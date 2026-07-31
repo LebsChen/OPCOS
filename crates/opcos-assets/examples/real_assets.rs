@@ -15,83 +15,88 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .unwrap_or_else(|| "/workspace".into());
     let client = client.with_workspace(workspace.clone());
-    let root = client.ls(Some(&workspace)).await?;
-    println!(
-        "workspace_entries={}",
-        root.items
-            .iter()
-            .map(|entry| entry.name.as_str())
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-    let mut repo = workspace.clone();
-    for candidate in ["repos", "work", "devin"] {
-        let path = format!("{workspace}\\{candidate}");
-        if let Ok(entries) = client.ls(Some(&path)).await {
-            println!(
-                "candidate={} entries={}",
-                candidate,
-                entries
-                    .items
-                    .iter()
-                    .map(|entry| entry.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
-            for entry in entries.items.iter().filter(|entry| entry.dir).take(20) {
-                let nested = format!("{path}\\{}", entry.name);
-                if client.read(&format!("{nested}\\AGENTS.md")).await.is_ok() {
-                    repo = nested;
-                    break;
-                }
-            }
-        }
-        if repo != workspace {
-            break;
-        }
-    }
-    if repo == workspace {
-        let candidate = format!("{workspace}\\work\\Cloud-Dev");
-        if client.ls(Some(&candidate)).await.is_ok() {
-            repo = candidate;
-        }
+    let repo = format!("{workspace}\\work\\Cloud-Dev");
+    let fs_probe = client
+        .exec_sync(ExecRequest {
+            command: format!(
+                "if exist \"{repo}\\AGENTS.md\" (echo agents=yes) else (echo agents=no) & if exist \"{repo}\\.devin\\blueprint.yaml\" (echo blueprint=yes) else (echo blueprint=no)"
+            ),
+            cwd: Some(workspace.clone()),
+            timeout_seconds: 30,
+            session: Some("opcos-m6-probe".into()),
+            env: None,
+        })
+        .await?;
+    println!("filesystem_probe={}", fs_probe.result.stdout.trim());
+    for path in [
+        "AGENTS.md",
+        "CLAUDE.md",
+        ".windsurfrules",
+        ".cursor/rules",
+        ".agents/skills",
+        ".devin/blueprint.yaml",
+    ] {
+        println!(
+            "probe {}={}",
+            path,
+            client.ls(Some(&format!("{repo}\\{path}"))).await.is_ok()
+                || client.read(&format!("{repo}\\{path}")).await.is_ok()
+        );
     }
     let bundle = discover(&client, &repo).await?;
+    let instruction_count = bundle
+        .agents
+        .iter()
+        .filter(|item| {
+            item.path.ends_with("AGENTS.md")
+                || item.path.ends_with("CLAUDE.md")
+                || item.path.contains(".cursor/rules/")
+                || item.path.ends_with(".windsurfrules")
+        })
+        .count();
     println!(
-        "assets agents={} knowledge={} playbook={} skills={}",
-        bundle.agents.len(),
+        "repo={} instruction_files={} knowledge={} playbook={} skills={}",
+        repo,
+        instruction_count,
         bundle.knowledge.len(),
         bundle.playbook.is_some(),
         bundle.skills.len()
+    );
+    let system_message = bundle.system_instructions();
+    println!(
+        "system_order agents={} knowledge={} playbook={} skill={} secret_or_token={}",
+        system_message.find("[AGENTS").is_some(),
+        system_message.find("[Knowledge").is_some(),
+        system_message.find("[Playbook").is_some(),
+        system_message.find("[Skill").is_some(),
+        system_message.to_ascii_lowercase().contains("token")
+            || system_message.to_ascii_lowercase().contains("secret")
     );
     let blueprint_text = RvmClient::read(&client, &format!("{repo}/.devin/blueprint.yaml"))
         .await?
         .content;
     let blueprint = parse_blueprint(&blueprint_text)?;
-    let command = blueprint
-        .initialize
-        .first()
-        .or_else(|| blueprint.dependencies.first())
-        .or_else(|| blueprint.build.first());
-    if let Some(command) = command {
-        let result = client
-            .exec_sync(ExecRequest {
-                command: command.clone(),
-                cwd: Some(repo),
-                timeout_seconds: 180,
-                session: Some("opcos-m6-smoke".into()),
-                env: None,
-            })
-            .await?;
-        println!(
-            "blueprint_step exit_code={} stdout_bytes={} stderr_bytes={}",
-            result.result.exit_code,
-            result.result.stdout.len(),
-            result.result.stderr.len()
-        );
-    } else {
-        println!("blueprint_step=none");
-    }
+    let phase_count = usize::from(!blueprint.initialize.is_empty())
+        + usize::from(!blueprint.dependencies.is_empty())
+        + usize::from(!blueprint.build.is_empty());
+    let command_count =
+        blueprint.initialize.len() + blueprint.dependencies.len() + blueprint.build.len();
+    println!("blueprint_phases={phase_count} blueprint_commands={command_count}");
+    let result = client
+        .exec_sync(ExecRequest {
+            command: "node --version".into(),
+            cwd: Some(repo),
+            timeout_seconds: 60,
+            session: Some("opcos-m6-smoke".into()),
+            env: None,
+        })
+        .await?;
+    println!(
+        "safe_command exit_code={} stdout_bytes={} stderr_bytes={}",
+        result.result.exit_code,
+        result.result.stdout.len(),
+        result.result.stderr.len()
+    );
     let mcp = client
         .mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
         .await?;

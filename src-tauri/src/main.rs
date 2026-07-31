@@ -183,6 +183,7 @@ struct SessionView {
     host_name: String,
     model: String,
     mode: String,
+    workspace: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -231,6 +232,7 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                host_id TEXT NOT NULL,
                model TEXT NOT NULL,
                mode TEXT NOT NULL,
+               workspace TEXT NOT NULL DEFAULT '',
                created_at TEXT NOT NULL
              );
              CREATE TABLE IF NOT EXISTS settings (
@@ -272,6 +274,21 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
              );",
         )
         .map_err(|error| error.to_string())?;
+    let has_workspace: bool = connection
+        .prepare("PRAGMA table_info(sessions)")
+        .and_then(|mut statement| {
+            let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+            Ok(rows.flatten().any(|name| name == "workspace"))
+        })
+        .map_err(|error| error.to_string())?;
+    if !has_workspace {
+        connection
+            .execute(
+                "ALTER TABLE sessions ADD COLUMN workspace TEXT NOT NULL DEFAULT ''",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
     Ok(connection)
 }
 
@@ -303,6 +320,20 @@ fn client_for(state: &DesktopState, host_id: &str) -> Result<HttpRvmClient, Stri
     let parsed = url::Url::parse(&url).map_err(|_| "remote host URL is invalid".to_owned())?;
     let config = RvmClientConfig::new(parsed, token).map_err(|error| error.to_string())?;
     HttpRvmClient::new(config).map_err(|error| error.to_string())
+}
+
+fn session_workspace(state: &DesktopState, session_id: &str) -> Result<Option<String>, String> {
+    state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .query_row(
+            "SELECT workspace FROM sessions WHERE id=?1",
+            [session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|workspace| (!workspace.is_empty()).then_some(workspace))
+        .map_err(|_| "session not found".to_owned())
 }
 
 async fn relay_surface(
@@ -494,20 +525,21 @@ async fn engine_for(
             return Ok(Arc::clone(engine));
         }
     }
-    let (host_id, model, mode) = {
+    let (host_id, model, mode, session_workspace) = {
         let connection = state
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?;
         connection
             .query_row(
-                "SELECT host_id,model,mode FROM sessions WHERE id=?1",
+                "SELECT host_id,model,mode,workspace FROM sessions WHERE id=?1",
                 [session_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 },
             )
@@ -550,7 +582,11 @@ async fn engine_for(
         .health()
         .await
         .map_err(|error| format!("remote host unavailable: {error}"))?;
-    let workspace = health.workspace.unwrap_or_else(|| "/workspace".into());
+    let workspace = if session_workspace.is_empty() {
+        health.workspace.unwrap_or_else(|| "/workspace".into())
+    } else {
+        session_workspace
+    };
     let executor_client = client.clone().with_workspace(workspace.clone());
     let executor = Arc::new(RemoteExecutor {
         shell: AsyncMutex::new(PersistentShell::new(
@@ -898,6 +934,7 @@ fn create_session(
     host_id: String,
     model: Option<String>,
     mode: Option<String>,
+    workspace: Option<String>,
 ) -> Result<SessionView, String> {
     let id = format!(
         "session-{}",
@@ -916,8 +953,8 @@ fn create_session(
         .map_err(|_| "remote host not found; session was not created".to_owned())?;
     connection
         .execute(
-            "INSERT INTO sessions(id,title,host_id,model,mode,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
-            params![id, title, host_id, model, mode, Utc::now().to_rfc3339()],
+            "INSERT INTO sessions(id,title,host_id,model,mode,workspace,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![id, title, host_id, model, mode, workspace.clone().unwrap_or_default(), Utc::now().to_rfc3339()],
         )
         .map_err(|error| error.to_string())?;
     Ok(SessionView {
@@ -927,6 +964,7 @@ fn create_session(
         host_name,
         model,
         mode,
+        workspace: workspace.unwrap_or_default(),
     })
 }
 
@@ -937,7 +975,7 @@ fn list_sessions(state: State<'_, DesktopState>) -> Result<Vec<SessionView>, Str
         .lock()
         .map_err(|_| "database lock poisoned")?;
     let mut statement = connection
-        .prepare("SELECT s.id,s.title,s.host_id,h.name,s.model,s.mode FROM sessions s JOIN hosts h ON h.id=s.host_id ORDER BY s.created_at DESC")
+        .prepare("SELECT s.id,s.title,s.host_id,h.name,s.model,s.mode,s.workspace FROM sessions s JOIN hosts h ON h.id=s.host_id ORDER BY s.created_at DESC")
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map([], |row| {
@@ -948,6 +986,7 @@ fn list_sessions(state: State<'_, DesktopState>) -> Result<Vec<SessionView>, Str
                 host_name: row.get(3)?,
                 model: row.get(4)?,
                 mode: row.get(5)?,
+                workspace: row.get(6)?,
             })
         })
         .map_err(|error| error.to_string())?;
@@ -1321,7 +1360,7 @@ async fn discover_remote_assets(
     state: State<'_, DesktopState>,
     session_id: String,
 ) -> Result<AssetBundle, String> {
-    let (host_id, workspace) = {
+    let host_id = {
         let connection = state
             .database
             .lock()
@@ -1329,22 +1368,21 @@ async fn discover_remote_assets(
         connection
             .query_row(
                 "SELECT host_id FROM sessions WHERE id=?1",
-                [session_id],
+                [session_id.clone()],
                 |row| row.get::<_, String>(0),
             )
-            .map_err(|_| "session not found".to_owned())
-            .map(|host_id| (host_id, String::new()))?
+            .map_err(|_| "session not found".to_owned())?
     };
     let client = client_for(&state, &host_id)?;
-    let workspace = if workspace.is_empty() {
+    let workspace = if let Some(workspace) = session_workspace(&state, &session_id)? {
+        workspace
+    } else {
         client
             .health()
             .await
             .map_err(|error| format!("remote host unavailable: {error}"))?
             .workspace
             .unwrap_or_else(|| "/workspace".into())
-    } else {
-        workspace
     };
     discover_assets(&client.with_workspace(workspace.clone()), &workspace)
         .await
