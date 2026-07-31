@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { canRebindSession, hostFailureMessage, noticeClass, redactApproval } from "./gui";
+import {
+  canRebindSession,
+  hostFailureMessage,
+  noticeClass,
+  redactApproval,
+  submitFailureMessage,
+} from "./gui";
 
 describe("GUI boundary behavior", () => {
   it("does not offer local fallback for an offline remote host", () => {
@@ -20,5 +26,11 @@ describe("GUI boundary behavior", () => {
   it("redacts approval secrets before display", () => {
     expect(redactApproval({ token: "secret", command: "echo ok" })).toContain("[redacted]");
     expect(redactApproval({ token: "secret", command: "echo ok" })).not.toContain("secret");
+  });
+
+  it("shows missing provider configuration instead of an assistant success", () => {
+    expect(submitFailureMessage("provider key is not configured; open Provider settings first")).toContain(
+      "Provider key is not configured",
+    );
   });
 });

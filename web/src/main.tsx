@@ -9,6 +9,7 @@ import {
   hostFailureMessage,
   noticeClass,
   redactApproval,
+  submitFailureMessage,
 } from "./gui";
 import "./style.css";
 
@@ -101,7 +102,7 @@ function App() {
       setHostToken("");
       await refresh();
     } catch (reason) {
-      setError(String(reason));
+      setError(submitFailureMessage(reason));
     }
   };
 

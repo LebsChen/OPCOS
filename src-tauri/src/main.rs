@@ -1,21 +1,92 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use async_trait::async_trait;
 use chrono::Utc;
+use opcos_engine::{AgentEngine, EngineError, ToolExecutor, TurnEngine};
+use opcos_policy::PermissionMode;
+use opcos_provider::ProviderConfig;
+use opcos_provider::openai::OpenAiProvider;
 use opcos_provider::registry;
-use opcos_rvm::{HttpRvmClient, RvmClient, RvmClientConfig};
-use opcos_store::{KeyringSecretStore, SecretStore};
+use opcos_rvm::{HttpRvmClient, PersistentShell, RvmClient, RvmClientConfig};
+use opcos_store::{KeyringSecretStore, SecretStore, SessionStore, SqliteStore};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, State};
+use tokio::sync::Mutex as AsyncMutex;
 
 const SECRET_SERVICE: &str = "com.opcos.desktop";
 
 struct DesktopState {
     database: Mutex<Connection>,
     secrets: KeyringSecretStore,
+    store: Arc<SqliteStore>,
+    engines: AsyncMutex<HashMap<String, Arc<GuiEngine>>>,
+}
+
+type GuiEngine = TurnEngine<OpenAiProvider, SqliteStore, RemoteExecutor>;
+
+struct RemoteExecutor {
+    client: HttpRvmClient,
+    shell: AsyncMutex<PersistentShell<HttpRvmClient>>,
+}
+
+#[async_trait]
+impl ToolExecutor for RemoteExecutor {
+    async fn execute(&self, name: &str, arguments: Value) -> Result<Value, String> {
+        let argument = |key: &str| {
+            arguments
+                .get(key)
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("missing string argument: {key}"))
+        };
+        match name {
+            "read_file" => self
+                .client
+                .read(argument("path")?)
+                .await
+                .map(|value| json!({"path":value.path,"content":value.content,"size":value.size}))
+                .map_err(|error| error.to_string()),
+            "write_file" => self
+                .client
+                .write(argument("path")?, argument("content")?)
+                .await
+                .map_err(|error| error.to_string()),
+            "list_dir" => self
+                .client
+                .ls(arguments.get("path").and_then(Value::as_str))
+                .await
+                .map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
+                .map_err(|error| error.to_string()),
+            "run_shell" | "exec" => self
+                .shell
+                .lock()
+                .await
+                .exec(argument("command")?)
+                .await
+                .map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
+                .map_err(|error| error.to_string()),
+            "git_status" => self
+                .client
+                .git_status(argument("cwd")?)
+                .await
+                .map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
+                .map_err(|error| error.to_string()),
+            "git_log" => self
+                .client
+                .git_log(
+                    argument("cwd")?,
+                    arguments.get("count").and_then(Value::as_u64).unwrap_or(20) as u32,
+                )
+                .await
+                .map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
+                .map_err(|error| error.to_string()),
+            _ => Err(format!("remote tool is unavailable: {name}")),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -126,30 +197,99 @@ fn client_for(state: &DesktopState, host_id: &str) -> Result<HttpRvmClient, Stri
     HttpRvmClient::new(config).map_err(|error| error.to_string())
 }
 
-fn append_transcript(
+async fn engine_for(
+    app: &tauri::AppHandle,
     state: &DesktopState,
     session_id: &str,
-    kind: &str,
-    payload: Value,
-) -> Result<(), String> {
-    let connection = state
-        .database
-        .lock()
-        .map_err(|_| "database lock poisoned")?;
-    let sequence: i64 = connection
-        .query_row(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM transcript WHERE session_id=?1",
-            [session_id],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    connection
-        .execute(
-            "INSERT INTO transcript(session_id,sequence,kind,payload) VALUES (?1,?2,?3,?4)",
-            params![session_id, sequence, kind, payload.to_string()],
-        )
-        .map_err(|error| error.to_string())?;
-    Ok(())
+) -> Result<Arc<GuiEngine>, String> {
+    {
+        let engines = state.engines.lock().await;
+        if let Some(engine) = engines.get(session_id) {
+            return Ok(Arc::clone(engine));
+        }
+    }
+    let (host_id, model, mode) = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        connection
+            .query_row(
+                "SELECT host_id,model,mode FROM sessions WHERE id=?1",
+                [session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .map_err(|_| "session not found".to_owned())?
+    };
+    let client = client_for(state, &host_id)?;
+    let health = client
+        .health()
+        .await
+        .map_err(|error| format!("remote host unavailable: {error}"))?;
+    let workspace = health.workspace.unwrap_or_else(|| "/workspace".into());
+    let executor_client = client.clone().with_workspace(workspace.clone());
+    let executor = Arc::new(RemoteExecutor {
+        shell: AsyncMutex::new(PersistentShell::new(
+            executor_client.clone(),
+            format!("opcos-{session_id}"),
+            Some(workspace.clone()),
+        )),
+        client: executor_client,
+    });
+    let key = state
+        .secrets
+        .get(&secret_key("provider-key", "openai"))
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "provider key is not configured; open Provider settings first".to_owned())?;
+    let provider = OpenAiProvider::new(ProviderConfig::new(
+        std::env::var("OPCOS_PROVIDER_BASE_URL")
+            .unwrap_or_else(|_| "https://ai.yaoshen.de5.net/v1".into()),
+        key,
+    ));
+    let permission_mode = match mode.as_str() {
+        "Discuss" => PermissionMode::Discuss,
+        "Plan" => PermissionMode::Plan,
+        "Auto" => PermissionMode::Auto,
+        "Custom" => PermissionMode::Custom,
+        _ => PermissionMode::Interactive,
+    };
+    let engine = Arc::new(TurnEngine::new(
+        provider,
+        Arc::clone(&state.store),
+        executor,
+        session_id,
+        workspace,
+        permission_mode,
+        model,
+    ));
+    let mut events = engine.events();
+    let handle = app.clone();
+    let session = session_id.to_owned();
+    tauri::async_runtime::spawn(async move {
+        while let Some(chunk) = events.recv().await {
+            emit(
+                &handle,
+                "stream",
+                Some(&session),
+                serde_json::to_value(chunk).unwrap_or(Value::Null),
+            );
+        }
+    });
+    let mut engines = state.engines.lock().await;
+    let entry = engines
+        .entry(session_id.to_owned())
+        .or_insert_with(|| Arc::clone(&engine));
+    Ok(Arc::clone(entry))
+}
+
+fn engine_error_message(error: EngineError) -> String {
+    error.to_string()
 }
 
 #[tauri::command]
@@ -323,22 +463,14 @@ fn read_transcript(
     state: State<'_, DesktopState>,
     session_id: String,
 ) -> Result<Vec<Value>, String> {
-    let connection = state
-        .database
-        .lock()
-        .map_err(|_| "database lock poisoned")?;
-    let mut statement = connection
-        .prepare("SELECT kind,payload FROM transcript WHERE session_id=?1 ORDER BY sequence")
+    let messages = state
+        .store
+        .load_messages(&session_id)
         .map_err(|error| error.to_string())?;
-    let rows = statement
-        .query_map([session_id], |row| {
-            let kind: String = row.get(0)?;
-            let payload: String = row.get(1)?;
-            Ok(json!({"kind":kind,"payload":serde_json::from_str::<Value>(&payload).unwrap_or(Value::Null)}))
-        })
-        .map_err(|error| error.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())
+    Ok(messages
+        .into_iter()
+        .map(|message| json!({"kind":message.role,"payload":message.content}))
+        .collect())
 }
 
 #[tauri::command]
@@ -365,73 +497,107 @@ async fn submit_turn(
         .health()
         .await
         .map_err(|error| format!("remote host unavailable: {error}"))?;
-    append_transcript(
-        &state,
-        &request.session_id,
-        "user",
-        json!({"text":request.text}),
-    )?;
+    let engine = engine_for(&app, &state, &request.session_id).await?;
     emit(
         &app,
         "message",
         Some(&request.session_id),
         json!({"role":"user","text":request.text}),
     );
-    emit(
-        &app,
-        "message",
-        Some(&request.session_id),
-        json!({"role":"assistant","text":"Engine turn is ready; provider execution will continue through the Rust engine."}),
-    );
-    append_transcript(
-        &state,
-        &request.session_id,
-        "assistant",
-        json!({"text":"Engine turn is ready; provider execution will continue through the Rust engine."}),
-    )?;
-    Ok(())
+    match engine.submit_text(request.text).await {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let message = engine_error_message(error);
+            emit(
+                &app,
+                "notice",
+                Some(&request.session_id),
+                json!({"kind":"error","text":message}),
+            );
+            Err(message)
+        }
+    }
 }
 
 #[tauri::command]
-fn interrupt(app: tauri::AppHandle, session_id: String) {
+async fn interrupt(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<(), String> {
+    let engine = engine_for(&app, &state, &session_id).await?;
+    engine.interrupt();
     emit(
         &app,
         "notice",
         Some(&session_id),
         json!({"kind":"interrupted","text":"Turn interrupted"}),
     );
+    Ok(())
 }
 
 #[tauri::command]
-fn steering(
+async fn steering(
     app: tauri::AppHandle,
     state: State<'_, DesktopState>,
     session_id: String,
     text: String,
 ) -> Result<(), String> {
-    append_transcript(&state, &session_id, "steering", json!({"text":text}))?;
+    let engine = engine_for(&app, &state, &session_id).await?;
+    engine.queue_steering(text.clone()).await;
     emit(&app, "steering", Some(&session_id), json!({"text":text}));
     Ok(())
 }
 
 #[tauri::command]
-fn resolve_approval(app: tauri::AppHandle, session_id: String, call_id: String, approve: bool) {
+async fn resolve_approval(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    session_id: String,
+    call_id: String,
+    approve: bool,
+) -> Result<(), String> {
+    let engine = engine_for(&app, &state, &session_id).await?;
+    engine
+        .resolve_approval(
+            &call_id,
+            if approve {
+                opcos_engine::ApprovalOutcome::Approve
+            } else {
+                opcos_engine::ApprovalOutcome::Deny
+            },
+        )
+        .await
+        .map(|_| ())
+        .map_err(engine_error_message)?;
     emit(
         &app,
         "approval_resolved",
         Some(&session_id),
         json!({"call_id":call_id,"approve":approve}),
     );
+    Ok(())
 }
 
 #[tauri::command]
-fn change_model(app: tauri::AppHandle, session_id: String, model: String) {
+async fn change_model(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    session_id: String,
+    model: String,
+) -> Result<(), String> {
+    let engine = engine_for(&app, &state, &session_id).await?;
+    engine
+        .change_model(model.clone())
+        .await
+        .map_err(engine_error_message)?;
     emit(
         &app,
         "notice",
         Some(&session_id),
         json!({"kind":"model_switch","text":format!("Switched to {model}")}),
     );
+    Ok(())
 }
 
 #[tauri::command]
@@ -509,13 +675,20 @@ fn main() {
                 .app_config_dir()
                 .map_err(|error| error.to_string())?;
             path.push("opcos.db");
-            let database = init_database(path).map_err(|error| {
+            let database = init_database(path.clone()).map_err(|error| {
                 let cause: Box<dyn std::error::Error> = Box::new(std::io::Error::other(error));
                 tauri::Error::Setup(cause.into())
             })?;
+            let store = Arc::new(SqliteStore::open(&path).map_err(|error| {
+                let cause: Box<dyn std::error::Error> =
+                    Box::new(std::io::Error::other(error.to_string()));
+                tauri::Error::Setup(cause.into())
+            })?);
             app.manage(DesktopState {
                 database: Mutex::new(database),
                 secrets: KeyringSecretStore::new(SECRET_SERVICE),
+                store,
+                engines: AsyncMutex::new(HashMap::new()),
             });
             emit(
                 app.handle(),

@@ -42,3 +42,10 @@ export function redactApproval(value: unknown): string {
       "$1$2[redacted]",
     );
 }
+
+export function submitFailureMessage(error: unknown): string {
+  const message = String(error);
+  return message.includes("provider key is not configured")
+    ? "Provider key is not configured; open Provider settings first."
+    : message;
+}
