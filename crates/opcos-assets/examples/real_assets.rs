@@ -15,19 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .unwrap_or_else(|| "/workspace".into());
     let client = client.with_workspace(workspace.clone());
-    let repo = format!("{workspace}\\work\\Cloud-Dev");
-    let fs_probe = client
-        .exec_sync(ExecRequest {
-            command: format!(
-                "if exist \"{repo}\\AGENTS.md\" (echo agents=yes) else (echo agents=no) & if exist \"{repo}\\.devin\\blueprint.yaml\" (echo blueprint=yes) else (echo blueprint=no)"
-            ),
-            cwd: Some(workspace.clone()),
-            timeout_seconds: 30,
-            session: Some("opcos-m6-probe".into()),
-            env: None,
-        })
-        .await?;
-    println!("filesystem_probe={}", fs_probe.result.stdout.trim());
+    let repo = format!("{workspace}/work/Cloud-Dev");
     for path in [
         "AGENTS.md",
         "CLAUDE.md",
