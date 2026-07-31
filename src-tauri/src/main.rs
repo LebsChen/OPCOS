@@ -41,6 +41,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio_tungstenite::accept_async;
 
 const SECRET_SERVICE: &str = "com.opcos.desktop";
+const ASKPASS_SCRIPT: &str = "if (($args -join ' ') -match 'Username') { $env:OPCOS_GIT_USERNAME } else { $env:OPCOS_GIT_PASSWORD }";
+mod scheduler;
 
 fn git_branch_name(slug: &str, timestamp: i64) -> Result<String, String> {
     let slug = slug
@@ -1666,10 +1668,7 @@ async fn git_workflow(
             .ok_or("GitHub token secret is not configured")?;
         let askpass = format!("{cwd}\\.opcos-askpass.ps1");
         client
-            .write(
-                &askpass,
-                "if (($args -join ' ') -match 'Username') { $env:OPCOS_GIT_USERNAME } else { $env:OPCOS_GIT_PASSWORD }",
-            )
+            .write(&askpass, ASKPASS_SCRIPT)
             .await
             .map_err(|error| error.to_string())?;
         env.insert("GIT_ASKPASS".into(), json!(askpass));
@@ -1917,13 +1916,21 @@ async fn run_schedule(
     state: State<'_, DesktopState>,
     schedule_id: String,
 ) -> Result<(), String> {
+    run_schedule_for(&app, &state, &schedule_id).await
+}
+
+async fn run_schedule_for(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    schedule_id: &str,
+) -> Result<(), String> {
     let (session_id, playbook_id) = state
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?
         .query_row(
             "SELECT session_id,playbook_id FROM schedules WHERE id=?1 AND enabled=1",
-            [&schedule_id],
+            [schedule_id],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .map_err(|_| "enabled schedule not found".to_owned())?;
@@ -1937,21 +1944,28 @@ async fn run_schedule(
             |row| row.get::<_, String>(0),
         )
         .map_err(|_| "playbook not found".to_owned())?;
-    let engine = engine_for(&app, &state, &session_id).await?;
-    engine
-        .submit_text(prompt)
-        .await
-        .map_err(engine_error_message)?;
     state
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?
         .execute(
-            "UPDATE schedules SET last_run=?2,last_result='ok' WHERE id=?1",
+            "UPDATE schedules SET last_run=?2,last_result='running' WHERE id=?1",
             params![schedule_id, Utc::now().to_rfc3339()],
         )
         .map_err(|error| error.to_string())?;
-    Ok(())
+    let engine = engine_for(app, state, &session_id).await?;
+    let result = engine.submit_text(prompt).await;
+    let result_label = if result.is_ok() { "ok" } else { "error" };
+    state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .execute(
+            "UPDATE schedules SET last_result=?2 WHERE id=?1",
+            params![schedule_id, result_label],
+        )
+        .map_err(|error| error.to_string())?;
+    result.map(|_| ()).map_err(engine_error_message)
 }
 
 #[tauri::command]
@@ -1981,12 +1995,20 @@ fn session_insights(state: State<'_, DesktopState>, session_id: String) -> Resul
             |row| row.get(0),
         )
         .unwrap_or(0);
+    let (input_tokens, output_tokens, duration_ms): (i64, i64, i64) = connection
+        .query_row(
+            "SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COALESCE(SUM(duration_ms),0) FROM usage_events WHERE session_id=?1",
+            [&session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap_or((0, 0, 0));
     Ok(json!({
         "session_id":session_id,
         "message_count":count,
         "tool_calls":tool_calls,
         "approval_count":approval_count,
-        "token_usage":null
+        "token_usage":{"input":input_tokens,"output":output_tokens},
+        "duration_ms":duration_ms
     }))
 }
 
@@ -2199,6 +2221,43 @@ fn main() {
                 surfaces: AsyncMutex::new(HashMap::new()),
                 ide_proxies: AsyncMutex::new(HashMap::new()),
             });
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+                loop {
+                    interval.tick().await;
+                    let state = handle.state::<DesktopState>();
+                    let due = {
+                        let Ok(connection) = state.database.lock() else {
+                            continue;
+                        };
+                        let Ok(mut statement) = connection
+                            .prepare("SELECT id,cron,last_run FROM schedules WHERE enabled=1")
+                        else {
+                            continue;
+                        };
+                        let Ok(rows) = statement.query_map([], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                            ))
+                        }) else {
+                            continue;
+                        };
+                        rows.filter_map(Result::ok)
+                            .filter_map(|(id, cron, last)| {
+                                let schedule = scheduler::Schedule::parse(&cron).ok()?;
+                                let last = last.and_then(|value| value.parse().ok());
+                                schedule.due(Utc::now(), last).then_some(id)
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    for id in due {
+                        let _ = run_schedule_for(&handle, &state, &id).await;
+                    }
+                }
+            });
             emit(
                 app.handle(),
                 "system",
@@ -2280,5 +2339,13 @@ mod m7_tests {
             assert!(reject_dangerous_git(command).is_err(), "{command}");
         }
         assert!(reject_dangerous_git("git add -- src/lib.rs").is_ok());
+    }
+
+    #[test]
+    fn askpass_script_contains_no_credential_value() {
+        let token = "ghp-test-secret";
+        assert!(!ASKPASS_SCRIPT.contains(token));
+        assert!(ASKPASS_SCRIPT.contains("OPCOS_GIT_PASSWORD"));
+        assert!(ASKPASS_SCRIPT.contains("OPCOS_GIT_USERNAME"));
     }
 }

@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::Utc;
 use opcos_policy::{Decision, DurableGrant, PermissionMode, ToolRisk, decide};
 use opcos_provider::{
     AssistantTurn, Caps, Provider, ProviderError, ProviderRequest, StreamChunk, TokenUsage,
@@ -6,12 +7,14 @@ use opcos_provider::{
 };
 use opcos_store::{
     CompactionRecord, GrantRecord, NoticeRecord, PendingRecord, SessionStore, StoredMessage,
+    UsageRecord,
 };
 use serde_json::{Value, json};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc};
 
@@ -338,10 +341,22 @@ where
                 },
                 settings: json!({}),
             };
+            let started = Instant::now();
             let (provider_result, partial) = self.stream_turn(request).await;
             match provider_result {
                 Ok(turn) => {
                     usage = turn.usage.clone();
+                    if let Some(value) = &turn.usage {
+                        self.store
+                            .append_usage(&UsageRecord {
+                                session_id: self.session_id.clone(),
+                                input_tokens: value.input,
+                                output_tokens: value.output,
+                                duration_ms: started.elapsed().as_millis() as u64,
+                                recorded_at: Utc::now(),
+                            })
+                            .map_err(|error| EngineError::Store(error.to_string()))?;
+                    }
                     let assistant = json!({"role":"assistant","content":turn.text.clone().unwrap_or_default(),
                         "tool_calls":turn.tool_calls,"reasoning":turn.reasoning});
                     self.append("assistant", assistant.clone()).await?;
