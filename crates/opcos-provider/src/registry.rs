@@ -205,6 +205,42 @@ pub async fn verify_openai_compatible(
     discover_models(client, base_url, api_key).await.map(|_| ())
 }
 
+/// Probe the Bedrock control plane without invoking a model. AWS SDK credential
+/// resolution and SigV4 remain inside the SDK; the returned messages deliberately
+/// distinguish invalid credentials from a valid identity lacking Bedrock access.
+pub async fn verify_bedrock(region: &str) -> Result<(), String> {
+    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_types::region::Region::new(region.to_owned()))
+        .load()
+        .await;
+    let client = aws_sdk_bedrock::Client::new(&config);
+    match client.list_foundation_models().send().await {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let detail = crate::sanitize_error(&error.to_string()).to_ascii_lowercase();
+            if detail.contains("credential")
+                || detail.contains("security token")
+                || detail.contains("signature")
+                || detail.contains("unauthorized")
+            {
+                Err("AWS credentials were rejected by Bedrock.".into())
+            } else if detail.contains("accessdenied")
+                || detail.contains("access denied")
+                || detail.contains("not authorized")
+            {
+                Err("AWS credentials are valid but lack Bedrock model-list permission.".into())
+            } else if detail.contains("region")
+                || detail.contains("endpoint")
+                || detail.contains("could not connect")
+            {
+                Err("Bedrock region or endpoint is unavailable.".into())
+            } else {
+                Err("Bedrock credential probe failed.".into())
+            }
+        }
+    }
+}
+
 pub async fn verify_vertex(client: &Client, endpoint: &str, api_key: &str) -> Result<(), String> {
     let response = client
         .post(endpoint)
