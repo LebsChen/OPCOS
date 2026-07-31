@@ -118,6 +118,7 @@ pub trait SecretStore: Send + Sync {
     fn delete(&self, key: &str) -> Result<(), StoreError>;
 }
 
+#[derive(Clone)]
 pub struct KeyringSecretStore {
     service: String,
 }

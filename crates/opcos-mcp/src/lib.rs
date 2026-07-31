@@ -51,7 +51,17 @@ pub async fn dispatch<C: RvmClient>(
             "capabilities": {},
             "serverInfo": {"name": "OPCOS", "version": env!("CARGO_PKG_VERSION")}
         }),
-        "tools/list" => json!({"tools": []}),
+        "tools/list" => {
+            let response = client
+                .mcp(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request.id,
+                    "method": "tools/list",
+                    "params": request.params,
+                }))
+                .await?;
+            response.get("result").cloned().unwrap_or(response)
+        }
         "ping" => json!({}),
         _ => {
             return Ok(JsonRpcResponse {

@@ -23,6 +23,16 @@ type UiEvent = {
   payload: Record<string, unknown>;
 };
 type ProviderDescriptor = { name: string; title: string };
+type Asset = {
+  id: string;
+  kind: string;
+  title: string;
+  body: string;
+  trigger: string;
+  scope: string;
+  enabled: boolean;
+};
+type SecretMetadata = { name: string; scope: string; purpose: string };
 
 async function command<T>(
   name: string,
@@ -49,6 +59,8 @@ function App() {
   const [baseUrl, setBaseUrl] = useState("");
   const [surfacePorts, setSurfacePorts] = useState<Record<string, number>>({});
   const [idePort, setIdePort] = useState<number | null>(null);
+  const [assets, setAssets] = useState<Asset[]>([]);
+  const [secretMetadata, setSecretMetadata] = useState<SecretMetadata[]>([]);
   const terminalHost = useRef<HTMLDivElement>(null);
   const vncHost = useRef<HTMLDivElement>(null);
 
@@ -72,6 +84,12 @@ function App() {
         setProvider(settings.provider);
         setBaseUrl(settings.base_url || "");
       })
+      .catch((reason: unknown) => setError(String(reason)));
+    void command<Asset[]>("list_assets")
+      .then(setAssets)
+      .catch((reason: unknown) => setError(String(reason)));
+    void command<SecretMetadata[]>("list_secret_metadata")
+      .then(setSecretMetadata)
       .catch((reason: unknown) => setError(String(reason)));
     let active = true;
     const subscription = listen<UiEvent>("opcos://event", (event) => {
@@ -417,6 +435,30 @@ function App() {
           {error && <div className="error-banner">{error}</div>}
         </main>
         <aside className="settings">
+          <h2>Assets</h2>
+          <button
+            disabled={!selected}
+            onClick={() => {
+              if (!selected) return;
+              void command<unknown>("discover_remote_assets", {
+                sessionId: selected.id,
+              })
+                .then(() => command<Asset[]>("list_assets"))
+                .then(setAssets)
+                .catch((reason: unknown) => setError(String(reason)));
+            }}
+          >
+            Discover repository assets
+          </button>
+          {assets.map((asset) => (
+            <div className="asset-row" key={asset.id}>
+              <strong>{asset.title}</strong>
+              <span className="muted">{asset.kind}</span>
+            </div>
+          ))}
+          <p className="muted">
+            {secretMetadata.length} configured secrets; values are never shown.
+          </p>
           <h2>Provider</h2>
           <select
             value={provider}

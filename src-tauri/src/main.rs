@@ -14,6 +14,7 @@ use axum::{
 };
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
+use opcos_assets::{AssetBundle, discover as discover_assets};
 use opcos_engine::{AgentEngine, EngineError, ToolExecutor, TurnEngine};
 use opcos_policy::PermissionMode;
 use opcos_provider::ProviderConfig;
@@ -189,6 +190,20 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                kind TEXT NOT NULL,
                payload TEXT NOT NULL,
                PRIMARY KEY(session_id, sequence)
+             );
+             CREATE TABLE IF NOT EXISTS asset_records (
+               id TEXT PRIMARY KEY,
+               kind TEXT NOT NULL,
+               title TEXT NOT NULL,
+               body TEXT NOT NULL,
+               trigger TEXT NOT NULL,
+               scope TEXT NOT NULL,
+               enabled INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS secret_records (
+               name TEXT PRIMARY KEY,
+               scope TEXT NOT NULL,
+               purpose TEXT NOT NULL
              );",
         )
         .map_err(|error| error.to_string())?;
@@ -478,7 +493,7 @@ async fn engine_for(
             format!("opcos-{session_id}"),
             Some(workspace.clone()),
         )),
-        client: executor_client,
+        client: executor_client.clone(),
     });
     let key = state
         .secrets
@@ -498,10 +513,15 @@ async fn engine_for(
         Arc::clone(&state.store),
         executor,
         session_id,
-        workspace,
+        workspace.clone(),
         permission_mode,
         model,
     ));
+    if let Ok(bundle) = discover_assets(&executor_client, &workspace).await {
+        engine
+            .set_system_instructions(Some(bundle.system_instructions()))
+            .await;
+    }
     let mut events = engine.events();
     let handle = app.clone();
     let session = session_id.to_owned();
@@ -939,6 +959,226 @@ fn provider_descriptors() -> Vec<registry::ProviderDescriptor> {
 }
 
 #[tauri::command]
+fn list_assets(state: State<'_, DesktopState>, kind: Option<String>) -> Result<Vec<Value>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id,kind,title,body,trigger,scope,enabled FROM asset_records
+             WHERE (?1 IS NULL OR kind=?1) ORDER BY title",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([kind], |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "kind": row.get::<_, String>(1)?,
+                "title": row.get::<_, String>(2)?,
+                "body": row.get::<_, String>(3)?,
+                "trigger": row.get::<_, String>(4)?,
+                "scope": row.get::<_, String>(5)?,
+                "enabled": row.get::<_, bool>(6)?,
+            }))
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn save_asset(
+    state: State<'_, DesktopState>,
+    id: String,
+    kind: String,
+    title: String,
+    body: String,
+    trigger: Option<String>,
+    scope: Option<String>,
+    enabled: Option<bool>,
+) -> Result<(), String> {
+    if !matches!(kind.as_str(), "knowledge" | "playbook" | "skill" | "agents") {
+        return Err("unsupported asset kind".into());
+    }
+    state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .execute(
+            "INSERT OR REPLACE INTO asset_records
+             (id,kind,title,body,trigger,scope,enabled) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                id,
+                kind,
+                title,
+                body,
+                trigger.unwrap_or_default(),
+                scope.unwrap_or_default(),
+                enabled.unwrap_or(true)
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_asset(state: State<'_, DesktopState>, id: String) -> Result<(), String> {
+    state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .execute("DELETE FROM asset_records WHERE id=?1", [id])
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn discover_remote_assets(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<AssetBundle, String> {
+    let (host_id, workspace) = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        connection
+            .query_row(
+                "SELECT host_id FROM sessions WHERE id=?1",
+                [session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|_| "session not found".to_owned())
+            .map(|host_id| (host_id, String::new()))?
+    };
+    let client = client_for(&state, &host_id)?;
+    let workspace = if workspace.is_empty() {
+        client
+            .health()
+            .await
+            .map_err(|error| format!("remote host unavailable: {error}"))?
+            .workspace
+            .unwrap_or_else(|| "/workspace".into())
+    } else {
+        workspace
+    };
+    discover_assets(&client.with_workspace(workspace.clone()), &workspace)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn read_blueprint(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Value, String> {
+    let host_id = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .query_row(
+            "SELECT host_id FROM sessions WHERE id=?1",
+            [session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| "session not found".to_owned())?;
+    let client = client_for(&state, &host_id)?;
+    let content = client
+        .read(".devin/blueprint.yaml")
+        .await
+        .map_err(|error| error.to_string())?
+        .content;
+    let value: serde_yaml::Value =
+        serde_yaml::from_str(&content).map_err(|error| format!("invalid blueprint: {error}"))?;
+    serde_json::to_value(value).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn execute_blueprint(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    command: String,
+    cwd: Option<String>,
+) -> Result<Value, String> {
+    if command.trim().is_empty() {
+        return Err("blueprint command cannot be empty".into());
+    }
+    let host_id = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .query_row(
+            "SELECT host_id FROM sessions WHERE id=?1",
+            [session_id.clone()],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| "session not found".to_owned())?;
+    let client = client_for(&state, &host_id)?;
+    let result = client
+        .exec_sync(opcos_rvm::ExecRequest {
+            command,
+            cwd,
+            timeout_seconds: 1800,
+            session: Some(format!("opcos-blueprint-{session_id}")),
+            env: None,
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    serde_json::to_value(result).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn save_secret_metadata(
+    state: State<'_, DesktopState>,
+    name: String,
+    scope: String,
+    purpose: String,
+    value: String,
+) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("secret value cannot be empty".into());
+    }
+    state
+        .secrets
+        .set(&secret_key("asset-secret", &name), &value)
+        .map_err(|error| error.to_string())?;
+    state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .execute(
+            "INSERT OR REPLACE INTO secret_records(name,scope,purpose) VALUES (?1,?2,?3)",
+            params![name, scope, purpose],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn list_secret_metadata(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let mut statement = connection
+        .prepare("SELECT name,scope,purpose FROM secret_records ORDER BY name")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(json!({
+                "name": row.get::<_, String>(0)?,
+                "scope": row.get::<_, String>(1)?,
+                "purpose": row.get::<_, String>(2)?,
+            }))
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn save_provider_key(
     state: State<'_, DesktopState>,
     provider: String,
@@ -1119,6 +1359,14 @@ fn main() {
             resolve_approval,
             change_model,
             provider_descriptors,
+            list_assets,
+            save_asset,
+            delete_asset,
+            discover_remote_assets,
+            read_blueprint,
+            execute_blueprint,
+            save_secret_metadata,
+            list_secret_metadata,
             provider_settings,
             save_provider_settings,
             save_provider_key,

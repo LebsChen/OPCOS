@@ -76,6 +76,7 @@ pub struct TurnEngine<P, S, E> {
     sequence: Mutex<i64>,
     interrupt_notify: Arc<tokio::sync::Notify>,
     unattended: AtomicBool,
+    system_instructions: Mutex<Option<String>>,
 }
 
 impl<P, S, E> TurnEngine<P, S, E>
@@ -115,7 +116,12 @@ where
             sequence: Mutex::new(initial_sequence),
             interrupt_notify: Arc::new(tokio::sync::Notify::new()),
             unattended: AtomicBool::new(false),
+            system_instructions: Mutex::new(None),
         }
+    }
+
+    pub async fn set_system_instructions(&self, instructions: Option<String>) {
+        *self.system_instructions.lock().await = instructions;
     }
 
     pub async fn submit_text(&self, text: impl Into<String>) -> Result<AssistantTurn, EngineError> {
@@ -603,7 +609,8 @@ where
     }
 
     fn provider_messages(&self) -> Result<Vec<Value>, EngineError> {
-        self.store
+        let mut messages: Vec<Value> = self
+            .store
             .load_resume_messages(&self.session_id)
             .map_err(|error| EngineError::Store(error.to_string()))
             .map(|items| {
@@ -623,7 +630,16 @@ where
                         content
                     })
                     .collect()
-            })
+            })?;
+        if let Ok(instructions) = self.system_instructions.try_lock()
+            && let Some(instructions) = instructions.as_ref()
+        {
+            messages.insert(
+                0,
+                json!({"role":"system","content":[{"type":"text","text":instructions}]}),
+            );
+        }
+        Ok(messages)
     }
 
     async fn compact_context(&self, messages: Vec<Value>) -> Result<Vec<Value>, EngineError> {

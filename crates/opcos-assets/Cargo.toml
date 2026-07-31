@@ -1,0 +1,12 @@
+[package]
+name = "opcos-assets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+opcos-rvm = { path = "../opcos-rvm" }
