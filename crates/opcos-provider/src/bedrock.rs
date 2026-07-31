@@ -3,20 +3,24 @@ use crate::{
     ToolCall,
 };
 use async_trait::async_trait;
+use base64::Engine;
 use serde_json::{Value, json};
-use tokio::sync::mpsc::Sender;
+use std::sync::Arc;
+use tokio::sync::{OnceCell, mpsc::Sender};
 
 /// Bedrock Converse wire conversion. The AWS SDK owns credentials and SigV4; these
 /// functions only normalize SDK-shaped JSON fixtures into canonical turns.
 #[derive(Clone, Debug)]
 pub struct BedrockProvider {
     region: String,
+    client: Arc<OnceCell<aws_sdk_bedrockruntime::Client>>,
 }
 
 impl BedrockProvider {
     pub fn new(region: impl Into<String>) -> Self {
         Self {
             region: region.into(),
+            client: Arc::new(OnceCell::new()),
         }
     }
 
@@ -34,6 +38,18 @@ impl BedrockProvider {
             assembler.push_json(event);
         }
         assembler.finish()
+    }
+
+    async fn client(&self) -> &aws_sdk_bedrockruntime::Client {
+        self.client
+            .get_or_init(|| async {
+                let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                    .region(aws_types::region::Region::new(self.region.clone()))
+                    .load()
+                    .await;
+                aws_sdk_bedrockruntime::Client::new(&config)
+            })
+            .await
     }
 }
 
@@ -311,38 +327,250 @@ fn parse_turn(value: &Value) -> AssistantTurn {
     }
 }
 
+type ConverseInput = (
+    Vec<aws_sdk_bedrockruntime::types::Message>,
+    Vec<aws_sdk_bedrockruntime::types::SystemContentBlock>,
+    Option<aws_sdk_bedrockruntime::types::ToolConfiguration>,
+    aws_sdk_bedrockruntime::types::InferenceConfiguration,
+);
+
+fn build_converse_input(request: &ProviderRequest) -> Result<ConverseInput, ProviderError> {
+    use aws_sdk_bedrockruntime::types::{
+        ContentBlock, ConversationRole, ImageBlock, ImageFormat, ImageSource, Message,
+        SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema, ToolResultBlock,
+        ToolResultContentBlock, ToolSpecification, ToolUseBlock,
+    };
+    let mut messages = Vec::new();
+    let mut system = Vec::new();
+    for value in &request.messages {
+        let role = value.get("role").and_then(Value::as_str).unwrap_or("user");
+        let blocks = value
+            .get("content")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                ProviderError::Protocol("Bedrock message content must be an array".into())
+            })?;
+        if role == "system" {
+            for block in blocks {
+                let text = block.as_str().or_else(|| {
+                    (block.get("type").and_then(Value::as_str) == Some("text"))
+                        .then(|| block.get("text").and_then(Value::as_str).unwrap_or(""))
+                });
+                let text = text.ok_or_else(|| {
+                    ProviderError::Protocol("unsupported Bedrock system block".into())
+                })?;
+                system.push(SystemContentBlock::Text(text.into()));
+            }
+            continue;
+        }
+        let role = match role {
+            "assistant" => ConversationRole::Assistant,
+            "user" | "tool" => ConversationRole::User,
+            other => {
+                return Err(ProviderError::Protocol(format!(
+                    "unsupported Bedrock role {other}"
+                )));
+            }
+        };
+        let mut builder = Message::builder().role(role);
+        for block in blocks {
+            let block_type = block.get("type").and_then(Value::as_str);
+            let content = match block_type {
+                None => ContentBlock::Text(
+                    block
+                        .as_str()
+                        .ok_or_else(|| {
+                            ProviderError::Protocol("invalid Bedrock text block".into())
+                        })?
+                        .into(),
+                ),
+                Some("text") => ContentBlock::Text(
+                    block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| ProviderError::Protocol("text block missing text".into()))?
+                        .into(),
+                ),
+                Some("tool_use") => {
+                    let tool = ToolUseBlock::builder()
+                        .tool_use_id(
+                            block
+                                .get("id")
+                                .or_else(|| block.get("tool_use_id"))
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| {
+                                    ProviderError::Protocol("tool_use missing id".into())
+                                })?,
+                        )
+                        .name(block.get("name").and_then(Value::as_str).ok_or_else(|| {
+                            ProviderError::Protocol("tool_use missing name".into())
+                        })?)
+                        .input(document_from_value(
+                            block.get("input").unwrap_or(&Value::Null),
+                        )?)
+                        .build()
+                        .map_err(|error| ProviderError::Protocol(error.to_string()))?;
+                    ContentBlock::ToolUse(tool)
+                }
+                Some("tool_result") => {
+                    let mut result = ToolResultBlock::builder().tool_use_id(
+                        block
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                ProviderError::Protocol("tool_result missing tool_use_id".into())
+                            })?,
+                    );
+                    let values = block
+                        .get("content")
+                        .map(|v| v.as_array().cloned().unwrap_or_default())
+                        .unwrap_or_else(|| {
+                            vec![block.get("content").cloned().unwrap_or(Value::Null)]
+                        });
+                    for value in values {
+                        if let Some(text) = value
+                            .as_str()
+                            .or_else(|| value.get("text").and_then(Value::as_str))
+                        {
+                            result = result.content(ToolResultContentBlock::Text(text.into()));
+                        } else {
+                            result = result.content(ToolResultContentBlock::Json(
+                                document_from_value(&value)?,
+                            ));
+                        }
+                    }
+                    ContentBlock::ToolResult(
+                        result
+                            .build()
+                            .map_err(|error| ProviderError::Protocol(error.to_string()))?,
+                    )
+                }
+                Some("image") => {
+                    let source = block.get("source").ok_or_else(|| {
+                        ProviderError::Protocol("image block missing source".into())
+                    })?;
+                    let data = source.get("data").and_then(Value::as_str).ok_or_else(|| {
+                        ProviderError::Protocol("image source missing base64 data".into())
+                    })?;
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(data)
+                        .map_err(|_| ProviderError::Protocol("invalid image base64".into()))?;
+                    let format = source
+                        .get("media_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("image/png")
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("png");
+                    let image = ImageBlock::builder()
+                        .format(ImageFormat::from(format))
+                        .source(ImageSource::Bytes(aws_smithy_types::Blob::new(bytes)))
+                        .build()
+                        .map_err(|error| ProviderError::Protocol(error.to_string()))?;
+                    ContentBlock::Image(image)
+                }
+                other => {
+                    return Err(ProviderError::Protocol(format!(
+                        "unsupported Bedrock content block {:?}",
+                        other
+                    )));
+                }
+            };
+            builder = builder.content(content);
+        }
+        messages.push(
+            builder
+                .build()
+                .map_err(|error| ProviderError::Protocol(error.to_string()))?,
+        );
+    }
+    let tool_config = if request.tools.is_empty() {
+        None
+    } else {
+        let mut builder = ToolConfiguration::builder();
+        for value in &request.tools {
+            let function = value.get("function").unwrap_or(value);
+            let name = function
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ProviderError::Protocol("tool missing name".into()))?;
+            let schema = function
+                .get("parameters")
+                .or_else(|| function.get("input_schema"))
+                .cloned()
+                .unwrap_or_else(|| json!({"type":"object"}));
+            let spec = ToolSpecification::builder()
+                .name(name)
+                .set_description(
+                    function
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                )
+                .input_schema(ToolInputSchema::Json(document_from_value(&schema)?))
+                .build()
+                .map_err(|error| ProviderError::Protocol(error.to_string()))?;
+            builder = builder.tools(Tool::ToolSpec(spec));
+        }
+        Some(
+            builder
+                .build()
+                .map_err(|error| ProviderError::Protocol(error.to_string()))?,
+        )
+    };
+    let mut inference = aws_sdk_bedrockruntime::types::InferenceConfiguration::builder();
+    if let Some(value) = request.settings.get("max_tokens").and_then(Value::as_i64) {
+        inference = inference.max_tokens(value as i32);
+    }
+    if let Some(value) = request.settings.get("temperature").and_then(Value::as_f64) {
+        inference = inference.temperature(value as f32);
+    }
+    Ok((messages, system, tool_config, inference.build()))
+}
+
+fn document_from_value(value: &Value) -> Result<aws_smithy_types::Document, ProviderError> {
+    use aws_smithy_types::Document;
+    Ok(match value {
+        Value::Null => Document::Null,
+        Value::Bool(value) => Document::Bool(*value),
+        Value::String(value) => Document::String(value.clone()),
+        Value::Array(values) => Document::Array(
+            values
+                .iter()
+                .map(document_from_value)
+                .collect::<Result<_, _>>()?,
+        ),
+        Value::Object(values) => Document::Object(
+            values
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), document_from_value(value)?)))
+                .collect::<Result<_, ProviderError>>()?,
+        ),
+        Value::Number(value) => Document::String(value.to_string()),
+    })
+}
+
 #[async_trait]
 impl Provider for BedrockProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<AssistantTurn, ProviderError> {
-        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(aws_types::region::Region::new(self.region.clone()))
-            .load()
-            .await;
-        let client = aws_sdk_bedrockruntime::Client::new(&config);
-        let mut builder = client.converse().model_id(request.model);
-        for message in request.messages {
-            let role = message
-                .get("role")
-                .and_then(Value::as_str)
-                .unwrap_or("user")
-                .into();
-            let text = message
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned();
-            let message = aws_sdk_bedrockruntime::types::Message::builder()
-                .role(role)
-                .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(text))
-                .build()
-                .map_err(|error| ProviderError::Protocol(error.to_string()))?;
+        let (messages, system, tool_config, inference) = build_converse_input(&request)?;
+        let mut builder = self.client().await.converse().model_id(request.model);
+        for message in messages {
             builder = builder.messages(message);
+        }
+        for block in system {
+            builder = builder.system(block);
+        }
+        builder = builder.inference_config(inference);
+        if let Some(tool_config) = tool_config {
+            builder = builder.tool_config(tool_config);
         }
         let response = builder
             .send()
             .await
             .map_err(|error| ProviderError::Protocol(error.to_string()))?;
         let mut text = String::new();
+        let mut reasoning = String::new();
         let mut tool_calls = Vec::new();
         if let Some(output) = response.output()
             && let Ok(message) = output.as_message()
@@ -350,6 +578,10 @@ impl Provider for BedrockProvider {
             for block in message.content() {
                 if let Ok(part) = block.as_text() {
                     text.push_str(part);
+                } else if let Ok(reasoning_block) = block.as_reasoning_content()
+                    && let Ok(reasoning_text) = reasoning_block.as_reasoning_text()
+                {
+                    reasoning.push_str(reasoning_text.text());
                 } else if let Ok(tool) = block.as_tool_use() {
                     tool_calls.push(ToolCall {
                         id: tool.tool_use_id().to_owned(),
@@ -362,8 +594,8 @@ impl Provider for BedrockProvider {
         Ok(AssistantTurn {
             text: (!text.is_empty()).then_some(text),
             tool_calls,
-            finish_reason: Some(response.stop_reason().as_str().to_owned()),
-            reasoning: None,
+            finish_reason: Some(map_stop(response.stop_reason().as_str())),
+            reasoning: (!reasoning.is_empty()).then_some(reasoning),
             extras: json!({}),
             usage: response.usage().map(|usage| TokenUsage {
                 input: usage.input_tokens().max(0) as u64,
@@ -379,29 +611,21 @@ impl Provider for BedrockProvider {
         request: ProviderRequest,
         output: Sender<StreamChunk>,
     ) -> Result<AssistantTurn, ProviderError> {
-        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(aws_types::region::Region::new(self.region.clone()))
-            .load()
-            .await;
-        let client = aws_sdk_bedrockruntime::Client::new(&config);
-        let mut builder = client.converse_stream().model_id(request.model);
-        for message in request.messages {
-            let role = message
-                .get("role")
-                .and_then(Value::as_str)
-                .unwrap_or("user")
-                .into();
-            let text = message
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned();
-            let message = aws_sdk_bedrockruntime::types::Message::builder()
-                .role(role)
-                .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(text))
-                .build()
-                .map_err(|error| ProviderError::Protocol(error.to_string()))?;
+        let (messages, system, tool_config, inference) = build_converse_input(&request)?;
+        let mut builder = self
+            .client()
+            .await
+            .converse_stream()
+            .model_id(request.model);
+        for message in messages {
             builder = builder.messages(message);
+        }
+        for block in system {
+            builder = builder.system(block);
+        }
+        builder = builder.inference_config(inference);
+        if let Some(tool_config) = tool_config {
+            builder = builder.tool_config(tool_config);
         }
         let response = builder
             .send()
@@ -414,8 +638,9 @@ impl Provider for BedrockProvider {
             .await
             .map_err(|error| ProviderError::Protocol(error.to_string()))?
         {
+            let sent = assembler.chunks.len();
             assembler.push_sdk(&event);
-            if let Some(chunk) = assembler.chunks.last().cloned() {
+            for chunk in assembler.chunks[sent..].iter().cloned() {
                 output
                     .send(chunk)
                     .await
@@ -491,5 +716,69 @@ mod tests {
         let turn = chunks.iter().find_map(|chunk| chunk.turn.as_ref()).unwrap();
         assert_eq!(fragments, r#"{"path":"."}"#);
         assert_eq!(turn.tool_calls[0].arguments["path"], ".");
+    }
+
+    #[test]
+    fn builds_lossless_tool_result_and_tool_configuration() {
+        let request = ProviderRequest {
+            model: "test".into(),
+            messages: vec![
+                json!({"role":"system","content":[{"type":"text","text":"system"}]}),
+                json!({"role":"user","content":[{"type":"text","text":"run"}]}),
+                json!({"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"ls","input":{"path":"."}}]}),
+                json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"ok"}]}]}),
+            ],
+            tools: vec![
+                json!({"type":"function","function":{"name":"ls","description":"list","parameters":{"type":"object"}}}),
+            ],
+            settings: json!({"max_tokens":128,"temperature":0.2}),
+        };
+        let (messages, system, tools, inference) = build_converse_input(&request).unwrap();
+        assert_eq!(system.len(), 1);
+        assert_eq!(messages.len(), 3);
+        assert!(messages[2].content()[0].is_tool_result());
+        assert_eq!(tools.unwrap().tools().len(), 1);
+        assert_eq!(inference.max_tokens(), Some(128));
+        assert_eq!(inference.temperature(), Some(0.2));
+    }
+
+    #[test]
+    fn stream_chunk_cursor_does_not_repeat_or_drop_events() {
+        let events: Vec<Value> = serde_json::from_str(
+            r#"[{"messageStart":{}},{"contentBlockDelta":{"contentBlockIndex":0,"delta":{"text":"hello"}}},{"messageStop":{"stopReason":"end_turn"}},{"metadata":{"usage":{"inputTokens":1,"outputTokens":2}}}]"#,
+        ).unwrap();
+        let expected = BedrockProvider::parse_stream(&events);
+        let mut assembler = BedrockAssembler::default();
+        let mut sent = Vec::new();
+        for event in &events {
+            let cursor = assembler.chunks.len();
+            assembler.push_json(event);
+            sent.extend(assembler.chunks[cursor..].iter().cloned());
+        }
+        let expected_sent = expected
+            .into_iter()
+            .filter(|chunk| chunk.turn.is_none())
+            .collect::<Vec<_>>();
+        assert_eq!(sent, expected_sent);
+    }
+
+    #[test]
+    fn complete_and_stream_assembly_share_canonical_reasoning_result() {
+        let complete = BedrockProvider::parse_converse(&json!({
+            "output":{"message":{"content":[
+                {"text":"done"},
+                {"reasoningContent":{"reasoningText":{"text":"think"}}}
+            ]}},
+            "stopReason":"end_turn",
+            "usage":{"inputTokens":1,"outputTokens":2}
+        }));
+        let stream = BedrockProvider::parse_stream(&[
+            json!({"contentBlockDelta":{"contentBlockIndex":0,"delta":{"text":"done"}}}),
+            json!({"contentBlockDelta":{"contentBlockIndex":1,"delta":{"reasoningContent":{"text":"think"}}}}),
+            json!({"messageStop":{"stopReason":"end_turn"}}),
+            json!({"metadata":{"usage":{"inputTokens":1,"outputTokens":2}}}),
+        ]);
+        let streamed = stream.iter().find_map(|chunk| chunk.turn.clone()).unwrap();
+        assert_eq!(complete, streamed);
     }
 }

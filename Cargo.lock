@@ -3244,6 +3244,7 @@ dependencies = [
  "aws-sdk-bedrockruntime",
  "aws-smithy-types",
  "aws-types",
+ "base64 0.22.1",
  "bytes",
  "futures-util",
  "reqwest",
