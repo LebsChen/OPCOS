@@ -13,14 +13,14 @@ use tokio::sync::{OnceCell, mpsc::Sender};
 #[derive(Clone, Debug)]
 pub struct BedrockProvider {
     region: String,
-    client: Arc<OnceCell<aws_sdk_bedrockruntime::Client>>,
+    config: Arc<OnceCell<aws_config::SdkConfig>>,
 }
 
 impl BedrockProvider {
     pub fn new(region: impl Into<String>) -> Self {
         Self {
             region: region.into(),
-            client: Arc::new(OnceCell::new()),
+            config: Arc::new(OnceCell::new()),
         }
     }
 
@@ -40,16 +40,48 @@ impl BedrockProvider {
         assembler.finish()
     }
 
-    async fn client(&self) -> &aws_sdk_bedrockruntime::Client {
-        self.client
+    async fn config(&self) -> &aws_config::SdkConfig {
+        self.config
             .get_or_init(|| async {
-                let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                aws_config::defaults(aws_config::BehaviorVersion::latest())
                     .region(aws_types::region::Region::new(self.region.clone()))
                     .load()
-                    .await;
-                aws_sdk_bedrockruntime::Client::new(&config)
+                    .await
             })
             .await
+    }
+
+    async fn client(&self) -> aws_sdk_bedrockruntime::Client {
+        aws_sdk_bedrockruntime::Client::new(self.config().await)
+    }
+
+    pub async fn verify_credentials(&self) -> Result<(), String> {
+        let client = aws_sdk_bedrock::Client::new(self.config().await);
+        match client.list_foundation_models().send().await {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let detail = error.to_string().to_ascii_lowercase();
+                if detail.contains("credential")
+                    || detail.contains("security token")
+                    || detail.contains("signature")
+                    || detail.contains("unauthorized")
+                {
+                    Err("AWS credentials were rejected by Bedrock.".into())
+                } else if detail.contains("accessdenied")
+                    || detail.contains("access denied")
+                    || detail.contains("not authorized")
+                {
+                    Err("AWS credentials are valid but lack Bedrock model-list permission.".into())
+                } else if detail.contains("region")
+                    || detail.contains("endpoint")
+                    || detail.contains("could not connect")
+                {
+                    Err("Bedrock region or endpoint is unavailable.".into())
+                } else {
+                    Err("Bedrock credential probe failed.".into())
+                }
+            }
+        }
     }
 }
 
