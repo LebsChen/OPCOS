@@ -1,7 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { FormEvent, useEffect, useState } from "react";
+import { useRef } from "react";
 import { createRoot } from "react-dom/client";
+import { Terminal } from "@xterm/xterm";
+import RFB from "@novnc/novnc";
+import "@xterm/xterm/css/xterm.css";
 import {
   Host,
   Session,
@@ -44,6 +48,9 @@ function App() {
   const [providers, setProviders] = useState<ProviderDescriptor[]>([]);
   const [baseUrl, setBaseUrl] = useState("");
   const [surfacePorts, setSurfacePorts] = useState<Record<string, number>>({});
+  const [idePort, setIdePort] = useState<number | null>(null);
+  const terminalHost = useRef<HTMLDivElement>(null);
+  const vncHost = useRef<HTMLDivElement>(null);
 
   const refresh = async () => {
     setHosts(await command<Host[]>("list_hosts"));
@@ -167,6 +174,52 @@ function App() {
     }
   };
 
+  const startIde = async () => {
+    if (!selected) return;
+    try {
+      const port = await command<number>("start_ide_proxy", {
+        sessionId: selected.id,
+        folderUri: `vscode-remote://${selected.host_name}/workspace`,
+      });
+      setIdePort(port);
+    } catch (reason) {
+      setError(String(reason));
+    }
+  };
+
+  useEffect(() => {
+    const port = surfacePorts.pty;
+    if (!port || !terminalHost.current) return;
+    const terminal = new Terminal({ convertEol: true, cursorBlink: true });
+    terminal.open(terminalHost.current);
+    const socket = new WebSocket(`ws://127.0.0.1:${port}`);
+    socket.binaryType = "arraybuffer";
+    socket.onmessage = (event) => {
+      terminal.write(
+        typeof event.data === "string"
+          ? event.data
+          : new Uint8Array(event.data as ArrayBuffer),
+      );
+    };
+    const input = terminal.onData((data) => socket.send(data));
+    terminal.onResize(({ cols, rows }) =>
+      socket.send(JSON.stringify({ type: "resize", cols, rows })),
+    );
+    return () => {
+      input.dispose();
+      socket.close();
+      terminal.dispose();
+    };
+  }, [surfacePorts.pty]);
+
+  useEffect(() => {
+    const port = surfacePorts.vnc;
+    if (!port || !vncHost.current) return;
+    const rfb = new RFB(vncHost.current, `ws://127.0.0.1:${port}`);
+    rfb.scaleViewport = true;
+    return () => rfb.disconnect();
+  }, [surfacePorts.vnc]);
+
   return (
     <div className="app">
       <header>
@@ -192,6 +245,16 @@ function App() {
                 )}
               </div>
             ))}
+            <button onClick={() => void startIde()}>Open Web IDE</button>
+            {idePort && (
+              <iframe
+                title="Remote Web IDE"
+                src={`http://127.0.0.1:${idePort}/`}
+                className="ide-frame"
+              />
+            )}
+            {surfacePorts.pty && <div ref={terminalHost} className="terminal" />}
+            {surfacePorts.vnc && <div ref={vncHost} className="vnc" />}
           </section>
           <section>
             <h2>Hosts</h2>

@@ -1,6 +1,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use async_trait::async_trait;
+use axum::{
+    Router,
+    body::Body,
+    extract::{
+        FromRequestParts, Path, Request, State as AxumState,
+        ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade},
+    },
+    http::{StatusCode, Uri},
+    response::{Html, IntoResponse, Response},
+    routing::any,
+};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use opcos_engine::{AgentEngine, EngineError, ToolExecutor, TurnEngine};
@@ -31,6 +42,7 @@ struct DesktopState {
     store: Arc<SqliteStore>,
     engines: AsyncMutex<HashMap<String, Arc<GuiEngine>>>,
     surfaces: AsyncMutex<HashMap<u16, tauri::async_runtime::JoinHandle<()>>>,
+    ide_proxies: AsyncMutex<HashMap<u16, tauri::async_runtime::JoinHandle<()>>>,
 }
 
 type GuiEngine = TurnEngine<OpenAiProvider, SqliteStore, RemoteExecutor>;
@@ -38,6 +50,12 @@ type GuiEngine = TurnEngine<OpenAiProvider, SqliteStore, RemoteExecutor>;
 struct RemoteExecutor {
     client: HttpRvmClient,
     shell: AsyncMutex<PersistentShell<HttpRvmClient>>,
+}
+
+#[derive(Clone)]
+struct IdeProxyState {
+    client: HttpRvmClient,
+    bootstrap: IdeBootstrap,
 }
 
 #[async_trait]
@@ -242,6 +260,111 @@ async fn relay_surface(
         _ = browser_to_upstream => {},
         _ = upstream_to_browser => {},
     }
+}
+
+async fn ide_document(AxumState(state): AxumState<IdeProxyState>) -> Html<String> {
+    Html(state.bootstrap.html)
+}
+
+async fn ide_root(AxumState(state): AxumState<IdeProxyState>, request: Request) -> Response {
+    if request
+        .headers()
+        .get("upgrade")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+    {
+        let (mut parts, _) = request.into_parts();
+        let uri = parts.uri.clone();
+        if let Ok(ws) = WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
+            return ws
+                .on_upgrade(move |socket| {
+                    ide_relay_socket(
+                        socket,
+                        state,
+                        format!("/ide/?{}", uri.query().unwrap_or_default()),
+                    )
+                })
+                .into_response();
+        }
+    }
+    Html(state.bootstrap.html).into_response()
+}
+
+async fn ide_asset(
+    AxumState(state): AxumState<IdeProxyState>,
+    Path(path): Path<String>,
+    uri: Uri,
+) -> Response {
+    let route = if path == "vscode-remote-resource" {
+        "/vscode-remote-resource".to_owned()
+    } else {
+        format!("/ide/static/{path}")
+    };
+    let query = uri
+        .query()
+        .map(|value| format!("?{value}"))
+        .unwrap_or_default();
+    let route = format!("{route}{query}");
+    match state
+        .client
+        .ide_request_bytes(&route, &state.bootstrap.cookies)
+        .await
+    {
+        Ok(bytes) => Response::new(Body::from(bytes)),
+        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+    }
+}
+
+async fn ide_relay_socket(mut browser: WebSocket, state: IdeProxyState, route: String) {
+    let Ok(upstream) = state
+        .client
+        .open_ide_ws(&route, &state.bootstrap.cookies)
+        .await
+    else {
+        let _ = browser.close().await;
+        return;
+    };
+    let (mut upstream_write, mut upstream_read) = upstream.split();
+    loop {
+        tokio::select! {
+            browser_message = browser.recv() => {
+                let Some(Ok(message)) = browser_message else { break };
+                let converted = match message {
+                    AxumMessage::Text(value) => tokio_tungstenite::tungstenite::Message::Text(value.to_string().into()),
+                    AxumMessage::Binary(value) => tokio_tungstenite::tungstenite::Message::Binary(value),
+                    AxumMessage::Ping(value) => tokio_tungstenite::tungstenite::Message::Ping(value),
+                    AxumMessage::Pong(value) => tokio_tungstenite::tungstenite::Message::Pong(value),
+                    AxumMessage::Close(_) => break,
+                };
+                if upstream_write.send(converted).await.is_err() { break; }
+            }
+            upstream_message = upstream_read.next() => {
+                let Some(Ok(message)) = upstream_message else { break };
+                let converted = match message {
+                    tokio_tungstenite::tungstenite::Message::Text(value) => AxumMessage::Text(value.to_string().into()),
+                    tokio_tungstenite::tungstenite::Message::Binary(value) => AxumMessage::Binary(value),
+                    tokio_tungstenite::tungstenite::Message::Ping(value) => AxumMessage::Ping(value),
+                    tokio_tungstenite::tungstenite::Message::Pong(value) => AxumMessage::Pong(value),
+                    tokio_tungstenite::tungstenite::Message::Close(_) => break,
+                    tokio_tungstenite::tungstenite::Message::Frame(_) => continue,
+                };
+                if browser.send(converted).await.is_err() { break; }
+            }
+        }
+    }
+}
+
+async fn serve_ide_proxy(listener: TcpListener, state: IdeProxyState) {
+    let router = Router::new()
+        .route("/", any(ide_root))
+        .route("/ide/", any(ide_document))
+        .route("/out/{*path}", any(ide_asset))
+        .route("/resources/{*path}", any(ide_asset))
+        .route("/extensions/{*path}", any(ide_asset))
+        .route("/node_modules/{*path}", any(ide_asset))
+        .route("/vscode-remote-resource", any(ide_asset))
+        .with_state(state);
+    let _ = axum::serve(listener, router).await;
 }
 
 async fn engine_for(
@@ -524,6 +647,48 @@ async fn ide_bootstrap(
         .ide_bootstrap(&folder_uri)
         .await
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn start_ide_proxy(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    folder_uri: String,
+) -> Result<u16, String> {
+    let host_id = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        connection
+            .query_row(
+                "SELECT host_id FROM sessions WHERE id=?1",
+                [&session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|_| "session not found".to_owned())?
+    };
+    if !folder_uri.starts_with("vscode-remote://") {
+        return Err("IDE folder must be a vscode-remote URI".into());
+    }
+    let client = client_for(&state, &host_id)?;
+    let bootstrap = client
+        .ide_bootstrap(&folder_uri)
+        .await
+        .map_err(|error| error.to_string())?;
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .map_err(|error| error.to_string())?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| error.to_string())?
+        .port();
+    let task = tauri::async_runtime::spawn(serve_ide_proxy(
+        listener,
+        IdeProxyState { client, bootstrap },
+    ));
+    state.ide_proxies.lock().await.insert(port, task);
+    Ok(port)
 }
 
 #[tauri::command]
@@ -895,6 +1060,7 @@ fn main() {
                 store,
                 engines: AsyncMutex::new(HashMap::new()),
                 surfaces: AsyncMutex::new(HashMap::new()),
+                ide_proxies: AsyncMutex::new(HashMap::new()),
             });
             emit(
                 app.handle(),
@@ -922,7 +1088,8 @@ fn main() {
             save_provider_key,
             validate_provider_key,
             start_surface,
-            ide_bootstrap
+            ide_bootstrap,
+            start_ide_proxy
         ])
         .run(tauri::generate_context!())
         .expect("error while running OPCOS");

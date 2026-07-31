@@ -16,6 +16,7 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
+axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 anyhow = "1"
 async-trait = "0.1"

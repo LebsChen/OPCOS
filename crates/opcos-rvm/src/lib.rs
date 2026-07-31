@@ -361,6 +361,8 @@ pub struct HttpRvmClient {
 pub struct IdeBootstrap {
     pub html: String,
     pub proxy_token: String,
+    #[serde(skip)]
+    pub cookies: Vec<String>,
 }
 
 fn redact_workbench_token(html: &str, upstream_token: &str, proxy_token: &str) -> String {
@@ -621,9 +623,125 @@ impl HttpRvmClient {
             return Ok(IdeBootstrap {
                 html: redact_workbench_token(&html, &self.config.token, &proxy_token),
                 proxy_token,
+                cookies,
             });
         }
         Err(RvmError::WebSocket("too many IDE redirects".into()))
+    }
+
+    pub async fn ide_request_bytes(
+        &self,
+        route: &str,
+        cookies: &[String],
+    ) -> Result<Bytes, RvmError> {
+        let mut url = self
+            .config
+            .base_url
+            .join(route)
+            .map_err(|_| RvmError::InvalidUrl)?;
+        let pairs = url
+            .query_pairs()
+            .map(|(key, value)| {
+                let key_is_token =
+                    key.eq_ignore_ascii_case("token") || key.eq_ignore_ascii_case("tkn");
+                (
+                    key.into_owned(),
+                    if key_is_token {
+                        self.config.token.clone()
+                    } else {
+                        value.into_owned()
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        url.set_query(None);
+        if !pairs.is_empty() {
+            let mut query = url.query_pairs_mut();
+            for (key, value) in pairs {
+                query.append_pair(&key, &value);
+            }
+        }
+        let mut request = self
+            .http
+            .get(url)
+            .header(header::AUTHORIZATION, self.config.auth_header());
+        if !cookies.is_empty() {
+            request = request.header(header::COOKIE, cookies.join("; "));
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let bytes = response.bytes().await?;
+        if !status.is_success() {
+            return Err(RvmError::http(
+                status,
+                &String::from_utf8_lossy(&bytes),
+                &self.config.token,
+            ));
+        }
+        Ok(bytes)
+    }
+
+    pub async fn open_ide_ws(
+        &self,
+        route: &str,
+        cookies: &[String],
+    ) -> Result<RvmWebSocket, RvmError> {
+        let mut url = self
+            .config
+            .base_url
+            .join(route)
+            .map_err(|_| RvmError::InvalidUrl)?;
+        url.set_scheme(match url.scheme() {
+            "https" => "wss",
+            _ => "ws",
+        })
+        .map_err(|_| RvmError::InvalidUrl)?;
+        let pairs = url
+            .query_pairs()
+            .map(|(key, value)| {
+                let key_is_token =
+                    key.eq_ignore_ascii_case("token") || key.eq_ignore_ascii_case("tkn");
+                (
+                    key.into_owned(),
+                    if key_is_token {
+                        self.config.token.clone()
+                    } else {
+                        value.into_owned()
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        url.set_query(None);
+        if !pairs.is_empty() {
+            let mut query = url.query_pairs_mut();
+            for (key, value) in pairs {
+                query.append_pair(&key, &value);
+            }
+        }
+        let mut request = url
+            .as_str()
+            .into_client_request()
+            .map_err(|error| RvmError::WebSocket(error.to_string()))?;
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            self.config
+                .auth_header()
+                .parse()
+                .map_err(|_| RvmError::WebSocket("invalid authorization header".into()))?,
+        );
+        if !cookies.is_empty() {
+            request.headers_mut().insert(
+                header::COOKIE,
+                cookies
+                    .join("; ")
+                    .parse()
+                    .map_err(|_| RvmError::WebSocket("invalid IDE cookie".into()))?,
+            );
+        }
+        connect_async(request)
+            .await
+            .map(|(stream, _)| stream)
+            .map_err(|error| RvmError::WebSocket(error.to_string()))
     }
 
     fn remote_path(&self, path: &str) -> Result<String, RvmError> {
@@ -1242,7 +1360,7 @@ mod tests {
                 } else {
                     socket
                         .write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<meta id=\"vscode-workbench-web-configuration\" data-settings='{\"connectionToken\":\"rvm-secret\"}'>",
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<meta id=\"vscode-workbench-web-configuration\" data-settings='{\"remoteAuthority\":\"antec\",\"connectionToken\":\"rvm-secret\"}'>",
                         )
                         .await
                         .unwrap();
@@ -1261,6 +1379,8 @@ mod tests {
             .unwrap();
         assert!(!result.html.contains("rvm-secret"));
         assert!(result.html.contains(&result.proxy_token));
+        assert!(result.html.contains("remoteAuthority"));
+        assert!(result.html.len() > "<html>bare workbench</html>".len());
         task.await.unwrap();
     }
 
