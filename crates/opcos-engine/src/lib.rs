@@ -162,7 +162,8 @@ where
                 tools: tool_definitions(),
                 settings: json!({}),
             };
-            match self.provider.stream(request, self.events.clone()).await {
+            let (provider_result, partial) = self.stream_turn(request).await;
+            match provider_result {
                 Ok(turn) => {
                     let assistant = json!({"role":"assistant","content":turn.text.clone().unwrap_or_default(),
                         "tool_calls":turn.tool_calls,"reasoning":turn.reasoning});
@@ -209,6 +210,14 @@ where
                     }
                 }
                 Err(error) => {
+                    if partial.text.is_some() || partial.reasoning.is_some() {
+                        self.append(
+                            "assistant",
+                            json!({"role":"assistant","content":partial.text.unwrap_or_default(),
+                                "reasoning":partial.reasoning,"interrupted":false}),
+                        )
+                        .await?;
+                    }
                     self.notice("error", "Provider request failed".into())
                         .await?;
                     if error.to_string().to_ascii_lowercase().contains("context") {
@@ -224,6 +233,33 @@ where
         self.notice("error", "Maximum iterations reached".into())
             .await?;
         Err(EngineError::MaxIterations)
+    }
+
+    async fn stream_turn(
+        &self,
+        request: ProviderRequest,
+    ) -> (Result<AssistantTurn, ProviderError>, PartialOutput) {
+        let (sender, mut receiver) = mpsc::channel(128);
+        let provider = self.provider.stream(request, sender);
+        tokio::pin!(provider);
+        let mut partial = PartialOutput::default();
+        loop {
+            tokio::select! {
+                result = &mut provider => return (result, partial),
+                chunk = receiver.recv() => {
+                    let Some(chunk) = chunk else { continue };
+                    if let Some(text) = chunk.text_delta.clone() {
+                        partial.text.get_or_insert_with(String::new).push_str(&text);
+                    }
+                    if let Some(reasoning) = chunk.reasoning_delta.clone() {
+                        partial.reasoning.get_or_insert_with(String::new).push_str(&reasoning);
+                    }
+                    if self.events.send(chunk).await.is_err() {
+                        return (Err(ProviderError::Protocol("stream receiver closed".into())), partial);
+                    }
+                }
+            }
+        }
     }
 
     async fn execute_tool(&self, call: &ToolCall) -> Value {
@@ -315,6 +351,12 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"run_shell","description":"Run a remote shell command.","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}),
         json!({"type":"function","function":{"name":"list_dir","description":"List a remote directory.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}),
     ]
+}
+
+#[derive(Default)]
+struct PartialOutput {
+    text: Option<String>,
+    reasoning: Option<String>,
 }
 
 #[cfg(test)]
