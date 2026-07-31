@@ -606,7 +606,7 @@ impl HttpRvmClient {
                 .get(url.clone())
                 .header(header::AUTHORIZATION, self.config.auth_header())
                 .header(header::ACCEPT, "text/html")
-                .header(header::USER_AGENT, "curl/8")
+                .header(header::USER_AGENT, "OPCOS/0.1")
                 .header("Sec-Fetch-Mode", "navigate");
             if !cookies.is_empty() {
                 request = request.header(header::COOKIE, cookies.join("; "));
@@ -695,7 +695,7 @@ impl HttpRvmClient {
             .get(url)
             .header(header::AUTHORIZATION, self.config.auth_header())
             .header(header::ACCEPT, "text/html")
-            .header(header::USER_AGENT, "curl/8")
+            .header(header::USER_AGENT, "OPCOS/0.1")
             .header("Sec-Fetch-Mode", "navigate");
         if !cookies.is_empty() {
             request = request.header(header::COOKIE, cookies.join("; "));
@@ -1401,6 +1401,7 @@ mod tests {
                 let size = socket.read(&mut request).await.unwrap();
                 let received = String::from_utf8_lossy(&request[..size]);
                 assert!(received.contains(expected));
+                assert!(received.contains("user-agent: OPCOS/0.1"));
                 if index == 0 {
                     socket
                         .write_all(
