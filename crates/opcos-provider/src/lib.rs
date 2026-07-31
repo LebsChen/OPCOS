@@ -1,9 +1,20 @@
+//! Provider-neutral model access with isolated wire adapters.
+
 use async_trait::async_trait;
+use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
+use std::fmt;
 use thiserror::Error;
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub mod anthropic;
+pub mod bedrock;
+pub mod matrix;
+pub mod openai;
+pub mod registry;
+pub mod sse;
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -11,7 +22,7 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TokenUsage {
     pub input: u64,
     pub output: u64,
@@ -19,7 +30,13 @@ pub struct TokenUsage {
     pub cache_write: u64,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+impl TokenUsage {
+    pub fn context_tokens(&self) -> u64 {
+        self.input + self.cache_read + self.cache_write
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct AssistantTurn {
     pub text: Option<String>,
     #[serde(default)]
@@ -31,27 +48,163 @@ pub struct AssistantTurn {
     pub usage: Option<TokenUsage>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct StreamChunk {
     pub text_delta: Option<String>,
     pub reasoning_delta: Option<String>,
     pub turn: Option<AssistantTurn>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct ProviderRequest {
     pub model: String,
     pub messages: Vec<Value>,
     #[serde(default)]
     pub tools: Vec<Value>,
+    #[serde(default)]
+    pub settings: Value,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Caps {
+    pub tools: bool,
+    pub vision: bool,
+    pub pdf: bool,
+    pub parallel_tool_calls: bool,
+    pub streaming: bool,
+    pub context_window: Option<u64>,
+}
+
+#[derive(Clone)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+#[derive(Clone)]
+pub struct ProviderConfig {
+    pub base_url: String,
+    pub api_key: Secret,
+    pub headers: Vec<(String, String)>,
+    pub timeout_seconds: u64,
+}
+
+impl ProviderConfig {
+    pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            api_key: Secret::new(api_key),
+            headers: Vec::new(),
+            timeout_seconds: 60,
+        }
+    }
+}
+
+impl fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("base_url", &self.base_url)
+            .field("api_key", &"[redacted]")
+            .field(
+                "headers",
+                &self
+                    .headers
+                    .iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>(),
+            )
+            .field("timeout_seconds", &self.timeout_seconds)
+            .finish()
+    }
 }
 
 #[derive(Debug, Error)]
 pub enum ProviderError {
-    #[error("provider request failed: {0}")]
-    Request(String),
+    #[error("provider request failed")]
+    Request(#[source] reqwest::Error),
+    #[error("provider returned HTTP {status}: {message}")]
+    Http { status: StatusCode, message: String },
     #[error("provider response was invalid: {0}")]
     Protocol(String),
+    #[error("provider capability is unavailable: {0}")]
+    Unsupported(String),
+}
+
+pub(crate) fn sanitize_error(value: &str) -> String {
+    let mut out = value.to_owned();
+    for marker in ["sk-", "sk_", "AIza", "Bearer "] {
+        if let Some(index) = out.find(marker) {
+            let end = out[index..]
+                .find(|character: char| {
+                    character.is_whitespace() || matches!(character, '"' | '\'')
+                })
+                .map_or(out.len(), |offset| index + offset);
+            out.replace_range(index..end, "[redacted]");
+        }
+    }
+    if out.len() > 1000 {
+        out.truncate(1000);
+    }
+    out
+}
+
+pub(crate) fn sanitize_secret(value: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        sanitize_error(value)
+    } else {
+        sanitize_error(&value.replace(secret, "[redacted]"))
+    }
+}
+
+pub(crate) fn client(config: &ProviderConfig) -> Result<Client, ProviderError> {
+    Client::builder()
+        .timeout(std::time::Duration::from_secs(config.timeout_seconds))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(ProviderError::Request)
+}
+
+pub(crate) fn apply_headers(
+    mut request: reqwest::RequestBuilder,
+    config: &ProviderConfig,
+) -> reqwest::RequestBuilder {
+    request = request.header(
+        header::AUTHORIZATION,
+        format!("Bearer {}", config.api_key.expose()),
+    );
+    for (name, value) in &config.headers {
+        request = request.header(name, value);
+    }
+    request
+}
+
+pub(crate) fn settings_object(settings: &Value) -> &serde_json::Map<String, Value> {
+    settings.as_object().unwrap_or_else(|| {
+        static EMPTY: std::sync::OnceLock<serde_json::Map<String, Value>> =
+            std::sync::OnceLock::new();
+        EMPTY.get_or_init(serde_json::Map::new)
+    })
+}
+
+pub(crate) fn tool_schema(tool: &Value) -> Value {
+    if tool.get("type").and_then(Value::as_str) == Some("function") {
+        tool.clone()
+    } else {
+        json!({"type":"function","function":tool})
+    }
 }
 
 #[async_trait]
@@ -62,5 +215,27 @@ pub trait Provider: Send + Sync {
         request: ProviderRequest,
         output: tokio::sync::mpsc::Sender<StreamChunk>,
     ) -> Result<AssistantTurn, ProviderError>;
-    fn capabilities(&self) -> Value;
+    fn capabilities(&self, model: &str) -> Caps;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secrets_never_appear_in_debug_or_errors() {
+        let key = "sk-super-secret-value";
+        let config = ProviderConfig::new("https://example.test/v1", key);
+        assert!(!format!("{config:?}").contains(key));
+        assert!(!sanitize_error(&format!("bad key {key}")).contains(key));
+    }
+
+    #[test]
+    fn canonical_types_do_not_require_wire_metadata() {
+        let turn = AssistantTurn {
+            text: Some("hello".into()),
+            ..Default::default()
+        };
+        assert!(turn.extras.is_null());
+    }
 }
