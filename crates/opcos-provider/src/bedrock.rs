@@ -376,14 +376,22 @@ fn build_converse_input(request: &ProviderRequest) -> Result<ConverseInput, Prov
     let mut system = Vec::new();
     for value in &request.messages {
         let role = value.get("role").and_then(Value::as_str).unwrap_or("user");
-        let blocks = value
-            .get("content")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                ProviderError::Protocol("Bedrock message content must be an array".into())
-            })?;
+        let blocks = match value.get("content") {
+            Some(Value::Array(blocks)) => blocks.clone(),
+            Some(Value::String(text)) => vec![json!({"type": "text", "text": text})],
+            Some(_) => {
+                return Err(ProviderError::Protocol(
+                    "Bedrock message content must be a string or array".into(),
+                ));
+            }
+            None => {
+                return Err(ProviderError::Protocol(
+                    "Bedrock message content is missing".into(),
+                ));
+            }
+        };
         if role == "system" {
-            for block in blocks {
+            for block in &blocks {
                 let text = block.as_str().or_else(|| {
                     (block.get("type").and_then(Value::as_str) == Some("text"))
                         .then(|| block.get("text").and_then(Value::as_str).unwrap_or(""))
@@ -405,7 +413,7 @@ fn build_converse_input(request: &ProviderRequest) -> Result<ConverseInput, Prov
             }
         };
         let mut builder = Message::builder().role(role);
-        for block in blocks {
+        for block in &blocks {
             let block_type = block.get("type").and_then(Value::as_str);
             let content = match block_type {
                 None => ContentBlock::Text(
@@ -772,6 +780,26 @@ mod tests {
         assert_eq!(tools.unwrap().tools().len(), 1);
         assert_eq!(inference.max_tokens(), Some(128));
         assert_eq!(inference.temperature(), Some(0.2));
+    }
+
+    #[test]
+    fn accepts_string_content_as_text_block() {
+        let string_request = ProviderRequest {
+            model: "test".into(),
+            messages: vec![json!({"role":"user","content":"hello"})],
+            ..Default::default()
+        };
+        let block_request = ProviderRequest {
+            model: "test".into(),
+            messages: vec![json!({"role":"user","content":[{"type":"text","text":"hello"}]})],
+            ..Default::default()
+        };
+        let string_input = build_converse_input(&string_request).unwrap();
+        let block_input = build_converse_input(&block_request).unwrap();
+        assert_eq!(string_input.0, block_input.0);
+        assert_eq!(string_input.1, block_input.1);
+        assert_eq!(string_input.2, block_input.2);
+        assert_eq!(string_input.3, block_input.3);
     }
 
     #[test]
