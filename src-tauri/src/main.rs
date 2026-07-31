@@ -12,6 +12,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::any,
 };
+use base64::Engine;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use opcos_assets::{
@@ -24,7 +25,8 @@ use opcos_provider::ProviderConfig;
 use opcos_provider::openai::OpenAiProvider;
 use opcos_provider::registry;
 use opcos_rvm::{
-    HttpRvmClient, IdeBootstrap, PersistentShell, RvmClient, RvmClientConfig, WsKind, WsParams,
+    ExecRequest, HttpRvmClient, IdeBootstrap, PersistentShell, RvmClient, RvmClientConfig, WsKind,
+    WsParams,
 };
 use opcos_store::{KeyringSecretStore, SecretStore, SessionStore, SqliteStore};
 use rusqlite::{Connection, params};
@@ -39,6 +41,35 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio_tungstenite::accept_async;
 
 const SECRET_SERVICE: &str = "com.opcos.desktop";
+
+fn git_branch_name(slug: &str, timestamp: i64) -> Result<String, String> {
+    let slug = slug
+        .trim()
+        .to_ascii_lowercase()
+        .replace(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-', "-")
+        .trim_matches('-')
+        .to_owned();
+    if slug.is_empty() {
+        return Err("branch slug is empty".into());
+    }
+    Ok(format!("devin/{timestamp}-{slug}"))
+}
+
+fn reject_dangerous_git(command: &str) -> Result<(), String> {
+    let lower = command.to_ascii_lowercase();
+    for forbidden in [
+        "force",
+        "reset --hard",
+        "clean -fd",
+        "commit --amend",
+        "config ",
+    ] {
+        if lower.contains(forbidden) {
+            return Err(format!("dangerous git operation is denied: {forbidden}"));
+        }
+    }
+    Ok(())
+}
 
 struct DesktopState {
     database: Mutex<Connection>,
@@ -271,6 +302,16 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                asset_id TEXT NOT NULL,
                enabled INTEGER NOT NULL,
                PRIMARY KEY(session_id,asset_id)
+             );
+             CREATE TABLE IF NOT EXISTS schedules (
+               id TEXT PRIMARY KEY,
+               name TEXT NOT NULL,
+               session_id TEXT NOT NULL,
+               playbook_id TEXT NOT NULL,
+               cron TEXT NOT NULL,
+               enabled INTEGER NOT NULL,
+               last_run TEXT,
+               last_result TEXT
              );",
         )
         .map_err(|error| error.to_string())?;
@@ -1555,6 +1596,401 @@ async fn run_blueprint(
 }
 
 #[tauri::command]
+fn git_branch_name_command(slug: String) -> Result<String, String> {
+    git_branch_name(&slug, Utc::now().timestamp())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn git_workflow(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    operation: String,
+    cwd: String,
+    slug: Option<String>,
+    files: Option<Vec<String>>,
+    message: Option<String>,
+    secret_names: Option<Vec<String>>,
+) -> Result<Value, String> {
+    let host_id = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .query_row(
+            "SELECT host_id FROM sessions WHERE id=?1",
+            [&session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| "session not found".to_owned())?;
+    let client = client_for(&state, &host_id)?.with_workspace(cwd.clone());
+    let command = match operation.as_str() {
+        "branch" => git_branch_name(
+            slug.as_deref().ok_or("branch slug is required")?,
+            Utc::now().timestamp(),
+        )
+        .map(|branch| format!("git switch -c {branch}"))?,
+        "add" => {
+            let files = files.ok_or("explicit files are required")?;
+            if files.is_empty() || files.iter().any(|path| path.trim().is_empty()) {
+                return Err("explicit files are required".into());
+            }
+            files
+                .iter()
+                .map(|path| format!("git add -- {}", shell_quote(path)))
+                .collect::<Vec<_>>()
+                .join(" && ")
+        }
+        "commit" => format!(
+            "git commit -m {}",
+            shell_quote(message.as_deref().ok_or("commit message is required")?)
+        ),
+        "push" => "git push".into(),
+        _ => return Err("unsupported git operation".into()),
+    };
+    reject_dangerous_git(&command)?;
+    let mut env = serde_json::Map::new();
+    let mut askpass_path = None;
+    if operation == "push" {
+        let names = secret_names.ok_or("GitHub secret names are required for push")?;
+        let username = names.first().ok_or("GitHub username secret is required")?;
+        let password = names.get(1).ok_or("GitHub token secret is required")?;
+        let username_value = state
+            .secrets
+            .get(&secret_key("asset-secret", username))
+            .map_err(|error| error.to_string())?
+            .ok_or("GitHub username secret is not configured")?;
+        let password_value = state
+            .secrets
+            .get(&secret_key("asset-secret", password))
+            .map_err(|error| error.to_string())?
+            .ok_or("GitHub token secret is not configured")?;
+        let askpass = format!("{cwd}\\.opcos-askpass.ps1");
+        client
+            .write(
+                &askpass,
+                "if (($args -join ' ') -match 'Username') { $env:OPCOS_GIT_USERNAME } else { $env:OPCOS_GIT_PASSWORD }",
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        env.insert("GIT_ASKPASS".into(), json!(askpass));
+        env.insert("GIT_TERMINAL_PROMPT".into(), json!("0"));
+        env.insert("OPCOS_GIT_USERNAME".into(), json!(username_value));
+        env.insert("OPCOS_GIT_PASSWORD".into(), json!(password_value));
+        askpass_path = Some(askpass);
+    }
+    let result = client
+        .exec_sync(ExecRequest {
+            command,
+            cwd: Some(cwd),
+            timeout_seconds: 120,
+            session: None,
+            env: Some(Value::Object(env)),
+        })
+        .await
+        .map_err(|error| error.to_string());
+    if let Some(path) = askpass_path {
+        let _ = client
+            .exec_sync(ExecRequest {
+                command: format!(
+                    "Remove-Item -LiteralPath '{}' -Force",
+                    path.replace('\'', "''")
+                ),
+                cwd: None,
+                timeout_seconds: 30,
+                session: None,
+                env: None,
+            })
+            .await;
+    }
+    result.map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[tauri::command]
+async fn github_pull_request(
+    state: State<'_, DesktopState>,
+    repo: String,
+    title: String,
+    head: String,
+    base: String,
+    body: String,
+    token_secret: String,
+) -> Result<Value, String> {
+    let token = state
+        .secrets
+        .get(&secret_key("asset-secret", &token_secret))
+        .map_err(|error| error.to_string())?
+        .ok_or("GitHub token is not configured")?;
+    let http = reqwest::Client::new();
+    let template_url =
+        format!("https://api.github.com/repos/{repo}/contents/.github/PULL_REQUEST_TEMPLATE.md");
+    let template = http
+        .get(template_url)
+        .header("User-Agent", "OPCOS/0.1")
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let template_text = if template.status().is_success() {
+        let value: Value = template.json().await.map_err(|error| error.to_string())?;
+        let content = value
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .replace('\n', "");
+        base64::engine::general_purpose::STANDARD
+            .decode(content)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let body = if template_text.is_empty() {
+        body
+    } else {
+        format!("{template_text}\n\n{body}")
+    };
+    if body.contains(&token)
+        || title.contains(&token)
+        || head.contains(&token)
+        || base.contains(&token)
+    {
+        return Err("GitHub credential must not appear in PR fields".into());
+    }
+    http.post(format!("https://api.github.com/repos/{repo}/pulls"))
+        .header("User-Agent", "OPCOS/0.1")
+        .bearer_auth(token)
+        .json(&json!({"title":title,"head":head,"base":base,"body":body}))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?
+        .json()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn review_snapshot(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    cwd: String,
+    base: String,
+) -> Result<Value, String> {
+    let host_id = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .query_row(
+            "SELECT host_id FROM sessions WHERE id=?1",
+            [&session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| "session not found".to_owned())?;
+    let client = client_for(&state, &host_id)?.with_workspace(cwd.clone());
+    let status = client
+        .git_status(&cwd)
+        .await
+        .map_err(|error| error.to_string())?;
+    let changes = client
+        .git_changes(&cwd, &base)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(json!({"status":status,"changes":changes}))
+}
+
+#[tauri::command]
+async fn review_file_diff(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    cwd: String,
+    path: String,
+    base: String,
+) -> Result<Value, String> {
+    let host_id = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .query_row(
+            "SELECT host_id FROM sessions WHERE id=?1",
+            [&session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| "session not found".to_owned())?;
+    client_for(&state, &host_id)?
+        .with_workspace(cwd.clone())
+        .git_file_diff(&cwd, &path, &base)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn session_worklog(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    after_id: String,
+    limit: Option<u32>,
+) -> Result<Value, String> {
+    let host_id = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .query_row(
+            "SELECT host_id FROM sessions WHERE id=?1",
+            [&session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| "session not found".to_owned())?;
+    let page = client_for(&state, &host_id)?
+        .worklog_query(&after_id, limit.unwrap_or(200))
+        .await
+        .map_err(|error| error.to_string())?;
+    let reset = !after_id.is_empty()
+        && !page.last_id.is_empty()
+        && page.last_id.parse::<u64>().ok() < after_id.parse::<u64>().ok();
+    Ok(json!({"events":page.events,"last_id":page.last_id,"window_lost":reset}))
+}
+
+#[derive(Debug, Deserialize)]
+struct ScheduleInput {
+    id: Option<String>,
+    name: String,
+    session_id: String,
+    playbook_id: String,
+    cron: String,
+    enabled: bool,
+}
+
+#[tauri::command]
+fn save_schedule(state: State<'_, DesktopState>, schedule: ScheduleInput) -> Result<Value, String> {
+    let id = schedule.id.unwrap_or_else(|| {
+        format!(
+            "schedule-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        )
+    });
+    state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .execute(
+            "INSERT OR REPLACE INTO schedules(id,name,session_id,playbook_id,cron,enabled,last_run,last_result) VALUES (?1,?2,?3,?4,?5,?6,COALESCE((SELECT last_run FROM schedules WHERE id=?1),NULL),COALESCE((SELECT last_result FROM schedules WHERE id=?1),NULL))",
+            params![id, schedule.name, schedule.session_id, schedule.playbook_id, schedule.cron, schedule.enabled],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(json!({"id":id,"enabled":schedule.enabled}))
+}
+
+#[tauri::command]
+fn list_schedules(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let mut statement = connection
+        .prepare("SELECT id,name,session_id,playbook_id,cron,enabled,last_run,last_result FROM schedules ORDER BY name")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(json!({
+                "id": row.get::<_,String>(0)?,
+                "name": row.get::<_,String>(1)?,
+                "session_id": row.get::<_,String>(2)?,
+                "playbook_id": row.get::<_,String>(3)?,
+                "cron": row.get::<_,String>(4)?,
+                "enabled": row.get::<_,i64>(5)? != 0,
+                "last_run": row.get::<_,Option<String>>(6)?,
+                "last_result": row.get::<_,Option<String>>(7)?
+            }))
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn run_schedule(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    schedule_id: String,
+) -> Result<(), String> {
+    let (session_id, playbook_id) = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .query_row(
+            "SELECT session_id,playbook_id FROM schedules WHERE id=?1 AND enabled=1",
+            [&schedule_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map_err(|_| "enabled schedule not found".to_owned())?;
+    let prompt = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .query_row(
+            "SELECT body FROM asset_records WHERE id=?1",
+            [&playbook_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| "playbook not found".to_owned())?;
+    let engine = engine_for(&app, &state, &session_id).await?;
+    engine
+        .submit_text(prompt)
+        .await
+        .map_err(engine_error_message)?;
+    state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .execute(
+            "UPDATE schedules SET last_run=?2,last_result='ok' WHERE id=?1",
+            params![schedule_id, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn session_insights(state: State<'_, DesktopState>, session_id: String) -> Result<Value, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM transcript WHERE session_id=?1",
+            [&session_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let tool_calls: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM tool_calls WHERE session_id=?1",
+            [&session_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let approval_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM audit_events WHERE session_id=?1 AND kind LIKE '%approval%'",
+            [&session_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    Ok(json!({
+        "session_id":session_id,
+        "message_count":count,
+        "tool_calls":tool_calls,
+        "approval_count":approval_count,
+        "token_usage":null
+    }))
+}
+
+#[tauri::command]
 fn save_secret_metadata(
     state: State<'_, DesktopState>,
     name: String,
@@ -1796,6 +2232,16 @@ fn main() {
             read_blueprint,
             execute_blueprint,
             run_blueprint,
+            git_branch_name_command,
+            git_workflow,
+            github_pull_request,
+            review_snapshot,
+            review_file_diff,
+            session_worklog,
+            session_insights,
+            save_schedule,
+            list_schedules,
+            run_schedule,
             save_secret_metadata,
             list_secret_metadata,
             provider_settings,
@@ -1808,4 +2254,31 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running OPCOS");
+}
+
+#[cfg(test)]
+mod m7_tests {
+    use super::*;
+
+    #[test]
+    fn branch_names_follow_devin_convention() {
+        assert_eq!(
+            git_branch_name("GitHub Workflow", 123).unwrap(),
+            "devin/123-github-workflow"
+        );
+    }
+
+    #[test]
+    fn dangerous_git_operations_are_rejected() {
+        for command in [
+            "git push --force",
+            "git reset --hard HEAD",
+            "git clean -fd",
+            "git commit --amend",
+            "git config user.name test",
+        ] {
+            assert!(reject_dangerous_git(command).is_err(), "{command}");
+        }
+        assert!(reject_dangerous_git("git add -- src/lib.rs").is_ok());
+    }
 }
