@@ -33,6 +33,12 @@ type Asset = {
   enabled: boolean;
 };
 type SecretMetadata = { name: string; scope: string; purpose: string };
+type CoordinationSnapshot = {
+  task_id: string;
+  roles: Array<{ id: string; session_id: string; state: string; sort_order: number }>;
+  tasks: Array<{ id: string; title: string; phase: string; branch?: string; pr?: string }>;
+  messages: Array<{ from: string; to: string; kind: string; msg_id: string }>;
+};
 
 async function command<T>(
   name: string,
@@ -63,6 +69,8 @@ function App() {
   const [secretMetadata, setSecretMetadata] = useState<SecretMetadata[]>([]);
   const [review, setReview] = useState<Record<string, unknown> | null>(null);
   const [worklog, setWorklog] = useState<Record<string, unknown> | null>(null);
+  const [coordTaskId, setCoordTaskId] = useState("");
+  const [coordination, setCoordination] = useState<CoordinationSnapshot | null>(null);
   const terminalHost = useRef<HTMLDivElement>(null);
   const vncHost = useRef<HTMLDivElement>(null);
 
@@ -230,6 +238,19 @@ function App() {
           sessionId: selected.id,
           afterId: "",
           limit: 200,
+        }),
+      );
+    } catch (reason) {
+      setError(String(reason));
+    }
+  };
+
+  const refreshCoordination = async () => {
+    if (!coordTaskId.trim()) return;
+    try {
+      setCoordination(
+        await command<CoordinationSnapshot>("coordination_snapshot", {
+          taskId: coordTaskId.trim(),
         }),
       );
     } catch (reason) {
@@ -484,6 +505,35 @@ function App() {
           {error && <div className="error-banner">{error}</div>}
         </main>
         <aside className="settings">
+          <h2>Coordination</h2>
+          <input
+            value={coordTaskId}
+            onChange={(event) => setCoordTaskId(event.target.value)}
+            placeholder="Coordination task ID"
+          />
+          <button onClick={() => void refreshCoordination()}>
+            Observe Leader/Workers
+          </button>
+          {coordination && (
+            <>
+              <h3>Roles</h3>
+              {coordination.roles.map((role) => (
+                <div className="asset-row" key={role.id}>
+                  <strong>{role.id}</strong>
+                  <span className="muted">{role.state}</span>
+                </div>
+              ))}
+              <h3>Board</h3>
+              {coordination.tasks.map((task) => (
+                <div className="asset-row" key={task.id}>
+                  <strong>{task.title}</strong>
+                  <span className="muted">{task.phase}</span>
+                </div>
+              ))}
+              <h3>Messages</h3>
+              <div className="muted">{coordination.messages.length} messages</div>
+            </>
+          )}
           <h2>Assets</h2>
           <button
             disabled={!selected}

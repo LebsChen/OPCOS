@@ -328,7 +328,9 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                lease_generation INTEGER NOT NULL,
                lease_until TEXT,
                require_acceptance INTEGER NOT NULL,
-               verified_pr_url TEXT
+               verified_pr_url TEXT,
+               branch TEXT,
+               pr TEXT
              );",
         )
         .map_err(|error| error.to_string())?;
@@ -1939,10 +1941,41 @@ async fn coordination_set_role_state(
     Ok(json!({"task_id":task_id,"role_id":role_id,"state":state_name}))
 }
 
+#[tauri::command]
+async fn coordination_snapshot(
+    state: State<'_, DesktopState>,
+    task_id: String,
+) -> Result<Value, String> {
+    let runtimes = state.coordination.lock().await;
+    let runtime = runtimes
+        .get(&task_id)
+        .ok_or_else(|| "coordination task is not started".to_owned())?;
+    let roles = runtime.roles();
+    let messages = runtime.messages();
+    let tasks = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let mut statement = connection
+            .prepare("SELECT id FROM coord_tasks ORDER BY id")
+            .map_err(|error| error.to_string())?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        ids.into_iter()
+            .filter_map(|id| load_coord_task(&connection, &id).ok())
+            .collect::<Vec<_>>()
+    };
+    Ok(json!({"task_id":task_id,"roles":roles,"tasks":tasks,"messages":messages}))
+}
+
 fn load_coord_task(connection: &Connection, id: &str) -> Result<BoardTask, String> {
     connection
         .query_row(
-            "SELECT id,title,phase,assignee,lease_generation,lease_until,require_acceptance,verified_pr_url FROM coord_tasks WHERE id=?1",
+            "SELECT id,title,phase,assignee,lease_generation,lease_until,require_acceptance,verified_pr_url,branch,pr FROM coord_tasks WHERE id=?1",
             [id],
             |row| {
                 let phase: String = row.get(2)?;
@@ -1957,6 +1990,8 @@ fn load_coord_task(connection: &Connection, id: &str) -> Result<BoardTask, Strin
                     lease_until: lease_until.and_then(|value| value.parse().ok()),
                     require_acceptance: row.get::<_, i64>(6)? != 0,
                     verified_pr_url: row.get(7)?,
+                    branch: row.get(8)?,
+                    pr: row.get(9)?,
                 })
             },
         )
@@ -1970,7 +2005,7 @@ fn save_coord_task(connection: &Connection, task: &BoardTask) -> Result<(), Stri
         .to_owned();
     connection
         .execute(
-            "INSERT OR REPLACE INTO coord_tasks(id,title,phase,assignee,lease_generation,lease_until,require_acceptance,verified_pr_url) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            "INSERT OR REPLACE INTO coord_tasks(id,title,phase,assignee,lease_generation,lease_until,require_acceptance,verified_pr_url,branch,pr) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 task.id,
                 task.title,
@@ -1980,6 +2015,8 @@ fn save_coord_task(connection: &Connection, task: &BoardTask) -> Result<(), Stri
                 task.lease_until.map(|value| value.to_rfc3339()),
                 i64::from(task.require_acceptance),
                 task.verified_pr_url,
+                task.branch,
+                task.pr,
             ],
         )
         .map_err(|error| error.to_string())?;
@@ -1992,6 +2029,8 @@ fn coordination_create_task(
     id: String,
     title: String,
     require_acceptance: bool,
+    branch: Option<String>,
+    pr: Option<String>,
 ) -> Result<Value, String> {
     let task = BoardTask {
         id,
@@ -2002,6 +2041,8 @@ fn coordination_create_task(
         lease_until: None,
         require_acceptance,
         verified_pr_url: None,
+        branch,
+        pr,
     };
     let connection = state
         .database
@@ -2518,6 +2559,7 @@ fn main() {
             coordination_start,
             coordination_message,
             coordination_set_role_state,
+            coordination_snapshot,
             coordination_create_task,
             coordination_claim_task,
             coordination_renew_task,

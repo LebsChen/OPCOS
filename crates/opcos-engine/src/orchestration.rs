@@ -84,6 +84,8 @@ pub enum CoordinationError {
     AwaitingAcceptance,
     #[error("coordination acceptance requires a verified pull request")]
     AcceptanceRequiresPullRequest,
+    #[error("serial dispatch conflict with task {0}")]
+    SerialConflict(String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -105,6 +107,46 @@ pub struct BoardTask {
     pub lease_until: Option<DateTime<Utc>>,
     pub require_acceptance: bool,
     pub verified_pr_url: Option<String>,
+    pub branch: Option<String>,
+    pub pr: Option<String>,
+}
+
+pub struct Board {
+    tasks: HashMap<String, BoardTask>,
+}
+
+impl Default for Board {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Board {
+    pub fn new() -> Self {
+        Self {
+            tasks: HashMap::new(),
+        }
+    }
+
+    pub fn insert(&mut self, task: BoardTask) {
+        self.tasks.insert(task.id.clone(), task);
+    }
+
+    pub fn dispatch(&self, task_id: &str) -> Result<(), CoordinationError> {
+        let task = self
+            .tasks
+            .get(task_id)
+            .ok_or(CoordinationError::NotClaimable)?;
+        if let Some(other) = self.tasks.values().find(|other| {
+            other.id != task.id
+                && !matches!(other.phase, BoardPhase::Done)
+                && ((task.branch.is_some() && task.branch == other.branch)
+                    || (task.pr.is_some() && task.pr == other.pr))
+        }) {
+            return Err(CoordinationError::SerialConflict(other.id.clone()));
+        }
+        Ok(())
+    }
 }
 
 impl BoardTask {
@@ -175,6 +217,7 @@ pub struct CoordinationRuntime {
     message_ids: HashSet<String>,
     minute_messages: VecDeque<DateTime<Utc>>,
     task_messages: usize,
+    messages: Vec<Envelope>,
 }
 
 impl CoordinationRuntime {
@@ -190,6 +233,7 @@ impl CoordinationRuntime {
             message_ids: HashSet::new(),
             minute_messages: VecDeque::new(),
             task_messages: 0,
+            messages: Vec::new(),
         })
     }
 
@@ -244,6 +288,7 @@ impl CoordinationRuntime {
         }
         self.minute_messages.push_back(now);
         self.task_messages += 1;
+        self.messages.push(envelope.clone());
         Ok(())
     }
 
@@ -261,6 +306,32 @@ impl CoordinationRuntime {
 
     pub fn role(&self, role_id: &str) -> Option<&Role> {
         self.roles.get(role_id)
+    }
+
+    pub fn roles(&self) -> Vec<Role> {
+        let mut roles = self.roles.values().cloned().collect::<Vec<_>>();
+        roles.sort_by_key(|role| role.sort_order);
+        roles
+    }
+
+    pub fn messages(&self) -> &[Envelope] {
+        &self.messages
+    }
+
+    pub fn pause(&mut self) {
+        for role in self.roles.values_mut() {
+            role.state = if role.sort_order == 0 {
+                RoleState::Paused
+            } else {
+                RoleState::Sleep
+            };
+        }
+    }
+
+    pub fn resume(&mut self) {
+        for role in self.roles.values_mut() {
+            role.state = RoleState::Active;
+        }
     }
 }
 
@@ -371,6 +442,8 @@ mod tests {
             lease_until: None,
             require_acceptance: true,
             verified_pr_url: None,
+            branch: None,
+            pr: None,
         };
         task.claim("worker-a", now).unwrap();
         assert_eq!(
@@ -396,5 +469,55 @@ mod tests {
             .set_role_state("worker-a", RoleState::Sleep)
             .unwrap();
         assert_eq!(runtime.role("worker-a").unwrap().state, RoleState::Sleep);
+    }
+
+    #[test]
+    fn shared_branch_is_serial_but_independent_branches_parallel() {
+        let mut board = Board::new();
+        board.insert(BoardTask {
+            id: "a".into(),
+            title: "a".into(),
+            phase: BoardPhase::Claimed,
+            assignee: Some("w".into()),
+            lease_generation: 1,
+            lease_until: None,
+            require_acceptance: false,
+            verified_pr_url: None,
+            branch: Some("feature/a".into()),
+            pr: Some("pr-1".into()),
+        });
+        board.insert(BoardTask {
+            id: "b".into(),
+            title: "b".into(),
+            phase: BoardPhase::Open,
+            assignee: None,
+            lease_generation: 0,
+            lease_until: None,
+            require_acceptance: false,
+            verified_pr_url: None,
+            branch: Some("feature/a".into()),
+            pr: Some("pr-1".into()),
+        });
+        assert!(matches!(
+            board.dispatch("b"),
+            Err(CoordinationError::SerialConflict(_))
+        ));
+        board.tasks.get_mut("b").unwrap().branch = Some("feature/b".into());
+        board.tasks.get_mut("b").unwrap().pr = Some("pr-2".into());
+        assert!(board.dispatch("b").is_ok());
+    }
+
+    #[test]
+    fn pause_stops_leader_first_and_resume_keeps_session_ids() {
+        let mut runtime = runtime();
+        let leader_session = runtime.role("leader").unwrap().session_id.clone();
+        let worker_session = runtime.role("worker-a").unwrap().session_id.clone();
+        runtime.pause();
+        assert_eq!(runtime.role("leader").unwrap().state, RoleState::Paused);
+        assert_eq!(runtime.role("worker-a").unwrap().state, RoleState::Sleep);
+        runtime.resume();
+        assert_eq!(runtime.role("leader").unwrap().session_id, leader_session);
+        assert_eq!(runtime.role("worker-a").unwrap().session_id, worker_session);
+        assert_eq!(runtime.role("worker-a").unwrap().state, RoleState::Active);
     }
 }
