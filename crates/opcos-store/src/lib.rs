@@ -67,6 +67,22 @@ pub struct ToolCallRecord {
     pub result: Option<serde_json::Value>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct PendingRecord {
+    pub session_id: String,
+    pub call_id: String,
+    pub tool: String,
+    pub arguments: serde_json::Value,
+    pub state: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct CompactionRecord {
+    pub session_id: String,
+    pub summary: String,
+    pub retained_from: i64,
+}
+
 pub trait SessionStore {
     fn append_message(&self, message: &StoredMessage) -> Result<(), StoreError>;
     fn load_messages(&self, session_id: &str) -> Result<Vec<StoredMessage>, StoreError>;
@@ -80,6 +96,11 @@ pub trait SessionStore {
         call_id: &str,
         result: &serde_json::Value,
     ) -> Result<(), StoreError>;
+    fn save_pending(&self, pending: &PendingRecord) -> Result<(), StoreError>;
+    fn load_pending(&self, session_id: &str) -> Result<Vec<PendingRecord>, StoreError>;
+    fn delete_pending(&self, session_id: &str, call_id: &str) -> Result<(), StoreError>;
+    fn save_compaction(&self, state: &CompactionRecord) -> Result<(), StoreError>;
+    fn load_compaction(&self, session_id: &str) -> Result<Option<CompactionRecord>, StoreError>;
 }
 
 pub trait SecretStore: Send + Sync {
@@ -216,6 +237,14 @@ impl SqliteStore {
              CREATE TABLE IF NOT EXISTS compaction_state (
                session_id TEXT PRIMARY KEY,
                state TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS pending (
+               session_id TEXT NOT NULL,
+               call_id TEXT NOT NULL,
+               tool TEXT NOT NULL,
+               arguments TEXT NOT NULL,
+               state TEXT NOT NULL,
+               PRIMARY KEY(session_id, call_id)
              );",
             )?;
         if self
@@ -339,6 +368,75 @@ impl SessionStore for SqliteStore {
         )?;
         Ok(())
     }
+
+    fn save_pending(&self, pending: &PendingRecord) -> Result<(), StoreError> {
+        self.connection.lock().expect("sqlite mutex poisoned").execute(
+            "INSERT OR REPLACE INTO pending(session_id,call_id,tool,arguments,state) VALUES (?1,?2,?3,?4,?5)",
+            params![pending.session_id, pending.call_id, pending.tool,
+                serde_json::to_string(&pending.arguments)?, pending.state],
+        )?;
+        Ok(())
+    }
+
+    fn load_pending(&self, session_id: &str) -> Result<Vec<PendingRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT session_id,call_id,tool,arguments,state FROM pending WHERE session_id=?1 ORDER BY call_id",
+        )?;
+        let rows = statement.query_map([session_id], |row| {
+            let arguments: String = row.get(3)?;
+            Ok(PendingRecord {
+                session_id: row.get(0)?,
+                call_id: row.get(1)?,
+                tool: row.get(2)?,
+                arguments: serde_json::from_str(&arguments).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                state: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn delete_pending(&self, session_id: &str, call_id: &str) -> Result<(), StoreError> {
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "DELETE FROM pending WHERE session_id=?1 AND call_id=?2",
+                params![session_id, call_id],
+            )?;
+        Ok(())
+    }
+
+    fn save_compaction(&self, state: &CompactionRecord) -> Result<(), StoreError> {
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "INSERT OR REPLACE INTO compaction_state(session_id,state) VALUES (?1,?2)",
+                params![state.session_id, serde_json::to_string(state)?],
+            )?;
+        Ok(())
+    }
+
+    fn load_compaction(&self, session_id: &str) -> Result<Option<CompactionRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let result = connection.query_row(
+            "SELECT state FROM compaction_state WHERE session_id=?1",
+            [session_id],
+            |row| row.get::<_, String>(0),
+        );
+        match result {
+            Ok(value) => Ok(Some(serde_json::from_str(&value)?)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -365,5 +463,32 @@ mod tests {
             updated_at: Utc::now(),
         };
         store.save_session(&session).unwrap();
+    }
+
+    #[test]
+    fn concurrent_message_writes_use_short_sqlite_critical_sections() {
+        use std::sync::Arc;
+        use std::thread;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let handles = (0..8)
+            .map(|sequence| {
+                let store = store.clone();
+                thread::spawn(move || {
+                    store
+                        .append_message(&StoredMessage {
+                            session_id: "concurrent".into(),
+                            sequence,
+                            role: "user".into(),
+                            content: serde_json::json!({"sequence":sequence}),
+                            display_only: false,
+                        })
+                        .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(store.load_messages("concurrent").unwrap().len(), 8);
     }
 }

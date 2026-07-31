@@ -3,7 +3,7 @@ use opcos_policy::{Decision, PermissionMode, ToolRisk, decide};
 use opcos_provider::{
     AssistantTurn, Caps, Provider, ProviderError, ProviderRequest, StreamChunk, ToolCall,
 };
-use opcos_store::{NoticeRecord, SessionStore, StoredMessage};
+use opcos_store::{CompactionRecord, NoticeRecord, PendingRecord, SessionStore, StoredMessage};
 use serde_json::{Value, json};
 use std::sync::{
     Arc,
@@ -22,6 +22,8 @@ pub enum EngineError {
     Interrupted,
     #[error("maximum iterations reached")]
     MaxIterations,
+    #[error("approval pending for tool call {0}")]
+    ApprovalPending(String),
 }
 
 #[async_trait]
@@ -29,11 +31,30 @@ pub trait ToolExecutor: Send + Sync {
     async fn execute(&self, name: &str, arguments: Value) -> Result<Value, String>;
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalRequest {
+    pub session_id: String,
+    pub call_id: String,
+    pub tool: String,
+    pub arguments: Value,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalOutcome {
+    Approve,
+    Deny,
+}
+
+#[async_trait]
+pub trait ApprovalSurface: Send + Sync {
+    async fn request(&self, request: ApprovalRequest) -> ApprovalOutcome;
+}
+
 #[async_trait]
 pub trait AgentEngine: Send + Sync {
     async fn submit_turn(&self, request: ProviderRequest) -> Result<AssistantTurn, EngineError>;
     fn interrupt(&self);
-    fn resume_pending(&self);
+    async fn resume_pending(&self) -> Result<Option<AssistantTurn>, EngineError>;
     fn events(&self) -> mpsc::Receiver<StreamChunk>;
 }
 
@@ -68,11 +89,17 @@ where
         model: impl Into<String>,
     ) -> Self {
         let (events, receiver) = mpsc::channel(256);
+        let session_id = session_id.into();
+        let initial_sequence = store
+            .load_messages(&session_id)
+            .ok()
+            .and_then(|messages| messages.into_iter().map(|message| message.sequence).max())
+            .unwrap_or(0);
         Self {
             provider,
             store,
             executor,
-            session_id: session_id.into(),
+            session_id,
             workspace: workspace.into(),
             mode,
             model: Mutex::new(model.into()),
@@ -80,7 +107,7 @@ where
             steering: Mutex::new(Vec::new()),
             events,
             receiver: Mutex::new(Some(receiver)),
-            sequence: Mutex::new(0),
+            sequence: Mutex::new(initial_sequence),
         }
     }
 
@@ -128,6 +155,35 @@ where
         self.steering.lock().await.push(text.into());
     }
 
+    pub async fn resolve_approval(
+        &self,
+        call_id: &str,
+        outcome: ApprovalOutcome,
+    ) -> Result<AssistantTurn, EngineError> {
+        let pending = self
+            .store
+            .load_pending(&self.session_id)
+            .map_err(|error| EngineError::Store(error.to_string()))?
+            .into_iter()
+            .find(|pending| pending.call_id == call_id)
+            .ok_or_else(|| EngineError::Store("approval request not found".into()))?;
+        let result = match outcome {
+            ApprovalOutcome::Approve => self
+                .executor
+                .execute(&pending.tool, pending.arguments)
+                .await
+                .unwrap_or_else(|error| json!({"error": error})),
+            ApprovalOutcome::Deny => json!({"error":"tool call denied by user"}),
+        };
+        let value = json!({"role":"tool","content":[{"type":"tool_result",
+            "tool_use_id":pending.call_id,"content":[{"type":"text","text":result.to_string()}]}]});
+        self.append("tool", value).await?;
+        self.store
+            .delete_pending(&self.session_id, call_id)
+            .map_err(|error| EngineError::Store(error.to_string()))?;
+        self.run_loop(self.provider_messages()?).await
+    }
+
     pub async fn change_model(&self, model: impl Into<String>) -> Result<(), EngineError> {
         let model = model.into();
         *self.model.lock().await = model.clone();
@@ -156,6 +212,9 @@ where
                     .await?;
                 return Err(EngineError::Interrupted);
             }
+            if messages.len() > 8 {
+                messages = self.compact_context(messages).await?;
+            }
             let request = ProviderRequest {
                 model: self.model.lock().await.clone(),
                 messages: messages.clone(),
@@ -182,7 +241,8 @@ where
                             messages.push(value);
                         }
                     } else {
-                        for call in &turn.tool_calls {
+                        let results = self.execute_tools(&turn.tool_calls).await?;
+                        for (call, result) in turn.tool_calls.iter().zip(results) {
                             self.store
                                 .append_tool_call(&opcos_store::ToolCallRecord {
                                     session_id: self.session_id.clone(),
@@ -193,7 +253,6 @@ where
                                     result: None,
                                 })
                                 .map_err(|error| EngineError::Store(error.to_string()))?;
-                            let result = self.execute_tool(call).await;
                             let value = json!({"role":"tool","content":[{"type":"tool_result",
                                 "tool_use_id":call.id,"content":[{"type":"text","text":result.to_string()}]}]});
                             self.append("tool", value.clone()).await?;
@@ -218,12 +277,15 @@ where
                         )
                         .await?;
                     }
+                    if error.to_string() == "provider response was invalid: interrupted" {
+                        self.notice("interrupted", "Turn interrupted".into())
+                            .await?;
+                        return Err(EngineError::Interrupted);
+                    }
                     self.notice("error", "Provider request failed".into())
                         .await?;
                     if error.to_string().to_ascii_lowercase().contains("context") {
-                        self.notice("compacted", "Context compacted before retry".into())
-                            .await?;
-                        messages = self.provider_messages()?;
+                        messages = self.compact_context(messages).await?;
                         continue;
                     }
                     return Err(error.into());
@@ -248,6 +310,9 @@ where
                 result = &mut provider => return (result, partial),
                 chunk = receiver.recv() => {
                     let Some(chunk) = chunk else { continue };
+                    if self.interrupted.load(Ordering::SeqCst) {
+                        return (Err(ProviderError::Protocol("interrupted".into())), partial);
+                    }
                     if let Some(text) = chunk.text_delta.clone() {
                         partial.text.get_or_insert_with(String::new).push_str(&text);
                     }
@@ -258,26 +323,81 @@ where
                         return (Err(ProviderError::Protocol("stream receiver closed".into())), partial);
                     }
                 }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {
+                    if self.interrupted.load(Ordering::SeqCst) {
+                        return (Err(ProviderError::Protocol("interrupted".into())), partial);
+                    }
+                }
             }
         }
     }
 
-    async fn execute_tool(&self, call: &ToolCall) -> Value {
-        let risk = match call.name.as_str() {
-            "read_file" | "list_dir" | "git_status" | "git_diff" | "git_log" => ToolRisk::Read,
-            "write_file" | "edit" => ToolRisk::Write,
-            "run_shell" => ToolRisk::Execute,
-            _ => ToolRisk::External,
-        };
-        match decide(self.mode, risk, false, &[], &call.name) {
-            Decision::Allow => self
-                .executor
-                .execute(&call.name, call.arguments.clone())
-                .await
-                .unwrap_or_else(|error| json!({"error":error})),
-            Decision::Deny => json!({"error":"tool call denied by policy"}),
-            Decision::NeedsUser => json!({"error":"tool call requires user approval"}),
+    async fn execute_tools(&self, calls: &[ToolCall]) -> Result<Vec<Value>, EngineError> {
+        let mut results: Vec<Option<Value>> = (0..calls.len()).map(|_| None).collect();
+        let mut readonly = Vec::new();
+        for (index, call) in calls.iter().enumerate() {
+            if self.interrupted.load(Ordering::SeqCst) {
+                results[index] = Some(json!({"error":"tool call interrupted"}));
+                continue;
+            }
+            if matches!(call.name.as_str(), "propose_plan" | "ask_user") {
+                self.store
+                    .save_pending(&PendingRecord {
+                        session_id: self.session_id.clone(),
+                        call_id: call.id.clone(),
+                        tool: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                        state: call.name.clone(),
+                    })
+                    .map_err(|error| EngineError::Store(error.to_string()))?;
+                return Err(EngineError::ApprovalPending(call.id.clone()));
+            }
+            let risk = tool_risk(&call.name);
+            match decide(self.mode, risk, false, &[], &call.name) {
+                Decision::Allow
+                    if matches!(risk, ToolRisk::Read | ToolRisk::Search | ToolRisk::GitRead) =>
+                {
+                    readonly.push((index, call));
+                }
+                Decision::Allow => {
+                    results[index] = Some(
+                        self.executor
+                            .execute(&call.name, call.arguments.clone())
+                            .await
+                            .unwrap_or_else(|error| json!({"error":error})),
+                    );
+                }
+                Decision::Deny => {
+                    results[index] = Some(json!({"error":"tool call denied by policy"}))
+                }
+                Decision::NeedsUser => {
+                    self.store
+                        .save_pending(&PendingRecord {
+                            session_id: self.session_id.clone(),
+                            call_id: call.id.clone(),
+                            tool: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                            state: "pending".into(),
+                        })
+                        .map_err(|error| EngineError::Store(error.to_string()))?;
+                    return Err(EngineError::ApprovalPending(call.id.clone()));
+                }
+            }
         }
+        let readonly_results =
+            futures_util::future::join_all(readonly.into_iter().map(|(index, call)| async move {
+                let result = self
+                    .executor
+                    .execute(&call.name, call.arguments.clone())
+                    .await
+                    .unwrap_or_else(|error| json!({"error":error}));
+                (index, result)
+            }))
+            .await;
+        for (index, result) in readonly_results {
+            results[index] = Some(result);
+        }
+        Ok(results.into_iter().map(Option::unwrap).collect())
     }
 
     fn provider_messages(&self) -> Result<Vec<Value>, EngineError> {
@@ -288,9 +408,68 @@ where
                 items
                     .into_iter()
                     .filter(|item| !item.display_only && item.role != "notice")
-                    .map(|item| item.content)
+                    .map(|item| {
+                        let mut content = item.content;
+                        let model = self.model.try_lock().ok();
+                        if !model
+                            .as_deref()
+                            .map(|model| self.provider.capabilities(model).vision)
+                            .unwrap_or(true)
+                        {
+                            downgrade_images(&mut content);
+                        }
+                        content
+                    })
                     .collect()
             })
+    }
+
+    async fn compact_context(&self, messages: Vec<Value>) -> Result<Vec<Value>, EngineError> {
+        let retained = messages.into_iter().rev().take(6).collect::<Vec<_>>();
+        let retained = retained.into_iter().rev().collect::<Vec<_>>();
+        let mut valid = Vec::new();
+        let mut pending_ids = std::collections::HashSet::new();
+        for message in &retained {
+            if message.get("role").and_then(Value::as_str) == Some("assistant") {
+                pending_ids.extend(
+                    message
+                        .get("tool_calls")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|call| {
+                            call.get("id").and_then(Value::as_str).map(str::to_owned)
+                        }),
+                );
+            }
+            if message.get("role").and_then(Value::as_str) == Some("tool")
+                && let Some(id) = message
+                    .pointer("/content/0/tool_use_id")
+                    .and_then(Value::as_str)
+            {
+                pending_ids.remove(id);
+            }
+            valid.push(message.clone());
+        }
+        if !pending_ids.is_empty() {
+            valid.retain(|message| {
+                !(message.get("role").and_then(Value::as_str) == Some("assistant")
+                    && message.get("tool_calls").is_some())
+            });
+        }
+        let summary = json!({"role":"user","content":[{"type":"text","text":"[Compacted history: earlier messages were summarized and remain durable in the session store.]"}]});
+        valid.insert(0, summary);
+        self.store
+            .save_compaction(&CompactionRecord {
+                session_id: self.session_id.clone(),
+                summary: "Earlier messages compacted; recent complete tool exchanges retained."
+                    .into(),
+                retained_from: valid.len() as i64,
+            })
+            .map_err(|error| EngineError::Store(error.to_string()))?;
+        self.notice("compacted", "Earlier context compacted".into())
+            .await?;
+        Ok(valid)
     }
 
     async fn append(&self, role: &str, content: Value) -> Result<(), EngineError> {
@@ -321,6 +500,15 @@ where
     }
 }
 
+fn tool_risk(name: &str) -> ToolRisk {
+    match name {
+        "read_file" | "list_dir" | "git_status" | "git_diff" | "git_log" => ToolRisk::Read,
+        "write_file" | "edit" => ToolRisk::Write,
+        "run_shell" => ToolRisk::Execute,
+        _ => ToolRisk::External,
+    }
+}
+
 #[async_trait]
 impl<P, S, E> AgentEngine for TurnEngine<P, S, E>
 where
@@ -334,7 +522,9 @@ where
     fn interrupt(&self) {
         self.interrupt();
     }
-    fn resume_pending(&self) {}
+    async fn resume_pending(&self) -> Result<Option<AssistantTurn>, EngineError> {
+        self.resume_pending_turn().await
+    }
     fn events(&self) -> mpsc::Receiver<StreamChunk> {
         self.receiver
             .try_lock()
@@ -350,7 +540,26 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"write_file","description":"Write a remote file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
         json!({"type":"function","function":{"name":"run_shell","description":"Run a remote shell command.","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}),
         json!({"type":"function","function":{"name":"list_dir","description":"List a remote directory.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}),
+        json!({"type":"function","function":{"name":"propose_plan","description":"Propose a plan and wait for approval.","parameters":{"type":"object","properties":{"plan":{"type":"string"}},"required":["plan"]}}}),
+        json!({"type":"function","function":{"name":"ask_user","description":"Ask the user a question and wait for an answer.","parameters":{"type":"object","properties":{"question":{"type":"string"}},"required":["question"]}}}),
     ]
+}
+
+fn downgrade_images(value: &mut Value) {
+    match value {
+        Value::Array(values) => values.iter_mut().for_each(downgrade_images),
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("image") {
+                *value = json!({
+                    "type":"text",
+                    "text":"[Image omitted: the selected model does not support vision.]"
+                });
+            } else {
+                object.values_mut().for_each(downgrade_images);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[derive(Default)]
@@ -413,17 +622,471 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct ApprovalProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for ApprovalProvider {
+        async fn complete(&self, _: ProviderRequest) -> Result<AssistantTurn, ProviderError> {
+            unreachable!()
+        }
+
+        async fn stream(
+            &self,
+            _: ProviderRequest,
+            _: mpsc::Sender<StreamChunk>,
+        ) -> Result<AssistantTurn, ProviderError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(AssistantTurn {
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".into(),
+                        name: "write_file".into(),
+                        arguments: json!({"path":"x","content":"x"}),
+                    }],
+                    ..Default::default()
+                })
+            } else {
+                Ok(AssistantTurn {
+                    text: Some("continued".into()),
+                    ..Default::default()
+                })
+            }
+        }
+
+        fn capabilities(&self, _: &str) -> Caps {
+            Caps::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_survives_restart_and_deny_writes_tool_result() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let provider = ApprovalProvider {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let first = TurnEngine::new(
+            provider.clone(),
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Interactive,
+            "fake",
+        );
+        assert!(matches!(
+            first.submit_text("write").await,
+            Err(EngineError::ApprovalPending(call_id)) if call_id == "call-1"
+        ));
+        assert_eq!(store.load_pending("s").unwrap().len(), 1);
+
+        let restarted = TurnEngine::new(
+            provider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Interactive,
+            "fake",
+        );
+        let turn = restarted
+            .resolve_approval("call-1", ApprovalOutcome::Deny)
+            .await
+            .unwrap();
+        assert_eq!(turn.text.as_deref(), Some("continued"));
+        assert!(store.load_pending("s").unwrap().is_empty());
+        let messages = store.load_messages("s").unwrap();
+        assert!(messages.iter().any(|message| {
+            message.role == "tool" && message.content.to_string().contains("denied by user")
+        }));
+    }
+
+    #[tokio::test]
+    async fn plan_and_ask_user_are_durable_pending_turns() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let provider = ApprovalProvider {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let engine = TurnEngine::new(
+            provider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let call = ToolCall {
+            id: "plan-1".into(),
+            name: "propose_plan".into(),
+            arguments: json!({"plan":"inspect"}),
+        };
+        let pending = engine.execute_tools(&[call]).await;
+        assert!(matches!(pending, Err(EngineError::ApprovalPending(id)) if id == "plan-1"));
+        assert_eq!(store.load_pending("s").unwrap()[0].state, "propose_plan");
+    }
+
+    #[test]
+    fn vision_content_is_explicitly_downgraded() {
+        let mut value = json!({"type":"image","source":{"data":"opaque"}});
+        downgrade_images(&mut value);
+        assert_eq!(
+            value,
+            json!({"type":"text","text":"[Image omitted: the selected model does not support vision.]"})
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_persists_state_and_keeps_complete_tool_pairs() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let mut messages = (0..10)
+            .map(|index| json!({"role":"user","content":format!("message-{index}")}))
+            .collect::<Vec<_>>();
+        messages.push(json!({"role":"assistant","tool_calls":[{"id":"orphan","name":"read_file","arguments":{}}]}));
+        let compacted = engine.compact_context(messages).await.unwrap();
+        assert!(compacted.iter().all(|message| {
+            message.get("tool_calls").is_none()
+                || message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_none_or(|calls| calls.is_empty())
+        }));
+        assert!(store.load_compaction("s").unwrap().is_some());
+    }
+
+    struct TimingTools {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for TimingTools {
+        async fn execute(&self, name: &str, _: Value) -> Result<Value, String> {
+            self.events.lock().await.push(format!("start:{name}"));
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            self.events.lock().await.push(format!("end:{name}"));
+            Ok(json!(name))
+        }
+    }
+
+    #[tokio::test]
+    async fn read_tools_overlap_but_write_tools_are_serial() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(TimingTools {
+                events: events.clone(),
+            }),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let reads = vec![
+            ToolCall {
+                id: "r1".into(),
+                name: "read_file".into(),
+                arguments: json!({}),
+            },
+            ToolCall {
+                id: "r2".into(),
+                name: "list_dir".into(),
+                arguments: json!({}),
+            },
+        ];
+        engine.execute_tools(&reads).await.unwrap();
+        let read_events = events.lock().await.clone();
+        assert!(
+            read_events
+                .iter()
+                .position(|item| item == "start:read_file")
+                .unwrap()
+                < read_events
+                    .iter()
+                    .position(|item| item == "end:read_file")
+                    .unwrap()
+        );
+        assert!(
+            read_events
+                .iter()
+                .position(|item| item == "start:list_dir")
+                .unwrap()
+                < read_events
+                    .iter()
+                    .position(|item| item == "end:read_file")
+                    .unwrap()
+        );
+
+        events.lock().await.clear();
+        let writes = vec![
+            ToolCall {
+                id: "w1".into(),
+                name: "write_file".into(),
+                arguments: json!({}),
+            },
+            ToolCall {
+                id: "w2".into(),
+                name: "run_shell".into(),
+                arguments: json!({}),
+            },
+        ];
+        engine.execute_tools(&writes).await.unwrap();
+        let write_events = events.lock().await.clone();
+        assert!(
+            write_events
+                .iter()
+                .position(|item| item == "end:write_file")
+                .unwrap()
+                < write_events
+                    .iter()
+                    .position(|item| item == "start:run_shell")
+                    .unwrap()
+        );
+    }
+
+    #[derive(Clone)]
+    struct LoopProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for LoopProvider {
+        async fn complete(&self, _: ProviderRequest) -> Result<AssistantTurn, ProviderError> {
+            unreachable!()
+        }
+        async fn stream(
+            &self,
+            _: ProviderRequest,
+            _: mpsc::Sender<StreamChunk>,
+        ) -> Result<AssistantTurn, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(AssistantTurn {
+                tool_calls: vec![ToolCall {
+                    id: "loop".into(),
+                    name: "read_file".into(),
+                    arguments: json!({}),
+                }],
+                ..Default::default()
+            })
+        }
+        fn capabilities(&self, _: &str) -> Caps {
+            Caps::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_stops_at_exactly_twelve_iterations() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = TurnEngine::new(
+            LoopProvider {
+                calls: calls.clone(),
+            },
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        assert!(matches!(
+            engine.submit_text("loop").await,
+            Err(EngineError::MaxIterations)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 12);
+    }
+
+    #[derive(Clone)]
+    struct OverflowProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for OverflowProvider {
+        async fn complete(&self, _: ProviderRequest) -> Result<AssistantTurn, ProviderError> {
+            unreachable!()
+        }
+        async fn stream(
+            &self,
+            _: ProviderRequest,
+            _: mpsc::Sender<StreamChunk>,
+        ) -> Result<AssistantTurn, ProviderError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(ProviderError::Protocol("context window exceeded".into()))
+            } else {
+                Ok(AssistantTurn {
+                    text: Some("retried".into()),
+                    ..Default::default()
+                })
+            }
+        }
+        fn capabilities(&self, _: &str) -> Caps {
+            Caps::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn context_overflow_compacts_and_retries_same_turn() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        for index in 0..10 {
+            store
+                .append_message(&StoredMessage {
+                    session_id: "s".into(),
+                    sequence: index,
+                    role: "user".into(),
+                    content: json!({"role":"user","content":format!("old-{index}")}),
+                    display_only: false,
+                })
+                .unwrap();
+        }
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = TurnEngine::new(
+            OverflowProvider {
+                calls: calls.clone(),
+            },
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        assert_eq!(
+            engine.retry().await.unwrap().text.as_deref(),
+            Some("retried")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(store.load_compaction("s").unwrap().is_some());
+    }
+
+    struct InterruptProvider {
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Provider for InterruptProvider {
+        async fn complete(&self, _: ProviderRequest) -> Result<AssistantTurn, ProviderError> {
+            unreachable!()
+        }
+        async fn stream(
+            &self,
+            _: ProviderRequest,
+            output: mpsc::Sender<StreamChunk>,
+        ) -> Result<AssistantTurn, ProviderError> {
+            output
+                .send(StreamChunk {
+                    text_delta: Some("partial".into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            self.started.notify_one();
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            Ok(AssistantTurn {
+                text: Some("done".into()),
+                ..Default::default()
+            })
+        }
+        fn capabilities(&self, _: &str) -> Caps {
+            Caps::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupt_during_stream_persists_partial_and_stops() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let engine = Arc::new(TurnEngine::new(
+            InterruptProvider {
+                started: started.clone(),
+            },
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        ));
+        let running = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.submit_text("interrupt").await })
+        };
+        started.notified().await;
+        engine.interrupt();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(EngineError::Interrupted)));
+        assert!(store.load_messages("s").unwrap().iter().any(|message| {
+            message.role == "assistant" && message.content.to_string().contains("partial")
+        }));
+    }
+
+    struct FailingRemoteTools;
+    #[async_trait]
+    impl ToolExecutor for FailingRemoteTools {
+        async fn execute(&self, _: &str, _: Value) -> Result<Value, String> {
+            Err("remote host unavailable".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_failure_is_explicit_and_never_falls_back_locally() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = TurnEngine::new(
+            LoopProvider { calls },
+            store.clone(),
+            Arc::new(FailingRemoteTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let result = engine.submit_text("read remotely").await;
+        assert!(matches!(result, Err(EngineError::MaxIterations)));
+        let messages = store.load_messages("s").unwrap();
+        assert!(messages.iter().any(|message| {
+            message.role == "tool"
+                && message
+                    .content
+                    .to_string()
+                    .contains("remote host unavailable")
+        }));
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.content.to_string().contains("local fallback"))
+        );
+    }
+
     #[tokio::test]
     async fn durable_user_and_assistant_messages_exclude_notices() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-        store
-            .append_notice(&NoticeRecord {
-                session_id: "s".into(),
-                sequence: 1,
-                kind: "error".into(),
-                content: "display only".into(),
-            })
-            .unwrap();
+        for (sequence, kind) in ["error", "interrupted", "compacted", "model_switch"]
+            .into_iter()
+            .enumerate()
+        {
+            store
+                .append_notice(&NoticeRecord {
+                    session_id: "s".into(),
+                    sequence: sequence as i64 + 1,
+                    kind: kind.into(),
+                    content: "display only".into(),
+                })
+                .unwrap();
+        }
         let engine = TurnEngine::new(
             FakeProvider,
             store.clone(),

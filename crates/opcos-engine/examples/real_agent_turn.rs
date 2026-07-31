@@ -66,7 +66,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let store = Arc::new(SqliteStore::open_in_memory()?);
     let provider = OpenAiProvider::new(ProviderConfig::new(
-        "https://ai.yaoshen.de5.net/v1",
+        std::env::var("OPCOS_PROVIDER_BASE_URL")
+            .unwrap_or_else(|_| "https://ai.yaoshen.de5.net/v1".into()),
         provider_key,
     ));
     let smoke_path = format!("{workspace}\\opcos-m3-smoke.txt");
