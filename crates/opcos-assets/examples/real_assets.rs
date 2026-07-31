@@ -60,6 +60,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         system_message.to_ascii_lowercase().contains("token")
             || system_message.to_ascii_lowercase().contains("secret")
     );
+    if env::var_os("OPCOS_SMOKE_SKIP_EXEC").is_some() {
+        println!("safe_command=skipped");
+        return Ok(());
+    }
     let blueprint_text = RvmClient::read(&client, &format!("{repo}/.devin/blueprint.yaml"))
         .await?
         .content;
