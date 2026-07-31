@@ -12,3 +12,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+opcos-rvm = { path = "../opcos-rvm" }
+url.workspace = true

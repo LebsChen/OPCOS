@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::Mutex;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -37,6 +38,48 @@ pub struct SessionRecord {
     pub compaction: serde_json::Value,
     pub host_id: String,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct StoredMessage {
+    pub session_id: String,
+    pub sequence: i64,
+    pub role: String,
+    pub content: serde_json::Value,
+    pub display_only: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct NoticeRecord {
+    pub session_id: String,
+    pub sequence: i64,
+    pub kind: String,
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ToolCallRecord {
+    pub session_id: String,
+    pub message_sequence: i64,
+    pub call_id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+    pub result: Option<serde_json::Value>,
+}
+
+pub trait SessionStore {
+    fn append_message(&self, message: &StoredMessage) -> Result<(), StoreError>;
+    fn load_messages(&self, session_id: &str) -> Result<Vec<StoredMessage>, StoreError>;
+    fn append_notice(&self, notice: &NoticeRecord) -> Result<(), StoreError>;
+    fn load_resume_messages(&self, session_id: &str) -> Result<Vec<StoredMessage>, StoreError>;
+    fn append_tool_call(&self, call: &ToolCallRecord) -> Result<(), StoreError>;
+    fn complete_tool_call(
+        &self,
+        session_id: &str,
+        message_sequence: i64,
+        call_id: &str,
+        result: &serde_json::Value,
+    ) -> Result<(), StoreError>;
 }
 
 pub trait SecretStore: Send + Sync {
@@ -84,14 +127,16 @@ impl SecretStore for KeyringSecretStore {
 }
 
 pub struct SqliteStore {
-    connection: Connection,
+    connection: Mutex<Connection>,
 }
 
 impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let connection = Connection::open(path)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
-        let store = Self { connection };
+        let store = Self {
+            connection: Mutex::new(connection),
+        };
         store.migrate()?;
         Ok(store)
     }
@@ -99,14 +144,19 @@ impl SqliteStore {
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let connection = Connection::open_in_memory()?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
-        let store = Self { connection };
+        let store = Self {
+            connection: Mutex::new(connection),
+        };
         store.migrate()?;
         Ok(store)
     }
 
     fn migrate(&self) -> Result<(), StoreError> {
-        self.connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS schema_migrations (
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
                version INTEGER PRIMARY KEY,
                applied_at TEXT NOT NULL
              );
@@ -125,24 +175,73 @@ impl SqliteStore {
                compaction TEXT NOT NULL,
                host_id TEXT NOT NULL,
                updated_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS messages (
+               session_id TEXT NOT NULL,
+               sequence INTEGER NOT NULL,
+               role TEXT NOT NULL,
+               content TEXT NOT NULL,
+               display_only INTEGER NOT NULL,
+               PRIMARY KEY(session_id, sequence)
+             );
+             CREATE TABLE IF NOT EXISTS notices (
+               session_id TEXT NOT NULL,
+               sequence INTEGER NOT NULL,
+               kind TEXT NOT NULL,
+               content TEXT NOT NULL,
+               PRIMARY KEY(session_id, sequence)
+             );
+             CREATE TABLE IF NOT EXISTS tool_calls (
+               session_id TEXT NOT NULL,
+               message_sequence INTEGER NOT NULL,
+               call_id TEXT NOT NULL,
+               name TEXT NOT NULL,
+               arguments TEXT NOT NULL,
+               result TEXT,
+               PRIMARY KEY(session_id, message_sequence, call_id)
+             );
+             CREATE TABLE IF NOT EXISTS grants (
+               session_id TEXT NOT NULL,
+               grant_key TEXT NOT NULL,
+               grant_value TEXT NOT NULL,
+               PRIMARY KEY(session_id, grant_key)
+             );
+             CREATE TABLE IF NOT EXISTS audit_events (
+               session_id TEXT NOT NULL,
+               sequence INTEGER NOT NULL,
+               kind TEXT NOT NULL,
+               payload TEXT NOT NULL,
+               PRIMARY KEY(session_id, sequence)
+             );
+             CREATE TABLE IF NOT EXISTS compaction_state (
+               session_id TEXT PRIMARY KEY,
+               state TEXT NOT NULL
              );",
-        )?;
-        if self.connection.query_row(
-            "SELECT COUNT(*) FROM schema_migrations WHERE version = 1",
-            [],
-            |row| row.get::<_, i64>(0),
-        )? == 0
-        {
-            self.connection.execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES (1, ?1)",
-                [Utc::now().to_rfc3339()],
             )?;
+        if self
+            .connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?
+            == 0
+        {
+            self.connection
+                .lock()
+                .expect("sqlite mutex poisoned")
+                .execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (1, ?1)",
+                    [Utc::now().to_rfc3339()],
+                )?;
         }
         Ok(())
     }
 
     pub fn save_session(&self, session: &SessionRecord) -> Result<(), StoreError> {
-        self.connection.execute(
+        self.connection.lock().expect("sqlite mutex poisoned").execute(
             "INSERT OR REPLACE INTO sessions VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![
                 session.session_id,
@@ -160,6 +259,83 @@ impl SqliteStore {
                 session.host_id,
                 session.updated_at.to_rfc3339(),
             ],
+        )?;
+        Ok(())
+    }
+}
+
+impl SessionStore for SqliteStore {
+    fn append_message(&self, message: &StoredMessage) -> Result<(), StoreError> {
+        self.connection.lock().expect("sqlite mutex poisoned").execute(
+            "INSERT INTO messages(session_id,sequence,role,content,display_only) VALUES (?1,?2,?3,?4,?5)",
+            params![message.session_id, message.sequence, message.role, serde_json::to_string(&message.content)?, message.display_only],
+        )?;
+        Ok(())
+    }
+
+    fn load_messages(&self, session_id: &str) -> Result<Vec<StoredMessage>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT session_id,sequence,role,content,display_only FROM messages WHERE session_id=?1 ORDER BY sequence",
+        )?;
+        let rows = statement.query_map([session_id], |row| {
+            let content: String = row.get(3)?;
+            Ok(StoredMessage {
+                session_id: row.get(0)?,
+                sequence: row.get(1)?,
+                role: row.get(2)?,
+                content: serde_json::from_str(&content).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                display_only: row.get::<_, i64>(4)? != 0,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn append_notice(&self, notice: &NoticeRecord) -> Result<(), StoreError> {
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "INSERT INTO notices(session_id,sequence,kind,content) VALUES (?1,?2,?3,?4)",
+                params![
+                    notice.session_id,
+                    notice.sequence,
+                    notice.kind,
+                    notice.content
+                ],
+            )?;
+        Ok(())
+    }
+
+    fn load_resume_messages(&self, session_id: &str) -> Result<Vec<StoredMessage>, StoreError> {
+        self.load_messages(session_id)
+    }
+
+    fn append_tool_call(&self, call: &ToolCallRecord) -> Result<(), StoreError> {
+        self.connection.lock().expect("sqlite mutex poisoned").execute(
+            "INSERT INTO tool_calls(session_id,message_sequence,call_id,name,arguments,result) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![call.session_id, call.message_sequence, call.call_id, call.name,
+                serde_json::to_string(&call.arguments)?, call.result.as_ref().map(serde_json::to_string).transpose()?],
+        )?;
+        Ok(())
+    }
+
+    fn complete_tool_call(
+        &self,
+        session_id: &str,
+        message_sequence: i64,
+        call_id: &str,
+        result: &serde_json::Value,
+    ) -> Result<(), StoreError> {
+        self.connection.lock().expect("sqlite mutex poisoned").execute(
+            "UPDATE tool_calls SET result=?4 WHERE session_id=?1 AND message_sequence=?2 AND call_id=?3",
+            params![session_id, message_sequence, call_id, serde_json::to_string(result)?],
         )?;
         Ok(())
     }

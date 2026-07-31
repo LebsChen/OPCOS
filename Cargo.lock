@@ -3207,11 +3207,13 @@ dependencies = [
  "async-trait",
  "opcos-policy",
  "opcos-provider",
+ "opcos-rvm",
  "opcos-store",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
+ "url",
 ]
 
 [[package]]
