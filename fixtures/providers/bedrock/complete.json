@@ -1,0 +1,1 @@
+{"output":{"message":{"content":[{"reasoningContent":{"reasoningText":{"text":"think"}}},{"text":"done"},{"toolUse":{"toolUseId":"tool_1","name":"ls","input":{"path":"."}}}]}},"stopReason":"tool_use","usage":{"inputTokens":9,"outputTokens":5}}
