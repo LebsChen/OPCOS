@@ -335,7 +335,11 @@ function App() {
                 provider,
                 key: providerKey,
               })
-                .then(() => setProviderKey(""))
+                .then(() => command("validate_provider_key", { provider }))
+                .then(() => {
+                  setProviderKey("");
+                  setError("");
+                })
                 .catch((reason: unknown) => setError(String(reason)));
             }}
           >

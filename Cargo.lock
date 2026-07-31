@@ -3198,6 +3198,7 @@ dependencies = [
  "opcos-provider",
  "opcos-rvm",
  "opcos-store",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",

@@ -455,12 +455,49 @@ fn save_provider_key(
 }
 
 #[tauri::command]
-fn validate_provider_key(state: State<'_, DesktopState>, provider: String) -> Result<bool, String> {
-    Ok(state
+async fn validate_provider_key(
+    state: State<'_, DesktopState>,
+    provider: String,
+) -> Result<bool, String> {
+    let key = state
         .secrets
         .get(&secret_key("provider-key", &provider))
         .map_err(|error| error.to_string())?
-        .is_some())
+        .ok_or_else(|| "provider key is not configured".to_owned())?;
+    let descriptor = registry::descriptors()
+        .into_iter()
+        .find(|item| item.name == provider)
+        .ok_or_else(|| "unknown provider".to_owned())?;
+    if provider == "bedrock" || descriptor.default_base_url.is_none() {
+        return Ok(true);
+    }
+    let url = format!(
+        "{}/models",
+        descriptor
+            .default_base_url
+            .unwrap_or_default()
+            .trim_end_matches('/')
+    );
+    let client = reqwest::Client::new();
+    let request = if provider == "anthropic" {
+        client.get(url).header("x-api-key", key)
+    } else {
+        client
+            .get(url)
+            .header("Authorization", format!("Bearer {key}"))
+    };
+    let response = request
+        .send()
+        .await
+        .map_err(|_| "provider validation request failed".to_owned())?;
+    if response.status().is_success() {
+        Ok(true)
+    } else {
+        Err(format!(
+            "provider rejected the key with HTTP {}",
+            response.status()
+        ))
+    }
 }
 
 fn main() {
