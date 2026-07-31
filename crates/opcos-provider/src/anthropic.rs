@@ -1,6 +1,6 @@
 use crate::{
     AssistantTurn, Caps, Provider, ProviderConfig, ProviderError, ProviderRequest, StreamChunk,
-    TokenUsage, ToolCall, client, sanitize_secret, settings_object, tool_schema,
+    TokenUsage, ToolCall, ToolCallDelta, client, sanitize_secret, settings_object, tool_schema,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -267,7 +267,16 @@ async fn consume_event(
     let value: Value = crate::sse::parse_json(event).map_err(ProviderError::Protocol)?;
     match event.event.as_str() {
         "message_start" => {
-            *usage = anthropic_usage(value.get("message").and_then(|m| m.get("usage")))
+            *usage = anthropic_usage(value.get("message").and_then(|m| m.get("usage")));
+            if let Some(value) = usage.clone() {
+                output
+                    .send(StreamChunk {
+                        usage: Some(value),
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(|_| ProviderError::Protocol("stream receiver closed".into()))?;
+            }
         }
         "content_block_start" => {
             let index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -323,15 +332,27 @@ async fn consume_event(
                     }
                 }
                 Some("input_json_delta") => {
-                    if let Some(entry) = tools.get_mut(
-                        &(value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize),
-                    ) {
-                        entry.2.push_str(
-                            delta
-                                .get("partial_json")
-                                .and_then(Value::as_str)
-                                .unwrap_or(""),
-                        );
+                    let index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let fragment = delta
+                        .get("partial_json")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if let Some(entry) = tools.get_mut(&index) {
+                        entry.2.push_str(fragment);
+                        output
+                            .send(StreamChunk {
+                                tool_call_delta: Some(ToolCallDelta {
+                                    index,
+                                    id: Some(entry.0.clone()),
+                                    name: Some(entry.1.clone()),
+                                    arguments_fragment: Some(fragment.into()),
+                                }),
+                                ..Default::default()
+                            })
+                            .await
+                            .map_err(|_| {
+                                ProviderError::Protocol("stream receiver closed".into())
+                            })?;
                     }
                 }
                 _ => {}
@@ -345,6 +366,15 @@ async fn consume_event(
                 .map(str::to_owned);
             if usage.is_none() {
                 *usage = anthropic_usage(value.get("usage"));
+            }
+            if let Some(value) = anthropic_usage(value.get("usage")) {
+                output
+                    .send(StreamChunk {
+                        usage: Some(value),
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(|_| ProviderError::Protocol("stream receiver closed".into()))?;
             }
         }
         _ => {}
@@ -366,5 +396,30 @@ mod tests {
         assert_eq!(turn.text.as_deref(), Some("hello"));
         assert_eq!(turn.tool_calls[0].name, "read_file");
         assert_eq!(turn.reasoning.as_deref(), Some("private thought"));
+    }
+
+    #[test]
+    fn stream_tool_fragments_reconstruct_terminal_arguments() {
+        let mut decoder = crate::sse::SseDecoder::new();
+        let events = decoder.push(include_bytes!(
+            "../../../fixtures/providers/anthropic/stream.sse"
+        ));
+        let fragments = events
+            .iter()
+            .filter_map(|event| crate::sse::parse_json(event).ok())
+            .filter_map(|value| {
+                (value["delta"]["type"].as_str() == Some("input_json_delta")).then(|| {
+                    value["delta"]["partial_json"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_owned()
+                })
+            })
+            .collect::<String>();
+        assert_eq!(fragments, r#"{"path":"README.md"}"#);
+        assert_eq!(
+            serde_json::from_str::<Value>(&fragments).unwrap()["path"],
+            "README.md"
+        );
     }
 }

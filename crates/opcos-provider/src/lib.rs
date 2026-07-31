@@ -49,9 +49,19 @@ pub struct AssistantTurn {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct ToolCallDelta {
+    pub index: usize,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub arguments_fragment: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct StreamChunk {
     pub text_delta: Option<String>,
     pub reasoning_delta: Option<String>,
+    pub tool_call_delta: Option<ToolCallDelta>,
+    pub usage: Option<TokenUsage>,
     pub turn: Option<AssistantTurn>,
 }
 
@@ -177,7 +187,7 @@ pub(crate) fn client(config: &ProviderConfig) -> Result<Client, ProviderError> {
         .map_err(ProviderError::Request)
 }
 
-pub(crate) fn apply_headers(
+pub(crate) fn apply_bearer_headers(
     mut request: reqwest::RequestBuilder,
     config: &ProviderConfig,
 ) -> reqwest::RequestBuilder {

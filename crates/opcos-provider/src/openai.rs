@@ -1,6 +1,7 @@
 use crate::{
     AssistantTurn, Caps, Provider, ProviderConfig, ProviderError, ProviderRequest, StreamChunk,
-    TokenUsage, ToolCall, apply_headers, client, sanitize_secret, settings_object, tool_schema,
+    TokenUsage, ToolCall, ToolCallDelta, apply_bearer_headers, client, sanitize_secret,
+    settings_object, tool_schema,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -49,7 +50,7 @@ impl OpenAiProvider {
         );
         let mut body = body;
         for _ in 0..2 {
-            let response = apply_headers(http.post(&url).json(&body), &self.config)
+            let response = apply_bearer_headers(http.post(&url).json(&body), &self.config)
                 .send()
                 .await
                 .map_err(ProviderError::Request)?;
@@ -271,7 +272,14 @@ impl Provider for OpenAiProvider {
                 let value: Value =
                     crate::sse::parse_json(&event).map_err(ProviderError::Protocol)?;
                 if let Some(value) = usage(value.get("usage")) {
-                    final_usage = Some(value);
+                    final_usage = Some(value.clone());
+                    output
+                        .send(StreamChunk {
+                            usage: Some(value),
+                            ..Default::default()
+                        })
+                        .await
+                        .map_err(|_| ProviderError::Protocol("stream receiver closed".into()))?;
                 }
                 let choice = value
                     .get("choices")
@@ -318,11 +326,38 @@ impl Provider for OpenAiProvider {
                         entry.0 = id.into();
                     }
                     if let Some(function) = call.get("function") {
-                        if let Some(name) = function.get("name").and_then(Value::as_str) {
-                            entry.1 = name.into();
+                        let name = function
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                        if let Some(name_value) = &name {
+                            entry.1 = name_value.clone();
                         }
-                        if let Some(args) = function.get("arguments").and_then(Value::as_str) {
-                            entry.2.push_str(args);
+                        let args = function
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                        if let Some(args_value) = &args {
+                            entry.2.push_str(args_value);
+                        }
+                        if name.is_some() || args.is_some() || call.get("id").is_some() {
+                            output
+                                .send(StreamChunk {
+                                    tool_call_delta: Some(ToolCallDelta {
+                                        index,
+                                        id: call
+                                            .get("id")
+                                            .and_then(Value::as_str)
+                                            .map(str::to_owned),
+                                        name,
+                                        arguments_fragment: args,
+                                    }),
+                                    ..Default::default()
+                                })
+                                .await
+                                .map_err(|_| {
+                                    ProviderError::Protocol("stream receiver closed".into())
+                                })?;
                         }
                     }
                 }
@@ -381,5 +416,27 @@ mod tests {
             &[json!({"type":"function","function":{"name":"read_file"}})],
         );
         assert_eq!(salvaged[0].name, "read_file");
+    }
+
+    #[test]
+    fn stream_tool_fragments_reconstruct_terminal_arguments() {
+        let mut decoder = crate::sse::SseDecoder::new();
+        let events = decoder.push(include_bytes!(
+            "../../../fixtures/providers/openai/stream.sse"
+        ));
+        let fragments = events
+            .iter()
+            .filter_map(|event| crate::sse::parse_json(event).ok())
+            .filter_map(|value| {
+                value["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect::<String>();
+        assert_eq!(fragments, r#"{"path":"README.md"}"#);
+        assert_eq!(
+            serde_json::from_str::<Value>(&fragments).unwrap()["path"],
+            "README.md"
+        );
     }
 }
