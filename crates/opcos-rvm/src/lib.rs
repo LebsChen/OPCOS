@@ -439,7 +439,10 @@ pub fn sanitize_proxy_url(raw: &str, upstream_token: &str) -> Result<Url, RvmErr
     let pairs = url
         .query_pairs()
         .map(|(key, value)| {
-            let key_is_token = key.eq_ignore_ascii_case("token") || key.eq_ignore_ascii_case("tkn");
+            let key_is_token = key.eq_ignore_ascii_case("token")
+                || key.eq_ignore_ascii_case("tkn")
+                || key.eq_ignore_ascii_case("connectionToken")
+                || key.eq_ignore_ascii_case("reconnectionToken");
             (
                 key.into_owned(),
                 if key_is_token {
@@ -642,8 +645,10 @@ impl HttpRvmClient {
         let pairs = url
             .query_pairs()
             .map(|(key, value)| {
-                let key_is_token =
-                    key.eq_ignore_ascii_case("token") || key.eq_ignore_ascii_case("tkn");
+                let key_is_token = key.eq_ignore_ascii_case("token")
+                    || key.eq_ignore_ascii_case("tkn")
+                    || key.eq_ignore_ascii_case("connectionToken")
+                    || key.eq_ignore_ascii_case("reconnectionToken");
                 (
                     key.into_owned(),
                     if key_is_token {
@@ -699,8 +704,10 @@ impl HttpRvmClient {
         let pairs = url
             .query_pairs()
             .map(|(key, value)| {
-                let key_is_token =
-                    key.eq_ignore_ascii_case("token") || key.eq_ignore_ascii_case("tkn");
+                let key_is_token = key.eq_ignore_ascii_case("token")
+                    || key.eq_ignore_ascii_case("tkn")
+                    || key.eq_ignore_ascii_case("connectionToken")
+                    || key.eq_ignore_ascii_case("reconnectionToken");
                 (
                     key.into_owned(),
                     if key_is_token {
@@ -1388,7 +1395,7 @@ mod tests {
     fn proxy_security_rejects_multi_encoded_traversal_and_replaces_empty_tokens() {
         assert!(has_encoded_traversal("/out/%252e%252e%252fetc/passwd"));
         let url = sanitize_proxy_url(
-            "http://localhost/out/file.js?tkn=&token=&x=1",
+            "http://localhost/out/file.js?tkn=&token=&connectionToken=local&reconnectionToken=local&x=1",
             "upstream-secret",
         )
         .unwrap();
@@ -1397,6 +1404,8 @@ mod tests {
             vec![
                 ("tkn".into(), "upstream-secret".into()),
                 ("token".into(), "upstream-secret".into()),
+                ("connectionToken".into(), "upstream-secret".into()),
+                ("reconnectionToken".into(), "upstream-secret".into()),
                 ("x".into(), "1".into())
             ]
         );
