@@ -3215,6 +3215,8 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-bedrockruntime",
+ "aws-smithy-types",
+ "aws-types",
  "bytes",
  "futures-util",
  "reqwest",

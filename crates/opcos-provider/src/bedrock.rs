@@ -215,10 +215,65 @@ fn parse_turn(value: &Value) -> AssistantTurn {
 
 #[async_trait]
 impl Provider for BedrockProvider {
-    async fn complete(&self, _request: ProviderRequest) -> Result<AssistantTurn, ProviderError> {
-        Err(ProviderError::Unsupported(
-            "Bedrock network transport is wired through aws-sdk-bedrockruntime in the desktop adapter".into(),
-        ))
+    async fn complete(&self, request: ProviderRequest) -> Result<AssistantTurn, ProviderError> {
+        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(aws_types::region::Region::new(self.region.clone()))
+            .load()
+            .await;
+        let client = aws_sdk_bedrockruntime::Client::new(&config);
+        let mut builder = client.converse().model_id(request.model);
+        for message in request.messages {
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("user")
+                .into();
+            let text = message
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let message = aws_sdk_bedrockruntime::types::Message::builder()
+                .role(role)
+                .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(text))
+                .build()
+                .map_err(|error| ProviderError::Protocol(error.to_string()))?;
+            builder = builder.messages(message);
+        }
+        let response = builder
+            .send()
+            .await
+            .map_err(|error| ProviderError::Protocol(error.to_string()))?;
+        let mut text = String::new();
+        let mut tool_calls = Vec::new();
+        if let Some(output) = response.output()
+            && let Ok(message) = output.as_message()
+        {
+            for block in message.content() {
+                if let Ok(part) = block.as_text() {
+                    text.push_str(part);
+                } else if let Ok(tool) = block.as_tool_use() {
+                    tool_calls.push(ToolCall {
+                        id: tool.tool_use_id().to_owned(),
+                        name: tool.name().to_owned(),
+                        arguments: document_value(tool.input()),
+                    });
+                }
+            }
+        }
+        Ok(AssistantTurn {
+            text: (!text.is_empty()).then_some(text),
+            tool_calls,
+            finish_reason: Some(response.stop_reason().as_str().to_owned()),
+            reasoning: None,
+            extras: json!({}),
+            usage: response.usage().map(|usage| TokenUsage {
+                input: usage.input_tokens().max(0) as u64,
+                output: usage.output_tokens().max(0) as u64,
+                cache_read: 0,
+                cache_write: 0,
+            }),
+        })
     }
 
     async fn stream(
@@ -227,7 +282,7 @@ impl Provider for BedrockProvider {
         _output: Sender<StreamChunk>,
     ) -> Result<AssistantTurn, ProviderError> {
         Err(ProviderError::Unsupported(
-            "Bedrock network transport is wired through aws-sdk-bedrockruntime in the desktop adapter".into(),
+            "Bedrock ConverseStream adapter is not yet enabled".into(),
         ))
     }
 
@@ -240,6 +295,24 @@ impl Provider for BedrockProvider {
             streaming: true,
             context_window: None,
         }
+    }
+}
+
+fn document_value(document: &aws_smithy_types::Document) -> Value {
+    use aws_smithy_types::Document;
+    match document {
+        Document::Object(values) => Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), document_value(value)))
+                .collect(),
+        ),
+        Document::Array(values) => Value::Array(values.iter().map(document_value).collect()),
+        Document::String(value) => Value::String(value.clone()),
+        Document::Bool(value) => Value::Bool(*value),
+        Document::Null => Value::Null,
+        Document::Number(value) => serde_json::from_str(&format!("{value:?}"))
+            .unwrap_or_else(|_| Value::String(format!("{value:?}"))),
     }
 }
 
