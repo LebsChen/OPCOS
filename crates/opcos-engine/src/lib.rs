@@ -751,6 +751,15 @@ mod tests {
         let pending = engine.execute_tools(&[call]).await;
         assert!(matches!(pending, Err(EngineError::ApprovalPending(id)) if id == "plan-1"));
         assert_eq!(store.load_pending("s").unwrap()[0].state, "propose_plan");
+        store.delete_pending("s", "plan-1").unwrap();
+        let ask = ToolCall {
+            id: "ask-1".into(),
+            name: "ask_user".into(),
+            arguments: json!({"question":"continue?"}),
+        };
+        let pending = engine.execute_tools(&[ask]).await;
+        assert!(matches!(pending, Err(EngineError::ApprovalPending(id)) if id == "ask-1"));
+        assert_eq!(store.load_pending("s").unwrap()[0].state, "ask_user");
     }
 
     #[test]
