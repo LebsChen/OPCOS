@@ -1448,6 +1448,18 @@ mod tests {
     }
 
     #[test]
+    fn ide_payload_translation_redacts_assets_and_websocket_frames() {
+        assert_eq!(
+            replace_bytes(
+                b"asset=rvm-secret;again=rvm-secret",
+                b"rvm-secret",
+                b"local-token"
+            ),
+            b"asset=local-token;again=local-token"
+        );
+    }
+
+    #[test]
     fn workbench_html_replaces_connection_token_without_cookie_output() {
         let html = r#"<meta id="vscode-workbench-web-configuration" data-settings='{"connectionToken":"rvm-secret"}'>"#;
         let sanitized = redact_workbench_token(html, "rvm-secret", "local-proxy");
