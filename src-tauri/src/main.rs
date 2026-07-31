@@ -307,7 +307,11 @@ async fn ide_asset(
     let route = format!("{route}{query}");
     match state
         .client
-        .ide_request_bytes(&route, &state.bootstrap.cookies)
+        .ide_request_bytes(
+            &route,
+            &state.bootstrap.cookies,
+            &state.bootstrap.proxy_token,
+        )
         .await
     {
         Ok(bytes) => Response::new(Body::from(bytes)),
@@ -330,8 +334,24 @@ async fn ide_relay_socket(mut browser: WebSocket, state: IdeProxyState, route: S
             browser_message = browser.recv() => {
                 let Some(Ok(message)) = browser_message else { break };
                 let converted = match message {
-                    AxumMessage::Text(value) => tokio_tungstenite::tungstenite::Message::Text(value.to_string().into()),
-                    AxumMessage::Binary(value) => tokio_tungstenite::tungstenite::Message::Binary(value),
+                    AxumMessage::Text(value) => tokio_tungstenite::tungstenite::Message::Text(
+                        String::from_utf8_lossy(
+                            &state.client.translate_ide_payload(
+                                value.as_bytes(),
+                                &state.bootstrap.proxy_token,
+                                true,
+                            ),
+                        )
+                        .into_owned()
+                        .into(),
+                    ),
+                    AxumMessage::Binary(value) => tokio_tungstenite::tungstenite::Message::Binary(
+                        state.client.translate_ide_payload(
+                            &value,
+                            &state.bootstrap.proxy_token,
+                            true,
+                        ).into(),
+                    ),
                     AxumMessage::Ping(value) => tokio_tungstenite::tungstenite::Message::Ping(value),
                     AxumMessage::Pong(value) => tokio_tungstenite::tungstenite::Message::Pong(value),
                     AxumMessage::Close(_) => break,
@@ -341,8 +361,24 @@ async fn ide_relay_socket(mut browser: WebSocket, state: IdeProxyState, route: S
             upstream_message = upstream_read.next() => {
                 let Some(Ok(message)) = upstream_message else { break };
                 let converted = match message {
-                    tokio_tungstenite::tungstenite::Message::Text(value) => AxumMessage::Text(value.to_string().into()),
-                    tokio_tungstenite::tungstenite::Message::Binary(value) => AxumMessage::Binary(value),
+                    tokio_tungstenite::tungstenite::Message::Text(value) => AxumMessage::Text(
+                        String::from_utf8_lossy(
+                            &state.client.translate_ide_payload(
+                                value.as_bytes(),
+                                &state.bootstrap.proxy_token,
+                                false,
+                            ),
+                        )
+                        .into_owned()
+                        .into(),
+                    ),
+                    tokio_tungstenite::tungstenite::Message::Binary(value) => AxumMessage::Binary(
+                        state.client.translate_ide_payload(
+                            &value,
+                            &state.bootstrap.proxy_token,
+                            false,
+                        ).into(),
+                    ),
                     tokio_tungstenite::tungstenite::Message::Ping(value) => AxumMessage::Ping(value),
                     tokio_tungstenite::tungstenite::Message::Pong(value) => AxumMessage::Pong(value),
                     tokio_tungstenite::tungstenite::Message::Close(_) => break,

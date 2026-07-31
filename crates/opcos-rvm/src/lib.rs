@@ -393,6 +393,24 @@ fn cookie_pair(set_cookie: &str) -> Option<String> {
     set_cookie.split(';').next().map(str::to_owned)
 }
 
+fn replace_bytes(payload: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    if from.is_empty() {
+        return payload.to_vec();
+    }
+    let mut output = Vec::with_capacity(payload.len());
+    let mut cursor = 0;
+    while cursor < payload.len() {
+        if payload[cursor..].starts_with(from) {
+            output.extend_from_slice(to);
+            cursor += from.len();
+        } else {
+            output.push(payload[cursor]);
+            cursor += 1;
+        }
+    }
+    output
+}
+
 pub fn has_encoded_traversal(path: &str) -> bool {
     let mut current = path.to_owned();
     for _ in 0..6 {
@@ -636,6 +654,7 @@ impl HttpRvmClient {
         &self,
         route: &str,
         cookies: &[String],
+        proxy_token: &str,
     ) -> Result<Bytes, RvmError> {
         let mut url = self
             .config
@@ -683,7 +702,24 @@ impl HttpRvmClient {
                 &self.config.token,
             ));
         }
-        Ok(bytes)
+        Ok(replace_bytes(&bytes, self.config.token.as_bytes(), proxy_token.as_bytes()).into())
+    }
+
+    pub fn translate_ide_payload(
+        &self,
+        payload: &[u8],
+        proxy_token: &str,
+        to_upstream: bool,
+    ) -> Vec<u8> {
+        let (from, to) = if to_upstream {
+            (proxy_token.as_bytes(), self.config.token.as_bytes())
+        } else {
+            (self.config.token.as_bytes(), proxy_token.as_bytes())
+        };
+        if from.is_empty() {
+            return payload.to_vec();
+        }
+        replace_bytes(payload, from, to)
     }
 
     pub async fn open_ide_ws(
