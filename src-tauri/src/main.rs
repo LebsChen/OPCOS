@@ -1199,6 +1199,124 @@ fn set_asset_enabled(
 }
 
 #[tauri::command]
+async fn export_assets(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    ids: Vec<String>,
+) -> Result<usize, String> {
+    let host_id = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .query_row(
+            "SELECT host_id FROM sessions WHERE id=?1",
+            [session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| "session not found".to_owned())?;
+    let client = client_for(&state, &host_id)?;
+    let health = client
+        .health()
+        .await
+        .map_err(|error| format!("remote host unavailable: {error}"))?;
+    let workspace = health.workspace.unwrap_or_else(|| "/workspace".into());
+    let rows = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id,kind,title,body,trigger,scope FROM asset_records
+                 WHERE id=?1",
+            )
+            .map_err(|error| error.to_string())?;
+        ids.iter()
+            .filter_map(|id| {
+                statement
+                    .query_row([id], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                        ))
+                    })
+                    .ok()
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut exported = 0;
+    for (id, kind, title, body, trigger, scope) in rows {
+        let (directory, filename) = match kind.as_str() {
+            "knowledge" => (".agents/knowledge", format!("{id}.md")),
+            "playbook" => (".agents/playbooks", format!("{id}.md")),
+            _ => continue,
+        };
+        let content = format!(
+            "---\nid: {id}\nname: {title}\ntrigger: {trigger}\nscope: {scope}\n---\n{body}\n"
+        );
+        client
+            .write(&format!("{workspace}/{directory}/{filename}"), &content)
+            .await
+            .map_err(|error| format!("asset export failed: {error}"))?;
+        exported += 1;
+    }
+    Ok(exported)
+}
+
+#[tauri::command]
+async fn import_assets(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<AssetBundle, String> {
+    let host_id = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .query_row(
+            "SELECT host_id FROM sessions WHERE id=?1",
+            [session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| "session not found".to_owned())?;
+    let client = client_for(&state, &host_id)?;
+    let health = client
+        .health()
+        .await
+        .map_err(|error| format!("remote host unavailable: {error}"))?;
+    let workspace = health.workspace.unwrap_or_else(|| "/workspace".into());
+    let bundle = discover_assets(&client.with_workspace(workspace.clone()), &workspace)
+        .await
+        .map_err(|error| error.to_string())?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    for item in &bundle.knowledge {
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO asset_records
+                 (id,kind,title,body,trigger,scope,enabled) VALUES (?1,'knowledge',?2,?3,?4,?5,1)",
+                params![item.title, item.title, item.body, item.trigger, item.scope],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    if let Some(item) = &bundle.playbook {
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO asset_records
+                 (id,kind,title,body,trigger,scope,enabled) VALUES (?1,'playbook',?2,?3,'','',1)",
+                params![item.title, item.title, item.body],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(bundle)
+}
+
+#[tauri::command]
 async fn discover_remote_assets(
     state: State<'_, DesktopState>,
     session_id: String,
@@ -1632,6 +1750,8 @@ fn main() {
             save_asset,
             delete_asset,
             set_asset_enabled,
+            export_assets,
+            import_assets,
             discover_remote_assets,
             mcp_tools,
             set_mcp_tool_enabled,

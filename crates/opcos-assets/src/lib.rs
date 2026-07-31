@@ -220,6 +220,12 @@ async fn discover_tree<R: RemoteAssetReader>(
                 bundle
                     .skills
                     .push(parse_skill(&child, &reader.read(&child).await?));
+            } else if child.contains("/.agents/knowledge/") && name.ends_with(".md") {
+                bundle
+                    .knowledge
+                    .push(parse_knowledge(&child, &reader.read(&child).await?)?);
+            } else if child.contains("/.agents/playbooks/") && name.ends_with(".md") {
+                bundle.playbook = Some(parse_playbook(&child, &reader.read(&child).await?));
             } else if name.ends_with(".md") {
                 bundle.agents.push(InstructionSource {
                     path: child.clone(),
