@@ -601,8 +601,13 @@ impl HttpRvmClient {
             .append_pair("tkn", &self.config.token)
             .append_pair("folder", folder);
         for _ in 0..8 {
-            let mut request = self.http.get(url.clone());
-            request = request.header(header::AUTHORIZATION, self.config.auth_header());
+            let mut request = self
+                .http
+                .get(url.clone())
+                .header(header::AUTHORIZATION, self.config.auth_header())
+                .header(header::ACCEPT, "text/html")
+                .header(header::USER_AGENT, "curl/8")
+                .header("Sec-Fetch-Mode", "navigate");
             if !cookies.is_empty() {
                 request = request.header(header::COOKIE, cookies.join("; "));
             }
@@ -624,10 +629,10 @@ impl HttpRvmClient {
                     .ok_or_else(|| RvmError::WebSocket("IDE redirect missing location".into()))?
                     .to_str()
                     .map_err(|_| RvmError::WebSocket("IDE redirect has invalid location".into()))?;
-                url = url
+                let redirected = url
                     .join(location)
                     .map_err(|_| RvmError::WebSocket("IDE redirect has invalid URL".into()))?;
-                url.set_query(None);
+                url = sanitize_proxy_url(redirected.as_str(), &self.config.token)?;
                 continue;
             }
             if !response.status().is_success() {
@@ -688,7 +693,10 @@ impl HttpRvmClient {
         let mut request = self
             .http
             .get(url)
-            .header(header::AUTHORIZATION, self.config.auth_header());
+            .header(header::AUTHORIZATION, self.config.auth_header())
+            .header(header::ACCEPT, "text/html")
+            .header(header::USER_AGENT, "curl/8")
+            .header("Sec-Fetch-Mode", "navigate");
         if !cookies.is_empty() {
             request = request.header(header::COOKIE, cookies.join("; "));
         }
