@@ -9,5 +9,12 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+chrono.workspace = true
+keyring.workspace = true
+rusqlite.workspace = true
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+opcos-provider = { path = "../crates/opcos-provider" }
+opcos-rvm = { path = "../crates/opcos-rvm" }
+opcos-store = { path = "../crates/opcos-store" }
+url.workspace = true
