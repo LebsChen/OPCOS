@@ -1,0 +1,1 @@
+[{"contentBlockDelta":{"contentBlockIndex":0,"delta":{"reasoningContent":{"text":"think"}}}},{"contentBlockDelta":{"contentBlockIndex":0,"delta":{"text":"hello"}}},{"messageStop":{"stopReason":"end_turn"}},{"metadata":{"usage":{"inputTokens":5,"outputTokens":2}}}]

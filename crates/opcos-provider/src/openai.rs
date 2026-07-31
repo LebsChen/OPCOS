@@ -215,9 +215,18 @@ impl Provider for OpenAiProvider {
         let choice = value
             .get("choices")
             .and_then(Value::as_array)
-            .and_then(|choices| choices.first())
-            .ok_or_else(|| ProviderError::Protocol("missing choices".into()))?;
-        let message = choice.get("message").unwrap_or(choice);
+            .and_then(|choices| choices.first());
+        let (choice, message) = if let Some(choice) = choice {
+            (choice, choice.get("message").unwrap_or(choice))
+        } else if let Some(output) = value.get("output").and_then(Value::as_array) {
+            let item = output
+                .iter()
+                .find(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+                .ok_or_else(|| ProviderError::Protocol("missing response output message".into()))?;
+            (item, item)
+        } else {
+            return Err(ProviderError::Protocol("missing choices".into()));
+        };
         let text = message
             .get("content")
             .and_then(Value::as_str)

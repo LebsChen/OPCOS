@@ -1,0 +1,8 @@
+data: {"choices":[{"delta":{"reasoning_content":"think"}}]}
+
+data: {"choices":[{"delta":{"content":"hello"}}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2}}
+
+data: [DONE]
+
