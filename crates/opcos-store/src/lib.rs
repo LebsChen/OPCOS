@@ -193,6 +193,41 @@ impl SqliteStore {
         Ok(store)
     }
 
+    pub fn load_tool_calls(&self, session_id: &str) -> Result<Vec<ToolCallRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT session_id,message_sequence,call_id,name,arguments,result FROM tool_calls WHERE session_id=?1 ORDER BY message_sequence,call_id",
+        )?;
+        let rows = statement.query_map([session_id], |row| {
+            let arguments: String = row.get(4)?;
+            let result: Option<String> = row.get(5)?;
+            Ok(ToolCallRecord {
+                session_id: row.get(0)?,
+                message_sequence: row.get(1)?,
+                call_id: row.get(2)?,
+                name: row.get(3)?,
+                arguments: serde_json::from_str(&arguments).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                result: result
+                    .map(|value| serde_json::from_str(&value))
+                    .transpose()
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            5,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     fn migrate(&self) -> Result<(), StoreError> {
         self.connection
             .lock()

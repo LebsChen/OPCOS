@@ -485,4 +485,14 @@ mod tests {
             "README.md"
         );
     }
+
+    #[test]
+    fn reasoning_content_is_separate_from_text() {
+        let value = json!({
+            "reasoning_content": "private chain",
+            "content": "visible answer"
+        });
+        assert_eq!(reasoning(&value).as_deref(), Some("private chain"));
+        assert_eq!(value["content"].as_str(), Some("visible answer"));
+    }
 }
