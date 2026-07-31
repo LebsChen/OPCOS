@@ -178,6 +178,30 @@ where
         let value = json!({"role":"tool","content":[{"type":"tool_result",
             "tool_use_id":pending.call_id,"content":[{"type":"text","text":result.to_string()}]}]});
         self.append("tool", value).await?;
+        if let Some(message_sequence) = self
+            .store
+            .load_messages(&self.session_id)
+            .map_err(|error| EngineError::Store(error.to_string()))?
+            .into_iter()
+            .rev()
+            .find(|message| {
+                message.role == "assistant"
+                    && message
+                        .content
+                        .get("tool_calls")
+                        .and_then(Value::as_array)
+                        .is_some_and(|calls| {
+                            calls
+                                .iter()
+                                .any(|call| call.get("id").and_then(Value::as_str) == Some(call_id))
+                        })
+            })
+            .map(|message| message.sequence)
+        {
+            self.store
+                .complete_tool_call(&self.session_id, message_sequence, call_id, &result)
+                .map_err(|error| EngineError::Store(error.to_string()))?;
+        }
         self.store
             .delete_pending(&self.session_id, call_id)
             .map_err(|error| EngineError::Store(error.to_string()))?;
@@ -241,8 +265,7 @@ where
                             messages.push(value);
                         }
                     } else {
-                        let results = self.execute_tools(&turn.tool_calls).await?;
-                        for (call, result) in turn.tool_calls.iter().zip(results) {
+                        for call in &turn.tool_calls {
                             self.store
                                 .append_tool_call(&opcos_store::ToolCallRecord {
                                     session_id: self.session_id.clone(),
@@ -253,6 +276,9 @@ where
                                     result: None,
                                 })
                                 .map_err(|error| EngineError::Store(error.to_string()))?;
+                        }
+                        let results = self.execute_tools(&turn.tool_calls).await?;
+                        for (call, result) in turn.tool_calls.iter().zip(results) {
                             let value = json!({"role":"tool","content":[{"type":"tool_result",
                                 "tool_use_id":call.id,"content":[{"type":"text","text":result.to_string()}]}]});
                             self.append("tool", value.clone()).await?;
