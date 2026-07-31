@@ -83,6 +83,13 @@ pub struct CompactionRecord {
     pub retained_from: i64,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GrantRecord {
+    pub session_id: String,
+    pub key: String,
+    pub target: String,
+}
+
 pub trait SessionStore {
     fn append_message(&self, message: &StoredMessage) -> Result<(), StoreError>;
     fn load_messages(&self, session_id: &str) -> Result<Vec<StoredMessage>, StoreError>;
@@ -101,6 +108,8 @@ pub trait SessionStore {
     fn delete_pending(&self, session_id: &str, call_id: &str) -> Result<(), StoreError>;
     fn save_compaction(&self, state: &CompactionRecord) -> Result<(), StoreError>;
     fn load_compaction(&self, session_id: &str) -> Result<Option<CompactionRecord>, StoreError>;
+    fn save_grant(&self, grant: &GrantRecord) -> Result<(), StoreError>;
+    fn load_grants(&self, session_id: &str) -> Result<Vec<GrantRecord>, StoreError>;
 }
 
 pub trait SecretStore: Send + Sync {
@@ -436,6 +445,32 @@ impl SessionStore for SqliteStore {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn save_grant(&self, grant: &GrantRecord) -> Result<(), StoreError> {
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "INSERT OR REPLACE INTO grants(session_id,grant_key,grant_value) VALUES (?1,?2,?3)",
+                params![grant.session_id, grant.key, grant.target],
+            )?;
+        Ok(())
+    }
+
+    fn load_grants(&self, session_id: &str) -> Result<Vec<GrantRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT session_id,grant_key,grant_value FROM grants WHERE session_id=?1 ORDER BY grant_key",
+        )?;
+        let rows = statement.query_map([session_id], |row| {
+            Ok(GrantRecord {
+                session_id: row.get(0)?,
+                key: row.get(1)?,
+                target: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 }
 

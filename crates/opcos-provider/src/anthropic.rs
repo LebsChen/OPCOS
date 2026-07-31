@@ -1,6 +1,7 @@
 use crate::{
     AssistantTurn, Caps, Provider, ProviderConfig, ProviderError, ProviderRequest, StreamChunk,
-    TokenUsage, ToolCall, ToolCallDelta, client, sanitize_secret, settings_object, tool_schema,
+    TokenUsage, ToolCall, ToolCallDelta, classify_context_error, client, sanitize_secret,
+    settings_object, tool_schema,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -78,6 +79,9 @@ impl AnthropicProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+            if let Some(error) = classify_context_error(status, &body) {
+                return Err(error);
+            }
             return Err(ProviderError::Http {
                 status,
                 message: sanitize_secret(&body, self.config.api_key.expose()),

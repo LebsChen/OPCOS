@@ -1,7 +1,7 @@
 use crate::{
     AssistantTurn, Caps, Provider, ProviderConfig, ProviderError, ProviderRequest, StreamChunk,
-    TokenUsage, ToolCall, ToolCallDelta, apply_bearer_headers, client, sanitize_secret,
-    settings_object, tool_schema,
+    TokenUsage, ToolCall, ToolCallDelta, apply_bearer_headers, classify_context_error, client,
+    sanitize_secret, settings_object, tool_schema,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -60,6 +60,9 @@ impl OpenAiProvider {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
             let lower = text.to_ascii_lowercase();
+            if let Some(error) = classify_context_error(status, &text) {
+                return Err(error);
+            }
             if lower.contains("reasoning_effort")
                 && lower.contains("not supported")
                 && body.get("reasoning_effort").is_some()

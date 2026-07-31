@@ -1,9 +1,12 @@
 use async_trait::async_trait;
-use opcos_policy::{Decision, PermissionMode, ToolRisk, decide};
+use opcos_policy::{Decision, DurableGrant, PermissionMode, ToolRisk, decide};
 use opcos_provider::{
-    AssistantTurn, Caps, Provider, ProviderError, ProviderRequest, StreamChunk, ToolCall,
+    AssistantTurn, Caps, Provider, ProviderError, ProviderRequest, StreamChunk, TokenUsage,
+    ToolCall,
 };
-use opcos_store::{CompactionRecord, NoticeRecord, PendingRecord, SessionStore, StoredMessage};
+use opcos_store::{
+    CompactionRecord, GrantRecord, NoticeRecord, PendingRecord, SessionStore, StoredMessage,
+};
 use serde_json::{Value, json};
 use std::sync::{
     Arc,
@@ -71,6 +74,8 @@ pub struct TurnEngine<P, S, E> {
     events: mpsc::Sender<StreamChunk>,
     receiver: Mutex<Option<mpsc::Receiver<StreamChunk>>>,
     sequence: Mutex<i64>,
+    interrupt_notify: Arc<tokio::sync::Notify>,
+    unattended: AtomicBool,
 }
 
 impl<P, S, E> TurnEngine<P, S, E>
@@ -108,6 +113,8 @@ where
             events,
             receiver: Mutex::new(Some(receiver)),
             sequence: Mutex::new(initial_sequence),
+            interrupt_notify: Arc::new(tokio::sync::Notify::new()),
+            unattended: AtomicBool::new(false),
         }
     }
 
@@ -128,26 +135,63 @@ where
             .store
             .load_resume_messages(&self.session_id)
             .map_err(|error| EngineError::Store(error.to_string()))?;
-        let Some(last) = messages.last() else {
+        let Some(assistant) = messages.iter().rev().find(|message| {
+            message.role == "assistant"
+                && message
+                    .content
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|calls| !calls.is_empty())
+        }) else {
             return Ok(None);
         };
-        let pending = last.role == "assistant"
-            && last
-                .content
-                .get("tool_calls")
-                .and_then(Value::as_array)
-                .is_some_and(|calls| !calls.is_empty())
-            && messages
-                .iter()
-                .skip_while(|item| item.sequence <= last.sequence)
-                .all(|item| item.role != "tool");
-        if pending {
-            Ok(Some(
-                self.run_loop(messages.into_iter().map(|item| item.content).collect())
-                    .await?,
-            ))
-        } else {
+        let result_ids = messages
+            .iter()
+            .filter(|message| message.role == "tool")
+            .filter_map(|message| {
+                message
+                    .content
+                    .pointer("/content/0/tool_use_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let calls = assistant
+            .content
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|call| {
+                let id = call.get("id").and_then(Value::as_str)?;
+                if result_ids.contains(id) {
+                    return None;
+                }
+                Some(ToolCall {
+                    id: id.into(),
+                    name: call.get("name").and_then(Value::as_str)?.into(),
+                    arguments: call.get("arguments").cloned().unwrap_or_default(),
+                })
+            })
+            .collect::<Vec<_>>();
+        if calls.is_empty() {
             Ok(None)
+        } else {
+            let sequence = assistant.sequence;
+            for call in &calls {
+                self.store
+                    .append_tool_call(&opcos_store::ToolCallRecord {
+                        session_id: self.session_id.clone(),
+                        message_sequence: sequence,
+                        call_id: call.id.clone(),
+                        name: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                        result: None,
+                    })
+                    .map_err(|error| EngineError::Store(error.to_string()))?;
+            }
+            self.execute_tools(sequence, &calls).await?;
+            Ok(Some(self.run_loop(self.provider_messages()?).await?))
         }
     }
 
@@ -155,30 +199,26 @@ where
         self.steering.lock().await.push(text.into());
     }
 
+    pub fn save_grant(
+        &self,
+        key: impl Into<String>,
+        target: impl Into<String>,
+    ) -> Result<(), EngineError> {
+        self.store
+            .save_grant(&GrantRecord {
+                session_id: self.session_id.clone(),
+                key: key.into(),
+                target: target.into(),
+            })
+            .map_err(|error| EngineError::Store(error.to_string()))
+    }
+
     pub async fn resolve_approval(
         &self,
         call_id: &str,
         outcome: ApprovalOutcome,
     ) -> Result<AssistantTurn, EngineError> {
-        let pending = self
-            .store
-            .load_pending(&self.session_id)
-            .map_err(|error| EngineError::Store(error.to_string()))?
-            .into_iter()
-            .find(|pending| pending.call_id == call_id)
-            .ok_or_else(|| EngineError::Store("approval request not found".into()))?;
-        let result = match outcome {
-            ApprovalOutcome::Approve => self
-                .executor
-                .execute(&pending.tool, pending.arguments)
-                .await
-                .unwrap_or_else(|error| json!({"error": error})),
-            ApprovalOutcome::Deny => json!({"error":"tool call denied by user"}),
-        };
-        let value = json!({"role":"tool","content":[{"type":"tool_result",
-            "tool_use_id":pending.call_id,"content":[{"type":"text","text":result.to_string()}]}]});
-        self.append("tool", value).await?;
-        if let Some(message_sequence) = self
+        let message_sequence = self
             .store
             .load_messages(&self.session_id)
             .map_err(|error| EngineError::Store(error.to_string()))?
@@ -197,14 +237,43 @@ where
                         })
             })
             .map(|message| message.sequence)
+            .ok_or_else(|| EngineError::Store("approval assistant message not found".into()))?;
+        let mut calls = Vec::new();
+        for item in self
+            .store
+            .load_pending(&self.session_id)
+            .map_err(|error| EngineError::Store(error.to_string()))?
         {
+            let result = if item.call_id == call_id && outcome == ApprovalOutcome::Approve {
+                self.executor
+                    .execute(&item.tool, item.arguments.clone())
+                    .await
+                    .unwrap_or_else(|error| json!({"error": error}))
+            } else if item.call_id == call_id {
+                json!({"error":"tool call denied by user"})
+            } else {
+                json!({"error":"tool call denied pending another approval"})
+            };
+            calls.push((
+                ToolCall {
+                    id: item.call_id.clone(),
+                    name: item.tool,
+                    arguments: item.arguments,
+                },
+                result,
+            ));
             self.store
-                .complete_tool_call(&self.session_id, message_sequence, call_id, &result)
+                .delete_pending(&self.session_id, &item.call_id)
                 .map_err(|error| EngineError::Store(error.to_string()))?;
         }
-        self.store
-            .delete_pending(&self.session_id, call_id)
-            .map_err(|error| EngineError::Store(error.to_string()))?;
+        for (call, result) in calls {
+            let value = json!({"role":"tool","content":[{"type":"tool_result",
+                "tool_use_id":call.id,"content":[{"type":"text","text":result.to_string()}]}]});
+            self.append("tool", value).await?;
+            self.store
+                .complete_tool_call(&self.session_id, message_sequence, &call.id, &result)
+                .map_err(|error| EngineError::Store(error.to_string()))?;
+        }
         self.run_loop(self.provider_messages()?).await
     }
 
@@ -217,6 +286,11 @@ where
 
     pub fn interrupt(&self) {
         self.interrupted.store(true, Ordering::SeqCst);
+        self.interrupt_notify.notify_waiters();
+    }
+
+    pub fn set_unattended(&self, unattended: bool) {
+        self.unattended.store(unattended, Ordering::SeqCst);
     }
     pub fn capabilities(&self, model: &str) -> Caps {
         self.provider.capabilities(model)
@@ -230,13 +304,14 @@ where
     }
 
     async fn run_loop(&self, mut messages: Vec<Value>) -> Result<AssistantTurn, EngineError> {
+        let mut usage: Option<TokenUsage> = None;
         for _ in 0..12 {
             if self.interrupted.load(Ordering::SeqCst) {
                 self.notice("interrupted", "Turn interrupted".into())
                     .await?;
                 return Err(EngineError::Interrupted);
             }
-            if messages.len() > 8 {
+            if self.should_compact(&messages, usage.as_ref()) {
                 messages = self.compact_context(messages).await?;
             }
             let request = ProviderRequest {
@@ -248,6 +323,7 @@ where
             let (provider_result, partial) = self.stream_turn(request).await;
             match provider_result {
                 Ok(turn) => {
+                    usage = turn.usage.clone();
                     let assistant = json!({"role":"assistant","content":turn.text.clone().unwrap_or_default(),
                         "tool_calls":turn.tool_calls,"reasoning":turn.reasoning});
                     self.append("assistant", assistant.clone()).await?;
@@ -277,19 +353,12 @@ where
                                 })
                                 .map_err(|error| EngineError::Store(error.to_string()))?;
                         }
-                        let results = self.execute_tools(&turn.tool_calls).await?;
+                        let results = self
+                            .execute_tools(assistant_sequence, &turn.tool_calls)
+                            .await?;
                         for (call, result) in turn.tool_calls.iter().zip(results) {
                             let value = json!({"role":"tool","content":[{"type":"tool_result",
                                 "tool_use_id":call.id,"content":[{"type":"text","text":result.to_string()}]}]});
-                            self.append("tool", value.clone()).await?;
-                            self.store
-                                .complete_tool_call(
-                                    &self.session_id,
-                                    assistant_sequence,
-                                    &call.id,
-                                    &result,
-                                )
-                                .map_err(|error| EngineError::Store(error.to_string()))?;
                             messages.push(value);
                         }
                     }
@@ -303,14 +372,14 @@ where
                         )
                         .await?;
                     }
-                    if error.to_string() == "provider response was invalid: interrupted" {
+                    if self.interrupted.load(Ordering::SeqCst) {
                         self.notice("interrupted", "Turn interrupted".into())
                             .await?;
                         return Err(EngineError::Interrupted);
                     }
                     self.notice("error", "Provider request failed".into())
                         .await?;
-                    if error.to_string().to_ascii_lowercase().contains("context") {
+                    if matches!(error, ProviderError::ContextOverflow) {
                         messages = self.compact_context(messages).await?;
                         continue;
                     }
@@ -323,19 +392,43 @@ where
         Err(EngineError::MaxIterations)
     }
 
+    fn should_compact(&self, messages: &[Value], usage: Option<&TokenUsage>) -> bool {
+        let model = self.model.try_lock().ok();
+        let caps = model
+            .as_deref()
+            .map(|model| self.provider.capabilities(model))
+            .unwrap_or_default();
+        let budget = caps.context_window.unwrap_or(32_000).saturating_mul(3) / 4;
+        let estimated = usage.map(TokenUsage::context_tokens).unwrap_or_else(|| {
+            serde_json::to_string(messages)
+                .map(|value| value.len() as u64 / 4)
+                .unwrap_or(u64::MAX)
+        });
+        estimated >= budget
+    }
+
     async fn stream_turn(
         &self,
         request: ProviderRequest,
     ) -> (Result<AssistantTurn, ProviderError>, PartialOutput) {
-        let (sender, mut receiver) = mpsc::channel(128);
+        let (sender, receiver) = mpsc::channel(128);
+        let mut receiver = Some(receiver);
         let provider = self.provider.stream(request, sender);
         tokio::pin!(provider);
         let mut partial = PartialOutput::default();
         loop {
             tokio::select! {
                 result = &mut provider => return (result, partial),
-                chunk = receiver.recv() => {
-                    let Some(chunk) = chunk else { continue };
+                chunk = async {
+                    match receiver.as_mut() {
+                        Some(receiver) => receiver.recv().await,
+                        None => futures_util::future::pending().await,
+                    }
+                } => {
+                    let Some(chunk) = chunk else {
+                        receiver = None;
+                        continue;
+                    };
                     if self.interrupted.load(Ordering::SeqCst) {
                         return (Err(ProviderError::Protocol("interrupted".into())), partial);
                     }
@@ -349,18 +442,31 @@ where
                         return (Err(ProviderError::Protocol("stream receiver closed".into())), partial);
                     }
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {
-                    if self.interrupted.load(Ordering::SeqCst) {
-                        return (Err(ProviderError::Protocol("interrupted".into())), partial);
-                    }
+                _ = self.interrupt_notify.notified() => {
+                    return (Err(ProviderError::Protocol("interrupted".into())), partial);
                 }
             }
         }
     }
 
-    async fn execute_tools(&self, calls: &[ToolCall]) -> Result<Vec<Value>, EngineError> {
+    async fn execute_tools(
+        &self,
+        assistant_sequence: i64,
+        calls: &[ToolCall],
+    ) -> Result<Vec<Value>, EngineError> {
         let mut results: Vec<Option<Value>> = (0..calls.len()).map(|_| None).collect();
         let mut readonly = Vec::new();
+        let grants = self
+            .store
+            .load_grants(&self.session_id)
+            .map_err(|error| EngineError::Store(error.to_string()))?
+            .into_iter()
+            .map(|grant| DurableGrant {
+                key: grant.key,
+                target: grant.target,
+            })
+            .collect::<Vec<_>>();
+        let unattended = self.unattended.load(Ordering::SeqCst);
         for (index, call) in calls.iter().enumerate() {
             if self.interrupted.load(Ordering::SeqCst) {
                 results[index] = Some(json!({"error":"tool call interrupted"}));
@@ -376,10 +482,28 @@ where
                         state: call.name.clone(),
                     })
                     .map_err(|error| EngineError::Store(error.to_string()))?;
+                let completed = results
+                    .iter()
+                    .take(index)
+                    .filter_map(|result| result.clone())
+                    .collect::<Vec<_>>();
+                self.persist_tool_results(assistant_sequence, &calls[..index], completed)
+                    .await?;
+                for remaining in &calls[index + 1..] {
+                    self.store
+                        .save_pending(&PendingRecord {
+                            session_id: self.session_id.clone(),
+                            call_id: remaining.id.clone(),
+                            tool: remaining.name.clone(),
+                            arguments: remaining.arguments.clone(),
+                            state: "pending".into(),
+                        })
+                        .map_err(|error| EngineError::Store(error.to_string()))?;
+                }
                 return Err(EngineError::ApprovalPending(call.id.clone()));
             }
             let risk = tool_risk(&call.name);
-            match decide(self.mode, risk, false, &[], &call.name) {
+            match decide(self.mode, risk, unattended, &grants, &call.name) {
                 Decision::Allow
                     if matches!(risk, ToolRisk::Read | ToolRisk::Search | ToolRisk::GitRead) =>
                 {
@@ -397,6 +521,38 @@ where
                     results[index] = Some(json!({"error":"tool call denied by policy"}))
                 }
                 Decision::NeedsUser => {
+                    let completed_reads = futures_util::future::join_all(readonly.drain(..).map(
+                        |(read_index, read_call): (usize, &ToolCall)| async move {
+                            let result = self
+                                .executor
+                                .execute(&read_call.name, read_call.arguments.clone())
+                                .await
+                                .unwrap_or_else(|error| json!({"error":error}));
+                            (read_index, result)
+                        },
+                    ))
+                    .await;
+                    for (read_index, result) in completed_reads {
+                        results[read_index] = Some(result);
+                    }
+                    let completed = results
+                        .iter()
+                        .take(index)
+                        .filter_map(|result| result.clone())
+                        .collect::<Vec<_>>();
+                    self.persist_tool_results(assistant_sequence, &calls[..index], completed)
+                        .await?;
+                    for remaining in &calls[index + 1..] {
+                        self.store
+                            .save_pending(&PendingRecord {
+                                session_id: self.session_id.clone(),
+                                call_id: remaining.id.clone(),
+                                tool: remaining.name.clone(),
+                                arguments: remaining.arguments.clone(),
+                                state: "pending".into(),
+                            })
+                            .map_err(|error| EngineError::Store(error.to_string()))?;
+                    }
                     self.store
                         .save_pending(&PendingRecord {
                             session_id: self.session_id.clone(),
@@ -423,7 +579,27 @@ where
         for (index, result) in readonly_results {
             results[index] = Some(result);
         }
-        Ok(results.into_iter().map(Option::unwrap).collect())
+        let results = results.into_iter().map(Option::unwrap).collect::<Vec<_>>();
+        self.persist_tool_results(assistant_sequence, calls, results.clone())
+            .await?;
+        Ok(results)
+    }
+
+    async fn persist_tool_results(
+        &self,
+        assistant_sequence: i64,
+        calls: &[ToolCall],
+        results: Vec<Value>,
+    ) -> Result<(), EngineError> {
+        for (call, result) in calls.iter().zip(results) {
+            let value = json!({"role":"tool","content":[{"type":"tool_result",
+                "tool_use_id":call.id,"content":[{"type":"text","text":result.to_string()}]}]});
+            self.append("tool", value).await?;
+            self.store
+                .complete_tool_call(&self.session_id, assistant_sequence, &call.id, &result)
+                .map_err(|error| EngineError::Store(error.to_string()))?;
+        }
+        Ok(())
     }
 
     fn provider_messages(&self) -> Result<Vec<Value>, EngineError> {
@@ -729,6 +905,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approval_pause_preserves_prior_and_following_tool_call_results() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .append_message(&StoredMessage {
+                session_id: "s".into(),
+                sequence: 1,
+                role: "assistant".into(),
+                content: json!({"role":"assistant","tool_calls":[
+                    {"id":"read-1","name":"read_file","arguments":{}},
+                    {"id":"write-1","name":"write_file","arguments":{}},
+                    {"id":"read-2","name":"list_dir","arguments":{}}
+                ]}),
+                display_only: false,
+            })
+            .unwrap();
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Interactive,
+            "fake",
+        );
+        let calls = vec![
+            ToolCall {
+                id: "read-1".into(),
+                name: "read_file".into(),
+                arguments: json!({}),
+            },
+            ToolCall {
+                id: "write-1".into(),
+                name: "write_file".into(),
+                arguments: json!({}),
+            },
+            ToolCall {
+                id: "read-2".into(),
+                name: "list_dir".into(),
+                arguments: json!({}),
+            },
+        ];
+        for call in &calls {
+            store
+                .append_tool_call(&opcos_store::ToolCallRecord {
+                    session_id: "s".into(),
+                    message_sequence: 1,
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    result: None,
+                })
+                .unwrap();
+        }
+        assert!(matches!(
+            engine.execute_tools(1, &calls).await,
+            Err(EngineError::ApprovalPending(id)) if id == "write-1"
+        ));
+        assert!(store.load_messages("s").unwrap().iter().any(|message| {
+            message
+                .content
+                .pointer("/content/0/tool_use_id")
+                .and_then(Value::as_str)
+                == Some("read-1")
+        }));
+        assert_eq!(store.load_pending("s").unwrap().len(), 2);
+        let restarted = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Interactive,
+            "fake",
+        );
+        restarted
+            .resolve_approval("write-1", ApprovalOutcome::Deny)
+            .await
+            .unwrap();
+        let results = store
+            .load_messages("s")
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.role == "tool")
+            .filter_map(|message| {
+                message
+                    .content
+                    .pointer("/content/0/tool_use_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert!(results.contains("read-1"));
+        assert!(results.contains("write-1"));
+        assert!(results.contains("read-2"));
+    }
+
+    #[tokio::test]
     async fn plan_and_ask_user_are_durable_pending_turns() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let provider = ApprovalProvider {
@@ -748,7 +1021,7 @@ mod tests {
             name: "propose_plan".into(),
             arguments: json!({"plan":"inspect"}),
         };
-        let pending = engine.execute_tools(&[call]).await;
+        let pending = engine.execute_tools(1, &[call]).await;
         assert!(matches!(pending, Err(EngineError::ApprovalPending(id)) if id == "plan-1"));
         assert_eq!(store.load_pending("s").unwrap()[0].state, "propose_plan");
         store.delete_pending("s", "plan-1").unwrap();
@@ -757,7 +1030,7 @@ mod tests {
             name: "ask_user".into(),
             arguments: json!({"question":"continue?"}),
         };
-        let pending = engine.execute_tools(&[ask]).await;
+        let pending = engine.execute_tools(1, &[ask]).await;
         assert!(matches!(pending, Err(EngineError::ApprovalPending(id)) if id == "ask-1"));
         assert_eq!(store.load_pending("s").unwrap()[0].state, "ask_user");
     }
@@ -770,6 +1043,42 @@ mod tests {
             value,
             json!({"type":"text","text":"[Image omitted: the selected model does not support vision.]"})
         );
+    }
+
+    #[test]
+    fn compaction_uses_token_budget_not_message_count() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let small = (0..20)
+            .map(|index| json!({"role":"user","content":format!("small-{index}")}))
+            .collect::<Vec<_>>();
+        assert!(!engine.should_compact(&small, None));
+        assert!(!engine.should_compact(
+            &small,
+            Some(&TokenUsage {
+                input: 1_000,
+                output: 0,
+                cache_read: 0,
+                cache_write: 0
+            })
+        ));
+        assert!(engine.should_compact(
+            &small,
+            Some(&TokenUsage {
+                input: 30_000,
+                output: 0,
+                cache_read: 0,
+                cache_write: 0
+            })
+        ));
     }
 
     #[tokio::test]
@@ -840,7 +1149,7 @@ mod tests {
                 arguments: json!({}),
             },
         ];
-        engine.execute_tools(&reads).await.unwrap();
+        engine.execute_tools(1, &reads).await.unwrap();
         let read_events = events.lock().await.clone();
         assert!(
             read_events
@@ -876,7 +1185,7 @@ mod tests {
                 arguments: json!({}),
             },
         ];
-        engine.execute_tools(&writes).await.unwrap();
+        engine.execute_tools(1, &writes).await.unwrap();
         let write_events = events.lock().await.clone();
         assert!(
             write_events
@@ -903,14 +1212,87 @@ mod tests {
         );
         engine.interrupt();
         let results = engine
-            .execute_tools(&[ToolCall {
-                id: "interrupted-1".into(),
-                name: "read_file".into(),
-                arguments: json!({}),
-            }])
+            .execute_tools(
+                1,
+                &[ToolCall {
+                    id: "interrupted-1".into(),
+                    name: "read_file".into(),
+                    arguments: json!({}),
+                }],
+            )
             .await
             .unwrap();
         assert_eq!(results, vec![json!({"error":"tool call interrupted"})]);
+    }
+
+    #[tokio::test]
+    async fn durable_grants_allow_exact_targets_only() {
+        let engine = TurnEngine::new(
+            FakeProvider,
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Interactive,
+            "fake",
+        );
+        engine.save_grant("write", "write_file").unwrap();
+        let allowed = engine
+            .execute_tools(
+                1,
+                &[ToolCall {
+                    id: "w".into(),
+                    name: "write_file".into(),
+                    arguments: json!({}),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed, vec![json!("ok")]);
+        assert!(matches!(
+            engine
+                .execute_tools(
+                    1,
+                    &[ToolCall { id:"x".into(), name:"run_shell".into(), arguments:json!({}) }],
+                )
+                .await,
+            Err(EngineError::ApprovalPending(id)) if id == "x"
+        ));
+    }
+
+    #[tokio::test]
+    async fn resume_executes_orphan_tool_calls_before_provider_retry() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .append_message(&StoredMessage {
+                session_id: "s".into(),
+                sequence: 1,
+                role: "assistant".into(),
+                content: json!({"role":"assistant","tool_calls":[
+                    {"id":"orphan","name":"read_file","arguments":{"path":"x"}}
+                ]}),
+                display_only: false,
+            })
+            .unwrap();
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let turn = engine.resume_pending_turn().await.unwrap().unwrap();
+        assert_eq!(turn.text.as_deref(), Some("done"));
+        assert!(store.load_messages("s").unwrap().iter().any(|message| {
+            message.role == "tool"
+                && message
+                    .content
+                    .pointer("/content/0/tool_use_id")
+                    .and_then(Value::as_str)
+                    == Some("orphan")
+        }));
     }
 
     #[derive(Clone)]
@@ -980,7 +1362,7 @@ mod tests {
             _: mpsc::Sender<StreamChunk>,
         ) -> Result<AssistantTurn, ProviderError> {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                Err(ProviderError::Protocol("context window exceeded".into()))
+                Err(ProviderError::ContextOverflow)
             } else {
                 Ok(AssistantTurn {
                     text: Some("retried".into()),
