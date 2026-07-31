@@ -890,6 +890,29 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn interrupted_tool_execution_returns_an_explicit_tool_result() {
+        let engine = TurnEngine::new(
+            FakeProvider,
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine.interrupt();
+        let results = engine
+            .execute_tools(&[ToolCall {
+                id: "interrupted-1".into(),
+                name: "read_file".into(),
+                arguments: json!({}),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(results, vec![json!({"error":"tool call interrupted"})]);
+    }
+
     #[derive(Clone)]
     struct LoopProvider {
         calls: Arc<std::sync::atomic::AtomicUsize>,
