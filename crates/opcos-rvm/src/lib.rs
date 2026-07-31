@@ -12,7 +12,7 @@ use tokio_tungstenite::{
 use url::Url;
 
 pub mod path_guard;
-pub use path_guard::{PathGuardError, RemotePathGuard};
+pub use path_guard::{PathGuardError, RemotePathGuard, join_remote_path};
 
 #[derive(Clone)]
 pub struct RvmClientConfig {

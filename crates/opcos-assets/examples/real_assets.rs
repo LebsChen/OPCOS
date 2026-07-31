@@ -15,6 +15,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .unwrap_or_else(|| "/workspace".into());
     let client = client.with_workspace(workspace.clone());
+    for path in [
+        "C:\\Users\\Team",
+        "C:\\Users\\Team\\work",
+        "C:\\Users\\Team\\work\\Cloud-Dev",
+    ] {
+        let listing = client.ls(Some(path)).await?;
+        println!(
+            "ls {}: {}",
+            path,
+            listing
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+    for path in [
+        "C:\\Users\\Team\\work\\Cloud-Dev\\AGENTS.md",
+        "C:\\Users\\Team/work/Cloud-Dev/AGENTS.md",
+    ] {
+        println!("read {}: {}", path, client.read(path).await.is_ok());
+    }
     let repo = format!("{workspace}/work/Cloud-Dev");
     for path in [
         "AGENTS.md",

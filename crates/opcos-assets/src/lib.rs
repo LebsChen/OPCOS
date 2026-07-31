@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use opcos_rvm::{RvmClient, RvmError};
+use opcos_rvm::{RvmClient, RvmError, join_remote_path};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -192,13 +192,13 @@ pub async fn discover<R: RemoteAssetReader>(
 ) -> Result<AssetBundle, AssetError> {
     let mut bundle = AssetBundle::default();
     for name in ["AGENTS.md", "CLAUDE.md", ".windsurfrules"] {
-        let path = format!("{workspace}/{name}");
+        let path = join_remote_path(workspace, name);
         if let Ok(content) = reader.read(&path).await {
             bundle.agents.push(InstructionSource { path, content });
         }
     }
     for path in [".cursor/rules", ".agents/skills"] {
-        let root = format!("{workspace}/{path}");
+        let root = join_remote_path(workspace, path);
         let _ = discover_tree(reader, &root, &mut bundle).await;
     }
     Ok(bundle)
@@ -213,7 +213,7 @@ async fn discover_tree<R: RemoteAssetReader>(
     while let Some(current) = pending.pop() {
         let entries = reader.list(Some(&current)).await?;
         for (name, dir) in entries {
-            let child = format!("{current}/{name}");
+            let child = join_remote_path(&current, &name);
             if dir {
                 pending.push(child);
             } else if name == "SKILL.md" {

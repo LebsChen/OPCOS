@@ -61,6 +61,14 @@ impl RemotePathGuard {
     }
 }
 
+pub fn join_remote_path(workspace: &str, child: &str) -> String {
+    let windows = workspace.as_bytes().get(1) == Some(&b':') || workspace.contains('\\');
+    let separator = if windows { '\\' } else { '/' };
+    let root = workspace.trim_end_matches(['/', '\\']);
+    let child = child.trim_start_matches(['/', '\\']).replace('/', "\\");
+    format!("{root}{separator}{child}")
+}
+
 impl fmt::Display for RemotePathGuard {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.workspace)
@@ -154,6 +162,18 @@ mod tests {
         assert_eq!(
             windows.path(r"C:\Windows"),
             Err(PathGuardError::OutsideWorkspace)
+        );
+    }
+
+    #[test]
+    fn joins_windows_paths_with_backslashes_and_tolerates_trailing_separators() {
+        assert_eq!(
+            join_remote_path("C:\\Users\\Team\\", "work/Cloud-Dev"),
+            "C:\\Users\\Team\\work\\Cloud-Dev"
+        );
+        assert_eq!(
+            join_remote_path("c:\\users\\TEAM", "\\AGENTS.md").to_ascii_lowercase(),
+            "c:\\users\\team\\agents.md"
         );
     }
 
