@@ -1,4 +1,5 @@
 use opcos_rvm::{ExecRequest, HttpRvmClient, RvmClient, RvmClientConfig, WorklogCursor};
+use serde_json::json;
 use std::env;
 use url::Url;
 
@@ -7,8 +8,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let base = Url::parse(&env::var("RVM_WINDOWS_URL")?)?;
     let token = env::var("RVM_WINDOWS_TOKEN")?;
     let client = HttpRvmClient::new(RvmClientConfig::new(base, token)?)?;
-
     let health = client.health().await?;
+    let workspace = health.workspace.as_deref().unwrap_or(".");
+    let client = client.with_workspace(workspace);
     println!(
         "health status={} version={} host={} workspace={} capabilities={}",
         health.status,
@@ -28,7 +30,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     println!("hostname={}", hostname.result.stdout.trim());
 
-    let workspace = health.workspace.as_deref().unwrap_or(".");
     let temp_path = format!("{workspace}/opcos-m1-smoke.txt");
     client.write(&temp_path, "opcos-m1\n").await?;
     let content = client.read(&temp_path).await?;
@@ -51,6 +52,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "git_changes={}",
         if git.is_ok() { "ok" } else { "unavailable" }
+    );
+    let status = client.git_status(workspace).await?;
+    println!("git_status_branch={}", status.branch);
+    let mcp = client
+        .mcp(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .await?;
+    println!(
+        "mcp_tools_list={}",
+        mcp.get("result")
+            .and_then(|result| result.get("tools"))
+            .and_then(|tools| tools.as_array())
+            .map_or(0, Vec::len)
     );
     let page = client.worklog_query("", 200).await?;
     let mut cursor = WorklogCursor::new();

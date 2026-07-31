@@ -11,6 +11,9 @@ use tokio_tungstenite::{
 };
 use url::Url;
 
+pub mod path_guard;
+pub use path_guard::{PathGuardError, RemotePathGuard};
+
 #[derive(Clone)]
 pub struct RvmClientConfig {
     pub base_url: Url,
@@ -58,22 +61,35 @@ pub enum RvmError {
     Http { status: StatusCode, message: String },
     #[error("RVM response JSON was invalid: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("RVM JSON-RPC error {code}: {message}")]
+    JsonRpc { code: i64, message: String },
     #[error("RVM websocket failed: {0}")]
     WebSocket(String),
     #[error("RVM capability is unavailable: {0}")]
     Unsupported(String),
+    #[error("remote path rejected: {0}")]
+    Path(String),
+    #[error("RVM persistent session could not be recovered: {0}")]
+    Session(String),
 }
 
 impl RvmError {
     fn http(status: StatusCode, body: &str, token: &str) -> Self {
-        let mut message = body.replace(token, "[redacted]");
-        for secret in ["Bearer ", "token", "tkn"] {
-            if secret == "Bearer " {
-                continue;
-            }
-            message = message.replace(secret, "[redacted]");
-        }
+        let message = if token.is_empty() {
+            body.to_owned()
+        } else {
+            body.replace(token, "[redacted]")
+        };
         Self::Http { status, message }
+    }
+
+    fn json_rpc(code: i64, message: &str, token: &str) -> Self {
+        let message = if token.is_empty() {
+            message.to_owned()
+        } else {
+            message.replace(token, "[redacted]")
+        };
+        Self::JsonRpc { code, message }
     }
 }
 
@@ -154,6 +170,34 @@ pub struct GitFileChange {
     pub change_type: String,
     pub additions: i64,
     pub deletions: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GitStatus {
+    pub branch: String,
+    pub files: Vec<Value>,
+    pub short_status: String,
+    pub has_uncommitted: bool,
+    pub has_untracked: bool,
+    pub diff_count: u64,
+    pub in_sync: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GitDiff {
+    pub diff: String,
+    pub exit_code: i32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GitLog {
+    pub commits: Vec<Value>,
+    pub count: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GitRevParse {
+    pub sha: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -255,6 +299,13 @@ pub enum WsKind {
     Cdp,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct WsParams {
+    pub cols: Option<u16>,
+    pub rows: Option<u16>,
+    pub cwd: Option<String>,
+}
+
 pub type RvmWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -290,15 +341,20 @@ pub trait RvmClient: Send + Sync {
     async fn ls(&self, path: Option<&str>) -> Result<DirectoryListing, RvmError>;
     async fn git_changes(&self, cwd: &str, base: &str) -> Result<GitChanges, RvmError>;
     async fn git_file_diff(&self, cwd: &str, path: &str, base: &str) -> Result<Value, RvmError>;
+    async fn git_status(&self, cwd: &str) -> Result<GitStatus, RvmError>;
+    async fn git_diff(&self, cwd: &str, reference: Option<&str>) -> Result<GitDiff, RvmError>;
+    async fn git_log(&self, cwd: &str, count: u32) -> Result<GitLog, RvmError>;
+    async fn git_rev_parse(&self, cwd: &str, reference: &str) -> Result<GitRevParse, RvmError>;
     async fn worklog_query(&self, after_id: &str, limit: u32) -> Result<WorklogPage, RvmError>;
     async fn mcp(&self, request: Value) -> Result<Value, RvmError>;
-    async fn open_ws(&self, kind: WsKind) -> Result<RvmWebSocket, RvmError>;
+    async fn open_ws(&self, kind: WsKind, params: WsParams) -> Result<RvmWebSocket, RvmError>;
 }
 
 #[derive(Clone)]
 pub struct HttpRvmClient {
     config: RvmClientConfig,
     http: Client,
+    path_guard: Option<RemotePathGuard>,
 }
 
 pub struct PersistentShell<C> {
@@ -320,20 +376,54 @@ where
     }
 
     pub async fn exec(&mut self, command: impl Into<String>) -> Result<ExecResult, RvmError> {
-        let result = self
-            .client
+        let command = command.into();
+        let result = self.exec_once(&command, self.cwd.clone()).await?;
+        if self.session_lost(&result) {
+            self.rebuild_cwd().await?;
+            let retry = self.exec_once(&command, None).await?;
+            if self.session_lost(&retry) {
+                return Err(RvmError::Session(retry.result.stderr.trim().to_owned()));
+            }
+            self.update_cwd(&retry);
+            return Ok(retry);
+        }
+        self.update_cwd(&result);
+        Ok(result)
+    }
+
+    async fn exec_once(&self, command: &str, cwd: Option<String>) -> Result<ExecResult, RvmError> {
+        self.client
             .exec_sync(ExecRequest {
-                command: command.into(),
-                cwd: self.cwd.clone(),
+                command: command.to_owned(),
+                cwd,
                 timeout_seconds: 30,
                 session: Some(self.session.clone()),
                 env: None,
             })
-            .await?;
+            .await
+    }
+
+    fn update_cwd(&mut self, result: &ExecResult) {
         if let Some(cwd) = result.result.cwd.clone() {
             self.cwd = Some(cwd);
         }
-        Ok(result)
+    }
+
+    fn session_lost(&self, result: &ExecResult) -> bool {
+        let returned_session_mismatch = result
+            .result
+            .session
+            .as_deref()
+            .is_some_and(|session| session != self.session);
+        let returned_cwd_mismatch = self.cwd.is_some()
+            && result
+                .result
+                .cwd
+                .as_deref()
+                .is_some_and(|cwd| Some(cwd) != self.cwd.as_deref());
+        let explicit_loss = result.result.stderr.contains("session exited")
+            || result.result.stderr.contains("session not found");
+        returned_session_mismatch || returned_cwd_mismatch || explicit_loss
     }
 
     pub async fn rebuild_cwd(&mut self) -> Result<(), RvmError> {
@@ -343,7 +433,10 @@ where
             } else {
                 format!("cd -- '{cwd}'")
             };
-            let _ = self.exec(command).await?;
+            let result = self.exec_once(&command, None).await?;
+            if result.result.exit_code != 0 || self.session_lost(&result) {
+                return Err(RvmError::Session(result.result.stderr.trim().to_owned()));
+            }
         }
         Ok(())
     }
@@ -363,7 +456,30 @@ impl HttpRvmClient {
             .timeout(config.request_timeout)
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
-        Ok(Self { config, http })
+        Ok(Self {
+            config,
+            http,
+            path_guard: None,
+        })
+    }
+
+    pub fn with_workspace(mut self, workspace: impl Into<String>) -> Self {
+        self.path_guard = Some(RemotePathGuard::new(workspace));
+        self
+    }
+
+    fn remote_path(&self, path: &str) -> Result<String, RvmError> {
+        self.path_guard
+            .as_ref()
+            .map_or_else(|| Ok(path.to_owned()), |guard| guard.path(path))
+            .map_err(|error| RvmError::Path(error.to_string()))
+    }
+
+    fn repository_path(&self, path: &str) -> Result<String, RvmError> {
+        self.path_guard
+            .as_ref()
+            .map_or_else(|| Ok(path.to_owned()), |guard| guard.repository_path(path))
+            .map_err(|error| RvmError::Path(error.to_string()))
     }
 
     async fn post_json<T: Serialize, R: DeserializeOwned>(
@@ -489,7 +605,8 @@ impl RvmClient for HttpRvmClient {
         struct Body<'a> {
             path: &'a str,
         }
-        self.post_json("/api/read", &Body { path }).await
+        let path = self.remote_path(path)?;
+        self.post_json("/api/read", &Body { path: &path }).await
     }
 
     async fn write(&self, path: &str, content: &str) -> Result<Value, RvmError> {
@@ -498,7 +615,15 @@ impl RvmClient for HttpRvmClient {
             path: &'a str,
             content: &'a str,
         }
-        self.post_json("/api/write", &Body { path, content }).await
+        let path = self.remote_path(path)?;
+        self.post_json(
+            "/api/write",
+            &Body {
+                path: &path,
+                content,
+            },
+        )
+        .await
     }
 
     async fn ls(&self, path: Option<&str>) -> Result<DirectoryListing, RvmError> {
@@ -507,7 +632,14 @@ impl RvmClient for HttpRvmClient {
             #[serde(skip_serializing_if = "Option::is_none")]
             path: Option<&'a str>,
         }
-        self.post_json("/api/ls", &Body { path }).await
+        let path = path.map(|path| self.remote_path(path)).transpose()?;
+        self.post_json(
+            "/api/ls",
+            &Body {
+                path: path.as_deref(),
+            },
+        )
+        .await
     }
 
     async fn git_changes(&self, cwd: &str, base: &str) -> Result<GitChanges, RvmError> {
@@ -516,7 +648,8 @@ impl RvmClient for HttpRvmClient {
             cwd: &'a str,
             base: &'a str,
         }
-        self.post_json("/api/git/changes", &Body { cwd, base })
+        let cwd = self.remote_path(cwd)?;
+        self.post_json("/api/git/changes", &Body { cwd: &cwd, base })
             .await
     }
 
@@ -527,8 +660,80 @@ impl RvmClient for HttpRvmClient {
             path: &'a str,
             base: &'a str,
         }
-        self.post_json("/api/git/file-diff", &Body { cwd, path, base })
-            .await
+        let cwd = self.remote_path(cwd)?;
+        let path = self.repository_path(path)?;
+        self.post_json(
+            "/api/git/file-diff",
+            &Body {
+                cwd: &cwd,
+                path: &path,
+                base,
+            },
+        )
+        .await
+    }
+
+    async fn git_status(&self, cwd: &str) -> Result<GitStatus, RvmError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            cwd: &'a str,
+        }
+        let cwd = self.remote_path(cwd)?;
+        self.post_json("/api/git/status", &Body { cwd: &cwd }).await
+    }
+
+    async fn git_diff(&self, cwd: &str, reference: Option<&str>) -> Result<GitDiff, RvmError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            cwd: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            #[serde(rename = "ref")]
+            reference: Option<&'a str>,
+        }
+        let cwd = self.remote_path(cwd)?;
+        self.post_json(
+            "/api/git/diff",
+            &Body {
+                cwd: &cwd,
+                reference,
+            },
+        )
+        .await
+    }
+
+    async fn git_log(&self, cwd: &str, count: u32) -> Result<GitLog, RvmError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            cwd: &'a str,
+            n: u32,
+        }
+        let cwd = self.remote_path(cwd)?;
+        self.post_json(
+            "/api/git/log",
+            &Body {
+                cwd: &cwd,
+                n: count,
+            },
+        )
+        .await
+    }
+
+    async fn git_rev_parse(&self, cwd: &str, reference: &str) -> Result<GitRevParse, RvmError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            cwd: &'a str,
+            #[serde(rename = "ref")]
+            reference: &'a str,
+        }
+        let cwd = self.remote_path(cwd)?;
+        self.post_json(
+            "/api/git/rev-parse",
+            &Body {
+                cwd: &cwd,
+                reference,
+            },
+        )
+        .await
     }
 
     async fn worklog_query(&self, after_id: &str, limit: u32) -> Result<WorklogPage, RvmError> {
@@ -571,13 +776,18 @@ impl RvmClient for HttpRvmClient {
             ));
         }
         let value: Value = serde_json::from_slice(&bytes)?;
-        if value.get("error").is_some() {
-            return Ok(value);
+        if let Some(error) = value.get("error") {
+            let code = error.get("code").and_then(Value::as_i64).unwrap_or(-32000);
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown JSON-RPC error");
+            return Err(RvmError::json_rpc(code, message, &self.config.token));
         }
         Ok(value)
     }
 
-    async fn open_ws(&self, kind: WsKind) -> Result<RvmWebSocket, RvmError> {
+    async fn open_ws(&self, kind: WsKind, params: WsParams) -> Result<RvmWebSocket, RvmError> {
         let path = match kind {
             WsKind::Pty => "/pty-ws",
             WsKind::Vnc => "/vnc-ws",
@@ -590,6 +800,21 @@ impl RvmClient for HttpRvmClient {
         })
         .map_err(|_| RvmError::InvalidUrl)?;
         url.set_path(path);
+        {
+            let mut pairs = url.query_pairs_mut();
+            if matches!(kind, WsKind::Pty) {
+                if let Some(cols) = params.cols {
+                    pairs.append_pair("cols", &cols.to_string());
+                }
+                if let Some(rows) = params.rows {
+                    pairs.append_pair("rows", &rows.to_string());
+                }
+                if let Some(cwd) = params.cwd {
+                    let cwd = self.remote_path(&cwd)?;
+                    pairs.append_pair("cwd", &cwd);
+                }
+            }
+        }
         let mut request = url
             .as_str()
             .into_client_request()
@@ -611,6 +836,8 @@ impl RvmClient for HttpRvmClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn token_is_redacted_from_debug() {
@@ -637,6 +864,24 @@ mod tests {
             token,
         );
         assert!(!error.to_string().contains(token));
+        let readable = RvmError::http(StatusCode::BAD_REQUEST, "missing token", token);
+        assert_eq!(
+            readable.to_string(),
+            "RVM returned HTTP 400 Bad Request: missing token"
+        );
+    }
+
+    #[test]
+    fn mcp_error_fixture_has_json_rpc_shape() {
+        let value: Value =
+            serde_json::from_str(include_str!("../../../fixtures/mcp/error.json")).unwrap();
+        assert_eq!(value["error"]["code"], -32601);
+        assert_eq!(value["error"]["message"], "method not found");
+        let error = RvmError::json_rpc(-32601, "invalid secret-token", "secret-token");
+        assert_eq!(
+            error.to_string(),
+            "RVM JSON-RPC error -32601: invalid [redacted]"
+        );
     }
 
     #[test]
@@ -665,6 +910,18 @@ mod tests {
         let changes: GitChanges =
             serde_json::from_str(include_str!("../../../fixtures/rvm/git-changes.json")).unwrap();
         assert_eq!(changes.files[0].change_type, "added");
+        let status: GitStatus =
+            serde_json::from_str(include_str!("../../../fixtures/rvm/git-status.json")).unwrap();
+        assert!(!status.has_uncommitted);
+        let diff: GitDiff =
+            serde_json::from_str(include_str!("../../../fixtures/rvm/git-diff.json")).unwrap();
+        assert_eq!(diff.exit_code, 0);
+        let log: GitLog =
+            serde_json::from_str(include_str!("../../../fixtures/rvm/git-log.json")).unwrap();
+        assert_eq!(log.count, 0);
+        let rev_parse: GitRevParse =
+            serde_json::from_str(include_str!("../../../fixtures/rvm/git-rev-parse.json")).unwrap();
+        assert_eq!(rev_parse.sha, "0123456789abcdef");
         let worklog: WorklogPage =
             serde_json::from_str(include_str!("../../../fixtures/rvm/worklog.json")).unwrap();
         assert_eq!(worklog.last_id, "1");
@@ -678,5 +935,112 @@ mod tests {
         assert!(cursor.accept(&first));
         assert!(!cursor.accept(&old));
         assert_eq!(cursor.after_id(), "");
+    }
+
+    #[derive(Clone)]
+    struct MockShellClient {
+        responses: Arc<Mutex<VecDeque<ExecResult>>>,
+    }
+
+    impl MockShellClient {
+        fn new(responses: Vec<ExecResult>) -> Self {
+            Self {
+                responses: Arc::new(Mutex::new(responses.into())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RvmClient for MockShellClient {
+        async fn health(&self) -> Result<Health, RvmError> {
+            unreachable!()
+        }
+        async fn info(&self) -> Result<Info, RvmError> {
+            unreachable!()
+        }
+        async fn capabilities(&self) -> Result<Capabilities, RvmError> {
+            unreachable!()
+        }
+        async fn exec_sync(&self, _: ExecRequest) -> Result<ExecResult, RvmError> {
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| RvmError::Session("mock exhausted".into()))
+        }
+        async fn read(&self, _: &str) -> Result<FileContent, RvmError> {
+            unreachable!()
+        }
+        async fn write(&self, _: &str, _: &str) -> Result<Value, RvmError> {
+            unreachable!()
+        }
+        async fn ls(&self, _: Option<&str>) -> Result<DirectoryListing, RvmError> {
+            unreachable!()
+        }
+        async fn git_changes(&self, _: &str, _: &str) -> Result<GitChanges, RvmError> {
+            unreachable!()
+        }
+        async fn git_file_diff(&self, _: &str, _: &str, _: &str) -> Result<Value, RvmError> {
+            unreachable!()
+        }
+        async fn git_status(&self, _: &str) -> Result<GitStatus, RvmError> {
+            unreachable!()
+        }
+        async fn git_diff(&self, _: &str, _: Option<&str>) -> Result<GitDiff, RvmError> {
+            unreachable!()
+        }
+        async fn git_log(&self, _: &str, _: u32) -> Result<GitLog, RvmError> {
+            unreachable!()
+        }
+        async fn git_rev_parse(&self, _: &str, _: &str) -> Result<GitRevParse, RvmError> {
+            unreachable!()
+        }
+        async fn worklog_query(&self, _: &str, _: u32) -> Result<WorklogPage, RvmError> {
+            unreachable!()
+        }
+        async fn mcp(&self, _: Value) -> Result<Value, RvmError> {
+            unreachable!()
+        }
+        async fn open_ws(&self, _: WsKind, _: WsParams) -> Result<RvmWebSocket, RvmError> {
+            unreachable!()
+        }
+    }
+
+    fn shell_result(session: Option<&str>, cwd: Option<&str>, stderr: &str) -> ExecResult {
+        ExecResult {
+            status: "completed".into(),
+            result: CommandResult {
+                stdout: "ok".into(),
+                stderr: stderr.into(),
+                exit_code: if stderr.is_empty() { 0 } else { 1 },
+                timed_out: false,
+                session: session.map(str::to_owned),
+                cwd: cwd.map(str::to_owned),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_shell_rebuilds_and_retries_after_session_loss() {
+        let client = MockShellClient::new(vec![
+            shell_result(Some("gone"), None, "shell session exited"),
+            shell_result(None, Some("/workspace"), ""),
+            shell_result(None, Some("/workspace"), ""),
+        ]);
+        let mut shell = PersistentShell::new(client, "shell-1", Some("/workspace".into()));
+        let result = shell.exec("echo recovered").await.unwrap();
+        assert_eq!(result.result.stdout, "ok");
+    }
+
+    #[tokio::test]
+    async fn persistent_shell_reports_second_failure() {
+        let client = MockShellClient::new(vec![
+            shell_result(Some("gone"), None, "shell session exited"),
+            shell_result(None, Some("/workspace"), ""),
+            shell_result(None, None, "shell session exited"),
+        ]);
+        let mut shell = PersistentShell::new(client, "shell-1", Some("/workspace".into()));
+        let error = shell.exec("echo recovered").await.unwrap_err();
+        assert!(error.to_string().contains("shell session exited"));
     }
 }

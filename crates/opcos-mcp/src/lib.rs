@@ -112,13 +112,33 @@ mod tests {
         async fn git_file_diff(&self, _: &str, _: &str, _: &str) -> Result<Value, RvmError> {
             unreachable!()
         }
+        async fn git_status(&self, _: &str) -> Result<opcos_rvm::GitStatus, RvmError> {
+            unreachable!()
+        }
+        async fn git_diff(&self, _: &str, _: Option<&str>) -> Result<opcos_rvm::GitDiff, RvmError> {
+            unreachable!()
+        }
+        async fn git_log(&self, _: &str, _: u32) -> Result<opcos_rvm::GitLog, RvmError> {
+            unreachable!()
+        }
+        async fn git_rev_parse(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<opcos_rvm::GitRevParse, RvmError> {
+            unreachable!()
+        }
         async fn worklog_query(&self, _: &str, _: u32) -> Result<opcos_rvm::WorklogPage, RvmError> {
             unreachable!()
         }
         async fn mcp(&self, _: Value) -> Result<Value, RvmError> {
             unreachable!()
         }
-        async fn open_ws(&self, _: opcos_rvm::WsKind) -> Result<opcos_rvm::RvmWebSocket, RvmError> {
+        async fn open_ws(
+            &self,
+            _: opcos_rvm::WsKind,
+            _: opcos_rvm::WsParams,
+        ) -> Result<opcos_rvm::RvmWebSocket, RvmError> {
             unreachable!()
         }
     }
