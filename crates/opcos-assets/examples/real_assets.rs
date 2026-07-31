@@ -15,6 +15,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .unwrap_or_else(|| "/workspace".into());
     let client = client.with_workspace(workspace.clone());
+    if env::var_os("OPCOS_SMOKE_FIXTURE").is_some() {
+        return run_fixture_smoke(&client, &workspace).await;
+    }
     for path in [
         "C:\\Users\\Team",
         "C:\\Users\\Team\\work",
@@ -122,5 +125,120 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|value| value.as_array())
             .map_or(0, Vec::len)
     );
+    Ok(())
+}
+
+async fn run_fixture_smoke(
+    client: &HttpRvmClient,
+    workspace: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let root = opcos_rvm::join_remote_path(workspace, ".opcos-smoke");
+    let create = format!(
+        "cmd /c \"mkdir \\\"{root}\\.cursor\\rules\\\" & mkdir \\\"{root}\\.agents\\skills\\demo\\\" & mkdir \\\"{root}\\.agents\\knowledge\\\" & mkdir \\\"{root}\\.agents\\playbooks\\\" & mkdir \\\"{root}\\.devin\\\"\""
+    );
+    let result = async {
+        client
+            .exec_sync(ExecRequest {
+                command: create,
+                cwd: Some(workspace.to_owned()),
+                timeout_seconds: 30,
+                session: Some("opcos-m6-fixture".into()),
+                env: None,
+            })
+            .await?;
+    let files = [
+        (
+            "AGENTS.md",
+            "# Agent instructions\nUse the repository policy.",
+        ),
+        ("CLAUDE.md", "Read AGENTS.md for repository instructions."),
+        (".windsurfrules", "Use the repository rules."),
+        (".cursor\\rules\\project.mdc", "Use the project rule."),
+        (
+            ".agents\\skills\\demo\\SKILL.md",
+            "---\nname: demo\n---\nUse the demo skill.",
+        ),
+        (
+            ".agents\\knowledge\\demo.md",
+            "---\nid: demo-knowledge\nname: Demo Knowledge\ntrigger: smoke\nscope: repository\n---\nKnown smoke context.",
+        ),
+        (
+            ".agents\\playbooks\\demo.md",
+            "---\nid: demo-playbook\nname: Demo Playbook\ntrigger: explicit\nscope: repository\n---\nRun the smoke playbook.",
+        ),
+        (
+            ".devin\\blueprint.yaml",
+            "initialize:\n  - node --version\ndependencies: []\nbuild: []\n",
+        ),
+    ];
+    for (path, content) in files {
+        client
+            .write(&opcos_rvm::join_remote_path(&root, path), content)
+            .await?;
+    }
+        let bundle = discover(client, &root).await?;
+        let instruction_files = bundle.agents.len();
+        let blueprint_text = RvmClient::read(
+            client,
+            &opcos_rvm::join_remote_path(&root, ".devin\\blueprint.yaml"),
+        )
+        .await?
+        .content;
+        let blueprint = parse_blueprint(&blueprint_text)?;
+        let command = blueprint
+            .initialize
+            .first()
+            .ok_or("missing initialize command")?;
+        let exec = client
+            .exec_sync(ExecRequest {
+                command: command.clone(),
+                cwd: Some(root.clone()),
+                timeout_seconds: 30,
+                session: Some("opcos-m6-fixture".into()),
+                env: None,
+            })
+            .await?;
+        let system = bundle.system_instructions();
+        println!(
+            "fixture instruction_files={} knowledge={} playbook={} skills={} phases={} commands={}",
+            instruction_files,
+            bundle.knowledge.len(),
+            bundle.playbook.is_some(),
+            bundle.skills.len(),
+            usize::from(!blueprint.initialize.is_empty())
+                + usize::from(!blueprint.dependencies.is_empty())
+                + usize::from(!blueprint.build.is_empty()),
+            blueprint.initialize.len() + blueprint.dependencies.len() + blueprint.build.len()
+        );
+        println!(
+            "fixture blueprint_exit={} stdout={} system={:?} token_or_secret={}",
+            exec.result.exit_code,
+            exec.result.stdout.trim(),
+            system,
+            system.to_ascii_lowercase().contains("token")
+                || system.to_ascii_lowercase().contains("secret")
+        );
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    let cleanup = client
+        .exec_sync(ExecRequest {
+            command: format!("cmd /c \"rmdir /s /q \\\"{root}\\\"\""),
+            cwd: Some(workspace.to_owned()),
+            timeout_seconds: 30,
+            session: Some("opcos-m6-fixture".into()),
+            env: None,
+        })
+        .await;
+    let verify = client.ls(Some(&root)).await.is_err();
+    println!(
+        "fixture_cleanup={} cleanup_exit={}",
+        verify,
+        cleanup.map(|r| r.result.exit_code).unwrap_or(-1)
+    );
+    result?;
+    if !verify {
+        return Err("fixture directory still exists".into());
+    }
     Ok(())
 }
