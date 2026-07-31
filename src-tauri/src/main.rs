@@ -2,12 +2,15 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
+use futures_util::{SinkExt, StreamExt};
 use opcos_engine::{AgentEngine, EngineError, ToolExecutor, TurnEngine};
 use opcos_policy::PermissionMode;
 use opcos_provider::ProviderConfig;
 use opcos_provider::openai::OpenAiProvider;
 use opcos_provider::registry;
-use opcos_rvm::{HttpRvmClient, PersistentShell, RvmClient, RvmClientConfig};
+use opcos_rvm::{
+    HttpRvmClient, IdeBootstrap, PersistentShell, RvmClient, RvmClientConfig, WsKind, WsParams,
+};
 use opcos_store::{KeyringSecretStore, SecretStore, SessionStore, SqliteStore};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -16,7 +19,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, State};
+use tokio::net::TcpListener;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio_tungstenite::accept_async;
 
 const SECRET_SERVICE: &str = "com.opcos.desktop";
 
@@ -25,6 +30,7 @@ struct DesktopState {
     secrets: KeyringSecretStore,
     store: Arc<SqliteStore>,
     engines: AsyncMutex<HashMap<String, Arc<GuiEngine>>>,
+    surfaces: AsyncMutex<HashMap<u16, tauri::async_runtime::JoinHandle<()>>>,
 }
 
 type GuiEngine = TurnEngine<OpenAiProvider, SqliteStore, RemoteExecutor>;
@@ -199,6 +205,43 @@ fn client_for(state: &DesktopState, host_id: &str) -> Result<HttpRvmClient, Stri
     let parsed = url::Url::parse(&url).map_err(|_| "remote host URL is invalid".to_owned())?;
     let config = RvmClientConfig::new(parsed, token).map_err(|error| error.to_string())?;
     HttpRvmClient::new(config).map_err(|error| error.to_string())
+}
+
+async fn relay_surface(
+    listener: TcpListener,
+    client: HttpRvmClient,
+    kind: WsKind,
+    params: WsParams,
+) {
+    let Ok((stream, _)) = listener.accept().await else {
+        return;
+    };
+    let Ok(browser) = accept_async(stream).await else {
+        return;
+    };
+    let Ok(upstream) = client.open_ws(kind, params).await else {
+        return;
+    };
+    let (mut browser_write, mut browser_read) = browser.split();
+    let (mut upstream_write, mut upstream_read) = upstream.split();
+    let browser_to_upstream = async {
+        while let Some(Ok(message)) = browser_read.next().await {
+            if upstream_write.send(message).await.is_err() {
+                break;
+            }
+        }
+    };
+    let upstream_to_browser = async {
+        while let Some(Ok(message)) = upstream_read.next().await {
+            if browser_write.send(message).await.is_err() {
+                break;
+            }
+        }
+    };
+    tokio::select! {
+        _ = browser_to_upstream => {},
+        _ = upstream_to_browser => {},
+    }
 }
 
 async fn engine_for(
@@ -424,6 +467,63 @@ async fn test_host(state: State<'_, DesktopState>, host_id: String) -> Result<Ho
             reason: Some(error),
         }),
     }
+}
+
+#[tauri::command]
+async fn start_surface(
+    state: State<'_, DesktopState>,
+    host_id: String,
+    surface: String,
+    cols: Option<u16>,
+    rows: Option<u16>,
+    cwd: Option<String>,
+) -> Result<u16, String> {
+    let kind = match surface.as_str() {
+        "pty" => WsKind::Pty,
+        "vnc" => WsKind::Vnc,
+        "cdp" => WsKind::Cdp,
+        _ => return Err("unknown surface".into()),
+    };
+    let client = client_for(&state, &host_id)?;
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .map_err(|error| error.to_string())?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| error.to_string())?
+        .port();
+    let params = WsParams { cols, rows, cwd };
+    let task = tauri::async_runtime::spawn(relay_surface(listener, client, kind, params));
+    state.surfaces.lock().await.insert(port, task);
+    Ok(port)
+}
+
+#[tauri::command]
+async fn ide_bootstrap(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    folder_uri: String,
+) -> Result<IdeBootstrap, String> {
+    if !folder_uri.starts_with("vscode-remote://") {
+        return Err("IDE folder must be a vscode-remote URI".into());
+    }
+    let host_id = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        connection
+            .query_row(
+                "SELECT host_id FROM sessions WHERE id=?1",
+                [&session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|_| "session not found".to_owned())?
+    };
+    client_for(&state, &host_id)?
+        .ide_bootstrap(&folder_uri)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -794,6 +894,7 @@ fn main() {
                 secrets: KeyringSecretStore::new(SECRET_SERVICE),
                 store,
                 engines: AsyncMutex::new(HashMap::new()),
+                surfaces: AsyncMutex::new(HashMap::new()),
             });
             emit(
                 app.handle(),
@@ -819,7 +920,9 @@ fn main() {
             provider_settings,
             save_provider_settings,
             save_provider_key,
-            validate_provider_key
+            validate_provider_key,
+            start_surface,
+            ide_bootstrap
         ])
         .run(tauri::generate_context!())
         .expect("error while running OPCOS");

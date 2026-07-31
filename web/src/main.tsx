@@ -43,6 +43,7 @@ function App() {
   const [providerKey, setProviderKey] = useState("");
   const [providers, setProviders] = useState<ProviderDescriptor[]>([]);
   const [baseUrl, setBaseUrl] = useState("");
+  const [surfacePorts, setSurfacePorts] = useState<Record<string, number>>({});
 
   const refresh = async () => {
     setHosts(await command<Host[]>("list_hosts"));
@@ -150,6 +151,22 @@ function App() {
     );
   };
 
+  const startSurface = async (surface: string) => {
+    if (!selected) return;
+    try {
+      const port = await command<number>("start_surface", {
+        hostId: selected.host_id,
+        surface,
+        cols: 120,
+        rows: 32,
+      });
+      setSurfacePorts((items) => ({ ...items, [surface]: port }));
+      setError("");
+    } catch (reason) {
+      setError(String(reason));
+    }
+  };
+
   return (
     <div className="app">
       <header>
@@ -159,6 +176,23 @@ function App() {
       </header>
       <div className="layout">
         <aside>
+          <section>
+            <h2>Workbench surfaces</h2>
+            <p className="muted">
+              RVM WebSockets terminate in Rust; the UI only receives loopback
+              bridge ports.
+            </p>
+            {(["pty", "vnc", "cdp"] as const).map((surface) => (
+              <div key={surface}>
+                <button onClick={() => void startSurface(surface)}>
+                  Start {surface.toUpperCase()}
+                </button>
+                {surfacePorts[surface] && (
+                  <small>ws://127.0.0.1:{surfacePorts[surface]}</small>
+                )}
+              </div>
+            ))}
+          </section>
           <section>
             <h2>Hosts</h2>
             <form onSubmit={(event) => void addHost(event)}>
