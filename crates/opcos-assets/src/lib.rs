@@ -197,7 +197,12 @@ pub async fn discover<R: RemoteAssetReader>(
             bundle.agents.push(InstructionSource { path, content });
         }
     }
-    for path in [".cursor/rules", ".agents/skills"] {
+    for path in [
+        ".cursor/rules",
+        ".agents/skills",
+        ".agents/knowledge",
+        ".agents/playbooks",
+    ] {
         let root = join_remote_path(workspace, path);
         let _ = discover_tree(reader, &root, &mut bundle).await;
     }
@@ -230,7 +235,8 @@ async fn discover_tree<R: RemoteAssetReader>(
                 && name.ends_with(".md")
             {
                 bundle.playbook = Some(parse_playbook(&child, &reader.read(&child).await?));
-            } else if name.ends_with(".md") {
+            } else if child.replace('\\', "/").contains("/.cursor/rules/") || name.ends_with(".md")
+            {
                 bundle.agents.push(InstructionSource {
                     path: child.clone(),
                     content: reader.read(&child).await?,

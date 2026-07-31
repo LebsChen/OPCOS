@@ -133,19 +133,7 @@ async fn run_fixture_smoke(
     workspace: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root = opcos_rvm::join_remote_path(workspace, ".opcos-smoke");
-    let create = format!(
-        "cmd /c \"mkdir \\\"{root}\\.cursor\\rules\\\" & mkdir \\\"{root}\\.agents\\skills\\demo\\\" & mkdir \\\"{root}\\.agents\\knowledge\\\" & mkdir \\\"{root}\\.agents\\playbooks\\\" & mkdir \\\"{root}\\.devin\\\"\""
-    );
     let result = async {
-        client
-            .exec_sync(ExecRequest {
-                command: create,
-                cwd: Some(workspace.to_owned()),
-                timeout_seconds: 30,
-                session: Some("opcos-m6-fixture".into()),
-                env: None,
-            })
-            .await?;
     let files = [
         (
             "AGENTS.md",
@@ -176,7 +164,10 @@ async fn run_fixture_smoke(
             .write(&opcos_rvm::join_remote_path(&root, path), content)
             .await?;
     }
-        let bundle = discover(client, &root).await?;
+        let mut bundle = discover(client, &root).await?;
+        for skill in &mut bundle.skills {
+            skill.active = true;
+        }
         let instruction_files = bundle.agents.len();
         let blueprint_text = RvmClient::read(
             client,
@@ -194,7 +185,7 @@ async fn run_fixture_smoke(
                 command: command.clone(),
                 cwd: Some(root.clone()),
                 timeout_seconds: 30,
-                session: Some("opcos-m6-fixture".into()),
+                session: None,
                 env: None,
             })
             .await?;
@@ -223,10 +214,13 @@ async fn run_fixture_smoke(
     .await;
     let cleanup = client
         .exec_sync(ExecRequest {
-            command: format!("cmd /c \"rmdir /s /q \\\"{root}\\\"\""),
+            command: format!(
+                "Remove-Item -LiteralPath '{}' -Recurse -Force",
+                root.replace('\'', "''")
+            ),
             cwd: Some(workspace.to_owned()),
             timeout_seconds: 30,
-            session: Some("opcos-m6-fixture".into()),
+            session: None,
             env: None,
         })
         .await;
