@@ -415,15 +415,9 @@ where
             .session
             .as_deref()
             .is_some_and(|session| session != self.session);
-        let returned_cwd_mismatch = self.cwd.is_some()
-            && result
-                .result
-                .cwd
-                .as_deref()
-                .is_some_and(|cwd| Some(cwd) != self.cwd.as_deref());
         let explicit_loss = result.result.stderr.contains("session exited")
             || result.result.stderr.contains("session not found");
-        returned_session_mismatch || returned_cwd_mismatch || explicit_loss
+        returned_session_mismatch || explicit_loss
     }
 
     pub async fn rebuild_cwd(&mut self) -> Result<(), RvmError> {
@@ -837,7 +831,10 @@ impl RvmClient for HttpRvmClient {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[test]
     fn token_is_redacted_from_debug() {
@@ -940,12 +937,14 @@ mod tests {
     #[derive(Clone)]
     struct MockShellClient {
         responses: Arc<Mutex<VecDeque<ExecResult>>>,
+        calls: Arc<AtomicUsize>,
     }
 
     impl MockShellClient {
         fn new(responses: Vec<ExecResult>) -> Self {
             Self {
                 responses: Arc::new(Mutex::new(responses.into())),
+                calls: Arc::new(AtomicUsize::new(0)),
             }
         }
     }
@@ -962,6 +961,7 @@ mod tests {
             unreachable!()
         }
         async fn exec_sync(&self, _: ExecRequest) -> Result<ExecResult, RvmError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
             self.responses
                 .lock()
                 .unwrap()
@@ -1042,5 +1042,15 @@ mod tests {
         let mut shell = PersistentShell::new(client, "shell-1", Some("/workspace".into()));
         let error = shell.exec("echo recovered").await.unwrap_err();
         assert!(error.to_string().contains("shell session exited"));
+    }
+
+    #[tokio::test]
+    async fn persistent_shell_accepts_cwd_changes_without_retrying() {
+        let client = MockShellClient::new(vec![shell_result(None, Some("/workspace/subdir"), "")]);
+        let calls = Arc::clone(&client.calls);
+        let mut shell = PersistentShell::new(client, "shell-1", Some("/workspace".into()));
+        let result = shell.exec("cd subdir").await.unwrap();
+        assert_eq!(result.result.cwd.as_deref(), Some("/workspace/subdir"));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 }
