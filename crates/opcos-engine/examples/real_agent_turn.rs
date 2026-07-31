@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use opcos_engine::{ToolExecutor, TurnEngine};
 use opcos_policy::PermissionMode;
-use opcos_provider::{ProviderConfig, openai::OpenAiProvider};
+use opcos_provider::{ProviderConfig, openai::OpenAiProvider, registry};
 use opcos_rvm::{HttpRvmClient, PersistentShell, RvmClient, RvmClientConfig};
 use opcos_store::SqliteStore;
 use serde_json::{Value, json};
@@ -65,9 +65,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )),
     });
     let store = Arc::new(SqliteStore::open_in_memory()?);
+    let default_base_url = registry::descriptors()
+        .into_iter()
+        .find(|descriptor| descriptor.name == "openai")
+        .and_then(|descriptor| descriptor.default_base_url)
+        .ok_or("OpenAI provider has no registry default URL")?;
     let provider = OpenAiProvider::new(ProviderConfig::new(
-        std::env::var("OPCOS_PROVIDER_BASE_URL")
-            .unwrap_or_else(|_| "https://ai.yaoshen.de5.net/v1".into()),
+        std::env::var("OPCOS_PROVIDER_BASE_URL").unwrap_or(default_base_url),
         provider_key,
     ));
     let smoke_path = format!("{workspace}\\opcos-m3-smoke.txt");

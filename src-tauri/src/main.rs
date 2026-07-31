@@ -155,6 +155,10 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                mode TEXT NOT NULL,
                created_at TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS settings (
+               key TEXT PRIMARY KEY,
+               value TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS transcript (
                session_id TEXT NOT NULL,
                sequence INTEGER NOT NULL,
@@ -227,6 +231,38 @@ async fn engine_for(
             )
             .map_err(|_| "session not found".to_owned())?
     };
+    let (provider_id, configured_base_url) = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let provider = connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='provider.id'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap_or_else(|_| "openai".into());
+        let base_url = connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='provider.base_url'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok();
+        (provider, base_url)
+    };
+    let descriptor = registry::descriptors()
+        .into_iter()
+        .find(|item| item.name == provider_id)
+        .ok_or_else(|| "provider is not configured; open Provider settings first".to_owned())?;
+    let base_url = std::env::var("OPCOS_PROVIDER_BASE_URL")
+        .ok()
+        .or(configured_base_url)
+        .or(descriptor.default_base_url)
+        .ok_or_else(|| {
+            "provider base URL is not configured; open Provider settings first".to_owned()
+        })?;
     let client = client_for(state, &host_id)?;
     let health = client
         .health()
@@ -244,14 +280,10 @@ async fn engine_for(
     });
     let key = state
         .secrets
-        .get(&secret_key("provider-key", "openai"))
+        .get(&secret_key("provider-key", &provider_id))
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "provider key is not configured; open Provider settings first".to_owned())?;
-    let provider = OpenAiProvider::new(ProviderConfig::new(
-        std::env::var("OPCOS_PROVIDER_BASE_URL")
-            .unwrap_or_else(|_| "https://ai.yaoshen.de5.net/v1".into()),
-        key,
-    ));
+    let provider = OpenAiProvider::new(ProviderConfig::new(base_url, key));
     let permission_mode = match mode.as_str() {
         "Discuss" => PermissionMode::Discuss,
         "Plan" => PermissionMode::Plan,
@@ -621,6 +653,65 @@ fn save_provider_key(
 }
 
 #[tauri::command]
+fn provider_settings(state: State<'_, DesktopState>) -> Result<Value, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let provider = connection
+        .query_row(
+            "SELECT value FROM settings WHERE key='provider.id'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_else(|_| "openai".into());
+    let base_url = connection
+        .query_row(
+            "SELECT value FROM settings WHERE key='provider.base_url'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok();
+    Ok(json!({"provider":provider,"base_url":base_url}))
+}
+
+#[tauri::command]
+fn save_provider_settings(
+    state: State<'_, DesktopState>,
+    provider: String,
+    base_url: Option<String>,
+) -> Result<(), String> {
+    let descriptor = registry::descriptors()
+        .into_iter()
+        .find(|item| item.name == provider)
+        .ok_or_else(|| "unknown provider".to_owned())?;
+    let base_url = base_url
+        .filter(|value| !value.trim().is_empty())
+        .or(descriptor.default_base_url)
+        .ok_or_else(|| {
+            "provider base URL is not configured; enter one in Provider settings".to_owned()
+        })?;
+    url::Url::parse(&base_url).map_err(|_| "provider base URL is invalid".to_owned())?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES ('provider.id',?1)",
+            [&provider],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES ('provider.base_url',?1)",
+            [&base_url],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 async fn validate_provider_key(
     state: State<'_, DesktopState>,
     provider: String,
@@ -637,13 +728,27 @@ async fn validate_provider_key(
     if provider == "bedrock" || descriptor.default_base_url.is_none() {
         return Ok(true);
     }
-    let url = format!(
-        "{}/models",
-        descriptor
-            .default_base_url
-            .unwrap_or_default()
-            .trim_end_matches('/')
-    );
+    let configured_base_url = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='provider.base_url'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+    };
+    let base_url = std::env::var("OPCOS_PROVIDER_BASE_URL")
+        .ok()
+        .or(configured_base_url)
+        .or(descriptor.default_base_url)
+        .ok_or_else(|| {
+            "provider base URL is not configured; open Provider settings first".to_owned()
+        })?;
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
     let client = reqwest::Client::new();
     let request = if provider == "anthropic" {
         client.get(url).header("x-api-key", key)
@@ -711,6 +816,8 @@ fn main() {
             resolve_approval,
             change_model,
             provider_descriptors,
+            provider_settings,
+            save_provider_settings,
             save_provider_key,
             validate_provider_key
         ])

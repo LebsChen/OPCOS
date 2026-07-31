@@ -49,3 +49,12 @@ export function submitFailureMessage(error: unknown): string {
     ? "Provider key is not configured; open Provider settings first."
     : message;
 }
+
+export function providerBaseUrlError(
+  baseUrl: string,
+  hasRegistryDefault: boolean,
+): string | null {
+  return baseUrl.trim() || hasRegistryDefault
+    ? null
+    : "Provider base URL is not configured; open Provider settings first.";
+}

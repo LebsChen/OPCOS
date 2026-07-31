@@ -42,6 +42,7 @@ function App() {
   const [provider, setProvider] = useState("openai");
   const [providerKey, setProviderKey] = useState("");
   const [providers, setProviders] = useState<ProviderDescriptor[]>([]);
+  const [baseUrl, setBaseUrl] = useState("");
 
   const refresh = async () => {
     setHosts(await command<Host[]>("list_hosts"));
@@ -57,6 +58,12 @@ function App() {
     void refresh().catch((reason: unknown) => setError(String(reason)));
     void command<ProviderDescriptor[]>("provider_descriptors")
       .then(setProviders)
+      .catch((reason: unknown) => setError(String(reason)));
+    void command<{ provider: string; base_url?: string }>("provider_settings")
+      .then((settings) => {
+        setProvider(settings.provider);
+        setBaseUrl(settings.base_url || "");
+      })
       .catch((reason: unknown) => setError(String(reason)));
     let active = true;
     const subscription = listen<UiEvent>("opcos://event", (event) => {
@@ -325,6 +332,12 @@ function App() {
             ))}
           </select>
           <input
+            value={baseUrl}
+            onChange={(event) => setBaseUrl(event.target.value)}
+            placeholder="Provider base URL (optional when registry has a default)"
+            type="url"
+          />
+          <input
             type="password"
             value={providerKey}
             onChange={(event) => setProviderKey(event.target.value)}
@@ -332,10 +345,16 @@ function App() {
           />
           <button
             onClick={() => {
-              void command("save_provider_key", {
+              void command("save_provider_settings", {
                 provider,
-                key: providerKey,
+                baseUrl: baseUrl || null,
               })
+                .then(() =>
+                  command("save_provider_key", {
+                    provider,
+                    key: providerKey,
+                  }),
+                )
                 .then(() => command("validate_provider_key", { provider }))
                 .then(() => {
                   setProviderKey("");

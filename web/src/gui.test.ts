@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import {
   canRebindSession,
   hostFailureMessage,
   noticeClass,
   redactApproval,
   submitFailureMessage,
+  providerBaseUrlError,
 } from "./gui";
 
 describe("GUI boundary behavior", () => {
@@ -32,5 +35,18 @@ describe("GUI boundary behavior", () => {
     expect(submitFailureMessage("provider key is not configured; open Provider settings first")).toContain(
       "Provider key is not configured",
     );
+  });
+
+  it("requires a base URL when the registry has no default", () => {
+    expect(providerBaseUrlError("", false)).toContain("base URL is not configured");
+    expect(providerBaseUrlError("", true)).toBeNull();
+  });
+
+  it("does not contain the retired private gateway address", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("../../src-tauri/src/main.rs", import.meta.url)),
+      "utf8",
+    );
+    expect(source).not.toContain(["ai", "yaoshen", "de5", "net"].join("."));
   });
 });
