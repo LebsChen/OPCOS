@@ -14,7 +14,10 @@ use axum::{
 };
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
-use opcos_assets::{AssetBundle, discover as discover_assets};
+use opcos_assets::{
+    AssetBundle, InstructionSource, KnowledgeEntry, Playbook, SkillEntry,
+    discover as discover_assets, parse_blueprint,
+};
 use opcos_engine::{AgentEngine, EngineError, ToolExecutor, TurnEngine};
 use opcos_policy::PermissionMode;
 use opcos_provider::ProviderConfig;
@@ -51,6 +54,7 @@ type GuiEngine = TurnEngine<OpenAiProvider, SqliteStore, RemoteExecutor>;
 struct RemoteExecutor {
     client: HttpRvmClient,
     shell: AsyncMutex<PersistentShell<HttpRvmClient>>,
+    secrets: KeyringSecretStore,
 }
 
 #[derive(Clone)]
@@ -86,14 +90,38 @@ impl ToolExecutor for RemoteExecutor {
                 .await
                 .map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
                 .map_err(|error| error.to_string()),
-            "run_shell" | "exec" => self
-                .shell
-                .lock()
-                .await
-                .exec(argument("command")?)
-                .await
-                .map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
-                .map_err(|error| error.to_string()),
+            "run_shell" | "exec" => {
+                let names = arguments
+                    .get("secret_names")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>();
+                let mut env = serde_json::Map::new();
+                let mut values = Vec::new();
+                for name in names {
+                    let value = self
+                        .secrets
+                        .get(&secret_key("asset-secret", name))
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| format!("secret is not configured: {name}"))?;
+                    env.insert(name.to_owned(), Value::String(value.clone()));
+                    values.push(value);
+                }
+                let result = self
+                    .shell
+                    .lock()
+                    .await
+                    .exec_with_env(argument("command")?, Some(Value::Object(env)))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let mut output = serde_json::to_value(result).unwrap_or(Value::Null);
+                for value in values {
+                    redact_json_strings(&mut output, &value);
+                }
+                Ok(output)
+            }
             "git_status" => self
                 .client
                 .git_status(argument("cwd")?)
@@ -109,8 +137,33 @@ impl ToolExecutor for RemoteExecutor {
                 .await
                 .map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
                 .map_err(|error| error.to_string()),
+            name if name.starts_with("mcp:") => {
+                let tool = name.trim_start_matches("mcp:");
+                self.client
+                    .mcp(json!({
+                        "jsonrpc": "2.0",
+                        "id": format!("opcos-{tool}"),
+                        "method": "tools/call",
+                        "params": {"name": tool, "arguments": arguments}
+                    }))
+                    .await
+                    .map_err(|error| error.to_string())
+            }
             _ => Err(format!("remote tool is unavailable: {name}")),
         }
+    }
+}
+
+fn redact_json_strings(value: &mut Value, secret: &str) {
+    match value {
+        Value::String(text) => *text = text.replace(secret, "[REDACTED]"),
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| redact_json_strings(item, secret)),
+        Value::Object(items) => items
+            .values_mut()
+            .for_each(|item| redact_json_strings(item, secret)),
+        _ => {}
     }
 }
 
@@ -204,6 +257,18 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                name TEXT PRIMARY KEY,
                scope TEXT NOT NULL,
                purpose TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS mcp_session_tools (
+               session_id TEXT NOT NULL,
+               name TEXT NOT NULL,
+               enabled INTEGER NOT NULL,
+               PRIMARY KEY(session_id,name)
+             );
+             CREATE TABLE IF NOT EXISTS asset_session_selection (
+               session_id TEXT NOT NULL,
+               asset_id TEXT NOT NULL,
+               enabled INTEGER NOT NULL,
+               PRIMARY KEY(session_id,asset_id)
              );",
         )
         .map_err(|error| error.to_string())?;
@@ -494,6 +559,7 @@ async fn engine_for(
             Some(workspace.clone()),
         )),
         client: executor_client.clone(),
+        secrets: state.secrets.clone(),
     });
     let key = state
         .secrets
@@ -517,7 +583,85 @@ async fn engine_for(
         permission_mode,
         model,
     ));
-    if let Ok(bundle) = discover_assets(&executor_client, &workspace).await {
+    if let Ok(response) = executor_client
+        .mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
+        .await
+    {
+        let all_tools = response
+            .get("result")
+            .and_then(|value| value.get("tools"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let enabled = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?
+            .prepare("SELECT name FROM mcp_session_tools WHERE session_id=?1 AND enabled=1")
+            .and_then(|mut statement| {
+                let rows = statement.query_map([session_id], |row| row.get::<_, String>(0))?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_default();
+        let selected = all_tools
+            .into_iter()
+            .filter(|tool| {
+                tool.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| enabled.iter().any(|item| item == name))
+            })
+            .collect();
+        engine.set_external_tools(selected).await;
+    }
+    if let Ok(mut bundle) = discover_assets(&executor_client, &workspace).await {
+        let local_assets = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?
+            .prepare(
+                "SELECT a.id,a.kind,a.title,a.body,a.trigger,a.scope
+                 FROM asset_records a
+                 LEFT JOIN asset_session_selection s
+                   ON s.asset_id=a.id AND s.session_id=?1
+                 WHERE a.enabled=1 AND COALESCE(s.enabled,1)=1",
+            )
+            .and_then(|mut statement| {
+                let rows = statement.query_map([session_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_default();
+        for (id, kind, title, body, trigger, scope) in local_assets {
+            match kind.as_str() {
+                "knowledge" => bundle.knowledge.push(KnowledgeEntry {
+                    title,
+                    body,
+                    trigger,
+                    scope,
+                    enabled: true,
+                }),
+                "playbook" => bundle.playbook = Some(Playbook { title, body }),
+                "skill" => bundle.skills.push(SkillEntry {
+                    name: title,
+                    path: id,
+                    content: body,
+                    active: true,
+                }),
+                "agents" => bundle.agents.push(InstructionSource {
+                    path: id,
+                    content: body,
+                }),
+                _ => {}
+            }
+        }
         engine
             .set_system_instructions(Some(bundle.system_instructions()))
             .await;
@@ -1035,6 +1179,26 @@ fn delete_asset(state: State<'_, DesktopState>, id: String) -> Result<(), String
 }
 
 #[tauri::command]
+fn set_asset_enabled(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    asset_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .execute(
+            "INSERT OR REPLACE INTO asset_session_selection(session_id,asset_id,enabled)
+             VALUES (?1,?2,?3)",
+            params![session_id, asset_id, enabled],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 async fn discover_remote_assets(
     state: State<'_, DesktopState>,
     session_id: String,
@@ -1067,6 +1231,52 @@ async fn discover_remote_assets(
     discover_assets(&client.with_workspace(workspace.clone()), &workspace)
         .await
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn mcp_tools(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Vec<Value>, String> {
+    let host_id = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .query_row(
+            "SELECT host_id FROM sessions WHERE id=?1",
+            [session_id.clone()],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| "session not found".to_owned())?;
+    let response = client_for(&state, &host_id)?
+        .mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(response
+        .get("result")
+        .and_then(|value| value.get("tools"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
+#[tauri::command]
+fn set_mcp_tool_enabled(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    name: String,
+    enabled: bool,
+) -> Result<(), String> {
+    state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .execute(
+            "INSERT OR REPLACE INTO mcp_session_tools(session_id,name,enabled) VALUES (?1,?2,?3)",
+            params![session_id, name, enabled],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1127,6 +1337,65 @@ async fn execute_blueprint(
         .await
         .map_err(|error| error.to_string())?;
     serde_json::to_value(result).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn run_blueprint(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Value, String> {
+    let host_id = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .query_row(
+            "SELECT host_id FROM sessions WHERE id=?1",
+            [session_id.clone()],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| "session not found".to_owned())?;
+    let client = client_for(&state, &host_id)?;
+    let blueprint = parse_blueprint(
+        &client
+            .read(".devin/blueprint.yaml")
+            .await
+            .map_err(|error| error.to_string())?
+            .content,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut completed = Vec::new();
+    for (phase, commands) in [
+        ("initialize", blueprint.initialize),
+        ("dependencies", blueprint.dependencies),
+        ("build", blueprint.build),
+    ] {
+        for (index, command) in commands.into_iter().enumerate() {
+            let result = client
+                .exec_sync(opcos_rvm::ExecRequest {
+                    command,
+                    cwd: None,
+                    timeout_seconds: 1800,
+                    session: Some(format!("opcos-blueprint-{session_id}")),
+                    env: None,
+                })
+                .await
+                .map_err(|error| format!("blueprint {phase}[{index}] failed: {error}"))?;
+            if result.result.exit_code != 0 {
+                return Err(format!(
+                    "blueprint {phase}[{index}] failed with exit code {}: {}",
+                    result.result.exit_code,
+                    result.result.stderr.trim()
+                ));
+            }
+            completed.push(json!({
+                "phase": phase,
+                "index": index,
+                "stdout": result.result.stdout,
+                "stderr": result.result.stderr,
+            }));
+        }
+    }
+    Ok(json!({"status":"ok","completed":completed}))
 }
 
 #[tauri::command]
@@ -1362,9 +1631,13 @@ fn main() {
             list_assets,
             save_asset,
             delete_asset,
+            set_asset_enabled,
             discover_remote_assets,
+            mcp_tools,
+            set_mcp_tool_enabled,
             read_blueprint,
             execute_blueprint,
+            run_blueprint,
             save_secret_metadata,
             list_secret_metadata,
             provider_settings,

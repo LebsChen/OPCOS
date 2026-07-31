@@ -48,6 +48,33 @@ pub struct SkillEntry {
     pub active: bool,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Blueprint {
+    #[serde(default)]
+    pub initialize: Vec<String>,
+    #[serde(default, alias = "install")]
+    pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub build: Vec<String>,
+}
+
+pub fn parse_blueprint(yaml: &str) -> Result<Blueprint, AssetError> {
+    serde_yaml::from_str(yaml).map_err(|error| AssetError::Invalid(format!("blueprint: {error}")))
+}
+
+pub fn redact_secret(value: &mut serde_json::Value, secret: &str) {
+    match value {
+        serde_json::Value::String(text) => *text = text.replace(secret, "[REDACTED]"),
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| redact_secret(item, secret)),
+        serde_json::Value::Object(items) => items
+            .values_mut()
+            .for_each(|item| redact_secret(item, secret)),
+        _ => {}
+    }
+}
+
 impl AssetBundle {
     pub fn system_instructions(&self) -> String {
         let mut sections = Vec::new();
@@ -237,5 +264,47 @@ mod tests {
         assert!(rendered.find("agents").unwrap() < rendered.find("knowledge").unwrap());
         assert!(rendered.find("knowledge").unwrap() < rendered.find("playbook").unwrap());
         assert!(rendered.find("playbook").unwrap() < rendered.find("skill").unwrap());
+    }
+
+    #[test]
+    fn parses_frontmatter_and_skill_shape() {
+        let knowledge = parse_knowledge(
+            ".agents/knowledge/repo.md",
+            "---\nname: Repository\ntrigger: build\nscope: repo\nenabled: true\n---\nUse the repository build command.",
+        )
+        .unwrap();
+        assert_eq!(knowledge.title, "Repository");
+        assert_eq!(knowledge.trigger, "build");
+        assert_eq!(knowledge.body, "Use the repository build command.");
+        let skill = parse_skill(
+            ".agents/skills/review/SKILL.md",
+            "# Review\nCheck the diff.",
+        );
+        assert_eq!(skill.name, "review");
+        assert!(skill.content.contains("Check the diff."));
+    }
+
+    #[test]
+    fn parses_structured_blueprint_steps() {
+        let blueprint =
+            parse_blueprint("initialize:\n  - setup\ninstall:\n  - deps\nbuild:\n  - compile\n")
+                .unwrap();
+        assert_eq!(blueprint.initialize, vec!["setup"]);
+        assert_eq!(blueprint.dependencies, vec!["deps"]);
+        assert_eq!(blueprint.build, vec!["compile"]);
+    }
+
+    #[test]
+    fn redacts_secret_values_from_serialized_outputs() {
+        let secret = "known-test-secret";
+        let mut value = serde_json::json!({
+            "provider": format!("prefix-{secret}"),
+            "worklog": [secret],
+            "transcript": {"text": secret},
+            "log": secret
+        });
+        redact_secret(&mut value, secret);
+        assert!(!value.to_string().contains(secret));
+        assert_eq!(value["worklog"][0], "[REDACTED]");
     }
 }

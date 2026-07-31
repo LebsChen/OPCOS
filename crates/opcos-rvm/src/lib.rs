@@ -500,11 +500,21 @@ where
     }
 
     pub async fn exec(&mut self, command: impl Into<String>) -> Result<ExecResult, RvmError> {
+        self.exec_with_env(command, None).await
+    }
+
+    pub async fn exec_with_env(
+        &mut self,
+        command: impl Into<String>,
+        env: Option<Value>,
+    ) -> Result<ExecResult, RvmError> {
         let command = command.into();
-        let result = self.exec_once(&command, self.cwd.clone()).await?;
+        let result = self
+            .exec_once(&command, self.cwd.clone(), env.clone())
+            .await?;
         if self.session_lost(&result) {
             self.rebuild_cwd().await?;
-            let retry = self.exec_once(&command, None).await?;
+            let retry = self.exec_once(&command, None, env).await?;
             if self.session_lost(&retry) {
                 return Err(RvmError::Session(retry.result.stderr.trim().to_owned()));
             }
@@ -515,14 +525,19 @@ where
         Ok(result)
     }
 
-    async fn exec_once(&self, command: &str, cwd: Option<String>) -> Result<ExecResult, RvmError> {
+    async fn exec_once(
+        &self,
+        command: &str,
+        cwd: Option<String>,
+        env: Option<Value>,
+    ) -> Result<ExecResult, RvmError> {
         self.client
             .exec_sync(ExecRequest {
                 command: command.to_owned(),
                 cwd,
                 timeout_seconds: 30,
                 session: Some(self.session.clone()),
-                env: None,
+                env,
             })
             .await
     }
@@ -551,7 +566,7 @@ where
             } else {
                 format!("cd -- '{cwd}'")
             };
-            let result = self.exec_once(&command, None).await?;
+            let result = self.exec_once(&command, None, None).await?;
             if result.result.exit_code != 0 || self.session_lost(&result) {
                 return Err(RvmError::Session(result.result.stderr.trim().to_owned()));
             }
