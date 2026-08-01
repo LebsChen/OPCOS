@@ -153,6 +153,7 @@ export type Item =
     }
   | {
       kind: "approval";
+      callId?: string;
       name: string;
       args: any;
       reason: string;

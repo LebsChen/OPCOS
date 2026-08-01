@@ -11,19 +11,14 @@ import {
 } from "react";
 import { Terminal } from "@xterm/xterm";
 import RFB from "@novnc/novnc";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import "@xterm/xterm/css/xterm.css";
 import {
   Host,
   Session,
   SurfaceTab,
-  filterSessions,
-  groupSessionsByHost,
   hostFailureMessage,
   hostStatusLabel,
   errorMessage,
-  noticeClass,
   redactApproval,
   submitFailureMessage,
 } from "./gui";
@@ -31,13 +26,11 @@ import {
   TranscriptViewItem,
   normalizeTranscript,
   reduceStreamEvent,
-  toolArgumentSummary,
 } from "./transcript";
 import { Sidebar } from "./components/Sidebar";
 import { NewSessionModal } from "./components/NewSessionModal";
 import { Transcript } from "./components/Transcript";
 import { Composer } from "./components/Composer";
-import { RightRail } from "./components/RightRail";
 import { SelectMenu as OpenWorkerSelectMenu } from "./components/SelectMenu";
 import { SettingsView, type SettingsSection } from "./components/SettingsView";
 import { Icon } from "./components/Icon";
@@ -132,388 +125,6 @@ function SelectMenu({
     />
   );
 }
-function LegacySidebar(props: {
-  hosts: Host[];
-  sessions: Session[];
-  selected?: Session | null;
-  query: string;
-  onQuery: (value: string) => void;
-  onSelect: (session: Session) => void;
-  onNew: () => void;
-  onTest: (host: Host) => void;
-  onSurface: (surface: "manage" | "activity" | "automations") => void;
-  onAddHost: (event: FormEvent) => void;
-  hostName: string;
-  setHostName: (value: string) => void;
-  hostUrl: string;
-  setHostUrl: (value: string) => void;
-  hostToken: string;
-  setHostToken: (value: string) => void;
-}) {
-  const groups = groupSessionsByHost(
-    filterSessions(props.sessions, props.query),
-  );
-  return (
-    <aside className="sidebar">
-      <div className="brand">
-        <span className="brand-mark">✦</span>
-        <strong>OPCOS</strong>
-        <span className="beta">M9</span>
-      </div>
-      <Button className="new-session" onClick={props.onNew}>
-        <Icon name="plus" /> New session
-      </Button>
-      <label className="search">
-        <Icon name="search" />
-        <input
-          value={props.query}
-          onChange={(event) => props.onQuery(event.target.value)}
-          placeholder={translate("Search sessions")}
-        />
-      </label>
-      <div className="sidebar-scroll">
-        <div className="sidebar-label">{translate("SESSIONS")}</div>
-        {groups.length === 0 && (
-          <p className="muted small">{translate("No sessions yet.")}</p>
-        )}
-        {groups.map((group) => (
-          <section className="session-group" key={group.hostId}>
-            <div className="group-title">
-              <span className="status-dot" />
-              {group.hostName}
-            </div>
-            {group.sessions.map((session) => (
-              <button
-                className={`session-row ${props.selected?.id === session.id ? "selected" : ""}`}
-                key={session.id}
-                onClick={() => props.onSelect(session)}
-              >
-                <span className="session-title">{session.title}</span>
-                <span className="session-meta">
-                  {session.host_name} · {session.model}
-                </span>
-              </button>
-            ))}
-          </section>
-        ))}
-        <div className="sidebar-label hosts-label">{translate("HOSTS")}</div>
-        <form className="host-form" onSubmit={props.onAddHost}>
-          <input
-            value={props.hostName}
-            onChange={(event) => props.setHostName(event.target.value)}
-            placeholder={translate("Host name")}
-            required
-          />
-          <input
-            value={props.hostUrl}
-            onChange={(event) => props.setHostUrl(event.target.value)}
-            placeholder={translate("Remote URL")}
-            type="url"
-            required
-          />
-          <input
-            value={props.hostToken}
-            onChange={(event) => props.setHostToken(event.target.value)}
-            placeholder={translate("Bearer token")}
-            type="password"
-            required
-          />
-          <Button type="submit">
-            <Icon name="plus" /> Add host
-          </Button>
-        </form>
-        {props.hosts.map((host) => (
-          <div className="host-row" key={host.id}>
-            <span>
-              <span
-                className={`status-dot ${host.online === false ? "offline" : host.online === true ? "online" : ""}`}
-              />
-              {host.name}
-            </span>
-            <Button className="tiny" onClick={() => props.onTest(host)}>
-              Test
-            </Button>
-            {host.online === false && (
-              <small className="failure">{hostFailureMessage(host)}</small>
-            )}
-          </div>
-        ))}
-      </div>
-      <div className="sidebar-footer">
-        <Button
-          className="nav-button"
-          onClick={() => props.onSurface("manage")}
-        >
-          <Icon name="gear" /> Manage
-        </Button>
-        <Button
-          className="nav-button"
-          onClick={() => props.onSurface("activity")}
-        >
-          <Icon name="audit" /> Activity
-        </Button>
-        <Button
-          className="nav-button"
-          onClick={() => props.onSurface("automations")}
-        >
-          <span>◷</span> Automations
-        </Button>
-      </div>
-    </aside>
-  );
-}
-
-function LegacyNewSessionModal({
-  hosts,
-  onClose,
-  onCreate,
-}: {
-  hosts: Host[];
-  onClose: () => void;
-  onCreate: (
-    title: string,
-    hostId: string,
-    model: string,
-    mode: string,
-    workspace: string,
-  ) => void;
-}) {
-  const [title, setTitle] = useState("");
-  const [hostId, setHostId] = useState(hosts[0]?.id || "");
-  const [model, setModel] = useState("auto");
-  const [mode, setMode] = useState("Interactive");
-  const [workspace, setWorkspace] = useState("");
-  return (
-    <div className="modal-backdrop">
-      <form
-        className="modal"
-        onSubmit={(event) => {
-          event.preventDefault();
-          onCreate(title || "New session", hostId, model, mode, workspace);
-        }}
-      >
-        <div className="modal-head">
-          <h2>{translate("New session")}</h2>
-          <button type="button" className="close" onClick={onClose}>
-            ×
-          </button>
-        </div>
-        <label>
-          Title
-          <input
-            value={title}
-            onChange={(event) => setTitle(event.target.value)}
-            placeholder={translate("What are you working on?")}
-          />
-        </label>
-        <label>
-          Bound host
-          <SelectMenu
-            value={hostId}
-            onChange={setHostId}
-            options={hosts.map((host) => ({
-              value: host.id,
-              label: host.name,
-            }))}
-          />
-        </label>
-        <label>
-          Model
-          <input
-            value={model}
-            onChange={(event) => setModel(event.target.value)}
-          />
-        </label>
-        <label>
-          Mode
-          <SelectMenu
-            value={mode}
-            onChange={setMode}
-            options={[
-              { value: "Interactive", label: "Interactive" },
-              { value: "Auto", label: "Auto" },
-            ]}
-          />
-        </label>
-        <label>
-          Workspace <span className="muted">(remote path)</span>
-          <input
-            value={workspace}
-            onChange={(event) => setWorkspace(event.target.value)}
-            placeholder={translate("workspacePath")}
-          />
-        </label>
-        <div className="modal-actions">
-          <Button type="button" onClick={onClose}>
-            Cancel
-          </Button>
-          <Button className="primary" disabled={!hostId}>
-            Create session
-          </Button>
-        </div>
-      </form>
-    </div>
-  );
-}
-
-function LegacyTranscript({
-  items,
-  onApprove,
-  onDeny,
-  running,
-}: {
-  items: TranscriptViewItem[];
-  onApprove: (id: string) => void;
-  onDeny: (id: string) => void;
-  running: boolean;
-}) {
-  return (
-    <div className="transcript">
-      {items.map((item) => (
-        <article
-          className={`transcript-item ${item.kind} ${noticeClass(item.noticeKind || item.kind)}`}
-          key={item.id}
-        >
-          {item.kind === "user" && (
-            <>
-              <div className="who">{translate("you")}</div>
-              <div className="bubble user-bubble">{item.text}</div>
-            </>
-          )}
-          {item.kind === "assistant" && (
-            <>
-              <div className="who">{translate("assistant")}</div>
-              <div className="bubble assistant-bubble">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                  {item.text || ""}
-                </ReactMarkdown>
-                {item.id === "stream:assistant" && (
-                  <span className="stream-cursor">▍</span>
-                )}
-              </div>
-            </>
-          )}
-          {item.kind === "thinking" && (
-            <details className="thinking">
-              <summary>{translate("Thinking")}</summary>
-              <div>{item.reasoning}</div>
-            </details>
-          )}
-          {item.kind === "notice" && (
-            <div className="notice-card">
-              <strong>{item.noticeKind || "notice"}</strong>
-              <span>{item.text}</span>
-            </div>
-          )}
-          {item.kind === "tool" && (
-            <details
-              className={`tool-card ${item.status || "running"}`}
-              open={item.status === "pending"}
-            >
-              <summary>
-                <span className="tool-icon">⌘</span>
-                <strong>{item.toolName || "tool"}</strong>
-                <span className="tool-state">{item.status}</span>
-              </summary>
-              <div className="tool-body">
-                <div className="tool-label">{translate("Arguments")}</div>
-                <code>{toolArgumentSummary(item.arguments)}</code>
-                {item.result !== undefined && (
-                  <>
-                    <div className="tool-label">{translate("Output")}</div>
-                    <code>{redactApproval(item.result)}</code>
-                  </>
-                )}
-                {item.approval && (
-                  <div className="approval-actions">
-                    <strong>
-                      {translate("Approval required. The session is paused.")}
-                    </strong>
-                    <div>
-                      <Button
-                        className="primary"
-                        disabled={!running}
-                        onClick={() => onApprove(item.callId || "")}
-                      >
-                        Approve
-                      </Button>
-                      <Button onClick={() => onDeny(item.callId || "")}>
-                        Deny
-                      </Button>
-                    </div>
-                  </div>
-                )}
-              </div>
-            </details>
-          )}
-        </article>
-      ))}
-      {running && (
-        <div className="waiting">
-          <span className="spinner" /> Waiting for agent…
-        </div>
-      )}
-    </div>
-  );
-}
-
-function LegacyComposer({
-  selected,
-  running,
-  onSubmit,
-  onSteer,
-  onInterrupt,
-}: {
-  selected: Session;
-  running: boolean;
-  onSubmit: (text: string) => void;
-  onSteer: (text: string) => void;
-  onInterrupt: () => void;
-}) {
-  const [text, setText] = useState("");
-  const send = () => {
-    const value = text.trim();
-    if (!value) return;
-    running ? onSteer(value) : onSubmit(value);
-    setText("");
-  };
-  return (
-    <div className="composer">
-      <textarea
-        value={text}
-        onChange={(event) => setText(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key === "Enter" && !event.shiftKey) {
-            event.preventDefault();
-            send();
-          }
-        }}
-        placeholder={
-          running
-            ? "Turn in progress — type a steering instruction…"
-            : `Ask OPCOS to work on ${selected.host_name}…`
-        }
-      />
-      <div className="composer-bar">
-        <span className="muted small">
-          {running
-            ? "Enter sends steering · Shift+Enter for newline"
-            : "Enter sends · Shift+Enter for newline"}
-        </span>
-        {running ? (
-          <Button onClick={onInterrupt}>
-            <Icon name="stop" /> Interrupt
-          </Button>
-        ) : (
-          <Button className="primary" onClick={send}>
-            <Icon name="arrowLeft" /> Send
-          </Button>
-        )}
-      </div>
-    </div>
-  );
-}
-
 function SurfaceView({
   tab,
   selected,
@@ -934,156 +545,6 @@ function WorklogView({
         </div>
       ))}
     </div>
-  );
-}
-
-function LegacyRightRail({
-  selected,
-  running,
-  items,
-  assets,
-  onAsset,
-  onMcp,
-  onError,
-}: {
-  selected: Session | null;
-  running: boolean;
-  items: TranscriptViewItem[];
-  assets: Asset[];
-  onAsset: (asset: Asset) => void;
-  onMcp: (name: string, enabled: boolean) => void;
-  onError: (error: unknown) => void;
-}) {
-  const [insights, setInsights] = useState<Record<string, unknown> | null>(
-    null,
-  );
-  const [tools, setTools] = useState<Array<Record<string, unknown>>>([]);
-  useEffect(() => {
-    if (!selected) return;
-    void command<Record<string, unknown>>("session_insights", {
-      sessionId: selected.id,
-    })
-      .then(setInsights)
-      .catch(onError);
-    void command<Array<Record<string, unknown>>>("mcp_tools", {
-      sessionId: selected.id,
-    })
-      .then(setTools)
-      .catch(onError);
-  }, [selected?.id]);
-  if (!selected)
-    return (
-      <aside className="right-rail">
-        <div className="empty-surface">{translate("Select a session.")}</div>
-      </aside>
-    );
-  const recentTools = items.filter((item) => item.kind === "tool").slice(-5);
-  return (
-    <aside className="right-rail">
-      <RailSection title={translate("Progress")}>
-        <div className="progress-line">
-          <span className={`status-dot ${running ? "busy" : "online"}`} />
-          {running ? "Turn in progress" : "Ready"}
-        </div>
-        {recentTools.map((tool) => (
-          <div className="rail-tool" key={tool.id}>
-            <strong>{tool.toolName}</strong>
-            <span>{tool.status}</span>
-          </div>
-        ))}
-      </RailSection>
-      <RailSection title={translate("Insights")}>
-        {insights ? (
-          <div className="insights">
-            <span>
-              Messages <b>{String(insights.message_count ?? 0)}</b>
-            </span>
-            <span>
-              Tool calls <b>{String(insights.tool_calls ?? 0)}</b>
-            </span>
-            <span>
-              Approvals <b>{String(insights.approval_count ?? 0)}</b>
-            </span>
-            <span>
-              Tokens{" "}
-              <b>
-                {String(
-                  (insights.token_usage as Record<string, unknown> | undefined)
-                    ?.input ?? 0,
-                )}{" "}
-                in /{" "}
-                {String(
-                  (insights.token_usage as Record<string, unknown> | undefined)
-                    ?.output ?? 0,
-                )}{" "}
-                out
-              </b>
-            </span>
-          </div>
-        ) : (
-          <span className="muted">{translate("Loading\u2026")}</span>
-        )}
-      </RailSection>
-      <RailSection title={translate("Access")}>
-        <dl className="access">
-          <dt>{translate("Host")}</dt>
-          <dd>{selected.host_name}</dd>
-          <dt>{translate("Workspace")}</dt>
-          <dd>{selected.workspace || "not configured"}</dd>
-          <dt>{translate("Mode")}</dt>
-          <dd>{selected.mode}</dd>
-          <dt>{translate("Model")}</dt>
-          <dd>{selected.model}</dd>
-        </dl>
-      </RailSection>
-      <RailSection title={translate("Assets")}>
-        {assets.length === 0 && (
-          <span className="muted">{translate("No assets configured.")}</span>
-        )}
-        {assets.map((asset) => (
-          <label className="toggle-row" key={asset.id}>
-            <span>
-              {asset.title}
-              <small>{asset.kind}</small>
-            </span>
-            <input
-              type="checkbox"
-              checked={asset.enabled}
-              onChange={() => onAsset(asset)}
-            />
-          </label>
-        ))}
-      </RailSection>
-      <RailSection title={translate("MCP tools")}>
-        {tools.map((tool) => {
-          const name = String(tool.name || "tool");
-          return (
-            <label className="toggle-row" key={name}>
-              <span>{name}</span>
-              <input
-                type="checkbox"
-                defaultChecked
-                onChange={(event) => onMcp(name, event.target.checked)}
-              />
-            </label>
-          );
-        })}
-      </RailSection>
-    </aside>
-  );
-}
-function RailSection({
-  title,
-  children,
-}: {
-  title: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <section className="rail-section">
-      <h3>{title}</h3>
-      {children}
-    </section>
   );
 }
 
@@ -3276,6 +2737,7 @@ function AppContent() {
       if (item.kind === "approval")
         output.push({
           kind: "approval",
+          callId: item.callId,
           name: item.toolName || "approval",
           args: item.arguments,
           reason: item.text || "",
@@ -3323,14 +2785,6 @@ function AppContent() {
   const steer = (text: string) => {
     if (!selected) return;
     void command("steering", { sessionId: selected.id, text }).catch(onError);
-  };
-  const approve = (callId: string, allow: boolean) => {
-    if (!selected) return;
-    void command("resolve_approval", {
-      sessionId: selected.id,
-      callId,
-      approve: allow,
-    }).catch(onError);
   };
   const tabs: Array<{ id: SurfaceTab; label: string; icon: string }> = [
     { id: "chat", label: "Chat", icon: "send" },
@@ -3507,7 +2961,18 @@ function AppContent() {
             <div className="main-content">
               {tab === "chat" ? (
                 <>
-                  <Transcript items={transcriptItems} running={running} />
+                  <Transcript
+                    items={transcriptItems}
+                    running={running}
+                    onApprove={(item, decision) => {
+                      if (!item.callId) return;
+                      void command("resolve_approval", {
+                        sessionId: selected.id,
+                        callId: item.callId,
+                        approve: decision === "once",
+                      }).catch(onError);
+                    }}
+                  />
                   <Composer
                     mode={selected.mode}
                     model={selected.model}
@@ -3518,6 +2983,7 @@ function AppContent() {
                     connected={Boolean(selected)}
                     running={running}
                     onSend={submit}
+                    onSteer={steer}
                     onModelChange={(model) => {
                       void command("change_model", {
                         sessionId: selected.id,

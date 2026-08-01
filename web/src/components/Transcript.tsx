@@ -2,6 +2,7 @@ import { useState } from "react";
 import { translate } from "../i18n";
 import type { ApprovalDecision, Item } from "../types";
 import { shortArgs } from "./ApprovalCard";
+import { ApprovalCard } from "./ApprovalCard";
 import { humanizeAsk, humanizeTool, type HumanLine } from "../humanize";
 import { Markdown } from "./Markdown";
 import { Icon } from "./Icon";
@@ -391,6 +392,10 @@ function TurnGroup({
 
 interface Props {
   items: Item[];
+  onApprove?: (
+    item: Extract<Item, { kind: "approval" }>,
+    decision: ApprovalDecision,
+  ) => void;
   // The session's live flag. While true, the FINAL run's trailing assistant text is still
   // narration (status), not the answer — promoting it early made each line flash as a full
   // ASSISTANT bubble and then vanish into the group when the next tool call arrived
@@ -416,7 +421,13 @@ export function retryAnchor(items: Item[]): number {
   return -1;
 }
 
-export function Transcript({ items, running, streamingText, onRetry }: Props) {
+export function Transcript({
+  items,
+  running,
+  streamingText,
+  onRetry,
+  onApprove,
+}: Props) {
   // §33 grouping: a turn = the maximal run of assistant/tool/resolved-approval items between
   // breakers (user, connector, notices, plan/dir requests…). Trailing assistant texts are the
   // ANSWER and render as bubbles after the group; interior assistant texts are narration and
@@ -457,6 +468,10 @@ export function Transcript({ items, running, streamingText, onRetry }: Props) {
         item.kind === "question") &&
       !item.resolved
     ) {
+      if (item.kind === "approval") {
+        flush();
+        blocks.push({ item, i });
+      }
       return;
     } else {
       flush();
@@ -514,6 +529,24 @@ export function Transcript({ items, running, streamingText, onRetry }: Props) {
                 </div>
                 <BubbleMeta text={item.text} ts={item.ts} align="right" />
               </div>
+            );
+          case "approval":
+            if (item.resolved) {
+              return (
+                <div className="transcript-item approval" key={bi}>
+                  <span className="status">
+                    {item.resolved === "deny" ? "✕ declined" : "✓ approved"}
+                  </span>
+                </div>
+              );
+            }
+            return (
+              <ApprovalCard
+                key={bi}
+                item={item}
+                compact
+                onApprove={(decision) => onApprove?.(item, decision)}
+              />
             );
           case "assistant":
             // Thinking-only item (stopped mid-reasoning): just the disclosure, no bubble.

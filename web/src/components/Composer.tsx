@@ -95,6 +95,7 @@ interface Props {
   onConnectModel?: () => void;
   onConfigureVoiceInput?: () => void;
   onSend: (text: string, attachments?: Attachment[]) => void;
+  onSteer?: (text: string, attachments?: Attachment[]) => void;
   onInterrupt: () => void;
   onModeChange?: (mode: string) => void;
   onModelChange: (model: string) => void;
@@ -315,11 +316,16 @@ export function Composer(props: Props) {
     const t = text.trim();
     if (
       (!t && attachments.length === 0) ||
-      props.running ||
       dictation?.recording ||
       dictationBusy
     )
       return;
+    if (props.running) {
+      props.onSteer?.(t, attachments);
+      setText("");
+      setAttachments([]);
+      return;
+    }
     // No model connected: keep the draft (don't drop it) and send the user to setup instead.
     if (needsModel) {
       props.onConnectModel?.();
