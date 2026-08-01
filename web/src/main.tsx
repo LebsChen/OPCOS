@@ -2106,8 +2106,8 @@ function App() {
                   <Transcript
                     items={activeItems}
                     running={running}
-                    onApprove={(id) => approve(id, true)}
-                    onDeny={(id) => approve(id, false)}
+                    onApprove={(id: string) => approve(id, true)}
+                    onDeny={(id: string) => approve(id, false)}
                   />
                   <Composer
                     selected={selected}
