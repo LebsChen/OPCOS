@@ -325,6 +325,7 @@ fn redact_approval_value(value: &Value) -> Value {
                     .map(|offset| index + 7 + offset)
                     .unwrap_or(redacted.len());
                 redacted.replace_range(index + 7..end, "[redacted]");
+                return Value::String("[redacted]".into());
             }
             Value::String(redacted)
         }
@@ -1264,26 +1265,38 @@ fn list_sessions(state: State<'_, DesktopState>) -> Result<Vec<SessionView>, Str
         .map_err(|_| "database lock poisoned")?;
     sessions
         .into_iter()
-        .map(|session| {
-            let host_name = connection
-                .query_row(
-                    "SELECT name FROM hosts WHERE id=?1",
-                    [&session.host_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .map_err(|_| "remote host not found for session".to_owned())?;
-            Ok(SessionView {
-                id: session.session_id,
-                title: session.title,
-                host_id: session.host_id,
-                host_name,
-                model: session.model,
-                provider: session.provider,
-                mode: session.mode,
-                workspace: session.workspace,
-            })
+        .map(|session| session_view_for_host(&connection, session))
+        .filter_map(|result| match result {
+            Ok(Some(session)) => Some(Ok(session)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
         })
         .collect()
+}
+
+fn session_view_for_host(
+    connection: &Connection,
+    session: SessionRecord,
+) -> Result<Option<SessionView>, String> {
+    let host_name = match connection.query_row(
+        "SELECT name FROM hosts WHERE id=?1",
+        [&session.host_id],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(name) => name,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    Ok(Some(SessionView {
+        id: session.session_id,
+        title: session.title,
+        host_id: session.host_id,
+        host_name,
+        model: session.model,
+        provider: session.provider,
+        mode: session.mode,
+        workspace: session.workspace,
+    }))
 }
 
 #[tauri::command]
@@ -1300,15 +1313,20 @@ fn read_transcript(
                 .into_iter()
                 .map(|record| {
                     let mut payload = record.payload;
+                    if matches!(record.kind.as_str(), "approval" | "tool") {
+                        if let Some(arguments) = payload.get_mut("arguments") {
+                            *arguments = redact_approval_value(arguments);
+                        }
+                        if let Some(result) = payload.get_mut("result") {
+                            *result = redact_approval_value(result);
+                        }
+                    }
                     if record.kind == "approval"
                         && payload
                             .get("approval")
                             .and_then(Value::as_bool)
                             .unwrap_or(false)
                     {
-                        if let Some(arguments) = payload.get_mut("arguments") {
-                            *arguments = redact_approval_value(arguments);
-                        }
                         if let Some(tool) = payload.get("tool").and_then(Value::as_str) {
                             payload["risk"] = json!(approval_risk(tool));
                         }
@@ -3019,5 +3037,59 @@ mod m7_tests {
             ide_asset_upstream_route("/static/out/workbench.js"),
             "/ide/static/out/workbench.js"
         );
+    }
+
+    #[test]
+    fn orphaned_sessions_are_skipped_from_session_list() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE hosts (id TEXT PRIMARY KEY, name TEXT NOT NULL)",
+                [],
+            )
+            .unwrap();
+        let now = Utc::now();
+        let session = SessionRecord {
+            session_id: "orphan".into(),
+            workspace: "/workspace".into(),
+            model: "auto".into(),
+            mode: "Interactive".into(),
+            title: "Orphan".into(),
+            extra_roots: vec![],
+            grants: json!({}),
+            pinned: false,
+            archived: false,
+            origin: None,
+            origin_label: None,
+            compaction: json!({}),
+            host_id: "deleted-host".into(),
+            provider: None,
+            created_at: now,
+            updated_at: now,
+        };
+        assert!(
+            session_view_for_host(&connection, session)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn transcript_tool_values_are_redacted_before_ui() {
+        let mut payload = json!({
+            "arguments": {
+                "authorization": "Bearer test-token",
+                "password": "secret-password",
+                "path": "/workspace/file.txt"
+            },
+            "result": "Bearer result-token"
+        });
+        let arguments = redact_approval_value(&payload["arguments"]);
+        let result = redact_approval_value(&payload["result"]);
+        *payload.get_mut("arguments").unwrap() = arguments;
+        *payload.get_mut("result").unwrap() = result;
+        assert_eq!(payload["arguments"]["authorization"], "[redacted]");
+        assert_eq!(payload["arguments"]["password"], "[redacted]");
+        assert_eq!(payload["result"], "[redacted]");
     }
 }

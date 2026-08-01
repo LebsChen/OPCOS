@@ -63,6 +63,42 @@ describe("OPCOS transcript folding", () => {
     );
   });
 
+  it("merges store tool rows into the assistant tool card by call id", () => {
+    const items = normalizeTranscript([
+      {
+        kind: "assistant",
+        payload: {
+          role: "assistant",
+          content: "",
+          tool_calls: [
+            {
+              id: "call-merge",
+              name: "run_shell",
+              arguments: { command: "pwd" },
+            },
+          ],
+        },
+      },
+      {
+        kind: "tool",
+        payload: {
+          call_id: "call-merge",
+          tool: "run_shell",
+          arguments: { command: "pwd" },
+          result: "ok",
+          status: "ok",
+          approval: false,
+        },
+      },
+    ]);
+    expect(items.filter((item) => item.kind === "tool")).toHaveLength(1);
+    expect(items.find((item) => item.kind === "tool")).toMatchObject({
+      callId: "call-merge",
+      status: "ok",
+      result: "ok",
+    });
+  });
+
   it("folds text deltas into one stable streaming item", () => {
     let items = reduceStreamEvent([], {
       kind: "stream",
