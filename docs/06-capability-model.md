@@ -80,6 +80,8 @@ plugin_member
 
 Harness 层只消费跨实现的事实事件：助手文本、工具调用、工具结果、挂起的审批/提问、回合结束、错误和中断。`TurnEngine` 通过 `BuiltinHarness` 提供内置实现；外部 harness 尚未接入，本轮不展示 OpenCode 入口。
 
+外部 harness 的启动、审批回复和提问回复返回异步 `TurnHandle`，完成结果只通过 `TurnFinished` 事件交付；句柄提供 `await_finished()` 便捷等待。这是因为 HTTP/SSE harness 不能在请求返回时同步取得最终回合结果，不得伪造空 `AssistantTurn` 或将仍在运行视为成功。可批准的审批事件必须已经补齐非空工具名和完整参数；补全失败只发显式失败事件并保持 pending，不创建审批卡片。
+
 Host 另提供进程流能力：
 
 ```rust

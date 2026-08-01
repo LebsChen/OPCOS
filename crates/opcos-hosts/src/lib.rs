@@ -75,6 +75,9 @@ pub trait HostProcess: Send {
     async fn next_event(&mut self) -> Result<Option<ProcessEvent>, HostError>;
     async fn write_stdin(&mut self, input: &[u8]) -> Result<(), HostError>;
     async fn interrupt(&mut self) -> Result<(), HostError>;
+    async fn shutdown(&mut self) -> Result<(), HostError> {
+        self.interrupt().await
+    }
 }
 
 struct LocalProcess {
@@ -106,6 +109,14 @@ impl HostProcess for LocalProcess {
     }
 }
 
+impl Drop for LocalProcess {
+    fn drop(&mut self) {
+        if let Some(kill) = self.kill.take() {
+            let _ = kill.send(());
+        }
+    }
+}
+
 struct RemoteProcess {
     sink: futures_util::stream::SplitSink<RvmWebSocket, tokio_tungstenite::tungstenite::Message>,
     events: mpsc::Receiver<Result<ProcessEvent, HostError>>,
@@ -131,6 +142,36 @@ impl HostProcess for RemoteProcess {
 
     async fn interrupt(&mut self) -> Result<(), HostError> {
         self.write_stdin(&[0x03]).await
+    }
+
+    async fn shutdown(&mut self) -> Result<(), HostError> {
+        let _ = self.interrupt().await;
+        Ok(())
+    }
+}
+
+pub struct HostProcessSupervisor {
+    process: Mutex<Option<Box<dyn HostProcess>>>,
+}
+
+impl HostProcessSupervisor {
+    pub fn new(process: Box<dyn HostProcess>) -> Self {
+        Self {
+            process: Mutex::new(Some(process)),
+        }
+    }
+
+    pub async fn shutdown(&self) -> Result<(), HostError> {
+        if let Some(mut process) = self.process.lock().await.take() {
+            process.shutdown().await?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for HostProcessSupervisor {
+    fn drop(&mut self) {
+        self.process.get_mut().take();
     }
 }
 
@@ -1207,6 +1248,28 @@ mod tests {
         }
         assert!(output.contains("streamed"));
         assert!(exited);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_local_process_stops_child() {
+        let root = tempfile_dir();
+        let marker = root.join("must-not-exist");
+        let host = LocalHost::new(&root).unwrap();
+        let process = host
+            .spawn(SpawnRequest {
+                command: format!("sleep 1; touch '{}'", marker.display()),
+                cwd: None,
+                env: None,
+                cols: 80,
+                rows: 24,
+            })
+            .await
+            .unwrap();
+        drop(process);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!marker.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

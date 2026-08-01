@@ -87,6 +87,14 @@
 
 ## P2 —— 平台化
 
+- **P2-2a Harness foundation**：
+  - `Harness` 的启动、审批回复和问题回复返回异步 `TurnHandle`；完成结果只通过 `TurnFinished` 事件到达，句柄提供 `await_finished()` 便捷等待；
+  - 外部 harness 的 HTTP/SSE 生命周期不能同步返回 `AssistantTurn`，因此不再伪造空结果或把“仍在运行”当作成功；
+  - 审批事件的可批准形状必须包含完整工具名和完整参数；补全失败只产生显式 enrichment failure 事件并保持 pending，不创建审批卡片；
+  - 会话记账通过可复用 `SessionRecorder` 访问状态、pending/Inbox、审计和产物记录；
+  - `HostProcess` 支持显式 shutdown、drop 关停和生命周期 supervisor；本机子进程 drop 后必须终止，远程进程仍受 PTY 退出码限制；
+  - sessions 独立保存 `external_session_id`，不把 OPCOS session ID 与外部 harness ID 混用。
+
 - **P2-1 Harness 抽象与进程流**：
   - 已落地 harness-neutral trait、事实中心事件模型与 `BuiltinHarness`（现有 `TurnEngine` 的适配器），不改变内置行为；
   - 已落地 `Host::spawn` / `HostProcess`，本机走管道，远程走 RVM 现有 `/pty-ws`；
@@ -100,6 +108,7 @@
   - 通过 Host 启动 `opencode serve`，使用 HTTP/SSE 事件流以及 permission/question API；
   - 需要验证远程 `/pty-ws` 承载 NDJSON 是否可靠；若不可靠，考虑远程端口转发或等价 Host 通道；
   - 远程 HTTP 端口如何安全访问仍是未决设计，本轮不解决；
+  - 已否决 `/api/expose-port` + cloudflared：公网暴露 agent 控制面会引入 URL 泄露、隧道生命周期和 cloudflared 可用性风险；目标方案为 Host 上的 `curl`（普通请求走 `Host::exec`，SSE 走 `Host::spawn`）；
   - 必须完整接入 Inbox、审批、二维状态、审计、产物登记和中断恢复后，才提供 OpenCode 入口。
 - **P2-2 自动化三类触发**：定时（已有）+ 出站事件轮询（GitHub / Linear / Sentry）+ webhook（需 relay，见 P3）。payload 以结构化 event context 传入，不压成一句 prompt。
 - **P2-3 连接器框架**：适配器接口 + OAuth（手工 token 路径永远保留）+ token 只进 SecretStore。先做一个真集成，不做空壳。
