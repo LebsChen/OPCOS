@@ -2085,9 +2085,9 @@ function Activity({
                       board: "audit",
                       roles: "gear",
                       tasks: "code",
-                      messages: "arrowLeft",
-                      worklog: "code",
-                      insights: "image",
+                      messages: "chat",
+                      worklog: "clock",
+                      insights: "sparkle",
                     } as const
                   )[item]
                 }
@@ -2227,7 +2227,7 @@ function Activity({
                     </Button>
                   </div>
                 )}
-                <div className="mt-5 grid grid-cols-1 gap-4">
+                <div className="grid grid-cols-1 gap-4">
                   {activityTab === "roles" && (
                     <CollectionPage
                       search=""
@@ -2257,7 +2257,7 @@ function Activity({
                     />
                   )}
                   <section
-                    className={`board-column rounded-xl2 border border-line bg-panel p-4 ${activityTab !== "tasks" ? "hidden" : ""}`}
+                    className={`board-column ${activityTab !== "tasks" ? "hidden" : ""}`}
                   >
                     <div className="inline-actions mb-3">
                       <input placeholder="Search tasks" />
@@ -2364,7 +2364,7 @@ function Activity({
                     )}
                   </section>
                   <section
-                    className={`board-column rounded-xl2 border border-line bg-panel p-4 ${activityTab !== "messages" ? "hidden" : ""}`}
+                    className={`board-column ${activityTab !== "messages" ? "hidden" : ""}`}
                   >
                     <div className="inline-actions mb-3">
                       <input placeholder="Search messages" />
