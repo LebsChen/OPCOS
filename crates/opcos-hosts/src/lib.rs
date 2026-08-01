@@ -138,7 +138,7 @@ pub struct LocalHost {
 
 #[derive(Debug)]
 struct LocalShell {
-    child: Child,
+    _child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     marker: String,
@@ -367,7 +367,7 @@ impl LocalHost {
             );
             let (child, stdin, stdout) = spawn_persistent_shell(cwd).await?;
             let mut shell = LocalShell {
-                child,
+                _child: child,
                 stdin,
                 stdout: BufReader::new(stdout),
                 marker,
@@ -388,8 +388,8 @@ impl LocalHost {
         }
         let shell = sessions.get_mut(session).expect("session exists");
         let mut stdout = String::new();
-        let marker = format!("{}\n", shell.marker);
-        let read = time::timeout(Duration::from_secs(timeout_seconds.max(1)), async {
+        let marker = shell.marker.clone();
+        time::timeout(Duration::from_secs(timeout_seconds.max(1)), async {
             loop {
                 let mut line = String::new();
                 if shell.stdout.read_line(&mut line).await? == 0 {
@@ -398,7 +398,8 @@ impl LocalHost {
                         "local shell exited",
                     ));
                 }
-                if line == marker {
+                if let Some(marker_start) = line.find(&marker) {
+                    stdout.push_str(&line[..marker_start]);
                     break;
                 }
                 stdout.push_str(&line);
@@ -407,7 +408,6 @@ impl LocalHost {
         })
         .await
         .map_err(|_| HostError::Timeout)??;
-        let _ = read;
         Ok(ExecResult {
             status: "completed".into(),
             result: CommandResult {

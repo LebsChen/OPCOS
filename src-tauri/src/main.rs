@@ -101,6 +101,7 @@ struct RemoteExecutor {
 struct LocalExecutor {
     host: LocalHost,
     secrets: KeyringSecretStore,
+    session_id: String,
 }
 
 enum DesktopExecutor {
@@ -265,7 +266,7 @@ impl ToolExecutor for DesktopExecutor {
                                     .and_then(Value::as_str)
                                     .map(str::to_owned),
                                 timeout_seconds: DEFAULT_EXEC_TIMEOUT_SECONDS,
-                                session: Some(format!("opcos-local-{session_id}")),
+                                session: Some(format!("opcos-local-{}", executor.session_id)),
                                 env: Some(Value::Object(env)),
                             })
                             .await
@@ -891,11 +892,14 @@ async fn engine_for(
                 _ => None,
             })
             .collect::<Vec<_>>();
+        let mut allowed_tools = allowed_tools;
+        allowed_tools.extend(["propose_plan".to_owned(), "ask_user".to_owned()]);
         (
             workspace.display().to_string(),
             Arc::new(DesktopExecutor::Local(LocalExecutor {
                 host,
                 secrets: state.secrets.clone(),
+                session_id: session_id.to_owned(),
             })),
             None,
             Some(allowed_tools),

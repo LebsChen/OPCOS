@@ -494,16 +494,11 @@ where
                     if let Ok(external) = self.external_tools.try_lock() {
                         tools.extend(external.iter().cloned().map(mcp_tool_definition));
                     }
-                    if let Ok(allowed) = self.allowed_tools.try_lock() {
-                        if let Some(allowed) = allowed.as_ref() {
-                            tools.retain(|tool| {
-                                tool.get("function")
-                                    .and_then(|function| function.get("name"))
-                                    .and_then(Value::as_str)
-                                    .is_some_and(|name| allowed.contains(name))
-                            });
-                        }
-                    }
+                    let allowed = self.allowed_tools.try_lock().ok();
+                    tools = filter_allowed_tools(
+                        tools,
+                        allowed.as_ref().and_then(|value| value.as_ref()),
+                    );
                     tools
                 },
                 settings: json!({}),
@@ -988,6 +983,18 @@ fn tool_definitions() -> Vec<Value> {
     ]
 }
 
+fn filter_allowed_tools(mut tools: Vec<Value>, allowed: Option<&HashSet<String>>) -> Vec<Value> {
+    if let Some(allowed) = allowed {
+        tools.retain(|tool| {
+            tool.get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .is_some_and(|name| allowed.contains(name))
+        });
+    }
+    tools
+}
+
 fn mcp_tool_definition(tool: Value) -> Value {
     let name = tool
         .get("name")
@@ -1046,6 +1053,29 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use opcos_store::{SessionStore, SqliteStore};
+
+    #[test]
+    fn host_capability_filter_removes_unsupported_tools() {
+        let allowed = HashSet::from([
+            "read_file".to_owned(),
+            "propose_plan".to_owned(),
+            "ask_user".to_owned(),
+        ]);
+        let tools = filter_allowed_tools(tool_definitions(), Some(&allowed));
+        let names = tools
+            .iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .collect::<HashSet<_>>();
+        assert!(names.contains("read_file"));
+        assert!(names.contains("propose_plan"));
+        assert!(!names.contains("run_shell"));
+        assert!(!names.contains("write_file"));
+        assert!(!names.contains("list_dir"));
+    }
 
     #[derive(Clone)]
     struct FakeProvider;
