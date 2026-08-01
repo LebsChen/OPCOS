@@ -14,6 +14,9 @@ export function CollectionPage({
   viewKey = "opcos.collection.view",
   renderCard,
   columns,
+  chips,
+  activeChip,
+  onChip,
 }: {
   search: string;
   onSearch: (value: string) => void;
@@ -26,6 +29,9 @@ export function CollectionPage({
   viewKey?: string;
   renderCard?: () => ReactNode;
   columns?: string[];
+  chips?: string[];
+  activeChip?: string;
+  onChip?: (chip: string) => void;
 }) {
   const [view, setView] = useState<CollectionView>(() => {
     const stored = localStorage.getItem(viewKey);
@@ -42,6 +48,16 @@ export function CollectionPage({
           value={search}
           onChange={(event) => onSearch(event.target.value)}
         />
+        {chips?.map((chip) => (
+          <button
+            key={chip}
+            type="button"
+            className={`bordered px-2 py-1 text-[12px] ${activeChip === chip ? "text-accent" : ""}`}
+            onClick={() => onChip?.(chip)}
+          >
+            {chip}
+          </button>
+        ))}
         {actions}
         <div className="inline-actions">
           <ButtonLike active={view === "list"} onClick={() => setView("list")}>

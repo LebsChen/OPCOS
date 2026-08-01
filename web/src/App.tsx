@@ -1111,6 +1111,7 @@ function ManageSections({
   const [assetPending, setAssetPending] = useState<string | null>(null);
   const [assetFormOpen, setAssetFormOpen] = useState(false);
   const [assetSearch, setAssetSearch] = useState("");
+  const [assetStatus, setAssetStatus] = useState("All");
   const [discoveredAssets, setDiscoveredAssets] = useState<Asset[] | null>(
     null,
   );
@@ -1376,6 +1377,43 @@ function ManageSections({
                   onSearch={setAssetSearch}
                   searchPlaceholder={`Search ${label}`}
                   columns={["Title", "Trigger", "Scope", "Status"]}
+                  renderCard={() => (
+                    <>
+                      {assets
+                        .filter(
+                          (asset) =>
+                            asset.kind === kind &&
+                            asset.title
+                              .toLowerCase()
+                              .includes(assetSearch.toLowerCase()) &&
+                            (assetStatus === "All" ||
+                              (assetStatus === "Enabled" && asset.enabled) ||
+                              (assetStatus === "Disabled" && !asset.enabled)),
+                        )
+                        .map((asset) => (
+                          <div
+                            className="rounded-xl2 border border-line bg-panel p-4"
+                            key={asset.id}
+                          >
+                            <div className="flex justify-between gap-2">
+                              <strong>{asset.title}</strong>
+                              <span className="text-[11px] text-muted">
+                                {asset.enabled ? "Enabled" : "Disabled"}
+                              </span>
+                            </div>
+                            <p className="mt-2 text-[13px] text-muted line-clamp-2">
+                              {asset.body}
+                            </p>
+                            <small className="mt-3 block text-muted">
+                              {asset.trigger || "No trigger"}
+                            </small>
+                          </div>
+                        ))}
+                    </>
+                  )}
+                  chips={["All", "Enabled", "Disabled"]}
+                  activeChip={assetStatus}
+                  onChip={setAssetStatus}
                   primary={
                     <Button
                       className="primary"
@@ -1393,6 +1431,9 @@ function ManageSections({
                         .filter(
                           (asset) =>
                             asset.kind === kind &&
+                            (assetStatus === "All" ||
+                              (assetStatus === "Enabled" && asset.enabled) ||
+                              (assetStatus === "Disabled" && !asset.enabled)) &&
                             asset.title
                               .toLowerCase()
                               .includes(assetSearch.toLowerCase()),
@@ -1735,7 +1776,11 @@ function McpManage({
               <div className="manage-row px-4" key={String(tool.name)}>
                 <span>
                   <strong>{String(tool.name)}</strong>
-                  <small>{String(tool.transport || "remote")} · Enabled</small>
+                  <small>
+                    {String(tool.transport || "remote")} ·{" "}
+                    {String(tool.command || tool.url || "host-provided")} ·
+                    Enabled
+                  </small>
                 </span>
                 <Button
                   onClick={() =>
