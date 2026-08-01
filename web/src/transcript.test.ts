@@ -1,7 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { normalizeTranscript, reduceStreamEvent } from "./transcript";
+import {
+  classifyStepStatus,
+  normalizeTranscript,
+  reduceStreamEvent,
+} from "./transcript";
 
 describe("OPCOS transcript folding", () => {
+  it.each([
+    ["running", "running"],
+    ["…", "running"],
+    ["ok", "ok"],
+    ["interrupted", "failed"],
+    ["error", "failed"],
+  ] as const)("classifies %s tool steps for rendering", (status, expected) => {
+    expect(classifyStepStatus(status)).toBe(expected);
+  });
+
   it("pairs persisted tool calls with their results", () => {
     const items = normalizeTranscript([
       {

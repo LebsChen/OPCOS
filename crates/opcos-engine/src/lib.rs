@@ -277,10 +277,12 @@ where
             .map_err(|error| EngineError::Store(error.to_string()))?
         {
             let result = if item.call_id == call_id && outcome == ApprovalOutcome::Approve {
-                self.executor
-                    .execute(&item.tool, item.arguments.clone())
-                    .await
-                    .unwrap_or_else(|error| json!({"error": error}))
+                self.execute_tool(&ToolCall {
+                    id: item.call_id.clone(),
+                    name: item.tool.clone(),
+                    arguments: item.arguments.clone(),
+                })
+                .await
             } else if item.call_id == call_id {
                 json!({"error":"tool call denied by user"})
             } else {
@@ -1099,6 +1101,70 @@ mod tests {
         assert!(results.contains("read-1"));
         assert!(results.contains("write-1"));
         assert!(results.contains("read-2"));
+    }
+
+    struct BlockingTools {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for BlockingTools {
+        async fn execute(&self, _: &str, _: Value) -> Result<Value, String> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(json!("done"))
+        }
+    }
+
+    #[tokio::test]
+    async fn approved_tool_is_tracked_until_its_result_is_persisted() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .append_message(&StoredMessage {
+                session_id: "s".into(),
+                sequence: 1,
+                role: "assistant".into(),
+                content: json!({"tool_calls":[{"id":"approved-1"}]}),
+                display_only: false,
+            })
+            .unwrap();
+        store
+            .save_pending(&PendingRecord {
+                session_id: "s".into(),
+                call_id: "approved-1".into(),
+                tool: "write_file".into(),
+                arguments: json!({"path":"x","content":"x"}),
+                state: "pending".into(),
+            })
+            .unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let engine = Arc::new(TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(BlockingTools {
+                started: started.clone(),
+                release: release.clone(),
+            }),
+            "s",
+            "/workspace",
+            PermissionMode::Interactive,
+            "fake",
+        ));
+        let task = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .resolve_approval("approved-1", ApprovalOutcome::Approve)
+                    .await
+            })
+        };
+        started.notified().await;
+        assert_eq!(engine.active_tool_call_ids().await, vec!["approved-1"]);
+        release.notify_one();
+        task.await.unwrap().unwrap();
+        assert!(engine.active_tool_call_ids().await.is_empty());
     }
 
     #[tokio::test]

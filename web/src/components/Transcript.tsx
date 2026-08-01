@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { translate } from "../i18n";
 import type { ApprovalDecision, Item } from "../types";
+import { classifyStepStatus } from "../transcript";
 import { shortArgs } from "./ApprovalCard";
 import { ApprovalCard } from "./ApprovalCard";
 import { humanizeAsk, humanizeTool, type HumanLine } from "../humanize";
@@ -197,10 +198,11 @@ function StepRow({
 }) {
   const [raw, setRaw] = useState(false);
   const resolution = approval?.resolved ?? tool.resolved;
+  const statusKind = classifyStepStatus(tool.status);
   const running =
-    tool.status === "…" && resolution !== "deny" && resolution !== "allow";
+    statusKind === "running" && resolution !== "deny" && resolution !== "allow";
   const failed =
-    tool.status !== "ok" &&
+    statusKind === "failed" &&
     !running &&
     resolution !== "deny" &&
     resolution !== "allow";

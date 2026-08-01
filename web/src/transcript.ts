@@ -6,6 +6,14 @@ export type TranscriptKind =
 export type ToolState = "running" | "ok" | "error" | "pending" | "interrupted";
 export type ApprovalResolution = "allow" | "deny";
 
+export type StepStatusKind = "running" | "ok" | "failed";
+
+export function classifyStepStatus(status: string): StepStatusKind {
+  if (status === "running" || status === "…") return "running";
+  if (status === "ok") return "ok";
+  return "failed";
+}
+
 export type TranscriptViewItem = {
   id: string;
   kind: TranscriptKind;
