@@ -9,7 +9,6 @@ use std::{
 };
 
 const MAX_FILES: usize = 20_000;
-const MAX_FILE_BYTES: i64 = 10 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_RESULTS: usize = 100;
 
@@ -109,7 +108,7 @@ pub async fn build(
     }
     let file_result = host
         .exec(ExecRequest {
-            command: "state=$(mktemp /tmp/opcos-index-count.XXXXXX); trap 'rm -f \"$state\"' 0 1 2 3 15; printf 0 > \"$state\"; find . -type d \\( -name .git -o -name node_modules -o -name target -o -name .venv -o -name dist -o -name build \\) -prune -o \\( -exec sh -c 'n=$(cat \"$1\"); [ \"$n\" -ge 20000 ] && exit 1; size=$(wc -c < \"$2\"); printf \"%s\\t%s\\n\" \"$2\" \"$size\"; printf \"%s\\n\" \"$((n + 1))\" > \"$1\"' sh \"$state\" {} \\; -o -quit \\)".into(),
+            command: "output=$(mktemp /tmp/opcos-index-files.XXXXXX); trap 'rm -f \"$output\"' 0 1 2 3 15; find . -type d \\( -name .git -o -name node_modules -o -name target -o -name .venv -o -name dist -o -name build \\) -prune -o -type f -size -10M -print > \"$output\"; status=$?; if [ \"$status\" -ne 0 ]; then cat \"$output\"; exit \"$status\"; fi; awk 'NR < 20000 { print } NR == 20000 { print \"__OPCOS_INDEX_TRUNCATED__\"; exit }' \"$output\"".into(),
             cwd: Some(workspace.to_owned()),
             timeout_seconds: 30,
             session: None,
@@ -129,20 +128,19 @@ pub async fn build(
     let mut files = Vec::new();
     let mut truncated = false;
     for line in file_stdout.lines().take(MAX_FILES + 1) {
-        let Some((path, size)) = line.split_once('\t') else {
-            continue;
-        };
+        if line == "__OPCOS_INDEX_TRUNCATED__" {
+            truncated = true;
+            break;
+        }
+        let (path, size) = line.split_once('\t').unwrap_or((line, ""));
         if files.len() >= MAX_FILES {
             truncated = true;
             break;
         }
-        let size_bytes = size.parse::<i64>().unwrap_or(0);
-        if size_bytes <= MAX_FILE_BYTES {
-            files.push(IndexFile {
-                path: path.trim_start_matches("./").to_owned(),
-                size_bytes,
-            });
-        }
+        files.push(IndexFile {
+            path: path.trim_start_matches("./").to_owned(),
+            size_bytes: size.parse::<i64>().unwrap_or(0),
+        });
     }
     if file_stdout.lines().count() > MAX_FILES {
         truncated = true;
@@ -322,6 +320,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_host_builds_a_real_ready_index() {
+        let started = std::time::Instant::now();
         let host = LocalHost::new(env!("CARGO_MANIFEST_DIR")).expect("local host");
         let root = std::env::temp_dir().join(format!("opcos-index-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -330,6 +329,32 @@ mod tests {
             .expect("local repository index");
         assert!(matches!(index.status.as_str(), "ready" | "limited"));
         assert!(!index.files.is_empty());
+        println!(
+            "repository workspace index: {:?}, {} files",
+            started.elapsed(),
+            index.files.len()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn local_host_builds_larger_index_without_timeout() {
+        let workspace = concat!(env!("CARGO_MANIFEST_DIR"), "/../web");
+        let started = std::time::Instant::now();
+        let host = LocalHost::new(workspace).expect("larger local host");
+        let root =
+            std::env::temp_dir().join(format!("opcos-index-large-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let index = build(&root, "local-large", workspace, &host)
+            .await
+            .expect("larger repository index");
+        assert!(matches!(index.status.as_str(), "ready" | "limited"));
+        assert!(!index.files.is_empty());
+        println!(
+            "larger workspace index: {:?}, {} files",
+            started.elapsed(),
+            index.files.len()
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }
