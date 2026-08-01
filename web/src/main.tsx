@@ -2173,7 +2173,7 @@ function App() {
         items={activeItems}
         assets={assets}
         onAsset={toggleAsset}
-        onMcp={(name, enabled) =>
+        onMcp={(name: string, enabled: boolean) =>
           selected &&
           command("set_mcp_tool_enabled", {
             sessionId: selected.id,
