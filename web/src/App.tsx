@@ -945,6 +945,7 @@ function ManageSections({
   const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
   const [assetTitle, setAssetTitle] = useState("");
   const [assetBody, setAssetBody] = useState("");
+  const [instructionsDraft, setInstructionsDraft] = useState("");
   const [assetKind, setAssetKind] = useState<Asset["kind"]>("knowledge");
   const [assetTrigger, setAssetTrigger] = useState("");
   const [assetScope, setAssetScope] = useState("");
@@ -1000,10 +1001,7 @@ function ManageSections({
     ],
     hosts: ["Hosts", "Bind and test the remote hosts used by OPCOS sessions."],
     agents: ["规则", "仓库级运行规则（对应仓库中的 AGENTS.md 文件）。"],
-    instructions: [
-      "Instructions",
-      "Global instructions applied to every new session.",
-    ],
+    instructions: ["全局指令", "应用于所有新会话的全局指令。"],
     knowledge: ["Knowledge", "Reusable reference material added to context."],
     playbook: ["Playbook", "Repeatable workflows available to automation."],
     skill: ["Skill", "Focused capability and instruction bundles."],
@@ -1029,6 +1027,12 @@ function ManageSections({
     assetTabKind === "agents"
       ? "规则"
       : assetTabKind[0].toUpperCase() + assetTabKind.slice(1);
+  useEffect(() => {
+    if (tab !== "instructions") return;
+    setInstructionsDraft(
+      assets.find((asset) => asset.kind === "instructions")?.body || "",
+    );
+  }, [assets, tab]);
   useEffect(() => {
     void command<Record<string, unknown>>("provider_settings")
       .then((value) => {
@@ -1528,6 +1532,119 @@ function ManageSections({
             }
           />
         )}
+        {tab === "instructions" && (
+          <div>
+            {(() => {
+              const instructions = assets.find(
+                (asset) => asset.kind === "instructions",
+              );
+              const saveInstructions = () =>
+                command("save_asset", {
+                  id: instructions?.id || "global-instructions",
+                  kind: "instructions",
+                  title: instructions?.title || "全局指令",
+                  body: instructionsDraft,
+                  trigger: null,
+                  scope: null,
+                  scopeKind: "global",
+                  enabled: true,
+                })
+                  .then(() => {
+                    setInstructionsDraft("");
+                    onRefresh();
+                  })
+                  .catch(onError);
+              return (
+                <>
+                  <div className="rounded-xl2 border border-line bg-panel p-5">
+                    <h2 className="text-[15px] font-semibold text-ink">
+                      全局指令
+                    </h2>
+                    <p className="text-[13px] text-muted mt-1">
+                      这里的内容会追加到所有会话的系统指令中。
+                    </p>
+                    <textarea
+                      className="mt-4 min-h-[260px] w-full"
+                      value={instructionsDraft}
+                      onChange={(event) =>
+                        setInstructionsDraft(event.target.value)
+                      }
+                      placeholder="输入全局指令内容"
+                    />
+                    <div className="inline-actions">
+                      <Button className="primary" onClick={saveInstructions}>
+                        保存指令
+                      </Button>
+                      {instructions && (
+                        <Button
+                          className="bordered"
+                          onClick={() => {
+                            setVersionHistoryAsset(instructions.id);
+                            setCompareVersionId(null);
+                            void command<Array<Record<string, unknown>>>(
+                              "list_asset_versions",
+                              { assetId: instructions.id },
+                            )
+                              .then(setAssetVersions)
+                              .catch(onError);
+                          }}
+                        >
+                          版本历史
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+                  {versionHistoryAsset && (
+                    <div className="manage-card mt-4">
+                      <div className="flex items-center justify-between">
+                        <strong>版本历史</strong>
+                        <Button
+                          className="bordered"
+                          onClick={() => {
+                            setVersionHistoryAsset(null);
+                            setAssetVersions([]);
+                            setCompareVersionId(null);
+                          }}
+                        >
+                          关闭
+                        </Button>
+                      </div>
+                      {assetVersions.map((version) => {
+                        const versionId = String(version.id);
+                        const isCurrent =
+                          instructions?.body === version.content;
+                        return (
+                          <div className="manage-row mt-2" key={versionId}>
+                            <span>
+                              <strong>
+                                v{String(version.version)}
+                                {isCurrent ? " · 当前" : ""}
+                              </strong>
+                              <small>{String(version.created_at)}</small>
+                            </span>
+                            <Button
+                              className="bordered"
+                              onClick={() =>
+                                command("rollback_asset", {
+                                  assetId: instructions!.id,
+                                  versionId,
+                                })
+                                  .then(onRefresh)
+                                  .catch(onError)
+                              }
+                            >
+                              回滚
+                            </Button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </>
+              );
+            })()}
+          </div>
+        )}
         {assetKinds.includes(tab as (typeof assetKinds)[number]) && (
           <div>
             {(
@@ -1537,11 +1654,7 @@ function ManageSections({
                   "规则",
                   "仓库级运行规则（对应仓库中的 AGENTS.md 文件）。",
                 ],
-                [
-                  "instructions",
-                  "Instructions",
-                  "Global instructions applied to every new session.",
-                ],
+                ["instructions", "全局指令", "应用于所有新会话的全局指令。"],
                 [
                   "knowledge",
                   "Knowledge",
@@ -1559,7 +1672,9 @@ function ManageSections({
                 ],
               ] as const
             )
-              .filter(([kind]) => kind === assetTabKind)
+              .filter(
+                ([kind]) => kind === assetTabKind && kind !== "instructions",
+              )
               .map(([kind, label, description]) => (
                 <CollectionPage
                   key={kind}
@@ -1769,7 +1884,9 @@ function ManageSections({
                                   setCompareVersionId(null);
                                   void command<Array<Record<string, unknown>>>(
                                     "list_asset_versions",
-                                    { assetId: asset.id },
+                                    {
+                                      assetId: asset.id,
+                                    },
                                   )
                                     .then(setAssetVersions)
                                     .catch(onError);
@@ -1801,7 +1918,9 @@ function ManageSections({
                                 disabled={assetPending === asset.id}
                                 onClick={() => {
                                   setAssetPending(asset.id);
-                                  void command("delete_asset", { id: asset.id })
+                                  void command("delete_asset", {
+                                    id: asset.id,
+                                  })
                                     .then(onRefresh)
                                     .catch(onError)
                                     .finally(() => setAssetPending(null));
@@ -1911,8 +2030,8 @@ function ManageSections({
                       : "新建规则"
                     : assetTabKind === "instructions"
                       ? editingAssetId
-                        ? "Edit Instructions"
-                        : "New Instructions"
+                        ? "编辑全局指令"
+                        : "新建全局指令"
                       : editingAssetId
                         ? "Edit asset"
                         : "New asset"}
@@ -2004,8 +2123,8 @@ function ManageSections({
                         : "创建规则"
                       : assetTabKind === "instructions"
                         ? editingAssetId
-                          ? "Save changes"
-                          : "Create Instructions"
+                          ? "保存更改"
+                          : "保存全局指令"
                         : editingAssetId
                           ? "Save changes"
                           : "Create asset"}
