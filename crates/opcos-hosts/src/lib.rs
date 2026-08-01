@@ -271,7 +271,13 @@ impl Host for LocalHost {
             .unwrap_or_else(|| self.root.clone());
         if let Some(session) = request.session.as_deref() {
             return self
-                .exec_persistent(session, &request.command, &cwd, request.timeout_seconds)
+                .exec_persistent(
+                    session,
+                    &request.command,
+                    &cwd,
+                    request.timeout_seconds,
+                    request.env.as_ref(),
+                )
                 .await;
         }
         let mut command = shell_command(&request.command, &cwd);
@@ -357,6 +363,7 @@ impl LocalHost {
         command: &str,
         cwd: &Path,
         timeout_seconds: u64,
+        env: Option<&Value>,
     ) -> Result<ExecResult, HostError> {
         let mut sessions = self.sessions.lock().await;
         if !sessions.contains_key(session) {
@@ -374,7 +381,9 @@ impl LocalHost {
             };
             shell
                 .stdin
-                .write_all(format!("{command}\n{}\n", marker_command(&shell.marker)).as_bytes())
+                .write_all(
+                    format!("{}\n", persistent_command(command, env, &shell.marker)).as_bytes(),
+                )
                 .await?;
             shell.stdin.flush().await?;
             sessions.insert(session.to_owned(), shell);
@@ -382,43 +391,85 @@ impl LocalHost {
             let shell = sessions.get_mut(session).expect("session exists");
             shell
                 .stdin
-                .write_all(format!("{command}\n{}\n", marker_command(&shell.marker)).as_bytes())
+                .write_all(
+                    format!("{}\n", persistent_command(command, env, &shell.marker)).as_bytes(),
+                )
                 .await?;
             shell.stdin.flush().await?;
         }
-        let shell = sessions.get_mut(session).expect("session exists");
-        let mut stdout = String::new();
-        let marker = shell.marker.clone();
-        time::timeout(Duration::from_secs(timeout_seconds.max(1)), async {
-            loop {
-                let mut line = String::new();
-                if shell.stdout.read_line(&mut line).await? == 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "local shell exited",
-                    ));
+        let result = {
+            let shell = sessions.get_mut(session).expect("session exists");
+            let mut stdout = String::new();
+            let marker = format!("{}:", shell.marker);
+            time::timeout(Duration::from_secs(timeout_seconds.max(1)), async {
+                loop {
+                    let mut line = String::new();
+                    if shell.stdout.read_line(&mut line).await? == 0 {
+                        return Err(HostError::Io(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "local shell exited",
+                        )));
+                    }
+                    if let Some(marker_start) = line.find(&marker) {
+                        stdout.push_str(&line[..marker_start]);
+                        let exit_code = line[marker_start + marker.len()..]
+                            .trim()
+                            .parse::<i32>()
+                            .map_err(|_| {
+                            HostError::InvalidResponse(
+                                "local shell returned an invalid exit code".into(),
+                            )
+                        })?;
+                        return Ok::<_, HostError>((stdout, exit_code));
+                    }
+                    stdout.push_str(&line);
                 }
-                if let Some(marker_start) = line.find(&marker) {
-                    stdout.push_str(&line[..marker_start]);
-                    break;
+            })
+            .await
+            .map_err(|_| HostError::Timeout)
+        };
+        let (stdout, exit_code) = match result {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) | Err(error) => {
+                if let Some(mut shell) = sessions.remove(session) {
+                    let _ = shell._child.kill().await;
+                    let _ = shell._child.wait().await;
                 }
-                stdout.push_str(&line);
+                return Err(error);
             }
-            Ok::<(), std::io::Error>(())
-        })
-        .await
-        .map_err(|_| HostError::Timeout)??;
+        };
         Ok(ExecResult {
-            status: "completed".into(),
+            status: "completed_stderr_merged".into(),
             result: CommandResult {
                 stdout,
                 stderr: String::new(),
-                exit_code: 0,
+                exit_code,
                 timed_out: false,
                 session: Some(session.to_owned()),
                 cwd: Some(cwd.display().to_string()),
             },
         })
+    }
+
+    pub async fn close_session(&self, session: &str) -> Result<(), HostError> {
+        let shell = self.sessions.lock().await.remove(session);
+        if let Some(mut shell) = shell {
+            shell._child.kill().await?;
+            let _ = shell._child.wait().await;
+        }
+        Ok(())
+    }
+
+    pub async fn close_all_sessions(&self) -> Result<(), HostError> {
+        let sessions = {
+            let mut active = self.sessions.lock().await;
+            std::mem::take(&mut *active)
+        };
+        for (_, mut shell) in sessions {
+            shell._child.kill().await?;
+            let _ = shell._child.wait().await;
+        }
+        Ok(())
     }
 }
 
@@ -437,15 +488,38 @@ fn shell_command(command: &str, cwd: &Path) -> Command {
     }
 }
 
-fn marker_command(marker: &str) -> String {
+fn persistent_command(command: &str, env: Option<&Value>, marker: &str) -> String {
+    let prefix = persistent_env_prefix(env);
     #[cfg(windows)]
     {
-        format!("echo {marker}")
+        format!("{prefix}{command} 2>&1 & echo {marker}:%ERRORLEVEL%")
     }
     #[cfg(not(windows))]
     {
-        format!("printf '%s\\n' '{marker}'")
+        format!(
+            "{prefix}{command} 2>&1; __opcos_exit=$?; printf '{marker}:%s\\n' \"$__opcos_exit\""
+        )
     }
+}
+
+fn persistent_env_prefix(env: Option<&Value>) -> String {
+    let Some(Value::Object(values)) = env else {
+        return String::new();
+    };
+    values
+        .iter()
+        .filter_map(|(key, value)| value.as_str().map(|value| (key, value)))
+        .map(|(key, value)| {
+            #[cfg(windows)]
+            {
+                format!("set \"{}={}\" && ", key, value.replace('"', "\"\""))
+            }
+            #[cfg(not(windows))]
+            {
+                format!("export {}='{}'; ", key, value.replace('\'', "'\\''"))
+            }
+        })
+        .collect()
 }
 
 async fn spawn_persistent_shell(cwd: &Path) -> Result<(Child, ChildStdin, ChildStdout), HostError> {
@@ -464,7 +538,7 @@ async fn spawn_persistent_shell(cwd: &Path) -> Result<(Child, ChildStdin, ChildS
     let mut child = process
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
         .spawn()?;
     let stdin = child
         .stdin
@@ -561,10 +635,12 @@ mod tests {
     #[tokio::test]
     async fn local_host_preserves_shell_session_state() {
         let root = tempfile_dir();
+        let child = root.join("child");
+        fs::create_dir_all(&child).unwrap();
         let host = LocalHost::new(&root).unwrap();
         let first = host
             .exec(ExecRequest {
-                command: shell_change_directory_command("."),
+                command: shell_set_session_state("child", "persisted"),
                 cwd: None,
                 timeout_seconds: 5,
                 session: Some("test-session".into()),
@@ -575,7 +651,7 @@ mod tests {
         assert!(first.result.session.is_some());
         let second = host
             .exec(ExecRequest {
-                command: shell_output_command("persistent"),
+                command: shell_print_session_state(),
                 cwd: None,
                 timeout_seconds: 5,
                 session: Some("test-session".into()),
@@ -583,8 +659,30 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(second.result.stdout.contains("persistent"));
+        assert!(second.result.stdout.contains("child"));
+        assert!(second.result.stdout.contains("persisted"));
+        host.close_session("test-session").await.unwrap();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn shell_set_session_state(directory: &str, value: &str) -> String {
+        format!("cd /D {directory} && set OPCOS_PERSISTENT={value}")
+    }
+
+    #[cfg(not(windows))]
+    fn shell_set_session_state(directory: &str, value: &str) -> String {
+        format!("cd {directory}; export OPCOS_PERSISTENT={value}")
+    }
+
+    #[cfg(windows)]
+    fn shell_print_session_state() -> String {
+        "echo %CD%^|%OPCOS_PERSISTENT%".into()
+    }
+
+    #[cfg(not(windows))]
+    fn shell_print_session_state() -> String {
+        "printf '%s|%s' \"$PWD\" \"$OPCOS_PERSISTENT\"".into()
     }
 
     #[cfg(windows)]
@@ -597,14 +695,94 @@ mod tests {
         format!("printf {value}")
     }
 
+    #[tokio::test]
+    async fn local_host_persistent_shell_returns_exit_code_and_merged_stderr() {
+        let root = tempfile_dir();
+        let host = LocalHost::new(&root).unwrap();
+        let result = host
+            .exec(ExecRequest {
+                command: shell_failure_command(),
+                cwd: None,
+                timeout_seconds: 5,
+                session: Some("failure-session".into()),
+                env: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.result.exit_code, 7);
+        assert!(result.result.stdout.contains("failure"));
+        assert!(result.result.stderr.is_empty());
+        host.close_session("failure-session").await.unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_host_persistent_shell_injects_environment() {
+        let root = tempfile_dir();
+        let host = LocalHost::new(&root).unwrap();
+        let result = host
+            .exec(ExecRequest {
+                command: shell_print_env_command(),
+                cwd: None,
+                timeout_seconds: 5,
+                session: Some("env-session".into()),
+                env: Some(serde_json::json!({"OPCOS_SECRET_TEST": "injected"})),
+            })
+            .await
+            .unwrap();
+        assert!(result.result.stdout.contains("injected"));
+        host.close_session("env-session").await.unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(windows)]
-    fn shell_change_directory_command(path: &str) -> String {
-        format!("cd /D {path}")
+    fn shell_print_env_command() -> String {
+        "echo %OPCOS_SECRET_TEST%".into()
     }
 
     #[cfg(not(windows))]
-    fn shell_change_directory_command(path: &str) -> String {
-        format!("cd {path}")
+    fn shell_print_env_command() -> String {
+        "printf '%s' \"$OPCOS_SECRET_TEST\"".into()
+    }
+
+    #[cfg(windows)]
+    fn shell_failure_command() -> String {
+        "echo failure 1>&2 & cmd /C exit 7".into()
+    }
+
+    #[cfg(not(windows))]
+    fn shell_failure_command() -> String {
+        "sh -c 'printf failure >&2; exit 7'".into()
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn local_host_timeout_rebuilds_session_without_stale_output() {
+        let root = tempfile_dir();
+        let host = LocalHost::new(&root).unwrap();
+        let timed_out = host
+            .exec(ExecRequest {
+                command: "sleep 2".into(),
+                cwd: None,
+                timeout_seconds: 1,
+                session: Some("timeout-session".into()),
+                env: None,
+            })
+            .await;
+        assert!(matches!(timed_out, Err(HostError::Timeout)));
+        let next = host
+            .exec(ExecRequest {
+                command: "printf clean".into(),
+                cwd: None,
+                timeout_seconds: 5,
+                session: Some("timeout-session".into()),
+                env: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(next.result.stdout, "clean");
+        host.close_session("timeout-session").await.unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
