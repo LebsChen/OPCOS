@@ -4,8 +4,9 @@ import { Icon } from "./Icon";
 
 // §34 (UX-016): the agent ends a deliverable turn with plain markdown —
 // [Title](artifact:relative/path) — and the renderer turns it into a chip that opens the
-// artifact viewer in place. Plumbing is a window event (the viewer lives in RightRail;
-// this component renders deep inside the transcript): RightRail resolves the path against
+// artifact viewer in place. Plumbing is a window event (the viewer lives in the
+// session workbench; this component renders deep inside the transcript): the workbench
+// resolves the path against
 // the session's artifact list, App un-hides the rail.
 export const OPEN_ARTIFACT_EVENT = "ocw-open-artifact";
 

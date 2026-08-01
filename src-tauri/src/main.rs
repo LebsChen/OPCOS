@@ -2685,6 +2685,14 @@ fn save_provider_key(
 }
 
 #[tauri::command]
+fn delete_provider_key(state: State<'_, DesktopState>, provider: String) -> Result<(), String> {
+    state
+        .secrets
+        .delete(&secret_key("provider-key", &provider))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn provider_settings(state: State<'_, DesktopState>) -> Result<Value, String> {
     let connection = state
         .database
@@ -2971,6 +2979,7 @@ fn main() {
             provider_configurations,
             save_provider_settings,
             save_provider_key,
+            delete_provider_key,
             validate_provider_key,
             start_surface,
             ide_bootstrap,

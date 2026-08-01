@@ -8,6 +8,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
 } from "react";
 import { Terminal } from "@xterm/xterm";
 import RFB from "@novnc/novnc";
@@ -28,7 +29,6 @@ import {
   reduceStreamEvent,
 } from "./transcript";
 import { Sidebar } from "./components/Sidebar";
-import { NewSessionModal } from "./components/NewSessionModal";
 import { Transcript } from "./components/Transcript";
 import { Composer } from "./components/Composer";
 import { SelectMenu as OpenWorkerSelectMenu } from "./components/SelectMenu";
@@ -130,7 +130,7 @@ function SurfaceView({
   selected,
   onError,
 }: {
-  tab: SurfaceTab;
+  tab: SurfaceTab | "pr";
   selected: Session;
   onError: (error: unknown) => void;
 }) {
@@ -168,7 +168,37 @@ function SurfaceView({
     setDiff(null);
     setWorklog(null);
     setIdeError("");
-  }, [selected.id, tab]);
+  }, [selected.id]);
+  useEffect(() => {
+    if (tab === "terminal" || tab === "desktop" || tab === "browser") {
+      if (!port) {
+        void start(
+          tab === "terminal" ? "pty" : tab === "desktop" ? "vnc" : "cdp",
+        );
+      }
+    } else if (tab === "ide" && !idePort && !ideError) {
+      setBusy(true);
+      void command<number>("start_ide_proxy", {
+        sessionId: selected.id,
+        folderUri: `vscode-remote://${selected.host_name}/${selected.workspace || "workspace"}`,
+      })
+        .then(setIdePort)
+        .catch((error) => {
+          setIdeError(errorMessage(error));
+          onError(error);
+        })
+        .finally(() => setBusy(false));
+    }
+  }, [
+    tab,
+    selected.id,
+    selected.host_id,
+    selected.host_name,
+    selected.workspace,
+    port,
+    idePort,
+    ideError,
+  ]);
   useEffect(() => {
     if (tab !== "terminal" || !port || !terminalHost.current) return;
     const terminal = new Terminal({
@@ -226,25 +256,16 @@ function SurfaceView({
   if (tab === "terminal" || tab === "desktop" || tab === "browser")
     return (
       <div className="surface-panel">
-        <div className="surface-toolbar">
-          <span>
-            {tab === "terminal"
-              ? "Remote PTY"
-              : tab === "desktop"
-                ? "Remote desktop"
-                : "Browser/CDP surface"}
-          </span>
-          <Button
-            disabled={busy || !!port}
-            onClick={() =>
-              void start(
-                tab === "terminal" ? "pty" : tab === "desktop" ? "vnc" : "cdp",
-              )
-            }
-          >
-            {port ? `Connected on ${port}` : `Start ${tab}`}
-          </Button>
-        </div>
+        {busy && (
+          <div className="surface-status muted">
+            Connecting to the bound remote host…
+          </div>
+        )}
+        {!busy && !port && (
+          <div className="surface-status warning">
+            Remote surface unavailable.
+          </div>
+        )}
         {tab === "terminal" && (
           <div className="terminal-host" ref={terminalHost} />
         )}
@@ -263,25 +284,11 @@ function SurfaceView({
   if (tab === "ide")
     return (
       <div className="surface-panel">
-        <div className="surface-toolbar">
-          <span>{translate("Remote Web IDE")}</span>
-          <Button
-            disabled={!!idePort}
-            onClick={() =>
-              command<number>("start_ide_proxy", {
-                sessionId: selected.id,
-                folderUri: `vscode-remote://${selected.host_name}/${selected.workspace || "workspace"}`,
-              })
-                .then(setIdePort)
-                .catch((error) => {
-                  setIdeError(errorMessage(error));
-                  onError(error);
-                })
-            }
-          >
-            {idePort ? "Connected" : "Open IDE"}
-          </Button>
-        </div>
+        {busy && (
+          <div className="surface-status muted">
+            Connecting to the bound remote host…
+          </div>
+        )}
         {idePort && !ideError ? (
           <iframe
             title={translate("Remote Web IDE")}
@@ -295,7 +302,7 @@ function SurfaceView({
                   /bad gateway|upstream|forbidden|not available/i.test(body)
                 ) {
                   setIdeError(
-                    "The remote Web IDE is unavailable: the bound host rejected its upstream IDE resources.",
+                    "Remote Web IDE bootstrap succeeded, but the bound host rejected its workbench assets.",
                   );
                 }
               } catch {
@@ -331,6 +338,7 @@ function SurfaceView({
         onError={onError}
       />
     );
+  if (tab === "pr") return <PRView selected={selected} onError={onError} />;
   if (tab === "worklog")
     return (
       <WorklogView
@@ -422,7 +430,6 @@ function ReviewView({
                 </button>
               );
             })}
-            <GitActions selected={selected} cwd={cwd} onError={onError} />
           </div>
           <DiffView diff={diff} />
         </div>
@@ -435,6 +442,25 @@ function ReviewView({
           </p>
         </div>
       )}
+    </div>
+  );
+}
+
+function PRView({
+  selected,
+  onError,
+}: {
+  selected: Session;
+  onError: (error: unknown) => void;
+}) {
+  const [cwd, setCwd] = useState(selected.workspace || "/workspace");
+  return (
+    <div className="surface-panel">
+      <div className="surface-toolbar">
+        <span>Git workflow and pull requests</span>
+        <input value={cwd} onChange={(event) => setCwd(event.target.value)} />
+      </div>
+      <GitActions selected={selected} cwd={cwd} onError={onError} />
     </div>
   );
 }
@@ -568,7 +594,59 @@ function WorklogView({
     })
       .then(setWorklog)
       .catch(onError);
+  useEffect(() => {
+    load();
+  }, [selected.id]);
   const events = Array.isArray(worklog?.events) ? worklog.events : [];
+  const [expanded, setExpanded] = useState<Record<number, boolean>>({});
+  const eventTitle = (event: unknown) => {
+    if (!event || typeof event !== "object") return "Worklog event";
+    const value = event as Record<string, unknown>;
+    return String(
+      value.title ??
+        value.name ??
+        value.type ??
+        value.category ??
+        "Worklog event",
+    );
+  };
+  const eventTime = (event: unknown) => {
+    const value = event as Record<string, unknown>;
+    const raw = value.ts ?? value.timestamp ?? value.created_at;
+    if (typeof raw !== "string" && typeof raw !== "number") return "";
+    const date = new Date(raw);
+    return Number.isNaN(date.valueOf())
+      ? ""
+      : date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  };
+  const eventDetail = (event: unknown) => {
+    if (!event || typeof event !== "object") return String(event);
+    const value = event as Record<string, unknown>;
+    const command = value.command ?? value.cmd;
+    const output = value.output ?? value.stdout ?? value.result;
+    if (command || output) {
+      return (
+        <div className="worklog-detail-stack">
+          {command ? (
+            <pre className="output-pre">$ {String(command)}</pre>
+          ) : null}
+          {output ? <pre className="output-pre">{String(output)}</pre> : null}
+        </div>
+      );
+    }
+    const diffText = value.diff ?? value.patch;
+    if (diffText) return <pre className="diff-view">{String(diffText)}</pre>;
+    return (
+      <dl className="worklog-fields">
+        {Object.entries(value).map(([key, item]) => (
+          <div key={key}>
+            <dt>{key}</dt>
+            <dd>{typeof item === "string" ? item : JSON.stringify(item)}</dd>
+          </div>
+        ))}
+      </dl>
+    );
+  };
   return (
     <div className="surface-panel">
       <div className="surface-toolbar">
@@ -589,12 +667,44 @@ function WorklogView({
           <Button onClick={load}>{translate("openWorklog")}</Button>
         </div>
       )}
-      {events.map((event) => (
-        <div className="timeline-row" key={JSON.stringify(event)}>
-          <span className="timeline-dot" />
-          <pre>{String(JSON.stringify(event, null, 2))}</pre>
-        </div>
-      ))}
+      <div className="worklog-timeline">
+        {events.map((event, index) => {
+          const isExpanded = Boolean(expanded[index]);
+          return (
+            <div
+              className={`worklog-entry${isExpanded ? " expanded" : ""}`}
+              key={`${index}-${JSON.stringify(event)}`}
+            >
+              <span className="timeline-dot" aria-hidden="true" />
+              <div className="worklog-entry-body">
+                <button
+                  className="worklog-entry-head"
+                  onClick={() =>
+                    setExpanded((items) => ({
+                      ...items,
+                      [index]: !items[index],
+                    }))
+                  }
+                  aria-expanded={isExpanded}
+                >
+                  <Icon name="clock" size={14} />
+                  <strong>{eventTitle(event)}</strong>
+                  <time>{eventTime(event)}</time>
+                  <Icon
+                    name={isExpanded ? "chevronDown" : "chevronRight"}
+                    size={14}
+                  />
+                </button>
+                {isExpanded && (
+                  <div className="worklog-entry-detail">
+                    {eventDetail(event)}
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -653,6 +763,7 @@ function ManageSections({
   const [providerModels, setProviderModels] = useState<Record<string, string>>(
     {},
   );
+  const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
   const [assetTitle, setAssetTitle] = useState("");
   const [assetBody, setAssetBody] = useState("");
   const [assetKind, setAssetKind] = useState<Asset["kind"]>("knowledge");
@@ -802,87 +913,148 @@ function ManageSections({
             </div>
           </div>
         )}
-        {tab === "provider" && (
-          <div className="divide-y divide-line">
-            {providers.map((descriptor) => {
+        {tab === "provider" &&
+          (selectedProvider === null ? (
+            <div className="grid grid-cols-2 xl:grid-cols-3 gap-2.5">
+              {providers.map((descriptor) => {
+                const config = providerConfigs.find(
+                  (item) => item.provider === descriptor.name,
+                );
+                return (
+                  <button
+                    key={descriptor.name}
+                    className="flex items-center gap-2.5 rounded-xl border border-line bg-panel px-3 py-2.5 text-left hover:border-lineStrong transition-colors"
+                    onClick={() => setSelectedProvider(descriptor.name)}
+                  >
+                    <span className="rounded-lg border border-line grid place-items-center shrink-0 w-8 h-8 bg-paper">
+                      <span className="text-[13px] font-semibold text-muted">
+                        {descriptor.title.slice(0, 1)}
+                      </span>
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block text-[13px] font-semibold leading-tight truncate">
+                        {descriptor.title}
+                      </span>
+                      <span className="block text-[11.5px] text-faint truncate">
+                        {config?.configured
+                          ? "✓ Configured securely."
+                          : config?.base_url
+                            ? config.base_url
+                            : "Not configured yet."}
+                      </span>
+                    </span>
+                    <span className="text-faint text-[14px]">›</span>
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            (() => {
+              const descriptor = providers.find(
+                (item) => item.name === selectedProvider,
+              );
+              if (!descriptor) return null;
               const config = providerConfigs.find(
                 (item) => item.provider === descriptor.name,
               );
               const currentUrl =
                 config?.base_url || descriptor.default_base_url || "";
               return (
-                <div
-                  className="py-4 first:pt-0 last:pb-0"
-                  key={descriptor.name}
-                >
-                  <div className="settings-row">
-                    <div>
-                      <strong>{descriptor.title}</strong>
-                      <small>
+                <div>
+                  <button
+                    className="text-[12.5px] text-muted hover:text-ink"
+                    onClick={() => setSelectedProvider(null)}
+                  >
+                    ‹ All providers
+                  </button>
+                  <div className="flex items-center gap-3 mt-3 mb-1">
+                    <span className="rounded-lg border border-line grid place-items-center shrink-0 w-9 h-9 bg-paper">
+                      <span className="text-[13px] font-semibold text-muted">
+                        {descriptor.title.slice(0, 1)}
+                      </span>
+                    </span>
+                    <span className="min-w-0">
+                      <span className="block text-[15px] font-semibold leading-tight">
+                        {descriptor.title}
+                      </span>
+                      <span className="block text-[11.5px] text-faint">
                         {config?.configured
-                          ? "Configured securely."
+                          ? "✓ Configured securely."
                           : "Not configured yet."}
-                      </small>
-                    </div>
-                    <SelectMenu
-                      value={
-                        providerModels[descriptor.name] ||
-                        descriptor.recommended_model ||
-                        ""
-                      }
-                      onChange={(value) =>
-                        setProviderModels((items) => ({
-                          ...items,
-                          [descriptor.name]: value,
-                        }))
-                      }
-                      options={(
-                        providerModelOptions[descriptor.name] || []
-                      ).map((item) => ({ value: item.id, label: item.label }))}
-                    />
+                      </span>
+                    </span>
                   </div>
-                  <div className="settings-row">
-                    <div>
-                      <strong>{translate("Base URL")}</strong>
-                      <small>
-                        {translate("Optional provider-compatible endpoint.")}
-                      </small>
-                    </div>
-                    <input
-                      type="url"
-                      value={currentUrl}
-                      onChange={(event) =>
-                        setProviderConfigs((items) =>
-                          items.map((item) =>
-                            item.provider === descriptor.name
-                              ? { ...item, base_url: event.target.value }
-                              : item,
-                          ),
-                        )
-                      }
-                    />
-                  </div>
-                  {descriptor.needs_key && (
-                    <div className="settings-row">
-                      <div>
-                        <strong>{translate("Provider key")}</strong>
-                        <small>
-                          Stored securely and never returned to the UI.
-                        </small>
-                      </div>
+                  <div className="form-grid mt-4">
+                    <label>
+                      Base URL
                       <input
-                        type="password"
-                        value={providerKeys[descriptor.name] || ""}
+                        type="url"
+                        value={currentUrl}
                         onChange={(event) =>
-                          setProviderKeys((items) => ({
-                            ...items,
-                            [descriptor.name]: event.target.value,
-                          }))
+                          setProviderConfigs((items) => {
+                            const found = items.some(
+                              (item) => item.provider === descriptor.name,
+                            );
+                            return found
+                              ? items.map((item) =>
+                                  item.provider === descriptor.name
+                                    ? { ...item, base_url: event.target.value }
+                                    : item,
+                                )
+                              : [
+                                  ...items,
+                                  {
+                                    provider: descriptor.name,
+                                    base_url: event.target.value,
+                                    configured: Boolean(config?.configured),
+                                  },
+                                ];
+                          })
                         }
                       />
-                    </div>
-                  )}
-                  <div className="settings-row justify-end">
+                    </label>
+                    {descriptor.needs_key && (
+                      <label>
+                        Provider key
+                        <input
+                          type="password"
+                          value={providerKeys[descriptor.name] || ""}
+                          placeholder={
+                            config?.configured ? "Stored securely" : ""
+                          }
+                          onChange={(event) =>
+                            setProviderKeys((items) => ({
+                              ...items,
+                              [descriptor.name]: event.target.value,
+                            }))
+                          }
+                        />
+                      </label>
+                    )}
+                    <label>
+                      Model
+                      <SelectMenu
+                        value={
+                          providerModels[descriptor.name] ||
+                          descriptor.recommended_model ||
+                          ""
+                        }
+                        onChange={(value) =>
+                          setProviderModels((items) => ({
+                            ...items,
+                            [descriptor.name]: value,
+                          }))
+                        }
+                        options={(
+                          providerModelOptions[descriptor.name] || []
+                        ).map((item) => ({
+                          value: item.id,
+                          label: item.label,
+                        }))}
+                      />
+                    </label>
+                  </div>
+                  <div className="flex items-center gap-2 mt-4">
                     <Button
                       className="primary"
                       onClick={() =>
@@ -930,15 +1102,36 @@ function ManageSections({
                           )
                       }
                     >
-                      Save and validate
+                      Test / Save
                     </Button>
+                    {config?.configured && (
+                      <Button
+                        onClick={() =>
+                          command("delete_provider_key", {
+                            provider: descriptor.name,
+                          })
+                            .then(() =>
+                              setProviderConfigs((items) =>
+                                items.map((item) =>
+                                  item.provider === descriptor.name
+                                    ? { ...item, configured: false }
+                                    : item,
+                                ),
+                              ),
+                            )
+                            .catch(onError)
+                        }
+                      >
+                        Clear key
+                      </Button>
+                    )}
                   </div>
                   {providerStatuses[descriptor.name] && (
                     <div
                       className={
                         providerStatuses[descriptor.name].includes("failed")
-                          ? "failure"
-                          : "success"
+                          ? "failure mt-3"
+                          : "success mt-3"
                       }
                     >
                       {providerStatuses[descriptor.name]}
@@ -946,9 +1139,8 @@ function ManageSections({
                   )}
                 </div>
               );
-            })}
-          </div>
-        )}
+            })()
+          ))}
         {false && tab === "provider" && (
           <div className="divide-y divide-line">
             <div className="settings-row">
@@ -2440,6 +2632,8 @@ function SessionRightPanel({
   providers,
   onProviderChange,
   onCollapsedChange,
+  width,
+  onWidthChange,
 }: {
   selected: Session;
   onError: (error: unknown) => void;
@@ -2448,24 +2642,58 @@ function SessionRightPanel({
   providers: ProviderDescriptor[];
   onProviderChange: (provider: string) => void;
   onCollapsedChange?: (collapsed: boolean) => void;
+  width: number;
+  onWidthChange: (width: number) => void;
 }) {
   type PanelTab =
-    "info" | "terminal" | "desktop" | "ide" | "review" | "worklog" | "browser";
+    | "info"
+    | "pr"
+    | "terminal"
+    | "desktop"
+    | "ide"
+    | "review"
+    | "worklog"
+    | "browser"
+    | "insights";
   const [panelTab, setPanelTab] = useState<PanelTab>("info");
   const [opened, setOpened] = useState<PanelTab[]>(["info"]);
-  const tabs: Array<{
+  const [insights, setInsights] = useState<Record<string, unknown> | null>(
+    null,
+  );
+  useEffect(() => {
+    setInsights(null);
+    void command<Record<string, unknown>>("session_insights", {
+      sessionId: selected.id,
+    })
+      .then(setInsights)
+      .catch(onError);
+  }, [selected.id]);
+  const informationTabs: Array<{
     id: typeof panelTab;
     label: string;
     icon: Parameters<typeof Icon>[0]["name"];
   }> = [
     { id: "info", label: "Info", icon: "info" },
+    { id: "pr", label: "PR", icon: "branch" },
+    { id: "worklog", label: "Worklog", icon: "clock" },
+    { id: "insights", label: "Insights", icon: "sparkle" },
+  ];
+  const workspaceTabs: Array<{
+    id: typeof panelTab;
+    label: string;
+    icon: Parameters<typeof Icon>[0]["name"];
+  }> = [{ id: "review", label: "Diff", icon: "diff" }];
+  const remoteTabs: Array<{
+    id: typeof panelTab;
+    label: string;
+    icon: Parameters<typeof Icon>[0]["name"];
+  }> = [
     { id: "terminal", label: "Shell", icon: "terminal" },
     { id: "desktop", label: "Desktop", icon: "monitor" },
     { id: "ide", label: "Web IDE", icon: "code" },
-    { id: "review", label: "Diff", icon: "diff" },
-    { id: "worklog", label: "Worklog", icon: "clock" },
     { id: "browser", label: "Browser", icon: "globe" },
   ];
+  const tabs = [...informationTabs, ...workspaceTabs, ...remoteTabs];
   if (collapsed) {
     return (
       <aside className="right-rail session-right-panel right-rail-collapsed">
@@ -2483,24 +2711,53 @@ function SessionRightPanel({
       </aside>
     );
   }
+  const openTab = (id: PanelTab) => {
+    setPanelTab(id);
+    setOpened((items) => (items.includes(id) ? items : [...items, id]));
+  };
   return (
-    <aside className="right-rail session-right-panel">
+    <aside className="right-rail session-right-panel" style={{ width }}>
       <div className="session-icon-rail">
-        {tabs.map((item) => (
-          <button
-            key={item.id}
-            className={`rail-btn${panelTab === item.id ? " active" : ""}`}
-            title={item.label}
-            onClick={() => {
-              setPanelTab(item.id);
-              setOpened((items) =>
-                items.includes(item.id) ? items : [...items, item.id],
-              );
-            }}
-          >
-            <Icon name={item.icon} />
-          </button>
-        ))}
+        <div className="rail-group" aria-label="Information">
+          {informationTabs.map((item) => (
+            <button
+              key={item.id}
+              className={`rail-btn${panelTab === item.id ? " active" : ""}`}
+              title={item.label}
+              onClick={() => {
+                openTab(item.id);
+              }}
+            >
+              <Icon name={item.icon} />
+            </button>
+          ))}
+        </div>
+        <div className="rail-sep" />
+        <div className="rail-group" aria-label="Workspace">
+          {workspaceTabs.map((item) => (
+            <button
+              key={item.id}
+              className={`rail-btn${panelTab === item.id ? " active" : ""}`}
+              title={item.label}
+              onClick={() => openTab(item.id)}
+            >
+              <Icon name={item.icon} />
+            </button>
+          ))}
+        </div>
+        <div className="rail-sep" />
+        <div className="rail-group" aria-label="Remote host capabilities">
+          {remoteTabs.map((item) => (
+            <button
+              key={item.id}
+              className={`rail-btn${panelTab === item.id ? " active" : ""}`}
+              title={item.label}
+              onClick={() => openTab(item.id)}
+            >
+              <Icon name={item.icon} />
+            </button>
+          ))}
+        </div>
         <button
           className="rail-btn panel-collapse"
           title={translate("Collapse session panel")}
@@ -2511,11 +2768,35 @@ function SessionRightPanel({
           <Icon name="sidebarRight" />
         </button>
       </div>
+      <div
+        className="session-panel-resizer"
+        role="separator"
+        aria-label="Resize session panel"
+        onPointerDown={(event) => {
+          event.currentTarget.setPointerCapture(event.pointerId);
+          const startX = event.clientX;
+          const startWidth = width;
+          const move = (moveEvent: PointerEvent) => {
+            const next = Math.min(
+              460,
+              Math.max(308, startWidth + startX - moveEvent.clientX),
+            );
+            onWidthChange(next);
+          };
+          const stop = () => {
+            window.removeEventListener("pointermove", move);
+            window.removeEventListener("pointerup", stop);
+          };
+          window.addEventListener("pointermove", move);
+          window.addEventListener("pointerup", stop, { once: true });
+        }}
+      />
       <div className="session-panel-drawer">
         <div className="drawer-head">
           <strong className="drawer-title">
             {tabs.find((item) => item.id === panelTab)?.label}
           </strong>
+          {running && <span className="live-pill">Live</span>}
           <button
             className="panel-collapse"
             title={translate("Collapse session panel")}
@@ -2578,6 +2859,34 @@ function SessionRightPanel({
               </div>
             </div>
           )}
+          {opened.includes("insights") && (
+            <div
+              className="session-pane"
+              style={{ display: panelTab === "insights" ? "block" : "none" }}
+            >
+              <div className="p-4">
+                <h2 className="text-[15px] font-semibold text-ink">Insights</h2>
+                {insights ? (
+                  <dl className="mt-4 space-y-3 text-[13px]">
+                    {Object.entries(insights)
+                      .filter(([key]) => key !== "session_id")
+                      .map(([key, value]) => (
+                        <div key={key}>
+                          <dt className="text-muted">{key}</dt>
+                          <dd>
+                            {typeof value === "string"
+                              ? value
+                              : JSON.stringify(value)}
+                          </dd>
+                        </div>
+                      ))}
+                  </dl>
+                ) : (
+                  <div className="muted">Loading insights…</div>
+                )}
+              </div>
+            </div>
+          )}
           {tabs
             .filter((item) => item.id !== "info" && opened.includes(item.id))
             .map((item) => (
@@ -2623,6 +2932,7 @@ class AppErrorBoundary extends Component<
 }
 
 function AppContent() {
+  const NAV_COLLAPSED_KEY = "opcos:nav-collapsed:v1";
   const [hosts, setHosts] = useState<Host[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selected, setSelected] = useState<Session | null>(null);
@@ -2635,7 +2945,27 @@ function AppContent() {
   const [error, setError] = useState("");
   const [running, setRunning] = useState(false);
   const [rightPanelCollapsed, setRightPanelCollapsed] = useState(false);
-  const [modal, setModal] = useState(false);
+  const [rightPanelWidth, setRightPanelWidth] = useState(() =>
+    Math.min(Math.round(window.innerWidth * 0.3), 460),
+  );
+  const [navCollapsed, setNavCollapsed] = useState(
+    () => localStorage.getItem(NAV_COLLAPSED_KEY) === "1",
+  );
+  const toggleNav = () => {
+    const next = !navCollapsed;
+    setNavCollapsed(next);
+    localStorage.setItem(NAV_COLLAPSED_KEY, next ? "1" : "0");
+  };
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "b") {
+        event.preventDefault();
+        toggleNav();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
   const [hostName, setHostName] = useState("");
   const [hostUrl, setHostUrl] = useState("");
   const [hostToken, setHostToken] = useState("");
@@ -2645,6 +2975,12 @@ function AppContent() {
   const [models, setModels] = useState<Array<{ id: string; label: string }>>(
     [],
   );
+  const [homeInput, setHomeInput] = useState("");
+  const [homeHostId, setHomeHostId] = useState("");
+  const [homeProvider, setHomeProvider] = useState("");
+  const [homeModel, setHomeModel] = useState("auto");
+  const [homeMode, setHomeMode] = useState("Interactive");
+  const [homeWorkspace, setHomeWorkspace] = useState("");
   const [secretBackend, setSecretBackend] = useState("");
   const generation = useRef(0);
   const refresh = async () => {
@@ -2669,6 +3005,12 @@ function AppContent() {
   useEffect(() => {
     void refresh().catch((reason) => setError(errorMessage(reason)));
   }, []);
+  useEffect(() => {
+    if (!homeHostId && hosts[0]) setHomeHostId(hosts[0].id);
+  }, [hosts, homeHostId]);
+  useEffect(() => {
+    if (!homeProvider && providers[0]) setHomeProvider(providers[0].name);
+  }, [providers, homeProvider]);
   useEffect(() => {
     void command<Array<{ id: string; label: string }>>("provider_models", {
       provider: "openai",
@@ -2801,28 +3143,38 @@ function AppContent() {
     await command("delete_host", { hostId });
     setHosts((items) => items.filter((item) => item.id !== hostId));
   };
-  const createSession = async (
-    title: string,
-    hostId: string,
-    model: string,
-    provider: string,
-    mode: string,
-    workspace: string,
-  ) => {
+  const openNewSessionHome = () => {
+    setSelected(null);
+    setTranscript([]);
+    setRunning(false);
+    setSurface("session");
+    setHomeInput("");
+  };
+  const submitHome = async () => {
+    const text = homeInput.trim();
+    if (!text || !homeHostId || running) return;
+    const title =
+      text.split(/\r?\n/, 1)[0].trim().slice(0, 80) || "New session";
     try {
+      setRunning(true);
       const next = await command<Session>("create_session", {
         title,
-        hostId,
-        model,
-        provider: provider || null,
-        mode,
-        workspace: workspace || null,
+        hostId: homeHostId,
+        model: homeModel || "auto",
+        provider: homeProvider || null,
+        mode: homeMode,
+        workspace: homeWorkspace || null,
       });
-      setModal(false);
-      await refresh();
       setSelected(next);
+      setSurface("session");
+      setHomeInput("");
+      await refresh();
+      await command("submit_turn", {
+        request: { session_id: next.id, text },
+      });
     } catch (reason) {
-      onError(reason);
+      setRunning(false);
+      onError(submitFailureMessage(reason));
     }
   };
   const activeItems = useMemo(() => transcript, [transcript]);
@@ -2915,7 +3267,12 @@ function AppContent() {
   };
   return (
     <div
-      className={`app ${surface === "session" ? "session-layout" : "surface-layout"}${rightPanelCollapsed ? " right-panel-collapsed" : ""}`}
+      className={`app ${surface === "session" && selected ? "session-layout" : "surface-layout"}${surface === "session" && selected && rightPanelCollapsed ? " right-panel-collapsed" : ""}${navCollapsed ? " nav-collapsed" : ""}`}
+      style={
+        {
+          "--right-panel-width": `${rightPanelCollapsed ? 44 : rightPanelWidth}px`,
+        } as CSSProperties
+      }
     >
       <Sidebar
         hosts={hosts}
@@ -2945,7 +3302,7 @@ function AppContent() {
           setSelected(next);
           setSurface("session");
         }}
-        onNew={() => setModal(true)}
+        onNew={openNewSessionHome}
         onTest={(host: Host) =>
           command<Host>("test_host", { hostId: host.id })
             .then((next) =>
@@ -2966,6 +3323,8 @@ function AppContent() {
         setHostUrl={setHostUrl}
         hostToken={hostToken}
         setHostToken={setHostToken}
+        collapsed={navCollapsed}
+        onCollapse={toggleNav}
       />
       <main className="main">
         {surface === "session" && selected ? (
@@ -3065,12 +3424,115 @@ function AppContent() {
         ) : surface === "activity" ? (
           <Activity selected={selected} onError={onError} />
         ) : (
-          <div className="empty-main">
-            <h1>{translate("startSession")}</h1>
-            <p>{translate("chooseHost")}</p>
-            <Button className="primary" onClick={() => setModal(true)}>
-              <Icon name="plus" /> {translate("newSession")}
-            </Button>
+          <div className="home">
+            <div className="home-inner">
+              <div className="home-greeting">OPCOS</div>
+              <div className="composer-card hero">
+                <textarea
+                  value={homeInput}
+                  placeholder="告诉 OPCOS 你想完成什么…"
+                  onChange={(event) => setHomeInput(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (
+                      event.key === "Enter" &&
+                      (event.metaKey || event.ctrlKey)
+                    ) {
+                      event.preventDefault();
+                      void submitHome();
+                    }
+                  }}
+                />
+                <div className="composer-row">
+                  <select
+                    className="chip"
+                    title="绑定主机"
+                    value={homeHostId}
+                    onChange={(event) => setHomeHostId(event.target.value)}
+                  >
+                    <option value="">主机: 未选择</option>
+                    {hosts.map((host) => (
+                      <option key={host.id} value={host.id}>
+                        {host.name}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    className="chip"
+                    title="Provider"
+                    value={homeProvider}
+                    onChange={(event) => setHomeProvider(event.target.value)}
+                  >
+                    <option value="">Provider: 默认</option>
+                    {providers.map((provider) => (
+                      <option key={provider.name} value={provider.name}>
+                        {provider.title}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    className="chip"
+                    title="模型"
+                    value={homeModel}
+                    onChange={(event) => setHomeModel(event.target.value)}
+                  >
+                    <option value="auto">模型: Auto</option>
+                    {models.map((model) => (
+                      <option key={model.id} value={model.id}>
+                        {model.label}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    className="chip"
+                    title="模式"
+                    value={homeMode}
+                    onChange={(event) => setHomeMode(event.target.value)}
+                  >
+                    <option value="Interactive">模式: Interactive</option>
+                    <option value="Auto">模式: Auto</option>
+                  </select>
+                  <input
+                    className="chip workspace-chip"
+                    title="远程 workspace"
+                    value={homeWorkspace}
+                    onChange={(event) => setHomeWorkspace(event.target.value)}
+                    placeholder="Workspace"
+                  />
+                  <span className="spacer" />
+                  <button
+                    className={`send-btn${running ? " sending" : ""}`}
+                    disabled={running || !homeInput.trim() || !homeHostId}
+                    onClick={() => void submitHome()}
+                    title="发送并创建会话"
+                  >
+                    {running ? "…" : "↑"}
+                  </button>
+                </div>
+              </div>
+              {sessions.length > 0 && (
+                <div className="recent">
+                  <div className="recent-head">最近会话</div>
+                  {sessions.slice(0, 8).map((item) => (
+                    <button
+                      className="recent-item"
+                      key={item.id}
+                      onClick={() => {
+                        setSelected(item);
+                        setSurface("session");
+                      }}
+                    >
+                      <span className="recent-dot" />
+                      <span className="recent-copy">
+                        <strong>{item.title}</strong>
+                        <small>
+                          {item.host_name} · {item.model}
+                        </small>
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
         )}
         {error && (
@@ -3096,17 +3558,8 @@ function AppContent() {
           }
           onError={onError}
           onCollapsedChange={setRightPanelCollapsed}
-        />
-      )}
-      {modal && (
-        <NewSessionModal
-          hosts={hosts}
-          providers={providers}
-          models={models}
-          onClose={() => setModal(false)}
-          onCreate={(title, hostId, model, provider, mode, workspace) =>
-            void createSession(title, hostId, model, provider, mode, workspace)
-          }
+          width={rightPanelWidth}
+          onWidthChange={setRightPanelWidth}
         />
       )}
     </div>

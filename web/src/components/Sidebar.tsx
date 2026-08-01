@@ -146,11 +146,9 @@ interface Props {
   integrationsActive: boolean;
   auditActive: boolean;
   inboxActive: boolean;
-  // Collapse controls (⌘B / hover-peek). `onCollapse` docks/undocks; `onPeekLeave` hides the
-  // floating peek when the pointer leaves the panel.
+  // Collapse controls (⌘B). The collapsed state remains an icon-only rail in the grid.
   collapsed?: boolean;
   onCollapse?: () => void;
-  onPeekLeave?: () => void;
 }
 
 // Compact age for project session rows: "now" / "5m" / "6h" / "3d" / "2w" / "4mo" / "2y".
@@ -939,11 +937,76 @@ export function Sidebar(props: SidebarProps) {
     );
   };
 
+  if (props.collapsed) {
+    return (
+      <aside className="sidebar sidebar--collapsed">
+        <div className="sidebar-header collapsed-header">
+          <button
+            className="nav-item-icon"
+            title="展开侧栏 (⌘B)"
+            aria-label="展开侧栏"
+            onClick={props.onCollapse}
+          >
+            <Icon name="sidebar" size={16} />
+          </button>
+        </div>
+        <button
+          className="nav-item-icon"
+          title="新建会话"
+          onClick={props.onNew}
+        >
+          <Icon name="plus" size={18} />
+        </button>
+        <nav className="side-nav">
+          <button
+            className="nav-item-icon"
+            title={translate("search")}
+            onClick={() => setSearchModalOpen(true)}
+          >
+            <Icon name="search" size={18} />
+          </button>
+          <button
+            className="nav-item-icon"
+            title={translate("automations")}
+            onClick={props.onOpenScheduled}
+          >
+            <Icon name="clock" size={18} />
+          </button>
+          <button
+            className="nav-item-icon"
+            title={translate("activity")}
+            onClick={props.onOpenAudit}
+          >
+            <Icon name="audit" size={18} />
+          </button>
+        </nav>
+        <div style={{ flex: 1 }} />
+        <div className="sidebar-footer">
+          <button
+            className="nav-item-icon"
+            title={translate("settings")}
+            onClick={props.onManage}
+          >
+            <Icon name="gear" size={18} />
+          </button>
+        </div>
+        {searchModalOpen && (
+          <SearchModal
+            sessions={props.sessions}
+            personas={personas ?? undefined}
+            onSelect={(id, ws, ag) => {
+              setSearchModalOpen(false);
+              props.onSelectSession(id, ws, ag);
+            }}
+            onClose={() => setSearchModalOpen(false)}
+          />
+        )}
+      </aside>
+    );
+  }
+
   return (
-    <div
-      className="sidebar flex flex-col min-h-0 bg-panel border-r border-line"
-      onMouseLeave={props.onPeekLeave}
-    >
+    <div className="sidebar flex flex-col min-h-0 bg-panel border-r border-line">
       {/* Header: collapse/pin control FIRST + wordmark. The pin sits at the same screen position
           as the collapsed reveal button (see .nav-pin-btn / .nav-reveal-btn in styles.css), so
           hovering the reveal peeks the nav and the pin lands right under the cursor — no travel.
