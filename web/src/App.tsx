@@ -177,15 +177,23 @@ function SurfaceView({
     terminal.open(terminalHost.current);
     const socket = new WebSocket(`ws://127.0.0.1:${port}`);
     socket.binaryType = "arraybuffer";
+    const pending: string[] = [];
+    const send = (data: string) => {
+      if (socket.readyState === WebSocket.OPEN) socket.send(data);
+      else pending.push(data);
+    };
+    socket.onopen = () => {
+      while (pending.length) socket.send(pending.shift()!);
+    };
     socket.onmessage = (event) =>
       terminal.write(
         typeof event.data === "string"
           ? event.data
           : new Uint8Array(event.data as ArrayBuffer),
       );
-    const input = terminal.onData((data) => socket.send(data));
+    const input = terminal.onData(send);
     terminal.onResize(({ cols, rows }) =>
-      socket.send(JSON.stringify({ type: "resize", cols, rows })),
+      send(JSON.stringify({ type: "resize", cols, rows })),
     );
     return () => {
       input.dispose();
@@ -2618,9 +2626,12 @@ function AppContent() {
         setRunning(true);
         if (payload.payload.turn) setRunning(false);
       }
+      if (payload.kind === "turn_done") setRunning(false);
       if (
         payload.kind === "notice" &&
-        ["interrupted", "error"].includes(String(payload.payload?.kind))
+        ["interrupted", "error", "approval_pending"].includes(
+          String(payload.payload?.kind),
+        )
       )
         setRunning(false);
       setTranscript((items) =>
@@ -2725,7 +2736,15 @@ function AppContent() {
           text: "",
           reasoning: item.reasoning || item.text || "",
         });
-      if (item.kind === "tool")
+      if (item.kind === "tool" && item.approval)
+        output.push({
+          kind: "approval",
+          callId: item.callId,
+          name: item.toolName || "approval",
+          args: item.arguments,
+          reason: item.text || "Tool action requires approval",
+        });
+      else if (item.kind === "tool")
         output.push({
           kind: "tool",
           id: item.id,

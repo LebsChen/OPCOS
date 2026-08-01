@@ -96,15 +96,26 @@ export function normalizeTranscript(raw: RawItem[]): TranscriptViewItem[] {
         typeof payload.call_id === "string"
           ? payload.call_id
           : `approval-${index}`;
-      output.push({
-        id: `approval:${callId}`,
-        kind: "tool",
-        callId,
-        toolName: typeof payload.tool === "string" ? payload.tool : "tool",
-        arguments: payload.arguments,
-        status: "pending",
-        approval: true,
-      });
+      const existing = output.find(
+        (item) => item.kind === "tool" && item.callId === callId,
+      );
+      if (existing?.kind === "tool") {
+        existing.toolName =
+          typeof payload.tool === "string" ? payload.tool : existing.toolName;
+        existing.arguments = payload.arguments;
+        existing.status = "pending";
+        existing.approval = true;
+      } else {
+        output.push({
+          id: `approval:${callId}`,
+          kind: "tool",
+          callId,
+          toolName: typeof payload.tool === "string" ? payload.tool : "tool",
+          arguments: payload.arguments,
+          status: "pending",
+          approval: true,
+        });
+      }
       return;
     }
     if (role === "assistant") {

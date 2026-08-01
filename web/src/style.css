@@ -27,7 +27,7 @@
 }
 body {
   margin: 0;
-  min-width: 980px;
+  min-width: 0;
   background: var(--paper);
 }
 .error-boundary {
@@ -54,7 +54,7 @@ button:disabled {
 }
 .app {
   display: grid;
-  grid-template-columns: 276px minmax(500px, 1fr) 256px;
+  grid-template-columns: 276px minmax(0, 1fr) 256px;
   height: 100vh;
   overflow: hidden;
   background: var(--color-panel);
@@ -86,6 +86,7 @@ button:disabled {
   min-height: 0;
   border-right: 1px solid var(--color-line);
   background: var(--panel);
+  color: var(--ink);
 }
 .brand {
   display: flex;
@@ -596,10 +597,17 @@ h3 {
 }
 
 .right-rail-collapsed {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 20;
   display: flex;
   justify-content: flex-start;
   align-items: center;
-  padding-top: 8px;
+}
+
+.app:has(.right-rail-collapsed) {
+  grid-template-columns: 276px minmax(0, 1fr);
 }
 
 .right-rail-collapsed .rail-toggle {
@@ -715,7 +723,7 @@ h3 {
   height: calc(100vh - 180px);
   border: 1px solid var(--color-line);
   border-radius: 8px;
-  background: #fff;
+  background: var(--paper);
 }
 .empty-surface,
 .empty-main {

@@ -53,6 +53,38 @@ describe("OPCOS transcript folding", () => {
     expect(items[0]).toMatchObject({ id: "stream:assistant", text: "hello" });
   });
 
+  it("deduplicates persisted pending approvals by call id", () => {
+    const items = normalizeTranscript([
+      {
+        kind: "assistant",
+        payload: {
+          role: "assistant",
+          content: "",
+          tool_calls: [
+            {
+              id: "call-pending",
+              name: "write_file",
+              arguments: { path: "/workspace/a.txt" },
+            },
+          ],
+        },
+      },
+      {
+        kind: "approval",
+        payload: {
+          call_id: "call-pending",
+          tool: "write_file",
+          arguments: { path: "/workspace/a.txt" },
+        },
+      },
+    ]);
+    expect(
+      items.filter(
+        (item) => item.kind === "tool" && item.callId === "call-pending",
+      ),
+    ).toHaveLength(1);
+  });
+
   it("keeps tool call deltas in a single card and finalizes the turn", () => {
     let items = reduceStreamEvent([], {
       kind: "stream",

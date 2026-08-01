@@ -25,10 +25,10 @@ use opcos_engine::{
     orchestration::{CoordinationRuntime, Envelope, Role},
 };
 use opcos_policy::PermissionMode;
-use opcos_provider::{Provider, ProviderConfig};
 use opcos_provider::anthropic::AnthropicProvider;
 use opcos_provider::openai::OpenAiProvider;
 use opcos_provider::registry;
+use opcos_provider::{Provider, ProviderConfig};
 use opcos_rvm::{
     ExecRequest, HttpRvmClient, IdeBootstrap, PersistentShell, RvmClient, RvmClientConfig, WsKind,
     WsParams,
@@ -676,21 +676,34 @@ async fn engine_for(
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?;
-        let provider = session_provider.unwrap_or_else(|| connection
-            .query_row(
-                "SELECT value FROM settings WHERE key='provider.id'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap_or_else(|_| "openai".into()));
+        let provider = session_provider.unwrap_or_else(|| {
+            connection
+                .query_row(
+                    "SELECT value FROM settings WHERE key='provider.id'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap_or_else(|_| "openai".into())
+        });
         let base_url = connection
             .query_row(
-                &format!("SELECT value FROM settings WHERE key='provider.base_url.{}'", provider),
+                &format!(
+                    "SELECT value FROM settings WHERE key='provider.base_url.{}'",
+                    provider
+                ),
                 [],
                 |row| row.get::<_, String>(0),
             )
             .ok()
-            .or_else(|| connection.query_row("SELECT value FROM settings WHERE key='provider.base_url'", [], |row| row.get::<_, String>(0)).ok());
+            .or_else(|| {
+                connection
+                    .query_row(
+                        "SELECT value FROM settings WHERE key='provider.base_url'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok()
+            });
         (provider, base_url)
     };
     let descriptor = registry::descriptors()
@@ -1246,7 +1259,10 @@ async fn submit_turn(
         json!({"role":"user","text":request.text}),
     );
     match engine.submit_text(request.text).await {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            emit(&app, "turn_done", Some(&request.session_id), json!({}));
+            Ok(())
+        }
         Err(EngineError::ApprovalPending(call_id)) => {
             if let Ok(Some(pending)) = state
                 .store
@@ -1273,6 +1289,7 @@ async fn submit_turn(
                 Some(&request.session_id),
                 json!({"kind":"approval_pending","text":message}),
             );
+            emit(&app, "turn_done", Some(&request.session_id), json!({}));
             Err(message)
         }
         Err(error) => {
@@ -1283,6 +1300,7 @@ async fn submit_turn(
                 Some(&request.session_id),
                 json!({"kind":"error","text":message}),
             );
+            emit(&app, "turn_done", Some(&request.session_id), json!({}));
             Err(message)
         }
     }
@@ -1376,7 +1394,9 @@ async fn change_provider(
     provider: Option<String>,
 ) -> Result<(), String> {
     if let Some(ref name) = provider
-        && !registry::descriptors().iter().any(|item| item.name == *name)
+        && !registry::descriptors()
+            .iter()
+            .any(|item| item.name == *name)
     {
         return Err("unknown provider".into());
     }
