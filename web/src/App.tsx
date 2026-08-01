@@ -1005,6 +1005,25 @@ function ManageSections({
   const [linearIssues, setLinearIssues] = useState<
     Array<Record<string, unknown>>
   >([]);
+  const [indexStatus, setIndexStatus] = useState<{
+    status: string;
+    built_at?: string;
+    file_count: number;
+    symbol_count: number;
+    truncated: boolean;
+    reason?: string;
+  } | null>(null);
+  useEffect(() => {
+    if (tab !== "index" || !selected) {
+      setIndexStatus(null);
+      return;
+    }
+    void command<typeof indexStatus>("repo_index_status", {
+      sessionId: selected.id,
+    })
+      .then(setIndexStatus)
+      .catch(onError);
+  }, [tab, selected, onError]);
   const sectionCopy: Record<SettingsSection, [string, string]> = {
     provider: [
       "Provider",
@@ -1020,6 +1039,10 @@ function ManageSections({
     connectors: [
       "Connectors",
       "Linear is connected locally with a Personal API Key. Other connectors are not integrated.",
+    ],
+    index: [
+      "Repository index",
+      "Build a host-backed path and symbol index before asking the agent to change code.",
     ],
     secrets: [
       "Secrets",
@@ -2278,6 +2301,56 @@ function ManageSections({
               </div>
             ))}
           </div>
+        )}
+        {tab === "index" && (
+          <CollectionPage
+            search=""
+            onSearch={() => undefined}
+            searchPlaceholder="Repository index"
+            primary={
+              <Button
+                className="primary"
+                disabled={!selected}
+                onClick={() =>
+                  selected &&
+                  command<typeof indexStatus>("repo_index_refresh", {
+                    sessionId: selected.id,
+                  })
+                    .then(setIndexStatus)
+                    .catch(onError)
+                }
+              >
+                {indexStatus?.status === "ready" ||
+                indexStatus?.status === "limited"
+                  ? "Refresh index"
+                  : "Build index"}
+              </Button>
+            }
+            rows={
+              indexStatus ? (
+                <div className="manage-row px-4">
+                  <span>
+                    <strong>{indexStatus.status}</strong>
+                    <small>
+                      {indexStatus.file_count} files ·{" "}
+                      {indexStatus.symbol_count} symbols
+                      {indexStatus.truncated ? " · limited by size" : ""}
+                    </small>
+                  </span>
+                  <span className="muted">
+                    {indexStatus.built_at
+                      ? new Date(indexStatus.built_at).toLocaleString()
+                      : "not built"}
+                  </span>
+                </div>
+              ) : null
+            }
+            empty={
+              selected
+                ? "Repository index has not been built for this session host."
+                : "Select a session to manage its repository index."
+            }
+          />
         )}
         {tab === "secrets" && (
           <CollectionPage

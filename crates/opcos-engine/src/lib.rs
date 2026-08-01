@@ -1351,7 +1351,10 @@ fn tool_risk(name: &str) -> ToolRisk {
         | "git_diff"
         | "git_log"
         | "linear_get_issue"
-        | "linear_list_my_issues" => ToolRisk::Read,
+        | "linear_list_my_issues"
+        | "repo_index_find_symbol"
+        | "repo_index_glob"
+        | "repo_index_search" => ToolRisk::Read,
         "write_file" | "edit" => ToolRisk::Write,
         "run_shell" => ToolRisk::Execute,
         _ => ToolRisk::External,
@@ -1760,6 +1763,9 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"linear_list_my_issues","description":"List Linear issues assigned to the current user. Read-only.","parameters":{"type":"object","properties":{"limit":{"type":"integer"}}}}}),
         json!({"type":"function","function":{"name":"linear_comment_issue","description":"Add a comment to a Linear issue. Requires approval.","parameters":{"type":"object","properties":{"issue_id":{"type":"string"},"body":{"type":"string"}},"required":["issue_id","body"]}}}),
         json!({"type":"function","function":{"name":"linear_update_issue_status","description":"Change a Linear issue status. Requires approval.","parameters":{"type":"object","properties":{"issue_id":{"type":"string"},"state_id":{"type":"string"}},"required":["issue_id","state_id"]}}}),
+        json!({"type":"function","function":{"name":"repo_index_find_symbol","description":"Find definitions and symbols in the repository index. Read-only.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}),
+        json!({"type":"function","function":{"name":"repo_index_glob","description":"Find repository paths matching a glob. Read-only.","parameters":{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}}}),
+        json!({"type":"function","function":{"name":"repo_index_search","description":"Search indexed symbol/content lines without loading whole files. Read-only.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}),
     ]
 }
 
