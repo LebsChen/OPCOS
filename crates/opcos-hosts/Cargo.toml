@@ -1,0 +1,14 @@
+[package]
+name = "opcos-hosts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+opcos-rvm = { path = "../opcos-rvm" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

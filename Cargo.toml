@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/opcos-hosts",
   "crates/opcos-rvm",
   "crates/opcos-provider",
   "crates/opcos-engine",
@@ -21,6 +22,7 @@ axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 anyhow = "1"
 async-trait = "0.1"
+opcos-hosts = { path = "crates/opcos-hosts" }
 aws-config = "1"
 aws-sdk-bedrockruntime = "1.138.0"
 aws-sdk-bedrock = "1.150.0"
