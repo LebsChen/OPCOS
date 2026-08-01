@@ -2969,26 +2969,14 @@ function SessionRightPanel({
     { id: "browser", label: "Browser", icon: "grid" },
   ];
   const tabs = [...informationTabs, ...workspaceTabs, ...remoteTabs];
-  if (collapsed) {
-    return (
-      <aside className="right-shell right-rail session-right-panel right-rail-collapsed">
-        <div className="icon-rail session-icon-rail">
-          <button
-            className="rail-btn"
-            title={translate("Expand session panel")}
-            onClick={() => {
-              onCollapsedChange?.(false);
-            }}
-          >
-            <Icon name="sidebarRight" />
-          </button>
-        </div>
-      </aside>
-    );
-  }
   const openTab = (id: PanelTab) => {
+    if (!collapsed && panelTab === id) {
+      onCollapsedChange?.(true);
+      return;
+    }
     setPanelTab(id);
     setOpened((items) => (items.includes(id) ? items : [...items, id]));
+    onCollapsedChange?.(false);
   };
   const openStandalonePane = async () => {
     const url = new URL(window.location.href);
@@ -3003,152 +2991,160 @@ function SessionRightPanel({
     });
   };
   return (
-    <aside className="right-shell right-rail session-right-panel">
-      <div className="right-panel session-panel-drawer">
-        <div className="drawer-head">
-          <strong className="drawer-title">
-            {tabs.find((item) => item.id === panelTab)?.label}
-          </strong>
-          {running && <span className="live-pill">Live</span>}
-          <div className="drawer-actions">
-            <button
-              className="drawer-action"
-              title="在独立窗口打开"
-              aria-label="在独立窗口打开"
-              onClick={() => void openStandalonePane().catch(onError)}
-            >
-              <Icon name="panelOpen" />
-            </button>
-            <button
-              className="drawer-action"
-              title={translate("Collapse session panel")}
-              aria-label={translate("Collapse session panel")}
-              onClick={() => {
-                onCollapsedChange?.(true);
-              }}
-            >
-              <Icon name="x" />
-            </button>
+    <aside
+      className={`right-shell right-rail session-right-panel${collapsed ? " drawer-collapsed" : ""}`}
+    >
+      {!collapsed && (
+        <div className="right-panel session-panel-drawer">
+          <div className="drawer-head">
+            <strong className="drawer-title">
+              {tabs.find((item) => item.id === panelTab)?.label}
+            </strong>
+            {running && <span className="live-pill">Live</span>}
+            <div className="drawer-actions">
+              <button
+                className="drawer-action"
+                title="在独立窗口打开"
+                aria-label="在独立窗口打开"
+                onClick={() => void openStandalonePane().catch(onError)}
+              >
+                <Icon name="panelOpen" />
+              </button>
+              <button
+                className="drawer-action"
+                title={translate("Collapse session panel")}
+                aria-label={translate("Collapse session panel")}
+                onClick={() => {
+                  onCollapsedChange?.(true);
+                }}
+              >
+                <Icon name="x" />
+              </button>
+            </div>
           </div>
-        </div>
-        <div className="session-panel-content">
-          {opened.includes("info") && (
-            <div
-              className="session-pane"
-              style={{ display: panelTab === "info" ? "block" : "none" }}
-            >
-              <div className="info">
-                <Field k={translate("Session ID")} v={selected.id} />
-                <Field
-                  k={translate("Status")}
-                  v={running ? "Running" : "Ready"}
-                />
-                <Field k={translate("Host")} v={selected.host_name} />
-                <Field
-                  k={translate("Workspace")}
-                  v={selected.workspace || translate("Not set")}
-                />
-                <Field k={translate("Model")} v={selected.model} />
-                <div className="field">
-                  <label>Provider</label>
-                  <select
-                    value={selected.provider || ""}
-                    onChange={(event) => onProviderChange(event.target.value)}
-                    aria-label="Provider"
-                  >
-                    <option value="">Global default</option>
-                    {providers.map((item) => (
-                      <option key={item.name} value={item.name}>
-                        {item.title}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                {running && (
-                  <div className="actions">
-                    <button
-                      type="button"
-                      onClick={() =>
-                        void command("interrupt", {
-                          sessionId: selected.id,
-                        }).catch(onError)
-                      }
-                    >
-                      Interrupt
-                    </button>
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
-          {opened.includes("insights") && (
-            <div
-              className="session-pane"
-              style={{ display: panelTab === "insights" ? "block" : "none" }}
-            >
-              <div className="p-4">
-                <h2 className="text-[15px] font-semibold text-ink">Insights</h2>
-                {insights ? (
-                  <dl className="mt-4 space-y-3 text-[13px]">
-                    {Object.entries(insights)
-                      .filter(([key]) => key !== "session_id")
-                      .map(([key, value]) => (
-                        <div key={key}>
-                          <dt className="text-muted">{key}</dt>
-                          <dd>
-                            {typeof value === "string"
-                              ? value
-                              : JSON.stringify(value)}
-                          </dd>
-                        </div>
-                      ))}
-                  </dl>
-                ) : (
-                  <div className="muted">Loading insights…</div>
-                )}
-              </div>
-            </div>
-          )}
-          {tabs
-            .filter((item) => item.id !== "info" && opened.includes(item.id))
-            .map((item) => (
+          <div className="session-panel-content">
+            {opened.includes("info") && (
               <div
                 className="session-pane"
-                key={item.id}
-                style={{ display: panelTab === item.id ? "flex" : "none" }}
+                style={{ display: panelTab === "info" ? "block" : "none" }}
               >
-                <SurfaceView
-                  tab={item.id as Exclude<SurfaceTab, "chat">}
-                  selected={selected}
-                  onError={onError}
-                />
+                <div className="info">
+                  <Field k={translate("Session ID")} v={selected.id} />
+                  <Field
+                    k={translate("Status")}
+                    v={running ? "Running" : "Ready"}
+                  />
+                  <Field k={translate("Host")} v={selected.host_name} />
+                  <Field
+                    k={translate("Workspace")}
+                    v={selected.workspace || translate("Not set")}
+                  />
+                  <Field k={translate("Model")} v={selected.model} />
+                  <div className="field">
+                    <label>Provider</label>
+                    <select
+                      value={selected.provider || ""}
+                      onChange={(event) => onProviderChange(event.target.value)}
+                      aria-label="Provider"
+                    >
+                      <option value="">Global default</option>
+                      {providers.map((item) => (
+                        <option key={item.name} value={item.name}>
+                          {item.title}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  {running && (
+                    <div className="actions">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          void command("interrupt", {
+                            sessionId: selected.id,
+                          }).catch(onError)
+                        }
+                      >
+                        Interrupt
+                      </button>
+                    </div>
+                  )}
+                </div>
               </div>
-            ))}
+            )}
+            {opened.includes("insights") && (
+              <div
+                className="session-pane"
+                style={{ display: panelTab === "insights" ? "block" : "none" }}
+              >
+                <div className="p-4">
+                  <h2 className="text-[15px] font-semibold text-ink">
+                    Insights
+                  </h2>
+                  {insights ? (
+                    <dl className="mt-4 space-y-3 text-[13px]">
+                      {Object.entries(insights)
+                        .filter(([key]) => key !== "session_id")
+                        .map(([key, value]) => (
+                          <div key={key}>
+                            <dt className="text-muted">{key}</dt>
+                            <dd>
+                              {typeof value === "string"
+                                ? value
+                                : JSON.stringify(value)}
+                            </dd>
+                          </div>
+                        ))}
+                    </dl>
+                  ) : (
+                    <div className="muted">Loading insights…</div>
+                  )}
+                </div>
+              </div>
+            )}
+            {tabs
+              .filter((item) => item.id !== "info" && opened.includes(item.id))
+              .map((item) => (
+                <div
+                  className="session-pane"
+                  key={item.id}
+                  style={{ display: panelTab === item.id ? "flex" : "none" }}
+                >
+                  <SurfaceView
+                    tab={item.id as Exclude<SurfaceTab, "chat">}
+                    selected={selected}
+                    onError={onError}
+                  />
+                </div>
+              ))}
+          </div>
         </div>
-      </div>
-      <div
-        className="session-panel-resizer"
-        role="separator"
-        aria-label="Resize session panel"
-        onPointerDown={(event) => {
-          event.currentTarget.setPointerCapture(event.pointerId);
-          const startX = event.clientX;
-          const startWidth = width;
-          const move = (moveEvent: PointerEvent) => {
-            const next = Math.min(
-              460,
-              Math.max(308, startWidth + startX - moveEvent.clientX),
-            );
-            onWidthChange(next);
-          };
-          const stop = () => {
-            window.removeEventListener("pointermove", move);
-            window.removeEventListener("pointerup", stop);
-          };
-          window.addEventListener("pointermove", move);
-          window.addEventListener("pointerup", stop, { once: true });
-        }}
-      />
+      )}
+      {!collapsed && (
+        <div
+          className="session-panel-resizer"
+          role="separator"
+          aria-label="Resize session panel"
+          onPointerDown={(event) => {
+            event.currentTarget.setPointerCapture(event.pointerId);
+            const startX = event.clientX;
+            const startWidth = width;
+            const move = (moveEvent: PointerEvent) => {
+              const next = Math.min(
+                460,
+                Math.max(308, startWidth + startX - moveEvent.clientX),
+              );
+              onWidthChange(next);
+            };
+            const stop = () => {
+              window.removeEventListener("pointermove", move);
+              window.removeEventListener("pointerup", stop);
+            };
+            window.addEventListener("pointermove", move);
+            window.addEventListener("pointerup", stop, { once: true });
+          }}
+        />
+      )}
       <div className="icon-rail session-icon-rail">
         <div className="rail-group" aria-label="Information">
           {informationTabs.map((item) => (
@@ -3188,15 +3184,6 @@ function SessionRightPanel({
             </button>
           ))}
         </div>
-        <button
-          className="rail-btn panel-collapse"
-          title={translate("Collapse session panel")}
-          onClick={() => {
-            onCollapsedChange?.(true);
-          }}
-        >
-          <Icon name="sidebarRight" />
-        </button>
       </div>
     </aside>
   );
@@ -3239,7 +3226,7 @@ function AppContent() {
   const [query, setQuery] = useState("");
   const [error, setError] = useState("");
   const [running, setRunning] = useState(false);
-  const [rightPanelCollapsed, setRightPanelCollapsed] = useState(false);
+  const [drawerCollapsed, setDrawerCollapsed] = useState(false);
   const [rightPanelWidth, setRightPanelWidth] = useState(() =>
     Math.min(Math.round(window.innerWidth * 0.3), 460),
   );
@@ -3611,10 +3598,10 @@ function AppContent() {
   };
   return (
     <div
-      className={`app ${surface === "session" && selected ? "session-layout" : "surface-layout"}${surface === "session" && selected && rightPanelCollapsed ? " right-panel-collapsed" : ""}${navCollapsed ? " nav-collapsed" : ""}${windowMaximized ? " window-maximized" : ""}`}
+      className={`app ${surface === "session" && selected ? "session-layout" : "surface-layout"}${surface === "session" && selected && drawerCollapsed ? " session-drawer-collapsed" : ""}${navCollapsed ? " nav-collapsed" : ""}${windowMaximized ? " window-maximized" : ""}`}
       style={
         {
-          "--right-panel-width": `${rightPanelCollapsed ? 44 : rightPanelWidth}px`,
+          "--right-panel-width": `${drawerCollapsed ? 44 : rightPanelWidth}px`,
         } as CSSProperties
       }
     >
@@ -3690,7 +3677,7 @@ function AppContent() {
                 <button
                   className="icon-button"
                   title={translate("Toggle session panel")}
-                  onClick={() => setRightPanelCollapsed((value) => !value)}
+                  onClick={() => setDrawerCollapsed((value) => !value)}
                 >
                   <Icon name="sidebarRight" />
                 </button>
@@ -3926,7 +3913,7 @@ function AppContent() {
         <SessionRightPanel
           selected={selected}
           running={running}
-          collapsed={rightPanelCollapsed}
+          collapsed={drawerCollapsed}
           providers={providers}
           onProviderChange={(provider) =>
             command("change_provider", {
@@ -3937,7 +3924,7 @@ function AppContent() {
               .catch(onError)
           }
           onError={onError}
-          onCollapsedChange={setRightPanelCollapsed}
+          onCollapsedChange={setDrawerCollapsed}
           width={rightPanelWidth}
           onWidthChange={setRightPanelWidth}
         />

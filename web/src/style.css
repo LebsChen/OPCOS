@@ -110,7 +110,7 @@ button:disabled {
 .app.nav-collapsed.session-layout {
   grid-template-columns: 56px minmax(320px, 1fr);
 }
-.app.nav-collapsed.session-layout.right-panel-collapsed {
+.app.nav-collapsed.session-layout.session-drawer-collapsed {
   grid-template-columns: 56px minmax(320px, 1fr);
 }
 .sidebar--collapsed {
@@ -682,7 +682,7 @@ h3 {
   width: var(--right-panel-width, 360px);
   overflow: hidden;
 }
-.app.right-panel-collapsed .session-right-panel {
+.app.session-drawer-collapsed .session-right-panel {
   width: 44px;
 }
 .right-panel,
@@ -778,9 +778,6 @@ h3 {
   background: var(--color-accent-soft);
   font-size: 10px;
   font-weight: 600;
-}
-.session-icon-rail .panel-collapse {
-  margin-top: auto;
 }
 .session-panel-drawer {
   display: flex;
@@ -928,39 +925,11 @@ h3 {
   flex-wrap: wrap;
 }
 
-.right-rail-collapsed {
-  z-index: 20;
-  display: flex;
-  height: 100%;
-  min-height: 0;
-  min-width: 0;
-  overflow: hidden;
-  justify-content: flex-start;
-  align-items: center;
-}
-
-.app.right-panel-collapsed {
-  grid-template-columns: 276px minmax(320px, 1fr) 44px;
-}
-.app.session-layout.right-panel-collapsed,
-.app.nav-collapsed.session-layout.right-panel-collapsed {
-  grid-template-columns: 276px minmax(320px, 1fr);
-}
-.app.session-layout.right-panel-collapsed .main-topbar,
-.app.session-layout.right-panel-collapsed .main-chat,
-.app.nav-collapsed.session-layout.right-panel-collapsed .main-topbar,
-.app.nav-collapsed.session-layout.right-panel-collapsed .main-chat {
+.app.session-layout.session-drawer-collapsed .main-topbar,
+.app.session-layout.session-drawer-collapsed .main-chat,
+.app.nav-collapsed.session-layout.session-drawer-collapsed .main-topbar,
+.app.nav-collapsed.session-layout.session-drawer-collapsed .main-chat {
   margin-right: 44px;
-}
-
-.right-rail-collapsed .rail-toggle {
-  display: grid;
-  width: 34px;
-  height: 34px;
-  margin: 0 auto;
-  place-items: center;
-  border-radius: 7px;
-  color: var(--color-muted);
 }
 .rail-section {
   padding: 15px 14px;
@@ -1385,7 +1354,7 @@ input.workspace-chip {
   .app.session-layout {
     grid-template-columns: 220px minmax(280px, 1fr);
   }
-  .app.session-layout.right-panel-collapsed {
+  .app.session-layout.session-drawer-collapsed {
     grid-template-columns: 220px minmax(280px, 1fr);
   }
   .surface-panel {
