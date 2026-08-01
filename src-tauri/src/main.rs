@@ -25,6 +25,7 @@ use opcos_engine::{
     orchestration::{CoordinationRuntime, Envelope, Role},
 };
 use opcos_hosts::{DEFAULT_EXEC_TIMEOUT_SECONDS, Host, LocalHost, RvmHost};
+use opcos_mcp::{McpCredentialStore, McpManager, McpServerConfig, stable_server_key};
 use opcos_policy::PermissionMode;
 use opcos_provider::anthropic::AnthropicProvider;
 use opcos_provider::bedrock::BedrockProvider;
@@ -94,18 +95,43 @@ struct DesktopState {
     coordination: AsyncMutex<HashMap<String, CoordinationRuntime>>,
 }
 
+#[derive(Clone)]
+struct McpCredentialAdapter {
+    store: KeyringSecretStore,
+}
+
+#[async_trait]
+impl McpCredentialStore for McpCredentialAdapter {
+    async fn get(
+        &self,
+        server_id: &str,
+    ) -> Result<Option<HashMap<String, String>>, opcos_mcp::McpClientError> {
+        let value = self
+            .store
+            .get(&secret_key("mcp-credential", server_id))
+            .map_err(|_| opcos_mcp::McpClientError::Transport)?;
+        value
+            .map(|value| {
+                serde_json::from_str(&value).map_err(|_| opcos_mcp::McpClientError::Transport)
+            })
+            .transpose()
+    }
+}
+
 type GuiEngine = TurnEngine<Box<dyn Provider>, SqliteStore, DesktopExecutor>;
 
 struct RemoteExecutor {
     client: HttpRvmClient,
     shell: AsyncMutex<PersistentShell<HttpRvmClient>>,
     secrets: KeyringSecretStore,
+    mcp: Arc<McpManager<McpCredentialAdapter>>,
 }
 
 struct LocalExecutor {
     host: LocalHost,
     secrets: KeyringSecretStore,
     session_id: String,
+    mcp: Arc<McpManager<McpCredentialAdapter>>,
 }
 
 enum DesktopExecutor {
@@ -205,6 +231,12 @@ impl ToolExecutor for RemoteExecutor {
                     .await
                     .map_err(|error| error.to_string())
             }
+            name if name.starts_with("mcp__") => self
+                .mcp
+                .call_qualified(name, arguments)
+                .await
+                .map(|result| result.content)
+                .map_err(|error| error.to_string()),
             _ => Err(format!("remote tool is unavailable: {name}")),
         }
     }
@@ -281,6 +313,12 @@ impl ToolExecutor for DesktopExecutor {
                         }
                         Ok(output)
                     }
+                    name if name.starts_with("mcp__") => executor
+                        .mcp
+                        .call_qualified(name, arguments)
+                        .await
+                        .map(|result| result.content)
+                        .map_err(|error| error.to_string()),
                     _ => Err(format!("local tool is unavailable: {name}")),
                 }
             }
@@ -498,6 +536,15 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                enabled INTEGER NOT NULL,
                PRIMARY KEY(session_id,name)
              );
+             CREATE TABLE IF NOT EXISTS mcp_tool_cache (
+               server_object_id TEXT NOT NULL,
+               config_version_id TEXT NOT NULL,
+               tool_name TEXT NOT NULL,
+               description TEXT,
+               input_schema_json TEXT NOT NULL,
+               discovered_at TEXT NOT NULL,
+               PRIMARY KEY(server_object_id,config_version_id,tool_name)
+             );
              CREATE TABLE IF NOT EXISTS asset_session_selection (
                session_id TEXT NOT NULL,
                asset_id TEXT NOT NULL,
@@ -538,6 +585,32 @@ fn content_hash(content: &str) -> String {
     format!("{:x}", digest.finalize())
 }
 
+fn validate_mcp_content(content: &str) -> Result<(), String> {
+    let value: Value = serde_json::from_str(content)
+        .map_err(|error| format!("invalid MCP config JSON: {error}"))?;
+    fn walk(value: &Value) -> bool {
+        match value {
+            Value::Object(map) => map.iter().any(|(key, value)| {
+                let key = key.to_ascii_lowercase();
+                key.contains("token")
+                    || key.contains("secret")
+                    || key.contains("password")
+                    || key == "authorization"
+                    || key == "client_secret"
+                    || walk(value)
+            }),
+            Value::Array(values) => values.iter().any(walk),
+            _ => false,
+        }
+    }
+    if walk(&value) {
+        return Err(
+            "MCP config contains credential fields; store credentials in SecretStore".into(),
+        );
+    }
+    Ok(())
+}
+
 fn migrate_config_objects(connection: &mut Connection) -> Result<(), String> {
     let migrated: bool = connection
         .query_row(
@@ -548,6 +621,24 @@ fn migrate_config_objects(connection: &mut Connection) -> Result<(), String> {
         .map_err(|error| error.to_string())?
         > 0;
     if migrated {
+        let _ = connection.execute("ALTER TABLE config_object ADD COLUMN server_key TEXT", []);
+        let mut keys = connection
+            .prepare("SELECT id FROM config_object WHERE server_key IS NULL")
+            .map_err(|error| error.to_string())?;
+        let ids = keys
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        for id in ids {
+            connection
+                .execute(
+                    "UPDATE config_object SET server_key=?1 WHERE id=?2",
+                    params![stable_server_key(&id), id],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        drop(keys);
         let asset_table = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -581,6 +672,7 @@ fn migrate_config_objects(connection: &mut Connection) -> Result<(), String> {
                id TEXT PRIMARY KEY,
                kind TEXT NOT NULL,
                name TEXT NOT NULL,
+               server_key TEXT,
                scope_kind TEXT NOT NULL,
                scope_key TEXT,
                status TEXT NOT NULL,
@@ -1284,6 +1376,9 @@ async fn engine_for(
         .or(configured_base_url)
         .or(descriptor.default_base_url)
         .unwrap_or_default();
+    let mcp_runtime = Arc::new(McpManager::new(Arc::new(McpCredentialAdapter {
+        store: state.secrets.clone(),
+    })));
     let (workspace, executor, remote_client, allowed_tools) = if host_id == "local" {
         let workspace = if session_workspace.is_empty() {
             std::env::current_dir()
@@ -1317,6 +1412,7 @@ async fn engine_for(
                 host,
                 secrets: state.secrets.clone(),
                 session_id: session_id.to_owned(),
+                mcp: Arc::clone(&mcp_runtime),
             })),
             None,
             Some(allowed_tools),
@@ -1345,6 +1441,7 @@ async fn engine_for(
                 )),
                 client: executor_client.clone(),
                 secrets: state.secrets.clone(),
+                mcp: Arc::clone(&mcp_runtime),
             }))),
             Some(executor_client),
             None,
@@ -1452,6 +1549,64 @@ async fn engine_for(
             })
             .collect();
         engine.set_external_tools(selected).await;
+    }
+    let mcp_configs = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let mut statement = connection
+            .prepare(
+                "SELECT o.id,o.name,COALESCE(o.server_key,''),o.current_version_id,v.content
+                 FROM config_object o
+                 JOIN config_object_version v ON v.id=o.current_version_id
+                 WHERE o.kind='mcp' AND o.status='active'",
+            )
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    serde_json::from_str::<Value>(&row.get::<_, String>(4)?)
+                        .unwrap_or_else(|_| json!({})),
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+    let mut independent_tools = Vec::new();
+    for (object_id, name, server_key, version_id, mut content) in mcp_configs {
+        content["object_id"] = Value::String(object_id);
+        content["name"] = Value::String(name);
+        content["server_key"] = Value::String(if server_key.is_empty() {
+            stable_server_key(content["object_id"].as_str().unwrap_or_default())
+        } else {
+            server_key
+        });
+        let config = match serde_json::from_value::<McpServerConfig>(content) {
+            Ok(config) => config,
+            Err(_) => continue,
+        };
+        if let Ok(tools) = mcp_runtime
+            .connect_with_retry(&config, &version_id, 0)
+            .await
+        {
+            independent_tools.extend(tools.into_iter().map(|tool| {
+                json!({
+                    "name": tool.name,
+                    "qualified_name": tool.qualified_name,
+                    "description": tool.description.unwrap_or_default(),
+                    "inputSchema": tool.input_schema,
+                })
+            }));
+        }
+    }
+    if !independent_tools.is_empty() {
+        engine.append_external_tools(independent_tools).await;
     }
     let mut bundle = if let Some(executor_client) = &remote_client {
         discover_assets(executor_client, &workspace)
@@ -2615,7 +2770,7 @@ fn list_assets(state: State<'_, DesktopState>, kind: Option<String>) -> Result<V
     let mut statement = connection
         .prepare(
             "SELECT o.id,o.kind,o.name,v.content,v.metadata_json,o.scope_kind,
-                    COALESCE(o.scope_key,''),o.status,o.current_version_id
+                    COALESCE(o.scope_key,''),o.status,o.current_version_id,o.server_key
              FROM config_object o
              JOIN config_object_version v ON v.id=o.current_version_id
              WHERE (?1 IS NULL OR o.kind=?1) AND o.status <> 'deleted'
@@ -2641,6 +2796,7 @@ fn list_assets(state: State<'_, DesktopState>, kind: Option<String>) -> Result<V
                 "enabled": row.get::<_, String>(7)? == "active",
                 "status": row.get::<_, String>(7)?,
                 "version_id": row.get::<_, String>(8)?,
+                "server_key": row.get::<_, Option<String>>(9)?.unwrap_or_else(|| stable_server_key(&row.get::<_, String>(0).unwrap_or_default())),
             }))
         })
         .map_err(|error| error.to_string())?;
@@ -2666,6 +2822,9 @@ fn save_asset(
         "knowledge" | "playbook" | "skill" | "agents" | "mcp"
     ) {
         return Err("unsupported asset kind".into());
+    }
+    if kind == "mcp" {
+        validate_mcp_content(&body)?;
     }
     let connection = state
         .database
@@ -2696,11 +2855,20 @@ fn save_asset(
     transaction
         .execute(
             "INSERT INTO config_object
-             (id,kind,name,scope_kind,scope_key,status,created_at,current_version_id)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,NULL)
+             (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,NULL)
              ON CONFLICT(id) DO UPDATE SET name=excluded.name,scope_kind=excluded.scope_kind,
                scope_key=excluded.scope_key,status=excluded.status",
-            params![id, object_kind, title, scope_kind, scope_key, status, now],
+            params![
+                id,
+                object_kind,
+                title,
+                stable_server_key(&id),
+                scope_kind,
+                scope_key,
+                status,
+                now
+            ],
         )
         .map_err(|error| error.to_string())?;
     let metadata = serde_json::to_string(&json!({
@@ -3147,6 +3315,142 @@ async fn mcp_tools(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default())
+}
+
+#[tauri::command]
+fn list_mcp_servers(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let mut statement = connection
+        .prepare(
+            "SELECT o.id,o.name,o.server_key,o.status,o.current_version_id,
+                    v.content
+             FROM config_object o
+             JOIN config_object_version v ON v.id=o.current_version_id
+             WHERE o.kind='mcp' AND o.status <> 'deleted'
+             ORDER BY o.name",
+        )
+        .map_err(|error| error.to_string())?;
+    statement
+        .query_map([], |row| {
+            let content: Value = serde_json::from_str::<Value>(&row.get::<_, String>(5)?)
+                .unwrap_or_else(|_| json!({}));
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "server_key": row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                "status": if row.get::<_, String>(3)? == "active" {
+                    "configured"
+                } else {
+                    "disabled"
+                },
+                "version_id": row.get::<_, String>(4)?,
+                "transport": content.get("transport").or_else(|| content.get("type")),
+                "url": content.get("url"),
+                "command": content.get("command"),
+            }))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn retry_mcp_server(
+    state: State<'_, DesktopState>,
+    server_id: String,
+) -> Result<Value, String> {
+    let (name, version_id, mut config): (String, String, Value) = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        connection
+            .query_row(
+                "SELECT o.name,o.current_version_id,v.content
+                 FROM config_object o
+                 JOIN config_object_version v ON v.id=o.current_version_id
+                 WHERE o.id=?1 AND o.kind='mcp' AND o.status='active'",
+                [server_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        serde_json::from_str::<Value>(&row.get::<_, String>(2)?)
+                            .unwrap_or_else(|_| json!({})),
+                    ))
+                },
+            )
+            .map_err(|error| format!("MCP server unavailable: {error}"))?
+    };
+    let server_key: String = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        connection
+            .query_row(
+                "SELECT COALESCE(server_key,'') FROM config_object WHERE id=?1",
+                [server_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?
+    };
+    config["object_id"] = Value::String(server_id.clone());
+    config["server_key"] = Value::String(if server_key.is_empty() {
+        stable_server_key(&server_id)
+    } else {
+        server_key
+    });
+    config["name"] = Value::String(name.clone());
+    let parsed: McpServerConfig =
+        serde_json::from_value(config).map_err(|error| format!("invalid MCP config: {error}"))?;
+    let manager = McpManager::new(Arc::new(McpCredentialAdapter {
+        store: state.secrets.clone(),
+    }));
+    let tools = manager
+        .connect_with_retry(&parsed, &version_id, 2)
+        .await
+        .map_err(|error| format!("MCP server retry failed: {error}"))?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM mcp_tool_cache WHERE server_object_id=?1 AND config_version_id=?2",
+            params![server_id, version_id],
+        )
+        .map_err(|error| error.to_string())?;
+    for tool in &tools {
+        transaction
+            .execute(
+                "INSERT INTO mcp_tool_cache
+                 (server_object_id,config_version_id,tool_name,description,input_schema_json,discovered_at)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                params![
+                    tool.server_id,
+                    version_id,
+                    tool.name,
+                    tool.description,
+                    serde_json::to_string(&tool.input_schema).map_err(|error| error.to_string())?,
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(json!({
+        "id": parsed.object_id,
+        "name": parsed.name,
+        "status": "connected",
+        "tool_count": tools.len(),
+    }))
 }
 
 #[tauri::command]
@@ -4301,6 +4605,8 @@ fn main() {
             import_assets,
             discover_remote_assets,
             mcp_tools,
+            list_mcp_servers,
+            retry_mcp_server,
             set_mcp_tool_enabled,
             read_blueprint,
             execute_blueprint,

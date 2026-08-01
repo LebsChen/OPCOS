@@ -2049,8 +2049,12 @@ function McpManage({
   onError: (error: unknown) => void;
 }) {
   const [tools, setTools] = useState<Array<Record<string, unknown>>>([]);
+  const [servers, setServers] = useState<Array<Record<string, unknown>>>([]);
   const [search, setSearch] = useState("");
   useEffect(() => {
+    void command<Array<Record<string, unknown>>>("list_mcp_servers")
+      .then(setServers)
+      .catch(onError);
     if (selected)
       void command<Array<Record<string, unknown>>>("mcp_tools", {
         sessionId: selected.id,
@@ -2067,8 +2071,37 @@ function McpManage({
       onSearch={setSearch}
       searchPlaceholder={translate("searchMcp")}
       rows={
-        filtered.length ? (
+        filtered.length || servers.length ? (
           <>
+            {servers
+              .filter((server) =>
+                String(server.name).toLowerCase().includes(search.toLowerCase()),
+              )
+              .map((server) => (
+                <div className="manage-row px-4" key={String(server.id)}>
+                  <span>
+                    <strong>{String(server.name)}</strong>
+                    <small>
+                      {String(server.transport || "remote")} ·{" "}
+                      {String(server.status || "configured")}
+                    </small>
+                  </span>
+                  <Button
+                    onClick={() =>
+                      command("retry_mcp_server", {
+                        serverId: String(server.id),
+                      })
+                        .then(() =>
+                          command<Array<Record<string, unknown>>>("list_mcp_servers"),
+                        )
+                        .then(setServers)
+                        .catch(onError)
+                    }
+                  >
+                    Retry
+                  </Button>
+                </div>
+              ))}
             {filtered.map((tool) => (
               <div className="manage-row px-4" key={String(tool.name)}>
                 <span>
