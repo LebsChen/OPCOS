@@ -1385,7 +1385,12 @@ impl SessionStore for SqliteStore {
     fn save_pending(&self, pending: &PendingRecord) -> Result<(), StoreError> {
         self.connection.lock().expect("sqlite mutex poisoned").execute(
             "INSERT OR REPLACE INTO pending(session_id,call_id,tool,arguments,state,kind,payload,visibility,created_at,resolution,resolved_at)
-             VALUES (?1,?2,?3,?4,?5,CASE WHEN ?3='ask_user' THEN 'question' WHEN ?3='propose_plan' THEN 'plan' ELSE 'approval' END,?4,'inline',?6,NULL,NULL)",
+             VALUES (?1,?2,?3,?4,?5,
+               CASE WHEN ?3='ask_user' THEN 'question'
+                    WHEN ?3='propose_plan' THEN 'plan'
+                    WHEN ?3 IN ('request_directory','request_workspace') THEN 'directory'
+                    ELSE 'approval' END,
+               ?4,'inline',?6,NULL,NULL)",
             params![pending.session_id, pending.call_id, pending.tool,
                 serde_json::to_string(&pending.arguments)?, pending.state, Utc::now().to_rfc3339()],
         )?;
