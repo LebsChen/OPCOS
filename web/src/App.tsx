@@ -1139,6 +1139,8 @@ function ManageSections({
   const [assetScope, setAssetScope] = useState("");
   const [editingAssetId, setEditingAssetId] = useState<string | null>(null);
   const [assetPending, setAssetPending] = useState<string | null>(null);
+  const [assetFormOpen, setAssetFormOpen] = useState(false);
+  const [assetSearch, setAssetSearch] = useState("");
   const [discoveredAssets, setDiscoveredAssets] = useState<Asset[] | null>(
     null,
   );
@@ -1175,6 +1177,10 @@ function ManageSections({
   const assetTabKind = assetKinds.includes(tab as (typeof assetKinds)[number])
     ? (tab as Asset["kind"])
     : "knowledge";
+  const assetLabel =
+    assetTabKind === "agents"
+      ? "AGENTS.md"
+      : assetTabKind[0].toUpperCase() + assetTabKind.slice(1);
   useEffect(() => {
     void command<Record<string, unknown>>("provider_settings")
       .then((value) => {
@@ -1389,7 +1395,13 @@ function ManageSections({
                   </h2>
                   <p className="field-help">{description}</p>
                   {assets
-                    .filter((asset) => asset.kind === kind)
+                    .filter(
+                      (asset) =>
+                        asset.kind === kind &&
+                        asset.title
+                          .toLowerCase()
+                          .includes(assetSearch.toLowerCase()),
+                    )
                     .map((asset) => (
                       <div className="manage-row" key={asset.id}>
                         <span>
@@ -1431,6 +1443,7 @@ function ManageSections({
                             className="bordered"
                             onClick={() => {
                               setEditingAssetId(asset.id);
+                              setAssetFormOpen(true);
                               setAssetKind(asset.kind);
                               setAssetTitle(asset.title);
                               setAssetBody(asset.body);
@@ -1461,82 +1474,111 @@ function ManageSections({
                   )}
                 </section>
               ))}
-            <div className="rounded-xl2 border border-line bg-panel p-5">
-              <h2 className="text-[15px] font-semibold text-ink">
-                {editingAssetId ? "Edit asset" : "New asset"}
-              </h2>
-              <div className="form-grid mt-4">
-                <label className="field-label">
-                  Title
-                  <input
-                    value={assetTitle}
-                    onChange={(event) => setAssetTitle(event.target.value)}
-                    placeholder="Asset title"
-                  />
-                </label>
-                <label className="field-label">
-                  Body
-                  <textarea
-                    value={assetBody}
-                    onChange={(event) => setAssetBody(event.target.value)}
-                    placeholder="Asset content"
-                  />
-                </label>
-                {(assetTabKind === "knowledge" || assetTabKind === "skill") && (
-                  <label className="field-label">
-                    Trigger
-                    <input
-                      value={assetTrigger}
-                      onChange={(event) => setAssetTrigger(event.target.value)}
-                      placeholder="Optional trigger"
-                    />
-                  </label>
-                )}
-                <label className="field-label">
-                  Scope
-                  <input
-                    value={assetScope}
-                    onChange={(event) => setAssetScope(event.target.value)}
-                    placeholder="Optional scope"
-                  />
-                </label>
-                <Button
-                  className="primary"
-                  onClick={() =>
-                    command("save_asset", {
-                      id: editingAssetId || `asset-${Date.now()}`,
-                      kind: assetTabKind,
-                      title: assetTitle,
-                      body: assetBody,
-                      trigger: assetTrigger || null,
-                      scope: assetScope || null,
-                      enabled: true,
-                    })
-                      .then(() => {
-                        setAssetTitle("");
-                        setAssetBody("");
-                        setAssetTrigger("");
-                        setAssetScope("");
-                        setEditingAssetId(null);
-                        onRefresh();
-                      })
-                      .catch(onError)
-                  }
-                >
-                  {editingAssetId ? "Save changes" : "Create asset"}
-                </Button>
-              </div>
+            <div className="inline-actions mb-3">
+              <input
+                value={assetSearch}
+                onChange={(event) => setAssetSearch(event.target.value)}
+                placeholder={`Search ${assetLabel}`}
+                aria-label={`Search ${assetLabel}`}
+              />
+              <Button
+                className="primary"
+                onClick={() => {
+                  setEditingAssetId(null);
+                  setAssetTitle("");
+                  setAssetBody("");
+                  setAssetTrigger("");
+                  setAssetScope("");
+                  setAssetFormOpen(true);
+                }}
+              >
+                New {assetLabel}
+              </Button>
             </div>
-            {selected && tab === "knowledge" && (
+            <div className="rounded-xl2 border border-line bg-panel p-5">
+              {assetFormOpen && (
+                <>
+                  <h2 className="text-[15px] font-semibold text-ink">
+                    {editingAssetId ? "Edit asset" : "New asset"}
+                  </h2>
+                  <div className="form-grid mt-4">
+                    <label className="field-label">
+                      Title
+                      <input
+                        value={assetTitle}
+                        onChange={(event) => setAssetTitle(event.target.value)}
+                        placeholder="Asset title"
+                      />
+                    </label>
+                    <label className="field-label">
+                      Body
+                      <textarea
+                        value={assetBody}
+                        onChange={(event) => setAssetBody(event.target.value)}
+                        placeholder="Asset content"
+                      />
+                    </label>
+                    {(assetTabKind === "knowledge" ||
+                      assetTabKind === "skill") && (
+                      <label className="field-label">
+                        Trigger
+                        <input
+                          value={assetTrigger}
+                          onChange={(event) =>
+                            setAssetTrigger(event.target.value)
+                          }
+                          placeholder="Optional trigger"
+                        />
+                      </label>
+                    )}
+                    <label className="field-label">
+                      Scope
+                      <input
+                        value={assetScope}
+                        onChange={(event) => setAssetScope(event.target.value)}
+                        placeholder="Optional scope"
+                      />
+                    </label>
+                    <Button
+                      className="primary"
+                      onClick={() =>
+                        command("save_asset", {
+                          id: editingAssetId || `asset-${Date.now()}`,
+                          kind: assetTabKind,
+                          title: assetTitle,
+                          body: assetBody,
+                          trigger: assetTrigger || null,
+                          scope: assetScope || null,
+                          enabled: true,
+                        })
+                          .then(() => {
+                            setAssetTitle("");
+                            setAssetBody("");
+                            setAssetTrigger("");
+                            setAssetScope("");
+                            setEditingAssetId(null);
+                            setAssetFormOpen(false);
+                            onRefresh();
+                          })
+                          .catch(onError)
+                      }
+                    >
+                      {editingAssetId ? "Save changes" : "Create asset"}
+                    </Button>
+                  </div>
+                </>
+              )}
+            </div>
+            {tab === "knowledge" && (
               <div className="inline-actions">
                 <Button
                   className="bordered"
-                  disabled={remoteAssetAction !== null}
+                  disabled={remoteAssetAction !== null || !selected}
                   onClick={() =>
                     (() => {
                       setRemoteAssetAction("discovering");
                       return command("discover_remote_assets", {
-                        sessionId: selected.id,
+                        sessionId: selected!.id,
                       })
                         .then((bundle) => {
                           setDiscoveredAssets(bundle as Asset[]);
@@ -1553,12 +1595,12 @@ function ManageSections({
                 </Button>
                 <Button
                   className="bordered"
-                  disabled={remoteAssetAction !== null}
+                  disabled={remoteAssetAction !== null || !selected}
                   onClick={() =>
                     (() => {
                       setRemoteAssetAction("importing");
                       return command("import_assets", {
-                        sessionId: selected.id,
+                        sessionId: selected!.id,
                       })
                         .then((bundle) => {
                           setDiscoveredAssets(bundle as Asset[]);
@@ -1573,12 +1615,12 @@ function ManageSections({
                 </Button>
                 <Button
                   className="bordered"
-                  disabled={remoteAssetAction !== null}
+                  disabled={remoteAssetAction !== null || !selected}
                   onClick={() =>
                     (() => {
                       setRemoteAssetAction("exporting");
                       return command("export_assets", {
-                        sessionId: selected.id,
+                        sessionId: selected!.id,
                         ids: assets.map((asset) => asset.id),
                       })
                         .then(() => setDiscoveredAssets([]))
@@ -1754,7 +1796,7 @@ function Automations({
               onClick={() => setAutomationTab(item)}
             >
               <Icon
-                name={item === "schedules" ? "clock" : "folder"}
+                name={item === "schedules" ? "refresh" : "code"}
                 size={15}
               />
               {item === "schedules" ? "Schedules" : "Runs"}
@@ -1950,12 +1992,12 @@ function Activity({
                 name={
                   (
                     {
-                      board: "sliders",
-                      roles: "folder",
+                      board: "activity",
+                      roles: "settings",
                       tasks: "code",
-                      messages: "gear",
-                      worklog: "clock",
-                      insights: "shield",
+                      messages: "send",
+                      worklog: "terminal",
+                      insights: "browser",
                     } as const
                   )[item]
                 }
