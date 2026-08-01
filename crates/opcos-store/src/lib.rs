@@ -27,6 +27,8 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("store migration error: {0}")]
     Migration(String),
+    #[error("session not found: {0}")]
+    SessionNotFound(String),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -235,6 +237,32 @@ fn value_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn legacy_approval_is_pending(kind: &str, payload: &serde_json::Value) -> bool {
+    if kind != "approval" || payload.get("result").is_some() {
+        return false;
+    }
+    !matches!(
+        value_string(payload, &["status", "state"])
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some(
+            "completed"
+                | "complete"
+                | "ok"
+                | "finished"
+                | "done"
+                | "allow"
+                | "allowed"
+                | "deny"
+                | "denied"
+                | "rejected"
+                | "error"
+                | "failed"
+        )
+    )
+}
+
 fn migrate_legacy_transcript(connection: &Connection) -> Result<(), StoreError> {
     let mut statement = connection.prepare(
         "SELECT session_id,sequence,kind,payload FROM transcript ORDER BY session_id,sequence",
@@ -301,10 +329,12 @@ fn migrate_legacy_transcript(connection: &Connection) -> Result<(), StoreError> 
                 "INSERT OR IGNORE INTO tool_calls(session_id,message_sequence,call_id,name,arguments,result) VALUES (?1,?2,?3,?4,?5,?6)",
                 params![session_id, sequence, call_id, tool, serde_json::to_string(&arguments)?, result],
             )?;
-            connection.execute(
-                "INSERT OR REPLACE INTO pending(session_id,call_id,tool,arguments,state) VALUES (?1,?2,?3,?4,'pending')",
-                params![session_id, call_id, tool, serde_json::to_string(&arguments)?],
-            )?;
+            if legacy_approval_is_pending(&kind, &payload) {
+                connection.execute(
+                    "INSERT OR REPLACE INTO pending(session_id,call_id,tool,arguments,state) VALUES (?1,?2,?3,?4,'pending')",
+                    params![session_id, call_id, tool, serde_json::to_string(&arguments)?],
+                )?;
+            }
         } else {
             let content = value_string(&payload, &["text", "message", "content"])
                 .unwrap_or_else(|| payload.to_string());
@@ -745,7 +775,13 @@ impl SqliteStore {
                         "toolName": approval.map(|item| item.tool.clone()).unwrap_or_else(|| call.name.clone()),
                         "arguments": arguments,
                         "result": call.result,
-                        "status": if approval.is_some() {"pending"} else if call.result.is_some() {"ok"} else {"pending"},
+                        "status": if approval.is_some() {
+                            "pending"
+                        } else if call.result.is_some() {
+                            "ok"
+                        } else {
+                            "interrupted"
+                        },
                         "approval": approval.is_some(),
                     }),
                 },
@@ -757,8 +793,10 @@ impl SqliteStore {
 
     fn migrate(&self) -> Result<(), StoreError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS schema_migrations (
+        connection.execute_batch("BEGIN IMMEDIATE")?;
+        let migration = (|| -> Result<(), StoreError> {
+            connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
                version INTEGER PRIMARY KEY,
                applied_at TEXT NOT NULL
              );
@@ -818,15 +856,15 @@ impl SqliteStore {
                duration_ms INTEGER NOT NULL,
                recorded_at TEXT NOT NULL
              );",
-        )?;
-        let session_columns = table_columns(&connection, "sessions")?;
-        let legacy_sessions = !session_columns.is_empty()
-            && !session_columns.iter().any(|column| column == "session_id");
-        if legacy_sessions && !table_exists(&connection, "sessions_legacy_p0_1")? {
-            connection.execute("ALTER TABLE sessions RENAME TO sessions_legacy_p0_1", [])?;
-        }
-        connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS sessions (
+            )?;
+            let session_columns = table_columns(&connection, "sessions")?;
+            let legacy_sessions = !session_columns.is_empty()
+                && !session_columns.iter().any(|column| column == "session_id");
+            if legacy_sessions && !table_exists(&connection, "sessions_legacy_p0_1")? {
+                connection.execute("ALTER TABLE sessions RENAME TO sessions_legacy_p0_1", [])?;
+            }
+            connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS sessions (
                session_id TEXT PRIMARY KEY,
                workspace TEXT NOT NULL,
                model TEXT NOT NULL,
@@ -848,54 +886,65 @@ impl SqliteStore {
                version INTEGER PRIMARY KEY,
                applied_at TEXT NOT NULL
              );",
-        )?;
-        let created_at_column = table_columns(&connection, "sessions")?
-            .iter()
-            .any(|column| column == "created_at");
-        if !created_at_column {
-            connection.execute(
-                "ALTER TABLE sessions ADD COLUMN created_at TEXT NOT NULL DEFAULT ''",
+            )?;
+            let created_at_column = table_columns(&connection, "sessions")?
+                .iter()
+                .any(|column| column == "created_at");
+            if !created_at_column {
+                connection.execute(
+                    "ALTER TABLE sessions ADD COLUMN created_at TEXT NOT NULL DEFAULT ''",
+                    [],
+                )?;
+                connection.execute(
+                    "UPDATE sessions SET created_at=updated_at WHERE created_at=''",
+                    [],
+                )?;
+            }
+            if !table_columns(&connection, "sessions")?
+                .iter()
+                .any(|column| column == "provider")
+            {
+                connection.execute("ALTER TABLE sessions ADD COLUMN provider TEXT", [])?;
+            }
+            if table_exists(&connection, "sessions_legacy_p0_1")? {
+                migrate_legacy_sessions(&connection)?;
+            }
+            if table_exists(&connection, "transcript")? {
+                migrate_legacy_transcript(&connection)?;
+                connection.execute("DROP TABLE transcript", [])?;
+            }
+            if table_exists(&connection, "sessions_legacy_p0_1")? {
+                connection.execute("DROP TABLE sessions_legacy_p0_1", [])?;
+            }
+            let version: i64 = connection.query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
                 [],
+                |row| row.get(0),
             )?;
-            connection.execute(
-                "UPDATE sessions SET created_at=updated_at WHERE created_at=''",
-                [],
-            )?;
+            if version < 1 {
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (1, ?1)",
+                    [Utc::now().to_rfc3339()],
+                )?;
+            }
+            if version < 2 {
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (2, ?1)",
+                    [Utc::now().to_rfc3339()],
+                )?;
+            }
+            Ok(())
+        })();
+        match migration {
+            Ok(()) => {
+                connection.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
         }
-        if !table_columns(&connection, "sessions")?
-            .iter()
-            .any(|column| column == "provider")
-        {
-            connection.execute("ALTER TABLE sessions ADD COLUMN provider TEXT", [])?;
-        }
-        if table_exists(&connection, "sessions_legacy_p0_1")? {
-            migrate_legacy_sessions(&connection)?;
-        }
-        if table_exists(&connection, "transcript")? {
-            migrate_legacy_transcript(&connection)?;
-            connection.execute("DROP TABLE transcript", [])?;
-        }
-        if table_exists(&connection, "sessions_legacy_p0_1")? {
-            connection.execute("DROP TABLE sessions_legacy_p0_1", [])?;
-        }
-        let version: i64 = connection.query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-            [],
-            |row| row.get(0),
-        )?;
-        if version < 1 {
-            connection.execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES (1, ?1)",
-                [Utc::now().to_rfc3339()],
-            )?;
-        }
-        if version < 2 {
-            connection.execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES (2, ?1)",
-                [Utc::now().to_rfc3339()],
-            )?;
-        }
-        Ok(())
     }
 
     pub fn save_session(&self, session: &SessionRecord) -> Result<(), StoreError> {
@@ -961,7 +1010,7 @@ impl SqliteStore {
                 params![provider, Utc::now().to_rfc3339(), session_id],
             )?;
         if changed == 0 {
-            return Err(StoreError::Migration("session not found".into()));
+            return Err(StoreError::SessionNotFound(session_id.into()));
         }
         Ok(())
     }
@@ -1232,7 +1281,8 @@ mod tests {
                        ('legacy-1','Legacy','host-1','model-1','provider-1','Interactive','/workspace','2025-01-01T00:00:00Z');
                      INSERT INTO transcript VALUES
                        ('legacy-1',1,'user','{{\"role\":\"user\",\"content\":\"hello\"}}'),
-                       ('legacy-1',2,'approval','{{\"callId\":\"call-1\",\"tool\":\"write_file\",\"arguments\":{{\"path\":\"/workspace/a\"}}}}');",
+                       ('legacy-1',2,'approval','{{\"callId\":\"call-1\",\"tool\":\"write_file\",\"arguments\":{{\"path\":\"/workspace/a\"}}}}'),
+                       ('legacy-1',3,'tool','{{\"callId\":\"call-2\",\"tool\":\"write_file\",\"arguments\":{{\"path\":\"/workspace/b\"}},\"result\":{{\"ok\":true}}}}');",
                     table = "sessions"
                     ),
                 )
@@ -1242,7 +1292,22 @@ mod tests {
         let first_session = first.load_session("legacy-1").unwrap().unwrap();
         let first_transcript = first.load_transcript("legacy-1").unwrap();
         assert_eq!(first_session.title, "Legacy");
-        assert_eq!(first_transcript.len(), 2);
+        assert_eq!(first_transcript.len(), 3);
+        assert_eq!(
+            first
+                .load_pending("legacy-1")
+                .unwrap()
+                .iter()
+                .map(|item| item.call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["call-1"]
+        );
+        let completed = first_transcript
+            .iter()
+            .find(|record| record.payload["call_id"] == "call-2")
+            .unwrap();
+        assert_eq!(completed.kind, "tool");
+        assert_eq!(completed.payload["status"], "ok");
         drop(first);
         let second = SqliteStore::open(&path).unwrap();
         assert_eq!(
@@ -1314,6 +1379,27 @@ mod tests {
         store
             .append_tool_call(&ToolCallRecord {
                 session_id: "transcript".into(),
+                message_sequence: 6,
+                call_id: "call-interrupted".into(),
+                name: "run_shell".into(),
+                arguments: serde_json::json!({"command":"echo hi"}),
+                result: None,
+            })
+            .unwrap();
+        for call_id in ["pending-b", "pending-a"] {
+            store
+                .save_pending(&PendingRecord {
+                    session_id: "transcript".into(),
+                    call_id: call_id.into(),
+                    tool: "write_file".into(),
+                    arguments: serde_json::json!({"path":format!("/workspace/{call_id}")}),
+                    state: "pending".into(),
+                })
+                .unwrap();
+        }
+        store
+            .append_tool_call(&ToolCallRecord {
+                session_id: "transcript".into(),
                 message_sequence: 3,
                 call_id: "call-1".into(),
                 name: "write_file".into(),
@@ -1333,13 +1419,28 @@ mod tests {
         let transcript = store.load_transcript("transcript").unwrap();
         let tools = transcript
             .iter()
-            .filter(|record| record.kind == "approval" || record.kind == "tool")
+            .filter(|record| {
+                (record.kind == "approval" || record.kind == "tool")
+                    && record.payload["call_id"] == "call-1"
+            })
             .collect::<Vec<_>>();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].payload["call_id"], "call-1");
         assert_eq!(tools[0].payload["status"], "pending");
         assert_eq!(tools[0].payload["arguments"]["content"], "secret");
         assert!(transcript.iter().any(|record| record.kind == "notice"));
+        let interrupted = transcript
+            .iter()
+            .find(|record| record.payload["call_id"] == "call-interrupted")
+            .unwrap();
+        assert_eq!(interrupted.kind, "tool");
+        assert_eq!(interrupted.payload["status"], "interrupted");
+        let pending_ids = transcript
+            .iter()
+            .filter(|record| record.kind == "approval")
+            .filter_map(|record| record.payload["call_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(pending_ids, vec!["call-1", "pending-a", "pending-b"]);
         assert!(transcript.iter().any(|record| {
             record
                 .payload

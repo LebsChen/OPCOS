@@ -40,6 +40,29 @@ describe("OPCOS transcript folding", () => {
     });
   });
 
+  it("renders interrupted store tool rows as failed tool items", () => {
+    const items = normalizeTranscript([
+      {
+        kind: "tool",
+        payload: {
+          call_id: "call-interrupted",
+          tool: "run_shell",
+          arguments: { command: "echo hi" },
+          result: null,
+          status: "interrupted",
+          approval: false,
+        },
+      },
+    ]);
+    expect(items).toContainEqual(
+      expect.objectContaining({
+        kind: "tool",
+        callId: "call-interrupted",
+        status: "interrupted",
+      }),
+    );
+  });
+
   it("folds text deltas into one stable streaming item", () => {
     let items = reduceStreamEvent([], {
       kind: "stream",

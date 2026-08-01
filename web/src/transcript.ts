@@ -3,7 +3,7 @@ import { redactApproval } from "./gui";
 export type TranscriptKind =
   "user" | "assistant" | "thinking" | "tool" | "notice" | "approval";
 
-export type ToolState = "running" | "ok" | "error" | "pending";
+export type ToolState = "running" | "ok" | "error" | "pending" | "interrupted";
 export type ApprovalResolution = "allow" | "deny";
 
 export type TranscriptViewItem = {
@@ -95,6 +95,39 @@ export function normalizeTranscript(raw: RawItem[]): TranscriptViewItem[] {
         noticeKind:
           typeof payload.kind === "string" ? payload.kind : record.kind,
         text: noticeText,
+      });
+      return;
+    }
+    if (
+      record.kind === "tool" &&
+      (typeof payload.call_id === "string" ||
+        typeof payload.callId === "string" ||
+        typeof payload.tool === "string" ||
+        typeof payload.toolName === "string")
+    ) {
+      const callId =
+        typeof payload.call_id === "string"
+          ? payload.call_id
+          : typeof payload.callId === "string"
+            ? payload.callId
+            : `tool-${index}`;
+      output.push({
+        id: stableId("tool", index, callId),
+        kind: "tool",
+        callId,
+        toolName:
+          typeof payload.toolName === "string"
+            ? payload.toolName
+            : typeof payload.tool === "string"
+              ? payload.tool
+              : "tool",
+        arguments: payload.arguments,
+        result: payload.result,
+        status:
+          typeof payload.status === "string"
+            ? (payload.status as ToolState)
+            : "interrupted",
+        approval: false,
       });
       return;
     }

@@ -21,7 +21,7 @@
 
 `messages`、`notices`、`tool_calls`、`pending` 与 `audit_events` 都采用 session 维度的复合主键或序列键；原始字符串和 JSON 文本保留在 store 中，避免只存 UI 文案。
 
-桌面 adapter 只初始化 `hosts`、`settings`、`asset_records`、`secret_records`、`mcp_session_tools`、`asset_session_selection`、`schedules`、`coord_tasks`；`sessions` 与 `transcript` 不再由桌面 schema 创建［推断］。启动时 `SqliteStore::open` 会识别旧桌面表，成功导入后删除旧表；失败会显式返回错误，避免静默丢失［推断］。
+桌面 adapter 只初始化 `hosts`、`settings`、`asset_records`、`secret_records`、`mcp_session_tools`、`asset_session_selection`、`schedules`、`coord_tasks`；`sessions` 与 `transcript` 不再由桌面 schema 创建［推断］。启动时 `SqliteStore::open` 会识别旧桌面表，在同一个 SQLite transaction 中导入并删除旧表；失败会回滚并显式返回错误，避免静默丢失［推断］。
 
 ## 1.2 目标态增量
 
