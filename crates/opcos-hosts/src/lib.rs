@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
+pub use opcos_rvm::ExecRequest;
 use opcos_rvm::{
-    Capabilities as RvmCapabilities, CommandResult, DirectoryListing, ExecRequest, ExecResult,
-    FileContent, Health, HttpRvmClient, RvmClient, RvmError, RvmWebSocket, WsKind, WsParams,
+    Capabilities as RvmCapabilities, CommandResult, DirectoryListing, ExecResult, FileContent,
+    Health, HttpRvmClient, RvmClient, RvmError, RvmWebSocket, WsKind, WsParams,
 };
 pub use opcos_rvm::{DEFAULT_EXEC_TIMEOUT_SECONDS, LIFECYCLE_EXEC_TIMEOUT_SECONDS};
 use serde::{Deserialize, Serialize};
@@ -166,6 +167,10 @@ impl HostProcessSupervisor {
             process.shutdown().await?;
         }
         Ok(())
+    }
+
+    pub async fn take(&self) -> Option<Box<dyn HostProcess>> {
+        self.process.lock().await.take()
     }
 }
 

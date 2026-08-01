@@ -82,6 +82,8 @@ Harness 层只消费跨实现的事实事件：助手文本、工具调用、工
 
 外部 harness 的启动、审批回复和提问回复返回异步 `TurnHandle`，完成结果只通过 `TurnFinished` 事件交付；句柄提供 `await_finished()` 便捷等待。这是因为 HTTP/SSE harness 不能在请求返回时同步取得最终回合结果，不得伪造空 `AssistantTurn` 或将仍在运行视为成功。可批准的审批事件必须已经补齐非空工具名和完整参数；补全失败只发显式失败事件并保持 pending，不创建审批卡片。
 
+P2-2 的 OpenCode harness 也只通过 Host 访问服务：本机和远程都在目标 Host 上执行 curl，普通请求走 `Host::exec`，SSE 走 `Host::spawn`；不使用本机 reqwest 直连，也不把远程回环端口通过公网隧道暴露。
+
 Host 另提供进程流能力：
 
 ```rust
