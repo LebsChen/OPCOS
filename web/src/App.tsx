@@ -1376,6 +1376,76 @@ function ManageSections({
                   search={assetSearch}
                   onSearch={setAssetSearch}
                   searchPlaceholder={`Search ${label}`}
+                  actions={
+                    tab === "knowledge" ? (
+                      <div className="inline-actions">
+                        <Button
+                          className="bordered"
+                          disabled={remoteAssetAction !== null || !selected}
+                          onClick={() =>
+                            (() => {
+                              setRemoteAssetAction("discovering");
+                              return command("discover_remote_assets", {
+                                sessionId: selected!.id,
+                              })
+                                .then((bundle) => {
+                                  setDiscoveredAssets(bundle as Asset[]);
+                                  return onRefresh();
+                                })
+                                .catch(onError)
+                                .finally(() => setRemoteAssetAction(null));
+                            })()
+                          }
+                        >
+                          {remoteAssetAction === "discovering"
+                            ? "Discovering…"
+                            : "Discover remote"}
+                        </Button>
+                        <Button
+                          className="bordered"
+                          disabled={remoteAssetAction !== null || !selected}
+                          onClick={() =>
+                            (() => {
+                              setRemoteAssetAction("importing");
+                              return command("import_assets", {
+                                sessionId: selected!.id,
+                              })
+                                .then((bundle) => {
+                                  setDiscoveredAssets(bundle as Asset[]);
+                                  return onRefresh();
+                                })
+                                .catch(onError)
+                                .finally(() => setRemoteAssetAction(null));
+                            })()
+                          }
+                        >
+                          {remoteAssetAction === "importing"
+                            ? "Importing…"
+                            : "Import"}
+                        </Button>
+                        <Button
+                          className="bordered"
+                          disabled={remoteAssetAction !== null || !selected}
+                          onClick={() =>
+                            (() => {
+                              setRemoteAssetAction("exporting");
+                              return command("export_assets", {
+                                sessionId: selected!.id,
+                                ids: assets.map((asset) => asset.id),
+                              })
+                                .then(() => setDiscoveredAssets([]))
+                                .catch(onError)
+                                .finally(() => setRemoteAssetAction(null));
+                            })()
+                          }
+                        >
+                          {remoteAssetAction === "exporting"
+                            ? "Exporting…"
+                            : "Export"}
+                        </Button>
+                      </div>
+                    ) : undefined
+                  }
                   columns={["Title", "Trigger", "Scope", "Status"]}
                   renderCard={() => (
                     <>
@@ -1586,76 +1656,6 @@ function ManageSections({
                   </Button>
                 </div>
               </div>
-            )}
-            {tab === "knowledge" && (
-              <div className="inline-actions">
-                <Button
-                  className="bordered"
-                  disabled={remoteAssetAction !== null || !selected}
-                  onClick={() =>
-                    (() => {
-                      setRemoteAssetAction("discovering");
-                      return command("discover_remote_assets", {
-                        sessionId: selected!.id,
-                      })
-                        .then((bundle) => {
-                          setDiscoveredAssets(bundle as Asset[]);
-                          return onRefresh();
-                        })
-                        .catch(onError)
-                        .finally(() => setRemoteAssetAction(null));
-                    })()
-                  }
-                >
-                  {remoteAssetAction === "discovering"
-                    ? "Discovering…"
-                    : "Discover remote"}
-                </Button>
-                <Button
-                  className="bordered"
-                  disabled={remoteAssetAction !== null || !selected}
-                  onClick={() =>
-                    (() => {
-                      setRemoteAssetAction("importing");
-                      return command("import_assets", {
-                        sessionId: selected!.id,
-                      })
-                        .then((bundle) => {
-                          setDiscoveredAssets(bundle as Asset[]);
-                          return onRefresh();
-                        })
-                        .catch(onError)
-                        .finally(() => setRemoteAssetAction(null));
-                    })()
-                  }
-                >
-                  {remoteAssetAction === "importing" ? "Importing…" : "Import"}
-                </Button>
-                <Button
-                  className="bordered"
-                  disabled={remoteAssetAction !== null || !selected}
-                  onClick={() =>
-                    (() => {
-                      setRemoteAssetAction("exporting");
-                      return command("export_assets", {
-                        sessionId: selected!.id,
-                        ids: assets.map((asset) => asset.id),
-                      })
-                        .then(() => setDiscoveredAssets([]))
-                        .catch(onError)
-                        .finally(() => setRemoteAssetAction(null));
-                    })()
-                  }
-                >
-                  {remoteAssetAction === "exporting" ? "Exporting…" : "Export"}
-                </Button>
-              </div>
-            )}
-            {discoveredAssets && (
-              <p className="field-help">
-                Remote discovery completed. Import uses the backend bundle and
-                imports its supported entries.
-              </p>
             )}
           </div>
         )}
