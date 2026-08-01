@@ -88,10 +88,30 @@ export function redactApproval(value: unknown): string {
 }
 
 export function submitFailureMessage(error: unknown): string {
-  const message = String(error);
+  const message = errorMessage(error);
   return message.includes("provider key is not configured")
     ? "Provider key is not configured; open Provider settings first."
     : message;
+}
+
+export function errorMessage(error: unknown): string {
+  if (error instanceof Error && error.message.trim()) return error.message;
+  if (typeof error === "string" && error.trim()) return error;
+  if (
+    error &&
+    typeof error === "object" &&
+    "message" in error &&
+    typeof error.message === "string" &&
+    error.message.trim()
+  )
+    return error.message;
+  try {
+    const serialized = JSON.stringify(error);
+    if (serialized && serialized !== "{}") return serialized;
+  } catch {
+    // Fall through to the stable generic message.
+  }
+  return "The requested action could not be completed.";
 }
 
 export function providerBaseUrlError(

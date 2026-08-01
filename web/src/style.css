@@ -811,6 +811,27 @@ h3 {
 .manage-row small {
   color: var(--color-faint);
 }
+.field-label {
+  display: grid;
+  gap: 5px;
+  color: var(--color-ink);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.field-help {
+  margin: 6px 0 0;
+  color: var(--color-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.btn.bordered {
+  background: var(--color-paper);
+}
+.empty-state {
+  padding: 14px 0;
+  color: var(--color-muted);
+  font-size: 12.5px;
+}
 .inline-actions {
   display: flex;
   flex-wrap: wrap;
