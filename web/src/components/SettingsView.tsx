@@ -7,6 +7,7 @@ export type SettingsSection =
   | "provider"
   | "hosts"
   | "agents"
+  | "instructions"
   | "knowledge"
   | "playbook"
   | "skill"
@@ -19,6 +20,7 @@ const tabs: Array<{ key: SettingsSection; label: string; icon: IconName }> = [
   { key: "provider", label: "provider", icon: "sparkle" },
   { key: "hosts", label: "hosts", icon: "folder" },
   { key: "agents", label: "agents", icon: "fileCode" },
+  { key: "instructions", label: "instructions", icon: "fileCode" },
   { key: "knowledge", label: "knowledge", icon: "file" },
   { key: "playbook", label: "playbook", icon: "table" },
   { key: "skill", label: "skill", icon: "sparkle" },

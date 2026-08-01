@@ -45,6 +45,7 @@
 ### P1-1 配置对象迁移
 
 - 做：五套资产收敛到 `config_object` + 不可变 `config_object_version`（[06](06-capability-model.md)、[01](01-data-model.md)）；scope 使用 `scope_kind + scope_key`；会话钉具体 version，调度运行记录实际 version；UI 仍保留五个入口但走同一套 store API，并提供历史、比较和回滚；技能改「先给清单、命中再读全文」留待后续优化。
+- P1-5 全局 Instructions：使用 `config_object(kind='instructions')` 的 global active version，按“全局 Instructions → Rules → Knowledge → Playbook → Skill”顺序注入；会话绑定版本后，中途编辑不影响进行中会话；Settings 沿用 Rules 编辑器。
 - 验收：编辑资产产生新版本、旧版本可回滚；30 个技能时上下文不膨胀（只注入清单）。
 
 ### P1-2 MCP client 完整化

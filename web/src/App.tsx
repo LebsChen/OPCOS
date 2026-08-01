@@ -57,7 +57,7 @@ type ProviderDescriptor = {
 };
 type Asset = {
   id: string;
-  kind: string;
+  kind: "agents" | "instructions" | "knowledge" | "playbook" | "skill" | string;
   title: string;
   body: string;
   trigger: string;
@@ -1000,6 +1000,10 @@ function ManageSections({
     ],
     hosts: ["Hosts", "Bind and test the remote hosts used by OPCOS sessions."],
     agents: ["规则", "仓库级运行规则（对应仓库中的 AGENTS.md 文件）。"],
+    instructions: [
+      "Instructions",
+      "Global instructions applied to every new session.",
+    ],
     knowledge: ["Knowledge", "Reusable reference material added to context."],
     playbook: ["Playbook", "Repeatable workflows available to automation."],
     skill: ["Skill", "Focused capability and instruction bundles."],
@@ -1011,7 +1015,13 @@ function ManageSections({
     blueprint: ["Blueprint", "Read and manage the selected host blueprint."],
     appearance: [translate("general"), translate("appearanceDescription")],
   };
-  const assetKinds = ["agents", "knowledge", "playbook", "skill"] as const;
+  const assetKinds = [
+    "agents",
+    "instructions",
+    "knowledge",
+    "playbook",
+    "skill",
+  ] as const;
   const assetTabKind = assetKinds.includes(tab as (typeof assetKinds)[number])
     ? (tab as Asset["kind"])
     : "knowledge";
@@ -1528,6 +1538,11 @@ function ManageSections({
                   "仓库级运行规则（对应仓库中的 AGENTS.md 文件）。",
                 ],
                 [
+                  "instructions",
+                  "Instructions",
+                  "Global instructions applied to every new session.",
+                ],
+                [
                   "knowledge",
                   "Knowledge",
                   "Reusable reference material added to the knowledge context.",
@@ -1894,9 +1909,13 @@ function ManageSections({
                     ? editingAssetId
                       ? "编辑规则"
                       : "新建规则"
-                    : editingAssetId
-                      ? "Edit asset"
-                      : "New asset"}
+                    : assetTabKind === "instructions"
+                      ? editingAssetId
+                        ? "Edit Instructions"
+                        : "New Instructions"
+                      : editingAssetId
+                        ? "Edit asset"
+                        : "New asset"}
                 </h2>
                 <div className="form-grid mt-4">
                   <label className="field-label">
@@ -1929,7 +1948,10 @@ function ManageSections({
                     </label>
                   )}
                   <label className="field-label">
-                    {assetTabKind === "agents" ? "适用范围" : "Scope"}
+                    {assetTabKind === "agents" ||
+                    assetTabKind === "instructions"
+                      ? "适用范围"
+                      : "Scope"}
                     <select
                       value={assetScopeKind}
                       onChange={(event) =>
@@ -1945,7 +1967,10 @@ function ManageSections({
                       value={assetScope}
                       onChange={(event) => setAssetScope(event.target.value)}
                       placeholder={translate("Workspace path (absolute)")}
-                      disabled={assetScopeKind === "global"}
+                      disabled={
+                        assetScopeKind === "global" ||
+                        assetTabKind === "instructions"
+                      }
                     />
                   </label>
                   <Button
@@ -1977,9 +2002,13 @@ function ManageSections({
                       ? editingAssetId
                         ? "保存更改"
                         : "创建规则"
-                      : editingAssetId
-                        ? "Save changes"
-                        : "Create asset"}
+                      : assetTabKind === "instructions"
+                        ? editingAssetId
+                          ? "Save changes"
+                          : "Create Instructions"
+                        : editingAssetId
+                          ? "Save changes"
+                          : "Create asset"}
                   </Button>
                 </div>
               </div>

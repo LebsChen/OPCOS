@@ -13,6 +13,7 @@ pub enum AssetError {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AssetBundle {
+    pub instructions: Option<InstructionSource>,
     pub agents: Vec<InstructionSource>,
     pub knowledge: Vec<KnowledgeEntry>,
     pub playbook: Option<Playbook>,
@@ -86,6 +87,9 @@ pub fn redact_secret(value: &mut serde_json::Value, secret: &str) {
 impl AssetBundle {
     pub fn system_instructions(&self) -> String {
         let mut sections = Vec::new();
+        if let Some(instructions) = &self.instructions {
+            sections.push(format!("[Global Instructions]\n{}", instructions.content));
+        }
         for source in &self.agents {
             sections.push(format!(
                 "[AGENTS source: {}]\n{}",
@@ -260,8 +264,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn system_instruction_order_is_agents_knowledge_playbook_skill() {
+    fn system_instruction_order_is_global_agents_knowledge_playbook_skill() {
         let bundle = AssetBundle {
+            instructions: Some(InstructionSource {
+                path: "global".into(),
+                content: "global".into(),
+            }),
             agents: vec![InstructionSource {
                 path: "AGENTS.md".into(),
                 content: "agents".into(),
@@ -285,6 +293,7 @@ mod tests {
             }],
         };
         let rendered = bundle.system_instructions();
+        assert!(rendered.find("global").unwrap() < rendered.find("agents").unwrap());
         assert!(rendered.find("agents").unwrap() < rendered.find("knowledge").unwrap());
         assert!(rendered.find("knowledge").unwrap() < rendered.find("playbook").unwrap());
         assert!(rendered.find("playbook").unwrap() < rendered.find("skill").unwrap());
