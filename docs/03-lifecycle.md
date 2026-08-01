@@ -52,7 +52,7 @@ turn_start
 - **审批延续**必须补 `turn_done`，否则前端永远显示 running。
 - **steering** 必须有完成事件，且在事件顺序上排在当前 assistant 流之前。
 - 同一个 `callId` 的重复记录要合并，不要产生两张卡片。
-- pending approval 在 store 里是 `tool_calls` 表中 `approval = true` 的记录，不是独立类型；前端负责转成审批卡片。
+- pending approval 在 store 里由 `pending` 表保存，并与 `tool_calls` 按 `call_id` 合并；`read_transcript` 转成 `kind=approval`，前端负责渲染审批卡片。
 
 ## 3.4 审批
 
@@ -60,7 +60,7 @@ turn_start
 
 1. 策略模式（只读 / 需审批 / 自动）
 2. 已有 standing rule 命中 → 直接放行并记审计
-3. 否则挂起，写 `tool_calls.approval = true`，发 `approval` 事件
+3. 否则挂起，写 `pending` 与对应 `tool_calls`，发 `approval` 事件
 
 决策只有两个值：`allow` / `deny`（不是 `once` 之类的字符串），映射到 `approve: true|false`。每次决策都要写 `audit_events`，且**审计负载不得包含任何 token 或密钥值**（Den 明文规定审计负载剔除凭据［OW文］）。
 

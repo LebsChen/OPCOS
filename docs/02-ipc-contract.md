@@ -4,18 +4,18 @@
 
 ## 2.1 Host、session 与 surface
 
-| 命令              | 参数                                                             | 返回                                                        | 失败语义                                                                      |
-| ----------------- | ---------------------------------------------------------------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| `list_hosts`      | 无                                                               | `HostView[]`：`id`, `name`, `online`, `reason`              | 数据库错误转字符串。                                                          |
-| `save_host`       | `id?`, `name`, `url`, `token`                                    | `HostView`                                                  | 已存在 host 不允许修改；secret 写入失败回滚 host。token 只进入 secret store。 |
-| `test_host`       | `host_id`                                                        | `HostView`                                                  | 认证失败与其它远程错误转为 `online=false, reason`，不是静默成功。             |
-| `delete_host`     | `host_id`                                                        | `()`                                                        | host 不存在时报错，并删除关联 secrets。                                       |
-| `start_surface`   | `host_id`, `surface`, `cols?`, `rows?`, `cwd?`                   | 本地 relay port `u16`                                       | `surface` 只接受 `pty` / `vnc` / `cdp`；绑定本地 relay 失败时报错。           |
-| `ide_bootstrap`   | `session_id`, `folder_uri`                                       | `IdeBootstrap`                                              | `folder_uri` 必须以 `vscode-remote://` 开头；session/远程读取失败显式报错。   |
-| `start_ide_proxy` | `session_id`, `folder_uri`                                       | 本地 proxy port `u16`                                       | `folder_uri` 前缀、listener 或远端 proxy 失败显式报错。                       |
-| `create_session`  | `title`, `host_id`, `model?`, `provider?`, `mode?`, `workspace?` | `SessionView`                                               | host 不存在时报 `remote host not found; session was not created`。            |
-| `list_sessions`   | 无                                                               | `SessionView[]`                                             | 数据库错误转字符串。                                                          |
-| `read_transcript` | `session_id`                                                     | `[{kind,payload}]`，pending approval 也转为 `kind=approval` | store 读取失败报错；approval arguments 先脱敏。                               |
+| 命令              | 参数                                                             | 返回                                                                                   | 失败语义                                                                      |
+| ----------------- | ---------------------------------------------------------------- | -------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `list_hosts`      | 无                                                               | `HostView[]`：`id`, `name`, `online`, `reason`                                         | 数据库错误转字符串。                                                          |
+| `save_host`       | `id?`, `name`, `url`, `token`                                    | `HostView`                                                                             | 已存在 host 不允许修改；secret 写入失败回滚 host。token 只进入 secret store。 |
+| `test_host`       | `host_id`                                                        | `HostView`                                                                             | 认证失败与其它远程错误转为 `online=false, reason`，不是静默成功。             |
+| `delete_host`     | `host_id`                                                        | `()`                                                                                   | host 不存在时报错，并删除关联 secrets。                                       |
+| `start_surface`   | `host_id`, `surface`, `cols?`, `rows?`, `cwd?`                   | 本地 relay port `u16`                                                                  | `surface` 只接受 `pty` / `vnc` / `cdp`；绑定本地 relay 失败时报错。           |
+| `ide_bootstrap`   | `session_id`, `folder_uri`                                       | `IdeBootstrap`                                                                         | `folder_uri` 必须以 `vscode-remote://` 开头；session/远程读取失败显式报错。   |
+| `start_ide_proxy` | `session_id`, `folder_uri`                                       | 本地 proxy port `u16`                                                                  | `folder_uri` 前缀、listener 或远端 proxy 失败显式报错。                       |
+| `create_session`  | `title`, `host_id`, `model?`, `provider?`, `mode?`, `workspace?` | `SessionView`                                                                          | host 不存在时报 `remote host not found; session was not created`。            |
+| `list_sessions`   | 无                                                               | `SessionView[]`                                                                        | 数据库错误转字符串。                                                          |
+| `read_transcript` | `session_id`                                                     | `[{kind,payload}]`，pending approval 转为 `kind=approval`，tool call 按 `call_id` 合并 | store 读取失败报错；approval arguments 先脱敏。                               |
 
 上述命令实现位于 `src-tauri/src/main.rs:989-1381`。`start_surface`、IDE proxy、`test_host` 是长任务/网络操作；它们返回建立结果，不把远程 host 不可用转换为本地执行。
 

@@ -25,6 +25,8 @@ pub enum StoreError {
     Encrypted(String),
     #[error("secret store I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("store migration error: {0}")]
+    Migration(String),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -49,6 +51,8 @@ pub struct SessionRecord {
     pub origin_label: Option<String>,
     pub compaction: serde_json::Value,
     pub host_id: String,
+    pub provider: Option<String>,
+    pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -117,6 +121,200 @@ pub struct AuditEvent {
     pub sequence: i64,
     pub kind: String,
     pub payload: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct TranscriptRecord {
+    pub kind: String,
+    pub payload: serde_json::Value,
+}
+
+fn table_exists(connection: &Connection, table: &str) -> Result<bool, StoreError> {
+    Ok(connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        [table],
+        |row| row.get::<_, i64>(0),
+    )? > 0)
+}
+
+fn table_columns(connection: &Connection, table: &str) -> Result<Vec<String>, StoreError> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::from)
+}
+
+fn parse_timestamp(value: String) -> Result<DateTime<Utc>, rusqlite::Error> {
+    value.parse().map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })
+}
+
+fn session_from_row(row: &rusqlite::Row<'_>) -> Result<SessionRecord, rusqlite::Error> {
+    let extra_roots: String = row.get(5)?;
+    let grants: String = row.get(6)?;
+    let compaction: String = row.get(11)?;
+    Ok(SessionRecord {
+        session_id: row.get(0)?,
+        workspace: row.get(1)?,
+        model: row.get(2)?,
+        mode: row.get(3)?,
+        title: row.get(4)?,
+        extra_roots: serde_json::from_str(&extra_roots).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        grants: serde_json::from_str(&grants).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        pinned: row.get::<_, i64>(7)? != 0,
+        archived: row.get::<_, i64>(8)? != 0,
+        origin: row.get(9)?,
+        origin_label: row.get(10)?,
+        compaction: serde_json::from_str(&compaction).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                11,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        host_id: row.get(12)?,
+        provider: row.get(13)?,
+        created_at: parse_timestamp(row.get(14)?)?,
+        updated_at: parse_timestamp(row.get(15)?)?,
+    })
+}
+
+fn migrate_legacy_sessions(connection: &Connection) -> Result<(), StoreError> {
+    let columns = table_columns(connection, "sessions_legacy_p0_1")?;
+    let provider = columns.iter().any(|column| column == "provider");
+    let query = if provider {
+        "SELECT id,title,host_id,model,mode,workspace,created_at,provider FROM sessions_legacy_p0_1"
+    } else {
+        "SELECT id,title,host_id,model,mode,workspace,created_at,NULL FROM sessions_legacy_p0_1"
+    };
+    let mut statement = connection.prepare(query)?;
+    let rows = statement.query_map([], |row| {
+        let created_at: String = row.get(6)?;
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            created_at,
+            row.get::<_, Option<String>>(7)?,
+        ))
+    })?;
+    let legacy = rows.collect::<Result<Vec<_>, _>>()?;
+    for (id, title, host_id, model, mode, workspace, created_at, provider) in legacy {
+        let timestamp = if created_at.is_empty() {
+            Utc::now().to_rfc3339()
+        } else {
+            created_at
+        };
+        connection.execute(
+            "INSERT OR IGNORE INTO sessions(session_id,workspace,model,mode,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,'[]','{}',0,0,NULL,NULL,'{}',?6,?7,?8,?8)",
+            params![id, workspace, model, mode, title, host_id, provider, timestamp],
+        )?;
+    }
+    Ok(())
+}
+
+fn value_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
+        .map(ToOwned::to_owned)
+}
+
+fn migrate_legacy_transcript(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT session_id,sequence,kind,payload FROM transcript ORDER BY session_id,sequence",
+    )?;
+    let rows = statement.query_map([], |row| {
+        let raw: String = row.get(3)?;
+        let payload = serde_json::from_str(&raw).unwrap_or(serde_json::Value::String(raw));
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            payload,
+        ))
+    })?;
+    let legacy = rows.collect::<Result<Vec<_>, _>>()?;
+    for (session_id, sequence, kind, payload) in legacy {
+        let role = if kind == "message" {
+            value_string(&payload, &["role"]).unwrap_or_else(|| "assistant".into())
+        } else {
+            kind.clone()
+        };
+        if matches!(role.as_str(), "user" | "assistant" | "system")
+            || (kind == "message" && role == "tool")
+        {
+            connection.execute(
+                "INSERT OR IGNORE INTO messages(session_id,sequence,role,content,display_only) VALUES (?1,?2,?3,?4,0)",
+                params![session_id, sequence, role, serde_json::to_string(&payload)?],
+            )?;
+            if role == "assistant"
+                && let Some(tool_calls) = payload
+                    .get("tool_calls")
+                    .and_then(serde_json::Value::as_array)
+            {
+                for (index, call) in tool_calls.iter().enumerate() {
+                    let call_id = value_string(call, &["id", "call_id", "callId"])
+                        .unwrap_or_else(|| format!("legacy-{session_id}-{sequence}-{index}"));
+                    let name = value_string(call, &["name", "tool", "toolName"])
+                        .unwrap_or_else(|| "tool".into());
+                    let arguments = call
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    let result = call.get("result").map(serde_json::to_string).transpose()?;
+                    connection.execute(
+                        "INSERT OR IGNORE INTO tool_calls(session_id,message_sequence,call_id,name,arguments,result) VALUES (?1,?2,?3,?4,?5,?6)",
+                        params![session_id, sequence, call_id, name, serde_json::to_string(&arguments)?, result],
+                    )?;
+                }
+            }
+        } else if matches!(kind.as_str(), "approval" | "tool") {
+            let call_id = value_string(&payload, &["call_id", "callId", "id"])
+                .unwrap_or_else(|| format!("legacy-{session_id}-{sequence}"));
+            let tool =
+                value_string(&payload, &["tool", "toolName"]).unwrap_or_else(|| "tool".into());
+            let arguments = payload
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let result = payload
+                .get("result")
+                .map(serde_json::to_string)
+                .transpose()?;
+            connection.execute(
+                "INSERT OR IGNORE INTO tool_calls(session_id,message_sequence,call_id,name,arguments,result) VALUES (?1,?2,?3,?4,?5,?6)",
+                params![session_id, sequence, call_id, tool, serde_json::to_string(&arguments)?, result],
+            )?;
+            connection.execute(
+                "INSERT OR REPLACE INTO pending(session_id,call_id,tool,arguments,state) VALUES (?1,?2,?3,?4,'pending')",
+                params![session_id, call_id, tool, serde_json::to_string(&arguments)?],
+            )?;
+        } else {
+            let content = value_string(&payload, &["text", "message", "content"])
+                .unwrap_or_else(|| payload.to_string());
+            connection.execute(
+                "INSERT OR IGNORE INTO notices(session_id,sequence,kind,content) VALUES (?1,?2,?3,?4)",
+                params![session_id, sequence, kind, content],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 pub trait SessionStore {
@@ -455,30 +653,114 @@ impl SqliteStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    pub fn load_transcript(&self, session_id: &str) -> Result<Vec<TranscriptRecord>, StoreError> {
+        let messages = self.load_messages(session_id)?;
+        let notices = {
+            let connection = self.connection.lock().expect("sqlite mutex poisoned");
+            let mut statement = connection.prepare(
+                "SELECT sequence,kind,content FROM notices WHERE session_id=?1 ORDER BY sequence",
+            )?;
+            let rows = statement.query_map([session_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    TranscriptRecord {
+                        kind: "notice".into(),
+                        payload: serde_json::json!({"kind":row.get::<_,String>(1)?,"text":row.get::<_,String>(2)?}),
+                    },
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let calls = self.load_tool_calls(session_id)?;
+        let pending = self.load_pending(session_id)?;
+        let pending_by_call = pending
+            .into_iter()
+            .map(|item| (item.call_id.clone(), item))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut records = Vec::new();
+        for message in messages {
+            records.push((
+                message.sequence,
+                0_u8,
+                TranscriptRecord {
+                    kind: message.role,
+                    payload: message.content,
+                },
+            ));
+        }
+        for (sequence, notice) in notices {
+            records.push((sequence, 1_u8, notice));
+        }
+        let mut merged = std::collections::BTreeMap::<String, (i64, ToolCallRecord)>::new();
+        for call in calls {
+            merged
+                .entry(call.call_id.clone())
+                .and_modify(|(sequence, current)| {
+                    *sequence = (*sequence).min(call.message_sequence);
+                    if call.result.is_some() {
+                        current.result = call.result.clone();
+                    }
+                    if !call.arguments.is_null() {
+                        current.arguments = call.arguments.clone();
+                    }
+                    if !call.name.is_empty() {
+                        current.name = call.name.clone();
+                    }
+                })
+                .or_insert_with(|| (call.message_sequence, call));
+        }
+        for approval in pending_by_call.values() {
+            merged.entry(approval.call_id.clone()).or_insert_with(|| {
+                (
+                    i64::MAX,
+                    ToolCallRecord {
+                        session_id: approval.session_id.clone(),
+                        message_sequence: i64::MAX,
+                        call_id: approval.call_id.clone(),
+                        name: approval.tool.clone(),
+                        arguments: approval.arguments.clone(),
+                        result: None,
+                    },
+                )
+            });
+        }
+        for (call_id, (sequence, call)) in merged {
+            let approval = pending_by_call.get(&call_id);
+            let arguments = approval
+                .map(|item| item.arguments.clone())
+                .unwrap_or_else(|| call.arguments.clone());
+            records.push((
+                sequence,
+                2_u8,
+                TranscriptRecord {
+                    kind: if approval.is_some() {
+                        "approval".into()
+                    } else {
+                        "tool".into()
+                    },
+                    payload: serde_json::json!({
+                        "call_id": call_id,
+                        "callId": call.call_id,
+                        "tool": approval.map(|item| item.tool.clone()).unwrap_or_else(|| call.name.clone()),
+                        "toolName": approval.map(|item| item.tool.clone()).unwrap_or_else(|| call.name.clone()),
+                        "arguments": arguments,
+                        "result": call.result,
+                        "status": if approval.is_some() {"pending"} else if call.result.is_some() {"ok"} else {"pending"},
+                        "approval": approval.is_some(),
+                    }),
+                },
+            ));
+        }
+        records.sort_by_key(|(sequence, priority, _)| (*sequence, *priority));
+        Ok(records.into_iter().map(|(_, _, record)| record).collect())
+    }
+
     fn migrate(&self) -> Result<(), StoreError> {
-        self.connection
-            .lock()
-            .expect("sqlite mutex poisoned")
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS schema_migrations (
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
                version INTEGER PRIMARY KEY,
                applied_at TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS sessions (
-               session_id TEXT PRIMARY KEY,
-               workspace TEXT NOT NULL,
-               model TEXT NOT NULL,
-               mode TEXT NOT NULL,
-               title TEXT NOT NULL,
-               extra_roots TEXT NOT NULL,
-               grants TEXT NOT NULL,
-               pinned INTEGER NOT NULL,
-               archived INTEGER NOT NULL,
-               origin TEXT,
-               origin_label TEXT,
-               compaction TEXT NOT NULL,
-               host_id TEXT NOT NULL,
-               updated_at TEXT NOT NULL
              );
              CREATE TABLE IF NOT EXISTS messages (
                session_id TEXT NOT NULL,
@@ -536,32 +818,89 @@ impl SqliteStore {
                duration_ms INTEGER NOT NULL,
                recorded_at TEXT NOT NULL
              );",
-            )?;
-        if self
-            .connection
-            .lock()
-            .expect("sqlite mutex poisoned")
-            .query_row(
-                "SELECT COUNT(*) FROM schema_migrations WHERE version = 1",
+        )?;
+        let session_columns = table_columns(&connection, "sessions")?;
+        let legacy_sessions = !session_columns.is_empty()
+            && !session_columns.iter().any(|column| column == "session_id");
+        if legacy_sessions && !table_exists(&connection, "sessions_legacy_p0_1")? {
+            connection.execute("ALTER TABLE sessions RENAME TO sessions_legacy_p0_1", [])?;
+        }
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sessions (
+               session_id TEXT PRIMARY KEY,
+               workspace TEXT NOT NULL,
+               model TEXT NOT NULL,
+               mode TEXT NOT NULL,
+               title TEXT NOT NULL,
+               extra_roots TEXT NOT NULL,
+               grants TEXT NOT NULL,
+               pinned INTEGER NOT NULL,
+               archived INTEGER NOT NULL,
+               origin TEXT,
+               origin_label TEXT,
+               compaction TEXT NOT NULL,
+               host_id TEXT NOT NULL,
+               provider TEXT,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS schema_migrations (
+               version INTEGER PRIMARY KEY,
+               applied_at TEXT NOT NULL
+             );",
+        )?;
+        let created_at_column = table_columns(&connection, "sessions")?
+            .iter()
+            .any(|column| column == "created_at");
+        if !created_at_column {
+            connection.execute(
+                "ALTER TABLE sessions ADD COLUMN created_at TEXT NOT NULL DEFAULT ''",
                 [],
-                |row| row.get::<_, i64>(0),
-            )?
-            == 0
+            )?;
+            connection.execute(
+                "UPDATE sessions SET created_at=updated_at WHERE created_at=''",
+                [],
+            )?;
+        }
+        if !table_columns(&connection, "sessions")?
+            .iter()
+            .any(|column| column == "provider")
         {
-            self.connection
-                .lock()
-                .expect("sqlite mutex poisoned")
-                .execute(
-                    "INSERT INTO schema_migrations(version, applied_at) VALUES (1, ?1)",
-                    [Utc::now().to_rfc3339()],
-                )?;
+            connection.execute("ALTER TABLE sessions ADD COLUMN provider TEXT", [])?;
+        }
+        if table_exists(&connection, "sessions_legacy_p0_1")? {
+            migrate_legacy_sessions(&connection)?;
+        }
+        if table_exists(&connection, "transcript")? {
+            migrate_legacy_transcript(&connection)?;
+            connection.execute("DROP TABLE transcript", [])?;
+        }
+        if table_exists(&connection, "sessions_legacy_p0_1")? {
+            connection.execute("DROP TABLE sessions_legacy_p0_1", [])?;
+        }
+        let version: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        if version < 1 {
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (1, ?1)",
+                [Utc::now().to_rfc3339()],
+            )?;
+        }
+        if version < 2 {
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (2, ?1)",
+                [Utc::now().to_rfc3339()],
+            )?;
         }
         Ok(())
     }
 
     pub fn save_session(&self, session: &SessionRecord) -> Result<(), StoreError> {
         self.connection.lock().expect("sqlite mutex poisoned").execute(
-            "INSERT OR REPLACE INTO sessions VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            "INSERT OR REPLACE INTO sessions(session_id,workspace,model,mode,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
             params![
                 session.session_id,
                 session.workspace,
@@ -576,9 +915,54 @@ impl SqliteStore {
                 session.origin_label,
                 serde_json::to_string(&session.compaction)?,
                 session.host_id,
+                session.provider,
+                session.created_at.to_rfc3339(),
                 session.updated_at.to_rfc3339(),
             ],
         )?;
+        Ok(())
+    }
+
+    pub fn load_session(&self, session_id: &str) -> Result<Option<SessionRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let result = connection.query_row(
+            "SELECT session_id,workspace,model,mode,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,created_at,updated_at FROM sessions WHERE session_id=?1",
+            [session_id],
+            session_from_row,
+        );
+        match result {
+            Ok(session) => Ok(Some(session)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn load_sessions(&self) -> Result<Vec<SessionRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT session_id,workspace,model,mode,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,created_at,updated_at FROM sessions ORDER BY created_at DESC",
+        )?;
+        let rows = statement.query_map([], session_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn update_session_provider(
+        &self,
+        session_id: &str,
+        provider: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let changed = self
+            .connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "UPDATE sessions SET provider=?1, updated_at=?2 WHERE session_id=?3",
+                params![provider, Utc::now().to_rfc3339(), session_id],
+            )?;
+        if changed == 0 {
+            return Err(StoreError::Migration("session not found".into()));
+        }
         Ok(())
     }
 }
@@ -807,9 +1191,162 @@ mod tests {
             origin_label: None,
             compaction: serde_json::json!({}),
             host_id: "antec".into(),
+            provider: Some("openai".into()),
+            created_at: Utc::now(),
             updated_at: Utc::now(),
         };
         store.save_session(&session).unwrap();
+    }
+
+    #[test]
+    fn legacy_desktop_migration_is_idempotent() {
+        let path = std::env::temp_dir().join(format!(
+            "opcos-store-migration-{}-{}.db",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = fs::remove_file(&path);
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    &format!(
+                    "CREATE TABLE {table} (
+                       id TEXT PRIMARY KEY,
+                       title TEXT NOT NULL,
+                       host_id TEXT NOT NULL,
+                       model TEXT NOT NULL,
+                       provider TEXT,
+                       mode TEXT NOT NULL,
+                       workspace TEXT NOT NULL,
+                       created_at TEXT NOT NULL
+                     );
+                     CREATE TABLE transcript (
+                       session_id TEXT NOT NULL,
+                       sequence INTEGER NOT NULL,
+                       kind TEXT NOT NULL,
+                       payload TEXT NOT NULL,
+                       PRIMARY KEY(session_id, sequence)
+                     );
+                     INSERT INTO sessions VALUES
+                       ('legacy-1','Legacy','host-1','model-1','provider-1','Interactive','/workspace','2025-01-01T00:00:00Z');
+                     INSERT INTO transcript VALUES
+                       ('legacy-1',1,'user','{{\"role\":\"user\",\"content\":\"hello\"}}'),
+                       ('legacy-1',2,'approval','{{\"callId\":\"call-1\",\"tool\":\"write_file\",\"arguments\":{{\"path\":\"/workspace/a\"}}}}');",
+                    table = "sessions"
+                    ),
+                )
+                .unwrap();
+        }
+        let first = SqliteStore::open(&path).unwrap();
+        let first_session = first.load_session("legacy-1").unwrap().unwrap();
+        let first_transcript = first.load_transcript("legacy-1").unwrap();
+        assert_eq!(first_session.title, "Legacy");
+        assert_eq!(first_transcript.len(), 2);
+        drop(first);
+        let second = SqliteStore::open(&path).unwrap();
+        assert_eq!(
+            second.load_session("legacy-1").unwrap().unwrap().title,
+            "Legacy"
+        );
+        assert_eq!(
+            second.load_transcript("legacy-1").unwrap(),
+            first_transcript
+        );
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('sessions_legacy_p0_1','transcript')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        println!(
+            "legacy migration: sessions=1 transcript={} old_tables=0 second_open=ok",
+            first_transcript.len()
+        );
+        drop(connection);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn transcript_assembly_merges_calls_and_converts_pending() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .append_message(&StoredMessage {
+                session_id: "transcript".into(),
+                sequence: 1,
+                role: "user".into(),
+                content: serde_json::json!({"role":"user","content":"hello"}),
+                display_only: false,
+            })
+            .unwrap();
+        store
+            .append_message(&StoredMessage {
+                session_id: "transcript".into(),
+                sequence: 5,
+                role: "assistant".into(),
+                content: serde_json::json!({"role":"assistant","content":"display-only"}),
+                display_only: true,
+            })
+            .unwrap();
+        store
+            .append_notice(&NoticeRecord {
+                session_id: "transcript".into(),
+                sequence: 4,
+                kind: "info".into(),
+                content: "notice".into(),
+            })
+            .unwrap();
+        store
+            .append_tool_call(&ToolCallRecord {
+                session_id: "transcript".into(),
+                message_sequence: 2,
+                call_id: "call-1".into(),
+                name: "write_file".into(),
+                arguments: serde_json::json!({"path":"/workspace/a"}),
+                result: None,
+            })
+            .unwrap();
+        store
+            .append_tool_call(&ToolCallRecord {
+                session_id: "transcript".into(),
+                message_sequence: 3,
+                call_id: "call-1".into(),
+                name: "write_file".into(),
+                arguments: serde_json::json!({"path":"/workspace/a"}),
+                result: Some(serde_json::json!({"ok":true})),
+            })
+            .unwrap();
+        store
+            .save_pending(&PendingRecord {
+                session_id: "transcript".into(),
+                call_id: "call-1".into(),
+                tool: "write_file".into(),
+                arguments: serde_json::json!({"path":"/workspace/a","content":"secret"}),
+                state: "pending".into(),
+            })
+            .unwrap();
+        let transcript = store.load_transcript("transcript").unwrap();
+        let tools = transcript
+            .iter()
+            .filter(|record| record.kind == "approval" || record.kind == "tool")
+            .collect::<Vec<_>>();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].payload["call_id"], "call-1");
+        assert_eq!(tools[0].payload["status"], "pending");
+        assert_eq!(tools[0].payload["arguments"]["content"], "secret");
+        assert!(transcript.iter().any(|record| record.kind == "notice"));
+        assert!(transcript.iter().any(|record| {
+            record
+                .payload
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                == Some("display-only")
+        }));
     }
 
     #[test]

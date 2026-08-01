@@ -34,7 +34,7 @@ use opcos_rvm::{
     ExecRequest, HttpRvmClient, IdeBootstrap, PersistentShell, RvmClient, RvmClientConfig, WsKind,
     WsParams, join_remote_path,
 };
-use opcos_store::{KeyringSecretStore, SecretStore, SessionStore, SqliteStore};
+use opcos_store::{KeyringSecretStore, SecretStore, SessionRecord, SessionStore, SqliteStore};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -352,25 +352,9 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                id TEXT PRIMARY KEY,
                name TEXT NOT NULL
              );
-             CREATE TABLE IF NOT EXISTS sessions (
-               id TEXT PRIMARY KEY,
-               title TEXT NOT NULL,
-               host_id TEXT NOT NULL,
-               model TEXT NOT NULL,
-               mode TEXT NOT NULL,
-               workspace TEXT NOT NULL DEFAULT '',
-               created_at TEXT NOT NULL
-             );
              CREATE TABLE IF NOT EXISTS settings (
                key TEXT PRIMARY KEY,
                value TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS transcript (
-               session_id TEXT NOT NULL,
-               sequence INTEGER NOT NULL,
-               kind TEXT NOT NULL,
-               payload TEXT NOT NULL,
-               PRIMARY KEY(session_id, sequence)
              );
              CREATE TABLE IF NOT EXISTS asset_records (
                id TEXT PRIMARY KEY,
@@ -422,34 +406,19 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
              );",
         )
         .map_err(|error| error.to_string())?;
-    let has_workspace: bool = connection
-        .prepare("PRAGMA table_info(sessions)")
-        .and_then(|mut statement| {
-            let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
-            Ok(rows.flatten().any(|name| name == "workspace"))
-        })
-        .map_err(|error| error.to_string())?;
-    if !has_workspace {
-        connection
-            .execute(
-                "ALTER TABLE sessions ADD COLUMN workspace TEXT NOT NULL DEFAULT ''",
-                [],
-            )
-            .map_err(|error| error.to_string())?;
-    }
-    let has_provider: bool = connection
-        .prepare("PRAGMA table_info(sessions)")
-        .and_then(|mut statement| {
-            let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
-            Ok(rows.flatten().any(|name| name == "provider"))
-        })
-        .map_err(|error| error.to_string())?;
-    if !has_provider {
-        connection
-            .execute("ALTER TABLE sessions ADD COLUMN provider TEXT", [])
-            .map_err(|error| error.to_string())?;
-    }
     Ok(connection)
+}
+
+fn session_for(state: &DesktopState, session_id: &str) -> Result<SessionRecord, String> {
+    state
+        .store
+        .load_session(session_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "session not found".to_owned())
+}
+
+fn session_host_id(state: &DesktopState, session_id: &str) -> Result<String, String> {
+    Ok(session_for(state, session_id)?.host_id)
 }
 
 fn client_for(state: &DesktopState, host_id: &str) -> Result<HttpRvmClient, String> {
@@ -489,17 +458,8 @@ fn client_for(state: &DesktopState, host_id: &str) -> Result<HttpRvmClient, Stri
 }
 
 fn session_workspace(state: &DesktopState, session_id: &str) -> Result<Option<String>, String> {
-    state
-        .database
-        .lock()
-        .map_err(|_| "database lock poisoned")?
-        .query_row(
-            "SELECT workspace FROM sessions WHERE id=?1",
-            [session_id],
-            |row| row.get::<_, String>(0),
-        )
-        .map(|workspace| (!workspace.is_empty()).then_some(workspace))
-        .map_err(|_| "session not found".to_owned())
+    let workspace = session_for(state, session_id)?.workspace;
+    Ok((!workspace.is_empty()).then_some(workspace))
 }
 
 async fn relay_surface(
@@ -725,27 +685,12 @@ async fn engine_for(
             return Ok(Arc::clone(engine));
         }
     }
-    let (host_id, model, mode, session_workspace, session_provider) = {
-        let connection = state
-            .database
-            .lock()
-            .map_err(|_| "database lock poisoned")?;
-        connection
-            .query_row(
-                "SELECT host_id,model,mode,workspace,provider FROM sessions WHERE id=?1",
-                [session_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                    ))
-                },
-            )
-            .map_err(|_| "session not found".to_owned())?
-    };
+    let session = session_for(state, session_id)?;
+    let host_id = session.host_id;
+    let model = session.model;
+    let mode = session.mode;
+    let session_workspace = session.workspace;
+    let session_provider = session.provider;
     let (provider_id, configured_base_url) = {
         let connection = state
             .database
@@ -1182,19 +1127,7 @@ async fn ide_bootstrap(
     if !folder_uri.starts_with("vscode-remote://") {
         return Err("IDE folder must be a vscode-remote URI".into());
     }
-    let host_id = {
-        let connection = state
-            .database
-            .lock()
-            .map_err(|_| "database lock poisoned")?;
-        connection
-            .query_row(
-                "SELECT host_id FROM sessions WHERE id=?1",
-                [&session_id],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(|_| "session not found".to_owned())?
-    };
+    let host_id = session_host_id(&state, &session_id)?;
     client_for(&state, &host_id)?
         .ide_bootstrap(&folder_uri)
         .await
@@ -1207,19 +1140,7 @@ async fn start_ide_proxy(
     session_id: String,
     folder_uri: String,
 ) -> Result<u16, String> {
-    let host_id = {
-        let connection = state
-            .database
-            .lock()
-            .map_err(|_| "database lock poisoned")?;
-        connection
-            .query_row(
-                "SELECT host_id FROM sessions WHERE id=?1",
-                [&session_id],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(|_| "session not found".to_owned())?
-    };
+    let host_id = session_host_id(&state, &session_id)?;
     if !folder_uri.starts_with("vscode-remote://") {
         return Err("IDE folder must be a vscode-remote URI".into());
     }
@@ -1283,20 +1204,35 @@ fn create_session(
     );
     let model = model.unwrap_or_else(|| "auto".into());
     let mode = mode.unwrap_or_else(|| "Interactive".into());
-    let connection = state
+    let host_name: String = state
         .database
         .lock()
-        .map_err(|_| "database lock poisoned")?;
-    let host_name: String = connection
+        .map_err(|_| "database lock poisoned")?
         .query_row("SELECT name FROM hosts WHERE id=?1", [&host_id], |row| {
             row.get(0)
         })
         .map_err(|_| "remote host not found; session was not created".to_owned())?;
-    connection
-        .execute(
-            "INSERT INTO sessions(id,title,host_id,model,provider,mode,workspace,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![id, title, host_id, model, provider, mode, workspace.clone().unwrap_or_default(), Utc::now().to_rfc3339()],
-        )
+    let now = Utc::now();
+    state
+        .store
+        .save_session(&SessionRecord {
+            session_id: id.clone(),
+            workspace: workspace.clone().unwrap_or_default(),
+            model: model.clone(),
+            mode: mode.clone(),
+            title: title.clone(),
+            extra_roots: vec![],
+            grants: json!({}),
+            pinned: false,
+            archived: false,
+            origin: None,
+            origin_label: None,
+            compaction: json!({}),
+            host_id: host_id.clone(),
+            provider: provider.clone(),
+            created_at: now,
+            updated_at: now,
+        })
         .map_err(|error| error.to_string())?;
     audit(
         &state,
@@ -1318,29 +1254,36 @@ fn create_session(
 
 #[tauri::command]
 fn list_sessions(state: State<'_, DesktopState>) -> Result<Vec<SessionView>, String> {
+    let sessions = state
+        .store
+        .load_sessions()
+        .map_err(|error| error.to_string())?;
     let connection = state
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?;
-    let mut statement = connection
-        .prepare("SELECT s.id,s.title,s.host_id,h.name,s.model,s.provider,s.mode,s.workspace FROM sessions s JOIN hosts h ON h.id=s.host_id ORDER BY s.created_at DESC")
-        .map_err(|error| error.to_string())?;
-    let rows = statement
-        .query_map([], |row| {
+    sessions
+        .into_iter()
+        .map(|session| {
+            let host_name = connection
+                .query_row(
+                    "SELECT name FROM hosts WHERE id=?1",
+                    [&session.host_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|_| "remote host not found for session".to_owned())?;
             Ok(SessionView {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                host_id: row.get(2)?,
-                host_name: row.get(3)?,
-                model: row.get(4)?,
-                provider: row.get(5)?,
-                mode: row.get(6)?,
-                workspace: row.get(7)?,
+                id: session.session_id,
+                title: session.title,
+                host_id: session.host_id,
+                host_name,
+                model: session.model,
+                provider: session.provider,
+                mode: session.mode,
+                workspace: session.workspace,
             })
         })
-        .map_err(|error| error.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())
+        .collect()
 }
 
 #[tauri::command]
@@ -1348,34 +1291,33 @@ fn read_transcript(
     state: State<'_, DesktopState>,
     session_id: String,
 ) -> Result<Vec<Value>, String> {
-    let messages = state
+    state
         .store
-        .load_messages(&session_id)
-        .map_err(|error| error.to_string())?;
-    let mut transcript = messages
-        .into_iter()
-        .map(|message| json!({"kind":message.role,"payload":message.content}))
-        .collect::<Vec<_>>();
-    transcript.extend(
-        state
-            .store
-            .load_pending(&session_id)
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(|pending| {
-                json!({
-                    "kind":"approval",
-                    "payload":{
-                        "call_id":pending.call_id,
-                        "tool":pending.tool,
-                        "arguments":redact_approval_value(&pending.arguments),
-                        "risk":approval_risk(&pending.tool),
-                        "reason":"Tool action requires approval"
+        .load_transcript(&session_id)
+        .map_err(|error| error.to_string())
+        .map(|records| {
+            records
+                .into_iter()
+                .map(|record| {
+                    let mut payload = record.payload;
+                    if record.kind == "approval"
+                        && payload
+                            .get("approval")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                    {
+                        if let Some(arguments) = payload.get_mut("arguments") {
+                            *arguments = redact_approval_value(arguments);
+                        }
+                        if let Some(tool) = payload.get("tool").and_then(Value::as_str) {
+                            payload["risk"] = json!(approval_risk(tool));
+                        }
+                        payload["reason"] = json!("Tool action requires approval");
                     }
+                    json!({"kind":record.kind,"payload":payload})
                 })
-            }),
-    );
-    Ok(transcript)
+                .collect()
+        })
 }
 
 #[tauri::command]
@@ -1384,19 +1326,7 @@ async fn submit_turn(
     state: State<'_, DesktopState>,
     request: SubmitRequest,
 ) -> Result<(), String> {
-    let host_id: String = {
-        let connection = state
-            .database
-            .lock()
-            .map_err(|_| "database lock poisoned")?;
-        connection
-            .query_row(
-                "SELECT host_id FROM sessions WHERE id=?1",
-                [&request.session_id],
-                |row| row.get(0),
-            )
-            .map_err(|_| "session not found".to_owned())?
-    };
+    let host_id = session_host_id(&state, &request.session_id)?;
     let client = client_for(&state, &host_id)?;
     client
         .health()
@@ -1485,19 +1415,9 @@ async fn upload_text_attachment(
     if content.len() > 256 * 1024 {
         return Err("text attachments are limited to 256 KiB".into());
     }
-    let (host_id, workspace) = {
-        let connection = state
-            .database
-            .lock()
-            .map_err(|_| "database lock poisoned")?;
-        connection
-            .query_row(
-                "SELECT host_id,workspace FROM sessions WHERE id=?1",
-                [&session_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .map_err(|_| "session not found".to_owned())?
-    };
+    let session = session_for(&state, &session_id)?;
+    let host_id = session.host_id;
+    let workspace = session.workspace;
     let client = client_for(&state, &host_id)?;
     let workspace = if workspace.is_empty() {
         client
@@ -1655,18 +1575,10 @@ async fn change_provider(
     {
         return Err("unknown provider".into());
     }
-    {
-        let connection = state
-            .database
-            .lock()
-            .map_err(|_| "database lock poisoned")?;
-        connection
-            .execute(
-                "UPDATE sessions SET provider=?1 WHERE id=?2",
-                params![provider, session_id],
-            )
-            .map_err(|error| error.to_string())?;
-    }
+    state
+        .store
+        .update_session_provider(&session_id, provider.as_deref())
+        .map_err(|error| error.to_string())?;
     state.engines.lock().await.remove(&session_id);
     Ok(())
 }
@@ -1797,16 +1709,7 @@ async fn export_assets(
     session_id: String,
     ids: Vec<String>,
 ) -> Result<usize, String> {
-    let host_id = state
-        .database
-        .lock()
-        .map_err(|_| "database lock poisoned")?
-        .query_row(
-            "SELECT host_id FROM sessions WHERE id=?1",
-            [session_id],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|_| "session not found".to_owned())?;
+    let host_id = session_host_id(&state, &session_id)?;
     let client = client_for(&state, &host_id)?;
     let health = client
         .health()
@@ -1865,16 +1768,7 @@ async fn import_assets(
     state: State<'_, DesktopState>,
     session_id: String,
 ) -> Result<AssetBundle, String> {
-    let host_id = state
-        .database
-        .lock()
-        .map_err(|_| "database lock poisoned")?
-        .query_row(
-            "SELECT host_id FROM sessions WHERE id=?1",
-            [session_id],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|_| "session not found".to_owned())?;
+    let host_id = session_host_id(&state, &session_id)?;
     let client = client_for(&state, &host_id)?;
     let health = client
         .health()
@@ -1914,19 +1808,7 @@ async fn discover_remote_assets(
     state: State<'_, DesktopState>,
     session_id: String,
 ) -> Result<AssetBundle, String> {
-    let host_id = {
-        let connection = state
-            .database
-            .lock()
-            .map_err(|_| "database lock poisoned")?;
-        connection
-            .query_row(
-                "SELECT host_id FROM sessions WHERE id=?1",
-                [session_id.clone()],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(|_| "session not found".to_owned())?
-    };
+    let host_id = session_host_id(&state, &session_id)?;
     let client = client_for(&state, &host_id)?;
     let workspace = if let Some(workspace) = session_workspace(&state, &session_id)? {
         workspace
@@ -1948,16 +1830,7 @@ async fn mcp_tools(
     state: State<'_, DesktopState>,
     session_id: String,
 ) -> Result<Vec<Value>, String> {
-    let host_id = state
-        .database
-        .lock()
-        .map_err(|_| "database lock poisoned")?
-        .query_row(
-            "SELECT host_id FROM sessions WHERE id=?1",
-            [session_id.clone()],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|_| "session not found".to_owned())?;
+    let host_id = session_host_id(&state, &session_id)?;
     let response = client_for(&state, &host_id)?
         .mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
         .await
@@ -1994,16 +1867,7 @@ async fn read_blueprint(
     state: State<'_, DesktopState>,
     session_id: String,
 ) -> Result<Value, String> {
-    let host_id = state
-        .database
-        .lock()
-        .map_err(|_| "database lock poisoned")?
-        .query_row(
-            "SELECT host_id FROM sessions WHERE id=?1",
-            [session_id],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|_| "session not found".to_owned())?;
+    let host_id = session_host_id(&state, &session_id)?;
     let client = client_for(&state, &host_id)?;
     let content = client
         .read(".devin/blueprint.yaml")
@@ -2025,16 +1889,7 @@ async fn execute_blueprint(
     if command.trim().is_empty() {
         return Err("blueprint command cannot be empty".into());
     }
-    let host_id = state
-        .database
-        .lock()
-        .map_err(|_| "database lock poisoned")?
-        .query_row(
-            "SELECT host_id FROM sessions WHERE id=?1",
-            [session_id.clone()],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|_| "session not found".to_owned())?;
+    let host_id = session_host_id(&state, &session_id)?;
     let client = client_for(&state, &host_id)?;
     let result = client
         .exec_sync(opcos_rvm::ExecRequest {
@@ -2054,16 +1909,7 @@ async fn run_blueprint(
     state: State<'_, DesktopState>,
     session_id: String,
 ) -> Result<Value, String> {
-    let host_id = state
-        .database
-        .lock()
-        .map_err(|_| "database lock poisoned")?
-        .query_row(
-            "SELECT host_id FROM sessions WHERE id=?1",
-            [session_id.clone()],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|_| "session not found".to_owned())?;
+    let host_id = session_host_id(&state, &session_id)?;
     let client = client_for(&state, &host_id)?;
     let blueprint = parse_blueprint(
         &client
@@ -2125,16 +1971,7 @@ async fn git_workflow(
     message: Option<String>,
     secret_names: Option<Vec<String>>,
 ) -> Result<Value, String> {
-    let host_id = state
-        .database
-        .lock()
-        .map_err(|_| "database lock poisoned")?
-        .query_row(
-            "SELECT host_id FROM sessions WHERE id=?1",
-            [&session_id],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|_| "session not found".to_owned())?;
+    let host_id = session_host_id(&state, &session_id)?;
     let client = client_for(&state, &host_id)?.with_workspace(cwd.clone());
     let command = match operation.as_str() {
         "branch" => git_branch_name(
@@ -2290,16 +2127,7 @@ async fn review_snapshot(
     cwd: String,
     base: String,
 ) -> Result<Value, String> {
-    let host_id = state
-        .database
-        .lock()
-        .map_err(|_| "database lock poisoned")?
-        .query_row(
-            "SELECT host_id FROM sessions WHERE id=?1",
-            [&session_id],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|_| "session not found".to_owned())?;
+    let host_id = session_host_id(&state, &session_id)?;
     let client = client_for(&state, &host_id)?.with_workspace(cwd.clone());
     let status = client
         .git_status(&cwd)
@@ -2320,16 +2148,7 @@ async fn review_file_diff(
     path: String,
     base: String,
 ) -> Result<Value, String> {
-    let host_id = state
-        .database
-        .lock()
-        .map_err(|_| "database lock poisoned")?
-        .query_row(
-            "SELECT host_id FROM sessions WHERE id=?1",
-            [&session_id],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|_| "session not found".to_owned())?;
+    let host_id = session_host_id(&state, &session_id)?;
     client_for(&state, &host_id)?
         .with_workspace(cwd.clone())
         .git_file_diff(&cwd, &path, &base)
@@ -2344,16 +2163,7 @@ async fn session_worklog(
     after_id: String,
     limit: Option<u32>,
 ) -> Result<Value, String> {
-    let host_id = state
-        .database
-        .lock()
-        .map_err(|_| "database lock poisoned")?
-        .query_row(
-            "SELECT host_id FROM sessions WHERE id=?1",
-            [&session_id],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|_| "session not found".to_owned())?;
+    let host_id = session_host_id(&state, &session_id)?;
     let page = client_for(&state, &host_id)?
         .worklog_query(&after_id, limit.unwrap_or(200))
         .await
@@ -2718,38 +2528,30 @@ async fn run_schedule_for(
 
 #[tauri::command]
 fn session_insights(state: State<'_, DesktopState>, session_id: String) -> Result<Value, String> {
-    let connection = state
-        .database
-        .lock()
-        .map_err(|_| "database lock poisoned")?;
-    let count: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM transcript WHERE session_id=?1",
-            [&session_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let tool_calls: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM tool_calls WHERE session_id=?1",
-            [&session_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let approval_count: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM audit_events WHERE session_id=?1 AND kind LIKE '%approval%'",
-            [&session_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let (input_tokens, output_tokens, duration_ms): (i64, i64, i64) = connection
-        .query_row(
-            "SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COALESCE(SUM(duration_ms),0) FROM usage_events WHERE session_id=?1",
-            [&session_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap_or((0, 0, 0));
+    let count = state
+        .store
+        .load_transcript(&session_id)
+        .map_err(|error| error.to_string())?
+        .len() as i64;
+    let tool_calls = state
+        .store
+        .load_tool_calls(&session_id)
+        .map_err(|error| error.to_string())?
+        .len() as i64;
+    let approval_count = state
+        .store
+        .load_audit(Some(&session_id))
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|event| event.kind.contains("approval"))
+        .count() as i64;
+    let usage = state
+        .store
+        .load_usage(&session_id)
+        .map_err(|error| error.to_string())?;
+    let input_tokens = usage.iter().map(|item| item.input_tokens).sum::<u64>();
+    let output_tokens = usage.iter().map(|item| item.output_tokens).sum::<u64>();
+    let duration_ms = usage.iter().map(|item| item.duration_ms).sum::<u64>();
     Ok(json!({
         "session_id":session_id,
         "message_count":count,
@@ -3036,15 +2838,15 @@ fn main() {
                 .app_config_dir()
                 .map_err(|error| error.to_string())?;
             path.push("opcos.db");
-            let database = init_database(path.clone()).map_err(|error| {
-                let cause: Box<dyn std::error::Error> = Box::new(std::io::Error::other(error));
-                tauri::Error::Setup(cause.into())
-            })?;
             let store = Arc::new(SqliteStore::open(&path).map_err(|error| {
                 let cause: Box<dyn std::error::Error> =
                     Box::new(std::io::Error::other(error.to_string()));
                 tauri::Error::Setup(cause.into())
             })?);
+            let database = init_database(path.clone()).map_err(|error| {
+                let cause: Box<dyn std::error::Error> = Box::new(std::io::Error::other(error));
+                tauri::Error::Setup(cause.into())
+            })?;
             let mut secret_path = path.clone();
             secret_path.set_file_name("secrets.enc");
             let secrets = KeyringSecretStore::with_fallback(SECRET_SERVICE, secret_path);
