@@ -61,8 +61,17 @@ pub struct StreamChunk {
     pub text_delta: Option<String>,
     pub reasoning_delta: Option<String>,
     pub tool_call_delta: Option<ToolCallDelta>,
+    pub tool_result: Option<ToolResult>,
     pub usage: Option<TokenUsage>,
     pub turn: Option<AssistantTurn>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct ToolResult {
+    pub call_id: String,
+    pub name: String,
+    pub arguments: Value,
+    pub result: Value,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]

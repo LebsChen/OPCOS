@@ -4140,8 +4140,19 @@ function AppContent() {
       }
       if (payload.session_id && payload.session_id !== selected?.id) return;
       if (payload.kind === "stream") {
-        setRunning(true);
-        if (payload.payload.turn) setRunning(false);
+        const streamPayload = payload.payload;
+        const hasStreamingContent =
+          typeof streamPayload.text_delta === "string" ||
+          typeof streamPayload.reasoning_delta === "string" ||
+          (streamPayload.tool_call_delta !== null &&
+            typeof streamPayload.tool_call_delta === "object") ||
+          (streamPayload.turn !== null &&
+            typeof streamPayload.turn === "object" &&
+            Object.keys(streamPayload.turn).length > 0);
+        if (hasStreamingContent) {
+          setRunning(true);
+          if (streamPayload.turn) setRunning(false);
+        }
       }
       if (payload.kind === "turn_done") {
         setRunning(false);

@@ -3,7 +3,7 @@ use chrono::Utc;
 use opcos_policy::{Decision, DurableGrant, PermissionMode, ToolRisk, decide};
 use opcos_provider::{
     AssistantTurn, Caps, Provider, ProviderError, ProviderRequest, StreamChunk, TokenUsage,
-    ToolCall,
+    ToolCall, ToolResult,
 };
 use opcos_store::{
     CompactionRecord, GrantRecord, NoticeRecord, PendingRecord, SessionStore, StoredMessage,
@@ -71,6 +71,102 @@ pub trait AgentEngine: Send + Sync {
     fn events(&self) -> mpsc::Receiver<StreamChunk>;
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HarnessKind {
+    Builtin,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HarnessTurnInput {
+    pub text: String,
+    pub model: String,
+    pub messages: Vec<Value>,
+    pub tools: Vec<Value>,
+    pub settings: Value,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HarnessResumeInput {
+    pub session_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HarnessApprovalRequest {
+    pub session_id: String,
+    pub request_id: String,
+    pub tool: String,
+    pub arguments: Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HarnessQuestionRequest {
+    pub session_id: String,
+    pub request_id: String,
+    pub tool: String,
+    pub arguments: Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum HarnessEvent {
+    AssistantTextDelta {
+        text: String,
+    },
+    AssistantReasoningDelta {
+        text: String,
+    },
+    ToolCallDelta {
+        call_id: Option<String>,
+        tool: Option<String>,
+        arguments_fragment: Option<String>,
+    },
+    ToolResult {
+        call_id: String,
+        tool: String,
+        arguments: Value,
+        result: Value,
+    },
+    TurnFinished {
+        turn: AssistantTurn,
+    },
+    ApprovalRequested(HarnessApprovalRequest),
+    QuestionRequested(HarnessQuestionRequest),
+    Error {
+        message: String,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum HarnessError {
+    #[error("engine: {0}")]
+    Engine(#[from] EngineError),
+    #[error("harness event stream already taken")]
+    EventsAlreadyTaken,
+    #[error("harness session mismatch: expected {expected}, got {actual}")]
+    SessionMismatch { expected: String, actual: String },
+}
+
+#[async_trait]
+pub trait Harness: Send + Sync {
+    fn kind(&self) -> HarnessKind;
+    async fn start_turn(&self, input: HarnessTurnInput) -> Result<AssistantTurn, HarnessError>;
+    fn events(&self) -> Result<mpsc::Receiver<HarnessEvent>, HarnessError>;
+    fn interrupt(&self);
+    async fn reply_approval(
+        &self,
+        request_id: &str,
+        outcome: ApprovalOutcome,
+    ) -> Result<AssistantTurn, HarnessError>;
+    async fn reply_question(
+        &self,
+        request_id: &str,
+        response: Value,
+    ) -> Result<AssistantTurn, HarnessError>;
+    async fn resume(
+        &self,
+        input: HarnessResumeInput,
+    ) -> Result<Option<AssistantTurn>, HarnessError>;
+}
+
 pub struct TurnEngine<P, S, E> {
     provider: P,
     store: Arc<S>,
@@ -117,6 +213,17 @@ where
     S: SessionStore + Send + Sync + 'static,
     E: ToolExecutor + 'static,
 {
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn pending_request(&self, call_id: &str) -> Result<Option<PendingRecord>, EngineError> {
+        self.store
+            .load_pending(&self.session_id)
+            .map(|items| items.into_iter().find(|item| item.call_id == call_id))
+            .map_err(|error| EngineError::Store(error.to_string()))
+    }
+
     pub fn new(
         provider: P,
         store: Arc<S>,
@@ -500,6 +607,18 @@ where
             self.store
                 .complete_tool_call(&self.session_id, message_sequence, &call.id, &result)
                 .map_err(|error| EngineError::Store(error.to_string()))?;
+            let _ = self
+                .events
+                .send(StreamChunk {
+                    tool_result: Some(ToolResult {
+                        call_id: call.id,
+                        name: call.name,
+                        arguments: call.arguments,
+                        result,
+                    }),
+                    ..StreamChunk::default()
+                })
+                .await;
         }
         drop(active);
         self.run_loop(self.provider_messages()?).await
@@ -912,6 +1031,18 @@ where
             self.store
                 .complete_tool_call(&self.session_id, assistant_sequence, &call.id, &result)
                 .map_err(|error| EngineError::Store(error.to_string()))?;
+            let _ = self
+                .events
+                .send(StreamChunk {
+                    tool_result: Some(ToolResult {
+                        call_id: call.id.clone(),
+                        name: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                        result,
+                    }),
+                    ..StreamChunk::default()
+                })
+                .await;
         }
         Ok(())
     }
@@ -1060,6 +1191,211 @@ where
     }
 }
 
+pub struct BuiltinHarness<P, S, E> {
+    engine: Arc<TurnEngine<P, S, E>>,
+    source: Mutex<Option<mpsc::Receiver<StreamChunk>>>,
+    controls: Mutex<Option<mpsc::Receiver<HarnessEvent>>>,
+    control_sender: mpsc::Sender<HarnessEvent>,
+    events: mpsc::Sender<HarnessEvent>,
+    receiver: Mutex<Option<mpsc::Receiver<HarnessEvent>>>,
+}
+
+impl<P, S, E> BuiltinHarness<P, S, E>
+where
+    P: Provider + Send + Sync,
+    S: SessionStore + Send + Sync + 'static,
+    E: ToolExecutor + 'static,
+{
+    pub fn new(engine: Arc<TurnEngine<P, S, E>>) -> Self {
+        let (events, receiver) = mpsc::channel(256);
+        let (control_sender, controls) = mpsc::channel(32);
+        let source = engine.events();
+        Self {
+            engine,
+            source: Mutex::new(Some(source)),
+            controls: Mutex::new(Some(controls)),
+            control_sender,
+            events,
+            receiver: Mutex::new(Some(receiver)),
+        }
+    }
+
+    async fn emit_pending(&self, call_id: &str) -> Result<(), HarnessError> {
+        let Some(pending) = self.engine.pending_request(call_id)? else {
+            return Ok(());
+        };
+        let event = if pending.tool == "ask_user" {
+            HarnessEvent::QuestionRequested(HarnessQuestionRequest {
+                session_id: pending.session_id,
+                request_id: pending.call_id,
+                tool: pending.tool,
+                arguments: pending.arguments,
+            })
+        } else {
+            HarnessEvent::ApprovalRequested(HarnessApprovalRequest {
+                session_id: pending.session_id,
+                request_id: pending.call_id,
+                tool: pending.tool,
+                arguments: pending.arguments,
+            })
+        };
+        self.control_sender
+            .send(event)
+            .await
+            .map_err(|_| HarnessError::EventsAlreadyTaken)
+    }
+}
+
+async fn send_harness_chunk(sender: &mpsc::Sender<HarnessEvent>, chunk: StreamChunk) -> bool {
+    let mut mapped = Vec::new();
+    if let Some(text) = chunk.text_delta {
+        mapped.push(HarnessEvent::AssistantTextDelta { text });
+    }
+    if let Some(reasoning) = chunk.reasoning_delta {
+        mapped.push(HarnessEvent::AssistantReasoningDelta { text: reasoning });
+    }
+    if let Some(tool) = chunk.tool_call_delta {
+        mapped.push(HarnessEvent::ToolCallDelta {
+            call_id: tool.id,
+            tool: tool.name,
+            arguments_fragment: tool.arguments_fragment,
+        });
+    }
+    if let Some(result) = chunk.tool_result {
+        mapped.push(HarnessEvent::ToolResult {
+            call_id: result.call_id,
+            tool: result.name,
+            arguments: result.arguments,
+            result: result.result,
+        });
+    }
+    if let Some(turn) = chunk.turn {
+        mapped.push(HarnessEvent::TurnFinished { turn });
+    }
+    for event in mapped {
+        if sender.send(event).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+#[async_trait]
+impl<P, S, E> Harness for BuiltinHarness<P, S, E>
+where
+    P: Provider + Send + Sync,
+    S: SessionStore + Send + Sync + 'static,
+    E: ToolExecutor + 'static,
+{
+    fn kind(&self) -> HarnessKind {
+        HarnessKind::Builtin
+    }
+
+    async fn start_turn(&self, input: HarnessTurnInput) -> Result<AssistantTurn, HarnessError> {
+        match self.engine.submit_text(input.text).await {
+            Ok(turn) => Ok(turn),
+            Err(EngineError::ApprovalPending(call_id)) => {
+                self.emit_pending(&call_id).await?;
+                Err(EngineError::ApprovalPending(call_id).into())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn events(&self) -> Result<mpsc::Receiver<HarnessEvent>, HarnessError> {
+        let receiver = self
+            .receiver
+            .try_lock()
+            .map_err(|_| HarnessError::EventsAlreadyTaken)?
+            .take()
+            .ok_or(HarnessError::EventsAlreadyTaken)?;
+        let source = self
+            .source
+            .try_lock()
+            .map_err(|_| HarnessError::EventsAlreadyTaken)?
+            .take()
+            .ok_or(HarnessError::EventsAlreadyTaken)?;
+        let controls = self
+            .controls
+            .try_lock()
+            .map_err(|_| HarnessError::EventsAlreadyTaken)?
+            .take()
+            .ok_or(HarnessError::EventsAlreadyTaken)?;
+        let sender = self.events.clone();
+        tokio::spawn(async move {
+            let mut source = source;
+            let mut controls = controls;
+            loop {
+                while let Ok(chunk) = source.try_recv() {
+                    if !send_harness_chunk(&sender, chunk).await {
+                        return;
+                    }
+                }
+                if let Ok(event) = controls.try_recv() {
+                    if sender.send(event).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                tokio::select! {
+                    chunk = source.recv() => {
+                        let Some(chunk) = chunk else { return; };
+                        if !send_harness_chunk(&sender, chunk).await {
+                            return;
+                        }
+                    }
+                    event = controls.recv() => {
+                        let Some(event) = event else { return; };
+                        if sender.send(event).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        Ok(receiver)
+    }
+
+    fn interrupt(&self) {
+        self.engine.interrupt();
+    }
+
+    async fn reply_approval(
+        &self,
+        request_id: &str,
+        outcome: ApprovalOutcome,
+    ) -> Result<AssistantTurn, HarnessError> {
+        self.engine
+            .resolve_approval(request_id, outcome)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn reply_question(
+        &self,
+        request_id: &str,
+        response: Value,
+    ) -> Result<AssistantTurn, HarnessError> {
+        self.engine
+            .resolve_pending_input(request_id, response)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn resume(
+        &self,
+        input: HarnessResumeInput,
+    ) -> Result<Option<AssistantTurn>, HarnessError> {
+        if input.session_id != self.engine.session_id() {
+            return Err(HarnessError::SessionMismatch {
+                expected: self.engine.session_id().to_owned(),
+                actual: input.session_id,
+            });
+        }
+        self.engine.resume_pending_turn().await.map_err(Into::into)
+    }
+}
+
 fn tool_definitions() -> Vec<Value> {
     vec![
         json!({"type":"function","function":{"name":"read_file","description":"Read a remote file.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}),
@@ -1131,6 +1467,7 @@ struct PartialOutput {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use opcos_provider::ToolCallDelta;
     use opcos_store::{SessionRecord, SessionStore, SqliteStore};
 
     #[test]
@@ -1242,6 +1579,104 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct HarnessProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for HarnessProvider {
+        async fn complete(&self, _: ProviderRequest) -> Result<AssistantTurn, ProviderError> {
+            unreachable!()
+        }
+
+        async fn stream(
+            &self,
+            _: ProviderRequest,
+            output: mpsc::Sender<StreamChunk>,
+        ) -> Result<AssistantTurn, ProviderError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            match call {
+                0 => {
+                    output
+                        .send(StreamChunk {
+                            text_delta: Some("before ".into()),
+                            tool_call_delta: Some(ToolCallDelta {
+                                index: 0,
+                                id: Some("read-1".into()),
+                                name: Some("read_file".into()),
+                                arguments_fragment: Some("{}".into()),
+                            }),
+                            ..Default::default()
+                        })
+                        .await
+                        .unwrap();
+                    tokio::task::yield_now().await;
+                    Ok(AssistantTurn {
+                        text: Some("before ".into()),
+                        tool_calls: vec![ToolCall {
+                            id: "read-1".into(),
+                            name: "read_file".into(),
+                            arguments: json!({}),
+                        }],
+                        ..Default::default()
+                    })
+                }
+                1 => {
+                    output
+                        .send(StreamChunk {
+                            text_delta: Some("approval ".into()),
+                            tool_call_delta: Some(ToolCallDelta {
+                                index: 0,
+                                id: Some("write-1".into()),
+                                name: Some("write_file".into()),
+                                arguments_fragment: Some(r#"{"path":"x","content":"x"}"#.into()),
+                            }),
+                            ..Default::default()
+                        })
+                        .await
+                        .unwrap();
+                    tokio::task::yield_now().await;
+                    Ok(AssistantTurn {
+                        text: Some("approval ".into()),
+                        tool_calls: vec![ToolCall {
+                            id: "write-1".into(),
+                            name: "write_file".into(),
+                            arguments: json!({"path":"x","content":"x"}),
+                        }],
+                        ..Default::default()
+                    })
+                }
+                2 => {
+                    let turn = AssistantTurn {
+                        text: Some("finished".into()),
+                        finish_reason: Some("stop".into()),
+                        ..Default::default()
+                    };
+                    output
+                        .send(StreamChunk {
+                            text_delta: Some("finished".into()),
+                            turn: Some(turn.clone()),
+                            ..Default::default()
+                        })
+                        .await
+                        .unwrap();
+                    tokio::task::yield_now().await;
+                    Ok(turn)
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        fn capabilities(&self, _: &str) -> Caps {
+            Caps {
+                tools: true,
+                streaming: true,
+                ..Default::default()
+            }
+        }
+    }
+
     #[tokio::test]
     async fn approval_survives_restart_and_deny_writes_tool_result() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
@@ -1282,6 +1717,133 @@ mod tests {
         assert!(messages.iter().any(|message| {
             message.role == "tool" && message.content.to_string().contains("denied by user")
         }));
+    }
+
+    #[tokio::test]
+    async fn builtin_harness_streams_facts_and_resumes_approval() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .save_session(&SessionRecord {
+                session_id: "harness-session".into(),
+                workspace: "/workspace".into(),
+                model: "fake".into(),
+                mode: "Interactive".into(),
+                title: "Harness".into(),
+                extra_roots: vec![],
+                grants: json!({}),
+                pinned: false,
+                archived: false,
+                origin: None,
+                origin_label: None,
+                compaction: json!({}),
+                host_id: "local".into(),
+                provider: None,
+                run_state: "idle".into(),
+                stop_reason: "none".into(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+        let engine = Arc::new(TurnEngine::new(
+            HarnessProvider {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            },
+            store,
+            Arc::new(FakeTools),
+            "harness-session",
+            "/workspace",
+            PermissionMode::Interactive,
+            "fake",
+        ));
+        let harness = BuiltinHarness::new(engine);
+        let mut events = harness.events().unwrap();
+        assert!(matches!(
+            harness.events(),
+            Err(HarnessError::EventsAlreadyTaken)
+        ));
+
+        let start = harness
+            .start_turn(HarnessTurnInput {
+                text: "start".into(),
+                model: "fake".into(),
+                ..Default::default()
+            })
+            .await;
+        assert!(
+            matches!(start, Err(HarnessError::Engine(EngineError::ApprovalPending(ref id))) if id == "write-1"),
+            "unexpected start result: {start:?}"
+        );
+        let mut observed = Vec::new();
+        let approval = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if let HarnessEvent::ApprovalRequested(request) = &event {
+                    let request = request.clone();
+                    observed.push(event);
+                    break request;
+                }
+                observed.push(event);
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(approval.request_id, "write-1");
+        assert_eq!(approval.session_id, "harness-session");
+        assert_eq!(approval.tool, "write_file");
+
+        let turn = harness
+            .reply_approval("write-1", ApprovalOutcome::Approve)
+            .await
+            .unwrap();
+        assert_eq!(turn.text.as_deref(), Some("finished"));
+
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(100), events.recv()).await
+        {
+            observed.push(event);
+        }
+        let read_call = observed.iter().position(|event| {
+            matches!(
+                event,
+                HarnessEvent::ToolCallDelta {
+                    call_id: Some(id),
+                    ..
+                } if id == "read-1"
+            )
+        });
+        let read_result = observed.iter().position(|event| {
+            matches!(
+                event,
+                HarnessEvent::ToolResult { call_id, .. } if call_id == "read-1"
+            )
+        });
+        let write_call = observed.iter().position(|event| {
+            matches!(
+                event,
+                HarnessEvent::ToolCallDelta {
+                    call_id: Some(id),
+                    ..
+                } if id == "write-1"
+            )
+        });
+        let write_result = observed.iter().position(|event| {
+            matches!(
+                event,
+                HarnessEvent::ToolResult { call_id, .. } if call_id == "write-1"
+            )
+        });
+        let finished = observed
+            .iter()
+            .position(|event| matches!(event, HarnessEvent::TurnFinished { turn } if turn.text.as_deref() == Some("finished")));
+        assert!(read_call.is_some(), "{observed:?}");
+        assert!(read_result.is_some(), "{observed:?}");
+        assert!(write_call.is_some(), "{observed:?}");
+        assert!(write_result.is_some(), "{observed:?}");
+        assert!(finished.is_some(), "{observed:?}");
+        assert!(read_call < read_result);
+        assert!(read_result < write_call);
+        assert!(write_call < write_result);
+        assert!(write_result < finished);
     }
 
     #[tokio::test]

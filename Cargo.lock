@@ -3287,11 +3287,13 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "futures-util",
  "opcos-rvm",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
+ "tokio-tungstenite 0.30.0",
 ]
 
 [[package]]
