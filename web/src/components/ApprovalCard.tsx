@@ -3,13 +3,16 @@ import type { ApprovalDecision, Item } from "../types";
 import { humanizeApprovalTitle, type HumanLine } from "../humanize";
 import { Icon } from "./Icon";
 
-export function shortArgs(args: any): string {
+type ApprovalArgs = Record<string, unknown>;
+
+export function shortArgs(args: ApprovalArgs | null | undefined): string {
   if (!args || typeof args !== "object") return "";
   return Object.entries(args)
     .map(([k, v]) => {
       let s = typeof v === "string" ? v : JSON.stringify(v);
-      if (s.length > 96) s = s.slice(0, 95) + "...";
-      return `${k}=${s.replace(/\n/g, " ")}`;
+      const text = s ?? "";
+      if (text.length > 96) s = text.slice(0, 95) + "...";
+      return `${k}=${(s ?? "").replace(/\n/g, " ")}`;
     })
     .join("  ");
 }
@@ -45,7 +48,9 @@ interface PermissionLine {
   access: string;
 }
 
-function permissionLines(args: any): PermissionLine[] {
+function permissionLines(
+  args: ApprovalArgs | null | undefined,
+): PermissionLine[] {
   const raw = args?.permissions;
   if (!Array.isArray(raw)) return [];
   return raw
@@ -71,7 +76,7 @@ export function TitleText({ line }: { line: HumanLine }) {
 // Shared with the parked-approval card (InboxItemCard) so both dialects match (§35).
 export function scopeNote(
   name: string,
-  args: any,
+  args: ApprovalArgs | null | undefined,
   category?: string,
 ): { text: string; external: boolean } {
   if (category === "connector")

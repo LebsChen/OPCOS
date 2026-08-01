@@ -1,3 +1,4 @@
+// @ts-nocheck
 // AccessSection — the rail's "what can this session touch" section (§32; absorbs the §23
 // Session-settings drawer and retires the topbar row/glance). One collapsible rail section:
 //   · header: "Access" + a permanent summary ("Slack, GitHub · 2 folders") — the §23 trust
@@ -11,7 +12,6 @@
 
 // Backend-only connector, cloud account, and local folder sections are removed
 // while retaining the OpenWorker Access/RootRow layout shell.
-// @ts-nocheck
 import { useCallback, useEffect, useRef, useState } from "react";
 import { translate } from "../i18n";
 type CloudStatus = any;

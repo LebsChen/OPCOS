@@ -1,5 +1,5 @@
-// The OpenWorker composer is progressively adapted to OPCOS data sources.
 // @ts-nocheck
+// The OpenWorker composer is progressively adapted to OPCOS data sources.
 import {
   useEffect,
   useLayoutEffect,
@@ -96,7 +96,7 @@ interface Props {
   onConfigureVoiceInput?: () => void;
   onSend: (text: string, attachments?: Attachment[]) => void;
   onInterrupt: () => void;
-  onModeChange: (mode: string) => void;
+  onModeChange?: (mode: string) => void;
   onModelChange: (model: string) => void;
   // When set (Code/Cowork), the Mode menu is shown. The folder/roots + branch controls left the
   // composer for the Session settings drawer (§22) — folder access is standing session config.
@@ -121,7 +121,7 @@ interface Props {
   contextWindow?: number;
 }
 
-export function Composer(props: any) {
+export function Composer(props: Props) {
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [dragging, setDragging] = useState(false);
@@ -548,7 +548,7 @@ export function Composer(props: any) {
                 {recordingTime}
               </span>
             </div>
-          ) : props.workspace !== undefined ? (
+          ) : props.workspace !== undefined && props.onModeChange ? (
             <ModeMenu
               mode={props.mode}
               onModeChange={props.onModeChange}

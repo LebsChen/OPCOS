@@ -41,6 +41,7 @@ import { RightRail } from "./components/RightRail";
 import { SelectMenu as OpenWorkerSelectMenu } from "./components/SelectMenu";
 import { SettingsView, type SettingsSection } from "./components/SettingsView";
 import { Icon } from "./components/Icon";
+import type { Item } from "./types";
 import { CollectionPage } from "./components/CollectionPage";
 import { getLocale, setLocale, subscribeLocale, translate } from "./i18n";
 import "./openworker-tailwind.css";
@@ -3246,6 +3247,49 @@ function AppContent() {
     }
   };
   const activeItems = useMemo(() => transcript, [transcript]);
+  const transcriptItems = useMemo<Item[]>(() => {
+    const output: Item[] = [];
+    activeItems.forEach((item) => {
+      if (item.kind === "user")
+        output.push({ kind: "user", text: item.text || "" });
+      if (item.kind === "assistant")
+        output.push({
+          kind: "assistant",
+          text: item.text || "",
+          reasoning: item.reasoning,
+        });
+      if (item.kind === "thinking")
+        output.push({
+          kind: "assistant",
+          text: "",
+          reasoning: item.reasoning || item.text || "",
+        });
+      if (item.kind === "tool")
+        output.push({
+          kind: "tool",
+          id: item.id,
+          name: item.toolName || "tool",
+          args: item.arguments,
+          status: item.status || "ok",
+          preview: item.result ? String(item.result) : undefined,
+        });
+      if (item.kind === "approval")
+        output.push({
+          kind: "approval",
+          name: item.toolName || "approval",
+          args: item.arguments,
+          reason: item.text || "",
+          resolved: item.status === "ok" ? "once" : undefined,
+        });
+      if (item.kind === "notice")
+        output.push({
+          kind: "notice",
+          tone: item.noticeKind === "error" ? "warn" : "info",
+          text: item.text || "",
+        });
+    });
+    return output;
+  }, [activeItems]);
   const approvalPending = activeItems.some(
     (item) =>
       item.kind === "tool" && item.approval && item.status === "pending",
@@ -3463,23 +3507,31 @@ function AppContent() {
             <div className="main-content">
               {tab === "chat" ? (
                 <>
-                  <Transcript
-                    items={activeItems}
-                    running={running}
-                    onApprove={(id: string) => approve(id, true)}
-                    onDeny={(id: string) => approve(id, false)}
-                  />
+                  <Transcript items={transcriptItems} running={running} />
                   <Composer
-                    selected={selected}
+                    mode={selected.mode}
+                    model={selected.model}
+                    models={models.map((item) => item.id)}
+                    modelLabels={Object.fromEntries(
+                      models.map((item) => [item.id, item.label]),
+                    )}
+                    connected={Boolean(selected)}
                     running={running}
-                    approvalPending={approvalPending}
-                    onSubmit={submit}
-                    onSteer={steer}
+                    onSend={submit}
+                    onModelChange={(model) => {
+                      void command("change_model", {
+                        sessionId: selected.id,
+                        model,
+                      })
+                        .then(() => setSelected({ ...selected, model }))
+                        .catch(onError);
+                    }}
                     onInterrupt={() =>
                       command("interrupt", { sessionId: selected.id }).catch(
                         onError,
                       )
                     }
+                    resetKey={selected.id}
                   />
                 </>
               ) : (

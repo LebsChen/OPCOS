@@ -1,6 +1,6 @@
+// @ts-nocheck
 // Unsupported connector delivery and unattended integrations are removed while
 // preserving the OpenWorker scheduled-view shell.
-// @ts-nocheck
 import { useEffect, useState } from "react";
 import { translate } from "../i18n";
 type Automation = any;

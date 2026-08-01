@@ -1,6 +1,6 @@
+// @ts-nocheck
 // The OpenWorker component is progressively adapted to OPCOS view models.
 // Type checking is restored as each unsupported backend-only section is removed.
-// @ts-nocheck
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import type {
   Automation,
@@ -175,7 +175,12 @@ const compactAge = (iso?: string | null): string => {
 
 // Sessions shown per group before "Show more" comes from Settings (sessions_peek, default 5).
 
-export function Sidebar(props: any) {
+type SidebarProps = Partial<Props> & {
+  sessions: SessionInfo[];
+  [key: string]: unknown;
+};
+
+export function Sidebar(props: SidebarProps) {
   props = {
     ...props,
     agent: props.agent ?? "opcos",

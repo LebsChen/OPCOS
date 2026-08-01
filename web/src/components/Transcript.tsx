@@ -390,9 +390,7 @@ function TurnGroup({
 }
 
 interface Props {
-  items: any[];
-  onApprove: (decision: ApprovalDecision) => void;
-  onDeny?: (id: string) => void;
+  items: Item[];
   // The session's live flag. While true, the FINAL run's trailing assistant text is still
   // narration (status), not the answer — promoting it early made each line flash as a full
   // ASSISTANT bubble and then vanish into the group when the next tool call arrived

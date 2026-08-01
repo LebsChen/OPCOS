@@ -1,5 +1,5 @@
-// Artifact viewer and connector integrations are unsupported in OPCOS.
 // @ts-nocheck
+// Artifact viewer and connector integrations are unsupported in OPCOS.
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { translate } from "../i18n";
 type ArtifactContent = any;
@@ -60,7 +60,7 @@ interface Props {
   onOpenIntegrations?: () => void;
 }
 
-export function RightRail(props: any) {
+export function RightRail(props: Props) {
   const {
     active,
     sessionId,

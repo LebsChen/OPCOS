@@ -1,6 +1,6 @@
+// @ts-nocheck
 // Unsupported connector/OAuth/cloud sections are removed during the OPCOS
 // data-layer adaptation while preserving the original tab layout.
-// @ts-nocheck
 import { useEffect, useState } from "react";
 import { translate } from "../i18n";
 import {
