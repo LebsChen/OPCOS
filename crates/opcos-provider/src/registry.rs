@@ -56,7 +56,21 @@ pub fn descriptors() -> Vec<ProviderDescriptor> {
             "OPENAI_API_KEY",
             true,
         ),
-        descriptor("bedrock", "Amazon Bedrock", "", "", false),
+        ProviderDescriptor {
+            name: "bedrock".into(),
+            title: "Amazon Bedrock（环境凭据）".into(),
+            needs_key: false,
+            default_base_url: None,
+            fields: vec![
+                field("region", "AWS region", false, true),
+                field("credentials", "AWS credentials", true, false),
+            ],
+            recommended_model: matrix::models_for_provider("bedrock")
+                .first()
+                .map(|entry| entry.id.to_string()),
+            env_key: None,
+            openai_compatible: false,
+        },
         descriptor(
             "deepseek",
             "DeepSeek",
@@ -73,7 +87,7 @@ pub fn descriptors() -> Vec<ProviderDescriptor> {
         ),
         ProviderDescriptor {
             name: "vertex".into(),
-            title: "Google Vertex AI".into(),
+            title: "Google Vertex AI（未接入）".into(),
             needs_key: true,
             default_base_url: None,
             fields: vec![

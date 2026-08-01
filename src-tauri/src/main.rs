@@ -26,6 +26,7 @@ use opcos_engine::{
 };
 use opcos_policy::PermissionMode;
 use opcos_provider::anthropic::AnthropicProvider;
+use opcos_provider::bedrock::BedrockProvider;
 use opcos_provider::openai::OpenAiProvider;
 use opcos_provider::registry;
 use opcos_provider::{Provider, ProviderConfig};
@@ -788,9 +789,7 @@ async fn engine_for(
         .ok()
         .or(configured_base_url)
         .or(descriptor.default_base_url)
-        .ok_or_else(|| {
-            "provider base URL is not configured; open Provider settings first".to_owned()
-        })?;
+        .unwrap_or_default();
     let client = client_for(state, &host_id)?;
     let health = client
         .health()
@@ -811,14 +810,55 @@ async fn engine_for(
         client: executor_client.clone(),
         secrets: state.secrets.clone(),
     });
-    let key = state
-        .secrets
-        .get(&secret_key("provider-key", &provider_id))
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "provider key is not configured; open Provider settings first".to_owned())?;
     let provider: Box<dyn Provider> = match descriptor.name.as_str() {
-        "anthropic" => Box::new(AnthropicProvider::new(ProviderConfig::new(base_url, key))),
+        "bedrock" => {
+            let region = std::env::var("AWS_REGION")
+                .ok()
+                .or_else(|| {
+                    state
+                        .database
+                        .lock()
+                        .ok()
+                        .and_then(|connection| {
+                            connection
+                                .query_row(
+                                    "SELECT value FROM settings WHERE key='provider.region.bedrock'",
+                                    [],
+                                    |row| row.get::<_, String>(0),
+                                )
+                                .ok()
+                        })
+                })
+                .ok_or_else(|| {
+                    "Amazon Bedrock is not connected: configure AWS_REGION and AWS credentials in the environment."
+                        .to_owned()
+                })?;
+            Box::new(BedrockProvider::new(region))
+        }
+        "vertex" => {
+            return Err(
+                "Google Vertex AI is not connected yet: service-account authentication is not supported by the current secret store."
+                    .into(),
+            );
+        }
+        "anthropic" => {
+            let key = state
+                .secrets
+                .get(&secret_key("provider-key", &provider_id))
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    "provider key is not configured; open Provider settings first".to_owned()
+                })?;
+            Box::new(AnthropicProvider::new(ProviderConfig::new(base_url, key)))
+        }
         _name if descriptor.openai_compatible => {
+            let key = state
+                .secrets
+                .get(&secret_key("provider-key", &provider_id))
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    "provider key is not configured; open Provider settings first".to_owned()
+                })?;
             Box::new(OpenAiProvider::new(ProviderConfig::new(base_url, key)))
         }
         name => return Err(format!("provider {name} is not supported for sessions")),
