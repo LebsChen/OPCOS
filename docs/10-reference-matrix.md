@@ -31,7 +31,7 @@
 
 ### P0：已有基础，需收口
 
-1. `opcos-store` 与 desktop DB 的 sessions/tool_calls 双 schema 合并。
+1. 合并 desktop DB 的重复 `sessions`；desktop `transcript` 与 store 的 `messages`/`notices`/`tool_calls` 是职责重叠，不是桌面 `tool_calls` 表。
 2. IPC command/event payload 统一，确保审批延续和 `turn_done` 顺序符合 [03](03-lifecycle.md)。
 3. host capability、health、remote path algebra 统一到 trait。
 4. MCP client 的 global/workspace 配置、tool discovery、approval、SecretStore。

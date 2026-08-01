@@ -21,7 +21,7 @@
 
 `messages`、`notices`、`tool_calls`、`pending` 与 `audit_events` 都采用 session 维度的复合主键或序列键；原始字符串和 JSON 文本保留在 store 中，避免只存 UI 文案。
 
-桌面 adapter 另有 SQLite 表，不属于上述 10 张 `opcos-store` 表：`main.rs` 初始化的桌面数据库包括 `hosts`、`sessions`、`transcript`、`tool_calls`、`asset_records`、`schedules`、`secret_records`、协调任务等（`src-tauri/src/main.rs:343-455`）。后续应明确单一权威，避免两套 session/tool schema 漂移。
+桌面 adapter 另有 SQLite 表，不属于上述 10 张 `opcos-store` 表：旧版 `main.rs` 初始化的桌面数据库包括 `hosts`、`sessions`、`transcript`、`asset_records`、`schedules`、`secret_records`、协调任务等（`src-tauri/src/main.rs:343-455`），实际没有桌面 `tool_calls` 表。重复的是桌面 `sessions`；桌面 `transcript` 与 store 的 `messages`、`notices`、`tool_calls` 在职责上重叠。P0-1 后桌面 `sessions`/`transcript` 删除，避免两套 session/tool 数据来源漂移。
 
 ## 1.2 目标态增量
 

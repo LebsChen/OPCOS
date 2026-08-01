@@ -12,7 +12,7 @@
 
 ### P0-1 单一存储权威
 
-`opcos-store` 与桌面 adapter 各有一套 `sessions` / `tool_calls` schema（见 [01](01-data-model.md) 1.1），会漂移。
+`opcos-store` 与桌面 adapter 各有一套 `sessions` schema；桌面 `transcript` 还与 store 的 `messages`、`notices`、`tool_calls` 职责重叠（见 [01](01-data-model.md) 1.1），会漂移。
 
 - 改：`crates/opcos-store`、`src-tauri/src/main.rs`
 - 做：桌面表只保留 adapter 专属（`hosts`、`secret_records`、`schedules`），会话/消息/工具/审批全部归 `opcos-store`；写一次性迁移。
