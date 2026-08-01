@@ -43,7 +43,13 @@ type UiEvent = {
   session_id?: string;
   payload: Record<string, unknown>;
 };
-type ProviderDescriptor = { name: string; title: string };
+type ProviderDescriptor = {
+  name: string;
+  title: string;
+  needs_key?: boolean;
+  default_base_url?: string | null;
+  recommended_model?: string | null;
+};
 type Asset = {
   id: string;
   kind: string;
@@ -1102,6 +1108,13 @@ function ManageSections({
   const [baseUrl, setBaseUrl] = useState("");
   const [key, setKey] = useState("");
   const [providerStatus, setProviderStatus] = useState("");
+  const [providerConfigs, setProviderConfigs] = useState<
+    Array<{ provider: string; base_url?: string; configured: boolean }>
+  >([]);
+  const [providerKeys, setProviderKeys] = useState<Record<string, string>>({});
+  const [providerStatuses, setProviderStatuses] = useState<
+    Record<string, string>
+  >({});
   const [assetTitle, setAssetTitle] = useState("");
   const [assetBody, setAssetBody] = useState("");
   const [assetKind, setAssetKind] = useState<Asset["kind"]>("knowledge");
@@ -1174,6 +1187,13 @@ function ManageSections({
       })
       .catch(onError);
   }, []);
+  useEffect(() => {
+    void command<
+      Array<{ provider: string; base_url?: string; configured: boolean }>
+    >("provider_configurations")
+      .then(setProviderConfigs)
+      .catch(onError);
+  }, []);
   return (
     <section>
       <header className="mb-5">
@@ -1212,6 +1232,150 @@ function ManageSections({
           </div>
         )}
         {tab === "provider" && (
+          <div className="divide-y divide-line">
+            {providers.map((descriptor) => {
+              const config = providerConfigs.find(
+                (item) => item.provider === descriptor.name,
+              );
+              const currentUrl =
+                config?.base_url || descriptor.default_base_url || "";
+              return (
+                <div
+                  className="py-4 first:pt-0 last:pb-0"
+                  key={descriptor.name}
+                >
+                  <div className="settings-row">
+                    <div>
+                      <strong>{descriptor.title}</strong>
+                      <small>
+                        {config?.configured
+                          ? "Configured securely."
+                          : "Not configured yet."}
+                      </small>
+                    </div>
+                    <SelectMenu
+                      value={
+                        provider === descriptor.name
+                          ? provider
+                          : descriptor.recommended_model || ""
+                      }
+                      onChange={() => setProvider(descriptor.name)}
+                      options={[
+                        {
+                          value: descriptor.name,
+                          label:
+                            descriptor.recommended_model || descriptor.title,
+                        },
+                      ]}
+                    />
+                  </div>
+                  <div className="settings-row">
+                    <div>
+                      <strong>Base URL</strong>
+                      <small>Optional provider-compatible endpoint.</small>
+                    </div>
+                    <input
+                      type="url"
+                      value={currentUrl}
+                      onChange={(event) =>
+                        setProviderConfigs((items) =>
+                          items.map((item) =>
+                            item.provider === descriptor.name
+                              ? { ...item, base_url: event.target.value }
+                              : item,
+                          ),
+                        )
+                      }
+                    />
+                  </div>
+                  {descriptor.needs_key && (
+                    <div className="settings-row">
+                      <div>
+                        <strong>Provider key</strong>
+                        <small>
+                          Stored securely and never returned to the UI.
+                        </small>
+                      </div>
+                      <input
+                        type="password"
+                        value={providerKeys[descriptor.name] || ""}
+                        onChange={(event) =>
+                          setProviderKeys((items) => ({
+                            ...items,
+                            [descriptor.name]: event.target.value,
+                          }))
+                        }
+                      />
+                    </div>
+                  )}
+                  <div className="settings-row justify-end">
+                    <Button
+                      className="primary"
+                      onClick={() =>
+                        command("save_provider_settings", {
+                          provider: descriptor.name,
+                          baseUrl: currentUrl || null,
+                        })
+                          .then(() =>
+                            providerKeys[descriptor.name]
+                              ? command("save_provider_key", {
+                                  provider: descriptor.name,
+                                  key: providerKeys[descriptor.name],
+                                })
+                              : undefined,
+                          )
+                          .then(() =>
+                            command<boolean>("validate_provider_key", {
+                              provider: descriptor.name,
+                            }),
+                          )
+                          .then((ok) => {
+                            setProviderKeys((items) => ({
+                              ...items,
+                              [descriptor.name]: "",
+                            }));
+                            setProviderStatuses((items) => ({
+                              ...items,
+                              [descriptor.name]: ok
+                                ? "Provider key validated successfully."
+                                : "Provider key validation failed.",
+                            }));
+                            setProviderConfigs((items) =>
+                              items.map((item) =>
+                                item.provider === descriptor.name
+                                  ? { ...item, configured: true }
+                                  : item,
+                              ),
+                            );
+                          })
+                          .catch((error) =>
+                            setProviderStatuses((items) => ({
+                              ...items,
+                              [descriptor.name]: `Provider validation failed: ${errorMessage(error)}`,
+                            })),
+                          )
+                      }
+                    >
+                      Save and validate
+                    </Button>
+                  </div>
+                  {providerStatuses[descriptor.name] && (
+                    <div
+                      className={
+                        providerStatuses[descriptor.name].includes("failed")
+                          ? "failure"
+                          : "success"
+                      }
+                    >
+                      {providerStatuses[descriptor.name]}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+        {false && tab === "provider" && (
           <div className="divide-y divide-line">
             <div className="settings-row">
               <div>

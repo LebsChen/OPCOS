@@ -2509,6 +2509,37 @@ fn provider_settings(state: State<'_, DesktopState>) -> Result<Value, String> {
 }
 
 #[tauri::command]
+fn provider_configurations(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned".to_owned())?;
+    registry::descriptors()
+        .into_iter()
+        .map(|descriptor| {
+            let key_name = secret_key("provider-key", &descriptor.name);
+            let configured = state
+                .secrets
+                .get(&key_name)
+                .map_err(|error| error.to_string())?
+                .is_some();
+            let key = format!("provider.base_url.{}", descriptor.name);
+            let base_url = connection
+                .query_row("SELECT value FROM settings WHERE key=?1", [&key], |row| {
+                    row.get::<_, String>(0)
+                })
+                .ok()
+                .or(descriptor.default_base_url.clone());
+            Ok(json!({
+                "provider": descriptor.name,
+                "base_url": base_url,
+                "configured": configured,
+            }))
+        })
+        .collect()
+}
+
+#[tauri::command]
 fn save_provider_settings(
     state: State<'_, DesktopState>,
     provider: String,
@@ -2539,6 +2570,13 @@ fn save_provider_settings(
         .execute(
             "INSERT OR REPLACE INTO settings(key,value) VALUES ('provider.base_url',?1)",
             [&base_url],
+        )
+        .map_err(|error| error.to_string())?;
+    let scoped_key = format!("provider.base_url.{provider}");
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES (?1,?2)",
+            [&scoped_key, &base_url],
         )
         .map_err(|error| error.to_string())?;
     Ok(())
@@ -2730,6 +2768,7 @@ fn main() {
             save_secret_metadata,
             list_secret_metadata,
             provider_settings,
+            provider_configurations,
             save_provider_settings,
             save_provider_key,
             validate_provider_key,
