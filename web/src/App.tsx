@@ -34,6 +34,7 @@ import { SelectMenu as OpenWorkerSelectMenu } from "./components/SelectMenu";
 import { SettingsView, type SettingsSection } from "./components/SettingsView";
 import { Icon } from "./components/Icon";
 import { CollectionPage } from "./components/CollectionPage";
+import { getLocale, setLocale, subscribeLocale, translate } from "./i18n";
 import "./openworker-tailwind.css";
 import "./openworker-styles.css";
 import "./style.css";
@@ -1149,6 +1150,8 @@ function ManageSections({
         window.matchMedia("(prefers-color-scheme: dark)").matches);
     document.documentElement.dataset.theme = dark ? "dark" : "light";
   }, [theme]);
+  const [locale, setCurrentLocale] = useState(getLocale());
+  useEffect(() => subscribeLocale(() => setCurrentLocale(getLocale())), []);
   const [blueprint, setBlueprint] = useState<Record<string, unknown> | null>(
     null,
   );
@@ -1175,7 +1178,7 @@ function ManageSections({
       "Inspect secret metadata without exposing secret values.",
     ],
     blueprint: ["Blueprint", "Read and manage the selected host blueprint."],
-    appearance: ["General", "Set the appearance of the OPCOS workbench."],
+    appearance: [translate("general"), translate("appearanceDescription")],
   };
   const assetKinds = ["agents", "knowledge", "playbook", "skill"] as const;
   const assetTabKind = assetKinds.includes(tab as (typeof assetKinds)[number])
@@ -1236,8 +1239,8 @@ function ManageSections({
           <div className="divide-y divide-line">
             <div className="settings-row">
               <div>
-                <strong>Theme</strong>
-                <small>Choose the light, dark, or system appearance.</small>
+                <strong>{translate("theme")}</strong>
+                <small>{translate("themeDescription")}</small>
               </div>
               <div className="seg">
                 {(["light", "dark", "auto"] as const).map((value) => (
@@ -1247,10 +1250,24 @@ function ManageSections({
                     onClick={() => setTheme(value)}
                     type="button"
                   >
-                    {value[0].toUpperCase() + value.slice(1)}
+                    {translate(value)}
                   </button>
                 ))}
               </div>
+            </div>
+            <div className="settings-row">
+              <div>
+                <strong>{translate("language")}</strong>
+                <small>{translate("languageDescription")}</small>
+              </div>
+              <SelectMenu
+                value={locale}
+                onChange={(value) => setLocale(value as "en" | "zh")}
+                options={[
+                  { value: "en", label: translate("english") },
+                  { value: "zh", label: translate("chinese") },
+                ]}
+              />
             </div>
           </div>
         )}
