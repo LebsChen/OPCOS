@@ -1753,6 +1753,7 @@ function Automations({
               }`}
               onClick={() => setAutomationTab(item)}
             >
+              <Icon name={item === "schedules" ? "clock" : "audit"} size={15} />
               {item === "schedules" ? "Schedules" : "Runs"}
             </button>
           ))}
@@ -1938,6 +1939,21 @@ function Activity({
                     .catch(onError);
               }}
             >
+              <Icon
+                name={
+                  (
+                    {
+                      board: "table",
+                      roles: "folder",
+                      tasks: "audit",
+                      messages: "chat",
+                      worklog: "clock",
+                      insights: "sparkle",
+                    } as const
+                  )[item]
+                }
+                size={15}
+              />
               {item[0].toUpperCase() + item.slice(1)}
             </button>
           ))}
@@ -1972,84 +1988,89 @@ function Activity({
             )}
             {activityTab !== "worklog" && activityTab !== "insights" && (
               <>
-                <div className="rounded-xl2 border border-line bg-panel p-5 space-y-4">
-                  <div>
-                    <label className="field-label">Coordination task ID</label>
-                    <input
-                      value={taskId}
-                      onChange={(event) => setTaskId(event.target.value)}
-                      placeholder="e.g. task-123"
+                {activityTab === "board" && (
+                  <div className="rounded-xl2 border border-line bg-panel p-5 space-y-4">
+                    <div>
+                      <label className="field-label">
+                        Coordination task ID
+                      </label>
+                      <input
+                        value={taskId}
+                        onChange={(event) => setTaskId(event.target.value)}
+                        placeholder="e.g. task-123"
+                      />
+                      <p className="field-help">
+                        The durable coordination board to observe or update.
+                      </p>
+                    </div>
+                    <div>
+                      <label className="field-label">Initial roles</label>
+                      <textarea
+                        value={rolesText}
+                        onChange={(event) => setRolesText(event.target.value)}
+                        placeholder='[{"id":"leader","sort_order":0,"session_id":"","state":"Active"}]'
+                      />
+                      <p className="field-help">
+                        Use the JSON shape shown above when starting a new
+                        board.
+                      </p>
+                    </div>
+                    <Button
+                      disabled={!taskId}
+                      onClick={() => {
+                        try {
+                          const roles = JSON.parse(rolesText);
+                          void command("coordination_start", {
+                            input: { taskId, roles },
+                          })
+                            .then(load)
+                            .catch(onError);
+                        } catch {
+                          onError("Roles must be valid JSON.");
+                        }
+                      }}
+                    >
+                      Start board
+                    </Button>
+                    <Button className="bordered" onClick={load}>
+                      Observe
+                    </Button>
+                    <label className="field-label">
+                      Role ID
+                      <input
+                        value={roleId}
+                        onChange={(event) => setRoleId(event.target.value)}
+                        placeholder="leader"
+                      />
+                    </label>
+                    <SelectMenu
+                      value={roleState}
+                      onChange={setRoleState}
+                      options={["active", "sleep", "paused"].map((value) => ({
+                        value,
+                        label: value,
+                      }))}
                     />
-                    <p className="field-help">
-                      The durable coordination board to observe or update.
-                    </p>
-                  </div>
-                  <div>
-                    <label className="field-label">Initial roles</label>
-                    <textarea
-                      value={rolesText}
-                      onChange={(event) => setRolesText(event.target.value)}
-                      placeholder='[{"id":"leader","sort_order":0,"session_id":"","state":"Active"}]'
-                    />
-                    <p className="field-help">
-                      Use the JSON shape shown above when starting a new board.
-                    </p>
-                  </div>
-                  <Button
-                    disabled={!taskId}
-                    onClick={() => {
-                      try {
-                        const roles = JSON.parse(rolesText);
-                        void command("coordination_start", {
-                          input: { taskId, roles },
+                    <Button
+                      className="bordered"
+                      disabled={!taskId || !roleId}
+                      onClick={() =>
+                        command("coordination_set_role_state", {
+                          taskId,
+                          roleId,
+                          stateName: roleState,
                         })
                           .then(load)
-                          .catch(onError);
-                      } catch {
-                        onError("Roles must be valid JSON.");
+                          .catch(onError)
                       }
-                    }}
-                  >
-                    Start board
-                  </Button>
-                  <Button className="bordered" onClick={load}>
-                    Observe
-                  </Button>
-                  <label className="field-label">
-                    Role ID
-                    <input
-                      value={roleId}
-                      onChange={(event) => setRoleId(event.target.value)}
-                      placeholder="leader"
-                    />
-                  </label>
-                  <SelectMenu
-                    value={roleState}
-                    onChange={setRoleState}
-                    options={["active", "sleep", "paused"].map((value) => ({
-                      value,
-                      label: value,
-                    }))}
-                  />
-                  <Button
-                    className="bordered"
-                    disabled={!taskId || !roleId}
-                    onClick={() =>
-                      command("coordination_set_role_state", {
-                        taskId,
-                        roleId,
-                        stateName: roleState,
-                      })
-                        .then(load)
-                        .catch(onError)
-                    }
-                  >
-                    Set role
-                  </Button>
-                </div>
+                    >
+                      Set role
+                    </Button>
+                  </div>
+                )}
                 <div className="board-grid mt-5">
                   <section
-                    className={`board-column rounded-xl2 border border-line bg-panel p-4 ${activityTab !== "board" && activityTab !== "roles" ? "hidden" : ""}`}
+                    className={`board-column rounded-xl2 border border-line bg-panel p-4 ${activityTab !== "roles" ? "hidden" : ""}`}
                   >
                     <h2>Roles</h2>
                     {board?.roles.length ? (
@@ -2068,7 +2089,7 @@ function Activity({
                     )}
                   </section>
                   <section
-                    className={`board-column rounded-xl2 border border-line bg-panel p-4 ${activityTab !== "board" && activityTab !== "tasks" ? "hidden" : ""}`}
+                    className={`board-column rounded-xl2 border border-line bg-panel p-4 ${activityTab !== "tasks" ? "hidden" : ""}`}
                   >
                     <h2>Tasks</h2>
                     <div className="inline-actions">
@@ -2165,7 +2186,7 @@ function Activity({
                     )}
                   </section>
                   <section
-                    className={`board-column rounded-xl2 border border-line bg-panel p-4 ${activityTab !== "board" && activityTab !== "messages" ? "hidden" : ""}`}
+                    className={`board-column rounded-xl2 border border-line bg-panel p-4 ${activityTab !== "messages" ? "hidden" : ""}`}
                   >
                     <h2>Messages</h2>
                     <label className="field-label">Message envelope</label>
@@ -2228,7 +2249,7 @@ function PageHeader({ title, subtitle }: { title: string; subtitle: string }) {
   return (
     <header className="page-header">
       <div>
-        <h1>{title}</h1>
+        <h1 className="text-[22px] font-semibold text-ink">{title}</h1>
         <p>{subtitle}</p>
       </div>
     </header>
