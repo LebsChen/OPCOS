@@ -129,12 +129,13 @@ where
     }
 
     async fn start_sse(&self) -> Result<(), HarnessError> {
+        let netrc_path = create_netrc(&self.host, &self.workspace, &self.password).await?;
         let process = self
             .host
             .spawn(SpawnRequest {
-                command: curl_command(self.port, "/event", None, true),
+                command: curl_command(self.port, "/event", None, true, Some(&netrc_path)),
                 cwd: Some(self.workspace.clone()),
-                env: Some(json!({PASSWORD_ENV: self.password})),
+                env: None,
                 cols: 240,
                 rows: 64,
             })
@@ -862,14 +863,15 @@ async fn curl_json(
     path: &str,
     body: Option<Value>,
 ) -> Result<Value, HarnessError> {
-    let command = curl_command(port, path, body.as_ref(), false);
+    let netrc_path = create_netrc(&host, workspace, password).await?;
+    let command = curl_command(port, path, body.as_ref(), false, Some(&netrc_path));
     let result = host
         .exec(ExecRequest {
             command,
             cwd: Some(workspace.into()),
             timeout_seconds: 30,
             session: None,
-            env: Some(json!({PASSWORD_ENV: password})),
+            env: None,
         })
         .await
         .map_err(|error| HarnessError::External(error.to_string()))?;
@@ -884,7 +886,13 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn curl_command(port: u16, path: &str, body: Option<&Value>, stream: bool) -> String {
+fn curl_command(
+    port: u16,
+    path: &str,
+    body: Option<&Value>,
+    stream: bool,
+    netrc_path: Option<&str>,
+) -> String {
     let mode = if stream {
         "--no-buffer"
     } else {
@@ -898,9 +906,52 @@ fn curl_command(port: u16, path: &str, body: Option<&Value>, stream: bool) -> St
             )
         })
         .unwrap_or_default();
-    format!(
-        "curl --silent --show-error {mode} --user \"{BASIC_USER}:${PASSWORD_ENV}\"{body} http://127.0.0.1:{port}{path}"
-    )
+    let netrc = netrc_path
+        .map(|path| format!(" --netrc-file {}", shell_quote(path)))
+        .unwrap_or_default();
+    let trap = netrc_path
+        .map(|path| format!("trap \"rm -f {}\" EXIT; ", shell_quote(path)))
+        .unwrap_or_default();
+    format!("{trap}curl --silent --show-error {mode}{netrc}{body} http://127.0.0.1:{port}{path}")
+}
+
+async fn create_netrc(
+    host: &Arc<dyn Host>,
+    workspace: &str,
+    password: &str,
+) -> Result<String, HarnessError> {
+    let filename = format!(".opcos-netrc-{}", uuid::Uuid::new_v4().simple());
+    let path = host
+        .join(&filename)
+        .map_err(|error| HarnessError::External(error.to_string()))?;
+    if !host.contains(&path) {
+        return Err(HarnessError::External(
+            "OpenCode netrc path escaped host workspace".into(),
+        ));
+    }
+    host.write(&path, &netrc_contents(password))
+        .await
+        .map_err(|error| HarnessError::External(error.to_string()))?;
+    let chmod = host
+        .exec(ExecRequest {
+            command: format!("chmod 600 {}", shell_quote(&path)),
+            cwd: Some(workspace.into()),
+            timeout_seconds: 10,
+            session: None,
+            env: None,
+        })
+        .await
+        .map_err(|error| HarnessError::External(error.to_string()))?;
+    if chmod.result.exit_code != 0 {
+        return Err(HarnessError::External(
+            "failed to restrict OpenCode netrc permissions".into(),
+        ));
+    }
+    Ok(path)
+}
+
+fn netrc_contents(password: &str) -> String {
+    format!("machine 127.0.0.1 login {BASIC_USER} password {password}\n")
 }
 
 #[derive(Default)]
@@ -955,16 +1006,26 @@ mod tests {
     #[test]
     fn curl_auth_command_uses_environment_without_secret() {
         let sentinel = "opencode-secret-sentinel";
-        let command = curl_command(
-            43123,
-            "/session/ses_1/message",
-            Some(&json!({"text": "hello"})),
-            false,
-        );
+        let netrc = netrc_contents(sentinel);
+        let spawn = SpawnRequest {
+            command: curl_command(
+                43123,
+                "/session/ses_1/message",
+                Some(&json!({"text": "hello"})),
+                false,
+                Some("/workspace/.opcos-netrc-sentinel"),
+            ),
+            cwd: Some("/workspace".into()),
+            env: None,
+            cols: 240,
+            rows: 64,
+        };
+        let command = spawn.command;
         assert!(!command.contains(sentinel));
-        assert!(command.contains("$OPENCODE_SERVER_PASSWORD"));
-        assert!(!command.contains("opencode-secret"));
-        assert!(!command.contains("https://"));
+        assert!(command.contains("--netrc-file"));
+        assert!(!command.contains("--user"));
+        assert!(netrc.contains(sentinel));
+        assert!(!command.contains(&netrc));
     }
 
     #[test]
