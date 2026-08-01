@@ -95,6 +95,7 @@ type Schedule = {
   enabled: boolean;
   last_run?: string;
   last_result?: string;
+  trigger?: string;
 };
 type Coordination = {
   task_id: string;
@@ -2341,6 +2342,7 @@ function Automations({
     assets.find((asset) => asset.kind === "playbook")?.id || "",
   );
   const [cron, setCron] = useState("0 * * * *");
+  const [trigger, setTrigger] = useState<"cron" | "filesystem">("cron");
   const [automationTab, setAutomationTab] = useState<"schedules" | "runs">(
     "schedules",
   );
@@ -2407,7 +2409,7 @@ function Automations({
                             <span>
                               <strong>{schedule.name}</strong>
                               <small>
-                                {schedule.cron} ·{" "}
+                                {schedule.trigger || "cron"} · {schedule.cron} ·{" "}
                                 {schedule.last_result || "never run"}
                               </small>
                             </span>
@@ -2463,6 +2465,22 @@ function Automations({
                           />
                         </label>
                         <label>
+                          Trigger
+                          <SelectMenu
+                            value={trigger}
+                            onChange={(value) =>
+                              setTrigger(value as "cron" | "filesystem")
+                            }
+                            options={[
+                              { value: "cron", label: "Cron" },
+                              {
+                                value: "filesystem",
+                                label: "File changes (local only)",
+                              },
+                            ]}
+                          />
+                        </label>
+                        <label>
                           Cron
                           <input
                             value={cron}
@@ -2478,6 +2496,19 @@ function Automations({
                                 sessionId,
                                 playbookId,
                                 cron,
+                                trigger,
+                                hostId:
+                                  sessions.find((item) => item.id === sessionId)
+                                    ?.host_id || "local",
+                                workspace:
+                                  sessions.find((item) => item.id === sessionId)
+                                    ?.workspace || "",
+                                harness:
+                                  sessions.find((item) => item.id === sessionId)
+                                    ?.harness || "builtin",
+                                mode:
+                                  sessions.find((item) => item.id === sessionId)
+                                    ?.mode || "Interactive",
                                 enabled: true,
                               },
                             })

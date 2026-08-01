@@ -46,6 +46,7 @@ serde_yaml = "0.9"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "process", "io-util"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+notify = "8"
 tracing = "0.1"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
