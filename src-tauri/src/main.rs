@@ -16,7 +16,7 @@ use base64::Engine;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use opcos_assets::{
-    AssetBundle, InstructionSource, KnowledgeEntry, Playbook, SkillEntry,
+    AssetBundle, AssetError, InstructionSource, KnowledgeEntry, Playbook, SkillEntry,
     discover as discover_assets, parse_blueprint,
 };
 use opcos_engine::{
@@ -110,6 +110,35 @@ struct LocalExecutor {
 enum DesktopExecutor {
     Remote(Box<RemoteExecutor>),
     Local(LocalExecutor),
+}
+
+struct HostAssetReader<'a> {
+    host: &'a dyn Host,
+}
+
+#[async_trait]
+impl opcos_assets::RemoteAssetReader for HostAssetReader<'_> {
+    async fn read(&self, path: &str) -> Result<String, AssetError> {
+        self.host
+            .read(path)
+            .await
+            .map(|content| content.content)
+            .map_err(|error| AssetError::Invalid(error.to_string()))
+    }
+
+    async fn list(&self, path: Option<&str>) -> Result<Vec<(String, bool)>, AssetError> {
+        self.host
+            .ls(path)
+            .await
+            .map(|listing| {
+                listing
+                    .items
+                    .into_iter()
+                    .map(|entry| (entry.name, entry.dir))
+                    .collect()
+            })
+            .map_err(|error| AssetError::Invalid(error.to_string()))
+    }
 }
 
 #[derive(Clone)]
@@ -812,6 +841,42 @@ async fn serve_ide_proxy(listener: TcpListener, state: IdeProxyState) {
     let _ = axum::serve(listener, router).await;
 }
 
+async fn asset_host_for_session(
+    state: &DesktopState,
+    session_id: &str,
+) -> Result<(Box<dyn Host>, String), String> {
+    let session = session_for(state, session_id)?;
+    if session.host_id == "local" {
+        if session.workspace.is_empty() {
+            return Err("local session requires an explicit workspace directory".into());
+        }
+        let workspace = PathBuf::from(session.workspace);
+        let host = LocalHost::new(&workspace).map_err(|error| error.to_string())?;
+        host.health().await.map_err(|error| error.to_string())?;
+        return Ok((Box::new(host), workspace.display().to_string()));
+    }
+    let client = client_for(state, &session.host_id)?;
+    let health = client
+        .health()
+        .await
+        .map_err(|error| format!("remote host unavailable: {error}"))?;
+    let workspace = if session.workspace.is_empty() {
+        health
+            .workspace
+            .ok_or_else(|| "remote host did not provide a workspace".to_owned())?
+    } else {
+        session.workspace
+    };
+    Ok((
+        Box::new(RvmHost::new(
+            session.host_id,
+            workspace.clone(),
+            client.with_workspace(workspace.clone()),
+        )),
+        workspace,
+    ))
+}
+
 async fn engine_for(
     app: &tauri::AppHandle,
     state: &DesktopState,
@@ -1040,8 +1105,14 @@ async fn engine_for(
             .collect();
         engine.set_external_tools(selected).await;
     }
-    if let Some(executor_client) = &remote_client
-        && let Ok(mut bundle) = discover_assets(executor_client, &workspace).await
+    if let Ok((asset_host, asset_workspace)) = asset_host_for_session(state, session_id).await
+        && let Ok(mut bundle) = discover_assets(
+            &HostAssetReader {
+                host: asset_host.as_ref(),
+            },
+            &asset_workspace,
+        )
+        .await
     {
         let local_assets = state
             .database
@@ -2119,13 +2190,19 @@ async fn steering(
     let handle = app.clone();
     let session = session_id.clone();
     tauri::async_runtime::spawn(async move {
-        if let Ok((run_state, stop_reason)) = completion.await {
-            emit(
+        match completion.await {
+            Ok((run_state, stop_reason)) => emit(
                 &handle,
                 "turn_done",
                 Some(&session),
                 json!({"run_state": run_state, "stop_reason": stop_reason}),
-            );
+            ),
+            Err(_) => emit(
+                &handle,
+                "turn_done",
+                Some(&session),
+                json!({"run_state":"error","stop_reason":"internal_error"}),
+            ),
         }
     });
     Ok(())
