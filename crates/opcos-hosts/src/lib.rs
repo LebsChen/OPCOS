@@ -531,15 +531,9 @@ fn persistent_command(
     cwd: &Path,
     change_cwd: bool,
 ) -> Result<String, HostError> {
-    let prefix = persistent_env_prefix(env)?;
-    #[cfg(not(windows))]
-    let env_suffix = if matches!(env, Some(Value::Object(values)) if !values.is_empty()) {
-        ")"
-    } else {
-        ""
-    };
     #[cfg(windows)]
     {
+        let prefix = persistent_env_prefix(env)?.unwrap_or_default();
         let directory = if change_cwd {
             format!("cd /d \"{}\" && ", cwd.display())
         } else {
@@ -559,21 +553,29 @@ fn persistent_command(
         } else {
             String::new()
         };
+        let command = if let Some(prefix) = persistent_env_prefix(env)? {
+            format!(
+                "{directory}({prefix}eval '{}') 2>&1",
+                shell_single_quote(command)
+            )
+        } else {
+            format!("{directory}{command} 2>&1")
+        };
         Ok(format!(
-            "{prefix}{directory}{command} 2>&1{env_suffix}; __opcos_exit=$?; printf '{marker}:%s:%s\\n' \"$__opcos_exit\" \"$PWD\""
+            "{command}; __opcos_exit=$?; printf '{marker}:%s:%s\\n' \"$__opcos_exit\" \"$PWD\""
         ))
     }
 }
 
-fn persistent_env_prefix(env: Option<&Value>) -> Result<String, HostError> {
+fn persistent_env_prefix(env: Option<&Value>) -> Result<Option<String>, HostError> {
     let Some(Value::Object(values)) = env else {
         #[cfg(windows)]
         {
-            return Ok("setlocal EnableDelayedExpansion && ".into());
+            return Ok(Some("setlocal EnableDelayedExpansion && ".into()));
         }
         #[cfg(not(windows))]
         {
-            return Ok(String::new());
+            return Ok(None);
         }
     };
     let prefix = values
@@ -593,22 +595,32 @@ fn persistent_env_prefix(env: Option<&Value>) -> Result<String, HostError> {
             }
             #[cfg(not(windows))]
             {
-                Ok(format!("{}='{}' ", key, value.replace('\'', "'\\''")))
+                Ok(format!(
+                    "{}='{}'; export {}; ",
+                    key,
+                    value.replace('\'', "'\\''"),
+                    key
+                ))
             }
         })
         .collect::<Result<String, _>>()?;
     #[cfg(windows)]
     {
-        Ok(format!("setlocal EnableDelayedExpansion && {prefix}"))
+        Ok(Some(format!("setlocal EnableDelayedExpansion && {prefix}")))
     }
     #[cfg(not(windows))]
     {
         if prefix.is_empty() {
-            Ok(prefix)
+            Ok(None)
         } else {
-            Ok(format!("({prefix}"))
+            Ok(Some(prefix))
         }
     }
+}
+
+#[cfg(not(windows))]
+fn shell_single_quote(value: &str) -> String {
+    value.replace('\'', "'\\''")
 }
 
 async fn spawn_persistent_shell(cwd: &Path) -> Result<(Child, ChildStdin, ChildStdout), HostError> {
@@ -824,6 +836,56 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn persistent_environment_with_cwd_is_scoped_and_preserves_cwd() {
+        let root = tempfile_dir();
+        let subdir = root.join("subdir");
+        fs::create_dir_all(&subdir).unwrap();
+        let host = LocalHost::new(&root).unwrap();
+        let session = Some("scoped-env-session".into());
+
+        let injected = host
+            .exec(ExecRequest {
+                command: "printenv MYVAR".into(),
+                cwd: Some(subdir.display().to_string()),
+                timeout_seconds: 5,
+                session: session.clone(),
+                env: Some(serde_json::json!({"MYVAR": "injected"})),
+            })
+            .await
+            .unwrap();
+        assert_eq!(injected.result.exit_code, 0);
+        assert_eq!(injected.result.stdout.trim(), "injected");
+
+        let not_persisted = host
+            .exec(ExecRequest {
+                command: "printenv MYVAR".into(),
+                cwd: None,
+                timeout_seconds: 5,
+                session: session.clone(),
+                env: None,
+            })
+            .await
+            .unwrap();
+        assert_ne!(not_persisted.result.exit_code, 0);
+
+        let cwd = host
+            .exec(ExecRequest {
+                command: "pwd".into(),
+                cwd: None,
+                timeout_seconds: 5,
+                session,
+                env: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(cwd.result.stdout.trim(), subdir.display().to_string());
+
+        host.close_session("scoped-env-session").await.unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(windows)]
     fn shell_print_env_command() -> String {
         "echo !OPCOS_SECRET_TEST!".into()
@@ -894,7 +956,7 @@ mod tests {
         )
         .unwrap();
         #[cfg(not(windows))]
-        assert!(!command.contains("export OPCOS_SECRET"));
+        assert!(command.contains("(OPCOS_SECRET='value'; export OPCOS_SECRET; eval"));
         #[cfg(windows)]
         assert!(command.contains("setlocal") && command.contains("endlocal"));
     }
