@@ -1128,6 +1128,19 @@ async fn start_ide_proxy(
         .ide_bootstrap(&folder_uri)
         .await
         .map_err(|error| error.to_string())?;
+    let asset_route = bootstrap
+        .html
+        .split(['"', '\''])
+        .find(|part| part.starts_with("/out/") || part.starts_with("/resources/"))
+        .map(str::to_owned)
+        .ok_or_else(|| "Remote Web IDE returned no loadable workbench asset paths.".to_owned())?;
+    client
+        .ide_request_bytes(&asset_route, &bootstrap.cookies, &bootstrap.proxy_token)
+        .await
+        .map_err(|_| {
+            "Remote Web IDE bootstrap succeeded, but the bound host rejected its workbench assets."
+                .to_owned()
+        })?;
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .map_err(|error| error.to_string())?;

@@ -163,4 +163,62 @@ describe("OPCOS transcript folding", () => {
       approval: false,
     });
   });
+
+  it("places live steering before the active assistant and finalizes running tools", () => {
+    let items = reduceStreamEvent([], {
+      kind: "stream",
+      payload: {
+        tool_call_delta: {
+          index: 0,
+          id: "call-live",
+          name: "run_shell",
+          arguments_fragment: "{}",
+        },
+      },
+    });
+    items = reduceStreamEvent(items, {
+      kind: "steering",
+      payload: { text: "use the safer command" },
+    });
+    items = reduceStreamEvent(items, {
+      kind: "stream",
+      payload: { text_delta: "done" },
+    });
+    expect(items.findIndex((item) => item.kind === "user")).toBeLessThan(
+      items.findIndex((item) => item.id === "stream:assistant"),
+    );
+    items = reduceStreamEvent(items, {
+      kind: "turn_done",
+      payload: {},
+    });
+    expect(items.find((item) => item.kind === "tool")).toMatchObject({
+      status: "ok",
+    });
+  });
+
+  it("does not restore stale approval notices or pending bubbles", () => {
+    const items = normalizeTranscript([
+      {
+        kind: "notice",
+        payload: {
+          role: "notice",
+          text: "Approval required before this tool can continue",
+        },
+      },
+      {
+        kind: "assistant",
+        payload: {
+          role: "assistant",
+          content: "Pending",
+          tool_calls: [{ id: "call-2", name: "write_file", arguments: {} }],
+        },
+      },
+    ]);
+    expect(items.some((item) => item.kind === "notice")).toBe(false);
+    expect(
+      items.some(
+        (item) => item.kind === "assistant" && item.text === "Pending",
+      ),
+    ).toBe(false);
+  });
 });

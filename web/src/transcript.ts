@@ -79,17 +79,22 @@ export function normalizeTranscript(raw: RawItem[]): TranscriptViewItem[] {
         record.kind,
       )
     ) {
+      const noticeText =
+        typeof payload.text === "string"
+          ? payload.text
+          : typeof payload.message === "string"
+            ? payload.message
+            : textFromContent(payload.content);
+      if (
+        noticeText.includes("Approval required before this tool can continue")
+      )
+        return;
       output.push({
         id: stableId("notice", index),
         kind: "notice",
         noticeKind:
           typeof payload.kind === "string" ? payload.kind : record.kind,
-        text:
-          typeof payload.text === "string"
-            ? payload.text
-            : typeof payload.message === "string"
-              ? payload.message
-              : textFromContent(payload.content),
+        text: noticeText,
       });
       return;
     }
@@ -129,13 +134,17 @@ export function normalizeTranscript(raw: RawItem[]): TranscriptViewItem[] {
           reasoning: String(payload.reasoning),
         });
       }
+      const assistantText =
+        typeof payload.content === "string"
+          ? payload.content
+          : textFromContent(payload.content);
       output.push({
         id: stableId("assistant", index),
         kind: "assistant",
         text:
-          typeof payload.content === "string"
-            ? payload.content
-            : textFromContent(payload.content),
+          calls.length > 0 && assistantText.trim().toLowerCase() === "pending"
+            ? ""
+            : assistantText,
       });
       calls.forEach((call, callIndex) => {
         const callId =
@@ -204,33 +213,60 @@ export function reduceStreamEvent(
     return next;
   }
   if (event.kind === "steering") {
-    next.push({
+    const steering = {
       id: `event:steering:${next.length}`,
       kind: "user",
       text: String(payload.text || ""),
-    });
+    } satisfies TranscriptViewItem;
+    const liveAssistant = next.findIndex(
+      (item) => item.id === "stream:assistant",
+    );
+    if (liveAssistant >= 0) next.splice(liveAssistant, 0, steering);
+    else next.push(steering);
     return next;
+  }
+  if (event.kind === "turn_done") {
+    return next.map((item) =>
+      item.kind === "tool" && item.status === "running" && !item.approval
+        ? { ...item, status: "ok" }
+        : item,
+    );
   }
   if (event.kind === "notice" || event.kind === "approval_resolved") {
     const noticeKind =
       typeof payload.kind === "string" ? payload.kind : event.kind;
     if (event.kind === "approval_resolved") {
       const callId = typeof payload.call_id === "string" ? payload.call_id : "";
-      return next
+      const resolved = next
         .filter(
           (item) =>
-            !(item.kind === "notice" && item.noticeKind === "approval_pending"),
+            !(
+              item.kind === "notice" &&
+              (item.noticeKind === "approval_pending" ||
+                item.text?.includes(
+                  "Approval required before this tool can continue",
+                ))
+            ),
         )
         .map((item) =>
           item.kind === "tool" && item.callId === callId
             ? {
                 ...item,
-                status: payload.approve === true ? "ok" : "error",
+                status: (payload.approve === true ? "ok" : "error") as
+                  "ok" | "error",
                 approval: false,
-                resolved: payload.approve === true ? "allow" : "deny",
+                resolved: (payload.approve === true ? "allow" : "deny") as
+                  "allow" | "deny",
               }
             : item,
         );
+      const seen = new Set<string>();
+      return resolved.filter((item) => {
+        if (item.kind !== "tool" || item.callId !== callId) return true;
+        if (seen.has(callId)) return false;
+        seen.add(callId);
+        return true;
+      });
     }
     next.push({
       id: `event:notice:${next.length}`,

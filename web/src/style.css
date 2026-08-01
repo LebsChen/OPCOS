@@ -312,11 +312,17 @@ select:focus {
   color: var(--color-ink);
 }
 .main {
+  position: relative;
   display: flex;
   flex-direction: column;
   min-width: 0;
   min-height: 0;
   background: var(--paper);
+}
+.app.session-layout > .main {
+  grid-column: 2;
+  grid-row: 1;
+  min-width: 0;
 }
 .main-topbar {
   position: relative;
@@ -327,6 +333,7 @@ select:focus {
   border-bottom: 1px solid var(--color-line);
   background: var(--paper);
   backdrop-filter: none;
+  z-index: 1;
 }
 .main-topbar-actions {
   display: flex;
@@ -597,6 +604,10 @@ h3 {
   display: flex;
   flex-direction: row;
   min-width: 0;
+  grid-column: 3;
+  grid-row: 1;
+  position: relative;
+  z-index: 5;
 }
 .session-icon-rail {
   width: 44px;

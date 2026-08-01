@@ -142,6 +142,7 @@ function SurfaceView({
   const [diff, setDiff] = useState<Record<string, unknown> | null>(null);
   const [worklog, setWorklog] = useState<Record<string, unknown> | null>(null);
   const [busy, setBusy] = useState(false);
+  const [ideError, setIdeError] = useState("");
   const start = async (surface: string) => {
     try {
       setBusy(true);
@@ -166,6 +167,7 @@ function SurfaceView({
     setReview(null);
     setDiff(null);
     setWorklog(null);
+    setIdeError("");
   }, [selected.id, tab]);
   useEffect(() => {
     if (tab !== "terminal" || !port || !terminalHost.current) return;
@@ -192,11 +194,24 @@ function SurfaceView({
           : new Uint8Array(event.data as ArrayBuffer),
       );
     const encoder = new TextEncoder();
+    const resize = () => {
+      const width = terminalHost.current?.clientWidth || 0;
+      const height = terminalHost.current?.clientHeight || 0;
+      if (!width || !height) return;
+      const cols = Math.max(20, Math.floor(width / 7.8));
+      const rows = Math.max(5, Math.floor(height / 17));
+      terminal.resize(cols, rows);
+      send(JSON.stringify({ type: "resize", cols, rows }));
+    };
     const input = terminal.onData((data) => send(encoder.encode(data)));
     terminal.onResize(({ cols, rows }) =>
       send(JSON.stringify({ type: "resize", cols, rows })),
     );
+    const observer = new ResizeObserver(resize);
+    observer.observe(terminalHost.current);
+    requestAnimationFrame(resize);
     return () => {
+      observer.disconnect();
       input.dispose();
       socket.close();
       terminal.dispose();
@@ -258,18 +273,45 @@ function SurfaceView({
                 folderUri: `vscode-remote://${selected.host_name}/${selected.workspace || "workspace"}`,
               })
                 .then(setIdePort)
-                .catch(onError)
+                .catch((error) => {
+                  setIdeError(errorMessage(error));
+                  onError(error);
+                })
             }
           >
             {idePort ? "Connected" : "Open IDE"}
           </Button>
         </div>
-        {idePort ? (
+        {idePort && !ideError ? (
           <iframe
             title={translate("Remote Web IDE")}
             src={`http://127.0.0.1:${idePort}/`}
             className="ide-frame"
+            onLoad={(event) => {
+              const frame = event.currentTarget;
+              try {
+                const body = frame.contentDocument?.body?.textContent || "";
+                if (
+                  /bad gateway|upstream|forbidden|not available/i.test(body)
+                ) {
+                  setIdeError(
+                    "The remote Web IDE is unavailable: the bound host rejected its upstream IDE resources.",
+                  );
+                }
+              } catch {
+                // Cross-origin frames cannot be inspected; browser errors remain visible.
+              }
+            }}
           />
+        ) : ideError ? (
+          <div className="empty-surface ide-error">
+            <Icon name="code" size={32} />
+            <p>{ideError}</p>
+            <p className="muted">
+              The host Web IDE is not authorized or not running. No local
+              fallback is used.
+            </p>
+          </div>
         ) : (
           <div className="empty-surface">
             <Icon name="code" size={32} />
@@ -2394,6 +2436,7 @@ function SessionRightPanel({
   selected,
   onError,
   running,
+  collapsed,
   providers,
   onProviderChange,
   onCollapsedChange,
@@ -2401,6 +2444,7 @@ function SessionRightPanel({
   selected: Session;
   onError: (error: unknown) => void;
   running: boolean;
+  collapsed: boolean;
   providers: ProviderDescriptor[];
   onProviderChange: (provider: string) => void;
   onCollapsedChange?: (collapsed: boolean) => void;
@@ -2408,7 +2452,6 @@ function SessionRightPanel({
   type PanelTab =
     "info" | "terminal" | "desktop" | "ide" | "review" | "worklog" | "browser";
   const [panelTab, setPanelTab] = useState<PanelTab>("info");
-  const [collapsed, setCollapsed] = useState(false);
   const [opened, setOpened] = useState<PanelTab[]>(["info"]);
   const tabs: Array<{
     id: typeof panelTab;
@@ -2431,7 +2474,6 @@ function SessionRightPanel({
             className="rail-btn"
             title={translate("Expand session panel")}
             onClick={() => {
-              setCollapsed(false);
               onCollapsedChange?.(false);
             }}
           >
@@ -2463,7 +2505,6 @@ function SessionRightPanel({
           className="rail-btn panel-collapse"
           title={translate("Collapse session panel")}
           onClick={() => {
-            setCollapsed(true);
             onCollapsedChange?.(true);
           }}
         >
@@ -2479,7 +2520,6 @@ function SessionRightPanel({
             className="panel-collapse"
             title={translate("Collapse session panel")}
             onClick={() => {
-              setCollapsed(true);
               onCollapsedChange?.(true);
             }}
           >
@@ -3036,6 +3076,7 @@ function AppContent() {
         <SessionRightPanel
           selected={selected}
           running={running}
+          collapsed={rightPanelCollapsed}
           providers={providers}
           onProviderChange={(provider) =>
             command("change_provider", {

@@ -146,7 +146,7 @@ function buildRows(items: TurnItem[]): TurnRow[] {
         bestDist = dist;
       }
     }
-    if (bestRow && ap.resolved !== "deny") bestRow.approval = ap;
+    if (bestRow) bestRow.approval = ap;
     else {
       // No executed call to attach to (or it was declined) — the ask keeps its own row,
       // placed where the approval sat in the stream.
@@ -196,8 +196,9 @@ function StepRow({
   approval?: ApprovalItem;
 }) {
   const [raw, setRaw] = useState(false);
-  const running = tool.status === "…";
-  const failed = tool.status !== "ok" && !running;
+  const running = tool.status === "…" && approval?.resolved !== "deny";
+  const failed =
+    tool.status !== "ok" && !running && approval?.resolved !== "deny";
   return (
     <div>
       <div
@@ -279,7 +280,16 @@ function TurnGroup({
   // line is the pulse; expanding is opt-in.
   const rows = buildRows(items);
   const tools = items.filter((it): it is ToolItem => it.kind === "tool");
-  const running = live || tools.some((t) => t.status === "…");
+  const deniedCalls = new Set(
+    items
+      .filter(
+        (it): it is ApprovalItem =>
+          it.kind === "approval" && it.resolved === "deny",
+      )
+      .map((it) => it.callId),
+  );
+  const running =
+    live || (tools.some((t) => t.status === "…") && !deniedCalls.size);
   const [userToggle, setUserToggle] = useState<boolean | null>(null);
   const open = userToggle ?? false;
   const lastNarr = [...items]
