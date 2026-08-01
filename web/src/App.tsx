@@ -2024,6 +2024,9 @@ export function App() {
             .catch(onError)
         }
         onSurface={setSurface}
+        onManage={() => setSurface("manage")}
+        onActivity={() => setSurface("activity")}
+        onAutomations={() => setSurface("automations")}
         onAddHost={addHost}
         hostName={hostName}
         setHostName={setHostName}
