@@ -1,7 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import { createRoot } from "react-dom/client";
 import { Terminal } from "@xterm/xterm";
 import RFB from "@novnc/novnc";
 import ReactMarkdown from "react-markdown";
@@ -30,6 +29,7 @@ import { NewSessionModal } from "./components/NewSessionModal";
 import { Transcript } from "./components/Transcript";
 import { Composer } from "./components/Composer";
 import { RightRail } from "./components/RightRail";
+import { SelectMenu as OpenWorkerSelectMenu } from "./components/SelectMenu";
 import "./openworker-tailwind.css";
 import "./openworker-styles.css";
 import "./style.css";
@@ -121,26 +121,22 @@ function SelectMenu({
   value,
   onChange,
   options,
+  ariaLabel = "Select option",
 }: {
   value: string;
   onChange: (value: string) => void;
   options: Array<{ value: string; label: string }>;
+  ariaLabel?: string;
 }) {
   return (
-    <select
-      className="select"
+    <OpenWorkerSelectMenu
       value={value}
-      onChange={(event) => onChange(event.target.value)}
-    >
-      {options.map((option) => (
-        <option value={option.value} key={option.value}>
-          {option.label}
-        </option>
-      ))}
-    </select>
+      onChange={onChange}
+      options={options}
+      ariaLabel={ariaLabel}
+    />
   );
 }
-
 function LegacySidebar(props: {
   hosts: Host[];
   sessions: Session[];
@@ -2054,7 +2050,7 @@ export function App() {
                 )}
                 <label>
                   Model
-                  <SelectMenu
+                  <OpenWorkerSelectMenu
                     value={selected.model}
                     onChange={(model) =>
                       command("change_model", { sessionId: selected.id, model })
@@ -2076,6 +2072,7 @@ export function App() {
                           label: model.label,
                         })),
                     ]}
+                    ariaLabel="Model"
                   />
                 </label>
                 {running && (
@@ -2170,22 +2167,24 @@ export function App() {
           </div>
         )}
       </main>
-      <RightRail
-        selected={surface === "session" ? selected : null}
-        running={running}
-        items={activeItems}
-        assets={assets}
-        onAsset={toggleAsset}
-        onMcp={(name: string, enabled: boolean) =>
-          selected &&
-          command("set_mcp_tool_enabled", {
-            sessionId: selected.id,
-            name,
-            enabled,
-          }).catch(onError)
-        }
-        onError={onError}
-      />
+      {surface === "session" && (
+        <RightRail
+          selected={selected}
+          running={running}
+          items={activeItems}
+          assets={assets}
+          onAsset={toggleAsset}
+          onMcp={(name: string, enabled: boolean) =>
+            selected &&
+            command("set_mcp_tool_enabled", {
+              sessionId: selected.id,
+              name,
+              enabled,
+            }).catch(onError)
+          }
+          onError={onError}
+        />
+      )}
       {modal && (
         <NewSessionModal
           hosts={hosts}
@@ -2198,4 +2197,3 @@ export function App() {
     </div>
   );
 }
-createRoot(document.getElementById("root")!).render(<App />);

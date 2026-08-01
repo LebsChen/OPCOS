@@ -1256,53 +1256,6 @@ export function Sidebar(props: any) {
                 data-testid="account-menu"
                 role="menu"
               >
-                {cloud?.signed_in ? (
-                  <div
-                    className="px-3 py-1.5 mb-1 text-[11px] text-faint truncate border-b border-line"
-                    title={`${accountEmail} · OpenWorker Cloud`}
-                  >
-                    {accountEmail} · OpenWorker Cloud
-                  </div>
-                ) : (
-                  <>
-                    <div className="px-3 py-1.5 text-[11px] text-faint border-b border-line">
-                      Not signed in — one-click connections need OpenWorker
-                      Cloud
-                    </div>
-                    <button
-                      className="w-full flex items-center gap-2.5 px-3 py-1.5 mb-1 text-[13px] text-left text-accent hover:bg-paper"
-                      data-testid="account-sign-in"
-                      onClick={async () => {
-                        setAppMenuOpen(false);
-                        // Opens the system browser server-side; completion lands out-of-band,
-                        // so poll until it flips (refocusing the window also refetches).
-                        await cloudLogin().catch(() => {});
-                        waitForCloudSignIn((s) => {
-                          if (s) setCloud(s);
-                          // Other always-mounted consumers (Settings' telemetry card,
-                          // connector panes) refetch on this.
-                          if (s?.signed_in) announceCloudChanged();
-                        });
-                      }}
-                    >
-                      <Icon name="plug" size={15} className="shrink-0" /> Sign
-                      in to OpenWorker Cloud
-                    </button>
-                  </>
-                )}
-                {appMenuItem(
-                  "inbox",
-                  "Inbox",
-                  props.onOpenInbox,
-                  props.inboxActive,
-                  <AttnBadge n={totalAttention} />,
-                )}
-                {appMenuItem(
-                  "plug",
-                  "Connectors",
-                  props.onOpenIntegrations,
-                  props.integrationsActive,
-                )}
                 <div className="h-px bg-line my-1 mx-2" />
                 {appMenuItem(
                   "gear",
@@ -1322,15 +1275,6 @@ export function Sidebar(props: any) {
                   "Activity",
                   props.onOpenAudit,
                   props.auditActive,
-                )}
-                {cloud?.signed_in && (
-                  <>
-                    <div className="h-px bg-line my-1 mx-2" />
-                    {appMenuItem("signOut", "Sign out", async () => {
-                      await cloudLogout().catch(() => {});
-                      announceCloudChanged();
-                    })}
-                  </>
                 )}
               </div>
             </>

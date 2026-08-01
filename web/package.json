@@ -8,6 +8,8 @@
     "build": "tsc --noEmit && vite build",
     "test": "vitest run",
     "cdp:self-check": "node --experimental-websocket scripts/cdp-self-check.mjs",
+    "cdp:assert-page": "node --experimental-websocket scripts/cdp-assert-page.mjs",
+    "cdp:capture-page": "node --experimental-websocket scripts/cdp-capture-page.mjs",
     "format": "prettier --write src",
     "format:check": "prettier --check src"
   },

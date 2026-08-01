@@ -59,6 +59,20 @@ button:disabled {
   --color-muted: var(--muted);
   --color-accent: var(--accent);
   --color-danger: var(--danger);
+  --paper: #11151d;
+  --panel: #171b24;
+  --ink: #edf0f5;
+  --muted: #9ca6b7;
+  --faint: #697486;
+  --line: #2b3342;
+  --line-strong: #3b465a;
+  --accent: #8ea9ff;
+  --accent-soft: #243354;
+  --ok: #70d6a0;
+  --ok-soft: #20382d;
+  --ok-line: #35694f;
+  --danger: #f1828b;
+  --danger-soft: #43262d;
 }
 
 .backend-badge {
@@ -83,6 +97,9 @@ button:disabled {
   padding: 0 18px;
   font-size: 16px;
   letter-spacing: -0.02em;
+}
+.brand-wordmark {
+  color: var(--color-ink);
 }
 .brand-mark {
   color: var(--color-accent);
@@ -297,6 +314,11 @@ h2,
 h3,
 p {
   margin: 0;
+}
+h1,
+h2,
+h3 {
+  color: var(--color-ink);
 }
 .session-header h1,
 .page-header h1 {
@@ -716,6 +738,8 @@ p {
 .page {
   min-height: 100%;
   overflow: auto;
+  color: var(--color-ink);
+  background: var(--color-panel);
 }
 .manage-tabs {
   display: flex;
@@ -740,7 +764,7 @@ p {
   padding: 18px;
   border: 1px solid var(--color-line);
   border-radius: 10px;
-  background: #151a23;
+  background: var(--color-panel);
 }
 .manage-card h2 {
   margin-bottom: 14px;
@@ -786,9 +810,12 @@ p {
 }
 .activity-toolbar {
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 7px;
   padding: 16px 24px;
   border-bottom: 1px solid var(--color-line);
+  background: var(--color-panel);
 }
 .board-grid {
   display: grid;
@@ -801,11 +828,12 @@ p {
   padding: 12px;
   border: 1px solid var(--color-line);
   border-radius: 8px;
-  background: #151a23;
+  background: var(--color-panel);
 }
 .board-column h2 {
   margin-bottom: 11px;
   font-size: 14px;
+  color: var(--color-ink);
 }
 .board-card {
   display: grid;
@@ -814,8 +842,14 @@ p {
   padding: 9px;
   border: 1px solid var(--color-line);
   border-radius: 6px;
-  color: var(--color-muted);
+  color: var(--color-ink);
   word-break: break-word;
+}
+.board-card strong {
+  color: var(--color-ink);
+}
+.board-card span {
+  color: var(--color-muted);
 }
 .modal-backdrop {
   position: fixed;
