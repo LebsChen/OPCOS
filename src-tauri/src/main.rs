@@ -246,7 +246,7 @@ fn emit(app: &tauri::AppHandle, kind: &str, session_id: Option<&str>, payload: V
         OpcosEvent {
             kind: kind.into(),
             session_id: session_id.map(str::to_owned),
-            payload,
+            payload: redact_approval_value(&payload),
         },
     );
 }
@@ -1314,15 +1314,7 @@ fn read_transcript(
             records
                 .into_iter()
                 .map(|record| {
-                    let mut payload = record.payload;
-                    if matches!(record.kind.as_str(), "approval" | "tool") {
-                        if let Some(arguments) = payload.get_mut("arguments") {
-                            *arguments = redact_approval_value(arguments);
-                        }
-                        if let Some(result) = payload.get_mut("result") {
-                            *result = redact_approval_value(result);
-                        }
-                    }
+                    let mut payload = redact_approval_value(&record.payload);
                     if record.kind == "approval"
                         && payload
                             .get("approval")
@@ -3096,5 +3088,19 @@ mod m7_tests {
         );
         assert_eq!(payload["arguments"]["password"], "[redacted]");
         assert_eq!(payload["result"], "Bearer [redacted]");
+        let assistant = redact_approval_value(&json!({
+            "role": "assistant",
+            "tool_calls": [{
+                "arguments": {
+                    "command": "curl -H \"Authorization: Bearer nested-token\" https://api.example.com/deploy"
+                },
+                "result": "Bearer nested-result"
+            }]
+        }));
+        assert_eq!(
+            assistant["tool_calls"][0]["arguments"]["command"],
+            "curl -H \"Authorization: Bearer [redacted]\" https://api.example.com/deploy"
+        );
+        assert_eq!(assistant["tool_calls"][0]["result"], "Bearer [redacted]");
     }
 }

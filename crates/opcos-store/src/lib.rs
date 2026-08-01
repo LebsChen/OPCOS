@@ -585,6 +585,13 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref();
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
         let connection = Connection::open(path)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         let store = Self {
@@ -1371,6 +1378,20 @@ mod tests {
         assert!(!session.created_at.to_rfc3339().is_empty());
         drop(store);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn open_creates_missing_database_parent_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "opcos-store-new-parent-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let path = root.join("nested").join("opcos.db");
+        let store = SqliteStore::open(&path).unwrap();
+        assert!(path.exists());
+        drop(store);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
