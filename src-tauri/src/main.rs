@@ -1547,35 +1547,55 @@ async fn resolve_approval(
         )
         .await
         .map(|_| ());
-    emit(
-        &app,
-        "approval_resolved",
-        Some(&session_id),
-        json!({"call_id":call_id,"approve":approve}),
-    );
-    audit(
-        &state,
-        &session_id,
-        if approve {
-            "approval_allowed"
-        } else {
-            "approval_denied"
-        },
-        json!({"call_id": call_id, "approved": approve}),
-    );
     match result {
         Ok(()) => {
+            emit(
+                &app,
+                "approval_resolved",
+                Some(&session_id),
+                json!({"call_id":call_id,"approve":approve}),
+            );
+            audit(
+                &state,
+                &session_id,
+                if approve {
+                    "approval_allowed"
+                } else {
+                    "approval_denied"
+                },
+                json!({"call_id": call_id, "approved": approve}),
+            );
             let _ = emit_pending_approval(&app, &state, &session_id)?;
             emit(&app, "turn_done", Some(&session_id), json!({}));
             Ok(())
         }
         Err(opcos_engine::EngineError::ApprovalPending(next_call_id)) => {
             let _ = next_call_id;
+            emit(
+                &app,
+                "approval_resolved",
+                Some(&session_id),
+                json!({"call_id":call_id,"approve":approve}),
+            );
+            audit(
+                &state,
+                &session_id,
+                if approve {
+                    "approval_allowed"
+                } else {
+                    "approval_denied"
+                },
+                json!({"call_id": call_id, "approved": approve}),
+            );
             emit_pending_approval(&app, &state, &session_id)?;
             emit(&app, "turn_done", Some(&session_id), json!({}));
             Ok(())
         }
-        Err(opcos_engine::EngineError::ApprovalAlreadyProcessed(_)) => Ok(()),
+        Err(opcos_engine::EngineError::ApprovalAlreadyProcessed(_)) => {
+            emit_pending_approval(&app, &state, &session_id)?;
+            emit(&app, "turn_done", Some(&session_id), json!({}));
+            Ok(())
+        }
         Err(error) => Err(engine_error_message(error)),
     }
 }
