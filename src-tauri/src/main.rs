@@ -250,6 +250,42 @@ fn emit(app: &tauri::AppHandle, kind: &str, session_id: Option<&str>, payload: V
     );
 }
 
+fn emit_pending_approval(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    session_id: &str,
+) -> Result<bool, String> {
+    let pending = state
+        .store
+        .load_pending(session_id)
+        .map_err(|error| error.to_string())?;
+    let Some(pending) = pending.into_iter().next() else {
+        return Ok(false);
+    };
+    emit(
+        app,
+        "approval",
+        Some(session_id),
+        json!({
+            "call_id": pending.call_id,
+            "tool": pending.tool,
+            "arguments": redact_approval_value(&pending.arguments),
+            "risk": approval_risk(&pending.tool),
+            "reason": "Tool action requires approval",
+        }),
+    );
+    emit(
+        app,
+        "notice",
+        Some(session_id),
+        json!({
+            "kind": "approval_pending",
+            "text": "Approval required before this tool can continue"
+        }),
+    );
+    Ok(true)
+}
+
 fn secret_key(prefix: &str, id: &str) -> String {
     format!("{prefix}:{id}")
 }
@@ -1131,7 +1167,13 @@ async fn start_ide_proxy(
     let asset_route = bootstrap
         .html
         .split(['"', '\''])
-        .find(|part| part.starts_with("/out/") || part.starts_with("/resources/"))
+        .find(|part| {
+            (part.starts_with("/out/") || part.starts_with("/resources/"))
+                && part
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|name| name.split(['?', '#']).next().unwrap_or("").contains('.'))
+        })
         .map(str::to_owned)
         .ok_or_else(|| "Remote Web IDE returned no loadable workbench asset paths.".to_owned())?;
     client
@@ -1407,34 +1449,13 @@ async fn resolve_approval(
     );
     match result {
         Ok(()) => {
+            let _ = emit_pending_approval(&app, &state, &session_id)?;
             emit(&app, "turn_done", Some(&session_id), json!({}));
             Ok(())
         }
         Err(opcos_engine::EngineError::ApprovalPending(next_call_id)) => {
-            if let Some(pending) = state
-                .store
-                .load_pending(&session_id)
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .find(|item| item.call_id == next_call_id)
-            {
-                emit(
-                    &app,
-                    "approval",
-                    Some(&session_id),
-                    json!({
-                        "call_id": pending.call_id,
-                        "tool": pending.tool,
-                        "arguments": redact_approval_value(&pending.arguments),
-                    }),
-                );
-            }
-            emit(
-                &app,
-                "notice",
-                Some(&session_id),
-                json!({"kind":"approval_pending"}),
-            );
+            let _ = next_call_id;
+            emit_pending_approval(&app, &state, &session_id)?;
             emit(&app, "turn_done", Some(&session_id), json!({}));
             Ok(())
         }

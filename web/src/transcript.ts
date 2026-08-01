@@ -138,14 +138,19 @@ export function normalizeTranscript(raw: RawItem[]): TranscriptViewItem[] {
         typeof payload.content === "string"
           ? payload.content
           : textFromContent(payload.content);
-      output.push({
-        id: stableId("assistant", index),
-        kind: "assistant",
-        text:
-          calls.length > 0 && assistantText.trim().toLowerCase() === "pending"
-            ? ""
-            : assistantText,
-      });
+      if (
+        assistantText.trim().toLowerCase() !== "pending" ||
+        calls.length > 0
+      ) {
+        output.push({
+          id: stableId("assistant", index),
+          kind: "assistant",
+          text:
+            assistantText.trim().toLowerCase() === "pending"
+              ? ""
+              : assistantText,
+        });
+      }
       calls.forEach((call, callIndex) => {
         const callId =
           typeof call.id === "string" ? call.id : `call-${index}-${callIndex}`;
@@ -174,11 +179,25 @@ export function normalizeTranscript(raw: RawItem[]): TranscriptViewItem[] {
       if (existing) {
         existing.result =
           textFromContent(resultPart.content) || resultPart.content;
-        existing.status =
-          existing.result && String(existing.result).includes('"error"')
+        const resultText = String(existing.result || "");
+        const denied = /tool call denied by user/i.test(resultText);
+        const approvalTool =
+          existing.toolName === "write_file" ||
+          existing.toolName === "edit" ||
+          existing.toolName === "run_shell" ||
+          existing.toolName === "send_message" ||
+          existing.toolName === "send_file";
+        existing.status = denied
+          ? "ok"
+          : resultText.includes('"error"')
             ? "error"
             : "ok";
         existing.approval = false;
+        if (denied) existing.resolved = "deny";
+        else if (approvalTool && resultText.includes('"error"')) {
+          existing.resolved = "allow";
+          existing.status = "ok";
+        }
       } else {
         output.push({
           id: stableId("tool-result", index, callId),
@@ -192,7 +211,32 @@ export function normalizeTranscript(raw: RawItem[]): TranscriptViewItem[] {
       }
     }
   });
-  return output;
+  const byCall = new Map<string, TranscriptViewItem>();
+  const deduped: TranscriptViewItem[] = [];
+  for (const item of output) {
+    if (item.kind !== "tool" || !item.callId) {
+      deduped.push(item);
+      continue;
+    }
+    const existing = byCall.get(item.callId);
+    if (!existing) {
+      byCall.set(item.callId, item);
+      deduped.push(item);
+      continue;
+    }
+    existing.toolName = item.toolName || existing.toolName;
+    existing.arguments ??= item.arguments;
+    existing.result ??= item.result;
+    existing.resolved ??= item.resolved;
+    existing.status =
+      item.resolved === "deny" || existing.resolved === "deny"
+        ? "ok"
+        : item.status === "error" || existing.status === "error"
+          ? "error"
+          : item.status || existing.status;
+    existing.approval = item.approval || existing.approval;
+  }
+  return deduped;
 }
 
 export function reduceStreamEvent(
@@ -338,7 +382,8 @@ export function reduceStreamEvent(
     const calls = next.filter(
       (item) => item.kind === "tool" && item.id.startsWith("stream:tool:"),
     );
-    let tool = calls[index];
+    let tool = next.find((item) => item.kind === "tool" && item.callId === id);
+    if (!tool) tool = calls[index];
     if (!tool) {
       tool = {
         id: `stream:tool:${index}`,

@@ -221,4 +221,52 @@ describe("OPCOS transcript folding", () => {
       ),
     ).toBe(false);
   });
+
+  it("deduplicates persisted tool rows and keeps denied state", () => {
+    const items = normalizeTranscript([
+      {
+        kind: "assistant",
+        payload: {
+          role: "assistant",
+          content: "",
+          tool_calls: [{ id: "call-3", name: "write_file", arguments: {} }],
+        },
+      },
+      {
+        kind: "assistant",
+        payload: {
+          role: "assistant",
+          content: "Pending",
+          tool_calls: [{ id: "call-3", name: "write_file", arguments: {} }],
+        },
+      },
+      {
+        kind: "tool",
+        payload: {
+          role: "tool",
+          content: [
+            {
+              tool_use_id: "call-3",
+              content: [
+                {
+                  type: "text",
+                  text: '{"error":"tool call denied by user"}',
+                },
+              ],
+            },
+          ],
+        },
+      },
+    ]);
+    expect(items.filter((item) => item.callId === "call-3")).toHaveLength(1);
+    expect(items.find((item) => item.callId === "call-3")).toMatchObject({
+      resolved: "deny",
+      status: "ok",
+    });
+    expect(
+      items.some(
+        (item) => item.kind === "assistant" && item.text === "Pending",
+      ),
+    ).toBe(false);
+  });
 });

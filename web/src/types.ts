@@ -146,6 +146,7 @@ export type Item =
       name: string;
       args: any;
       status: string;
+      resolved?: "allow" | "deny";
       preview?: string;
       hidden?: number;
       standingRule?: string;

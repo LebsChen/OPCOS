@@ -196,9 +196,14 @@ function StepRow({
   approval?: ApprovalItem;
 }) {
   const [raw, setRaw] = useState(false);
-  const running = tool.status === "…" && approval?.resolved !== "deny";
+  const resolution = approval?.resolved ?? tool.resolved;
+  const running =
+    tool.status === "…" && resolution !== "deny" && resolution !== "allow";
   const failed =
-    tool.status !== "ok" && !running && approval?.resolved !== "deny";
+    tool.status !== "ok" &&
+    !running &&
+    resolution !== "deny" &&
+    resolution !== "allow";
   return (
     <div>
       <div
@@ -218,7 +223,7 @@ function StepRow({
           )}
         </span>
         <LineText line={humanizeTool(tool.name, tool.args)} />
-        {approval && approvalChip(approval.resolved)}
+        {resolution && approvalChip(resolution)}
         {!!tool.standingRule && (
           <span
             className="text-[10.5px] px-1.5 rounded-full bg-tealSoft text-tealInk shrink-0"

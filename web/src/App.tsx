@@ -2727,6 +2727,12 @@ function AppContent() {
       }
       if (payload.kind === "turn_done") setRunning(false);
       if (
+        payload.kind === "approval_resolved" ||
+        (payload.kind === "notice" &&
+          String(payload.payload?.kind) === "approval_pending")
+      )
+        setError("");
+      if (
         payload.kind === "notice" &&
         ["interrupted", "error", "approval_pending"].includes(
           String(payload.payload?.kind),
@@ -2749,6 +2755,8 @@ function AppContent() {
     const runtime = (window as Window & { __TAURI_INTERNALS__?: unknown })
       .__TAURI_INTERNALS__;
     const message = errorMessage(reason);
+    if (message.includes("Approval required before this tool can continue"))
+      return;
     if (!runtime && /invoke|tauri/i.test(message)) return;
     setError(redactApproval(message));
   };
