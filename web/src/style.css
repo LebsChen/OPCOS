@@ -50,6 +50,9 @@ button:disabled {
   overflow: hidden;
   background: var(--color-panel);
 }
+.app.surface-layout {
+  grid-template-columns: 276px minmax(500px, 1fr);
+}
 
 /* OpenWorker-compatible surface tokens used by the ported workbench vocabulary. */
 :root {

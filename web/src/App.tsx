@@ -2686,7 +2686,9 @@ export function App() {
     { id: "worklog", label: "Worklog", icon: "activity" },
   ];
   return (
-    <div className="app">
+    <div
+      className={`app ${surface === "session" ? "session-layout" : "surface-layout"}`}
+    >
       <Sidebar
         hosts={hosts}
         sessions={sessions}
