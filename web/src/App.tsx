@@ -2624,6 +2624,15 @@ function PageHeader({ title, subtitle }: { title: string; subtitle: string }) {
   );
 }
 
+function Field({ k, v }: { k: string; v: string }) {
+  return (
+    <div className="field">
+      <label>{k}</label>
+      <div className="value">{v}</div>
+    </div>
+  );
+}
+
 function SessionRightPanel({
   selected,
   onError,
@@ -2813,49 +2822,47 @@ function SessionRightPanel({
               className="session-pane"
               style={{ display: panelTab === "info" ? "block" : "none" }}
             >
-              <div className="p-4">
-                <h2 className="text-[15px] font-semibold text-ink">
-                  {translate("Session")}
-                </h2>
-                <dl className="mt-4 space-y-3 text-[13px]">
-                  <div>
-                    <dt className="text-muted">{translate("Status")}</dt>
-                    <dd>{running ? "Running" : "Ready"}</dd>
+              <div className="info">
+                <Field k={translate("Session ID")} v={selected.id} />
+                <Field
+                  k={translate("Status")}
+                  v={running ? "Running" : "Ready"}
+                />
+                <Field k={translate("Host")} v={selected.host_name} />
+                <Field
+                  k={translate("Workspace")}
+                  v={selected.workspace || translate("Not set")}
+                />
+                <Field k={translate("Model")} v={selected.model} />
+                <div className="field">
+                  <label>Provider</label>
+                  <select
+                    value={selected.provider || ""}
+                    onChange={(event) => onProviderChange(event.target.value)}
+                    aria-label="Provider"
+                  >
+                    <option value="">Global default</option>
+                    {providers.map((item) => (
+                      <option key={item.name} value={item.name}>
+                        {item.title}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                {running && (
+                  <div className="actions">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void command("interrupt", {
+                          sessionId: selected.id,
+                        }).catch(onError)
+                      }
+                    >
+                      Interrupt
+                    </button>
                   </div>
-                  <div>
-                    <dt className="text-muted">{translate("Host")}</dt>
-                    <dd>{selected.host_name}</dd>
-                  </div>
-                  <div>
-                    <dt className="text-muted">{translate("Workspace")}</dt>
-                    <dd>{selected.workspace || "Not set"}</dd>
-                  </div>
-                  <div>
-                    <dt className="text-muted">{translate("Model")}</dt>
-                    <dd>{selected.model}</dd>
-                  </div>
-                  <div>
-                    <dt className="text-muted">Provider</dt>
-                    <dd>
-                      <OpenWorkerSelectMenu
-                        value={selected.provider || ""}
-                        onChange={onProviderChange}
-                        options={[
-                          { value: "", label: "Global default" },
-                          ...providers.map((item) => ({
-                            value: item.name,
-                            label: item.title,
-                          })),
-                        ]}
-                        ariaLabel="Provider"
-                      />
-                    </dd>
-                  </div>
-                  <div>
-                    <dt className="text-muted">Access</dt>
-                    <dd>Commands run on the bound remote host.</dd>
-                  </div>
-                </dl>
+                )}
               </div>
             </div>
           )}

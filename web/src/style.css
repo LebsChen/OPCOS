@@ -727,8 +727,8 @@ h3 {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  min-height: 46px;
-  padding: 0 12px;
+  height: 52px;
+  padding: 0 14px;
   border-bottom: 1px solid var(--color-line);
 }
 .drawer-title {
@@ -740,6 +740,9 @@ h3 {
   min-height: 0;
   flex: 1;
   overflow: hidden;
+}
+.session-pane > .info {
+  padding: 14px;
 }
 
 .session-panel-tabs {
@@ -773,6 +776,42 @@ h3 {
   min-height: 0;
   flex: 1;
   overflow: auto;
+}
+
+.field {
+  margin-bottom: 12px;
+}
+.field label {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--color-muted);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+}
+.field .value {
+  word-break: break-all;
+  font-family: var(--mono);
+  font-size: 13px;
+}
+.field .inline {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.field .inline input:not([type="checkbox"]):not([type="radio"]) {
+  flex: 1;
+}
+.field select {
+  width: 100%;
+}
+.actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 14px;
+  flex-wrap: wrap;
 }
 
 .right-rail-collapsed {
