@@ -29,10 +29,12 @@
 
 ### `config_object` / `config_object_version`
 
-| 表                      | 建议字段                                                                                                        | 约束                                                                                       |
-| ----------------------- | --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `config_object`         | `id`, `kind`, `title`, `description`, `source_mode`, `status`, `current_version_id`, `created_at`, `updated_at` | `kind`、`source_mode`、`status` 使用 [06](06-capability-model.md) 的枚举；删除优先软删除。 |
-| `config_object_version` | `id`, `config_object_id`, `version_number`, `created_at`, `created_via`, `payload_json`, `raw_source_text`      | 版本不可变；`config_object_id` 外键；`current_version_id` 指向版本。                       |
+| 表                      | 建议字段                                                                                       | 约束                                                                                                                                                                |
+| ----------------------- | ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `config_object`         | `id`, `kind`, `name`, `scope_kind`, `scope_key`, `status`, `created_at`, `current_version_id`  | `kind` 为 `rules / knowledge / runbook / skill / mcp`；scope 为 `global`（key 为 NULL）、`repo`（规范化 workspace）、`host`（host id）；删除使用 `status=deleted`。 |
+| `config_object_version` | `id`, `object_id`, `version`, `content`, `content_hash`, `created_at`, `note`, `metadata_json` | 版本不可变；`object_id + version` 唯一；内容 hash 相同不新增版本；`current_version_id` 指向当前版本。                                                               |
+
+`enabled`/`active` 是对象运行态，保存在 `config_object.status`，不产生新版本；知识库的 `trigger` 与 skill activation 元数据保存在对应 version 的 `metadata_json`，不得拼入正文。会话启动时把适用对象的具体 version id 写入 `session_config_versions`，旧会话不会随 current version 漂移。
 
 Den 的 config object 具有不可变版本、访问授权以及 archive/restore/delete 生命周期［OW文］；OPCOS 采用相同形状但先做本地持久化［推断］。
 
@@ -97,13 +99,15 @@ OPCOS 需要吸收的概念：
 
 ## 1.4 迁移顺序
 
-1. 新增迁移版本记录和幂等检查，不改现有 10 张表。
-2. 建 `config_object`、`config_object_version`，把现有 `asset_records` 按 `kind` 建立初始版本。
+1. 新增迁移版本记录和幂等检查。
+2. 建 `config_object`、`config_object_version`、`config_object_legacy_map`、`session_config_versions`，把现有 `asset_records` 按 `kind` 建立初始版本；旧表重命名为 `asset_records_legacy_p1_1` 并保留。
 3. 建 `host`，从桌面 `hosts` 导入元数据；URL/token 继续留在 secret store。
 4. 建 `artifact`，先由 worklog、diff、附件导出引用，不复制文件。
 5. 建 `automation`，从 `schedules` 双写一版后再切读路径。
 6. 建 `plugin`、`plugin_member`，完成本地导入/导出后再考虑远程授权。
 7. P0-1 已将桌面 session/transcript 迁入 `opcos-store`；后续只允许通过 store 读写会话与 transcript，保留一次性旧表导入逻辑［推断］。
+
+`mcp_session_tools` 继续保留为 session 级 MCP tool selection，不等同于 `kind=mcp` 的 server 配置对象；当前没有独立 MCP server 行时不伪造迁移数据。调度表引用 runbook object，实际每次运行的 version id 记录在 `schedule_runs`，以便复现而不冻结后续调度。
 
 迁移每一步都必须可重复、可回滚；外部参照系统的云端组织、ACU 和 handoff 不进入本地迁移［推断］。
 
