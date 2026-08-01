@@ -1646,6 +1646,7 @@ fn shell_artifact_paths(command: &str) -> Vec<String> {
                     && !path.is_empty()
                     && path != "/dev/null"
                     && path != "NUL"
+                    && !path.starts_with('&')
                 {
                     paths.push(path.clone());
                 }
@@ -1664,6 +1665,7 @@ fn shell_artifact_paths(command: &str) -> Vec<String> {
                     && !path.is_empty()
                     && path != "/dev/null"
                     && path != "NUL"
+                    && !path.starts_with('&')
                 {
                     paths.push(path.clone());
                 }
@@ -1777,6 +1779,44 @@ async fn record_artifacts(
     Ok(())
 }
 
+async fn record_artifacts_best_effort(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    session_id: &str,
+    host_id: &str,
+    calls: Vec<ToolCallRecord>,
+) {
+    if let Err(error) = record_artifacts(state, session_id, host_id, calls).await {
+        emit(
+            app,
+            "notice",
+            Some(session_id),
+            json!({"kind":"artifact_registration_failed","text":error}),
+        );
+    }
+}
+
+fn approval_artifact_calls(
+    state: &DesktopState,
+    session_id: &str,
+    call_id: &str,
+    sequence_before: i64,
+) -> Result<Vec<ToolCallRecord>, String> {
+    let mut calls = state
+        .store
+        .load_tool_calls_after(session_id, sequence_before)
+        .map_err(|error| error.to_string())?;
+    if let Some(call) = state
+        .store
+        .load_tool_call(session_id, call_id)
+        .map_err(|error| error.to_string())?
+        && !calls.iter().any(|item| item.call_id == call.call_id)
+    {
+        calls.push(call);
+    }
+    Ok(calls)
+}
+
 async fn artifact_host(
     state: &DesktopState,
     session_id: &str,
@@ -1842,8 +1882,14 @@ async fn read_artifact(
     if artifact.host_id != host_id {
         return Err("artifact belongs to an unavailable host binding".to_owned());
     }
+    let path = host
+        .join(&artifact.path)
+        .map_err(|error| format!("artifact path rejected: {error}"))?;
+    if !host.contains(&path) {
+        return Err("artifact path is outside the bound workspace".into());
+    }
     let content = host
-        .read(&artifact.path)
+        .read(&path)
         .await
         .map_err(|error| format!("artifact host read failed: {error}"))?;
     Ok(json!({
@@ -1902,7 +1948,7 @@ async fn submit_turn(
                 .store
                 .load_tool_calls_after(&request.session_id, sequence_before)
                 .map_err(|error| error.to_string())?;
-            record_artifacts(&state, &request.session_id, &host_id, calls).await?;
+            record_artifacts_best_effort(&app, &state, &request.session_id, &host_id, calls).await;
             emit(
                 &app,
                 "turn_done",
@@ -1916,7 +1962,7 @@ async fn submit_turn(
                 .store
                 .load_tool_calls_after(&request.session_id, sequence_before)
                 .map_err(|error| error.to_string())?;
-            record_artifacts(&state, &request.session_id, &host_id, calls).await?;
+            record_artifacts_best_effort(&app, &state, &request.session_id, &host_id, calls).await;
             if let Ok(Some(pending)) = state
                 .store
                 .load_pending(&request.session_id)
@@ -1955,7 +2001,7 @@ async fn submit_turn(
                 .store
                 .load_tool_calls_after(&request.session_id, sequence_before)
                 .map_err(|error| error.to_string())?;
-            record_artifacts(&state, &request.session_id, &host_id, calls).await?;
+            record_artifacts_best_effort(&app, &state, &request.session_id, &host_id, calls).await;
             let message = engine_error_message(error);
             if message.contains("denied") || message.contains("policy") {
                 audit(
@@ -2091,6 +2137,10 @@ async fn resolve_approval(
     approve: bool,
 ) -> Result<(), String> {
     let host_id = session_host_id(&state, &session_id)?;
+    let sequence_before = state
+        .store
+        .max_message_notice_sequence(&session_id)
+        .map_err(|error| error.to_string())?;
     let engine = engine_for(&app, &state, &session_id).await?;
     let result = engine
         .resolve_approval(
@@ -2121,13 +2171,8 @@ async fn resolve_approval(
     );
     match result {
         Ok(()) => {
-            let calls = state
-                .store
-                .load_tool_call(&session_id, &call_id)
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .collect();
-            record_artifacts(&state, &session_id, &host_id, calls).await?;
+            let calls = approval_artifact_calls(&state, &session_id, &call_id, sequence_before)?;
+            record_artifacts_best_effort(&app, &state, &session_id, &host_id, calls).await;
             let _ = emit_pending_approval(&app, &state, &session_id)?;
             emit(
                 &app,
@@ -2139,13 +2184,8 @@ async fn resolve_approval(
         }
         Err(opcos_engine::EngineError::ApprovalPending(next_call_id)) => {
             let _ = next_call_id;
-            let calls = state
-                .store
-                .load_tool_call(&session_id, &call_id)
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .collect();
-            record_artifacts(&state, &session_id, &host_id, calls).await?;
+            let calls = approval_artifact_calls(&state, &session_id, &call_id, sequence_before)?;
+            record_artifacts_best_effort(&app, &state, &session_id, &host_id, calls).await;
             emit_pending_approval(&app, &state, &session_id)?;
             emit(
                 &app,
@@ -2157,13 +2197,8 @@ async fn resolve_approval(
         }
         Err(opcos_engine::EngineError::ApprovalAlreadyProcessed(_)) => Ok(()),
         Err(error) => {
-            let calls = state
-                .store
-                .load_tool_call(&session_id, &call_id)
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .collect();
-            record_artifacts(&state, &session_id, &host_id, calls).await?;
+            let calls = approval_artifact_calls(&state, &session_id, &call_id, sequence_before)?;
+            record_artifacts_best_effort(&app, &state, &session_id, &host_id, calls).await;
             Err(engine_error_message(error))
         }
     }
@@ -3150,7 +3185,7 @@ async fn run_schedule_for(
         .store
         .load_tool_calls_after(&session_id, sequence_before)
         .map_err(|error| error.to_string())?;
-    record_artifacts(state, &session_id, &host_id, calls).await?;
+    record_artifacts_best_effort(app, state, &session_id, &host_id, calls).await;
     let result_label = if result.is_ok() { "ok" } else { "error" };
     state
         .database
