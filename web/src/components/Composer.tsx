@@ -54,7 +54,7 @@ const getDictationStatus = async (): Promise<DictationStatus | null> => null;
 const startDictation = async (): Promise<DictationStatus | null> => null;
 const stopDictation = async (): Promise<string | null> => null;
 
-// Visual source: OpenWorker surfaces/gui/src/components/Composer.tsx:1-696.
+// Visual source: OpenWorker surfaces/gui/src/components/Composer.tsx:1-813.
 // OPCOS keeps the composer shell, controls, and class names and adapts only
 // invoke-backed session actions, harness selection, assets, and attachments.
 
