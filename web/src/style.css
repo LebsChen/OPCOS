@@ -657,31 +657,13 @@ h3 {
   border-radius: 50%;
   animation: spin 1s linear infinite;
 }
-.composer {
-  margin: 0 max(24px, 7vw) 20px;
-  padding: 9px;
-  border: 1px solid var(--color-line);
-  border-radius: 11px;
-  background: var(--panel);
-}
-.composer textarea {
-  min-height: 58px;
-  resize: vertical;
-  border: 0;
-  background: transparent;
-}
-.composer-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding-top: 5px;
-}
 .right-rail {
   min-width: 0;
   overflow: hidden;
   background: var(--panel);
 }
 
+.right-shell,
 .session-right-panel {
   display: flex;
   flex-direction: row;
@@ -693,8 +675,19 @@ h3 {
   position: relative;
   z-index: 5;
   width: 100%;
-  border-left: 1px solid var(--color-line);
+  overflow: hidden;
 }
+.right-panel,
+.session-panel-drawer {
+  height: 100%;
+  min-width: 0;
+  width: auto;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+}
+.icon-rail,
 .session-icon-rail {
   width: 44px;
   min-width: 44px;
@@ -709,9 +702,6 @@ h3 {
   overflow-x: hidden;
   border-left: 1px solid var(--color-line);
   background: var(--panel);
-}
-.right-rail-collapsed .session-icon-rail {
-  border-left: 0;
 }
 .app.window-maximized .session-icon-rail {
   padding-top: 48px;
@@ -762,6 +752,7 @@ h3 {
   margin-left: -2px;
   cursor: col-resize;
   z-index: 2;
+  border-left: 1px solid var(--color-line);
 }
 .session-panel-resizer:hover {
   background: var(--color-accent-soft);
@@ -784,6 +775,7 @@ h3 {
   min-width: 0;
   flex-direction: column;
   overflow: hidden;
+  background: var(--panel);
 }
 .drawer-head {
   display: flex;
@@ -1066,6 +1058,9 @@ h3 {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  width: 100%;
+  max-width: 768px;
+  margin: 0 auto;
   background: var(--panel);
   border: 1px solid var(--color-line);
   border-radius: 10px;
@@ -1082,11 +1077,39 @@ h3 {
   background: transparent;
   outline: 0;
 }
+.composer-wrap {
+  flex: none;
+  padding: 14px 18px;
+}
+.composer-card textarea {
+  width: 100%;
+  height: 56px;
+  min-height: 24px;
+  max-height: 88px;
+  padding: 2px 2px 6px;
+  border: 0;
+  resize: none;
+  outline: 0;
+  overflow-y: auto;
+  background: transparent;
+  color: var(--color-ink);
+  font: inherit;
+  font-size: 14.5px;
+  line-height: 1.45;
+}
+.composer-card textarea:focus {
+  border: 0;
+  box-shadow: none;
+}
 .composer-row {
   display: flex;
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+}
+.composer-row button,
+.composer-row select {
+  flex-shrink: 0;
 }
 .composer-row .spacer {
   flex: 1;

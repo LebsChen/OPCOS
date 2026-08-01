@@ -2851,8 +2851,8 @@ function SessionRightPanel({
   const tabs = [...informationTabs, ...workspaceTabs, ...remoteTabs];
   if (collapsed) {
     return (
-      <aside className="right-rail session-right-panel right-rail-collapsed">
-        <div className="session-icon-rail">
+      <aside className="right-shell right-rail session-right-panel right-rail-collapsed">
+        <div className="icon-rail session-icon-rail">
           <button
             className="rail-btn"
             title={translate("Expand session panel")}
@@ -2883,8 +2883,11 @@ function SessionRightPanel({
     });
   };
   return (
-    <aside className="right-rail session-right-panel" style={{ width }}>
-      <div className="session-panel-drawer">
+    <aside
+      className="right-shell right-rail session-right-panel"
+      style={{ width }}
+    >
+      <div className="right-panel session-panel-drawer">
         <div className="drawer-head">
           <strong className="drawer-title">
             {tabs.find((item) => item.id === panelTab)?.label}
@@ -3029,7 +3032,7 @@ function SessionRightPanel({
           window.addEventListener("pointerup", stop, { once: true });
         }}
       />
-      <div className="session-icon-rail">
+      <div className="icon-rail session-icon-rail">
         <div className="rail-group" aria-label="Information">
           {informationTabs.map((item) => (
             <button
@@ -3626,86 +3629,88 @@ function AppContent() {
           <div className="home">
             <div className="home-inner">
               <div className="home-greeting">OPCOS</div>
-              <div className="composer-card hero">
-                <textarea
-                  value={homeInput}
-                  placeholder="告诉 OPCOS 你想完成什么…"
-                  onChange={(event) => setHomeInput(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (
-                      event.key === "Enter" &&
-                      (event.metaKey || event.ctrlKey)
-                    ) {
-                      event.preventDefault();
-                      void submitHome();
-                    }
-                  }}
-                />
-                <div className="composer-row">
-                  <select
-                    className="chip"
-                    title="绑定主机"
-                    value={homeHostId}
-                    onChange={(event) => setHomeHostId(event.target.value)}
-                  >
-                    <option value="">主机: 未选择</option>
-                    {hosts.map((host) => (
-                      <option key={host.id} value={host.id}>
-                        {host.name}
-                      </option>
-                    ))}
-                  </select>
-                  <select
-                    className="chip"
-                    title="Provider"
-                    value={homeProvider}
-                    onChange={(event) => setHomeProvider(event.target.value)}
-                  >
-                    <option value="">Provider: 默认</option>
-                    {providers.map((provider) => (
-                      <option key={provider.name} value={provider.name}>
-                        {provider.title}
-                      </option>
-                    ))}
-                  </select>
-                  <select
-                    className="chip"
-                    title="模型"
-                    value={homeModel}
-                    onChange={(event) => setHomeModel(event.target.value)}
-                  >
-                    <option value="auto">模型: Auto</option>
-                    {models.map((model) => (
-                      <option key={model.id} value={model.id}>
-                        {model.label}
-                      </option>
-                    ))}
-                  </select>
-                  <select
-                    className="chip"
-                    title="模式"
-                    value={homeMode}
-                    onChange={(event) => setHomeMode(event.target.value)}
-                  >
-                    <option value="Interactive">模式: Interactive</option>
-                    <option value="Auto">模式: Auto</option>
-                  </select>
-                  <input
-                    className="chip workspace-chip"
-                    title="远程 workspace"
-                    value={homeWorkspace}
-                    onChange={(event) => setHomeWorkspace(event.target.value)}
-                    placeholder="Workspace"
+              <div className="composer-wrap">
+                <div className="composer-card hero">
+                  <textarea
+                    value={homeInput}
+                    placeholder="告诉 OPCOS 你想完成什么…"
+                    onChange={(event) => setHomeInput(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (
+                        event.key === "Enter" &&
+                        (event.metaKey || event.ctrlKey)
+                      ) {
+                        event.preventDefault();
+                        void submitHome();
+                      }
+                    }}
                   />
-                  <span className="spacer" />
-                  <button
-                    className={`send-btn${running ? " sending" : ""}`}
-                    disabled={running || !homeInput.trim() || !homeHostId}
-                    onClick={() => void submitHome()}
-                    title="发送并创建会话"
-                  >
-                    {running ? "…" : "↑"}
-                  </button>
+                  <div className="composer-row">
+                    <select
+                      className="chip"
+                      title="绑定主机"
+                      value={homeHostId}
+                      onChange={(event) => setHomeHostId(event.target.value)}
+                    >
+                      <option value="">主机: 未选择</option>
+                      {hosts.map((host) => (
+                        <option key={host.id} value={host.id}>
+                          {host.name}
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      className="chip"
+                      title="Provider"
+                      value={homeProvider}
+                      onChange={(event) => setHomeProvider(event.target.value)}
+                    >
+                      <option value="">Provider: 默认</option>
+                      {providers.map((provider) => (
+                        <option key={provider.name} value={provider.name}>
+                          {provider.title}
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      className="chip"
+                      title="模型"
+                      value={homeModel}
+                      onChange={(event) => setHomeModel(event.target.value)}
+                    >
+                      <option value="auto">模型: Auto</option>
+                      {models.map((model) => (
+                        <option key={model.id} value={model.id}>
+                          {model.label}
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      className="chip"
+                      title="模式"
+                      value={homeMode}
+                      onChange={(event) => setHomeMode(event.target.value)}
+                    >
+                      <option value="Interactive">模式: Interactive</option>
+                      <option value="Auto">模式: Auto</option>
+                    </select>
+                    <input
+                      className="chip workspace-chip"
+                      title="远程 workspace"
+                      value={homeWorkspace}
+                      onChange={(event) => setHomeWorkspace(event.target.value)}
+                      placeholder="Workspace"
+                    />
+                    <span className="spacer" />
+                    <button
+                      className={`send-btn${running ? " sending" : ""}`}
+                      disabled={running || !homeInput.trim() || !homeHostId}
+                      onClick={() => void submitHome()}
+                      title="发送并创建会话"
+                    >
+                      {running ? "…" : "↑"}
+                    </button>
+                  </div>
                 </div>
               </div>
               {sessions.length > 0 && (

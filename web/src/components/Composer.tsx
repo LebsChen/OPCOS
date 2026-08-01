@@ -125,8 +125,6 @@ interface Props {
 export function Composer(props: Props) {
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
-  const [dragging, setDragging] = useState(false);
-  const [attachMenuOpen, setAttachMenuOpen] = useState(false);
   const [dictation, setDictation] = useState<DictationStatus | null>(null);
   const [dictationBusy, setDictationBusy] = useState<string | null>(null);
   const [dictationError, setDictationError] = useState<string | null>(null);
@@ -412,10 +410,10 @@ export function Composer(props: Props) {
 
   // The send button is accent only when there's something to send — subtle grey otherwise, so the
   // composer isn't carrying a constant blue dot.
-  const hasContent = text.trim().length > 0 || attachments.length > 0;
+  const hasContent = text.trim().length > 0;
 
   return (
-    <div className="composer-wrap px-6 pb-5 pt-4">
+    <div className="composer-wrap">
       {props.approvalSlot}
 
       {dictationError && (
@@ -444,93 +442,19 @@ export function Composer(props: Props) {
         </div>
       )}
 
-      {/* Attachments preview — a strip ABOVE the input box (mock/Claude-style). */}
-      {attachments.length > 0 && (
-        <div className="max-w-3xl mx-auto mb-1.5 flex flex-wrap gap-2">
-          {attachments.map((a, i) => (
-            <AttachChip
-              key={i}
-              a={a}
-              onRemove={() =>
-                setAttachments((all) => all.filter((_, j) => j !== i))
-              }
-            />
-          ))}
-        </div>
-      )}
-
-      <div
-        className={
-          "composer max-w-3xl mx-auto rounded-2xl border border-line bg-panel shadow-sm" +
-          (dragging ? " dragging" : "")
-        }
-        onDragOver={(e) => {
-          e.preventDefault();
-          setDragging(true);
-        }}
-        onDragLeave={() => setDragging(false)}
-        onDrop={(e) => {
-          e.preventDefault();
-          setDragging(false);
-          if (e.dataTransfer.files.length) addFiles(e.dataTransfer.files);
-        }}
-      >
+      <div className="composer-card">
         <textarea
           ref={textareaRef}
           className="w-full block px-3.5 pt-3.5 pb-1.5 text-[14.5px]"
-          placeholder={props.placeholder || "Ask OPCOS…  (drop or paste files)"}
+          placeholder={props.placeholder || "Ask OPCOS…"}
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={onKey}
-          onPaste={onPaste}
           rows={1}
         />
 
-        {/* Three-control row (§22): + attach · Mode ⌄ …(right)… model (fresh only) · send */}
-        <div className="px-2.5 pb-2.5 pt-1 flex items-center gap-1.5">
-          {/* + attach menu */}
-          <div className="relative">
-            <button
-              className={iconBtn + (attachMenuOpen ? " bg-paper text-ink" : "")}
-              title={translate("Attach")}
-              aria-label={translate("Attach")}
-              onClick={() => setAttachMenuOpen((v) => !v)}
-            >
-              <Icon name="plus" size={17} />
-            </button>
-            {attachMenuOpen && (
-              <>
-                <div
-                  className="fixed inset-0 z-30"
-                  onClick={() => setAttachMenuOpen(false)}
-                />
-                <div className="absolute z-40 bottom-full mb-1 left-0 min-w-[180px] rounded-xl border border-line bg-panel shadow-2xl py-1.5">
-                  {attachItem("image", "Photo or image", () =>
-                    pickFiles("image/*"),
-                  )}
-                  {attachItem("file", "PDF", () =>
-                    pickFiles("application/pdf,.pdf"),
-                  )}
-                  {attachItem("fileCode", "Other files", () =>
-                    pickFiles(
-                      "text/*,.md,.csv,.json,.yaml,.yml,.log,.py,.ts,.tsx,.js,.rs,.go,.toml",
-                    ),
-                  )}
-                </div>
-              </>
-            )}
-          </div>
-          <input
-            ref={fileInput}
-            type="file"
-            multiple
-            style={{ display: "none" }}
-            onChange={(e) => {
-              if (e.target.files) addFiles(e.target.files);
-              e.target.value = "";
-            }}
-          />
-
+        {/* Mode, model, and send/steer controls are the real OPCOS composer actions. */}
+        <div className="composer-row">
           {/* Listening replaces the quiet middle controls with a LIVE waveform (mic RMS,
               polled ~10Hz, scrolling left) + elapsed time (§37). */}
           {dictation?.recording ? (
