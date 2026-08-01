@@ -1753,19 +1753,17 @@ fn shell_artifact_paths(command: &str) -> Vec<String> {
 
 const ARTIFACT_HASH_LIMIT: i64 = 8 * 1024 * 1024;
 
-async fn artifact_hash(
-    state: &DesktopState,
-    session_id: &str,
-    path: &str,
-    size_bytes: Option<i64>,
-) -> Option<String> {
+fn artifact_hash_command(path: &str) -> String {
+    let escaped = path.replace('\'', "'\\''");
+    format!("sha256sum -- '{escaped}' 2>/dev/null || shasum -a 256 -- '{escaped}'")
+}
+
+async fn artifact_hash(host: &dyn Host, path: &str, size_bytes: Option<i64>) -> Option<String> {
     if size_bytes.is_none_or(|size| size > ARTIFACT_HASH_LIMIT) {
         return None;
     }
-    let (host, _) = artifact_host(state, session_id).await.ok()?;
     let path = host.join(path).ok()?;
-    let escaped = path.replace('\'', "'\\''");
-    let command = format!("sha256sum -- '{escaped}' 2>/dev/null || shasum -a 256 -- '{escaped}'");
+    let command = artifact_hash_command(&path);
     let result = host
         .exec(ExecRequest {
             command,
@@ -1793,11 +1791,24 @@ async fn record_artifacts(
     host_id: &str,
     calls: Vec<ToolCallRecord>,
 ) -> Result<(), String> {
+    let (host, resolved_host_id) = artifact_host(state, session_id).await?;
+    if resolved_host_id != host_id {
+        return Err("artifact host binding changed during collection".into());
+    }
     for call in calls {
         let Some(result) = call.result.as_ref() else {
             continue;
         };
         if result.get("error").is_some() {
+            continue;
+        }
+        if matches!(call.name.as_str(), "run_shell" | "exec")
+            && result
+                .get("result")
+                .and_then(|value| value.get("exit_code"))
+                .and_then(Value::as_i64)
+                .is_some_and(|exit_code| exit_code != 0)
+        {
             continue;
         }
         let paths = match call.name.as_str() {
@@ -1831,7 +1842,7 @@ async fn record_artifacts(
             } else {
                 result.get("size").and_then(Value::as_i64)
             };
-            let sha256 = artifact_hash(state, session_id, &path, size_bytes).await;
+            let sha256 = artifact_hash(host.as_ref(), &path, size_bytes).await;
             state
                 .store
                 .upsert_artifact(&ArtifactRecord {
@@ -2007,7 +2018,7 @@ async fn submit_turn(
     }
     let sequence_before = state
         .store
-        .max_message_notice_sequence(&request.session_id)
+        .max_message_sequence(&request.session_id)
         .map_err(|error| error.to_string())?;
     let engine = engine_for(&app, &state, &request.session_id).await?;
     emit(
@@ -2219,7 +2230,7 @@ async fn resolve_approval(
     let host_id = session_host_id(&state, &session_id)?;
     let sequence_before = state
         .store
-        .max_message_notice_sequence(&session_id)
+        .max_message_sequence(&session_id)
         .map_err(|error| error.to_string())?;
     let engine = engine_for(&app, &state, &session_id).await?;
     let result = engine
@@ -3257,7 +3268,7 @@ async fn run_schedule_for(
     let engine = engine_for(app, state, &session_id).await?;
     let sequence_before = state
         .store
-        .max_message_notice_sequence(&session_id)
+        .max_message_sequence(&session_id)
         .map_err(|error| error.to_string())?;
     let result = engine.submit_text(prompt).await;
     let host_id = session_host_id(state, &session_id)?;
@@ -3762,6 +3773,13 @@ mod m7_tests {
             shell_artifact_paths("generate | tee -a reports/out.log"),
             vec!["reports/out.log"]
         );
+    }
+
+    #[test]
+    fn artifact_hash_command_quotes_shell_metacharacters() {
+        let command = artifact_hash_command("reports/O'Brien; $(touch hacked) final.txt");
+        assert!(command.contains("'reports/O'\\''Brien; $(touch hacked) final.txt'"));
+        assert_eq!(command.matches('\'').count() % 2, 0);
     }
 
     #[test]

@@ -826,6 +826,15 @@ impl SqliteStore {
         )?)
     }
 
+    pub fn max_message_sequence(&self, session_id: &str) -> Result<i64, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        Ok(connection.query_row(
+            "SELECT COALESCE(MAX(sequence), 0) FROM messages WHERE session_id=?1",
+            [session_id],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn load_tool_calls_after(
         &self,
         session_id: &str,
