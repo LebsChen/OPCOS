@@ -3094,7 +3094,13 @@ function StandalonePane({ route }: { route: PaneRoute }) {
             onError={(reason) => setError(errorMessage(reason))}
           />
         )}
-        {selected && route.tab !== "info" && route.tab !== "insights" && (
+        {selected && route.tab === "artifacts" && (
+          <ArtifactsPane selected={selected} />
+        )}
+        {selected &&
+          route.tab !== "info" &&
+          route.tab !== "insights" &&
+          route.tab !== "artifacts" && (
           <SurfaceView
             tab={route.tab as SurfaceTab | "pr"}
             selected={selected}
