@@ -856,6 +856,9 @@ fn session_host_id(state: &DesktopState, session_id: &str) -> Result<String, Str
 }
 
 fn client_for(state: &DesktopState, host_id: &str) -> Result<HttpRvmClient, String> {
+    if host_id == "local" {
+        return Err("本机 host 不支持该能力".into());
+    }
     let connection = state
         .database
         .lock()
