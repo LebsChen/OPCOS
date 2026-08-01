@@ -440,6 +440,11 @@ impl HttpClient {
         credentials: Option<HashMap<String, String>>,
     ) -> Result<Self, McpClientError> {
         let url = config.url.clone().ok_or(McpClientError::InvalidConfig)?;
+        let parsed = reqwest::Url::parse(&url).map_err(|_| McpClientError::InvalidConfig)?;
+        let loopback = matches!(parsed.host_str(), Some("127.0.0.1" | "localhost"));
+        if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback) {
+            return Err(McpClientError::InvalidConfig);
+        }
         let mut headers = HeaderMap::new();
         headers.insert(
             reqwest::header::ACCEPT,
@@ -464,7 +469,10 @@ impl HttpClient {
             headers.insert(reqwest::header::AUTHORIZATION, value);
         }
         Ok(Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|_| McpClientError::InvalidConfig)?,
             url,
             headers,
             next_id: 1,
@@ -630,8 +638,10 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
         version_id: &str,
     ) -> Result<Vec<McpTool>, McpClientError> {
         let tools = self.connect_inner(config, version_id).await?;
-        self.start_liveness(config.clone(), version_id.to_owned())
-            .await;
+        if config.enabled {
+            self.start_liveness(config.clone(), version_id.to_owned())
+                .await;
+        }
         Ok(tools)
     }
 
@@ -652,7 +662,18 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
                     tool_count: 0,
                 },
             );
-            return Err(McpClientError::Disconnected);
+            return Ok(Vec::new());
+        }
+        if self
+            .active_versions
+            .lock()
+            .await
+            .get(&config.object_id)
+            .is_some_and(|active| active == version_id)
+            && self.clients.lock().await.contains_key(&config.object_id)
+            && let Some(tools) = self.cached_tools(&config.object_id, version_id).await
+        {
+            return Ok(tools);
         }
         self.statuses.lock().await.insert(
             config.object_id.clone(),
@@ -1130,6 +1151,31 @@ mod tests {
         }];
         assert!(filter_tools(tools, None, None).len() == 1);
         assert!(filter_tools(Vec::new(), None, None).is_empty());
+    }
+
+    #[test]
+    fn http_transport_rejects_non_loopback_http() {
+        let config = McpServerConfig {
+            object_id: "server-a".into(),
+            server_key: "abc123".into(),
+            name: "server-a".into(),
+            transport: McpTransport::StreamableHttp,
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            url: Some("http://example.com/mcp".into()),
+            headers: HashMap::new(),
+            enabled: true,
+            include_tools: None,
+            exclude_tools: None,
+            requires_approval: true,
+            auth: None,
+        };
+        assert!(matches!(
+            HttpClient::new(&config, None),
+            Err(McpClientError::InvalidConfig)
+        ));
     }
 
     #[tokio::test]

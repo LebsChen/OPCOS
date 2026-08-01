@@ -1923,7 +1923,7 @@ function ManageSections({
                     <input
                       value={assetScope}
                       onChange={(event) => setAssetScope(event.target.value)}
-                      placeholder={translate("Optional scope")}
+                      placeholder={translate("Workspace path (absolute)")}
                       disabled={assetScopeKind === "global"}
                     />
                   </label>

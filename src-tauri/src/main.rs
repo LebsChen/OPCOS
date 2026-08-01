@@ -690,8 +690,40 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
              );",
         )
         .map_err(|error| error.to_string())?;
+    migrate_mcp_session_tools(&connection)?;
     migrate_config_objects(&mut connection)?;
     Ok(connection)
+}
+
+fn migrate_mcp_session_tools(connection: &Connection) -> Result<(), String> {
+    let has_source = connection
+        .prepare("PRAGMA table_info(mcp_session_tools)")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|error| error.to_string())?
+        .iter()
+        .any(|column| column == "source");
+    if has_source {
+        return Ok(());
+    }
+    connection
+        .execute_batch(
+            "CREATE TABLE mcp_session_tools_v2 (
+               session_id TEXT NOT NULL,
+               source TEXT NOT NULL,
+               name TEXT NOT NULL,
+               enabled INTEGER NOT NULL,
+               PRIMARY KEY(session_id,source,name)
+             );
+             INSERT INTO mcp_session_tools_v2(session_id,source,name,enabled)
+               SELECT session_id,'host',name,enabled FROM mcp_session_tools;
+             DROP TABLE mcp_session_tools;
+             ALTER TABLE mcp_session_tools_v2 RENAME TO mcp_session_tools;",
+        )
+        .map_err(|error| error.to_string())
 }
 
 fn content_hash(content: &str) -> String {
@@ -815,6 +847,11 @@ fn migrate_config_objects(connection: &mut Connection) -> Result<(), String> {
                version_id TEXT NOT NULL,
                PRIMARY KEY(session_id, object_id)
              );
+             CREATE TABLE IF NOT EXISTS session_config_bindings (
+               session_id TEXT NOT NULL,
+               object_id TEXT NOT NULL,
+               PRIMARY KEY(session_id, object_id)
+             );
              CREATE TABLE IF NOT EXISTS schedule_runs (
                id TEXT PRIMARY KEY,
                schedule_id TEXT NOT NULL,
@@ -867,13 +904,19 @@ fn migrate_config_objects(connection: &mut Connection) -> Result<(), String> {
         };
         let object_id = format!("config:{legacy_id}");
         let version_id = format!("{object_id}:v1");
-        let (scope_kind, scope_key) = if scope.is_empty() {
+        let is_workspace_path = PathBuf::from(scope).is_absolute()
+            || scope.starts_with('/')
+            || scope
+                .as_bytes()
+                .get(1)
+                .is_some_and(|separator| *separator == b':');
+        let (scope_kind, scope_key) = if scope.is_empty() || !is_workspace_path {
             ("global", None)
         } else {
             ("repo", Some(scope.as_str()))
         };
         let status = if *enabled { "active" } else { "disabled" };
-        let metadata = json!({"trigger": trigger, "scope": scope});
+        let metadata = json!({"trigger": trigger, "scope": scope, "legacy_scope": scope});
         transaction
             .execute(
                 "INSERT OR IGNORE INTO config_object
@@ -1330,7 +1373,7 @@ fn bind_session_config_versions(
         .map_err(|_| "database lock poisoned")?;
     let exists: bool = connection
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM session_config_versions WHERE session_id=?1)",
+            "SELECT EXISTS(SELECT 1 FROM session_config_bindings WHERE session_id=?1)",
             [session_id],
             |row| row.get(0),
         )
@@ -1343,29 +1386,45 @@ fn bind_session_config_versions(
         .map_err(|error| error.to_string())?;
     let mut statement = transaction
         .prepare(
-            "SELECT id,current_version_id FROM config_object
-             WHERE status='active' AND current_version_id IS NOT NULL
-               AND (scope_kind='global'
-                 OR (scope_kind='repo' AND scope_key=?1)
-                 OR (scope_kind='host' AND scope_key=?2))",
+            "SELECT o.id,o.current_version_id,COALESCE(selection.enabled,1)
+             FROM config_object o
+             LEFT JOIN asset_session_selection selection
+               ON selection.session_id=?3 AND selection.asset_id=o.id
+             WHERE o.status='active' AND o.current_version_id IS NOT NULL
+               AND (o.scope_kind='global'
+                 OR (o.scope_kind='repo' AND o.scope_key=?1)
+                 OR (o.scope_kind='host' AND o.scope_key=?2))",
         )
         .map_err(|error| error.to_string())?;
     let objects = statement
-        .query_map(params![workspace, host_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        .query_map(params![workspace, host_id, session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
         })
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
     drop(statement);
-    for (object_id, version_id) in objects {
+    for (object_id, version_id, enabled) in objects {
         transaction
             .execute(
-                "INSERT INTO session_config_versions(session_id,object_id,version_id)
-                 VALUES (?1,?2,?3)",
-                params![session_id, object_id, version_id],
+                "INSERT OR IGNORE INTO session_config_bindings(session_id,object_id)
+                 VALUES (?1,?2)",
+                params![session_id, object_id],
             )
             .map_err(|error| error.to_string())?;
+        if enabled {
+            transaction
+                .execute(
+                    "INSERT INTO session_config_versions(session_id,object_id,version_id)
+                     VALUES (?1,?2,?3)",
+                    params![session_id, object_id, version_id],
+                )
+                .map_err(|error| error.to_string())?;
+        }
     }
     transaction.commit().map_err(|error| error.to_string())
 }
@@ -1458,7 +1517,19 @@ async fn engine_for(
     let mode = session.mode;
     let session_workspace = session.workspace;
     let session_provider = session.provider;
-    bind_session_config_versions(state, session_id, &session_workspace, &host_id)?;
+    let resolved_workspace = if !session_workspace.is_empty() {
+        session_workspace.clone()
+    } else if host_id == "local" {
+        return Err("local session requires an explicit workspace directory".into());
+    } else {
+        client_for(state, &host_id)?
+            .health()
+            .await
+            .map_err(|error| format!("remote host unavailable: {error}"))?
+            .workspace
+            .ok_or_else(|| "remote host did not provide a workspace".to_owned())?
+    };
+    bind_session_config_versions(state, session_id, &resolved_workspace, &host_id)?;
     let (provider_id, configured_base_url) = {
         let connection = state
             .database
@@ -1639,9 +1710,7 @@ async fn engine_for(
         permission_mode,
         model,
     ));
-    if let Some(allowed_tools) = allowed_tools {
-        engine.set_allowed_tools(allowed_tools).await;
-    }
+    let mut allowed_tools = allowed_tools;
     if let Some(executor_client) = &remote_client
         && let Ok(response) = executor_client
             .mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
@@ -1657,7 +1726,10 @@ async fn engine_for(
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?
-            .prepare("SELECT name FROM mcp_session_tools WHERE session_id=?1 AND enabled=1")
+            .prepare(
+                "SELECT name FROM mcp_session_tools
+                 WHERE session_id=?1 AND source='host' AND enabled=1",
+            )
             .and_then(|mut statement| {
                 let rows = statement.query_map([session_id], |row| row.get::<_, String>(0))?;
                 rows.collect::<Result<Vec<_>, _>>()
@@ -1702,27 +1774,8 @@ async fn engine_for(
             .map_err(|error| error.to_string())?
     };
     let mut independent_tools = Vec::new();
-    let enabled_mcp_tools = state
-        .database
-        .lock()
-        .ok()
-        .and_then(|connection| {
-            connection
-                .prepare("SELECT name FROM mcp_session_tools WHERE session_id=?1 AND enabled=1")
-                .ok()
-                .and_then(|mut statement| {
-                    statement
-                        .query_map([session_id], |row| row.get::<_, String>(0))
-                        .ok()
-                        .map(|rows| {
-                            rows.filter_map(Result::ok)
-                                .collect::<std::collections::HashSet<_>>()
-                        })
-                })
-        })
-        .unwrap_or_default();
     for (object_id, name, server_key, version_id, mut content) in mcp_configs {
-        content["object_id"] = Value::String(object_id);
+        content["object_id"] = Value::String(object_id.clone());
         content["name"] = Value::String(name);
         content["server_key"] = Value::String(if server_key.is_empty() {
             stable_server_key(content["object_id"].as_str().unwrap_or_default())
@@ -1737,6 +1790,32 @@ async fn engine_for(
             .connect_with_retry(&config, &version_id, 0)
             .await
         {
+            let qualified_names = tools
+                .iter()
+                .map(|tool| tool.qualified_name.clone())
+                .collect::<Vec<_>>();
+            let selected_names = state
+                .database
+                .lock()
+                .ok()
+                .and_then(|connection| {
+                    connection
+                        .prepare(
+                            "SELECT name FROM mcp_session_tools
+                             WHERE session_id=?1 AND source=?2 AND enabled=1",
+                        )
+                        .ok()
+                        .and_then(|mut statement| {
+                            statement
+                                .query_map(params![session_id, object_id], |row| {
+                                    row.get::<_, String>(0)
+                                })
+                                .ok()
+                                .map(|rows| rows.filter_map(Result::ok).collect::<Vec<_>>())
+                        })
+                })
+                .unwrap_or_default();
+            let has_explicit_selection = !selected_names.is_empty();
             independent_tools.extend(
                 tools
                     .into_iter()
@@ -1749,15 +1828,24 @@ async fn engine_for(
                         })
                     })
                     .filter(|tool| {
-                        enabled_mcp_tools.is_empty()
-                            || enabled_mcp_tools.contains(
-                                tool.get("qualified_name")
+                        !has_explicit_selection
+                            || selected_names.iter().any(|name| {
+                                name == tool
+                                    .get("qualified_name")
                                     .and_then(Value::as_str)
-                                    .unwrap_or_default(),
-                            )
+                                    .unwrap_or_default()
+                            })
                     }),
             );
+            if host_id == "local"
+                && let Some(allowed) = allowed_tools.as_mut()
+            {
+                allowed.extend(qualified_names);
+            }
         }
+    }
+    if let Some(allowed_tools) = allowed_tools {
+        engine.set_allowed_tools(allowed_tools).await;
     }
     if !independent_tools.is_empty() {
         engine.append_external_tools(independent_tools).await;
@@ -3195,6 +3283,13 @@ fn set_asset_enabled(
             params![session_id, asset_id, enabled],
         )
         .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO session_config_bindings(session_id,object_id)
+             VALUES (?1,?2)",
+            params![session_id, asset_id],
+        )
+        .map_err(|error| error.to_string())?;
     if enabled {
         connection
             .execute(
@@ -3441,7 +3536,16 @@ async fn import_assets(
         .unchecked_transaction()
         .map_err(|error| error.to_string())?;
     for item in &bundle.knowledge {
-        let object_id = format!("import:{}", item.title);
+        let object_id = transaction
+            .query_row(
+                "SELECT id FROM config_object WHERE kind='knowledge' AND name=?1
+                 ORDER BY id LIMIT 1",
+                [&item.title],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| format!("config:{}", item.title));
         let version_id = format!("{object_id}:v1");
         transaction
             .execute(
@@ -3486,7 +3590,16 @@ async fn import_assets(
             .map_err(|error| error.to_string())?;
     }
     if let Some(item) = &bundle.playbook {
-        let object_id = format!("import:{}", item.title);
+        let object_id = transaction
+            .query_row(
+                "SELECT id FROM config_object WHERE kind='runbook' AND name=?1
+                 ORDER BY id LIMIT 1",
+                [&item.title],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| format!("config:{}", item.title));
         let version_id = format!("{object_id}:v1");
         transaction
             .execute(
@@ -3709,15 +3822,18 @@ fn set_mcp_tool_enabled(
     state: State<'_, DesktopState>,
     session_id: String,
     name: String,
+    source: Option<String>,
     enabled: bool,
 ) -> Result<(), String> {
+    let source = source.unwrap_or_else(|| "host".into());
     state
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?
         .execute(
-            "INSERT OR REPLACE INTO mcp_session_tools(session_id,name,enabled) VALUES (?1,?2,?3)",
-            params![session_id, name, enabled],
+            "INSERT OR REPLACE INTO mcp_session_tools(session_id,source,name,enabled)
+             VALUES (?1,?2,?3,?4)",
+            params![session_id, source, name, enabled],
         )
         .map_err(|error| error.to_string())?;
     Ok(())
@@ -5138,7 +5254,8 @@ mod m7_tests {
         assert_eq!(migrated.0, "knowledge");
         assert_eq!(migrated.1, "Use cargo");
         assert!(migrated.2.contains("\"trigger\":\"build\""));
-        assert_eq!(migrated.3, "repo");
+        assert_eq!(migrated.3, "global");
+        assert!(migrated.2.contains("\"legacy_scope\":\"repo-a\""));
         assert!(
             connection
                 .query_row(

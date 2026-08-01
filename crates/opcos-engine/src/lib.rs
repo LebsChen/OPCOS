@@ -317,16 +317,14 @@ where
     fn finish_turn<T>(&self, result: &Result<T, EngineError>) {
         let (run_state, stop_reason) = self.turn_status(result);
         self.set_session_status(run_state, stop_reason);
-        if !matches!(result, Err(EngineError::ApprovalAlreadyProcessed(_))) {
-            let waiters = std::mem::take(
-                &mut *self
-                    .steering_waiters
-                    .lock()
-                    .expect("steering waiters mutex poisoned"),
-            );
-            for waiter in waiters {
-                let _ = waiter.send((run_state.to_owned(), stop_reason.to_owned()));
-            }
+        let waiters = std::mem::take(
+            &mut *self
+                .steering_waiters
+                .lock()
+                .expect("steering waiters mutex poisoned"),
+        );
+        for waiter in waiters {
+            let _ = waiter.send((run_state.to_owned(), stop_reason.to_owned()));
         }
     }
 
@@ -366,9 +364,7 @@ where
         self.set_session_status("running", "none");
         self.policy_denied.store(false, Ordering::SeqCst);
         let result = self.resolve_approval_inner(call_id, outcome).await;
-        if !matches!(result, Err(EngineError::ApprovalAlreadyProcessed(_))) {
-            self.finish_turn(&result);
-        }
+        self.finish_turn(&result);
         result
     }
 
@@ -1075,7 +1071,7 @@ struct PartialOutput {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use opcos_store::{SessionStore, SqliteStore};
+    use opcos_store::{SessionRecord, SessionStore, SqliteStore};
 
     #[test]
     fn host_capability_filter_removes_unsupported_tools() {
@@ -1345,6 +1341,28 @@ mod tests {
     async fn approved_tool_is_tracked_until_its_result_is_persisted() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         store
+            .save_session(&SessionRecord {
+                session_id: "s".into(),
+                workspace: "/workspace".into(),
+                model: "fake".into(),
+                mode: "Interactive".into(),
+                title: "Approval".into(),
+                extra_roots: vec![],
+                grants: json!({}),
+                pinned: false,
+                archived: false,
+                origin: None,
+                origin_label: None,
+                compaction: json!({}),
+                host_id: "local".into(),
+                provider: None,
+                run_state: "idle".into(),
+                stop_reason: "none".into(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+        store
             .append_message(&StoredMessage {
                 session_id: "s".into(),
                 sequence: 1,
@@ -1367,7 +1385,7 @@ mod tests {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let engine = Arc::new(TurnEngine::new(
             FakeProvider,
-            store,
+            store.clone(),
             Arc::new(BlockingTools {
                 started: started.clone(),
                 release: release.clone(),
@@ -1397,6 +1415,9 @@ mod tests {
                 .await,
             Err(EngineError::ApprovalAlreadyProcessed(id)) if id == "approved-1"
         ));
+        let session = store.load_session("s").unwrap().unwrap();
+        assert_eq!(session.run_state, "idle");
+        assert_eq!(session.stop_reason, "waiting_for_approval");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
