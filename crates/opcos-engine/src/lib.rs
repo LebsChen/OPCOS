@@ -123,9 +123,8 @@ where
         let (events, receiver) = mpsc::channel(256);
         let session_id = session_id.into();
         let initial_sequence = store
-            .load_messages(&session_id)
+            .max_message_notice_sequence(&session_id)
             .ok()
-            .and_then(|messages| messages.into_iter().map(|message| message.sequence).max())
             .unwrap_or(0);
         Self {
             provider,
@@ -1001,6 +1000,51 @@ mod tests {
         async fn execute(&self, _: &str, _: Value) -> Result<Value, String> {
             Ok(json!("ok"))
         }
+    }
+
+    #[tokio::test]
+    async fn restart_seeds_sequence_after_trailing_notice() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .append_message(&StoredMessage {
+                session_id: "sequence-session".into(),
+                sequence: 1,
+                role: "user".into(),
+                content: json!({"role":"user","text":"before"}),
+                display_only: false,
+            })
+            .unwrap();
+        store
+            .append_notice(&opcos_store::NoticeRecord {
+                session_id: "sequence-session".into(),
+                sequence: 2,
+                kind: "interrupted".into(),
+                content: "Turn interrupted".into(),
+            })
+            .unwrap();
+        let restarted = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "sequence-session",
+            "/workspace",
+            PermissionMode::Interactive,
+            "fake",
+        );
+        restarted.submit_text("after").await.unwrap();
+        let messages = store.load_messages("sequence-session").unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 4]
+        );
+        let transcript = store.load_transcript("sequence-session").unwrap();
+        assert_eq!(transcript[0].kind, "user");
+        assert_eq!(transcript[1].kind, "notice");
+        assert_eq!(transcript[2].kind, "user");
+        assert_eq!(transcript[3].kind, "assistant");
     }
 
     #[derive(Clone)]

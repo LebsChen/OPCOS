@@ -354,6 +354,7 @@ pub trait SessionStore {
     fn append_message(&self, message: &StoredMessage) -> Result<(), StoreError>;
     fn load_messages(&self, session_id: &str) -> Result<Vec<StoredMessage>, StoreError>;
     fn append_notice(&self, notice: &NoticeRecord) -> Result<(), StoreError>;
+    fn max_message_notice_sequence(&self, session_id: &str) -> Result<i64, StoreError>;
     fn load_resume_messages(&self, session_id: &str) -> Result<Vec<StoredMessage>, StoreError>;
     fn append_tool_call(&self, call: &ToolCallRecord) -> Result<(), StoreError>;
     fn complete_tool_call(
@@ -1089,6 +1090,19 @@ impl SessionStore for SqliteStore {
         Ok(())
     }
 
+    fn max_message_notice_sequence(&self, session_id: &str) -> Result<i64, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        Ok(connection.query_row(
+            "SELECT COALESCE(MAX(sequence), 0) FROM (
+               SELECT sequence FROM messages WHERE session_id=?1
+               UNION ALL
+               SELECT sequence FROM notices WHERE session_id=?1
+             )",
+            [session_id],
+            |row| row.get(0),
+        )?)
+    }
+
     fn load_resume_messages(&self, session_id: &str) -> Result<Vec<StoredMessage>, StoreError> {
         self.load_messages(session_id)
     }
@@ -1620,6 +1634,34 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "approval_allowed");
         assert_eq!(events[0].payload["call_id"], "call-1");
+    }
+
+    #[test]
+    fn max_message_notice_sequence_merges_both_tables() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .append_message(&StoredMessage {
+                session_id: "sequence-session".into(),
+                sequence: 3,
+                role: "user".into(),
+                content: serde_json::json!({"text":"hello"}),
+                display_only: false,
+            })
+            .unwrap();
+        store
+            .append_notice(&NoticeRecord {
+                session_id: "sequence-session".into(),
+                sequence: 7,
+                kind: "interrupted".into(),
+                content: "Turn interrupted".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .max_message_notice_sequence("sequence-session")
+                .unwrap(),
+            7
+        );
     }
 
     #[test]
