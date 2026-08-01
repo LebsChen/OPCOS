@@ -776,7 +776,7 @@ export function PlusMenu({
           )}
           <div className="pm-divider" />
           {[
-            { kind: "agents", label: "AGENTS.md", reference: "@AGENTS.md" },
+            { kind: "agents", label: "规则", reference: "@AGENTS.md" },
             { kind: "knowledge", label: "知识库", reference: "@Knowledge" },
             { kind: "playbook", label: "运行手册", reference: "@Playbook" },
             { kind: "skill", label: "技能", reference: "@Skill" },

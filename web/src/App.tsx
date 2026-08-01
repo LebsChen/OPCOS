@@ -930,7 +930,7 @@ function ManageSections({
       "Choose a provider and validate its connection key.",
     ],
     hosts: ["Hosts", "Bind and test the remote hosts used by OPCOS sessions."],
-    agents: ["AGENTS.md", "Repository-wide operating guidance for the host."],
+    agents: ["规则", "仓库级运行规则（对应仓库中的 AGENTS.md 文件）。"],
     knowledge: ["Knowledge", "Reusable reference material added to context."],
     playbook: ["Playbook", "Repeatable workflows available to automation."],
     skill: ["Skill", "Focused capability and instruction bundles."],
@@ -948,7 +948,7 @@ function ManageSections({
     : "knowledge";
   const assetLabel =
     assetTabKind === "agents"
-      ? "AGENTS.md"
+      ? "规则"
       : assetTabKind[0].toUpperCase() + assetTabKind.slice(1);
   useEffect(() => {
     void command<Record<string, unknown>>("provider_settings")
@@ -1454,8 +1454,8 @@ function ManageSections({
               [
                 [
                   "agents",
-                  "AGENTS.md",
-                  "Repository-wide instructions loaded as the host's operating guidance.",
+                  "规则",
+                  "仓库级运行规则（对应仓库中的 AGENTS.md 文件）。",
                 ],
                 [
                   "knowledge",
@@ -1480,7 +1480,9 @@ function ManageSections({
                   key={kind}
                   search={assetSearch}
                   onSearch={setAssetSearch}
-                  searchPlaceholder={`Search ${label}`}
+                  searchPlaceholder={
+                    kind === "agents" ? "搜索规则" : `Search ${label}`
+                  }
                   actions={
                     tab === "knowledge" ? (
                       <div className="inline-actions">
@@ -1551,7 +1553,11 @@ function ManageSections({
                       </div>
                     ) : undefined
                   }
-                  columns={["Title", "Trigger", "Scope", "Status"]}
+                  columns={
+                    kind === "agents"
+                      ? ["标题", "触发条件", "范围", "状态"]
+                      : ["Title", "Trigger", "Scope", "Status"]
+                  }
                   renderCard={() => (
                     <>
                       {assets
@@ -1573,14 +1579,23 @@ function ManageSections({
                             <div className="flex justify-between gap-2">
                               <strong>{asset.title}</strong>
                               <span className="text-[11px] text-muted">
-                                {asset.enabled ? "Enabled" : "Disabled"}
+                                {kind === "agents"
+                                  ? asset.enabled
+                                    ? "已启用"
+                                    : "已禁用"
+                                  : asset.enabled
+                                    ? "Enabled"
+                                    : "Disabled"}
                               </span>
                             </div>
                             <p className="mt-2 text-[13px] text-muted line-clamp-2">
                               {asset.body}
                             </p>
                             <small className="mt-3 block text-muted">
-                              {asset.trigger || "No trigger"}
+                              {asset.trigger ||
+                                (kind === "agents"
+                                  ? "未设置触发条件"
+                                  : "No trigger")}
                             </small>
                           </div>
                         ))}
@@ -1597,7 +1612,7 @@ function ManageSections({
                         setAssetFormOpen(true);
                       }}
                     >
-                      New {label}
+                      {kind === "agents" ? "新建规则" : `New ${label}`}
                     </Button>
                   }
                   rows={
@@ -1618,7 +1633,13 @@ function ManageSections({
                             <span>
                               <strong>{asset.title}</strong>
                               <small>
-                                {asset.enabled ? "Enabled" : "Disabled"}
+                                {kind === "agents"
+                                  ? asset.enabled
+                                    ? "已启用"
+                                    : "已禁用"
+                                  : asset.enabled
+                                    ? "Enabled"
+                                    : "Disabled"}
                                 {asset.trigger ? ` · ${asset.trigger}` : ""}
                               </small>
                             </span>
@@ -1645,10 +1666,16 @@ function ManageSections({
                                 }}
                               >
                                 {assetPending === asset.id
-                                  ? "Saving…"
+                                  ? kind === "agents"
+                                    ? "保存中…"
+                                    : "Saving…"
                                   : asset.enabled
-                                    ? "Disable"
-                                    : "Enable"}
+                                    ? kind === "agents"
+                                      ? "停用"
+                                      : "Disable"
+                                    : kind === "agents"
+                                      ? "启用"
+                                      : "Enable"}
                               </Button>
                               <Button
                                 className="bordered"
@@ -1662,7 +1689,7 @@ function ManageSections({
                                   setAssetScope(asset.scope);
                                 }}
                               >
-                                Edit
+                                {kind === "agents" ? "编辑" : "Edit"}
                               </Button>
                               <Button
                                 className="danger"
@@ -1675,19 +1702,23 @@ function ManageSections({
                                     .finally(() => setAssetPending(null));
                                 }}
                               >
-                                Delete
+                                {kind === "agents" ? "删除" : "Delete"}
                               </Button>
                             </span>
                           </div>
                         ))}
                       {!assets.some((asset) => asset.kind === kind) && (
                         <p className="px-4 py-6 text-[13px] text-muted">
-                          No {label} assets yet.
+                          {kind === "agents"
+                            ? "暂无规则。"
+                            : `No ${label} assets yet.`}
                         </p>
                       )}
                     </>
                   }
-                  empty={`No ${label} assets yet.`}
+                  empty={
+                    kind === "agents" ? "暂无规则。" : `No ${label} assets yet.`
+                  }
                 />
               ))}
             {assetFormOpen && (
