@@ -1914,7 +1914,7 @@ function ManageSections({
                     <input
                       value={assetScope}
                       onChange={(event) => setAssetScope(event.target.value)}
-                      placeholder={translate("Optional scope")}
+                      placeholder={translate("Workspace path (absolute)")}
                       disabled={assetScopeKind === "global"}
                     />
                   </label>
@@ -3094,13 +3094,7 @@ function StandalonePane({ route }: { route: PaneRoute }) {
             onError={(reason) => setError(errorMessage(reason))}
           />
         )}
-        {selected && route.tab === "artifacts" && (
-          <ArtifactsPane selected={selected} />
-        )}
-        {selected &&
-          route.tab !== "info" &&
-          route.tab !== "insights" &&
-          route.tab !== "artifacts" && (
+        {selected && route.tab !== "info" && route.tab !== "insights" && (
           <SurfaceView
             tab={route.tab as SurfaceTab | "pr"}
             selected={selected}
