@@ -4086,7 +4086,10 @@ function AppContent() {
     if (!homeHostId) return;
     void command<
       Array<{ id: string; label: string; available: boolean; reason?: string }>
-    >("harness_options", { hostId: homeHostId })
+    >("harness_options", {
+      hostId: homeHostId,
+      workspace: homeWorkspace || null,
+    })
       .then((options) => {
         setHarnessOptions(options);
         if (
@@ -4102,7 +4105,10 @@ function AppContent() {
     if (!selected) return;
     void command<
       Array<{ id: string; label: string; available: boolean; reason?: string }>
-    >("harness_options", { hostId: selected.host_id })
+    >("harness_options", {
+      hostId: selected.host_id,
+      workspace: selected.workspace || null,
+    })
       .then(setSelectedHarnessOptions)
       .catch(() => setSelectedHarnessOptions([]));
   }, [selected?.id, selected?.host_id]);

@@ -2376,7 +2376,12 @@ async fn change_harness(
         );
     }
     if harness == "opencode" {
-        let options = harness_options(state.clone(), session.host_id.clone()).await?;
+        let options = harness_options(
+            state.clone(),
+            session.host_id.clone(),
+            (!session.workspace.is_empty()).then_some(session.workspace.clone()),
+        )
+        .await?;
         let option = options
             .into_iter()
             .find(|option| option.id == "opencode")
@@ -2410,6 +2415,7 @@ async fn change_harness(
 async fn harness_options(
     state: State<'_, DesktopState>,
     host_id: String,
+    workspace: Option<String>,
 ) -> Result<Vec<HarnessAvailability>, String> {
     let mut options = vec![HarnessAvailability {
         id: "builtin".into(),
@@ -2418,14 +2424,15 @@ async fn harness_options(
         reason: None,
     }];
     let host: Arc<dyn Host> = if host_id == "local" {
-        Arc::new(
-            LocalHost::new(std::env::current_dir().map_err(|e| e.to_string())?)
-                .map_err(|e| e.to_string())?,
-        )
+        let workspace = workspace
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| "cannot probe OpenCode: explicit workspace is required".to_owned())?;
+        Arc::new(LocalHost::new(&workspace).map_err(|e| e.to_string())?)
     } else {
         let client = client_for(&state, &host_id)?;
-        let health = client.health().await.map_err(|e| e.to_string())?;
-        let workspace = health.workspace.unwrap_or_else(|| "/workspace".into());
+        let workspace = workspace
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| "cannot probe OpenCode: explicit workspace is required".to_owned())?;
         Arc::new(RvmHost::new(
             host_id.clone(),
             workspace.clone(),
@@ -2464,7 +2471,7 @@ async fn harness_options(
             env: None,
         })
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("cannot probe OpenCode on host: {e}"))?;
     options.push(HarnessAvailability {
         id: "opencode".into(),
         label: "OpenCode".into(),
@@ -3127,6 +3134,7 @@ async fn submit_opencode_turn(
         let mut events = harness.events().map_err(|error| error.to_string())?;
         let event_app = app.clone();
         let event_session = request.session_id.clone();
+        let event_store = Arc::clone(&state.store);
         tauri::async_runtime::spawn(async move {
             while let Some(event) = events.recv().await {
                 match event {
@@ -3148,9 +3156,9 @@ async fn submit_opencode_turn(
                         arguments_fragment,
                     } => emit(
                         &event_app,
-                        "tool_call_delta",
+                        "stream",
                         Some(&event_session),
-                        json!({"call_id":call_id,"tool":tool,"arguments_fragment":arguments_fragment}),
+                        json!({"tool_call_delta":{"id":call_id,"name":tool,"arguments_fragment":arguments_fragment}}),
                     ),
                     opcos_engine::HarnessEvent::ToolResult {
                         call_id,
@@ -3159,22 +3167,58 @@ async fn submit_opencode_turn(
                         result,
                     } => emit(
                         &event_app,
-                        "tool_result",
+                        "stream",
                         Some(&event_session),
-                        json!({"call_id":call_id,"tool":tool,"arguments":arguments,"result":result}),
+                        json!({"tool_result":{"call_id":call_id,"tool":tool,"arguments":redact_approval_value(&arguments),"result":redact_approval_value(&result)}}),
                     ),
-                    opcos_engine::HarnessEvent::ApprovalRequested(request) => emit(
-                        &event_app,
-                        "approval_requested",
-                        Some(&event_session),
-                        json!({"call_id":request.request_id,"tool":request.tool,"arguments":request.arguments}),
-                    ),
-                    opcos_engine::HarnessEvent::QuestionRequested(request) => emit(
-                        &event_app,
-                        "question_requested",
-                        Some(&event_session),
-                        json!({"call_id":request.request_id,"tool":request.tool,"arguments":request.arguments}),
-                    ),
+                    opcos_engine::HarnessEvent::ApprovalRequested(request) => {
+                        let unattended = event_store.is_unattended(&event_session).unwrap_or(false);
+                        if unattended {
+                            emit(
+                                &event_app,
+                                "notice",
+                                Some(&event_session),
+                                json!({"kind":"approval_pending","text":"Approval request sent to the Inbox"}),
+                            );
+                            emit(
+                                &event_app,
+                                "turn_done",
+                                Some(&event_session),
+                                session_status_payload_from_store(&event_store, &event_session),
+                            );
+                        } else {
+                            emit(
+                                &event_app,
+                                "approval",
+                                Some(&event_session),
+                                json!({"call_id":request.request_id,"tool":request.tool,"arguments":redact_approval_value(&request.arguments)}),
+                            );
+                        }
+                    }
+                    opcos_engine::HarnessEvent::QuestionRequested(request) => {
+                        let unattended = event_store.is_unattended(&event_session).unwrap_or(false);
+                        if unattended {
+                            emit(
+                                &event_app,
+                                "notice",
+                                Some(&event_session),
+                                json!({"kind":"question_pending","text":"Question sent to the Inbox"}),
+                            );
+                            emit(
+                                &event_app,
+                                "turn_done",
+                                Some(&event_session),
+                                session_status_payload_from_store(&event_store, &event_session),
+                            );
+                        } else {
+                            emit(
+                                &event_app,
+                                "question_requested",
+                                Some(&event_session),
+                                json!({"call_id":request.request_id,"tool":request.tool,"arguments":redact_approval_value(&request.arguments)}),
+                            );
+                        }
+                    }
                     opcos_engine::HarnessEvent::ApprovalEnrichmentFailed {
                         request_id,
                         reason,
@@ -3185,18 +3229,28 @@ async fn submit_opencode_turn(
                         Some(&event_session),
                         json!({"kind":"error","text":reason,"request_id":request_id}),
                     ),
-                    opcos_engine::HarnessEvent::Error { message } => emit(
-                        &event_app,
-                        "notice",
-                        Some(&event_session),
-                        json!({"kind":"error","text":message}),
-                    ),
-                    opcos_engine::HarnessEvent::TurnFinished { turn } => emit(
-                        &event_app,
-                        "turn_done",
-                        Some(&event_session),
-                        json!({"run_state":"idle","stop_reason":"none","turn":turn}),
-                    ),
+                    opcos_engine::HarnessEvent::Error { message } => {
+                        emit(
+                            &event_app,
+                            "notice",
+                            Some(&event_session),
+                            json!({"kind":"error","text":message}),
+                        );
+                        emit(
+                            &event_app,
+                            "turn_done",
+                            Some(&event_session),
+                            session_status_payload_from_store(&event_store, &event_session),
+                        );
+                    }
+                    opcos_engine::HarnessEvent::TurnFinished { turn } => {
+                        let mut payload =
+                            session_status_payload_from_store(&event_store, &event_session);
+                        if let Some(object) = payload.as_object_mut() {
+                            object.insert("turn".into(), json!(turn));
+                        }
+                        emit(&event_app, "turn_done", Some(&event_session), payload);
+                    }
                 }
             }
         });

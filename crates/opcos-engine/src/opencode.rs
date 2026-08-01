@@ -552,7 +552,7 @@ where
                 Some("inbox"),
             )?;
             recorder
-                .update_status("waiting", "waiting_for_approval")
+                .update_status("idle", "waiting_for_approval")
                 .map_err(|error| HarnessError::External(error.to_string()))?;
             pending_turns.lock().await.insert(
                 request.request_id.clone(),
@@ -588,8 +588,18 @@ where
     }
     if event_type == "question.asked" {
         if let Some(request) = question_request(properties, recorder.session_id()) {
+            recorder.save_pending(
+                &PendingRecord {
+                    session_id: recorder.session_id().into(),
+                    call_id: request.request_id.clone(),
+                    tool: "ask_user".into(),
+                    arguments: request.arguments.clone(),
+                    state: "waiting_user".into(),
+                },
+                Some("inbox"),
+            )?;
             recorder
-                .update_status("waiting", "waiting_for_user")
+                .update_status("idle", "waiting_for_user")
                 .map_err(|error| HarnessError::External(error.to_string()))?;
             let _ = events.send(HarnessEvent::QuestionRequested(request)).await;
         }
@@ -602,6 +612,14 @@ where
             .and_then(Value::as_str)
             == Some("idle")
     {
+        if !recorder
+            .store()
+            .load_pending(recorder.session_id())
+            .map_err(|error| HarnessError::External(error.to_string()))?
+            .is_empty()
+        {
+            return Ok(());
+        }
         if let Some((turn_id, turn)) = turns.lock().await.iter().next() {
             let result = AssistantTurn {
                 text: Some(turn.text.lock().await.clone()).filter(|text| !text.is_empty()),
