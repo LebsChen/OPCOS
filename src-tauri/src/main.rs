@@ -37,6 +37,7 @@ use opcos_rvm::{
 };
 use opcos_store::{
     ArtifactRecord, KeyringSecretStore, SecretStore, SessionRecord, SessionStore, SqliteStore,
+    ToolCallRecord,
 };
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -1589,74 +1590,185 @@ fn artifact_kind(path: &str) -> (&'static str, Option<&'static str>) {
     }
 }
 
-fn shell_artifact_path(command: &str) -> Option<String> {
-    let tokens = command.split_whitespace().collect::<Vec<_>>();
-    for (index, token) in tokens.iter().enumerate() {
-        if matches!(*token, ">" | ">>" | "tee") {
-            let path = tokens.get(index + 1)?.trim_matches(['"', '\'']);
-            if !path.is_empty() && path != "/dev/null" && path != "NUL" {
-                return Some(path.to_owned());
+fn shell_tokens(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    let mut characters = command.chars().peekable();
+    while let Some(character) = characters.next() {
+        if let Some(active_quote) = quote {
+            if character == active_quote {
+                quote = None;
+            } else {
+                token.push(character);
             }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '>' => {
+                if !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                }
+                if characters.peek() == Some(&'>') {
+                    characters.next();
+                    tokens.push(">>".into());
+                } else {
+                    tokens.push(">".into());
+                }
+            }
+            character if character.is_whitespace() => {
+                if !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                }
+            }
+            character => token.push(character),
         }
     }
-    None
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    tokens
 }
 
-fn record_artifacts(state: &DesktopState, session_id: &str, host_id: &str) -> Result<(), String> {
-    for call in state
-        .store
-        .load_tool_calls(session_id)
-        .map_err(|error| error.to_string())?
-    {
+fn shell_artifact_paths(command: &str) -> Vec<String> {
+    let tokens = shell_tokens(command);
+    let mut paths = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        match tokens[index].as_str() {
+            ">" | ">>" => {
+                if let Some(path) = tokens.get(index + 1)
+                    && !path.is_empty()
+                    && path != "/dev/null"
+                    && path != "NUL"
+                {
+                    paths.push(path.clone());
+                }
+                index += 2;
+            }
+            "tee" => {
+                index += 1;
+                while let Some(token) = tokens.get(index) {
+                    if token.starts_with('-') {
+                        index += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if let Some(path) = tokens.get(index)
+                    && !path.is_empty()
+                    && path != "/dev/null"
+                    && path != "NUL"
+                {
+                    paths.push(path.clone());
+                }
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    paths
+}
+
+const ARTIFACT_HASH_LIMIT: i64 = 8 * 1024 * 1024;
+
+async fn artifact_hash(
+    state: &DesktopState,
+    session_id: &str,
+    path: &str,
+    size_bytes: Option<i64>,
+) -> Option<String> {
+    if size_bytes.is_none_or(|size| size > ARTIFACT_HASH_LIMIT) {
+        return None;
+    }
+    let (host, _) = artifact_host(state, session_id).await.ok()?;
+    let path = host.join(path).ok()?;
+    let escaped = path.replace('\'', "'\\''");
+    let command = format!("sha256sum -- '{escaped}' 2>/dev/null || shasum -a 256 -- '{escaped}'");
+    let result = host
+        .exec(ExecRequest {
+            command,
+            cwd: None,
+            timeout_seconds: DEFAULT_EXEC_TIMEOUT_SECONDS,
+            session: None,
+            env: None,
+        })
+        .await
+        .ok()?;
+    if result.result.exit_code != 0 {
+        return None;
+    }
+    result
+        .result
+        .stdout
+        .split_whitespace()
+        .next()
+        .map(str::to_owned)
+}
+
+async fn record_artifacts(
+    state: &DesktopState,
+    session_id: &str,
+    host_id: &str,
+    calls: Vec<ToolCallRecord>,
+) -> Result<(), String> {
+    for call in calls {
         let Some(result) = call.result.as_ref() else {
             continue;
         };
         if result.get("error").is_some() {
             continue;
         }
-        let path = match call.name.as_str() {
+        let paths = match call.name.as_str() {
             "write_file" => call
                 .arguments
                 .get("path")
                 .and_then(Value::as_str)
-                .map(str::to_owned),
+                .map(str::to_owned)
+                .into_iter()
+                .collect(),
             "run_shell" | "exec" => call
                 .arguments
                 .get("command")
                 .and_then(Value::as_str)
-                .and_then(shell_artifact_path),
-            _ => None,
+                .map(shell_artifact_paths)
+                .unwrap_or_default(),
+            _ => Vec::new(),
         };
-        let Some(path) = path else {
+        if paths.is_empty() {
             continue;
-        };
-        let (kind, mime) = artifact_kind(&path);
-        let size_bytes = if call.name == "write_file" {
-            result.get("size").and_then(Value::as_i64).or_else(|| {
-                call.arguments
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .map(|content| content.len() as i64)
-            })
-        } else {
-            result.get("size").and_then(Value::as_i64)
-        };
-        state
-            .store
-            .upsert_artifact(&ArtifactRecord {
-                id: format!("{host_id}:{path}"),
-                session_id: session_id.to_owned(),
-                turn_id: call.message_sequence,
-                call_id: call.call_id,
-                host_id: host_id.to_owned(),
-                path,
-                size_bytes,
-                sha256: None,
-                mime: mime.map(str::to_owned),
-                kind: kind.to_owned(),
-                created_at: Utc::now(),
-            })
-            .map_err(|error| error.to_string())?;
+        }
+        for path in paths {
+            let (kind, mime) = artifact_kind(&path);
+            let size_bytes = if call.name == "write_file" {
+                result.get("size").and_then(Value::as_i64).or_else(|| {
+                    call.arguments
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map(|content| content.len() as i64)
+                })
+            } else {
+                result.get("size").and_then(Value::as_i64)
+            };
+            let sha256 = artifact_hash(state, session_id, &path, size_bytes).await;
+            state
+                .store
+                .upsert_artifact(&ArtifactRecord {
+                    id: format!("{session_id}:{host_id}:{path}"),
+                    session_id: session_id.to_owned(),
+                    turn_id: call.message_sequence,
+                    call_id: call.call_id.clone(),
+                    host_id: host_id.to_owned(),
+                    path,
+                    size_bytes,
+                    sha256,
+                    mime: mime.map(str::to_owned),
+                    kind: kind.to_owned(),
+                    created_at: Utc::now(),
+                })
+                .map_err(|error| error.to_string())?;
+        }
     }
     Ok(())
 }
@@ -1766,6 +1878,10 @@ async fn submit_turn(
         );
         return Err(format!("remote host unavailable: {error}"));
     }
+    let sequence_before = state
+        .store
+        .max_message_notice_sequence(&request.session_id)
+        .map_err(|error| error.to_string())?;
     let engine = engine_for(&app, &state, &request.session_id).await?;
     emit(
         &app,
@@ -1775,7 +1891,11 @@ async fn submit_turn(
     );
     match engine.submit_text(request.text).await {
         Ok(_) => {
-            record_artifacts(&state, &request.session_id, &host_id)?;
+            let calls = state
+                .store
+                .load_tool_calls_after(&request.session_id, sequence_before)
+                .map_err(|error| error.to_string())?;
+            record_artifacts(&state, &request.session_id, &host_id, calls).await?;
             emit(
                 &app,
                 "turn_done",
@@ -1785,7 +1905,11 @@ async fn submit_turn(
             Ok(())
         }
         Err(EngineError::ApprovalPending(call_id)) => {
-            record_artifacts(&state, &request.session_id, &host_id)?;
+            let calls = state
+                .store
+                .load_tool_calls_after(&request.session_id, sequence_before)
+                .map_err(|error| error.to_string())?;
+            record_artifacts(&state, &request.session_id, &host_id, calls).await?;
             if let Ok(Some(pending)) = state
                 .store
                 .load_pending(&request.session_id)
@@ -1820,7 +1944,11 @@ async fn submit_turn(
             Err(message)
         }
         Err(error) => {
-            record_artifacts(&state, &request.session_id, &host_id)?;
+            let calls = state
+                .store
+                .load_tool_calls_after(&request.session_id, sequence_before)
+                .map_err(|error| error.to_string())?;
+            record_artifacts(&state, &request.session_id, &host_id, calls).await?;
             let message = engine_error_message(error);
             if message.contains("denied") || message.contains("policy") {
                 audit(
@@ -1986,7 +2114,13 @@ async fn resolve_approval(
     );
     match result {
         Ok(()) => {
-            record_artifacts(&state, &session_id, &host_id)?;
+            let calls = state
+                .store
+                .load_tool_call(&session_id, &call_id)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .collect();
+            record_artifacts(&state, &session_id, &host_id, calls).await?;
             let _ = emit_pending_approval(&app, &state, &session_id)?;
             emit(
                 &app,
@@ -1998,7 +2132,13 @@ async fn resolve_approval(
         }
         Err(opcos_engine::EngineError::ApprovalPending(next_call_id)) => {
             let _ = next_call_id;
-            record_artifacts(&state, &session_id, &host_id)?;
+            let calls = state
+                .store
+                .load_tool_call(&session_id, &call_id)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .collect();
+            record_artifacts(&state, &session_id, &host_id, calls).await?;
             emit_pending_approval(&app, &state, &session_id)?;
             emit(
                 &app,
@@ -2010,7 +2150,13 @@ async fn resolve_approval(
         }
         Err(opcos_engine::EngineError::ApprovalAlreadyProcessed(_)) => Ok(()),
         Err(error) => {
-            record_artifacts(&state, &session_id, &host_id)?;
+            let calls = state
+                .store
+                .load_tool_call(&session_id, &call_id)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .collect();
+            record_artifacts(&state, &session_id, &host_id, calls).await?;
             Err(engine_error_message(error))
         }
     }
@@ -2987,9 +3133,17 @@ async fn run_schedule_for(
         )
         .map_err(|error| error.to_string())?;
     let engine = engine_for(app, state, &session_id).await?;
+    let sequence_before = state
+        .store
+        .max_message_notice_sequence(&session_id)
+        .map_err(|error| error.to_string())?;
     let result = engine.submit_text(prompt).await;
     let host_id = session_host_id(state, &session_id)?;
-    record_artifacts(state, &session_id, &host_id)?;
+    let calls = state
+        .store
+        .load_tool_calls_after(&session_id, sequence_before)
+        .map_err(|error| error.to_string())?;
+    record_artifacts(state, &session_id, &host_id, calls).await?;
     let result_label = if result.is_ok() { "ok" } else { "error" };
     state
         .database
@@ -3474,6 +3628,18 @@ mod m7_tests {
             assert!(reject_dangerous_git(command).is_err(), "{command}");
         }
         assert!(reject_dangerous_git("git add -- src/lib.rs").is_ok());
+    }
+
+    #[test]
+    fn shell_artifact_paths_cover_attached_quoted_and_repeated_redirects() {
+        assert_eq!(
+            shell_artifact_paths(r#"printf x >out.txt >> "reports/final output.txt""#),
+            vec!["out.txt", "reports/final output.txt"]
+        );
+        assert_eq!(
+            shell_artifact_paths("generate | tee -a reports/out.log"),
+            vec!["reports/out.log"]
+        );
     }
 
     #[test]

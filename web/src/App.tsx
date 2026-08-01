@@ -92,7 +92,9 @@ type RailIconName =
   | "code"
   | "grid"
   | "globe"
-  | "file";
+  | "file"
+  | "refresh"
+  | "back";
 
 function RailIcon({
   name,
@@ -206,6 +208,21 @@ function RailIcon({
           <path d="M14 3v6h6" />
           <line x1="8" y1="13" x2="16" y2="13" />
           <line x1="8" y1="17" x2="16" y2="17" />
+        </svg>
+      );
+    case "refresh":
+      return (
+        <svg {...s}>
+          <path d="M20 11a8 8 0 0 0-14.5-4L4 9" />
+          <path d="M4 4v5h5" />
+          <path d="M4 13a8 8 0 0 0 14.5 4L20 15" />
+          <path d="M20 20v-5h-5" />
+        </svg>
+      );
+    case "back":
+      return (
+        <svg {...s}>
+          <path d="m15 18-6-6 6-6" />
         </svg>
       );
   }
@@ -3007,7 +3024,23 @@ type ArtifactRecord = {
   path: string;
   kind: string;
   size_bytes?: number | null;
+  sha256?: string | null;
+  created_at: string;
 };
+
+function formatBytes(size: number | null | undefined) {
+  if (size == null) return "Size unavailable";
+  if (size < 1024) return `${size} B`;
+  const units = ["KB", "MB", "GB"];
+  let value = size;
+  let unit = "B";
+  for (const next of units) {
+    value /= 1024;
+    unit = next;
+    if (value < 1024) break;
+  }
+  return `${value.toFixed(value >= 10 ? 0 : 1)} ${unit}`;
+}
 
 function ArtifactsPane({ selected }: { selected: Session }) {
   const [artifacts, setArtifacts] = useState<ArtifactRecord[]>([]);
@@ -3049,7 +3082,7 @@ function ArtifactsPane({ selected }: { selected: Session }) {
             aria-label="Back to artifacts"
             title="Back"
           >
-            ←
+            <RailIcon name="back" size={16} />
           </button>
           <div className="artifact-heading">
             <div className="artifact-title">
@@ -3083,7 +3116,7 @@ function ArtifactsPane({ selected }: { selected: Session }) {
           onClick={refresh}
           title="Refresh artifacts"
         >
-          ↻
+          <RailIcon name="refresh" size={16} />
         </button>
       </div>
       <div className="rail-section-body">
@@ -3105,9 +3138,10 @@ function ArtifactsPane({ selected }: { selected: Session }) {
                 <span className="artifact-name">
                   {artifact.path.split(/[\\/]/).pop() || artifact.path}
                   <span className="artifact-row-meta">
-                    {artifact.size_bytes == null
-                      ? "Size unavailable"
-                      : `${artifact.size_bytes} B`}
+                    {formatBytes(artifact.size_bytes)}
+                    {artifact.sha256 ? "" : " · Hash not calculated"}
+                    {" · "}
+                    {new Date(artifact.created_at).toLocaleString()}
                   </span>
                 </span>
                 <span className="artifact-open">Open</span>
