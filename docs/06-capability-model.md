@@ -91,4 +91,5 @@ async fn spawn(&self, request: SpawnRequest) -> Result<Box<dyn HostProcess>, Hos
 - `LocalHost` 使用普通管道，避免没有必要的 PTY 噪声。
 - `RvmHost` 使用已有 `/pty-ws` 双向 WebSocket；RVM 主机端不做修改。
 - `/pty-ws` 是终端字节流，存在 echo、控制序列和窗口宽度导致换行污染风险。P2-2 接 OpenCode 时必须先验证 `--format json` 在该通道上的可靠性。
+- 远程 PTY 的进程流没有退出码，`ProcessEvent::Exited` 始终携带 `None`；本机管道可以交付真实退出码。P2-2 再考虑用 marker 回读远程退出码。
 - 远程能力只有在主机能力表声明 `pty` 时才把 `process_stream` 标记为可用；不可用主机仍显式返回不可用，不代理到本机。

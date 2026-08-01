@@ -1611,7 +1611,7 @@ mod tests {
                         })
                         .await
                         .unwrap();
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                     Ok(AssistantTurn {
                         text: Some("before ".into()),
                         tool_calls: vec![ToolCall {
@@ -1636,7 +1636,7 @@ mod tests {
                         })
                         .await
                         .unwrap();
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                     Ok(AssistantTurn {
                         text: Some("approval ".into()),
                         tool_calls: vec![ToolCall {
@@ -1661,7 +1661,7 @@ mod tests {
                         })
                         .await
                         .unwrap();
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                     Ok(turn)
                 }
                 _ => unreachable!(),

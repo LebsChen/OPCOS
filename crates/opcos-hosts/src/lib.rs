@@ -22,6 +22,7 @@ use tokio::{
     sync::{Mutex, mpsc, oneshot},
     time,
 };
+use uuid::Uuid;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Capability {
@@ -278,9 +279,15 @@ impl Host for RvmHost {
                 },
             )
             .await?;
+        let env_path = remote_env_path(&self.workspace, request.env.as_ref())?;
+        if let Some(path) = &env_path {
+            self.client
+                .write(path, &remote_env_file(request.env.as_ref())?)
+                .await?;
+        }
         let (mut sink, mut stream) = websocket.split();
         let (events, receiver) = mpsc::channel(64);
-        let command = remote_spawn_command(&request.command, request.env.as_ref())?;
+        let command = remote_spawn_command(&request.command, env_path.as_deref())?;
         sink.send(tokio_tungstenite::tungstenite::Message::Binary(
             format!("{command}\n").into_bytes().into(),
         ))
@@ -438,7 +445,9 @@ impl LocalHost {
                 available: true,
                 source: "static".into(),
                 observed_at,
-                reason: None,
+                reason: (*name == "process_stream").then(|| {
+                    "uses local pipes without PTY echo; process exit codes are available".into()
+                }),
             })
             .collect::<Vec<_>>();
         items.extend(unavailable.into_iter().map(|(name, reason)| Capability {
@@ -884,11 +893,38 @@ impl Utf8Decoder {
     }
 }
 
-fn remote_spawn_command(command: &str, env: Option<&Value>) -> Result<String, HostError> {
-    let Some(Value::Object(values)) = env else {
-        return Ok(command.to_owned());
+fn remote_spawn_command(command: &str, env_path: Option<&str>) -> Result<String, HostError> {
+    let prefix = if let Some(path) = env_path {
+        let path = shell_single_quote(path);
+        format!(
+            "chmod 600 '{path}' && set -a && . '{path}'; __opcos_env_status=$?; set +a; rm -f '{path}'; [ \"$__opcos_env_status\" -eq 0 ] || exit \"$__opcos_env_status\"; "
+        )
+    } else {
+        String::new()
     };
-    let assignments = values
+    Ok(format!("set +o history; {prefix}{command}"))
+}
+
+fn remote_env_path(workspace: &str, env: Option<&Value>) -> Result<Option<String>, HostError> {
+    let Some(Value::Object(values)) = env else {
+        return Ok(None);
+    };
+    if values.is_empty() {
+        return Ok(None);
+    }
+    let filename = format!(".opcos-env-{}.sh", Uuid::new_v4().simple());
+    let path = opcos_rvm::join_remote_path(workspace, &filename);
+    opcos_rvm::RemotePathGuard::new(workspace)
+        .path(&path)
+        .map(Some)
+        .map_err(|error| HostError::Path(error.to_string()))
+}
+
+fn remote_env_file(env: Option<&Value>) -> Result<String, HostError> {
+    let Some(Value::Object(values)) = env else {
+        return Ok(String::new());
+    };
+    values
         .iter()
         .filter_map(|(key, value)| value.as_str().map(|value| (key, value)))
         .map(|(key, value)| {
@@ -898,17 +934,13 @@ fn remote_spawn_command(command: &str, env: Option<&Value>) -> Result<String, Ho
                 ));
             }
             Ok(format!(
-                "{}='{}'; export {}; ",
+                "{}='{}'; export {};\n",
                 key,
                 shell_single_quote(value),
                 key
             ))
         })
-        .collect::<Result<String, HostError>>()?;
-    Ok(format!(
-        "({assignments} eval '{}')",
-        shell_single_quote(command)
-    ))
+        .collect()
 }
 
 fn is_shell_identifier(value: &str) -> bool {
@@ -1083,7 +1115,7 @@ fn remote_capabilities(
                     observed_at,
                     reason: if name == "process_stream" && available {
                         Some(
-                            "uses remote PTY bytes; echo, control sequences, and wrapping may affect structured output"
+                            "uses remote PTY bytes; echo, control sequences, wrapping, and no exit code may affect structured output"
                                 .into(),
                         )
                     } else {
@@ -1098,6 +1130,19 @@ fn remote_capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_spawn_env_line_does_not_contain_secret_value() {
+        let sentinel = "opcos-secret-sentinel";
+        let env = serde_json::json!({"OPCOS_SECRET_TEST": sentinel});
+        let path = remote_env_path("/workspace", Some(&env)).unwrap().unwrap();
+        let command = remote_spawn_command("printf ready", Some(&path)).unwrap();
+        assert!(!command.contains(sentinel));
+        assert!(command.contains("set +o history"));
+        assert!(command.contains("chmod 600"));
+        assert!(command.contains(&path));
+        assert!(remote_env_file(Some(&env)).unwrap().contains(sentinel));
+    }
     use std::fs;
 
     #[tokio::test]
