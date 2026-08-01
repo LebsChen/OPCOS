@@ -65,6 +65,21 @@ turn_start
 
 决策只有两个值：`allow` / `deny`（不是 `once` 之类的字符串），映射到 `approve: true|false`。每次决策都要写 `audit_events`，且**审计负载不得包含任何 token 或密钥值**（Den 明文规定审计负载剔除凭据［OW文］）。
 
+## 3.4.1 Inbox 挂起项与无人值守
+
+审批、`ask_user` 提问、目录/工作区请求和 `propose_plan` 统一写入 durable
+`pending` 表，使用 `kind`、`payload`、`created_at`、`state`、`resolution` 和
+`resolved_at` 表达同一条挂起项。状态只能从 `pending` 进入 `resolved` 或 `expired`；
+重复处理是幂等的，第一次解决结果保留。
+
+会话的无人值守开关单独持久化。开启后，挂起项的可见性为 `inbox`，会话仍使用既有
+二维状态 `idle / waiting_for_approval` 或 `idle / waiting_for_user`，不会引入新的
+运行状态词。应用重启只重建内存 engine，不丢失 Inbox 项；处理仍调用现有的
+`resolve_approval` 或 pending resume 路径。
+
+投递、处理和过期均写入 `audit_events`。进入存储和 UI 前，载荷必须沿用既有审批
+脱敏路径，禁止把 token、密码或其他凭据写入 Inbox。
+
 ## 3.5 产物（Artifacts）［推断］
 
 三个参照系统都有产物面板（Devin / Tembo / OpenWork）。OPCOS 目前只有 Diff 与 Worklog。目标态：

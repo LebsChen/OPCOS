@@ -368,6 +368,57 @@ where
         result
     }
 
+    pub async fn resolve_pending_input(
+        &self,
+        call_id: &str,
+        response: Value,
+    ) -> Result<AssistantTurn, EngineError> {
+        self.set_session_status("running", "none");
+        let result = self.resolve_pending_input_inner(call_id, response).await;
+        self.finish_turn(&result);
+        result
+    }
+
+    async fn resolve_pending_input_inner(
+        &self,
+        call_id: &str,
+        response: Value,
+    ) -> Result<AssistantTurn, EngineError> {
+        let message_sequence = self
+            .store
+            .load_messages(&self.session_id)
+            .map_err(|error| EngineError::Store(error.to_string()))?
+            .into_iter()
+            .rev()
+            .find(|message| {
+                message.role == "assistant"
+                    && message
+                        .content
+                        .get("tool_calls")
+                        .and_then(Value::as_array)
+                        .is_some_and(|calls| {
+                            calls
+                                .iter()
+                                .any(|call| call.get("id").and_then(Value::as_str) == Some(call_id))
+                        })
+            })
+            .map(|message| message.sequence)
+            .ok_or_else(|| EngineError::Store("pending assistant message not found".into()))?;
+        let pending = self
+            .store
+            .take_pending(&self.session_id, call_id)
+            .map_err(|error| EngineError::Store(error.to_string()))?
+            .ok_or_else(|| EngineError::ApprovalAlreadyProcessed(call_id.to_owned()))?;
+        let result = json!({"answer": response});
+        let value = json!({"role":"tool","content":[{"type":"tool_result",
+            "tool_use_id":pending.call_id,"content":[{"type":"text","text":result.to_string()}]}]});
+        self.append("tool", value).await?;
+        self.store
+            .complete_tool_call(&self.session_id, message_sequence, call_id, &result)
+            .map_err(|error| EngineError::Store(error.to_string()))?;
+        self.run_loop(self.provider_messages()?).await
+    }
+
     async fn resolve_approval_inner(
         &self,
         call_id: &str,
@@ -468,6 +519,18 @@ where
 
     pub fn set_unattended(&self, unattended: bool) {
         self.unattended.store(unattended, Ordering::SeqCst);
+    }
+
+    fn save_pending(&self, pending: &PendingRecord) -> Result<(), EngineError> {
+        self.store
+            .save_pending(pending)
+            .map_err(|error| EngineError::Store(error.to_string()))?;
+        if self.unattended.load(Ordering::SeqCst) {
+            self.store
+                .set_pending_visibility(&self.session_id, &pending.call_id, "inbox")
+                .map_err(|error| EngineError::Store(error.to_string()))?;
+        }
+        Ok(())
     }
     pub fn capabilities(&self, model: &str) -> Caps {
         self.provider.capabilities(model)
@@ -700,15 +763,13 @@ where
                 continue;
             }
             if matches!(call.name.as_str(), "propose_plan" | "ask_user") {
-                self.store
-                    .save_pending(&PendingRecord {
-                        session_id: self.session_id.clone(),
-                        call_id: call.id.clone(),
-                        tool: call.name.clone(),
-                        arguments: call.arguments.clone(),
-                        state: call.name.clone(),
-                    })
-                    .map_err(|error| EngineError::Store(error.to_string()))?;
+                self.save_pending(&PendingRecord {
+                    session_id: self.session_id.clone(),
+                    call_id: call.id.clone(),
+                    tool: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    state: call.name.clone(),
+                })?;
                 let completed_reads = futures_util::future::join_all(readonly.drain(..).map(
                     |(read_index, read_call): (usize, &ToolCall)| async move {
                         let result = self.execute_tool(read_call).await;
@@ -732,15 +793,13 @@ where
                 self.persist_tool_results(assistant_sequence, &calls[..index], completed)
                     .await?;
                 for remaining in &calls[index + 1..] {
-                    self.store
-                        .save_pending(&PendingRecord {
-                            session_id: self.session_id.clone(),
-                            call_id: remaining.id.clone(),
-                            tool: remaining.name.clone(),
-                            arguments: remaining.arguments.clone(),
-                            state: "pending".into(),
-                        })
-                        .map_err(|error| EngineError::Store(error.to_string()))?;
+                    self.save_pending(&PendingRecord {
+                        session_id: self.session_id.clone(),
+                        call_id: remaining.id.clone(),
+                        tool: remaining.name.clone(),
+                        arguments: remaining.arguments.clone(),
+                        state: "pending".into(),
+                    })?;
                 }
                 return Err(EngineError::ApprovalPending(call.id.clone()));
             }
@@ -782,25 +841,21 @@ where
                     self.persist_tool_results(assistant_sequence, &calls[..index], completed)
                         .await?;
                     for remaining in &calls[index + 1..] {
-                        self.store
-                            .save_pending(&PendingRecord {
-                                session_id: self.session_id.clone(),
-                                call_id: remaining.id.clone(),
-                                tool: remaining.name.clone(),
-                                arguments: remaining.arguments.clone(),
-                                state: "pending".into(),
-                            })
-                            .map_err(|error| EngineError::Store(error.to_string()))?;
-                    }
-                    self.store
-                        .save_pending(&PendingRecord {
+                        self.save_pending(&PendingRecord {
                             session_id: self.session_id.clone(),
-                            call_id: call.id.clone(),
-                            tool: call.name.clone(),
-                            arguments: call.arguments.clone(),
+                            call_id: remaining.id.clone(),
+                            tool: remaining.name.clone(),
+                            arguments: remaining.arguments.clone(),
                             state: "pending".into(),
-                        })
-                        .map_err(|error| EngineError::Store(error.to_string()))?;
+                        })?;
+                    }
+                    self.save_pending(&PendingRecord {
+                        session_id: self.session_id.clone(),
+                        call_id: call.id.clone(),
+                        tool: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                        state: "pending".into(),
+                    })?;
                     return Err(EngineError::ApprovalPending(call.id.clone()));
                 }
             }
@@ -1485,6 +1540,7 @@ mod tests {
             PermissionMode::Auto,
             "fake",
         );
+        engine.set_unattended(true);
         let calls = vec![
             ToolCall {
                 id: "read-before-plan".into(),
@@ -1520,6 +1576,7 @@ mod tests {
                 .any(|call| { call.call_id == "read-before-plan" && call.result.is_some() })
         );
         assert_eq!(store.load_pending("s").unwrap()[0].state, "propose_plan");
+        assert_eq!(store.list_inbox().unwrap()[0].kind, "plan");
         store.delete_pending("s", "plan-1").unwrap();
         let ask = ToolCall {
             id: "ask-1".into(),

@@ -97,6 +97,20 @@ pub struct PendingRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct InboxRecord {
+    pub session_id: String,
+    pub call_id: String,
+    pub kind: String,
+    pub tool: String,
+    pub payload: serde_json::Value,
+    pub state: String,
+    pub visibility: String,
+    pub created_at: String,
+    pub resolution: Option<String>,
+    pub resolved_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct CompactionRecord {
     pub session_id: String,
     pub summary: String,
@@ -464,6 +478,21 @@ pub trait SessionStore {
         session_id: &str,
         call_id: &str,
     ) -> Result<Option<PendingRecord>, StoreError>;
+    fn set_pending_visibility(
+        &self,
+        session_id: &str,
+        call_id: &str,
+        visibility: &str,
+    ) -> Result<(), StoreError>;
+    fn set_unattended(&self, session_id: &str, unattended: bool) -> Result<(), StoreError>;
+    fn is_unattended(&self, session_id: &str) -> Result<bool, StoreError>;
+    fn list_inbox(&self) -> Result<Vec<InboxRecord>, StoreError>;
+    fn resolve_inbox(
+        &self,
+        session_id: &str,
+        call_id: &str,
+        resolution: &str,
+    ) -> Result<bool, StoreError>;
     fn save_compaction(&self, state: &CompactionRecord) -> Result<(), StoreError>;
     fn load_compaction(&self, session_id: &str) -> Result<Option<CompactionRecord>, StoreError>;
     fn save_grant(&self, grant: &GrantRecord) -> Result<(), StoreError>;
@@ -478,6 +507,7 @@ pub trait SessionStore {
         run_state: &str,
         stop_reason: &str,
     ) -> Result<(), StoreError>;
+    fn update_session_mode(&self, session_id: &str, mode: &str) -> Result<(), StoreError>;
 }
 
 pub trait SecretStore: Send + Sync {
@@ -1018,6 +1048,12 @@ impl SqliteStore {
                tool TEXT NOT NULL,
                arguments TEXT NOT NULL,
                state TEXT NOT NULL,
+               kind TEXT NOT NULL DEFAULT 'approval',
+               payload TEXT NOT NULL DEFAULT '{}',
+               visibility TEXT NOT NULL DEFAULT 'inline',
+               created_at TEXT NOT NULL DEFAULT '',
+               resolution TEXT,
+               resolved_at TEXT,
                PRIMARY KEY(session_id, call_id)
              );
              CREATE TABLE IF NOT EXISTS usage_events (
@@ -1060,6 +1096,10 @@ impl SqliteStore {
              CREATE TABLE IF NOT EXISTS schema_migrations (
                version INTEGER PRIMARY KEY,
                applied_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS session_preferences (
+               session_id TEXT PRIMARY KEY,
+               unattended INTEGER NOT NULL DEFAULT 0
              );",
             )?;
             let created_at_column = table_columns(&connection, "sessions")?
@@ -1094,6 +1134,26 @@ impl SqliteStore {
                     [],
                 )?;
             }
+            let pending_columns = table_columns(&connection, "pending")?;
+            for (name, definition) in [
+                ("kind", "TEXT NOT NULL DEFAULT 'approval'"),
+                ("payload", "TEXT NOT NULL DEFAULT '{}'"),
+                ("visibility", "TEXT NOT NULL DEFAULT 'inline'"),
+                ("created_at", "TEXT NOT NULL DEFAULT ''"),
+                ("resolution", "TEXT"),
+                ("resolved_at", "TEXT"),
+            ] {
+                if !pending_columns.iter().any(|column| column == name) {
+                    connection.execute(
+                        &format!("ALTER TABLE pending ADD COLUMN {name} {definition}"),
+                        [],
+                    )?;
+                }
+            }
+            connection.execute(
+                "UPDATE pending SET created_at=?1 WHERE created_at=''",
+                [Utc::now().to_rfc3339()],
+            )?;
             if table_exists(&connection, "sessions_legacy_p0_1")? {
                 migrate_legacy_sessions(&connection)?;
             }
@@ -1205,6 +1265,17 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub fn update_session_mode(&self, session_id: &str, mode: &str) -> Result<(), StoreError> {
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "UPDATE sessions SET mode=?1, updated_at=?2 WHERE session_id=?3",
+                params![mode, Utc::now().to_rfc3339(), session_id],
+            )?;
+        Ok(())
+    }
+
     pub fn update_session_status(
         &self,
         session_id: &str,
@@ -1230,6 +1301,10 @@ impl SessionStore for SqliteStore {
         stop_reason: &str,
     ) -> Result<(), StoreError> {
         SqliteStore::update_session_status(self, session_id, run_state, stop_reason)
+    }
+
+    fn update_session_mode(&self, session_id: &str, mode: &str) -> Result<(), StoreError> {
+        SqliteStore::update_session_mode(self, session_id, mode)
     }
 
     fn append_message(&self, message: &StoredMessage) -> Result<(), StoreError> {
@@ -1309,9 +1384,10 @@ impl SessionStore for SqliteStore {
 
     fn save_pending(&self, pending: &PendingRecord) -> Result<(), StoreError> {
         self.connection.lock().expect("sqlite mutex poisoned").execute(
-            "INSERT OR REPLACE INTO pending(session_id,call_id,tool,arguments,state) VALUES (?1,?2,?3,?4,?5)",
+            "INSERT OR REPLACE INTO pending(session_id,call_id,tool,arguments,state,kind,payload,visibility,created_at,resolution,resolved_at)
+             VALUES (?1,?2,?3,?4,?5,CASE WHEN ?3='ask_user' THEN 'question' WHEN ?3='propose_plan' THEN 'plan' ELSE 'approval' END,?4,'inline',?6,NULL,NULL)",
             params![pending.session_id, pending.call_id, pending.tool,
-                serde_json::to_string(&pending.arguments)?, pending.state],
+                serde_json::to_string(&pending.arguments)?, pending.state, Utc::now().to_rfc3339()],
         )?;
         Ok(())
     }
@@ -1319,7 +1395,8 @@ impl SessionStore for SqliteStore {
     fn load_pending(&self, session_id: &str) -> Result<Vec<PendingRecord>, StoreError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT session_id,call_id,tool,arguments,state FROM pending WHERE session_id=?1 ORDER BY call_id",
+            "SELECT session_id,call_id,tool,arguments,state FROM pending
+             WHERE session_id=?1 AND state NOT IN ('resolved','expired') ORDER BY call_id",
         )?;
         let rows = statement.query_map([session_id], |row| {
             let arguments: String = row.get(3)?;
@@ -1361,7 +1438,8 @@ impl SessionStore for SqliteStore {
         let pending = transaction
             .query_row(
                 "SELECT session_id,call_id,tool,arguments,state
-                 FROM pending WHERE session_id=?1 AND call_id=?2",
+                 FROM pending WHERE session_id=?1 AND call_id=?2
+                 AND state NOT IN ('resolved','expired')",
                 params![session_id, call_id],
                 |row| {
                     let arguments: String = row.get(3)?;
@@ -1383,12 +1461,105 @@ impl SessionStore for SqliteStore {
             .optional()?;
         if pending.is_some() {
             transaction.execute(
-                "DELETE FROM pending WHERE session_id=?1 AND call_id=?2",
-                params![session_id, call_id],
+                "UPDATE pending SET state='resolved', resolved_at=?3
+                 WHERE session_id=?1 AND call_id=?2",
+                params![session_id, call_id, Utc::now().to_rfc3339()],
             )?;
         }
         transaction.commit()?;
         Ok(pending)
+    }
+
+    fn set_pending_visibility(
+        &self,
+        session_id: &str,
+        call_id: &str,
+        visibility: &str,
+    ) -> Result<(), StoreError> {
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "UPDATE pending SET visibility=?3 WHERE session_id=?1 AND call_id=?2",
+                params![session_id, call_id, visibility],
+            )?;
+        Ok(())
+    }
+
+    fn set_unattended(&self, session_id: &str, unattended: bool) -> Result<(), StoreError> {
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "INSERT INTO session_preferences(session_id,unattended) VALUES (?1,?2)
+             ON CONFLICT(session_id) DO UPDATE SET unattended=excluded.unattended",
+                params![session_id, unattended],
+            )?;
+        Ok(())
+    }
+
+    fn is_unattended(&self, session_id: &str) -> Result<bool, StoreError> {
+        let value = self
+            .connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .query_row(
+                "SELECT unattended FROM session_preferences WHERE session_id=?1",
+                [session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(value.unwrap_or(0) != 0)
+    }
+
+    fn list_inbox(&self) -> Result<Vec<InboxRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT session_id,call_id,kind,tool,payload,state,visibility,created_at,resolution,resolved_at
+             FROM pending WHERE visibility='inbox' ORDER BY created_at DESC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let payload: String = row.get(4)?;
+            Ok(InboxRecord {
+                session_id: row.get(0)?,
+                call_id: row.get(1)?,
+                kind: row.get(2)?,
+                tool: row.get(3)?,
+                payload: serde_json::from_str(&payload).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                state: row.get(5)?,
+                visibility: row.get(6)?,
+                created_at: row.get(7)?,
+                resolution: row.get(8)?,
+                resolved_at: row.get(9)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn resolve_inbox(
+        &self,
+        session_id: &str,
+        call_id: &str,
+        resolution: &str,
+    ) -> Result<bool, StoreError> {
+        let changed = self
+            .connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "UPDATE pending SET state='resolved', resolution=?3, resolved_at=?4
+             WHERE session_id=?1 AND call_id=?2
+               AND (state NOT IN ('resolved','expired')
+                    OR (state='resolved' AND resolution IS NULL))",
+                params![session_id, call_id, resolution, Utc::now().to_rfc3339()],
+            )?;
+        Ok(changed == 1)
     }
 
     fn save_compaction(&self, state: &CompactionRecord) -> Result<(), StoreError> {
@@ -1910,6 +2081,45 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "approval_allowed");
         assert_eq!(events[0].payload["call_id"], "call-1");
+    }
+
+    #[test]
+    fn inbox_items_are_durable_and_idempotent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .save_pending(&PendingRecord {
+                session_id: "unattended".into(),
+                call_id: "call-1".into(),
+                tool: "run_shell".into(),
+                arguments: serde_json::json!({"command":"echo hi"}),
+                state: "pending".into(),
+            })
+            .unwrap();
+        store
+            .set_pending_visibility("unattended", "call-1", "inbox")
+            .unwrap();
+        let items = store.list_inbox().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].state, "pending");
+        assert!(
+            store
+                .resolve_inbox("unattended", "call-1", "allow")
+                .unwrap()
+        );
+        assert!(!store.resolve_inbox("unattended", "call-1", "deny").unwrap());
+        let reloaded = store.list_inbox().unwrap();
+        assert_eq!(reloaded[0].resolution.as_deref(), Some("allow"));
+        assert_eq!(reloaded[0].state, "resolved");
+    }
+
+    #[test]
+    fn unattended_preference_survives_store_reopen() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert!(!store.is_unattended("s").unwrap());
+        store.set_unattended("s", true).unwrap();
+        assert!(store.is_unattended("s").unwrap());
+        store.set_unattended("s", false).unwrap();
+        assert!(!store.is_unattended("s").unwrap());
     }
 
     #[test]

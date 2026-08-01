@@ -74,6 +74,8 @@
 
 - 做：审批、提问、目录请求、计划确认统一停放 durable Inbox；会话可标记 unattended；断线重连后恢复挂起项（参照 OpenWorker 的模型）。
 - 验收：unattended 会话产生的审批出现在 Inbox；重启 app 后仍在，处理后会话继续。
+- 实现约束：挂起项统一复用 `pending` durable 表，状态为 `pending/resolved/expired`；
+  处理必须幂等，投递/处理/过期写入 `audit_events`，载荷沿既有脱敏路径处理。
 
 ### P1-5 全局 Instructions
 

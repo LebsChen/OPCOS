@@ -1710,6 +1710,12 @@ async fn engine_for(
         permission_mode,
         model,
     ));
+    engine.set_unattended(
+        state
+            .store
+            .is_unattended(session_id)
+            .map_err(|error| error.to_string())?,
+    );
     let mut allowed_tools = allowed_tools;
     if let Some(executor_client) = &remote_client
         && let Ok(response) = executor_client
@@ -2765,11 +2771,42 @@ async fn submit_turn(
             Ok(())
         }
         Err(EngineError::ApprovalPending(call_id)) => {
+            let unattended = state
+                .store
+                .is_unattended(&request.session_id)
+                .map_err(|error| error.to_string())?;
+            if unattended {
+                state
+                    .store
+                    .set_pending_visibility(&request.session_id, &call_id, "inbox")
+                    .map_err(|error| error.to_string())?;
+                audit(
+                    &state,
+                    &request.session_id,
+                    "pending_item_delivered",
+                    json!({"call_id": call_id, "visibility": "inbox"}),
+                );
+            }
             let calls = state
                 .store
                 .load_tool_calls_after(&request.session_id, sequence_before)
                 .map_err(|error| error.to_string())?;
             record_artifacts_best_effort(&app, &state, &request.session_id, &host_id, calls).await;
+            if unattended {
+                emit(
+                    &app,
+                    "notice",
+                    Some(&request.session_id),
+                    json!({"kind":"approval_pending","text":"Approval required; delivered to Inbox"}),
+                );
+                emit(
+                    &app,
+                    "turn_done",
+                    Some(&request.session_id),
+                    session_status_payload(&state, &request.session_id),
+                );
+                return Ok(());
+            }
             if let Ok(Some(pending)) = state
                 .store
                 .load_pending(&request.session_id)
@@ -3008,6 +3045,142 @@ async fn resolve_approval(
             record_artifacts_best_effort(&app, &state, &session_id, &host_id, calls).await;
             Err(engine_error_message(error))
         }
+    }
+}
+
+#[tauri::command]
+fn list_inbox(state: State<'_, DesktopState>) -> Result<Vec<opcos_store::InboxRecord>, String> {
+    state
+        .store
+        .list_inbox()
+        .map(|items| {
+            items
+                .into_iter()
+                .map(|mut item| {
+                    item.payload = redact_approval_value(&item.payload);
+                    item
+                })
+                .collect()
+        })
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn get_unattended(state: State<'_, DesktopState>, session_id: String) -> Result<bool, String> {
+    state
+        .store
+        .is_unattended(&session_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn set_unattended(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    session_id: String,
+    unattended: bool,
+) -> Result<(), String> {
+    state
+        .store
+        .set_unattended(&session_id, unattended)
+        .map_err(|error| error.to_string())?;
+    if let Some(engine) = state.engines.lock().await.get(&session_id).cloned() {
+        engine.set_unattended(unattended);
+    }
+    audit(
+        &state,
+        &session_id,
+        "unattended_changed",
+        json!({"unattended": unattended}),
+    );
+    emit(
+        &app,
+        "unattended_changed",
+        Some(&session_id),
+        json!({"unattended": unattended}),
+    );
+    Ok(())
+}
+
+#[tauri::command]
+fn change_mode(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    mode: String,
+) -> Result<(), String> {
+    state
+        .store
+        .update_session_mode(&session_id, &mode)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn resolve_inbox(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    session_id: String,
+    call_id: String,
+    resolution: String,
+) -> Result<(), String> {
+    let item = state
+        .store
+        .list_inbox()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|item| item.session_id == session_id && item.call_id == call_id)
+        .ok_or_else(|| "inbox item not found".to_owned())?;
+    if item.state == "resolved" || item.state == "expired" {
+        return Ok(());
+    }
+    let engine = engine_for(&app, &state, &session_id).await?;
+    let result = if item.kind == "approval" {
+        engine
+            .resolve_approval(
+                &call_id,
+                if resolution == "allow" {
+                    opcos_engine::ApprovalOutcome::Approve
+                } else {
+                    opcos_engine::ApprovalOutcome::Deny
+                },
+            )
+            .await
+            .map(|_| ())
+    } else {
+        engine
+            .resolve_pending_input(&call_id, Value::String(resolution.clone()))
+            .await
+            .map(|_| ())
+    };
+    match result {
+        Ok(()) | Err(opcos_engine::EngineError::ApprovalAlreadyProcessed(_)) => {
+            let _ = state
+                .store
+                .resolve_inbox(&session_id, &call_id, &resolution);
+            audit(
+                &state,
+                &session_id,
+                "pending_item_resolved",
+                redact_approval_value(&json!({
+                    "call_id": call_id,
+                    "kind": item.kind,
+                    "resolution": resolution
+                })),
+            );
+            emit(
+                &app,
+                "inbox_resolved",
+                Some(&session_id),
+                json!({"call_id": call_id, "resolution": resolution}),
+            );
+            emit(
+                &app,
+                "turn_done",
+                Some(&session_id),
+                session_status_payload(&state, &session_id),
+            );
+            Ok(())
+        }
+        Err(error) => Err(engine_error_message(error)),
     }
 }
 
@@ -5112,6 +5285,11 @@ fn main() {
             interrupt,
             steering,
             resolve_approval,
+            list_inbox,
+            get_unattended,
+            set_unattended,
+            change_mode,
+            resolve_inbox,
             change_model,
             change_provider,
             provider_descriptors,
