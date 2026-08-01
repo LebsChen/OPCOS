@@ -474,7 +474,7 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                key TEXT PRIMARY KEY,
                value TEXT NOT NULL
              );
-             CREATE TABLE IF NOT EXISTS schema_migrations (
+             CREATE TABLE IF NOT EXISTS desktop_schema_migrations (
                version TEXT PRIMARY KEY,
                applied_at TEXT NOT NULL
              );
@@ -541,7 +541,7 @@ fn content_hash(content: &str) -> String {
 fn migrate_config_objects(connection: &mut Connection) -> Result<(), String> {
     let migrated: bool = connection
         .query_row(
-            "SELECT COUNT(*) FROM schema_migrations WHERE version='p1-1-config-objects'",
+            "SELECT COUNT(*) FROM desktop_schema_migrations WHERE version='p1-1-config-objects'",
             [],
             |row| row.get::<_, i64>(0),
         )
@@ -717,11 +717,26 @@ fn migrate_config_objects(connection: &mut Connection) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     transaction
         .execute(
-            "INSERT OR IGNORE INTO session_config_versions(session_id,object_id,version_id)
-             SELECT s.session_id,m.object_id,o.current_version_id
+            "INSERT OR REPLACE INTO asset_session_selection(session_id,asset_id,enabled)
+             SELECT s.session_id,m.object_id,s.enabled
              FROM asset_session_selection s
-             JOIN config_object_legacy_map m ON m.legacy_asset_id=s.asset_id
-             JOIN config_object o ON o.id=m.object_id
+             JOIN config_object_legacy_map m ON m.legacy_asset_id=s.asset_id",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM asset_session_selection
+             WHERE asset_id IN (SELECT legacy_asset_id FROM config_object_legacy_map)",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO session_config_versions(session_id,object_id,version_id)
+             SELECT s.session_id,s.asset_id,o.current_version_id
+             FROM asset_session_selection s
+             JOIN config_object o ON o.id=s.asset_id
              WHERE s.enabled=1 AND o.current_version_id IS NOT NULL",
             [],
         )
@@ -747,7 +762,7 @@ fn migrate_config_objects(connection: &mut Connection) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     transaction
         .execute(
-            "INSERT INTO schema_migrations(version,applied_at) VALUES ('p1-1-config-objects',?1)",
+            "INSERT INTO desktop_schema_migrations(version,applied_at) VALUES ('p1-1-config-objects',?1)",
             [Utc::now().to_rfc3339()],
         )
         .map_err(|error| error.to_string())?;
@@ -1161,13 +1176,7 @@ fn load_session_config_assets(
              FROM session_config_versions s
              JOIN config_object o ON o.id=s.object_id
              JOIN config_object_version v ON v.id=s.version_id
-             LEFT JOIN asset_session_selection legacy
-               ON legacy.session_id=s.session_id AND legacy.asset_id=(
-                 SELECT legacy_asset_id FROM config_object_legacy_map
-                 WHERE object_id=s.object_id LIMIT 1
-               )
-             WHERE s.session_id=?1 AND o.status='active'
-               AND COALESCE(legacy.enabled,1)=1",
+             WHERE s.session_id=?1 AND o.status='active'",
         )
         .map_err(|error| error.to_string())?;
     statement
@@ -2723,11 +2732,16 @@ fn save_asset(
     };
     let scope_key = scope.filter(|value| !value.is_empty());
     let scope_kind = match scope_kind.as_deref() {
-        Some("global") if scope_key.is_none() => "global",
+        Some("global") => "global",
         Some("repo") if scope_key.is_some() => "repo",
         Some("host") if scope_key.is_some() => "host",
         _ if scope_key.is_some() => "repo",
         _ => "global",
+    };
+    let scope_key = if scope_kind == "global" {
+        None
+    } else {
+        scope_key
     };
     let status = if enabled.unwrap_or(true) {
         "active"
@@ -3885,6 +3899,7 @@ async fn run_schedule_for(
             params![schedule_id, Utc::now().to_rfc3339()],
         )
         .map_err(|error| error.to_string())?;
+    let started_at = Utc::now().to_rfc3339();
     let engine = engine_for(app, state, &session_id).await?;
     let sequence_before = state
         .store
@@ -3915,8 +3930,8 @@ async fn run_schedule_for(
                 schedule_id,
                 object_id,
                 version_id,
+                started_at,
                 finished_at,
-                Utc::now().to_rfc3339(),
                 result_label
             ],
         )
@@ -4414,7 +4429,8 @@ mod m7_tests {
         let mut connection = Connection::open_in_memory().unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE schema_migrations(version TEXT PRIMARY KEY, applied_at TEXT NOT NULL);
+                "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+                 CREATE TABLE desktop_schema_migrations(version TEXT PRIMARY KEY, applied_at TEXT NOT NULL);
                  CREATE TABLE schedules(
                    id TEXT PRIMARY KEY, name TEXT NOT NULL, session_id TEXT NOT NULL,
                    playbook_id TEXT NOT NULL, cron TEXT NOT NULL, enabled INTEGER NOT NULL,
@@ -4493,7 +4509,8 @@ mod m7_tests {
         let mut connection = Connection::open_in_memory().unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE schema_migrations(version TEXT PRIMARY KEY, applied_at TEXT NOT NULL);
+                "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+                 CREATE TABLE desktop_schema_migrations(version TEXT PRIMARY KEY, applied_at TEXT NOT NULL);
                  CREATE TABLE schedules(
                    id TEXT PRIMARY KEY, name TEXT NOT NULL, session_id TEXT NOT NULL,
                    playbook_id TEXT NOT NULL, cron TEXT NOT NULL, enabled INTEGER NOT NULL,
