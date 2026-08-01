@@ -287,6 +287,14 @@ mod tests {
     use super::*;
     use opcos_hosts::LocalHost;
 
+    fn local_rg_available() -> bool {
+        std::process::Command::new("sh")
+            .args(["-c", "command -v rg"])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
     #[test]
     fn index_path_is_stable_and_workspace_scoped() {
         assert_eq!(
@@ -320,6 +328,10 @@ mod tests {
 
     #[tokio::test]
     async fn local_host_builds_a_real_ready_index() {
+        if !local_rg_available() {
+            println!("skipped: local repository index test requires ripgrep (rg)");
+            return;
+        }
         let started = std::time::Instant::now();
         let host = LocalHost::new(env!("CARGO_MANIFEST_DIR")).expect("local host");
         let root = std::env::temp_dir().join(format!("opcos-index-test-{}", std::process::id()));
@@ -339,6 +351,10 @@ mod tests {
 
     #[tokio::test]
     async fn local_host_builds_larger_index_without_timeout() {
+        if !local_rg_available() {
+            println!("skipped: larger local repository index test requires ripgrep (rg)");
+            return;
+        }
         let workspace = concat!(env!("CARGO_MANIFEST_DIR"), "/../web");
         let started = std::time::Instant::now();
         let host = LocalHost::new(workspace).expect("larger local host");
@@ -355,6 +371,28 @@ mod tests {
             started.elapsed(),
             index.files.len()
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn local_host_reports_missing_rg_without_fabricating_index() {
+        if local_rg_available() {
+            println!("skipped: missing-rg assertion requires a host without ripgrep");
+            return;
+        }
+        let host = LocalHost::new(env!("CARGO_MANIFEST_DIR")).expect("local host");
+        let root =
+            std::env::temp_dir().join(format!("opcos-index-missing-rg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let error = build(&root, "local-missing-rg", env!("CARGO_MANIFEST_DIR"), &host)
+            .await
+            .expect_err("missing rg must make the index unavailable");
+        assert!(error.contains("host is missing ripgrep (rg)"));
+        let index = load(&root, "local-missing-rg", env!("CARGO_MANIFEST_DIR"))
+            .expect("unavailable index should be persisted")
+            .expect("unavailable index should exist");
+        assert_eq!(index.status, "unavailable");
+        assert_eq!(index.error.as_deref(), Some(error.as_str()));
         let _ = std::fs::remove_dir_all(root);
     }
 }
