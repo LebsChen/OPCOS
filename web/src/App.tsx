@@ -32,6 +32,7 @@ import { Composer } from "./components/Composer";
 import { RightRail } from "./components/RightRail";
 import { SelectMenu as OpenWorkerSelectMenu } from "./components/SelectMenu";
 import { SettingsView, type SettingsSection } from "./components/SettingsView";
+import { Icon } from "./components/Icon";
 import "./openworker-tailwind.css";
 import "./openworker-styles.css";
 import "./style.css";
@@ -81,38 +82,6 @@ async function command<T>(
     return new Promise<T>(() => {});
   }
   return invoke<T>(name, args);
-}
-
-function Icon({ name, size = 16 }: { name: string; size?: number }) {
-  const paths: Record<string, string> = {
-    plus: "M8 3v10M3 8h10",
-    search: "m11 11 4 4m-1.5-8A4.5 4.5 0 1 1 4.5 7 4.5 4.5 0 0 1 13.5 7Z",
-    settings:
-      "M6.5 2h3l.5 2 1.5.8 1.8-.9 2.1 2.1-.9 1.8.8 1.5 2 .5v3l-2 .5-.8 1.5.9 1.8-2.1 2.1-1.8-.9-1.5.8-.5 2h-3l-.5-2-1.5-.8-1.8.9-2.1-2.1.9-1.8-.8-1.5-2-.5v-3l2-.5.8-1.5-.9-1.8L3.2 4.7l1.8.9 1.5-.8.5-2Z M8 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z",
-    activity: "M2 8h3l1.5-4L10 12l1.5-4H15",
-    send: "m2 2 13 6-13 6 3-6-3-6Zm3 6h10",
-    stop: "M4 4h8v8H4z",
-    terminal: "m3 4 4 4-4 4m6 0h4",
-    desktop: "M2 3h12v8H2zM6 14h4M8 11v3",
-    browser: "M2 3h12v10H2zM2 6h12M4 4.5h.01M6 4.5h.01",
-    code: "m5 4-4 4 4 4m6-8 4 4-4 4M9 2 7 14",
-    refresh: "M13 5V2l-2 2a5 5 0 1 0 1.2 6",
-  };
-  return (
-    <svg
-      width={size}
-      height={size}
-      viewBox="0 0 16 16"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.5"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <path d={paths[name] || paths.plus} />
-    </svg>
-  );
 }
 
 function Button({
@@ -256,13 +225,13 @@ function LegacySidebar(props: {
           className="nav-button"
           onClick={() => props.onSurface("manage")}
         >
-          <Icon name="settings" /> Manage
+          <Icon name="gear" /> Manage
         </Button>
         <Button
           className="nav-button"
           onClick={() => props.onSurface("activity")}
         >
-          <Icon name="activity" /> Activity
+          <Icon name="audit" /> Activity
         </Button>
         <Button
           className="nav-button"
@@ -516,7 +485,7 @@ function LegacyComposer({
           </Button>
         ) : (
           <Button className="primary" onClick={send}>
-            <Icon name="send" /> Send
+            <Icon name="arrowLeft" /> Send
           </Button>
         )}
       </div>
@@ -626,7 +595,7 @@ function SurfaceView({
         {tab === "desktop" && <div className="vnc-host" ref={vncHost} />}
         {tab === "browser" && (
           <div className="empty-surface">
-            <Icon name="browser" size={32} />
+            <Icon name="image" size={32} />
             <p>
               CDP relay started on demand. Connect a browser client to{" "}
               <code>ws://127.0.0.1:{port || "…"}</code>.
@@ -1955,7 +1924,7 @@ function Activity({
       <div className="flex min-h-full">
         <nav className="page-subnav w-[208px] shrink-0 border-r border-line bg-panel/40 px-3 py-4">
           <div className="px-2 text-[13.5px] font-semibold mb-3 flex items-center gap-2">
-            <Icon name="activity" size={16} /> Activity
+            <Icon name="audit" size={16} /> Activity
           </div>
           {(
             [
@@ -1992,12 +1961,12 @@ function Activity({
                 name={
                   (
                     {
-                      board: "activity",
-                      roles: "settings",
+                      board: "audit",
+                      roles: "gear",
                       tasks: "code",
-                      messages: "send",
-                      worklog: "terminal",
-                      insights: "browser",
+                      messages: "arrowLeft",
+                      worklog: "code",
+                      insights: "image",
                     } as const
                   )[item]
                 }
@@ -2658,7 +2627,9 @@ export function App() {
                   key={item.id}
                   onClick={() => setTab(item.id)}
                 >
-                  <Icon name={item.icon} />
+                  <Icon
+                    name={item.icon as import("./components/Icon").IconName}
+                  />
                   {item.label}
                 </button>
               ))}

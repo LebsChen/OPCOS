@@ -349,5 +349,10 @@ export function Icon({
           <path d="M9.2 7V4.9c0-.5.4-.9.9-.9h3.8c.5 0 .9.4.9.9V7" />
         </svg>
       );
+    default:
+      if (typeof console !== "undefined") {
+        console.warn(`Unknown OPCOS icon: ${String(name)}`);
+      }
+      return null;
   }
 }
