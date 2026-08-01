@@ -31,6 +31,7 @@ import {
 import { Sidebar } from "./components/Sidebar";
 import { sessionStatusLabel } from "./sessionStatus";
 import { Transcript } from "./components/Transcript";
+import { ApprovalCard, PreviewBlock } from "./components/ApprovalCard";
 import { Composer, PlusMenu, SendButton } from "./components/Composer";
 import { SelectMenu as OpenWorkerSelectMenu } from "./components/SelectMenu";
 import { SettingsView, type SettingsSection } from "./components/SettingsView";
@@ -75,6 +76,16 @@ type InboxRecord = {
   created_at: string;
   resolution?: string | null;
 };
+
+function relativeTime(value: string): string {
+  const elapsed = Date.now() - new Date(value).getTime();
+  const minutes = Math.max(0, Math.round(elapsed / 60_000));
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
+}
 type Schedule = {
   id: string;
   name: string;
@@ -3671,12 +3682,19 @@ class AppErrorBoundary extends Component<
 
 function InboxPane({
   items,
+  sessions,
   onResolve,
+  onOpenSession,
 }: {
   items: InboxRecord[];
+  sessions: Session[];
   onResolve: (item: InboxRecord, resolution: string) => void;
+  onOpenSession: (sessionId: string) => void;
 }) {
+  const [answers, setAnswers] = useState<Record<string, string>>({});
   const pending = items.filter((item) => item.state !== "resolved");
+  const sessionTitle = (sessionId: string) =>
+    sessions.find((session) => session.id === sessionId)?.title || sessionId;
   return (
     <div className="surface-panel p-4">
       <div className="flex items-center justify-between mb-4">
@@ -3700,37 +3718,94 @@ function InboxPane({
               </strong>
               <span className="text-xs text-faint">{item.tool}</span>
             </div>
-            <pre className="text-xs whitespace-pre-wrap mt-2">
-              {JSON.stringify(item.payload, null, 2)}
-            </pre>
-            <div className="approval-btns mt-3">
-              {item.kind === "question" ? (
-                <button
-                  className="btn approval-primary"
-                  onClick={() => {
-                    const answer = window.prompt("Answer", "");
-                    if (answer !== null) onResolve(item, answer);
-                  }}
-                >
-                  Answer
-                </button>
-              ) : (
-                <>
-                  <button
-                    className="btn approval-primary"
-                    onClick={() => onResolve(item, "allow")}
-                  >
-                    Allow
-                  </button>
-                  <button
-                    className="btn quiet-deny"
-                    onClick={() => onResolve(item, "deny")}
-                  >
-                    Deny
-                  </button>
-                </>
-              )}
+            <div className="flex items-center gap-2 mt-2 text-xs text-faint">
+              <button
+                className="hover:text-ink underline-offset-2 hover:underline"
+                onClick={() => onOpenSession(item.session_id)}
+              >
+                {sessionTitle(item.session_id)}
+              </button>
+              <span>·</span>
+              <span>{relativeTime(item.created_at)}</span>
             </div>
+            {item.kind === "approval" ? (
+              <ApprovalCard
+                item={{
+                  kind: "approval",
+                  callId: item.call_id,
+                  name: item.tool,
+                  args: item.payload,
+                  reason: "requires approval",
+                }}
+                onApprove={(decision) => onResolve(item, decision)}
+              />
+            ) : (
+              <>
+                {item.kind === "question" && (
+                  <div className="approval-with mt-3">
+                    {String(
+                      item.payload.question ||
+                        item.payload.prompt ||
+                        "Answer required",
+                    )}
+                  </div>
+                )}
+                {item.kind === "plan" &&
+                  typeof item.payload.plan === "string" && (
+                    <PreviewBlock text={item.payload.plan} mono={false} />
+                  )}
+                {item.kind === "directory" &&
+                  typeof item.payload.path === "string" && (
+                    <PreviewBlock text={item.payload.path} />
+                  )}
+                <div className="approval-btns mt-3">
+                  {item.kind === "question" ? (
+                    <>
+                      <input
+                        className="ob-input flex-1"
+                        value={answers[item.call_id] || ""}
+                        onChange={(event) =>
+                          setAnswers((current) => ({
+                            ...current,
+                            [item.call_id]: event.target.value,
+                          }))
+                        }
+                        placeholder="Type your answer"
+                      />
+                      <button
+                        className="btn approval-primary"
+                        disabled={!answers[item.call_id]?.trim()}
+                        onClick={() => {
+                          onResolve(item, answers[item.call_id].trim());
+                          setAnswers((current) => {
+                            const next = { ...current };
+                            delete next[item.call_id];
+                            return next;
+                          });
+                        }}
+                      >
+                        Answer
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <button
+                        className="btn approval-primary"
+                        onClick={() => onResolve(item, "allow")}
+                      >
+                        Allow
+                      </button>
+                      <button
+                        className="btn quiet-deny"
+                        onClick={() => onResolve(item, "deny")}
+                      >
+                        Deny
+                      </button>
+                    </>
+                  )}
+                </div>
+              </>
+            )}
           </div>
         ))}
       </div>
@@ -4358,6 +4433,14 @@ function AppContent() {
         ) : surface === "inbox" ? (
           <InboxPane
             items={inbox}
+            sessions={sessions}
+            onOpenSession={(sessionId) => {
+              const next = sessions.find((session) => session.id === sessionId);
+              if (next) {
+                setSelected(next);
+                setSurface("session");
+              }
+            }}
             onResolve={(item, resolution) =>
               command("resolve_inbox", {
                 sessionId: item.session_id,
