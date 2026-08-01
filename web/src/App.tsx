@@ -1515,80 +1515,78 @@ function ManageSections({
                   empty={`No ${label} assets yet.`}
                 />
               ))}
-            <div className="rounded-xl2 border border-line bg-panel p-5">
-              {assetFormOpen && (
-                <>
-                  <h2 className="text-[15px] font-semibold text-ink">
-                    {editingAssetId ? "Edit asset" : "New asset"}
-                  </h2>
-                  <div className="form-grid mt-4">
+            {assetFormOpen && (
+              <div className="rounded-xl2 border border-line bg-panel p-5">
+                <h2 className="text-[15px] font-semibold text-ink">
+                  {editingAssetId ? "Edit asset" : "New asset"}
+                </h2>
+                <div className="form-grid mt-4">
+                  <label className="field-label">
+                    Title
+                    <input
+                      value={assetTitle}
+                      onChange={(event) => setAssetTitle(event.target.value)}
+                      placeholder="Asset title"
+                    />
+                  </label>
+                  <label className="field-label">
+                    Body
+                    <textarea
+                      value={assetBody}
+                      onChange={(event) => setAssetBody(event.target.value)}
+                      placeholder="Asset content"
+                    />
+                  </label>
+                  {(assetTabKind === "knowledge" ||
+                    assetTabKind === "skill") && (
                     <label className="field-label">
-                      Title
+                      Trigger
                       <input
-                        value={assetTitle}
-                        onChange={(event) => setAssetTitle(event.target.value)}
-                        placeholder="Asset title"
+                        value={assetTrigger}
+                        onChange={(event) =>
+                          setAssetTrigger(event.target.value)
+                        }
+                        placeholder="Optional trigger"
                       />
                     </label>
-                    <label className="field-label">
-                      Body
-                      <textarea
-                        value={assetBody}
-                        onChange={(event) => setAssetBody(event.target.value)}
-                        placeholder="Asset content"
-                      />
-                    </label>
-                    {(assetTabKind === "knowledge" ||
-                      assetTabKind === "skill") && (
-                      <label className="field-label">
-                        Trigger
-                        <input
-                          value={assetTrigger}
-                          onChange={(event) =>
-                            setAssetTrigger(event.target.value)
-                          }
-                          placeholder="Optional trigger"
-                        />
-                      </label>
-                    )}
-                    <label className="field-label">
-                      Scope
-                      <input
-                        value={assetScope}
-                        onChange={(event) => setAssetScope(event.target.value)}
-                        placeholder="Optional scope"
-                      />
-                    </label>
-                    <Button
-                      className="primary"
-                      onClick={() =>
-                        command("save_asset", {
-                          id: editingAssetId || `asset-${Date.now()}`,
-                          kind: assetTabKind,
-                          title: assetTitle,
-                          body: assetBody,
-                          trigger: assetTrigger || null,
-                          scope: assetScope || null,
-                          enabled: true,
+                  )}
+                  <label className="field-label">
+                    Scope
+                    <input
+                      value={assetScope}
+                      onChange={(event) => setAssetScope(event.target.value)}
+                      placeholder="Optional scope"
+                    />
+                  </label>
+                  <Button
+                    className="primary"
+                    onClick={() =>
+                      command("save_asset", {
+                        id: editingAssetId || `asset-${Date.now()}`,
+                        kind: assetTabKind,
+                        title: assetTitle,
+                        body: assetBody,
+                        trigger: assetTrigger || null,
+                        scope: assetScope || null,
+                        enabled: true,
+                      })
+                        .then(() => {
+                          setAssetTitle("");
+                          setAssetBody("");
+                          setAssetTrigger("");
+                          setAssetScope("");
+                          setEditingAssetId(null);
+                          setAssetFormOpen(false);
+                          onRefresh();
                         })
-                          .then(() => {
-                            setAssetTitle("");
-                            setAssetBody("");
-                            setAssetTrigger("");
-                            setAssetScope("");
-                            setEditingAssetId(null);
-                            setAssetFormOpen(false);
-                            onRefresh();
-                          })
-                          .catch(onError)
-                      }
-                    >
-                      {editingAssetId ? "Save changes" : "Create asset"}
-                    </Button>
-                  </div>
-                </>
-              )}
-            </div>
+                        .catch(onError)
+                    }
+                  >
+                    {editingAssetId ? "Save changes" : "Create asset"}
+                  </Button>
+                </div>
+              </div>
+            )}
             {tab === "knowledge" && (
               <div className="inline-actions">
                 <Button

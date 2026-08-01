@@ -789,7 +789,7 @@ h3 {
 .form-grid {
   display: grid;
   gap: 10px;
-  max-width: 620px;
+  max-width: none;
 }
 .form-grid label {
   display: grid;
