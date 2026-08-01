@@ -1724,11 +1724,17 @@ function ManageSections({
             {assetFormOpen && (
               <div className="rounded-xl2 border border-line bg-panel p-5">
                 <h2 className="text-[15px] font-semibold text-ink">
-                  {editingAssetId ? "Edit asset" : "New asset"}
+                  {assetTabKind === "agents"
+                    ? editingAssetId
+                      ? "编辑规则"
+                      : "新建规则"
+                    : editingAssetId
+                      ? "Edit asset"
+                      : "New asset"}
                 </h2>
                 <div className="form-grid mt-4">
                   <label className="field-label">
-                    Title
+                    {assetTabKind === "agents" ? "标题" : "Title"}
                     <input
                       value={assetTitle}
                       onChange={(event) => setAssetTitle(event.target.value)}
@@ -1736,7 +1742,7 @@ function ManageSections({
                     />
                   </label>
                   <label className="field-label">
-                    Body
+                    {assetTabKind === "agents" ? "内容" : "Body"}
                     <textarea
                       value={assetBody}
                       onChange={(event) => setAssetBody(event.target.value)}
@@ -1757,7 +1763,7 @@ function ManageSections({
                     </label>
                   )}
                   <label className="field-label">
-                    Scope
+                    {assetTabKind === "agents" ? "适用范围" : "Scope"}
                     <input
                       value={assetScope}
                       onChange={(event) => setAssetScope(event.target.value)}
@@ -1788,7 +1794,13 @@ function ManageSections({
                         .catch(onError)
                     }
                   >
-                    {editingAssetId ? "Save changes" : "Create asset"}
+                    {assetTabKind === "agents"
+                      ? editingAssetId
+                        ? "保存更改"
+                        : "创建规则"
+                      : editingAssetId
+                        ? "Save changes"
+                        : "Create asset"}
                   </Button>
                 </div>
               </div>
