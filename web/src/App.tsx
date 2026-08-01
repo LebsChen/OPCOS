@@ -3107,6 +3107,7 @@ class AppErrorBoundary extends Component<
 
 function AppContent() {
   const NAV_COLLAPSED_KEY = "opcos:nav-collapsed:v1";
+  const [windowMaximized, setWindowMaximized] = useState(false);
   const [hosts, setHosts] = useState<Host[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selected, setSelected] = useState<Session | null>(null);
@@ -3157,6 +3158,30 @@ function AppContent() {
   const [homeWorkspace, setHomeWorkspace] = useState("");
   const [secretBackend, setSecretBackend] = useState("");
   const generation = useRef(0);
+  useEffect(() => {
+    if (
+      !(window as Window & { __TAURI_INTERNALS__?: unknown })
+        .__TAURI_INTERNALS__
+    )
+      return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void import("@tauri-apps/api/window")
+      .then(async ({ getCurrentWindow }) => {
+        const current = getCurrentWindow();
+        const sync = async () => {
+          const maximized = await current.isMaximized();
+          if (!disposed) setWindowMaximized(maximized);
+        };
+        await sync();
+        unlisten = await current.onResized(() => void sync());
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
   const refresh = async () => {
     const [nextHosts, nextSessions, nextAssets, nextProviders, nextSecrets] =
       await Promise.all([
@@ -3441,7 +3466,7 @@ function AppContent() {
   };
   return (
     <div
-      className={`app ${surface === "session" && selected ? "session-layout" : "surface-layout"}${surface === "session" && selected && rightPanelCollapsed ? " right-panel-collapsed" : ""}${navCollapsed ? " nav-collapsed" : ""}`}
+      className={`app ${surface === "session" && selected ? "session-layout" : "surface-layout"}${surface === "session" && selected && rightPanelCollapsed ? " right-panel-collapsed" : ""}${navCollapsed ? " nav-collapsed" : ""}${windowMaximized ? " window-maximized" : ""}`}
       style={
         {
           "--right-panel-width": `${rightPanelCollapsed ? 44 : rightPanelWidth}px`,
