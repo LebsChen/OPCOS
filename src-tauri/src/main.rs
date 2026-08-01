@@ -940,7 +940,7 @@ fn save_host(
 #[tauri::command]
 async fn test_host(state: State<'_, DesktopState>, host_id: String) -> Result<HostView, String> {
     let client = client_for(&state, &host_id)?;
-    let health = client.health().await.map_err(|error| error.to_string());
+    let info = client.info().await.map_err(|error| error.to_string());
     let connection = state
         .database
         .lock()
@@ -950,19 +950,31 @@ async fn test_host(state: State<'_, DesktopState>, host_id: String) -> Result<Ho
             row.get(0)
         })
         .map_err(|error| error.to_string())?;
-    match health {
-        Ok(health) => Ok(HostView {
+    match info {
+        Ok(info) => Ok(HostView {
             id: host_id,
             name,
             online: Some(true),
-            reason: Some(format!("{} {:?}", health.status, health.capabilities)),
+            reason: Some(format!(
+                "{} {}",
+                info.hostname.as_deref().unwrap_or("remote host"),
+                info.platform.as_deref().unwrap_or("unknown platform")
+            )),
         }),
-        Err(error) => Ok(HostView {
-            id: host_id,
-            name,
-            online: Some(false),
-            reason: Some(error),
-        }),
+        Err(error) => {
+            let lower = error.to_ascii_lowercase();
+            let reason = if lower.contains("401") || lower.contains("unauthorized") {
+                format!("remote host authentication failed: {error}")
+            } else {
+                error
+            };
+            Ok(HostView {
+                id: host_id,
+                name,
+                online: Some(false),
+                reason: Some(reason),
+            })
+        }
     }
 }
 

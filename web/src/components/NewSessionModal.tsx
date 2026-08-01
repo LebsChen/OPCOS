@@ -101,6 +101,11 @@ export function NewSessionModal({
                 .map((item) => ({ value: item.id, label: item.label })),
             ]}
           />
+          <input
+            value={model}
+            onChange={(event) => setModel(event.target.value)}
+            placeholder={translate("customModel")}
+          />
         </label>
         <label>
           Mode

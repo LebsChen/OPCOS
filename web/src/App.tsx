@@ -1,6 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Component,
+  FormEvent,
+  ReactNode,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Terminal } from "@xterm/xterm";
 import RFB from "@novnc/novnc";
 import ReactMarkdown from "react-markdown";
@@ -1558,7 +1566,15 @@ function ManageSections({
                       </Button>
                       <Button
                         className="danger"
-                        onClick={() => setConfirmDeleteHostId(host.id)}
+                        onClick={() => {
+                          if (confirmDeleteHostId === host.id) {
+                            void onDeleteHost(host.id)
+                              .then(() => setConfirmDeleteHostId(null))
+                              .catch(onError);
+                          } else {
+                            setConfirmDeleteHostId(host.id);
+                          }
+                        }}
                       >
                         {confirmDeleteHostId === host.id
                           ? "Confirm delete"
@@ -3014,7 +3030,30 @@ function SessionRightPanel({
   );
 }
 
-export function App() {
+class AppErrorBoundary extends Component<
+  { children: ReactNode },
+  { error: Error | null }
+> {
+  state = { error: null as Error | null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="error-boundary">
+          <h1>{translate("workbenchError")}</h1>
+          <p>{this.state.error.message}</p>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+function AppContent() {
   const [hosts, setHosts] = useState<Host[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selected, setSelected] = useState<Session | null>(null);
@@ -3264,12 +3303,30 @@ export function App() {
     >
       <Sidebar
         hosts={hosts}
-        sessions={sessions}
+        sessions={sessions.map((session) => ({
+          session_id: session.id,
+          title: session.title,
+          workspace: session.workspace || "",
+          agent: "opcos",
+          model: session.model,
+          mode: session.mode,
+          updated_at: null,
+          messages: 0,
+          pinned: false,
+          archived: false,
+          attention: 0,
+          liveness: selected?.id === session.id && running ? "working" : "idle",
+        }))}
+        agent="opcos"
+        workspace={selected?.workspace || ""}
+        activeSession={selected?.id || ""}
         selected={selected}
         query={query}
         onQuery={setQuery}
-        onSelect={(session: Session) => {
-          setSelected(session);
+        onSelectSession={(id: string) => {
+          const next = sessions.find((item) => item.id === id);
+          if (!next) return;
+          setSelected(next);
           setSurface("session");
           setTab("chat");
         }}
@@ -3359,6 +3416,21 @@ export function App() {
                         })),
                     ]}
                     ariaLabel="Model"
+                  />
+                  <input
+                    key={selected.model}
+                    defaultValue={selected.model}
+                    placeholder={translate("customModel")}
+                    onBlur={(event) => {
+                      const model = event.target.value.trim();
+                      if (!model || model === selected.model) return;
+                      void command("change_model", {
+                        sessionId: selected.id,
+                        model,
+                      })
+                        .then(() => setSelected({ ...selected, model }))
+                        .catch(onError);
+                    }}
                   />
                 </label>
                 {running && (
@@ -3476,5 +3548,13 @@ export function App() {
         />
       )}
     </div>
+  );
+}
+
+export function App() {
+  return (
+    <AppErrorBoundary>
+      <AppContent />
+    </AppErrorBoundary>
   );
 }

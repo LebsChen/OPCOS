@@ -106,6 +106,13 @@ const messages: Record<Locale, Record<string, string>> = {
     sessionOnly: "this session only",
     startSession: "Start a session",
     chooseHost: "Choose a bound host and create an OPCOS workspace.",
+    workbenchError: "The workbench could not render this view.",
+    customModel: "Custom model ID",
+    recent: "Recent",
+    noMatchingConversations: "No matching conversations.",
+    noConversations: "No conversations yet.",
+    showLess: "Show less",
+    showMore: "Show more",
   },
   zh: {
     general: "通用",
@@ -206,6 +213,13 @@ const messages: Record<Locale, Record<string, string>> = {
     sessionOnly: "本会话中静音",
     startSession: "开始会话",
     chooseHost: "选择已绑定的主机并创建 OPCOS 工作区。",
+    workbenchError: "工作台无法渲染此页面。",
+    customModel: "自定义模型 ID",
+    recent: "最近",
+    noMatchingConversations: "没有匹配的会话。",
+    noConversations: "暂无会话。",
+    showLess: "收起",
+    showMore: "显示更多",
   },
 };
 

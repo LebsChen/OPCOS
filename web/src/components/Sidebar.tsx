@@ -424,108 +424,7 @@ export function Sidebar(props: any) {
   // the menu offers Rename · Pin/Unpin · Archive/Unarchive · Delete, with the two-step delete
   // confirm kept inside it. Shared by BOTH row styles, so the chronological cardRow offers the
   // same actions as the persona accordion's sessionRow (owner ask 2026-07-09).
-  const rowActions = (s: SessionInfo, title: string) => {
-    const menuOpen = rowMenu?.id === s.session_id;
-    const item = (
-      testid: string,
-      icon: IconName,
-      label: string,
-      onClick: () => void,
-    ) => (
-      <button
-        className="w-full flex items-center gap-2 px-2.5 py-1.5 text-[12.5px] text-left hover:bg-paper"
-        data-testid={testid}
-        role="menuitem"
-        onClick={() => {
-          closeRowMenu();
-          onClick();
-        }}
-      >
-        <Icon name={icon} size={13} className="shrink-0 text-muted" />
-        <span className="flex-1">{label}</span>
-      </button>
-    );
-    return (
-      <span
-        // Stay visible while this row's menu is open — the pointer may be on the menu, off the row.
-        className={
-          (menuOpen ? "flex" : "hidden group-hover:flex") +
-          " items-center shrink-0"
-        }
-        onClick={(e) => e.stopPropagation()}
-      >
-        <button
-          title={translate("sessionActions")}
-          aria-label={translate("sessionActions")}
-          aria-haspopup="menu"
-          aria-expanded={menuOpen}
-          data-testid="row-menu"
-          className={
-            "w-5 h-5 grid place-items-center rounded hover:bg-paper " +
-            (menuOpen ? "text-ink bg-paper" : "text-faint hover:text-ink")
-          }
-          onClick={(e) =>
-            menuOpen
-              ? closeRowMenu()
-              : openRowMenu(s.session_id, e.currentTarget)
-          }
-        >
-          {/* Vertical kebab = the horizontal glyph rotated — no extra icon needed. */}
-          <Icon name="moreHorizontal" size={14} className="rotate-90" />
-        </button>
-        {menuOpen && (
-          <>
-            <div className="fixed inset-0 z-40" onClick={closeRowMenu} />
-            <div
-              className="fixed z-50 w-40 rounded-xl border border-line bg-panel shadow-xl py-1"
-              style={{ top: rowMenu!.top, left: rowMenu!.left }}
-              role="menu"
-            >
-              {item("row-menu-rename", "pencil", "Rename", () => {
-                setEditingId(s.session_id);
-                setEditValue(title);
-              })}
-              {item("row-menu-pin", "pin", s.pinned ? "Unpin" : "Pin", () =>
-                props.onTogglePin(s.session_id, !s.pinned),
-              )}
-              {item(
-                "row-menu-archive",
-                "archive",
-                s.archived ? "Unarchive" : "Archive",
-                () => props.onArchiveSession(s.session_id, !s.archived),
-              )}
-              <div className="h-px bg-line my-1 mx-2" />
-              {confirmDelId === s.session_id ? (
-                <button
-                  title={translate("deleteConfirm")}
-                  className="w-full flex items-center gap-2 px-2.5 py-1.5 text-[12.5px] text-left font-medium text-danger hover:bg-paper"
-                  data-testid="row-menu-delete"
-                  role="menuitem"
-                  onClick={() => {
-                    closeRowMenu();
-                    props.onDeleteSession(s.session_id);
-                  }}
-                >
-                  <Icon name="trash" size={13} className="shrink-0" />
-                  <span className="flex-1">{translate("deleteQuestion")}</span>
-                </button>
-              ) : (
-                <button
-                  className="w-full flex items-center gap-2 px-2.5 py-1.5 text-[12.5px] text-left text-danger hover:bg-paper"
-                  data-testid="row-menu-delete"
-                  role="menuitem"
-                  onClick={() => setConfirmDelId(s.session_id)}
-                >
-                  <Icon name="trash" size={13} className="shrink-0" />
-                  <span className="flex-1">{translate("delete")}</span>
-                </button>
-              )}
-            </div>
-          </>
-        )}
-      </span>
-    );
-  };
+  const rowActions = (_s: SessionInfo, _title: string) => null;
 
   // A compact session row (mock §141 grouped/recent rows): one-line title + right-side indicators,
   // with the ⋮ actions kebab revealed on hover. Used in accordion bodies + grouped cards.
@@ -723,7 +622,7 @@ export function Sidebar(props: any) {
         data-testid="recent-header"
       >
         <span className="text-[10.5px] uppercase tracking-[0.07em] text-faint font-semibold">
-          Recent
+          {translate("recent")}
         </span>
         <button
           className="w-6 h-6 grid place-items-center rounded-md text-faint hover:text-ink hover:bg-paper -mr-1"
@@ -1168,8 +1067,8 @@ export function Sidebar(props: any) {
                 {recentSessions.length === 0 ? (
                   <div className="px-2 py-1.5 text-[12px] text-faint leading-snug">
                     {normalizedQuery
-                      ? "No matching conversations."
-                      : "No conversations yet."}
+                      ? translate("noMatchingConversations")
+                      : translate("noConversations")}
                   </div>
                 ) : (
                   <>
@@ -1183,8 +1082,8 @@ export function Sidebar(props: any) {
                         onClick={() => setRecentExpanded((v) => !v)}
                       >
                         {recentExpanded
-                          ? "Show less"
-                          : `Show ${recentSessions.length - RECENT_PEEK} more`}
+                          ? translate("showLess")
+                          : `${translate("showMore")} (${recentSessions.length - RECENT_PEEK})`}
                       </button>
                     )}
                   </>

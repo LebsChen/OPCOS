@@ -1,16 +1,16 @@
 :root {
-  --color-panel: #171b24;
-  --color-panel-raised: #1d2330;
-  --color-line: #2b3342;
-  --color-ink: #edf0f5;
-  --color-muted: #9ca6b7;
-  --color-faint: #697486;
-  --color-accent: #8ea9ff;
-  --color-accent-soft: #243354;
-  --color-danger: #f1828b;
-  --color-danger-soft: #43262d;
-  --color-ok: #70d6a0;
-  --color-warn: #e6b66e;
+  --color-panel: var(--panel);
+  --color-panel-raised: var(--panel);
+  --color-line: var(--line);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn-ink);
   font-family:
     Inter,
     ui-sans-serif,
@@ -19,7 +19,7 @@
     "Segoe UI",
     sans-serif;
   color: var(--color-ink);
-  background: #11151d;
+  background: var(--paper);
   font-size: 13px;
 }
 * {
@@ -28,7 +28,16 @@
 body {
   margin: 0;
   min-width: 980px;
-  background: #11151d;
+  background: var(--paper);
+}
+.error-boundary {
+  min-height: 100vh;
+  display: grid;
+  place-content: center;
+  gap: 8px;
+  padding: 32px;
+  color: var(--ink);
+  background: var(--paper);
 }
 button,
 input,
@@ -62,20 +71,6 @@ button:disabled {
   --color-muted: var(--muted);
   --color-accent: var(--accent);
   --color-danger: var(--danger);
-  --paper: #11151d;
-  --panel: #171b24;
-  --ink: #edf0f5;
-  --muted: #9ca6b7;
-  --faint: #697486;
-  --line: #2b3342;
-  --line-strong: #3b465a;
-  --accent: #8ea9ff;
-  --accent-soft: #243354;
-  --ok: #70d6a0;
-  --ok-soft: #20382d;
-  --ok-line: #35694f;
-  --danger: #f1828b;
-  --danger-soft: #43262d;
 }
 
 .backend-badge {
@@ -90,7 +85,7 @@ button:disabled {
   flex-direction: column;
   min-height: 0;
   border-right: 1px solid var(--color-line);
-  background: #151a23;
+  background: var(--panel);
 }
 .brand {
   display: flex;
@@ -128,8 +123,8 @@ button:disabled {
   color: var(--color-ink);
 }
 .btn:hover {
-  border-color: #53617a;
-  background: #212938;
+  border-color: var(--line-strong);
+  background: var(--panel);
 }
 .btn.primary,
 .new-session {
@@ -238,7 +233,7 @@ button:disabled {
 }
 .session-row:hover,
 .session-row.selected {
-  background: #232b3a;
+  background: var(--panel);
 }
 .session-title {
   overflow: hidden;
@@ -264,7 +259,7 @@ select,
   border: 1px solid var(--color-line);
   border-radius: 6px;
   outline: 0;
-  background: #11161f;
+  background: var(--paper);
   color: var(--color-ink);
   padding: 8px 9px;
 }
@@ -317,7 +312,7 @@ select:focus {
   flex-direction: column;
   min-width: 0;
   min-height: 0;
-  background: #171c26;
+  background: var(--paper);
 }
 .session-header,
 .page-header {
@@ -365,7 +360,7 @@ h3 {
   gap: 2px;
   padding: 0 18px;
   border-bottom: 1px solid var(--color-line);
-  background: #151a23;
+  background: var(--panel);
 }
 .surface-tabs button {
   display: inline-flex;
@@ -427,7 +422,7 @@ h3 {
   overflow: auto;
   padding: 10px;
   border-radius: 6px;
-  background: #10141c;
+  background: var(--paper);
 }
 .assistant-bubble code {
   padding: 2px 4px;
@@ -454,10 +449,10 @@ h3 {
 .tool-card {
   border: 1px solid var(--color-line);
   border-radius: 9px;
-  background: #141923;
+  background: var(--panel);
 }
 .tool-card.pending {
-  border-color: #8e6c39;
+  border-color: var(--warn-ink);
 }
 .tool-card.ok {
   border-color: #35694f;
@@ -540,7 +535,7 @@ h3 {
   padding: 9px;
   border: 1px solid var(--color-line);
   border-radius: 11px;
-  background: #141923;
+  background: var(--panel);
 }
 .composer textarea {
   min-height: 58px;
@@ -558,7 +553,7 @@ h3 {
   min-width: 0;
   overflow: auto;
   border-left: 1px solid var(--color-line);
-  background: #151a23;
+  background: var(--panel);
 }
 
 .session-right-panel {
@@ -710,7 +705,7 @@ h3 {
   height: calc(100vh - 180px);
   border: 1px solid var(--color-line);
   border-radius: 8px;
-  background: #11151d;
+  background: var(--paper);
 }
 .vnc-host {
   overflow: hidden;
@@ -759,7 +754,7 @@ h3 {
 }
 .file-row:hover {
   color: var(--color-ink);
-  background: #202735;
+  background: var(--panel);
 }
 .diff-view {
   min-height: 420px;
@@ -768,7 +763,7 @@ h3 {
   padding: 13px;
   border: 1px solid var(--color-line);
   border-radius: 7px;
-  background: #10141c;
+  background: var(--paper);
   white-space: pre-wrap;
 }
 .diff-add {
@@ -927,7 +922,7 @@ h3 {
   max-height: 300px;
   padding: 10px;
   border: 1px solid var(--color-line);
-  background: #10141c;
+  background: var(--paper);
 }
 .activity-toolbar {
   display: flex;
@@ -978,7 +973,7 @@ h3 {
   inset: 0;
   display: grid;
   place-items: center;
-  background: #090c12b8;
+  background: var(--scrim);
 }
 .modal {
   display: grid;
