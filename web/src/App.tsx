@@ -2174,12 +2174,13 @@ function Activity({
     '[{"id":"leader","sort_order":0,"session_id":"","state":"Active"}]',
   );
   const [activityTab, setActivityTab] = useState<
-    "board" | "roles" | "tasks" | "messages" | "worklog" | "insights"
+    "audit" | "board" | "roles" | "tasks" | "messages" | "worklog" | "insights"
   >("board");
   const [worklog, setWorklog] = useState<Record<string, unknown> | null>(null);
   const [insights, setInsights] = useState<Record<string, unknown> | null>(
     null,
   );
+  const [auditEvents, setAuditEvents] = useState<Record<string, unknown>[]>([]);
   const load = () =>
     command<Coordination>("coordination_snapshot", { taskId })
       .then(setBoard)
@@ -2193,6 +2194,7 @@ function Activity({
           </div>
           {(
             [
+              "audit",
               "board",
               "roles",
               "tasks",
@@ -2220,12 +2222,19 @@ function Activity({
                   })
                     .then(setInsights)
                     .catch(onError);
+                if (item === "audit")
+                  void command<Record<string, unknown>[]>("audit_events", {
+                    sessionId: selected?.id ?? null,
+                  })
+                    .then(setAuditEvents)
+                    .catch(onError);
               }}
             >
               <Icon
                 name={
                   (
                     {
+                      audit: "audit",
                       board: "audit",
                       roles: "gear",
                       tasks: "code",
@@ -2251,6 +2260,8 @@ function Activity({
                 {
                   (
                     {
+                      audit:
+                        "Review durable security and configuration events.",
                       board: "Start or observe the active coordination board.",
                       roles: "Review board roles and their current state.",
                       tasks:
@@ -2281,6 +2292,31 @@ function Activity({
                   ) : null
                 }
                 empty={translate("selectSessionWorklog")}
+              />
+            )}
+            {activityTab === "audit" && (
+              <CollectionPage
+                search=""
+                onSearch={() => undefined}
+                searchPlaceholder="Filter audit events"
+                rows={
+                  auditEvents.length ? (
+                    <>
+                      {auditEvents.map((event, index) => (
+                        <div
+                          className="manage-row px-4"
+                          key={`${event.kind}-${index}`}
+                        >
+                          <span>
+                            <strong>{String(event.kind)}</strong>
+                            <small>{JSON.stringify(event.payload)}</small>
+                          </span>
+                        </div>
+                      ))}
+                    </>
+                  ) : null
+                }
+                empty="No audit events recorded yet."
               />
             )}
             {activityTab === "insights" && (

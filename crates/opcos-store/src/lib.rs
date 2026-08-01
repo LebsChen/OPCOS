@@ -111,6 +111,14 @@ pub struct UsageRecord {
     pub recorded_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AuditEvent {
+    pub session_id: String,
+    pub sequence: i64,
+    pub kind: String,
+    pub payload: serde_json::Value,
+}
+
 pub trait SessionStore {
     fn append_message(&self, message: &StoredMessage) -> Result<(), StoreError>;
     fn load_messages(&self, session_id: &str) -> Result<Vec<StoredMessage>, StoreError>;
@@ -353,6 +361,53 @@ impl SqliteStore {
         };
         store.migrate()?;
         Ok(store)
+    }
+
+    pub fn append_audit(
+        &self,
+        session_id: &str,
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(), StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let sequence: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM audit_events WHERE session_id=?1",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        connection.execute(
+            "INSERT INTO audit_events(session_id,sequence,kind,payload) VALUES (?1,?2,?3,?4)",
+            params![session_id, sequence, kind, serde_json::to_string(payload)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_audit(&self, session_id: Option<&str>) -> Result<Vec<AuditEvent>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT session_id,sequence,kind,payload
+             FROM audit_events
+             WHERE (?1 IS NULL OR session_id=?1)
+             ORDER BY rowid DESC
+             LIMIT 500",
+        )?;
+        let rows = statement.query_map([session_id], |row| {
+            let payload: String = row.get(3)?;
+            Ok(AuditEvent {
+                session_id: row.get(0)?,
+                sequence: row.get(1)?,
+                kind: row.get(2)?,
+                payload: serde_json::from_str(&payload).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     pub fn open_in_memory() -> Result<Self, StoreError> {
@@ -800,6 +855,22 @@ mod tests {
         assert_eq!(records[0].input_tokens, 12);
         assert_eq!(records[0].output_tokens, 7);
         assert_eq!(records[0].duration_ms, 345);
+    }
+
+    #[test]
+    fn audit_events_round_trip_without_secret_values() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .append_audit(
+                "session-audit",
+                "approval_allowed",
+                &serde_json::json!({"call_id":"call-1","approved":true}),
+            )
+            .unwrap();
+        let events = store.load_audit(Some("session-audit")).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "approval_allowed");
+        assert_eq!(events[0].payload["call_id"], "call-1");
     }
 
     #[test]

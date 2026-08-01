@@ -250,6 +250,10 @@ fn emit(app: &tauri::AppHandle, kind: &str, session_id: Option<&str>, payload: V
     );
 }
 
+fn audit(state: &DesktopState, session_id: &str, kind: &str, payload: Value) {
+    let _ = state.store.append_audit(session_id, kind, &payload);
+}
+
 fn emit_pending_approval(
     app: &tauri::AppHandle,
     state: &DesktopState,
@@ -1012,6 +1016,12 @@ fn save_host(
         }
         return Err(error.to_string());
     }
+    audit(
+        &state,
+        "",
+        "host_created",
+        json!({"host_id": id, "name": name}),
+    );
     Ok(HostView {
         id,
         name,
@@ -1090,6 +1100,7 @@ fn delete_host(state: State<'_, DesktopState>, host_id: String) -> Result<(), St
         .secrets
         .delete(&secret_key("rvm-url", &host_id))
         .map_err(|error| error.to_string())?;
+    audit(&state, "", "host_deleted", json!({"host_id": host_id}));
     Ok(())
 }
 
@@ -1247,6 +1258,12 @@ fn create_session(
             params![id, title, host_id, model, provider, mode, workspace.clone().unwrap_or_default(), Utc::now().to_rfc3339()],
         )
         .map_err(|error| error.to_string())?;
+    audit(
+        &state,
+        &id,
+        "session_created",
+        json!({"session_id": id, "host_id": host_id, "model": model}),
+    );
     Ok(SessionView {
         id,
         title,
@@ -1388,6 +1405,14 @@ async fn submit_turn(
         }
         Err(error) => {
             let message = engine_error_message(error);
+            if message.contains("denied") || message.contains("policy") {
+                audit(
+                    &state,
+                    &request.session_id,
+                    "tool_policy_denied",
+                    json!({"message": message}),
+                );
+            }
             emit(
                 &app,
                 "notice",
@@ -1467,6 +1492,12 @@ async fn interrupt(
 ) -> Result<(), String> {
     let engine = engine_for(&app, &state, &session_id).await?;
     engine.interrupt();
+    audit(
+        &state,
+        &session_id,
+        "session_interrupted",
+        json!({"session_id": session_id}),
+    );
     emit(
         &app,
         "notice",
@@ -1523,6 +1554,16 @@ async fn resolve_approval(
         "approval_resolved",
         Some(&session_id),
         json!({"call_id":call_id,"approve":approve}),
+    );
+    audit(
+        &state,
+        &session_id,
+        if approve {
+            "approval_allowed"
+        } else {
+            "approval_denied"
+        },
+        json!({"call_id": call_id, "approved": approve}),
     );
     match result {
         Ok(()) => {
@@ -2680,6 +2721,30 @@ fn session_insights(state: State<'_, DesktopState>, session_id: String) -> Resul
 }
 
 #[tauri::command]
+fn audit_events(
+    state: State<'_, DesktopState>,
+    session_id: Option<String>,
+) -> Result<Vec<Value>, String> {
+    state
+        .store
+        .load_audit(session_id.as_deref())
+        .map(|events| {
+            events
+                .into_iter()
+                .map(|event| {
+                    json!({
+                        "session_id": event.session_id,
+                        "sequence": event.sequence,
+                        "kind": event.kind,
+                        "payload": event.payload,
+                    })
+                })
+                .collect()
+        })
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn save_secret_metadata(
     state: State<'_, DesktopState>,
     name: String,
@@ -2740,7 +2805,14 @@ fn save_provider_key(
     state
         .secrets
         .set(&secret_key("provider-key", &provider), &key)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    audit(
+        &state,
+        "",
+        "provider_key_saved",
+        json!({"provider": provider}),
+    );
+    Ok(())
 }
 
 #[tauri::command]
@@ -2748,7 +2820,14 @@ fn delete_provider_key(state: State<'_, DesktopState>, provider: String) -> Resu
     state
         .secrets
         .delete(&secret_key("provider-key", &provider))
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    audit(
+        &state,
+        "",
+        "provider_key_deleted",
+        json!({"provider": provider}),
+    );
+    Ok(())
 }
 
 #[tauri::command]
@@ -3021,6 +3100,7 @@ fn main() {
             review_file_diff,
             session_worklog,
             session_insights,
+            audit_events,
             save_schedule,
             list_schedules,
             run_schedule,
