@@ -1500,7 +1500,7 @@ function ManageSections({
           <CollectionPage
             search=""
             onSearch={() => undefined}
-            searchPlaceholder="Search hosts"
+            searchPlaceholder={translate("searchHosts")}
             primary={
               <Button className="primary" onClick={() => setHostFormOpen(true)}>
                 Add host
@@ -1551,7 +1551,7 @@ function ManageSections({
                 </>
               ) : null
             }
-            empty="No hosts configured yet."
+            empty={translate("noHosts")}
             form={
               hostFormOpen ? (
                 <form
@@ -1910,8 +1910,10 @@ function ManageSections({
           <CollectionPage
             search=""
             onSearch={() => undefined}
-            searchPlaceholder="Search secret keys"
-            primary={<Button className="primary">Add secret</Button>}
+            searchPlaceholder={translate("searchSecretKeys")}
+            primary={
+              <Button className="primary">{translate("addSecret")}</Button>
+            }
             rows={
               secrets.length ? (
                 <>
@@ -1923,13 +1925,13 @@ function ManageSections({
                           {secret.scope} · {secret.purpose}
                         </small>
                       </span>
-                      <span className="muted">Delete</span>
+                      <span className="muted">{translate("delete")}</span>
                     </div>
                   ))}
                 </>
               ) : null
             }
-            empty="No secret metadata configured. Secret values are never shown."
+            empty={translate("noSecretMetadata")}
           />
         )}
         {tab === "blueprint" && (
@@ -2012,7 +2014,7 @@ function McpManage({
     <CollectionPage
       search={search}
       onSearch={setSearch}
-      searchPlaceholder="Search MCP tools"
+      searchPlaceholder={translate("searchMcp")}
       rows={
         filtered.length ? (
           <>
@@ -2116,7 +2118,7 @@ function Automations({
                 <CollectionPage
                   search=""
                   onSearch={() => undefined}
-                  searchPlaceholder="Search schedules"
+                  searchPlaceholder={translate("searchSchedules")}
                   primary={
                     <Button
                       className="primary"
@@ -2153,7 +2155,7 @@ function Automations({
                       </>
                     ) : null
                   }
-                  empty="No schedules yet."
+                  empty={translate("noSchedules")}
                   form={
                     scheduleFormOpen ? (
                       <div className="manage-card form-grid">
@@ -2222,7 +2224,7 @@ function Automations({
               <CollectionPage
                 search=""
                 onSearch={() => undefined}
-                searchPlaceholder="Search runs"
+                searchPlaceholder={translate("searchRuns")}
                 rows={
                   schedules.length ? (
                     <>
@@ -2239,7 +2241,7 @@ function Automations({
                     </>
                   ) : null
                 }
-                empty="No schedule runs recorded yet."
+                empty={translate("noRuns")}
               />
             )}
           </div>
@@ -2363,8 +2365,12 @@ function Activity({
               <CollectionPage
                 search=""
                 onSearch={() => undefined}
-                searchPlaceholder="Filter worklog events"
-                primary={<Button className="primary">Reload worklog</Button>}
+                searchPlaceholder={translate("filterWorklog")}
+                primary={
+                  <Button className="primary">
+                    {translate("reloadWorklog")}
+                  </Button>
+                }
                 rows={
                   selected && worklog ? (
                     <pre className="p-4">
@@ -2372,7 +2378,7 @@ function Activity({
                     </pre>
                   ) : null
                 }
-                empty="Select a session to load its worklog."
+                empty={translate("selectSessionWorklog")}
               />
             )}
             {activityTab === "insights" && (
@@ -2476,7 +2482,7 @@ function Activity({
                     <CollectionPage
                       search=""
                       onSearch={() => undefined}
-                      searchPlaceholder="Search roles"
+                      searchPlaceholder={translate("searchRoles")}
                       rows={
                         board?.roles.length ? (
                           <>
@@ -2497,14 +2503,14 @@ function Activity({
                           </>
                         ) : null
                       }
-                      empty="No roles loaded yet. Start or observe a board."
+                      empty={translate("noRoles")}
                     />
                   )}
                   {activityTab === "tasks" && (
                     <CollectionPage
                       search=""
                       onSearch={() => undefined}
-                      searchPlaceholder="Search tasks"
+                      searchPlaceholder={translate("searchTasks")}
                       primary={
                         <Button
                           className="primary"
@@ -2561,7 +2567,7 @@ function Activity({
                           </>
                         ) : null
                       }
-                      empty="No coordination tasks yet."
+                      empty={translate("noTasks")}
                       form={
                         taskFormOpen ? (
                           <div className="rounded-xl2 border border-line bg-panel p-5">
@@ -2612,7 +2618,7 @@ function Activity({
                     <CollectionPage
                       search=""
                       onSearch={() => undefined}
-                      searchPlaceholder="Search messages"
+                      searchPlaceholder={translate("searchMessages")}
                       primary={
                         <Button
                           className="primary"

@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { Icon, type IconName } from "./Icon";
+import { translate } from "../i18n";
 
 export type SettingsSection =
   | "appearance"
@@ -14,16 +15,16 @@ export type SettingsSection =
   | "blueprint";
 
 const tabs: Array<{ key: SettingsSection; label: string; icon: IconName }> = [
-  { key: "appearance", label: "General", icon: "sliders" },
-  { key: "provider", label: "Provider", icon: "sparkle" },
-  { key: "hosts", label: "Hosts", icon: "folder" },
-  { key: "agents", label: "AGENTS.md", icon: "fileCode" },
-  { key: "knowledge", label: "Knowledge", icon: "file" },
-  { key: "playbook", label: "Playbook", icon: "table" },
-  { key: "skill", label: "Skill", icon: "sparkle" },
-  { key: "mcp", label: "MCP", icon: "plug" },
-  { key: "secrets", label: "Secrets", icon: "shield" },
-  { key: "blueprint", label: "Blueprint", icon: "code" },
+  { key: "appearance", label: "general", icon: "sliders" },
+  { key: "provider", label: "provider", icon: "sparkle" },
+  { key: "hosts", label: "hosts", icon: "folder" },
+  { key: "agents", label: "agents", icon: "fileCode" },
+  { key: "knowledge", label: "knowledge", icon: "file" },
+  { key: "playbook", label: "playbook", icon: "table" },
+  { key: "skill", label: "skill", icon: "sparkle" },
+  { key: "mcp", label: "mcp", icon: "plug" },
+  { key: "secrets", label: "secrets", icon: "shield" },
+  { key: "blueprint", label: "blueprint", icon: "code" },
 ];
 
 export function SettingsView({
@@ -39,7 +40,7 @@ export function SettingsView({
     <main className="flex-1 min-w-0 flex bg-paper">
       <nav className="page-subnav w-[208px] shrink-0 border-r border-line bg-panel/40 px-3 py-4">
         <div className="px-2 text-[13.5px] font-semibold mb-3 flex items-center gap-2">
-          <Icon name="gear" size={16} /> Settings
+          <Icon name="gear" size={16} /> {translate("settings")}
         </div>
         {tabs.map((tab) => (
           <button
@@ -53,7 +54,7 @@ export function SettingsView({
             onClick={() => onTabChange(tab.key)}
           >
             <Icon name={tab.icon} size={15} />
-            {tab.label}
+            {translate(tab.label)}
           </button>
         ))}
       </nav>

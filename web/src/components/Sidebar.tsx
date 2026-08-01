@@ -15,6 +15,7 @@ import { PersonaGlyph, personaGlyph } from "./personaIcon";
 import { SearchModal } from "./SearchModal";
 import { baseName } from "../paths";
 import { showPersonas } from "../flags";
+import { translate } from "../i18n";
 
 const AUTOMATIONS_CHANGED = "opcos://automations-changed";
 const PERSONAS_CHANGED = "opcos://personas-changed";
@@ -28,9 +29,9 @@ const setNavLayout = async (_layout?: string) => undefined;
 // (so third-party / Ops personas appear); the hardcoded set is the fallback before personas load.
 const SURFACES: { key: string; label: string; icon: IconName; cls: string }[] =
   [
-    { key: "cowork", label: "Sessions", icon: "diamond", cls: "ico-cowork" },
-    { key: "chat", label: "Chat", icon: "chat", cls: "ico-chat" },
-    { key: "code", label: "Code", icon: "code", cls: "ico-code" },
+    { key: "cowork", label: "sessions", icon: "diamond", cls: "ico-cowork" },
+    { key: "chat", label: "chat", icon: "chat", cls: "ico-chat" },
+    { key: "code", label: "code", icon: "code", cls: "ico-code" },
   ];
 
 const surfaceFromPersona = (p: Persona) => ({
@@ -80,12 +81,12 @@ function LiveDot({ state }: { state?: "working" | "sleeping" | "idle" }) {
   return state === "working" ? (
     <span
       className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse shrink-0"
-      title="Working now"
+      title={translate("workingNow")}
     />
   ) : (
     <span
       className="w-1.5 h-1.5 rounded-full bg-faint/60 shrink-0"
-      title="Sleeping (will wake itself)"
+      title={translate("sleeping")}
     />
   );
 }
@@ -454,8 +455,8 @@ export function Sidebar(props: any) {
         onClick={(e) => e.stopPropagation()}
       >
         <button
-          title="Session actions"
-          aria-label="Session actions"
+          title={translate("sessionActions")}
+          aria-label={translate("sessionActions")}
           aria-haspopup="menu"
           aria-expanded={menuOpen}
           data-testid="row-menu"
@@ -496,7 +497,7 @@ export function Sidebar(props: any) {
               <div className="h-px bg-line my-1 mx-2" />
               {confirmDelId === s.session_id ? (
                 <button
-                  title="Click again to permanently delete"
+                  title={translate("deleteConfirm")}
                   className="w-full flex items-center gap-2 px-2.5 py-1.5 text-[12.5px] text-left font-medium text-danger hover:bg-paper"
                   data-testid="row-menu-delete"
                   role="menuitem"
@@ -506,7 +507,7 @@ export function Sidebar(props: any) {
                   }}
                 >
                   <Icon name="trash" size={13} className="shrink-0" />
-                  <span className="flex-1">Delete?</span>
+                  <span className="flex-1">{translate("deleteQuestion")}</span>
                 </button>
               ) : (
                 <button
@@ -516,7 +517,7 @@ export function Sidebar(props: any) {
                   onClick={() => setConfirmDelId(s.session_id)}
                 >
                   <Icon name="trash" size={13} className="shrink-0" />
-                  <span className="flex-1">Delete</span>
+                  <span className="flex-1">{translate("delete")}</span>
                 </button>
               )}
             </div>
@@ -726,8 +727,8 @@ export function Sidebar(props: any) {
         </span>
         <button
           className="w-6 h-6 grid place-items-center rounded-md text-faint hover:text-ink hover:bg-paper -mr-1"
-          title="Group & filter conversations"
-          aria-label="Group and filter conversations"
+          title={translate("groupFilter")}
+          aria-label={translate("groupFilter")}
           onClick={() => setGroupMenuOpen((v) => !v)}
         >
           <Icon name="sliders" size={14} />
@@ -900,8 +901,8 @@ export function Sidebar(props: any) {
               </span>
               <button
                 className="w-5 h-5 grid place-items-center rounded text-faint hover:text-ink hover:bg-panel"
-                title="New project"
-                aria-label="New project"
+                title={translate("newProject")}
+                aria-label={translate("newProject")}
                 onClick={() => props.onNewProject(browseKey)}
               >
                 <Icon name="folderPlus" size={14} />
@@ -1080,7 +1081,8 @@ export function Sidebar(props: any) {
           className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-[13px] text-left text-muted hover:bg-paper hover:text-ink"
           onClick={() => setSearchModalOpen(true)}
         >
-          <Icon name="search" size={15} className="shrink-0" /> Search
+          <Icon name="search" size={15} className="shrink-0" />{" "}
+          {translate("search")}
         </button>
       </div>
 
@@ -1096,7 +1098,7 @@ export function Sidebar(props: any) {
           onClick={props.onOpenScheduled}
         >
           <Icon name="clock" size={15} className="shrink-0" />
-          <span className="flex-1">Automations</span>
+          <span className="flex-1">{translate("automations")}</span>
         </button>
       </div>
 
@@ -1208,20 +1210,20 @@ export function Sidebar(props: any) {
                 <div className="h-px bg-line my-1 mx-2" />
                 {appMenuItem(
                   "gear",
-                  "Settings",
+                  translate("settings"),
                   props.onManage,
                   false,
                   <span className="text-[11px] text-faint">⌘ ,</span>,
                 )}
                 {appMenuItem(
                   "clock",
-                  "Automations",
+                  translate("automations"),
                   props.onOpenScheduled,
                   props.scheduledActive,
                 )}
                 {appMenuItem(
                   "audit",
-                  "Activity",
+                  translate("activity"),
                   props.onOpenAudit,
                   props.auditActive,
                 )}
@@ -1238,7 +1240,7 @@ export function Sidebar(props: any) {
             onClick={() => setAppMenuOpen((v) => !v)}
             aria-haspopup="menu"
             aria-expanded={appMenuOpen}
-            aria-label="OPCOS navigation menu"
+            aria-label={translate("navigationMenu")}
           >
             <span
               className={
@@ -1310,13 +1312,14 @@ function NewSessionSplit({
             onNew(solo && enabled.length === 1 ? enabled[0].id : current)
           }
         >
-          <Icon name="plus" size={15} className="shrink-0" /> New session
+          <Icon name="plus" size={15} className="shrink-0" />{" "}
+          {translate("newSession")}
         </button>
         {!solo && (
           <button
             className="px-2.5 rounded-r-lg bg-accent text-white border-l border-white/25 hover:opacity-95 flex items-center"
-            title="Start with a specific persona"
-            aria-label="Choose a persona"
+            title={translate("startPersona")}
+            aria-label={translate("choosePersona")}
             onClick={() => setOpen((v) => !v)}
           >
             <Icon name="chevronDown" size={13} />

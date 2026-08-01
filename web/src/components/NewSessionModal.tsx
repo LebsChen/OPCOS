@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Host } from "../gui";
 import { Button, SelectMenu } from "./ui";
+import { translate } from "../i18n";
 
 type ProviderOption = { name: string; title: string };
 type ModelOption = { id: string; label: string };
@@ -38,7 +39,7 @@ export function NewSessionModal({
         onSubmit={(event) => {
           event.preventDefault();
           onCreate(
-            title || "New session",
+            title || translate("newSession"),
             hostId,
             model,
             provider,
@@ -48,17 +49,17 @@ export function NewSessionModal({
         }}
       >
         <div className="modal-head">
-          <h2>New session</h2>
+          <h2>{translate("newSession")}</h2>
           <button type="button" className="close" onClick={onClose}>
             ×
           </button>
         </div>
         <label>
-          Title
+          {translate("title")}
           <input
             value={title}
             onChange={(event) => setTitle(event.target.value)}
-            placeholder="What are you working on?"
+            placeholder={translate("sessionPrompt")}
           />
         </label>
         <label>
@@ -73,7 +74,7 @@ export function NewSessionModal({
           />
         </label>
         <label>
-          Provider
+          {translate("provider")}
           <SelectMenu
             value={provider}
             onChange={setProvider}
@@ -117,15 +118,15 @@ export function NewSessionModal({
           <input
             value={workspace}
             onChange={(event) => setWorkspace(event.target.value)}
-            placeholder="/workspace"
+            placeholder={translate("workspacePath")}
           />
         </label>
         <div className="modal-actions">
           <Button type="button" onClick={onClose}>
-            Cancel
+            {translate("cancel")}
           </Button>
           <Button className="primary" disabled={!hostId}>
-            Create session
+            {translate("createSession")}
           </Button>
         </div>
       </form>
