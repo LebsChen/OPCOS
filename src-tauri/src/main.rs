@@ -24,7 +24,9 @@ use opcos_engine::{
     orchestration::{BoardPhase, BoardTask},
     orchestration::{CoordinationRuntime, Envelope, Role},
 };
-use opcos_hosts::{DEFAULT_EXEC_TIMEOUT_SECONDS, Host, LocalHost, RvmHost};
+use opcos_hosts::{
+    DEFAULT_EXEC_TIMEOUT_SECONDS, Host, LifecycleStage, LocalHost, RvmHost, execute_lifecycle_stage,
+};
 use opcos_mcp::{
     McpCredentialStore, McpManager, McpServerConfig, qualified_tool_name, stable_server_key,
 };
@@ -2534,6 +2536,40 @@ async fn artifact_host(
     ))
 }
 
+async fn lifecycle_host(
+    state: &DesktopState,
+    session_id: &str,
+) -> Result<(Box<dyn Host>, String), String> {
+    let session = session_for(state, session_id)?;
+    let host_id = session.host_id;
+    if host_id == "local" {
+        if session.workspace.is_empty() {
+            return Err("local lifecycle requires an explicit workspace directory".into());
+        }
+        let host =
+            LocalHost::new(PathBuf::from(session.workspace)).map_err(|error| error.to_string())?;
+        host.health().await.map_err(|error| error.to_string())?;
+        return Ok((Box::new(host), host_id));
+    }
+    let client = client_for(state, &host_id)?;
+    let health = client
+        .health()
+        .await
+        .map_err(|error| format!("remote host unavailable: {error}"))?;
+    let workspace = if session.workspace.is_empty() {
+        health
+            .workspace
+            .ok_or_else(|| "remote host did not provide a workspace".to_owned())?
+    } else {
+        session.workspace
+    };
+    let client = client.with_workspace(workspace.clone());
+    Ok((
+        Box::new(RvmHost::new(host_id.clone(), workspace, client)),
+        host_id,
+    ))
+}
+
 #[tauri::command]
 async fn list_artifacts(
     state: State<'_, DesktopState>,
@@ -3690,9 +3726,8 @@ async fn read_blueprint(
     state: State<'_, DesktopState>,
     session_id: String,
 ) -> Result<Value, String> {
-    let host_id = session_host_id(&state, &session_id)?;
-    let client = client_for(&state, &host_id)?;
-    let content = client
+    let (host, _) = lifecycle_host(&state, &session_id).await?;
+    let content = host
         .read(".devin/blueprint.yaml")
         .await
         .map_err(|error| error.to_string())?
@@ -3712,19 +3747,170 @@ async fn execute_blueprint(
     if command.trim().is_empty() {
         return Err("blueprint command cannot be empty".into());
     }
-    let host_id = session_host_id(&state, &session_id)?;
-    let client = client_for(&state, &host_id)?;
-    let result = client
-        .exec_sync(opcos_rvm::ExecRequest {
-            command,
+    let (host, host_id) = lifecycle_host(&state, &session_id).await?;
+    let result = host
+        .exec(opcos_rvm::ExecRequest {
+            command: command.clone(),
             cwd,
-            timeout_seconds: 1800,
-            session: Some(format!("opcos-blueprint-{session_id}")),
+            timeout_seconds: DEFAULT_EXEC_TIMEOUT_SECONDS,
+            session: None,
             env: None,
         })
         .await
         .map_err(|error| error.to_string())?;
-    serde_json::to_value(result).map_err(|error| error.to_string())
+    let value = serde_json::to_value(&result).map_err(|error| error.to_string())?;
+    audit(
+        &state,
+        &session_id,
+        "lifecycle_command_finished",
+        redact_approval_value(&json!({
+            "stage": "maintenance",
+            "host_id": host_id,
+            "command": command,
+            "exit_code": result.result.exit_code,
+            "stdout": result.result.stdout,
+            "stderr": result.result.stderr,
+            "timed_out": result.result.timed_out,
+        })),
+    );
+    if result.result.timed_out || result.result.exit_code != 0 {
+        return Err(format!(
+            "blueprint command failed: `{command}` exited with code {}",
+            result.result.exit_code
+        ));
+    }
+    Ok(value)
+}
+
+async fn run_lifecycle_stage(
+    state: &DesktopState,
+    session_id: &str,
+    stage: LifecycleStage,
+    commands: Vec<String>,
+) -> Result<Value, String> {
+    let (host, host_id) = lifecycle_host(state, session_id).await?;
+    let started_at = Utc::now();
+    audit(
+        state,
+        session_id,
+        "lifecycle_stage_started",
+        json!({
+            "stage": stage,
+            "host_id": host_id,
+            "command_count": commands.len(),
+            "started_at": started_at.to_rfc3339(),
+        }),
+    );
+    let results = match execute_lifecycle_stage(host.as_ref(), stage, commands).await {
+        Ok(results) => results,
+        Err(error) => {
+            audit(
+                state,
+                session_id,
+                "lifecycle_stage_failed",
+                json!({
+                    "stage": stage,
+                    "host_id": host_id,
+                    "error": error.to_string(),
+                    "elapsed_ms": (Utc::now() - started_at).num_milliseconds(),
+                }),
+            );
+            return Err(format!("lifecycle {stage:?} failed: {error}"));
+        }
+    };
+    let mut hard_failure = None;
+    let mut soft_failure = false;
+    for result in &results {
+        let failed = result.timed_out || result.exit_code != 0;
+        soft_failure |= failed && stage.is_soft_failure();
+        if failed && !stage.is_soft_failure() {
+            hard_failure = Some(result);
+        }
+        audit(
+            state,
+            session_id,
+            if failed {
+                "lifecycle_command_failed"
+            } else {
+                "lifecycle_command_finished"
+            },
+            redact_approval_value(&json!({
+                "stage": stage,
+                "host_id": host_id,
+                "index": result.index,
+                "command": result.command,
+                "exit_code": result.exit_code,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "timed_out": result.timed_out,
+                "continued": result.continued,
+                "elapsed_ms": result.elapsed_ms,
+            })),
+        );
+    }
+    let elapsed_ms = (Utc::now() - started_at).num_milliseconds();
+    if let Some(result) = hard_failure {
+        audit(
+            state,
+            session_id,
+            "lifecycle_stage_failed",
+            redact_approval_value(&json!({
+                "stage": stage,
+                "host_id": host_id,
+                "command": result.command,
+                "exit_code": result.exit_code,
+                "elapsed_ms": elapsed_ms,
+            })),
+        );
+        return Err(format!(
+            "lifecycle {stage:?} blocked by `{}` with exit code {}",
+            result.command, result.exit_code
+        ));
+    }
+    audit(
+        state,
+        session_id,
+        "lifecycle_stage_finished",
+        json!({
+            "stage": stage,
+            "host_id": host_id,
+            "status": if soft_failure { "soft_failed" } else { "ok" },
+            "elapsed_ms": elapsed_ms,
+        }),
+    );
+    serde_json::to_value(&results).map_err(|error| error.to_string())
+}
+
+async fn run_configured_lifecycle_stage(
+    state: &DesktopState,
+    session_id: &str,
+    stage: LifecycleStage,
+) -> Result<Value, String> {
+    let (host, _) = lifecycle_host(state, session_id).await?;
+    let blueprint = parse_blueprint(
+        &host
+            .read(".devin/blueprint.yaml")
+            .await
+            .map_err(|error| error.to_string())?
+            .content,
+    )
+    .map_err(|error| error.to_string())?;
+    let commands = match stage {
+        LifecycleStage::Clone => blueprint.clone,
+        LifecycleStage::Initialize => {
+            let mut commands = blueprint.dependencies;
+            commands.extend(blueprint.initialize);
+            commands
+        }
+        LifecycleStage::Maintenance => blueprint.maintenance,
+        LifecycleStage::PostBuild => {
+            let mut commands = blueprint.build;
+            commands.extend(blueprint.post_build);
+            commands
+        }
+        LifecycleStage::PrePush => blueprint.pre_push,
+    };
+    run_lifecycle_stage(state, session_id, stage, commands).await
 }
 
 #[tauri::command]
@@ -3732,49 +3918,18 @@ async fn run_blueprint(
     state: State<'_, DesktopState>,
     session_id: String,
 ) -> Result<Value, String> {
-    let host_id = session_host_id(&state, &session_id)?;
-    let client = client_for(&state, &host_id)?;
-    let blueprint = parse_blueprint(
-        &client
-            .read(".devin/blueprint.yaml")
-            .await
-            .map_err(|error| error.to_string())?
-            .content,
-    )
-    .map_err(|error| error.to_string())?;
-    let mut completed = Vec::new();
-    for (phase, commands) in [
-        ("initialize", blueprint.initialize),
-        ("dependencies", blueprint.dependencies),
-        ("build", blueprint.build),
+    let mut stages = serde_json::Map::new();
+    for stage in [
+        LifecycleStage::Clone,
+        LifecycleStage::Initialize,
+        LifecycleStage::Maintenance,
+        LifecycleStage::PostBuild,
+        LifecycleStage::PrePush,
     ] {
-        for (index, command) in commands.into_iter().enumerate() {
-            let result = client
-                .exec_sync(opcos_rvm::ExecRequest {
-                    command,
-                    cwd: None,
-                    timeout_seconds: 1800,
-                    session: Some(format!("opcos-blueprint-{session_id}")),
-                    env: None,
-                })
-                .await
-                .map_err(|error| format!("blueprint {phase}[{index}] failed: {error}"))?;
-            if result.result.exit_code != 0 {
-                return Err(format!(
-                    "blueprint {phase}[{index}] failed with exit code {}: {}",
-                    result.result.exit_code,
-                    result.result.stderr.trim()
-                ));
-            }
-            completed.push(json!({
-                "phase": phase,
-                "index": index,
-                "stdout": result.result.stdout,
-                "stderr": result.result.stderr,
-            }));
-        }
+        let result = run_configured_lifecycle_stage(&state, &session_id, stage).await?;
+        stages.insert(format!("{stage:?}"), result);
     }
-    Ok(json!({"status":"ok","completed":completed}))
+    Ok(json!({"status":"ok","stages":stages}))
 }
 
 #[tauri::command]
@@ -3794,6 +3949,9 @@ async fn git_workflow(
     message: Option<String>,
     secret_names: Option<Vec<String>>,
 ) -> Result<Value, String> {
+    if operation == "push" {
+        run_configured_lifecycle_stage(&state, &session_id, LifecycleStage::PrePush).await?;
+    }
     let host_id = session_host_id(&state, &session_id)?;
     let client = client_for(&state, &host_id)?.with_workspace(cwd.clone());
     let command = match operation.as_str() {
@@ -3880,8 +4038,10 @@ fn shell_quote(value: &str) -> String {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn github_pull_request(
     state: State<'_, DesktopState>,
+    session_id: Option<String>,
     repo: String,
     title: String,
     head: String,
@@ -3889,6 +4049,9 @@ async fn github_pull_request(
     body: String,
     token_secret: String,
 ) -> Result<Value, String> {
+    if let Some(session_id) = session_id {
+        run_configured_lifecycle_stage(&state, &session_id, LifecycleStage::PrePush).await?;
+    }
     let token = state
         .secrets
         .get(&secret_key("asset-secret", &token_secret))
