@@ -1107,7 +1107,7 @@ function ManageSections({
     ).then((entries) => setProviderModelOptions(Object.fromEntries(entries)));
   }, [providers]);
   return (
-    <section>
+    <section className="settings-body">
       <header className="mb-5">
         <h1 className="text-[22px] font-semibold text-ink">
           {sectionCopy[tab][0]}
@@ -2874,7 +2874,7 @@ function Activity({
           ))}
         </nav>
         <div className="flex-1 min-w-0 overflow-y-auto hairline-scroll">
-          <div className="max-w-4xl mx-auto w-full px-7 py-6">
+          <div className="activity-body max-w-4xl mx-auto w-full px-7 py-6">
             <header className="mb-5">
               <h1 className="text-[22px] font-semibold text-ink">
                 {activityTab[0].toUpperCase() + activityTab.slice(1)}

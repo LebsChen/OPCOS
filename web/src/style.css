@@ -1763,6 +1763,29 @@ input.workspace-chip {
   gap: 7px;
   margin-top: 10px;
 }
+.settings-body .manage-card,
+.activity-body .manage-card {
+  margin: 0 0 12px;
+  padding: 16px;
+  border-radius: 12px;
+}
+.settings-body .manage-row,
+.activity-body .manage-row {
+  min-height: 56px;
+  margin: 0 0 8px;
+  padding: 14px 16px;
+  border: 1px solid var(--color-line);
+  border-radius: 12px;
+  background: var(--color-panel);
+}
+.settings-body .manage-row:last-child,
+.activity-body .manage-row:last-child {
+  margin-bottom: 0;
+}
+.settings-body .inline-actions,
+.activity-body .inline-actions {
+  margin-top: 0;
+}
 .code-block {
   overflow: auto;
   max-height: 300px;
