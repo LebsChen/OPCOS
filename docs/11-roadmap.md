@@ -1,0 +1,96 @@
+# 11 开发路线与 Todos
+
+定位：**Devin 为主（Cloud 形态与产品完整度对标 Devin），Tembo / OpenWork / OpenWorker / Cloud-Dev 为辅（Local 形态的实现参照）**。见 [README](README.md)。
+
+每一项都写明：改哪里、验收标准。**验收标准是可执行的**——没有真机证据不算完成。所有项都受 [00](00-architecture.md) 硬约束与 [08](08-security.md) 的 token 边界限制。
+
+状态图例：`[ ]` 未开始 · `[~]` 进行中 · `[x]` 完成
+
+---
+
+## P0 —— 收口现有实现（地基，不做完不往上盖）
+
+### P0-1 单一存储权威
+
+`opcos-store` 与桌面 adapter 各有一套 `sessions` / `tool_calls` schema（见 [01](01-data-model.md) 1.1），会漂移。
+
+- 改：`crates/opcos-store`、`src-tauri/src/main.rs`
+- 做：桌面表只保留 adapter 专属（`hosts`、`secret_records`、`schedules`），会话/消息/工具/审批全部归 `opcos-store`；写一次性迁移。
+- 验收：`cargo test` 通过；重启后 transcript、pending approval、审计完整；数据库中不再有两张 `sessions`。
+
+### P0-2 会话状态二维化
+
+- 改：`opcos-engine`、`opcos-store`、`web/src`
+- 做：`run_state`（`idle|running|interrupted|error`）× `stop_reason`（见 [03](03-lifecycle.md) 3.2），持久化原始枚举；UI 用 `stop_reason` 区分「等你回话 / 等审批 / 跑完了 / 主机不可用」。
+- 验收：四种 `stop_reason` 各能在 UI 上被区分出来；`host_unavailable` 不被显示成「已完成」。
+
+### P0-3 Host trait 与本机 host
+
+用户已多次提出「VM 默认 local 缺失」。
+
+- 改：新增 `crates/opcos-hosts`，`opcos-rvm` 实现 `RvmHost`
+- 做：按 [04](04-host-protocol.md) 4.1 落 `Host` trait；实现 `LocalHost`（真实进程生命周期：启动、停止、端口占用检测、崩溃恢复、能力探测、只绑定回环）；能力探测结果带来源与时间戳。
+- 验收：设置页出现「本机」，能真起真停；端口被占用时报明确错误；远程不可用仍显式报错、不回落本机。
+
+### P0-4 产物模型
+
+- 改：`opcos-store`、右栏
+- 做：`artifact` 表只存引用（host、路径、大小、hash、turn），不复制内容；工具执行结果落产物记录；右栏加 Artifacts pane（照 Cloud-Dev 现有 pane 结构，不自造）。
+- 验收：一次真实 turn 后产物列表出现远端文件，点击能读回内容；远端不可读时显式报错。
+
+---
+
+## P1 —— 能力模型与协议
+
+### P1-1 配置对象迁移
+
+- 做：五套资产收敛到 `config_object` + 不可变 `config_object_version`（[06](06-capability-model.md)、[01](01-data-model.md)）；UI 仍保留五个入口但走同一套组件；技能改「先给清单、命中再读全文」。
+- 验收：编辑资产产生新版本、旧版本可回滚；30 个技能时上下文不膨胀（只注入清单）。
+
+### P1-2 MCP client 完整化
+
+- 做：global（`~/.config/opcos/mcp.json`）与 workspace（`<ws>/.opcos/mcp.json`）配置层叠、同名 workspace 覆盖 global；transport `stdio` / `http` / `streamable-http` / `sse`；OAuth token 进 SecretStore **不写配置文件**；tool discovery + 逐 tool 审批（[05](05-mcp.md)）。
+- 验收：接入一个真实 MCP server，工具可发现、可逐个审批；配置文件中无任何 token。
+
+### P1-3 生命周期阶段与 pre-push 门禁
+
+- 做：按 [07](07-automation.md) 7.3 实现五个阶段与各自失败语义；补 `pre-push` 门禁（硬失败阻止 push）。
+- 验收：故意让 `pre-push` 失败 → push 被阻止并显示失败命令与退出码；`maintenance` 失败不阻断。
+
+### P1-4 Inbox 与无人值守
+
+- 做：审批、提问、目录请求、计划确认统一停放 durable Inbox；会话可标记 unattended；断线重连后恢复挂起项（参照 OpenWorker 的模型）。
+- 验收：unattended 会话产生的审批出现在 Inbox；重启 app 后仍在，处理后会话继续。
+
+### P1-5 全局 Instructions
+
+- 做：`kind = instruction` 的配置对象，追加到所有会话的系统提示（PR 标题、commit 文案等规则）。
+- 验收：新会话的系统提示包含指令内容；关闭后不再包含。
+
+---
+
+## P2 —— 平台化
+
+- **P2-1 Harness 可插拔**：`opcos-harness`，内置 + Claude Code / Codex / OpenCode 子进程，统一事件流（参照 Tembo 的 6 种 harness）。
+- **P2-2 自动化三类触发**：定时（已有）+ 出站事件轮询（GitHub / Linear / Sentry）+ webhook（需 relay，见 P3）。payload 以结构化 event context 传入，不压成一句 prompt。
+- **P2-3 连接器框架**：适配器接口 + OAuth（手工 token 路径永远保留）+ token 只进 SecretStore。先做一个真集成，不做空壳。
+- **P2-4 插件打包**：`plugin` / `plugin_member`，支持从 GitHub 仓库导入导出；MCP server URL 只能来自插件自己的配置对象。
+- **P2-5 仓库索引与语义检索**：`opcos-context`，知识按触发条件注入（对标 Devin DeepWiki）。
+
+## P3 —— OPCOS Cloud（可完全关闭）
+
+顺序 **A → D → B → C**，见 [09](09-cloud.md)。前三种都不改变「agent 循环在本地」。
+
+- **A** 托管 OAuth broker（云端不存连接器 token）
+- **D** 配置对象与插件分发、授权
+- **B** 事件 relay（公网入站 webhook，本地只出站）
+- **C** worker fleet（队列 + 原子 claim + 租约超时回队，照 Devin Outposts）
+
+---
+
+## 收尾项（贯穿）
+
+- [ ] 剩余自造 UI（会话 topbar、Transcript、composer 外壳、Settings 正文页、Activity 看板）退回 OpenWork / Cloud-Dev 参照实现
+- [ ] blueprint 写入 Tauri / Rust / 系统依赖
+- [ ] 每个里程碑后跑真机 Tauri 端到端验收并录屏
+- [ ] 发布产物：deb / rpm / AppImage / Windows NSIS + `SHA256SUMS.txt`（本地构建，GitHub Actions 只做 lint/test）
