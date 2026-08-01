@@ -33,6 +33,7 @@ import { RightRail } from "./components/RightRail";
 import { SelectMenu as OpenWorkerSelectMenu } from "./components/SelectMenu";
 import { SettingsView, type SettingsSection } from "./components/SettingsView";
 import { Icon } from "./components/Icon";
+import { ListPage } from "./components/ListPage";
 import "./openworker-tailwind.css";
 import "./openworker-styles.css";
 import "./style.css";
@@ -1356,13 +1357,9 @@ function ManageSections({
               .filter(([kind]) => kind === assetTabKind)
               .map(([kind, label, description]) => (
                 <section
-                  className="mb-5 rounded-xl2 border border-line bg-paper p-4"
+                  className="mb-5 rounded-xl2 border border-line bg-panel divide-y divide-line"
                   key={kind}
                 >
-                  <h2 className="text-[15px] font-semibold text-ink">
-                    Saved items
-                  </h2>
-                  <p className="field-help">{description}</p>
                   {assets
                     .filter(
                       (asset) =>
@@ -1372,7 +1369,7 @@ function ManageSections({
                           .includes(assetSearch.toLowerCase()),
                     )
                     .map((asset) => (
-                      <div className="manage-row" key={asset.id}>
+                      <div className="manage-row px-4" key={asset.id}>
                         <span>
                           <strong>{asset.title}</strong>
                           <small>
@@ -1439,7 +1436,9 @@ function ManageSections({
                       </div>
                     ))}
                   {!assets.some((asset) => asset.kind === kind) && (
-                    <p className="empty-state">No {label} assets yet.</p>
+                    <p className="px-4 py-6 text-[13px] text-muted">
+                      No {label} assets yet.
+                    </p>
                   )}
                 </section>
               ))}
@@ -1995,15 +1994,20 @@ function Activity({
               }
             />
             {activityTab === "worklog" && (
-              <div className="rounded-xl2 border border-line bg-panel p-5">
-                {!selected ? (
-                  <p className="empty-state">
-                    Select a session to load its worklog.
-                  </p>
-                ) : (
-                  <pre>{JSON.stringify(worklog, null, 2)}</pre>
-                )}
-              </div>
+              <ListPage
+                search=""
+                onSearch={() => undefined}
+                searchPlaceholder="Filter worklog events"
+                primary={<Button className="primary">Reload worklog</Button>}
+                rows={
+                  selected && worklog ? (
+                    <pre className="p-4">
+                      {JSON.stringify(worklog, null, 2)}
+                    </pre>
+                  ) : null
+                }
+                empty="Select a session to load its worklog."
+              />
             )}
             {activityTab === "insights" && (
               <div className="rounded-xl2 border border-line bg-panel p-5">
