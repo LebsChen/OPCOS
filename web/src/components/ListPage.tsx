@@ -14,7 +14,7 @@ export function ListPage({
   onSearch: (value: string) => void;
   searchPlaceholder: string;
   actions?: ReactNode;
-  primary: ReactNode;
+  primary?: ReactNode;
   rows: ReactNode;
   empty: string;
   form?: ReactNode;
@@ -30,7 +30,7 @@ export function ListPage({
           onChange={(event) => onSearch(event.target.value)}
         />
         {actions}
-        {primary}
+        {primary ?? null}
       </div>
       <div className="rounded-xl2 border border-line bg-panel divide-y divide-line">
         {hasRows ? (

@@ -1901,9 +1901,11 @@ function Activity({
   const [roleId, setRoleId] = useState("");
   const [roleState, setRoleState] = useState("active");
   const [taskTitle, setTaskTitle] = useState("");
+  const [taskFormOpen, setTaskFormOpen] = useState(false);
   const [worker, setWorker] = useState("");
   const [prUrl, setPrUrl] = useState("");
   const [message, setMessage] = useState("");
+  const [messageFormOpen, setMessageFormOpen] = useState(false);
   const [rolesText, setRolesText] = useState(
     '[{"id":"leader","sort_order":0,"session_id":"","state":"Active"}]',
   );
@@ -2057,7 +2059,10 @@ function Activity({
                           void command("coordination_start", {
                             input: { taskId, roles },
                           })
-                            .then(load)
+                            .then(() => {
+                              setTaskFormOpen(false);
+                              return load();
+                            })
                             .catch(onError);
                         } catch {
                           onError("Roles must be valid JSON.");
@@ -2103,61 +2108,80 @@ function Activity({
                   </div>
                 )}
                 <div className="mt-5 grid grid-cols-1 gap-4">
-                  <section
-                    className={`board-column rounded-xl2 border border-line bg-panel p-4 ${activityTab !== "roles" ? "hidden" : ""}`}
-                  >
-                    <h2>Roles</h2>
-                    {board?.roles.length ? (
-                      board.roles.map((role) => (
-                        <div className="board-card" key={String(role.id)}>
-                          <strong>{String(role.id)}</strong>
-                          <span>Session: {String(role.session_id)}</span>
-                          <span>Order: {String(role.sort_order)}</span>
-                          <span>State: {String(role.state)}</span>
-                        </div>
-                      ))
-                    ) : (
-                      <p className="empty-state">
-                        No roles loaded yet. Start or observe a board.
-                      </p>
-                    )}
-                  </section>
+                  {activityTab === "roles" && (
+                    <ListPage
+                      search=""
+                      onSearch={() => undefined}
+                      searchPlaceholder="Search roles"
+                      rows={
+                        board?.roles.length ? (
+                          <>
+                            {board.roles.map((role) => (
+                              <div
+                                className="manage-row px-4"
+                                key={String(role.id)}
+                              >
+                                <span>
+                                  <strong>{String(role.id)}</strong>
+                                  <small>
+                                    {String(role.state)} · Session{" "}
+                                    {String(role.session_id)}
+                                  </small>
+                                </span>
+                              </div>
+                            ))}
+                          </>
+                        ) : null
+                      }
+                      empty="No roles loaded yet. Start or observe a board."
+                    />
+                  )}
                   <section
                     className={`board-column rounded-xl2 border border-line bg-panel p-4 ${activityTab !== "tasks" ? "hidden" : ""}`}
                   >
-                    <h2>Tasks</h2>
-                    <div className="inline-actions">
-                      <input
-                        value={taskTitle}
-                        onChange={(event) => setTaskTitle(event.target.value)}
-                        placeholder="New task"
-                      />
-                      <input
-                        value={worker}
-                        onChange={(event) => setWorker(event.target.value)}
-                        placeholder="Worker / assignee"
-                      />
-                      <input
-                        value={prUrl}
-                        onChange={(event) => setPrUrl(event.target.value)}
-                        placeholder="Verified PR URL"
-                      />
+                    <div className="inline-actions mb-3">
+                      <input placeholder="Search tasks" />
                       <Button
                         className="primary"
-                        disabled={!taskId}
-                        onClick={() =>
-                          command("coordination_create_task", {
-                            id: `task-${Date.now()}`,
-                            title: taskTitle,
-                            requireAcceptance: true,
-                          })
-                            .then(load)
-                            .catch(onError)
-                        }
+                        onClick={() => setTaskFormOpen(true)}
                       >
-                        Create
+                        New task
                       </Button>
                     </div>
+                    {taskFormOpen && (
+                      <div className="inline-actions">
+                        <input
+                          value={taskTitle}
+                          onChange={(event) => setTaskTitle(event.target.value)}
+                          placeholder="New task"
+                        />
+                        <input
+                          value={worker}
+                          onChange={(event) => setWorker(event.target.value)}
+                          placeholder="Worker / assignee"
+                        />
+                        <input
+                          value={prUrl}
+                          onChange={(event) => setPrUrl(event.target.value)}
+                          placeholder="Verified PR URL"
+                        />
+                        <Button
+                          className="primary"
+                          disabled={!taskId}
+                          onClick={() =>
+                            command("coordination_create_task", {
+                              id: `task-${Date.now()}`,
+                              title: taskTitle,
+                              requireAcceptance: true,
+                            })
+                              .then(load)
+                              .catch(onError)
+                          }
+                        >
+                          Create
+                        </Button>
+                      </div>
+                    )}
                     {board?.tasks.length ? (
                       board.tasks.map((task) => (
                         <div
@@ -2222,36 +2246,51 @@ function Activity({
                   <section
                     className={`board-column rounded-xl2 border border-line bg-panel p-4 ${activityTab !== "messages" ? "hidden" : ""}`}
                   >
-                    <h2>Messages</h2>
-                    <label className="field-label">Message envelope</label>
-                    <textarea
-                      value={message}
-                      onChange={(event) => setMessage(event.target.value)}
-                      placeholder='{"kind":"status","payload":{}}'
-                    />
-                    <p className="field-help">
-                      Messages use the coordination envelope accepted by the
-                      remote host.
-                    </p>
-                    <Button
-                      className="bordered"
-                      disabled={!taskId}
-                      onClick={() => {
-                        try {
-                          const envelope = JSON.parse(message);
-                          void command("coordination_message", {
-                            taskId,
-                            envelope,
-                          })
-                            .then(load)
-                            .catch(onError);
-                        } catch {
-                          onError("Message must be valid JSON.");
-                        }
-                      }}
-                    >
-                      Send message
-                    </Button>
+                    <div className="inline-actions mb-3">
+                      <input placeholder="Search messages" />
+                      <Button
+                        className="primary"
+                        onClick={() => setMessageFormOpen(true)}
+                      >
+                        New message
+                      </Button>
+                    </div>
+                    {messageFormOpen && (
+                      <>
+                        <label className="field-label">Message envelope</label>
+                        <textarea
+                          value={message}
+                          onChange={(event) => setMessage(event.target.value)}
+                          placeholder='{"kind":"status","payload":{}}'
+                        />
+                        <p className="field-help">
+                          Messages use the coordination envelope accepted by the
+                          remote host.
+                        </p>
+                        <Button
+                          className="bordered"
+                          disabled={!taskId}
+                          onClick={() => {
+                            try {
+                              const envelope = JSON.parse(message);
+                              void command("coordination_message", {
+                                taskId,
+                                envelope,
+                              })
+                                .then(() => {
+                                  setMessageFormOpen(false);
+                                  return load();
+                                })
+                                .catch(onError);
+                            } catch {
+                              onError("Message must be valid JSON.");
+                            }
+                          }}
+                        >
+                          Send message
+                        </Button>
+                      </>
+                    )}
                     {board?.messages.length ? (
                       board.messages.map((item) => (
                         <div className="board-card" key={String(item.msg_id)}>
