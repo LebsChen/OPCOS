@@ -26,6 +26,11 @@ P2-4 先落地 Linear 的直接 GraphQL 连接器，而不是复用 Linear MCP�
 OAuth 回调或远端 transport。Linear webhook 需要公网入站，仍延后到 Cloud B；本地
 事件继续使用 P2-3 的回环触发器和用户手动/低频定时拉取。Linear PAT 只存入
 SecretStore，连接器工具缺少 PAT、网络不可达或权限不足时返回显式错误。
+
+Linear writes are exposed only through the agent tool path, where the existing
+policy creates a pending approval/Inbox item before execution. There is no
+frontend boolean that can authorize a comment or status change; a client-supplied
+`approved` flag is not an approval.
 2. **入站 webhook**（需要 relay）：本地只出站长连接到 relay，relay 提供稳定公网端点接事件后推给本机。不暴露本机端口。
 
 先做 1，不要因为 2 才好看就先做 2。

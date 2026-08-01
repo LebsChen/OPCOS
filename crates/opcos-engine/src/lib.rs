@@ -364,6 +364,7 @@ pub struct TurnEngine<P, S, E> {
     system_instructions: Mutex<Option<String>>,
     external_tools: Mutex<Vec<Value>>,
     allowed_tools: Mutex<Option<HashSet<String>>>,
+    linear_tools_enabled: AtomicBool,
     active_tool_calls: StdMutex<HashSet<String>>,
     policy_denied: AtomicBool,
 }
@@ -438,6 +439,7 @@ where
             system_instructions: Mutex::new(None),
             external_tools: Mutex::new(Vec::new()),
             allowed_tools: Mutex::new(None),
+            linear_tools_enabled: AtomicBool::new(false),
             active_tool_calls: StdMutex::new(HashSet::new()),
             policy_denied: AtomicBool::new(false),
         }
@@ -457,6 +459,10 @@ where
 
     pub async fn set_allowed_tools(&self, tools: impl IntoIterator<Item = String>) {
         *self.allowed_tools.lock().await = Some(tools.into_iter().collect());
+    }
+
+    pub fn set_linear_tools_enabled(&self, enabled: bool) {
+        self.linear_tools_enabled.store(enabled, Ordering::SeqCst);
     }
 
     pub async fn submit_text(&self, text: impl Into<String>) -> Result<AssistantTurn, EngineError> {
@@ -884,6 +890,15 @@ where
                         tools,
                         allowed.as_ref().and_then(|value| value.as_ref()),
                     );
+                    if !self.linear_tools_enabled.load(Ordering::SeqCst) {
+                        tools.retain(|tool| {
+                            !tool
+                                .get("function")
+                                .and_then(|function| function.get("name"))
+                                .and_then(Value::as_str)
+                                .is_some_and(|name| name.starts_with("linear_"))
+                        });
+                    }
                     tools
                 },
                 settings: json!({}),
@@ -1330,7 +1345,13 @@ where
 
 fn tool_risk(name: &str) -> ToolRisk {
     match name {
-        "read_file" | "list_dir" | "git_status" | "git_diff" | "git_log" => ToolRisk::Read,
+        "read_file"
+        | "list_dir"
+        | "git_status"
+        | "git_diff"
+        | "git_log"
+        | "linear_get_issue"
+        | "linear_list_my_issues" => ToolRisk::Read,
         "write_file" | "edit" => ToolRisk::Write,
         "run_shell" => ToolRisk::Execute,
         _ => ToolRisk::External,
@@ -1826,6 +1847,14 @@ mod tests {
         assert!(!names.contains("run_shell"));
         assert!(!names.contains("write_file"));
         assert!(!names.contains("list_dir"));
+    }
+
+    #[test]
+    fn linear_read_tools_are_read_only_but_writes_require_external_approval() {
+        assert_eq!(tool_risk("linear_get_issue"), ToolRisk::Read);
+        assert_eq!(tool_risk("linear_list_my_issues"), ToolRisk::Read);
+        assert_eq!(tool_risk("linear_comment_issue"), ToolRisk::External);
+        assert_eq!(tool_risk("linear_update_issue_status"), ToolRisk::External);
     }
 
     #[derive(Clone)]

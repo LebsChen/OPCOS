@@ -1679,6 +1679,11 @@ async fn engine_for(
         .or(configured_base_url)
         .or(descriptor.default_base_url)
         .unwrap_or_default();
+    let linear_tools_enabled = state
+        .secrets
+        .get(&secret_key("asset-secret", "linear-pat"))
+        .map_err(|error| error.to_string())?
+        .is_some();
     let mcp_runtime = Arc::clone(&state.mcp);
     let (workspace, executor, remote_client, allowed_tools) = if host_id == "local" {
         if session_workspace.is_empty() {
@@ -1705,6 +1710,14 @@ async fn engine_for(
             .collect::<Vec<_>>();
         let mut allowed_tools = allowed_tools;
         allowed_tools.extend(["propose_plan".to_owned(), "ask_user".to_owned()]);
+        if linear_tools_enabled {
+            allowed_tools.extend([
+                "linear_get_issue".to_owned(),
+                "linear_list_my_issues".to_owned(),
+                "linear_comment_issue".to_owned(),
+                "linear_update_issue_status".to_owned(),
+            ]);
+        }
         (
             workspace.display().to_string(),
             Arc::new(DesktopExecutor::Local(LocalExecutor {
@@ -1815,6 +1828,7 @@ async fn engine_for(
         permission_mode,
         model,
     ));
+    engine.set_linear_tools_enabled(linear_tools_enabled);
     engine.set_unattended(
         state
             .store
@@ -4468,62 +4482,6 @@ async fn linear_list_my_issues(
 }
 
 #[tauri::command]
-async fn linear_comment_issue(
-    state: State<'_, DesktopState>,
-    issue_id: String,
-    body: String,
-    approved: bool,
-) -> Result<Value, String> {
-    if !approved {
-        return Err("approval required for Linear comment".into());
-    }
-    let data = linear_graphql(
-        &state,
-        "mutation($issueId:String!,$body:String!) { commentCreate(input:{issueId:$issueId,body:$body}) { success comment { id body } } }",
-        json!({"issueId": issue_id, "body": body}),
-    )
-    .await?;
-    audit(
-        &state,
-        "",
-        "linear_comment_created",
-        json!({"issue_id": issue_id}),
-    );
-    Ok(data
-        .get("commentCreate")
-        .cloned()
-        .unwrap_or_else(|| json!({})))
-}
-
-#[tauri::command]
-async fn linear_update_issue_status(
-    state: State<'_, DesktopState>,
-    issue_id: String,
-    state_id: String,
-    approved: bool,
-) -> Result<Value, String> {
-    if !approved {
-        return Err("approval required for Linear status change".into());
-    }
-    let data = linear_graphql(
-        &state,
-        "mutation($id:String!,$stateId:String!) { issueUpdate(id:$id,input:{stateId:$stateId}) { success issue { id identifier state { id name type } } } }",
-        json!({"id": issue_id, "stateId": state_id}),
-    )
-    .await?;
-    audit(
-        &state,
-        "",
-        "linear_issue_status_updated",
-        json!({"issue_id": issue_id, "state_id": state_id}),
-    );
-    Ok(data
-        .get("issueUpdate")
-        .cloned()
-        .unwrap_or_else(|| json!({})))
-}
-
-#[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn linear_create_session_from_issue(
     state: State<'_, DesktopState>,
@@ -6563,8 +6521,6 @@ fn main() {
             linear_connection,
             linear_get_issue,
             linear_list_my_issues,
-            linear_comment_issue,
-            linear_update_issue_status,
             linear_create_session_from_issue,
             list_mcp_servers,
             retry_mcp_server,
