@@ -1115,6 +1115,12 @@ function ManageSections({
   const [providerStatuses, setProviderStatuses] = useState<
     Record<string, string>
   >({});
+  const [providerModelOptions, setProviderModelOptions] = useState<
+    Record<string, Array<{ id: string; label: string }>>
+  >({});
+  const [providerModels, setProviderModels] = useState<Record<string, string>>(
+    {},
+  );
   const [assetTitle, setAssetTitle] = useState("");
   const [assetBody, setAssetBody] = useState("");
   const [assetKind, setAssetKind] = useState<Asset["kind"]>("knowledge");
@@ -1194,6 +1200,23 @@ function ManageSections({
       .then(setProviderConfigs)
       .catch(onError);
   }, []);
+  useEffect(() => {
+    if (!providers.length) return;
+    void Promise.all(
+      providers.map(
+        async (item) =>
+          [
+            item.name,
+            await command<Array<{ id: string; label: string }>>(
+              "provider_models",
+              {
+                provider: item.name,
+              },
+            ),
+          ] as const,
+      ),
+    ).then((entries) => setProviderModelOptions(Object.fromEntries(entries)));
+  }, [providers]);
   return (
     <section>
       <header className="mb-5">
@@ -1255,18 +1278,19 @@ function ManageSections({
                     </div>
                     <SelectMenu
                       value={
-                        provider === descriptor.name
-                          ? provider
-                          : descriptor.recommended_model || ""
+                        providerModels[descriptor.name] ||
+                        descriptor.recommended_model ||
+                        ""
                       }
-                      onChange={() => setProvider(descriptor.name)}
-                      options={[
-                        {
-                          value: descriptor.name,
-                          label:
-                            descriptor.recommended_model || descriptor.title,
-                        },
-                      ]}
+                      onChange={(value) =>
+                        setProviderModels((items) => ({
+                          ...items,
+                          [descriptor.name]: value,
+                        }))
+                      }
+                      options={(
+                        providerModelOptions[descriptor.name] || []
+                      ).map((item) => ({ value: item.id, label: item.label }))}
                     />
                   </div>
                   <div className="settings-row">
