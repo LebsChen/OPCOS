@@ -1741,6 +1741,7 @@ function Automations({
   const [automationTab, setAutomationTab] = useState<"schedules" | "runs">(
     "schedules",
   );
+  const [scheduleFormOpen, setScheduleFormOpen] = useState(false);
   const load = () =>
     command<Schedule[]>("list_schedules").then(setSchedules).catch(onError);
   useEffect(() => {
@@ -1783,104 +1784,134 @@ function Automations({
             />
             {automationTab === "schedules" ? (
               <>
-                <div className="manage-card form-grid">
-                  <label>
-                    Name
-                    <input
-                      value={name}
-                      onChange={(event) => setName(event.target.value)}
-                    />
-                  </label>
-                  <label>
-                    Session
-                    <SelectMenu
-                      value={sessionId}
-                      onChange={setSessionId}
-                      options={sessions.map((session) => ({
-                        value: session.id,
-                        label: session.title,
-                      }))}
-                    />
-                  </label>
-                  <label>
-                    Playbook
-                    <SelectMenu
-                      value={playbookId}
-                      onChange={setPlaybookId}
-                      options={assets
-                        .filter((asset) => asset.kind === "playbook")
-                        .map((asset) => ({
-                          value: asset.id,
-                          label: asset.title,
-                        }))}
-                    />
-                  </label>
-                  <label>
-                    Cron
-                    <input
-                      value={cron}
-                      onChange={(event) => setCron(event.target.value)}
-                    />
-                  </label>
-                  <Button
-                    className="primary"
-                    onClick={() =>
-                      command("save_schedule", {
-                        schedule: {
-                          name,
-                          sessionId,
-                          playbookId,
-                          cron,
-                          enabled: true,
-                        },
-                      })
-                        .then(load)
-                        .catch(onError)
-                    }
-                  >
-                    Save automation
-                  </Button>
-                </div>
-                <div className="manage-card">
-                  {schedules.map((schedule) => (
-                    <div className="manage-row" key={schedule.id}>
-                      <span>
-                        <strong>{schedule.name}</strong>
-                        <small>
-                          {schedule.cron} ·{" "}
-                          {schedule.last_result || "never run"}
-                        </small>
-                      </span>
-                      <Button
-                        onClick={() =>
-                          command("run_schedule", { scheduleId: schedule.id })
-                            .then(load)
-                            .catch(onError)
-                        }
-                      >
-                        Run now
-                      </Button>
-                    </div>
-                  ))}
-                </div>
+                <ListPage
+                  search=""
+                  onSearch={() => undefined}
+                  searchPlaceholder="Search schedules"
+                  primary={
+                    <Button
+                      className="primary"
+                      onClick={() => setScheduleFormOpen(true)}
+                    >
+                      New schedule
+                    </Button>
+                  }
+                  rows={
+                    schedules.length ? (
+                      <>
+                        {schedules.map((schedule) => (
+                          <div className="manage-row px-4" key={schedule.id}>
+                            <span>
+                              <strong>{schedule.name}</strong>
+                              <small>
+                                {schedule.cron} ·{" "}
+                                {schedule.last_result || "never run"}
+                              </small>
+                            </span>
+                            <Button
+                              onClick={() =>
+                                command("run_schedule", {
+                                  scheduleId: schedule.id,
+                                })
+                                  .then(load)
+                                  .catch(onError)
+                              }
+                            >
+                              Run now
+                            </Button>
+                          </div>
+                        ))}
+                      </>
+                    ) : null
+                  }
+                  empty="No schedules yet."
+                  form={
+                    scheduleFormOpen ? (
+                      <div className="manage-card form-grid">
+                        <label>
+                          Name
+                          <input
+                            value={name}
+                            onChange={(event) => setName(event.target.value)}
+                          />
+                        </label>
+                        <label>
+                          Session
+                          <SelectMenu
+                            value={sessionId}
+                            onChange={setSessionId}
+                            options={sessions.map((session) => ({
+                              value: session.id,
+                              label: session.title,
+                            }))}
+                          />
+                        </label>
+                        <label>
+                          Playbook
+                          <SelectMenu
+                            value={playbookId}
+                            onChange={setPlaybookId}
+                            options={assets
+                              .filter((asset) => asset.kind === "playbook")
+                              .map((asset) => ({
+                                value: asset.id,
+                                label: asset.title,
+                              }))}
+                          />
+                        </label>
+                        <label>
+                          Cron
+                          <input
+                            value={cron}
+                            onChange={(event) => setCron(event.target.value)}
+                          />
+                        </label>
+                        <Button
+                          className="primary"
+                          onClick={() =>
+                            command("save_schedule", {
+                              schedule: {
+                                name,
+                                sessionId,
+                                playbookId,
+                                cron,
+                                enabled: true,
+                              },
+                            })
+                              .then(load)
+                              .catch(onError)
+                          }
+                        >
+                          Save automation
+                        </Button>
+                      </div>
+                    ) : undefined
+                  }
+                />
               </>
             ) : (
-              <div className="rounded-xl2 border border-line bg-panel p-5">
-                <p className="empty-state">
-                  Run history is reported by the selected schedule when
-                  available.
-                </p>
-                {schedules.map((schedule) => (
-                  <div className="manage-row" key={schedule.id}>
-                    <span>
-                      <strong>{schedule.name}</strong>
-                      <small>
-                        {schedule.last_result || "No run recorded yet"}
-                      </small>
-                    </span>
-                  </div>
-                ))}
-              </div>
+              <ListPage
+                search=""
+                onSearch={() => undefined}
+                searchPlaceholder="Search runs"
+                rows={
+                  schedules.length ? (
+                    <>
+                      {schedules.map((schedule) => (
+                        <div className="manage-row px-4" key={schedule.id}>
+                          <span>
+                            <strong>{schedule.name}</strong>
+                            <small>
+                              {schedule.last_result || "No run recorded yet"}
+                            </small>
+                          </span>
+                        </div>
+                      ))}
+                    </>
+                  ) : null
+                }
+                empty="No schedule runs recorded yet."
+              />
             )}
           </div>
         </div>
