@@ -56,7 +56,7 @@ export function SettingsView({
         ))}
       </nav>
       <div className="flex-1 min-w-0 overflow-y-auto hairline-scroll">
-        <div className="max-w-3xl mx-auto px-7 py-6">{children}</div>
+        <div className="w-full px-7 py-6">{children}</div>
       </div>
     </main>
   );
