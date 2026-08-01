@@ -1,4 +1,3 @@
-// @ts-nocheck
 // The OpenWorker component is progressively adapted to OPCOS view models.
 // Type checking is restored as each unsupported backend-only section is removed.
 import { useEffect, useMemo, useState, type ReactNode } from "react";
@@ -22,7 +21,10 @@ const PERSONAS_CHANGED = "opcos://personas-changed";
 const ConnectorIcon = (_props: Record<string, unknown>) => null;
 const getAutomations = async () => [];
 const getPersonas = async () => [];
-const getSettings = async (): Promise<Record<string, any>> => ({});
+const getSettings = async (): Promise<{
+  nav_layout?: "flat" | "grouped";
+  sessions_peek?: number;
+}> => ({});
 const setNavLayout = async (_layout?: string) => undefined;
 
 // Session surfaces shown as accordions, in display order. The surfaced personas drive this list
@@ -175,23 +177,35 @@ const compactAge = (iso?: string | null): string => {
 
 type SidebarProps = Partial<Props> & {
   sessions: SessionInfo[];
+  hosts?: unknown[];
+  selected?: unknown;
+  query?: string;
+  onQuery?: (value: string) => void;
+  onNew?: () => void;
+  onSelect?: (id: string, workspace: string, agent: string) => void;
+  onManage?: () => void;
+  onAutomations?: () => void;
+  onActivity?: () => void;
   [key: string]: unknown;
 };
 
 export function Sidebar(props: SidebarProps) {
-  props = {
-    ...props,
-    agent: props.agent ?? "opcos",
-    workspace: props.workspace ?? "",
-    surfaces: props.surfaces ?? { chat: true },
-    onNewSession: props.onNewSession ?? props.onNew ?? (() => undefined),
-    onSelectSession:
-      props.onSelectSession ?? props.onSelect ?? (() => undefined),
-    onManage: props.onManage ?? (() => undefined),
-    onOpenScheduled:
-      props.onOpenScheduled ?? props.onAutomations ?? (() => undefined),
-    onOpenAudit: props.onOpenAudit ?? props.onActivity ?? (() => undefined),
-  };
+  const agent = props.agent ?? "opcos";
+  const workspace = props.workspace ?? "";
+  const surfaces = props.surfaces ?? { chat: true };
+  const onNewSession = props.onNewSession ?? props.onNew ?? (() => undefined);
+  const onSelectSession =
+    props.onSelectSession ?? props.onSelect ?? (() => undefined);
+  const onManage = props.onManage ?? (() => undefined);
+  const onOpenScheduled =
+    props.onOpenScheduled ?? props.onAutomations ?? (() => undefined);
+  const onOpenAudit =
+    props.onOpenAudit ?? props.onActivity ?? (() => undefined);
+  const onManagePersonas = props.onManagePersonas ?? (() => undefined);
+  const onRenameSession = props.onRenameSession ?? (() => undefined);
+  const onOpenAutomation = props.onOpenAutomation ?? (() => undefined);
+  const onNewProject = props.onNewProject ?? (() => undefined);
+  const activeSession = props.activeSession ?? "";
   const [searchModalOpen, setSearchModalOpen] = useState(false);
   const [appMenuOpen, setAppMenuOpen] = useState(false);
   // focus and whenever the menu opens (sign-in completes out-of-band in the browser).
@@ -324,12 +338,12 @@ export function Sidebar(props: SidebarProps) {
   const personaVisible = (agent: string) =>
     filterPersonas.size === 0 || filterPersonas.has(agent);
 
-  // Which accordion body is expanded. Decoupled from the active session (props.agent): expanding
+  // Which accordion body is expanded. Decoupled from the active session (agent): expanding
   // a persona BROWSES its sessions without switching the chat area. Selecting a session or "New
   // session" is what switches (and re-opens that persona). Falls back to the active persona.
-  const [openKey, setOpenKey] = useState<string | null>(props.agent);
-  useEffect(() => setOpenKey(props.agent), [props.agent]);
-  const browseKey = openKey ?? props.agent; // the persona whose sessions the body shows
+  const [openKey, setOpenKey] = useState<string | null>(agent);
+  useEffect(() => setOpenKey(agent), [agent]);
+  const browseKey = openKey ?? agent; // the persona whose sessions the body shows
 
   // Per-project collapse + "Show more". The active workspace's folder is open by default; toggling
   // any folder flips it (XOR). `projShowAll` lifts the peek cap for a given folder;
@@ -434,10 +448,10 @@ export function Sidebar(props: SidebarProps) {
   const sessionRow = (s: SessionInfo, opts: { showTime?: boolean } = {}) => {
     const title = s.title || s.session_id;
     const editing = editingId === s.session_id;
-    const active = s.session_id === props.activeSession;
+    const active = s.session_id === activeSession;
     const commitRename = () => {
       const next = editValue.trim();
-      if (next && next !== title) props.onRenameSession(s.session_id, next);
+      if (next && next !== title) onRenameSession(s.session_id, next);
       setEditingId(null);
     };
     return (
@@ -448,8 +462,7 @@ export function Sidebar(props: SidebarProps) {
           (active ? "bg-ink/[0.055]" : "hover:bg-panel")
         }
         onClick={() => {
-          if (!editing)
-            props.onSelectSession(s.session_id, s.workspace, s.agent);
+          if (!editing) onSelectSession(s.session_id, s.workspace, s.agent);
         }}
         title={editing ? undefined : title}
       >
@@ -507,12 +520,12 @@ export function Sidebar(props: SidebarProps) {
   // layout's Pinned and Recent sections. Personas are disabled for the first release; when
   // they return, surface the persona on hover (e.g. in the row tooltip) — not as a subtitle.
   const cardRow = (s: SessionInfo) => {
-    const active = s.session_id === props.activeSession;
+    const active = s.session_id === activeSession;
     const title = s.title || s.session_id;
     const editing = editingId === s.session_id;
     const commitRename = () => {
       const next = editValue.trim();
-      if (next && next !== title) props.onRenameSession(s.session_id, next);
+      if (next && next !== title) onRenameSession(s.session_id, next);
       setEditingId(null);
     };
     return (
@@ -524,8 +537,7 @@ export function Sidebar(props: SidebarProps) {
         }
         title={editing ? undefined : title}
         onClick={() => {
-          if (!editing)
-            props.onSelectSession(s.session_id, s.workspace, s.agent);
+          if (!editing) onSelectSession(s.session_id, s.workspace, s.agent);
         }}
       >
         {/* No leading glyph on session rows (Rohit's call 2026-07-07: the per-session icon
@@ -597,7 +609,7 @@ export function Sidebar(props: SidebarProps) {
               className="w-full flex items-center gap-2 px-1.5 py-1 rounded-lg text-left hover:bg-paper"
               data-testid={`scheduled-${a.id}`}
               title={a.title}
-              onClick={() => props.onOpenAutomation(a.id)}
+              onClick={() => onOpenAutomation(a.id)}
             >
               <div className="flex-1 min-w-0">
                 <div className="text-[13px] text-ink truncate">{a.title}</div>
@@ -742,9 +754,9 @@ export function Sidebar(props: SidebarProps) {
   const projectOrder: string[] = [];
   const seen = new Set<string>();
   // Pin the active folder at top only when browsing the active persona (else it belongs elsewhere).
-  if (props.workspace && browseKey === props.agent) {
-    projectOrder.push(props.workspace);
-    seen.add(props.workspace);
+  if (workspace && browseKey === agent) {
+    projectOrder.push(workspace);
+    seen.add(workspace);
   }
   for (const s of mine) {
     if (s.workspace && !seen.has(s.workspace)) {
@@ -772,12 +784,11 @@ export function Sidebar(props: SidebarProps) {
           .map(surfaceFromPersona)
       : SURFACES.filter(
           (s) =>
-            s.key === "cowork" ||
-            props.surfaces[s.key as keyof SurfaceVisibility],
+            s.key === "cowork" || surfaces[s.key as keyof SurfaceVisibility],
         )
   ).filter((s) => personaVisible(s.key));
 
-  const isCurrent = (key: string) => props.agent === key; // the active session's persona
+  const isCurrent = (key: string) => agent === key; // the active session's persona
   const isExpanded = (key: string) => openKey === key; // its body is open
   // Expand ≠ switch: clicking a header only browses (toggles the accordion). The chat area
   // changes only when a session is selected or "New session" is clicked.
@@ -805,7 +816,7 @@ export function Sidebar(props: SidebarProps) {
                 className="w-5 h-5 grid place-items-center rounded text-faint hover:text-ink hover:bg-panel"
                 title={translate("newProject")}
                 aria-label={translate("newProject")}
-                onClick={() => props.onNewProject(browseKey)}
+                onClick={() => onNewProject(browseKey)}
               >
                 <Icon name="folderPlus" size={14} />
               </button>
@@ -819,11 +830,11 @@ export function Sidebar(props: SidebarProps) {
               {projectOrder.map((proj) => {
                 const list = filteredByProject.get(proj) || [];
                 if (normalizedQuery && list.length === 0) return null; // hide non-matching folders while searching
-                const isActive = proj === props.workspace;
+                const isActive = proj === workspace;
                 // Open the active project by default; if none is active (browsing from another
                 // persona), open the most-recent folder so the accordion isn't all-collapsed.
                 const activeInOrder =
-                  !!props.workspace && projectOrder.includes(props.workspace);
+                  !!workspace && projectOrder.includes(workspace);
                 const defaultOpen =
                   isActive || (!activeInOrder && proj === projectOrder[0]);
                 const open =
@@ -953,7 +964,7 @@ export function Sidebar(props: SidebarProps) {
         <button
           className="nav-item-icon"
           title="新建会话"
-          onClick={props.onNew}
+          onClick={() => onNewSession(agent)}
         >
           <Icon name="plus" size={18} />
         </button>
@@ -968,14 +979,14 @@ export function Sidebar(props: SidebarProps) {
           <button
             className="nav-item-icon"
             title={translate("automations")}
-            onClick={props.onOpenScheduled}
+            onClick={onOpenScheduled}
           >
             <Icon name="clock" size={18} />
           </button>
           <button
             className="nav-item-icon"
             title={translate("activity")}
-            onClick={props.onOpenAudit}
+            onClick={onOpenAudit}
           >
             <Icon name="audit" size={18} />
           </button>
@@ -985,7 +996,7 @@ export function Sidebar(props: SidebarProps) {
           <button
             className="nav-item-icon"
             title={translate("settings")}
-            onClick={props.onManage}
+            onClick={onManage}
           >
             <Icon name="gear" size={18} />
           </button>
@@ -996,7 +1007,7 @@ export function Sidebar(props: SidebarProps) {
             personas={personas ?? undefined}
             onSelect={(id, ws, ag) => {
               setSearchModalOpen(false);
-              props.onSelectSession(id, ws, ag);
+              onSelectSession(id, ws, ag);
             }}
             onClose={() => setSearchModalOpen(false)}
           />
@@ -1041,9 +1052,9 @@ export function Sidebar(props: SidebarProps) {
       {/* New session: split button — primary starts the last-used persona; ▾ picks a specific one. */}
       <NewSessionSplit
         personas={personas}
-        current={props.agent}
-        onNew={props.onNewSession}
-        onManage={props.onManagePersonas}
+        current={agent}
+        onNew={onNewSession}
+        onManage={onManagePersonas}
       />
 
       {/* Search: a borderless nav-style entry (not a boxed input) that opens the command-palette
@@ -1067,7 +1078,7 @@ export function Sidebar(props: SidebarProps) {
             (props.scheduledActive ? "text-ink bg-paper" : "text-muted")
           }
           data-testid="nav-automations"
-          onClick={props.onOpenScheduled}
+          onClick={onOpenScheduled}
         >
           <Icon name="clock" size={15} className="shrink-0" />
           <span className="flex-1">{translate("automations")}</span>
@@ -1183,20 +1194,20 @@ export function Sidebar(props: SidebarProps) {
                 {appMenuItem(
                   "gear",
                   translate("settings"),
-                  props.onManage,
+                  onManage,
                   false,
                   <span className="text-[11px] text-faint">⌘ ,</span>,
                 )}
                 {appMenuItem(
                   "clock",
                   translate("automations"),
-                  props.onOpenScheduled,
+                  onOpenScheduled,
                   props.scheduledActive,
                 )}
                 {appMenuItem(
                   "audit",
                   translate("activity"),
-                  props.onOpenAudit,
+                  onOpenAudit,
                   props.auditActive,
                 )}
               </div>
@@ -1243,7 +1254,7 @@ export function Sidebar(props: SidebarProps) {
           personas={personas ?? undefined}
           onSelect={(id, ws, ag) => {
             setSearchModalOpen(false);
-            props.onSelectSession(id, ws, ag);
+            onSelectSession(id, ws, ag);
           }}
           onClose={() => setSearchModalOpen(false)}
         />

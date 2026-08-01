@@ -1,4 +1,3 @@
-// @ts-nocheck
 // The OpenWorker composer is progressively adapted to OPCOS data sources.
 import {
   useEffect,
@@ -9,10 +8,30 @@ import {
 } from "react";
 import { translate } from "../i18n";
 import type { Attachment, SessionUsage } from "../types";
-const isPdfFile = () => false;
-const readFile = async () => null;
-const getSettings = async () => ({});
-const inspectPdf = async () => null;
+const isPdfFile = (file: File): boolean =>
+  file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+const readFile = async (file: File): Promise<Attachment | null> => {
+  if (isPdfFile(file)) {
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () =>
+        resolve(typeof reader.result === "string" ? reader.result : "");
+      reader.onerror = () =>
+        reject(reader.error ?? new Error("could not read file"));
+      reader.readAsDataURL(file);
+    });
+    return { kind: "pdf", name: file.name, data_url: dataUrl };
+  }
+  const text = await file.text();
+  return { kind: "text", name: file.name, text };
+};
+const getSettings = async (): Promise<{
+  pdf_max_pages?: number;
+  pdf_max_mb?: number;
+}> => ({});
+const inspectPdf = async (
+  _dataUrl: string,
+): Promise<{ ok: boolean; pages?: number; error?: string }> => ({ ok: true });
 const formatTokens = (value: number) => String(value);
 const totalTokens = (value: SessionUsage) =>
   Object.values(value?.byModel ?? {}).reduce(
@@ -28,12 +47,12 @@ type DictationStatus = {
   model_verified?: boolean;
   test_passed?: boolean;
 };
-const isTauri = () => false;
+const isTauri = (): boolean => false;
 const cancelDictation = async () => undefined;
 const getDictationLevel = async () => 0;
-const getDictationStatus = async () => null;
-const startDictation = async () => null;
-const stopDictation = async () => null;
+const getDictationStatus = async (): Promise<DictationStatus | null> => null;
+const startDictation = async (): Promise<DictationStatus | null> => null;
+const stopDictation = async (): Promise<string | null> => null;
 
 // Plan + Custom hidden for this release (owner ask 2026-07-22): Plan's approval flow isn't
 // polished enough to ship, and Custom (config.toml auto-allow rules) is a power-user mode
@@ -279,8 +298,8 @@ export function Composer(props: Props) {
       accepted.push(file);
     }
     const read = (await Promise.all(accepted.map(readFile))).filter(
-      Boolean,
-    ) as Attachment[];
+      (attachment): attachment is Attachment => attachment !== null,
+    );
     const next: Attachment[] = [];
     for (const a of read) {
       if (a.kind === "pdf" && a.data_url) {
