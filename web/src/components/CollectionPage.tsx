@@ -13,6 +13,7 @@ export function CollectionPage({
   form,
   viewKey = "opcos.collection.view",
   renderCard,
+  columns,
 }: {
   search: string;
   onSearch: (value: string) => void;
@@ -24,6 +25,7 @@ export function CollectionPage({
   form?: ReactNode;
   viewKey?: string;
   renderCard?: () => ReactNode;
+  columns?: string[];
 }) {
   const [view, setView] = useState<CollectionView>(() => {
     const stored = localStorage.getItem(viewKey);
@@ -51,6 +53,13 @@ export function CollectionPage({
         </div>
         {primary ?? null}
       </div>
+      {columns && view === "list" && hasRows && (
+        <div className="grid grid-cols-[minmax(0,2fr)_minmax(0,1fr)_minmax(0,1fr)_auto] gap-3 rounded-t-xl2 border border-line border-b-0 bg-panel px-4 py-2 text-[11px] uppercase tracking-wide text-muted">
+          {columns.map((column) => (
+            <span key={column}>{column}</span>
+          ))}
+        </div>
+      )}
       <div
         className={
           view === "grid"

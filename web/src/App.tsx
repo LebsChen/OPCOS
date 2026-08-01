@@ -33,7 +33,7 @@ import { RightRail } from "./components/RightRail";
 import { SelectMenu as OpenWorkerSelectMenu } from "./components/SelectMenu";
 import { SettingsView, type SettingsSection } from "./components/SettingsView";
 import { Icon } from "./components/Icon";
-import { ListPage } from "./components/ListPage";
+import { CollectionPage } from "./components/CollectionPage";
 import "./openworker-tailwind.css";
 import "./openworker-styles.css";
 import "./style.css";
@@ -1250,7 +1250,7 @@ function ManageSections({
           </div>
         )}
         {tab === "hosts" && (
-          <ListPage
+          <CollectionPage
             search=""
             onSearch={() => undefined}
             searchPlaceholder="Search hosts"
@@ -1370,113 +1370,110 @@ function ManageSections({
             )
               .filter(([kind]) => kind === assetTabKind)
               .map(([kind, label, description]) => (
-                <section
-                  className="mb-5 rounded-xl2 border border-line bg-panel divide-y divide-line"
+                <CollectionPage
                   key={kind}
-                >
-                  {assets
-                    .filter(
-                      (asset) =>
-                        asset.kind === kind &&
-                        asset.title
-                          .toLowerCase()
-                          .includes(assetSearch.toLowerCase()),
-                    )
-                    .map((asset) => (
-                      <div className="manage-row px-4" key={asset.id}>
-                        <span>
-                          <strong>{asset.title}</strong>
-                          <small>
-                            {asset.enabled ? "Enabled" : "Disabled"}
-                            {asset.trigger ? ` · ${asset.trigger}` : ""}
-                          </small>
-                        </span>
-                        <span className="inline-actions">
-                          <Button
-                            className="bordered"
-                            disabled={assetPending === asset.id}
-                            onClick={() => {
-                              if (!selected) {
-                                onError(
-                                  "Select a session before changing asset access.",
-                                );
-                                return;
-                              }
-                              setAssetPending(asset.id);
-                              void command("set_asset_enabled", {
-                                sessionId: selected.id,
-                                assetId: asset.id,
-                                enabled: !asset.enabled,
-                              })
-                                .then(() => onRefresh())
-                                .catch(onError)
-                                .finally(() => setAssetPending(null));
-                            }}
-                          >
-                            {assetPending === asset.id
-                              ? "Saving…"
-                              : asset.enabled
-                                ? "Disable"
-                                : "Enable"}
-                          </Button>
-                          <Button
-                            className="bordered"
-                            onClick={() => {
-                              setEditingAssetId(asset.id);
-                              setAssetFormOpen(true);
-                              setAssetKind(asset.kind);
-                              setAssetTitle(asset.title);
-                              setAssetBody(asset.body);
-                              setAssetTrigger(asset.trigger);
-                              setAssetScope(asset.scope);
-                            }}
-                          >
-                            Edit
-                          </Button>
-                          <Button
-                            className="danger"
-                            disabled={assetPending === asset.id}
-                            onClick={() => {
-                              setAssetPending(asset.id);
-                              void command("delete_asset", { id: asset.id })
-                                .then(onRefresh)
-                                .catch(onError)
-                                .finally(() => setAssetPending(null));
-                            }}
-                          >
-                            Delete
-                          </Button>
-                        </span>
-                      </div>
-                    ))}
-                  {!assets.some((asset) => asset.kind === kind) && (
-                    <p className="px-4 py-6 text-[13px] text-muted">
-                      No {label} assets yet.
-                    </p>
-                  )}
-                </section>
+                  search={assetSearch}
+                  onSearch={setAssetSearch}
+                  searchPlaceholder={`Search ${label}`}
+                  columns={["Title", "Trigger", "Scope", "Status"]}
+                  primary={
+                    <Button
+                      className="primary"
+                      onClick={() => {
+                        setEditingAssetId(null);
+                        setAssetFormOpen(true);
+                      }}
+                    >
+                      New {label}
+                    </Button>
+                  }
+                  rows={
+                    <>
+                      {assets
+                        .filter(
+                          (asset) =>
+                            asset.kind === kind &&
+                            asset.title
+                              .toLowerCase()
+                              .includes(assetSearch.toLowerCase()),
+                        )
+                        .map((asset) => (
+                          <div className="manage-row px-4" key={asset.id}>
+                            <span>
+                              <strong>{asset.title}</strong>
+                              <small>
+                                {asset.enabled ? "Enabled" : "Disabled"}
+                                {asset.trigger ? ` · ${asset.trigger}` : ""}
+                              </small>
+                            </span>
+                            <span className="inline-actions">
+                              <Button
+                                className="bordered"
+                                disabled={assetPending === asset.id}
+                                onClick={() => {
+                                  if (!selected) {
+                                    onError(
+                                      "Select a session before changing asset access.",
+                                    );
+                                    return;
+                                  }
+                                  setAssetPending(asset.id);
+                                  void command("set_asset_enabled", {
+                                    sessionId: selected.id,
+                                    assetId: asset.id,
+                                    enabled: !asset.enabled,
+                                  })
+                                    .then(() => onRefresh())
+                                    .catch(onError)
+                                    .finally(() => setAssetPending(null));
+                                }}
+                              >
+                                {assetPending === asset.id
+                                  ? "Saving…"
+                                  : asset.enabled
+                                    ? "Disable"
+                                    : "Enable"}
+                              </Button>
+                              <Button
+                                className="bordered"
+                                onClick={() => {
+                                  setEditingAssetId(asset.id);
+                                  setAssetFormOpen(true);
+                                  setAssetKind(asset.kind);
+                                  setAssetTitle(asset.title);
+                                  setAssetBody(asset.body);
+                                  setAssetTrigger(asset.trigger);
+                                  setAssetScope(asset.scope);
+                                }}
+                              >
+                                Edit
+                              </Button>
+                              <Button
+                                className="danger"
+                                disabled={assetPending === asset.id}
+                                onClick={() => {
+                                  setAssetPending(asset.id);
+                                  void command("delete_asset", { id: asset.id })
+                                    .then(onRefresh)
+                                    .catch(onError)
+                                    .finally(() => setAssetPending(null));
+                                }}
+                              >
+                                Delete
+                              </Button>
+                            </span>
+                          </div>
+                        ))}
+                      {!assets.some((asset) => asset.kind === kind) && (
+                        <p className="px-4 py-6 text-[13px] text-muted">
+                          No {label} assets yet.
+                        </p>
+                      )}
+                    </>
+                  }
+                  empty={`No ${label} assets yet.`}
+                />
               ))}
-            <div className="inline-actions mb-3">
-              <input
-                value={assetSearch}
-                onChange={(event) => setAssetSearch(event.target.value)}
-                placeholder={`Search ${assetLabel}`}
-                aria-label={`Search ${assetLabel}`}
-              />
-              <Button
-                className="primary"
-                onClick={() => {
-                  setEditingAssetId(null);
-                  setAssetTitle("");
-                  setAssetBody("");
-                  setAssetTrigger("");
-                  setAssetScope("");
-                  setAssetFormOpen(true);
-                }}
-              >
-                New {assetLabel}
-              </Button>
-            </div>
             <div className="rounded-xl2 border border-line bg-panel p-5">
               {assetFormOpen && (
                 <>
@@ -1625,18 +1622,30 @@ function ManageSections({
         )}
         {tab === "mcp" && <McpManage selected={selected} onError={onError} />}
         {tab === "secrets" && (
-          <div>
-            <h2>Secret metadata</h2>
-            {secrets.map((secret) => (
-              <div className="manage-row" key={secret.name}>
-                <span>{secret.name}</span>
-                <span className="muted">
-                  {secret.scope} · {secret.purpose}
-                </span>
-              </div>
-            ))}
-            <p className="muted">Secret values are never shown.</p>
-          </div>
+          <CollectionPage
+            search=""
+            onSearch={() => undefined}
+            searchPlaceholder="Search secret keys"
+            primary={<Button className="primary">Add secret</Button>}
+            rows={
+              secrets.length ? (
+                <>
+                  {secrets.map((secret) => (
+                    <div className="manage-row px-4" key={secret.name}>
+                      <span>
+                        <strong>{secret.name}</strong>
+                        <small>
+                          {secret.scope} · {secret.purpose}
+                        </small>
+                      </span>
+                      <span className="muted">Delete</span>
+                    </div>
+                  ))}
+                </>
+              ) : null
+            }
+            empty="No secret metadata configured. Secret values are never shown."
+          />
         )}
         {tab === "blueprint" && (
           <div className="form-grid">
@@ -1702,6 +1711,7 @@ function McpManage({
   onError: (error: unknown) => void;
 }) {
   const [tools, setTools] = useState<Array<Record<string, unknown>>>([]);
+  const [search, setSearch] = useState("");
   useEffect(() => {
     if (selected)
       void command<Array<Record<string, unknown>>>("mcp_tools", {
@@ -1710,29 +1720,45 @@ function McpManage({
         .then(setTools)
         .catch(onError);
   }, [selected?.id]);
+  const filtered = tools.filter((tool) =>
+    String(tool.name).toLowerCase().includes(search.toLowerCase()),
+  );
   return (
-    <div>
-      <h2>MCP tools</h2>
-      {!selected && (
-        <p className="muted">Select a session to inspect its host MCP tools.</p>
-      )}
-      {tools.map((tool) => (
-        <div className="manage-row" key={String(tool.name)}>
-          <span>{String(tool.name)}</span>
-          <Button
-            onClick={() =>
-              command("set_mcp_tool_enabled", {
-                sessionId: selected?.id,
-                name: String(tool.name),
-                enabled: true,
-              }).catch(onError)
-            }
-          >
-            Enable
-          </Button>
-        </div>
-      ))}
-    </div>
+    <CollectionPage
+      search={search}
+      onSearch={setSearch}
+      searchPlaceholder="Search MCP tools"
+      rows={
+        filtered.length ? (
+          <>
+            {filtered.map((tool) => (
+              <div className="manage-row px-4" key={String(tool.name)}>
+                <span>
+                  <strong>{String(tool.name)}</strong>
+                  <small>{String(tool.transport || "remote")} · Enabled</small>
+                </span>
+                <Button
+                  onClick={() =>
+                    command("set_mcp_tool_enabled", {
+                      sessionId: selected?.id,
+                      name: String(tool.name),
+                      enabled: true,
+                    }).catch(onError)
+                  }
+                >
+                  Enable
+                </Button>
+              </div>
+            ))}
+          </>
+        ) : null
+      }
+      empty={
+        selected
+          ? "No MCP tools available."
+          : "Select a session to inspect its host MCP tools."
+      }
+    />
   );
 }
 
@@ -1798,7 +1824,7 @@ function Automations({
             />
             {automationTab === "schedules" ? (
               <>
-                <ListPage
+                <CollectionPage
                   search=""
                   onSearch={() => undefined}
                   searchPlaceholder="Search schedules"
@@ -1904,7 +1930,7 @@ function Automations({
                 />
               </>
             ) : (
-              <ListPage
+              <CollectionPage
                 search=""
                 onSearch={() => undefined}
                 searchPlaceholder="Search runs"
@@ -2041,7 +2067,7 @@ function Activity({
               }
             />
             {activityTab === "worklog" && (
-              <ListPage
+              <CollectionPage
                 search=""
                 onSearch={() => undefined}
                 searchPlaceholder="Filter worklog events"
@@ -2154,7 +2180,7 @@ function Activity({
                 )}
                 <div className="mt-5 grid grid-cols-1 gap-4">
                   {activityTab === "roles" && (
-                    <ListPage
+                    <CollectionPage
                       search=""
                       onSearch={() => undefined}
                       searchPlaceholder="Search roles"
