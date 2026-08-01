@@ -196,13 +196,16 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> Result<SessionRecord, rusqlite::
 
 fn migrate_legacy_sessions(connection: &Connection) -> Result<(), StoreError> {
     let columns = table_columns(connection, "sessions_legacy_p0_1")?;
+    let workspace = columns.iter().any(|column| column == "workspace");
+    let created_at = columns.iter().any(|column| column == "created_at");
     let provider = columns.iter().any(|column| column == "provider");
-    let query = if provider {
-        "SELECT id,title,host_id,model,mode,workspace,created_at,provider FROM sessions_legacy_p0_1"
-    } else {
-        "SELECT id,title,host_id,model,mode,workspace,created_at,NULL FROM sessions_legacy_p0_1"
-    };
-    let mut statement = connection.prepare(query)?;
+    let workspace_expression = if workspace { "workspace" } else { "''" };
+    let created_at_expression = if created_at { "created_at" } else { "''" };
+    let provider_expression = if provider { "provider" } else { "NULL" };
+    let query = format!(
+        "SELECT id,title,host_id,model,mode,{workspace_expression},{created_at_expression},{provider_expression} FROM sessions_legacy_p0_1"
+    );
+    let mut statement = connection.prepare(&query)?;
     let rows = statement.query_map([], |row| {
         let created_at: String = row.get(6)?;
         Ok((
@@ -1334,6 +1337,39 @@ mod tests {
             first_transcript.len()
         );
         drop(connection);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn oldest_desktop_session_schema_gets_safe_defaults() {
+        let path = std::env::temp_dir().join(format!(
+            "opcos-store-old-session-{}-{}.db",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = fs::remove_file(&path);
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE sessions (
+                       id TEXT PRIMARY KEY,
+                       title TEXT NOT NULL,
+                       host_id TEXT NOT NULL,
+                       model TEXT NOT NULL,
+                       mode TEXT NOT NULL
+                     );
+                     INSERT INTO sessions VALUES
+                       ('old-1','Old','host-1','auto','Interactive');",
+                )
+                .unwrap();
+        }
+        let store = SqliteStore::open(&path).unwrap();
+        let session = store.load_session("old-1").unwrap().unwrap();
+        assert_eq!(session.workspace, "");
+        assert_eq!(session.provider, None);
+        assert!(!session.created_at.to_rfc3339().is_empty());
+        drop(store);
         let _ = fs::remove_file(path);
     }
 

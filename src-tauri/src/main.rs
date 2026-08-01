@@ -321,11 +321,13 @@ fn redact_approval_value(value: &Value) -> Value {
             let mut redacted = value.clone();
             if let Some(index) = redacted.to_ascii_lowercase().find("bearer ") {
                 let end = redacted[index + 7..]
-                    .find(char::is_whitespace)
+                    .find(|character: char| {
+                        character.is_whitespace()
+                            || matches!(character, '"' | '\'' | ')' | ']' | '}')
+                    })
                     .map(|offset| index + 7 + offset)
                     .unwrap_or(redacted.len());
                 redacted.replace_range(index + 7..end, "[redacted]");
-                return Value::String("[redacted]".into());
             }
             Value::String(redacted)
         }
@@ -3078,7 +3080,7 @@ mod m7_tests {
     fn transcript_tool_values_are_redacted_before_ui() {
         let mut payload = json!({
             "arguments": {
-                "authorization": "Bearer test-token",
+                "command": "curl -H \"Authorization: Bearer test-token\" https://api.example.com/deploy",
                 "password": "secret-password",
                 "path": "/workspace/file.txt"
             },
@@ -3088,8 +3090,11 @@ mod m7_tests {
         let result = redact_approval_value(&payload["result"]);
         *payload.get_mut("arguments").unwrap() = arguments;
         *payload.get_mut("result").unwrap() = result;
-        assert_eq!(payload["arguments"]["authorization"], "[redacted]");
+        assert_eq!(
+            payload["arguments"]["command"],
+            "curl -H \"Authorization: Bearer [redacted]\" https://api.example.com/deploy"
+        );
         assert_eq!(payload["arguments"]["password"], "[redacted]");
-        assert_eq!(payload["result"], "[redacted]");
+        assert_eq!(payload["result"], "Bearer [redacted]");
     }
 }
