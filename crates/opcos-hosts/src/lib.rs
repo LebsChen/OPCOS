@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+pub use opcos_rvm::DEFAULT_EXEC_TIMEOUT_SECONDS;
 use opcos_rvm::{
     Capabilities as RvmCapabilities, CommandResult, DirectoryListing, ExecRequest, ExecResult,
     FileContent, Health, HttpRvmClient, RvmClient, RvmError,
@@ -7,11 +8,19 @@ use opcos_rvm::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 use thiserror::Error;
-use tokio::{fs, process::Command, time};
+use tokio::{
+    fs,
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::{Child, ChildStdin, ChildStdout, Command},
+    sync::Mutex,
+    time,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Capability {
@@ -124,6 +133,15 @@ impl Host for RvmHost {
 pub struct LocalHost {
     id: String,
     root: PathBuf,
+    sessions: Arc<Mutex<HashMap<String, LocalShell>>>,
+}
+
+#[derive(Debug)]
+struct LocalShell {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    marker: String,
 }
 
 impl LocalHost {
@@ -133,6 +151,7 @@ impl LocalHost {
         Ok(Self {
             id: "local".into(),
             root,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -173,7 +192,14 @@ impl LocalHost {
     }
 
     fn capability_items(observed_at: DateTime<Utc>) -> HostCapabilities {
-        let available = ["exec", "exec_sync", "read", "write", "ls"];
+        let available = [
+            "exec",
+            "exec_sync",
+            "read",
+            "write",
+            "ls",
+            "shell_persistent",
+        ];
         let unavailable = [
             ("pty", "not implemented by the in-process LocalHost"),
             ("vnc", "not available for the in-process LocalHost"),
@@ -187,7 +213,7 @@ impl LocalHost {
             .map(|name| Capability {
                 name: (*name).into(),
                 available: true,
-                source: "local-probe".into(),
+                source: "static".into(),
                 observed_at,
                 reason: None,
             })
@@ -195,7 +221,7 @@ impl LocalHost {
         items.extend(unavailable.into_iter().map(|(name, reason)| Capability {
             name: name.into(),
             available: false,
-            source: "local-probe".into(),
+            source: "static".into(),
             observed_at,
             reason: Some(reason.into()),
         }));
@@ -218,10 +244,17 @@ impl Host for LocalHost {
             host: Some(self.root.display().to_string()),
             workspace: Some(self.root.display().to_string()),
             ide_port: None,
-            capabilities: vec!["exec", "exec_sync", "read", "write", "ls"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
+            capabilities: vec![
+                "exec",
+                "exec_sync",
+                "read",
+                "write",
+                "ls",
+                "shell_persistent",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
         })
     }
 
@@ -236,8 +269,12 @@ impl Host for LocalHost {
             .map(|path| self.secure_path(path))
             .transpose()?
             .unwrap_or_else(|| self.root.clone());
-        let mut command = Command::new("sh");
-        command.arg("-lc").arg(request.command).current_dir(&cwd);
+        if let Some(session) = request.session.as_deref() {
+            return self
+                .exec_persistent(session, &request.command, &cwd, request.timeout_seconds)
+                .await;
+        }
+        let mut command = shell_command(&request.command, &cwd);
         if let Some(Value::Object(env)) = request.env {
             for (key, value) in env {
                 if let Some(value) = value.as_str() {
@@ -313,6 +350,133 @@ impl Host for LocalHost {
     }
 }
 
+impl LocalHost {
+    async fn exec_persistent(
+        &self,
+        session: &str,
+        command: &str,
+        cwd: &Path,
+        timeout_seconds: u64,
+    ) -> Result<ExecResult, HostError> {
+        let mut sessions = self.sessions.lock().await;
+        if !sessions.contains_key(session) {
+            let marker = format!(
+                "__OPCOS_LOCAL_SHELL_{}_{}__",
+                std::process::id(),
+                sessions.len()
+            );
+            let (child, stdin, stdout) = spawn_persistent_shell(cwd).await?;
+            let mut shell = LocalShell {
+                child,
+                stdin,
+                stdout: BufReader::new(stdout),
+                marker,
+            };
+            shell
+                .stdin
+                .write_all(format!("{command}\n{}\n", marker_command(&shell.marker)).as_bytes())
+                .await?;
+            shell.stdin.flush().await?;
+            sessions.insert(session.to_owned(), shell);
+        } else {
+            let shell = sessions.get_mut(session).expect("session exists");
+            shell
+                .stdin
+                .write_all(format!("{command}\n{}\n", marker_command(&shell.marker)).as_bytes())
+                .await?;
+            shell.stdin.flush().await?;
+        }
+        let shell = sessions.get_mut(session).expect("session exists");
+        let mut stdout = String::new();
+        let marker = format!("{}\n", shell.marker);
+        let read = time::timeout(Duration::from_secs(timeout_seconds.max(1)), async {
+            loop {
+                let mut line = String::new();
+                if shell.stdout.read_line(&mut line).await? == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "local shell exited",
+                    ));
+                }
+                if line == marker {
+                    break;
+                }
+                stdout.push_str(&line);
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .map_err(|_| HostError::Timeout)??;
+        let _ = read;
+        Ok(ExecResult {
+            status: "completed".into(),
+            result: CommandResult {
+                stdout,
+                stderr: String::new(),
+                exit_code: 0,
+                timed_out: false,
+                session: Some(session.to_owned()),
+                cwd: Some(cwd.display().to_string()),
+            },
+        })
+    }
+}
+
+fn shell_command(command: &str, cwd: &Path) -> Command {
+    #[cfg(windows)]
+    {
+        let mut process = Command::new("cmd");
+        process.arg("/C").arg(command).current_dir(cwd);
+        process
+    }
+    #[cfg(not(windows))]
+    {
+        let mut process = Command::new("sh");
+        process.arg("-lc").arg(command).current_dir(cwd);
+        process
+    }
+}
+
+fn marker_command(marker: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!("echo {marker}")
+    }
+    #[cfg(not(windows))]
+    {
+        format!("printf '%s\\n' '{marker}'")
+    }
+}
+
+async fn spawn_persistent_shell(cwd: &Path) -> Result<(Child, ChildStdin, ChildStdout), HostError> {
+    #[cfg(windows)]
+    let mut process = {
+        let mut process = Command::new("cmd");
+        process.args(["/Q", "/D", "/K"]).current_dir(cwd);
+        process
+    };
+    #[cfg(not(windows))]
+    let mut process = {
+        let mut process = Command::new("sh");
+        process.arg("-s").current_dir(cwd);
+        process
+    };
+    let mut child = process
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| HostError::InvalidResponse("local shell stdin unavailable".into()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| HostError::InvalidResponse("local shell stdout unavailable".into()))?;
+    Ok((child, stdin, stdout))
+}
+
 fn remote_capabilities(
     capabilities: RvmCapabilities,
     observed_at: DateTime<Utc>,
@@ -365,7 +529,7 @@ mod tests {
         let host = LocalHost::new(&root).unwrap();
         let result = host
             .exec(ExecRequest {
-                command: "printf hello".into(),
+                command: shell_output_command("hello"),
                 cwd: None,
                 timeout_seconds: 5,
                 session: None,
@@ -392,6 +556,55 @@ mod tests {
                 .any(|item| item.name == "vnc" && !item.available)
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_host_preserves_shell_session_state() {
+        let root = tempfile_dir();
+        let host = LocalHost::new(&root).unwrap();
+        let first = host
+            .exec(ExecRequest {
+                command: shell_change_directory_command("."),
+                cwd: None,
+                timeout_seconds: 5,
+                session: Some("test-session".into()),
+                env: None,
+            })
+            .await
+            .unwrap();
+        assert!(first.result.session.is_some());
+        let second = host
+            .exec(ExecRequest {
+                command: shell_output_command("persistent"),
+                cwd: None,
+                timeout_seconds: 5,
+                session: Some("test-session".into()),
+                env: None,
+            })
+            .await
+            .unwrap();
+        assert!(second.result.stdout.contains("persistent"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn shell_output_command(value: &str) -> String {
+        format!("echo {value}")
+    }
+
+    #[cfg(not(windows))]
+    fn shell_output_command(value: &str) -> String {
+        format!("printf {value}")
+    }
+
+    #[cfg(windows)]
+    fn shell_change_directory_command(path: &str) -> String {
+        format!("cd /D {path}")
+    }
+
+    #[cfg(not(windows))]
+    fn shell_change_directory_command(path: &str) -> String {
+        format!("cd {path}")
     }
 
     #[test]

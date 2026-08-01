@@ -24,7 +24,7 @@ use opcos_engine::{
     orchestration::{BoardPhase, BoardTask},
     orchestration::{CoordinationRuntime, Envelope, Role},
 };
-use opcos_hosts::{Host, LocalHost};
+use opcos_hosts::{DEFAULT_EXEC_TIMEOUT_SECONDS, Host, LocalHost};
 use opcos_policy::PermissionMode;
 use opcos_provider::anthropic::AnthropicProvider;
 use opcos_provider::bedrock::BedrockProvider;
@@ -264,8 +264,8 @@ impl ToolExecutor for DesktopExecutor {
                                     .get("cwd")
                                     .and_then(Value::as_str)
                                     .map(str::to_owned),
-                                timeout_seconds: 30,
-                                session: None,
+                                timeout_seconds: DEFAULT_EXEC_TIMEOUT_SECONDS,
+                                session: Some(format!("opcos-local-{session_id}")),
                                 env: Some(Value::Object(env)),
                             })
                             .await
@@ -866,7 +866,7 @@ async fn engine_for(
         .or(configured_base_url)
         .or(descriptor.default_base_url)
         .unwrap_or_default();
-    let (workspace, executor, remote_client) = if host_id == "local" {
+    let (workspace, executor, remote_client, allowed_tools) = if host_id == "local" {
         let workspace = if session_workspace.is_empty() {
             std::env::current_dir()
                 .map_err(|error| format!("local workspace unavailable: {error}"))?
@@ -875,6 +875,22 @@ async fn engine_for(
         };
         let host = LocalHost::new(&workspace).map_err(|error| error.to_string())?;
         let _ = host.health().await.map_err(|error| error.to_string())?;
+        let capabilities = host
+            .capabilities()
+            .await
+            .map_err(|error| error.to_string())?;
+        let allowed_tools = capabilities
+            .items
+            .iter()
+            .filter(|item| item.available)
+            .filter_map(|item| match item.name.as_str() {
+                "read" => Some("read_file".to_owned()),
+                "write" => Some("write_file".to_owned()),
+                "ls" => Some("list_dir".to_owned()),
+                "exec" | "exec_sync" => Some("run_shell".to_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         (
             workspace.display().to_string(),
             Arc::new(DesktopExecutor::Local(LocalExecutor {
@@ -882,6 +898,7 @@ async fn engine_for(
                 secrets: state.secrets.clone(),
             })),
             None,
+            Some(allowed_tools),
         )
     } else {
         let client = client_for(state, &host_id)?;
@@ -909,6 +926,7 @@ async fn engine_for(
                 secrets: state.secrets.clone(),
             }))),
             Some(executor_client),
+            None,
         )
     };
     let provider: Box<dyn Provider> = match descriptor.name.as_str() {
@@ -980,6 +998,9 @@ async fn engine_for(
         permission_mode,
         model,
     ));
+    if let Some(allowed_tools) = allowed_tools {
+        engine.set_allowed_tools(allowed_tools).await;
+    }
     if let Some(executor_client) = &remote_client
         && let Ok(response) = executor_client
             .mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
@@ -2309,7 +2330,7 @@ async fn git_workflow(
                     path.replace('\'', "''")
                 ),
                 cwd: None,
-                timeout_seconds: 30,
+                timeout_seconds: DEFAULT_EXEC_TIMEOUT_SECONDS,
                 session: None,
                 env: None,
             })

@@ -89,6 +89,7 @@ pub struct TurnEngine<P, S, E> {
     unattended: AtomicBool,
     system_instructions: Mutex<Option<String>>,
     external_tools: Mutex<Vec<Value>>,
+    allowed_tools: Mutex<Option<HashSet<String>>>,
     active_tool_calls: StdMutex<HashSet<String>>,
     policy_denied: AtomicBool,
 }
@@ -148,6 +149,7 @@ where
             unattended: AtomicBool::new(false),
             system_instructions: Mutex::new(None),
             external_tools: Mutex::new(Vec::new()),
+            allowed_tools: Mutex::new(None),
             active_tool_calls: StdMutex::new(HashSet::new()),
             policy_denied: AtomicBool::new(false),
         }
@@ -159,6 +161,10 @@ where
 
     pub async fn set_external_tools(&self, tools: Vec<Value>) {
         *self.external_tools.lock().await = tools;
+    }
+
+    pub async fn set_allowed_tools(&self, tools: impl IntoIterator<Item = String>) {
+        *self.allowed_tools.lock().await = Some(tools.into_iter().collect());
     }
 
     pub async fn submit_text(&self, text: impl Into<String>) -> Result<AssistantTurn, EngineError> {
@@ -487,6 +493,16 @@ where
                     let mut tools = tool_definitions();
                     if let Ok(external) = self.external_tools.try_lock() {
                         tools.extend(external.iter().cloned().map(mcp_tool_definition));
+                    }
+                    if let Ok(allowed) = self.allowed_tools.try_lock() {
+                        if let Some(allowed) = allowed.as_ref() {
+                            tools.retain(|tool| {
+                                tool.get("function")
+                                    .and_then(|function| function.get("name"))
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|name| allowed.contains(name))
+                            });
+                        }
                     }
                     tools
                 },
