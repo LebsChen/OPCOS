@@ -687,8 +687,40 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
              );",
         )
         .map_err(|error| error.to_string())?;
+    migrate_mcp_session_tools(&connection)?;
     migrate_config_objects(&mut connection)?;
     Ok(connection)
+}
+
+fn migrate_mcp_session_tools(connection: &Connection) -> Result<(), String> {
+    let has_source = connection
+        .prepare("PRAGMA table_info(mcp_session_tools)")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|error| error.to_string())?
+        .iter()
+        .any(|column| column == "source");
+    if has_source {
+        return Ok(());
+    }
+    connection
+        .execute_batch(
+            "CREATE TABLE mcp_session_tools_v2 (
+               session_id TEXT NOT NULL,
+               source TEXT NOT NULL,
+               name TEXT NOT NULL,
+               enabled INTEGER NOT NULL,
+               PRIMARY KEY(session_id,source,name)
+             );
+             INSERT INTO mcp_session_tools_v2(session_id,source,name,enabled)
+               SELECT session_id,'host',name,enabled FROM mcp_session_tools;
+             DROP TABLE mcp_session_tools;
+             ALTER TABLE mcp_session_tools_v2 RENAME TO mcp_session_tools;",
+        )
+        .map_err(|error| error.to_string())
 }
 
 fn content_hash(content: &str) -> String {
@@ -1675,9 +1707,7 @@ async fn engine_for(
         permission_mode,
         model,
     ));
-    if let Some(allowed_tools) = allowed_tools {
-        engine.set_allowed_tools(allowed_tools).await;
-    }
+    let mut allowed_tools = allowed_tools;
     if let Some(executor_client) = &remote_client
         && let Ok(response) = executor_client
             .mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
@@ -1693,7 +1723,10 @@ async fn engine_for(
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?
-            .prepare("SELECT name FROM mcp_session_tools WHERE session_id=?1 AND enabled=1")
+            .prepare(
+                "SELECT name FROM mcp_session_tools
+                 WHERE session_id=?1 AND source='host' AND enabled=1",
+            )
             .and_then(|mut statement| {
                 let rows = statement.query_map([session_id], |row| row.get::<_, String>(0))?;
                 rows.collect::<Result<Vec<_>, _>>()
@@ -1738,27 +1771,8 @@ async fn engine_for(
             .map_err(|error| error.to_string())?
     };
     let mut independent_tools = Vec::new();
-    let enabled_mcp_tools = state
-        .database
-        .lock()
-        .ok()
-        .and_then(|connection| {
-            connection
-                .prepare("SELECT name FROM mcp_session_tools WHERE session_id=?1 AND enabled=1")
-                .ok()
-                .and_then(|mut statement| {
-                    statement
-                        .query_map([session_id], |row| row.get::<_, String>(0))
-                        .ok()
-                        .map(|rows| {
-                            rows.filter_map(Result::ok)
-                                .collect::<std::collections::HashSet<_>>()
-                        })
-                })
-        })
-        .unwrap_or_default();
     for (object_id, name, server_key, version_id, mut content) in mcp_configs {
-        content["object_id"] = Value::String(object_id);
+        content["object_id"] = Value::String(object_id.clone());
         content["name"] = Value::String(name);
         content["server_key"] = Value::String(if server_key.is_empty() {
             stable_server_key(content["object_id"].as_str().unwrap_or_default())
@@ -1773,6 +1787,32 @@ async fn engine_for(
             .connect_with_retry(&config, &version_id, 0)
             .await
         {
+            let qualified_names = tools
+                .iter()
+                .map(|tool| tool.qualified_name.clone())
+                .collect::<Vec<_>>();
+            let selected_names = state
+                .database
+                .lock()
+                .ok()
+                .and_then(|connection| {
+                    connection
+                        .prepare(
+                            "SELECT name FROM mcp_session_tools
+                             WHERE session_id=?1 AND source=?2 AND enabled=1",
+                        )
+                        .ok()
+                        .and_then(|mut statement| {
+                            statement
+                                .query_map(params![session_id, object_id], |row| {
+                                    row.get::<_, String>(0)
+                                })
+                                .ok()
+                                .map(|rows| rows.filter_map(Result::ok).collect::<Vec<_>>())
+                        })
+                })
+                .unwrap_or_default();
+            let has_explicit_selection = !selected_names.is_empty();
             independent_tools.extend(
                 tools
                     .into_iter()
@@ -1785,15 +1825,24 @@ async fn engine_for(
                         })
                     })
                     .filter(|tool| {
-                        enabled_mcp_tools.is_empty()
-                            || enabled_mcp_tools.contains(
-                                tool.get("qualified_name")
+                        !has_explicit_selection
+                            || selected_names.iter().any(|name| {
+                                name == tool
+                                    .get("qualified_name")
                                     .and_then(Value::as_str)
-                                    .unwrap_or_default(),
-                            )
+                                    .unwrap_or_default()
+                            })
                     }),
             );
+            if host_id == "local"
+                && let Some(allowed) = allowed_tools.as_mut()
+            {
+                allowed.extend(qualified_names);
+            }
         }
+    }
+    if let Some(allowed_tools) = allowed_tools {
+        engine.set_allowed_tools(allowed_tools).await;
     }
     if !independent_tools.is_empty() {
         engine.append_external_tools(independent_tools).await;
@@ -3735,15 +3784,18 @@ fn set_mcp_tool_enabled(
     state: State<'_, DesktopState>,
     session_id: String,
     name: String,
+    source: Option<String>,
     enabled: bool,
 ) -> Result<(), String> {
+    let source = source.unwrap_or_else(|| "host".into());
     state
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?
         .execute(
-            "INSERT OR REPLACE INTO mcp_session_tools(session_id,name,enabled) VALUES (?1,?2,?3)",
-            params![session_id, name, enabled],
+            "INSERT OR REPLACE INTO mcp_session_tools(session_id,source,name,enabled)
+             VALUES (?1,?2,?3,?4)",
+            params![session_id, source, name, enabled],
         )
         .map_err(|error| error.to_string())?;
     Ok(())
