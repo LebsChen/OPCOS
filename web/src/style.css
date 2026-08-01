@@ -798,7 +798,7 @@ h3 {
 
 @media (max-width: 1100px) {
   .app.session-layout {
-    grid-template-columns: 220px minmax(0, 1fr) 264px;
+    grid-template-columns: 220px minmax(0, 1fr) 300px;
   }
   .app.session-layout.right-panel-collapsed {
     grid-template-columns: 220px minmax(0, 1fr) 44px;

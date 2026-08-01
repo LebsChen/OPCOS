@@ -196,6 +196,19 @@ describe("OPCOS transcript folding", () => {
     });
   });
 
+  it("moves steering ahead when the assistant stream already started", () => {
+    let items = reduceStreamEvent([], {
+      kind: "stream",
+      payload: { text_delta: "answer" },
+    });
+    items = reduceStreamEvent(items, {
+      kind: "steering",
+      payload: { text: "clarify first" },
+    });
+    expect(items.map((item) => item.kind)).toEqual(["user", "assistant"]);
+    expect(items[0]).toMatchObject({ text: "clarify first" });
+  });
+
   it("does not restore stale approval notices or pending bubbles", () => {
     const items = normalizeTranscript([
       {

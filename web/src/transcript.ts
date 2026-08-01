@@ -374,6 +374,14 @@ export function reduceStreamEvent(
   if (live) {
     live.text = `${live.text || ""}${textDelta}`;
     live.reasoning = `${live.reasoning || ""}${reasoningDelta}`;
+    const steeringIndex = next.findIndex(
+      (item) => item.kind === "user" && item.id.startsWith("event:steering:"),
+    );
+    if (steeringIndex >= 0) {
+      const [steering] = next.splice(steeringIndex, 1);
+      const assistantIndex = next.indexOf(live);
+      next.splice(assistantIndex, 0, steering);
+    }
   }
   const delta = payloadObject(payload.tool_call_delta);
   if (Object.keys(delta).length > 0) {

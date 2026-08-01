@@ -611,6 +611,19 @@ async fn ide_asset_route(state: IdeProxyState, path: String, uri: Uri, prefix: &
     }
 }
 
+fn ide_asset_upstream_route(route: &str) -> String {
+    if let Some(path) = route.strip_prefix("/out/") {
+        return format!("/ide/out/{path}");
+    }
+    if let Some(path) = route.strip_prefix("/resources/") {
+        return format!("/ide/resources/{path}");
+    }
+    if let Some(path) = route.strip_prefix("/static/") {
+        return format!("/ide/static/{path}");
+    }
+    route.to_owned()
+}
+
 async fn ide_relay_socket(mut browser: WebSocket, state: IdeProxyState, route: String) {
     let Ok(upstream) = state
         .client
@@ -1176,8 +1189,13 @@ async fn start_ide_proxy(
         })
         .map(str::to_owned)
         .ok_or_else(|| "Remote Web IDE returned no loadable workbench asset paths.".to_owned())?;
+    let asset_upstream_route = ide_asset_upstream_route(&asset_route);
     client
-        .ide_request_bytes(&asset_route, &bootstrap.cookies, &bootstrap.proxy_token)
+        .ide_request_bytes(
+            &asset_upstream_route,
+            &bootstrap.cookies,
+            &bootstrap.proxy_token,
+        )
         .await
         .map_err(|_| {
             "Remote Web IDE bootstrap succeeded, but the bound host rejected its workbench assets."
@@ -2994,5 +3012,21 @@ mod m7_tests {
         assert!(!ASKPASS_SCRIPT.contains(token));
         assert!(ASKPASS_SCRIPT.contains("OPCOS_GIT_PASSWORD"));
         assert!(ASKPASS_SCRIPT.contains("OPCOS_GIT_USERNAME"));
+    }
+
+    #[test]
+    fn ide_preflight_uses_the_same_upstream_prefix_as_asset_proxy() {
+        assert_eq!(
+            ide_asset_upstream_route("/out/nls.messages.js"),
+            "/ide/out/nls.messages.js"
+        );
+        assert_eq!(
+            ide_asset_upstream_route("/resources/workbench.css?x=1"),
+            "/ide/resources/workbench.css?x=1"
+        );
+        assert_eq!(
+            ide_asset_upstream_route("/static/out/workbench.js"),
+            "/ide/static/out/workbench.js"
+        );
     }
 }
