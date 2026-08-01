@@ -799,6 +799,31 @@ h3 {
   gap: 5px;
   color: var(--color-muted);
 }
+.settings-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 24px;
+  min-height: 64px;
+  padding: 14px 0;
+}
+.settings-row > div {
+  min-width: 0;
+}
+.settings-row strong,
+.settings-row small {
+  display: block;
+}
+.settings-row small {
+  margin-top: 4px;
+  color: var(--color-muted);
+  font-size: 12px;
+}
+.settings-row > input,
+.settings-row > select,
+.settings-row > .relative {
+  width: min(420px, 38vw);
+}
 .manage-row {
   display: flex;
   align-items: center;
