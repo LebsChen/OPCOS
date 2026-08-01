@@ -981,6 +981,27 @@ h3 {
 .app.nav-collapsed.session-layout.session-drawer-collapsed .main-chat {
   margin-right: 44px;
 }
+
+/* Session chat uses the OpenWorker topbar/workspace geometry. The session drawer remains
+   OPCOS-specific; its width is the only layout value supplied by the adapter. */
+.app.session-layout .main-topbar {
+  position: absolute;
+  inset: 0 var(--right-panel-width, 360px) auto 0;
+  height: 48px;
+  min-height: 0;
+  padding: 0 14px 0 20px;
+  border-bottom: 0;
+  background: color-mix(in srgb, var(--paper) 72%, transparent);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  z-index: 6;
+}
+.app.session-layout .main-chat {
+  padding-top: 48px;
+}
+.app.session-layout .main-scroll {
+  padding: 24px 8% 24px;
+}
 .rail-section {
   padding: 15px 14px;
   border-bottom: 1px solid var(--color-line);

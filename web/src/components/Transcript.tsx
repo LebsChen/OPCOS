@@ -8,6 +8,10 @@ import { humanizeAsk, humanizeTool, type HumanLine } from "../humanize";
 import { Markdown } from "./Markdown";
 import { Icon } from "./Icon";
 
+// Visual source: OpenWorker surfaces/gui/src/components/Transcript.tsx:1-465.
+// OPCOS keeps that structure/classes and adapts only transcript item types, approval
+// resolution, connector omission, and invoke-backed retry behavior.
+
 // Hover affordances for a message bubble (FB-005): copy the raw text + the message's time.
 // Lives in a ZERO-HEIGHT strip under the bubble (absolute, inside the transcript's 20px gap)
 // so revealing it on group-hover never shifts the layout. `ts` is unix seconds — canonical

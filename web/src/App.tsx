@@ -4756,29 +4756,49 @@ function AppContent() {
       <main className="main">
         {surface === "session" && selected ? (
           <>
-            <header className="main-topbar session-header">
-              <div>
-                <h1>{selected.title}</h1>
-                <p>
-                  {selected.host_name} ·{" "}
-                  {selected.workspace || "workspace not set"} · {selected.model}
-                </p>
-                <p className="surface-status muted">
-                  {sessionStatusLabel(selected.run_state, selected.stop_reason)}
-                </p>
+            {/* OpenWorker session topbar: surfaces/gui/src/App.tsx:1365-1442.
+                Only the facts and Tauri panel action are adapted to OPCOS. */}
+            <header className="main-topbar">
+              <div className="main-topbar-side">
+                {navCollapsed && (
+                  <button
+                    className="topbar-icon-btn"
+                    onClick={toggleNav}
+                    aria-label="Show sidebar"
+                    title="Show sidebar"
+                  >
+                    <Icon name="sidebar" size={16} />
+                  </button>
+                )}
               </div>
-              <div className="main-topbar-actions">
+              <div className="main-title">
+                <span className="main-title-text" title={selected.title}>
+                  {selected.title}
+                </span>
+                <span className="title-sub" data-testid="session-subtitle">
+                  {[
+                    selected.host_name,
+                    selected.workspace || "workspace not set",
+                    selected.model,
+                    sessionStatusLabel(
+                      selected.run_state,
+                      selected.stop_reason,
+                    ),
+                  ].join(" · ")}
+                </span>
+              </div>
+              <div className="main-topbar-side main-topbar-actions">
                 {secretBackend && (
                   <span className="backend-badge">
                     Secrets: {secretBackend}
                   </span>
                 )}
                 <button
-                  className="icon-button"
+                  className="topbar-icon-btn"
                   title={translate("Toggle session panel")}
                   onClick={() => setDrawerCollapsed((value) => !value)}
                 >
-                  <Icon name="sidebarRight" />
+                  <Icon name="sidebarRight" size={16} />
                 </button>
               </div>
             </header>
