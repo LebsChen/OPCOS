@@ -303,7 +303,7 @@ function VoiceInputSection() {
 
       {!desktop ? (
         <div className={CARD + " p-4 text-[13px] text-muted"}>
-          Voice Input setup is available in the OpenWorker desktop app.
+          Voice Input setup is available in the OPCOS desktop app.
         </div>
       ) : (
         <div className="space-y-4">
@@ -512,7 +512,7 @@ function PersonasSection({
     <section>
       <PanelHead
         title="Personas"
-        sub="Which coworkers are enabled and shown in the picker, plus installing new persona bundles."
+        sub="Which OPCOS modes are enabled and shown in the picker."
       />
       <PersonasTab key={galleryBump} onOpenPersona={onOpenPersona} />
       <button
@@ -526,8 +526,7 @@ function PersonasSection({
             Browse the Persona Gallery
           </span>
           <span className="block text-[12px] text-muted">
-            Curated coworkers from the OpenWorker team — see what each can do
-            before installing.
+            Curated OPCOS modes — see what each can do before installing.
           </span>
         </span>
         <span className="text-[12.5px] text-accent shrink-0">Open →</span>
@@ -567,7 +566,7 @@ function AppearanceSection() {
     <section>
       <PanelHead
         title="General"
-        sub="How OpenWorker looks and behaves on this machine."
+        sub="How OPCOS looks and behaves on this machine."
       />
 
       <div className={CARD + " p-4 mb-4"}>
@@ -607,7 +606,7 @@ function AppearanceSection() {
             <span>
               <span className="block text-[13px] text-ink">Open at login</span>
               <span className="block text-[12px] text-muted">
-                Launch OpenWorker automatically when you sign in.
+                Launch OPCOS automatically when you sign in.
               </span>
             </span>
           </label>
@@ -770,7 +769,7 @@ function UpdateInline() {
             ? "You're on the latest version."
             : state === "error"
               ? "Couldn't check right now — try again later."
-              : "Downloading — OpenWorker restarts by itself when it's ready."}
+              : "Downloading — OPCOS restarts by itself when it's ready."}
         </span>
       )}
     </span>
@@ -936,9 +935,9 @@ function CompactionCard() {
       <div className={FIELD_LABEL}>Context compaction</div>
       <div className={FIELD_HELP}>
         Long sessions are compacted automatically: older turns are summarized so
-        the coworker keeps working instead of running out of context. Your
-        visible transcript is never changed — a small marker shows where
-        compaction happened.
+        OPCOS keeps working instead of running out of context. Your visible
+        transcript is never changed — a small marker shows where compaction
+        happened.
       </div>
 
       <div className="mt-3 flex items-center gap-5 flex-wrap">
@@ -1034,7 +1033,7 @@ function SidebarCard() {
       <div className={FIELD_LABEL}>Sidebar</div>
       <label className="flex items-center gap-3 mt-2.5">
         <span className="text-[13px] text-ink">
-          Conversations shown per coworker
+          Conversations shown per mode
         </span>
         <input
           type="number"
@@ -1046,8 +1045,8 @@ function SidebarCard() {
         />
       </label>
       <div className={FIELD_HELP}>
-        Longer lists collapse behind &ldquo;Show more&rdquo;. Applies per
-        coworker and per project.
+        Longer lists collapse behind &ldquo;Show more&rdquo;. Applies per mode
+        and per project.
       </div>
     </div>
   );
@@ -1096,7 +1095,7 @@ function FilesCard() {
         <input
           className={INPUT}
           type="text"
-          placeholder="~/OpenWorker"
+          placeholder="~/OPCOS"
           value={scratchDraft}
           spellCheck={false}
           autoComplete="off"

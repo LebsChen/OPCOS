@@ -303,8 +303,8 @@ function ProgressSummary({
   }
   return (
     <div className="rail-muted">
-      For longer multi-step tasks, progress will appear here while OpenWorker
-      plans, uses tools, waits for approval, and produces artifacts.
+      For longer multi-step tasks, progress will appear here while OPCOS plans,
+      uses tools, waits for approval, and produces artifacts.
     </div>
   );
 }

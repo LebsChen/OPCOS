@@ -945,6 +945,38 @@ async fn test_host(state: State<'_, DesktopState>, host_id: String) -> Result<Ho
 }
 
 #[tauri::command]
+fn delete_host(state: State<'_, DesktopState>, host_id: String) -> Result<(), String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let exists: bool = connection
+        .query_row(
+            "SELECT COUNT(*) FROM hosts WHERE id=?1",
+            [&host_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| error.to_string())?
+        > 0;
+    if !exists {
+        return Err("remote host not found".into());
+    }
+    connection
+        .execute("DELETE FROM hosts WHERE id=?1", [&host_id])
+        .map_err(|error| error.to_string())?;
+    drop(connection);
+    state
+        .secrets
+        .delete(&secret_key("rvm-token", &host_id))
+        .map_err(|error| error.to_string())?;
+    state
+        .secrets
+        .delete(&secret_key("rvm-url", &host_id))
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 async fn start_surface(
     state: State<'_, DesktopState>,
     host_id: String,
@@ -2653,6 +2685,7 @@ fn main() {
             list_hosts,
             save_host,
             test_host,
+            delete_host,
             create_session,
             list_sessions,
             read_transcript,

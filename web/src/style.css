@@ -142,6 +142,22 @@ button:disabled {
   color: #fff;
   opacity: 0.9;
 }
+.btn.danger {
+  border-color: var(--color-danger);
+  color: var(--color-danger);
+}
+.btn.danger:hover {
+  background: var(--color-danger-soft);
+}
+.status-online {
+  color: var(--color-ok);
+}
+.status-offline {
+  color: var(--color-danger);
+}
+.status-unknown {
+  color: var(--color-faint);
+}
 .new-session {
   margin: 0 13px 12px;
 }

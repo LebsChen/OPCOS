@@ -1092,6 +1092,7 @@ function Manage({
   onError,
   onAddHost,
   onTestHost,
+  onDeleteHost,
   hostName,
   setHostName,
   hostUrl,
@@ -1108,6 +1109,7 @@ function Manage({
   onError: (error: unknown) => void;
   onAddHost: (event: FormEvent) => void;
   onTestHost: (hostId: string) => Promise<Host>;
+  onDeleteHost: (hostId: string) => Promise<void>;
   hostName: string;
   setHostName: (value: string) => void;
   hostUrl: string;
@@ -1127,6 +1129,10 @@ function Manage({
   );
   const [blueprintCommand, setBlueprintCommand] = useState("");
   const [testingHostId, setTestingHostId] = useState<string | null>(null);
+  const [deletingHostId, setDeletingHostId] = useState<string | null>(null);
+  const [confirmDeleteHostId, setConfirmDeleteHostId] = useState<string | null>(
+    null,
+  );
   const tabs = ["provider", "hosts", "assets", "mcp", "secrets", "blueprint"];
   useEffect(() => {
     void command<Record<string, unknown>>("provider_settings")
@@ -1260,7 +1266,13 @@ function Manage({
                 <span>
                   <strong>{host.name}</strong>
                   <small
-                    className={host.online === false ? "failure" : "muted"}
+                    className={
+                      host.online === true
+                        ? "status-online"
+                        : host.online === false
+                          ? "status-offline"
+                          : "status-unknown"
+                    }
                   >
                     {hostStatusLabel(host)}
                     {host.reason ? ` · ${host.reason}` : ""}
@@ -1279,6 +1291,32 @@ function Manage({
                 >
                   {testingHostId === host.id ? "Testing…" : "Test"}
                 </Button>
+                {confirmDeleteHostId === host.id ? (
+                  <>
+                    <Button
+                      className="danger"
+                      disabled={deletingHostId === host.id}
+                      onClick={() => {
+                        setDeletingHostId(host.id);
+                        void onDeleteHost(host.id)
+                          .catch(onError)
+                          .finally(() => {
+                            setDeletingHostId(null);
+                            setConfirmDeleteHostId(null);
+                          });
+                      }}
+                    >
+                      {deletingHostId === host.id ? "Deleting…" : "Confirm"}
+                    </Button>
+                    <Button onClick={() => setConfirmDeleteHostId(null)}>
+                      Cancel
+                    </Button>
+                  </>
+                ) : (
+                  <Button onClick={() => setConfirmDeleteHostId(host.id)}>
+                    Delete
+                  </Button>
+                )}
               </div>
             ))}
           </div>
@@ -1957,6 +1995,10 @@ export function App() {
       throw reason;
     }
   };
+  const deleteHost = async (hostId: string) => {
+    await command("delete_host", { hostId });
+    setHosts((items) => items.filter((item) => item.id !== hostId));
+  };
   const createSession = async (
     title: string,
     hostId: string,
@@ -2173,6 +2215,7 @@ export function App() {
             onError={onError}
             onAddHost={addHost}
             onTestHost={testHost}
+            onDeleteHost={deleteHost}
             hostName={hostName}
             setHostName={setHostName}
             hostUrl={hostUrl}
@@ -2187,10 +2230,7 @@ export function App() {
         ) : (
           <div className="empty-main">
             <h1>Start a session</h1>
-            <p>
-              Choose a bound host and create an OpenWorker-style OPCOS
-              workspace.
-            </p>
+            <p>Choose a bound host and create an OPCOS workspace.</p>
             <Button className="primary" onClick={() => setModal(true)}>
               <Icon name="plus" /> New session
             </Button>

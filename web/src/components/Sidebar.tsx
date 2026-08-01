@@ -28,7 +28,7 @@ const setNavLayout = async (_layout?: string) => undefined;
 // (so third-party / Ops personas appear); the hardcoded set is the fallback before personas load.
 const SURFACES: { key: string; label: string; icon: IconName; cls: string }[] =
   [
-    { key: "cowork", label: "Coworker", icon: "diamond", cls: "ico-cowork" },
+    { key: "cowork", label: "Sessions", icon: "diamond", cls: "ico-cowork" },
     { key: "chat", label: "Chat", icon: "chat", cls: "ico-chat" },
     { key: "code", label: "Code", icon: "code", cls: "ico-code" },
   ];
@@ -710,7 +710,7 @@ export function Sidebar(props: any) {
     ) : null;
 
   // RECENT header with the group/filter control (§20) — the group toggle moved off the brand bar.
-  // "Group by" flips the persona accordion ↔ chronological list; "Filter by coworker" narrows to
+  // "Group by" flips the persona accordion ↔ chronological list; "Filter by workspace" narrows to
   // the checked personas (none checked = all shown).
   const recentHeader = () => {
     const filterPersonaList = (personas || []).filter(
@@ -768,7 +768,7 @@ export function Sidebar(props: any) {
                   <div className="my-1 border-t border-line" />
                   <div className="px-2 pt-1 pb-1 flex items-center justify-between">
                     <span className="text-[10.5px] uppercase tracking-[0.06em] text-faint font-semibold">
-                      Filter by coworker
+                      Filter by workspace
                     </span>
                     {filterPersonas.size > 0 && (
                       <button

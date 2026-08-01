@@ -151,7 +151,7 @@ export function ScheduledView({ onOpenRun, onRunNow, initialOpenId }: Props) {
         <div className="flex-1 min-w-0">
           <PanelHead
             title="Automations"
-            sub="Recurring tasks OpenWorker runs on a schedule."
+            sub="Recurring tasks OPCOS runs on a schedule."
           />
         </div>
         <button
@@ -165,8 +165,8 @@ export function ScheduledView({ onOpenRun, onRunNow, initialOpenId }: Props) {
       <div className="text-[12px] text-faint flex gap-1.5 mb-4">
         <span aria-hidden>ⓘ</span>
         <span>
-          Runs only while openworker-server is up — a missed schedule catches up
-          once when it next starts.
+          Runs while OPCOS is running — a missed schedule catches up once when
+          it next starts.
         </span>
       </div>
 
@@ -188,8 +188,7 @@ export function ScheduledView({ onOpenRun, onRunNow, initialOpenId }: Props) {
         !showForm && (
           <div className={CARD + " p-4 text-[12.5px] text-muted"}>
             No scheduled tasks yet — use a template above, click{" "}
-            <strong>+ New automation</strong>, or just ask OpenWorker in a
-            session.
+            <strong>+ New automation</strong>, or just ask OPCOS in a session.
           </div>
         )
       ) : (
