@@ -276,11 +276,13 @@ impl Host for LocalHost {
                     &request.command,
                     &cwd,
                     request.timeout_seconds,
+                    request.cwd.is_some(),
                     request.env.as_ref(),
                 )
                 .await;
         }
         let mut command = shell_command(&request.command, &cwd);
+        command.kill_on_drop(true);
         if let Some(Value::Object(env)) = request.env {
             for (key, value) in env {
                 if let Some(value) = value.as_str() {
@@ -363,6 +365,7 @@ impl LocalHost {
         command: &str,
         cwd: &Path,
         timeout_seconds: u64,
+        change_cwd: bool,
         env: Option<&Value>,
     ) -> Result<ExecResult, HostError> {
         let mut sessions = self.sessions.lock().await;
@@ -382,7 +385,11 @@ impl LocalHost {
             shell
                 .stdin
                 .write_all(
-                    format!("{}\n", persistent_command(command, env, &shell.marker)).as_bytes(),
+                    format!(
+                        "{}\n",
+                        persistent_command(command, env, &shell.marker, cwd, change_cwd)
+                    )
+                    .as_bytes(),
                 )
                 .await?;
             shell.stdin.flush().await?;
@@ -392,7 +399,11 @@ impl LocalHost {
             shell
                 .stdin
                 .write_all(
-                    format!("{}\n", persistent_command(command, env, &shell.marker)).as_bytes(),
+                    format!(
+                        "{}\n",
+                        persistent_command(command, env, &shell.marker, cwd, change_cwd)
+                    )
+                    .as_bytes(),
                 )
                 .await?;
             shell.stdin.flush().await?;
@@ -412,15 +423,20 @@ impl LocalHost {
                     }
                     if let Some(marker_start) = line.find(&marker) {
                         stdout.push_str(&line[..marker_start]);
-                        let exit_code = line[marker_start + marker.len()..]
-                            .trim()
+                        let marker_values =
+                            line[marker_start + marker.len()..].trim().splitn(2, ':');
+                        let mut marker_values = marker_values;
+                        let exit_code = marker_values
+                            .next()
+                            .unwrap_or_default()
                             .parse::<i32>()
                             .map_err(|_| {
-                            HostError::InvalidResponse(
-                                "local shell returned an invalid exit code".into(),
-                            )
-                        })?;
-                        return Ok::<_, HostError>((stdout, exit_code));
+                                HostError::InvalidResponse(
+                                    "local shell returned an invalid exit code".into(),
+                                )
+                            })?;
+                        let actual_cwd = marker_values.next().unwrap_or_default().to_owned();
+                        return Ok::<_, HostError>((stdout, exit_code, actual_cwd));
                     }
                     stdout.push_str(&line);
                 }
@@ -428,7 +444,7 @@ impl LocalHost {
             .await
             .map_err(|_| HostError::Timeout)
         };
-        let (stdout, exit_code) = match result {
+        let (stdout, exit_code, actual_cwd) = match result {
             Ok(Ok(result)) => result,
             Ok(Err(error)) | Err(error) => {
                 if let Some(mut shell) = sessions.remove(session) {
@@ -446,7 +462,7 @@ impl LocalHost {
                 exit_code,
                 timed_out: false,
                 session: Some(session.to_owned()),
-                cwd: Some(cwd.display().to_string()),
+                cwd: Some(actual_cwd),
             },
         })
     }
@@ -488,16 +504,35 @@ fn shell_command(command: &str, cwd: &Path) -> Command {
     }
 }
 
-fn persistent_command(command: &str, env: Option<&Value>, marker: &str) -> String {
+fn persistent_command(
+    command: &str,
+    env: Option<&Value>,
+    marker: &str,
+    cwd: &Path,
+    change_cwd: bool,
+) -> String {
     let prefix = persistent_env_prefix(env);
     #[cfg(windows)]
     {
-        format!("{prefix}{command} 2>&1 & echo {marker}:%ERRORLEVEL%")
+        let directory = if change_cwd {
+            format!("cd /d \"{}\" && ", cwd.display())
+        } else {
+            String::new()
+        };
+        format!("{prefix}{directory}{command} 2>&1 & echo {marker}:%ERRORLEVEL%:%CD%")
     }
     #[cfg(not(windows))]
     {
+        let directory = if change_cwd {
+            format!(
+                "cd -- '{}' && ",
+                cwd.display().to_string().replace('\'', "'\\''")
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "{prefix}{command} 2>&1; __opcos_exit=$?; printf '{marker}:%s\\n' \"$__opcos_exit\""
+            "{prefix}{directory}{command} 2>&1; __opcos_exit=$?; printf '{marker}:%s:%s\\n' \"$__opcos_exit\" \"$PWD\""
         )
     }
 }

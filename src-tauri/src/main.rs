@@ -868,12 +868,10 @@ async fn engine_for(
         .or(descriptor.default_base_url)
         .unwrap_or_default();
     let (workspace, executor, remote_client, allowed_tools) = if host_id == "local" {
-        let workspace = if session_workspace.is_empty() {
-            std::env::current_dir()
-                .map_err(|error| format!("local workspace unavailable: {error}"))?
-        } else {
-            PathBuf::from(session_workspace)
-        };
+        if session_workspace.is_empty() {
+            return Err("local session requires an explicit workspace directory".into());
+        }
+        let workspace = PathBuf::from(session_workspace);
         let host = LocalHost::new(&workspace).map_err(|error| error.to_string())?;
         let _ = host.health().await.map_err(|error| error.to_string())?;
         let capabilities = host
@@ -1422,18 +1420,17 @@ fn create_session(
     );
     let model = model.unwrap_or_else(|| "auto".into());
     let mode = mode.unwrap_or_else(|| "Interactive".into());
-    let host_name = if host_id == "local" {
-        "本机".to_owned()
-    } else {
-        state
-            .database
-            .lock()
-            .map_err(|_| "database lock poisoned")?
-            .query_row("SELECT name FROM hosts WHERE id=?1", [&host_id], |row| {
-                row.get(0)
-            })
-            .map_err(|_| "remote host not found; session was not created".to_owned())?
-    };
+    if host_id == "local" && workspace.as_deref().is_none_or(str::is_empty) {
+        return Err("local session requires an explicit workspace directory".into());
+    }
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let host_name = host_name(&connection, &host_id)
+        .map_err(|error| format!("{error}; session was not created"))?
+        .ok_or_else(|| "remote host not found; session was not created".to_owned())?;
+    drop(connection);
     let now = Utc::now();
     state
         .store
@@ -1503,14 +1500,8 @@ fn session_view_for_host(
     connection: &Connection,
     session: SessionRecord,
 ) -> Result<Option<SessionView>, String> {
-    let host_name = match connection.query_row(
-        "SELECT name FROM hosts WHERE id=?1",
-        [&session.host_id],
-        |row| row.get::<_, String>(0),
-    ) {
-        Ok(name) => name,
-        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
-        Err(error) => return Err(error.to_string()),
+    let Some(host_name) = host_name(connection, &session.host_id)? else {
+        return Ok(None);
     };
     Ok(Some(SessionView {
         id: session.session_id,
@@ -1524,6 +1515,19 @@ fn session_view_for_host(
         run_state: session.run_state,
         stop_reason: session.stop_reason,
     }))
+}
+
+fn host_name(connection: &Connection, host_id: &str) -> Result<Option<String>, String> {
+    if host_id == "local" {
+        return Ok(Some("本机".into()));
+    }
+    match connection.query_row("SELECT name FROM hosts WHERE id=?1", [host_id], |row| {
+        row.get::<_, String>(0)
+    }) {
+        Ok(name) => Ok(Some(name)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 #[tauri::command]
@@ -1572,24 +1576,27 @@ async fn submit_turn(
     request: SubmitRequest,
 ) -> Result<(), String> {
     let host_id = session_host_id(&state, &request.session_id)?;
-    let client = client_for(&state, &host_id)?;
-    if let Err(error) = client.health().await {
-        let _ = state
-            .store
-            .update_session_status(&request.session_id, "error", "host_unavailable");
-        emit(
-            &app,
-            "notice",
-            Some(&request.session_id),
-            json!({"kind":"error","text":"Remote host unavailable"}),
-        );
-        emit(
-            &app,
-            "turn_done",
-            Some(&request.session_id),
-            session_status_payload(&state, &request.session_id),
-        );
-        return Err(format!("remote host unavailable: {error}"));
+    if host_id != "local" {
+        let client = client_for(&state, &host_id)?;
+        if let Err(error) = client.health().await {
+            let _ =
+                state
+                    .store
+                    .update_session_status(&request.session_id, "error", "host_unavailable");
+            emit(
+                &app,
+                "notice",
+                Some(&request.session_id),
+                json!({"kind":"error","text":"Remote host unavailable"}),
+            );
+            emit(
+                &app,
+                "turn_done",
+                Some(&request.session_id),
+                session_status_payload(&state, &request.session_id),
+            );
+            return Err(format!("remote host unavailable: {error}"));
+        }
     }
     let engine = engine_for(&app, &state, &request.session_id).await?;
     emit(
