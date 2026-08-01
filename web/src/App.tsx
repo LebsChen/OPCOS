@@ -1527,7 +1527,7 @@ function ManageSections({
                 </Button>
               </div>
             </div>
-            {selected && (
+            {selected && tab === "knowledge" && (
               <div className="inline-actions">
                 <Button
                   className="bordered"
