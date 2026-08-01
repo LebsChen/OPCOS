@@ -323,77 +323,95 @@ fn redact_approval_value(value: &Value) -> Value {
 }
 
 fn redact_secret_patterns(value: &str) -> String {
-    let mut redacted = value.to_owned();
-    for marker in [
+    const MARKERS: &[&str] = &[
         "--api-key=",
         "--password=",
         "--token=",
         "x-api-key:",
-        "password=",
         "github_token=",
+        "password=",
         "token=",
         "secret=",
         "bearer ",
         "basic ",
-    ] {
-        redact_after_marker(&mut redacted, marker);
-    }
-    let mut search_from = 0;
-    while let Some(relative) = redacted.to_ascii_lowercase()[search_from..].find("-u ") {
-        let start = search_from + relative + 3;
-        let end = redacted[start..]
-            .find(char::is_whitespace)
-            .map(|offset| start + offset)
-            .unwrap_or(redacted.len());
-        if let Some(separator) = redacted[start..end].find(':') {
-            let secret_start = start + separator + 1;
-            redacted.replace_range(secret_start..end, "[redacted]");
-        }
-        search_from = end;
-        if search_from >= redacted.len() {
-            break;
-        }
-    }
-    redacted
-}
-
-fn redact_after_marker(value: &mut String, marker: &str) {
-    let marker_len = marker.len();
-    let requires_boundary = matches!(marker, "token=" | "password=" | "secret=");
-    let mut search_from = 0;
-    loop {
-        let lower = value.to_ascii_lowercase();
-        let Some(relative) = lower[search_from..].find(marker) else {
-            break;
-        };
-        let marker_start = search_from + relative;
-        if requires_boundary
-            && marker_start > 0
-            && (value.as_bytes()[marker_start - 1].is_ascii_alphanumeric()
-                || value.as_bytes()[marker_start - 1] == b'_'
-                || value.as_bytes()[marker_start - 1] == b'-')
-        {
-            search_from = marker_start + 1;
+    ];
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0;
+    while cursor < value.len() {
+        if !value.is_char_boundary(cursor) {
+            cursor += 1;
             continue;
         }
-        let secret_start = marker_start + marker_len;
-        let secret_start = secret_start
-            + value[secret_start..]
-                .find(|character: char| !character.is_whitespace())
-                .unwrap_or(value.len() - secret_start);
-        let secret_end = value[secret_start..]
-            .find(|character: char| {
-                character.is_whitespace() || matches!(character, '"' | '\'' | ')' | ']' | '}' | ',')
-            })
-            .map(|offset| secret_start + offset)
-            .unwrap_or(value.len());
-        if secret_start < secret_end {
-            value.replace_range(secret_start..secret_end, "[redacted]");
-            search_from = secret_start + "[redacted]".len();
-        } else {
+        if value[cursor..].starts_with("-u ") {
+            let token_start = cursor + 3;
+            let token_end = credential_end(value, token_start);
+            if let Some(colon) = value[token_start..token_end].find(':') {
+                let secret_start = token_start + colon + 1;
+                output.push_str(&value[cursor..secret_start]);
+                output.push_str("[redacted]");
+                cursor = token_end;
+                continue;
+            }
+        }
+        let marker = MARKERS.iter().copied().find(|marker| {
+            ascii_starts_with_ignore_case(&value[cursor..], marker)
+                && (!matches!(*marker, "token=" | "password=" | "secret=")
+                    || cursor == 0
+                    || !value.as_bytes()[cursor - 1].is_ascii_alphanumeric()
+                        && value.as_bytes()[cursor - 1] != b'_'
+                        && value.as_bytes()[cursor - 1] != b'-')
+        });
+        if let Some(marker) = marker {
+            let secret_start = cursor + marker.len();
+            let value_start = skip_whitespace(value, secret_start);
+            let secret_end = credential_end(value, value_start);
+            if value_start < secret_end {
+                output.push_str(&value[cursor..value_start]);
+                output.push_str("[redacted]");
+                cursor = secret_end;
+                continue;
+            }
+        }
+        let next = value[cursor..]
+            .chars()
+            .next()
+            .expect("cursor is within a valid string")
+            .len_utf8();
+        output.push_str(&value[cursor..cursor + next]);
+        cursor += next;
+    }
+    output
+}
+
+fn ascii_starts_with_ignore_case(value: &str, marker: &str) -> bool {
+    value
+        .as_bytes()
+        .get(..marker.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(marker.as_bytes()))
+}
+
+fn skip_whitespace(value: &str, mut cursor: usize) -> usize {
+    while cursor < value.len() {
+        let character = value[cursor..]
+            .chars()
+            .next()
+            .expect("cursor is within a valid string");
+        if !character.is_whitespace() {
             break;
         }
+        cursor += character.len_utf8();
     }
+    cursor
+}
+
+fn credential_end(value: &str, start: usize) -> usize {
+    value[start..]
+        .char_indices()
+        .find_map(|(offset, character)| {
+            (character.is_whitespace() || matches!(character, '"' | '\'' | ')' | ']' | '}' | ','))
+                .then_some(start + offset)
+        })
+        .unwrap_or(value.len())
 }
 
 fn emit_approval_decision(
@@ -3242,6 +3260,27 @@ mod m7_tests {
                     || redact_secret_patterns(input).contains("run")
             );
         }
+    }
+
+    #[test]
+    fn transcript_redaction_handles_unicode_and_repeated_basic_auth() {
+        let input =
+            "curl -u a:0123456789abcdef 中文说明 && curl -u b:second-secret https://example.test";
+        assert_eq!(
+            redact_secret_patterns(input),
+            "curl -u a:[redacted] 中文说明 && curl -u b:[redacted] https://example.test"
+        );
+    }
+
+    #[test]
+    fn transcript_redaction_scales_for_large_repeated_logs() {
+        let input = (0..1_000)
+            .map(|index| format!("echo token=secret-{index} 中文\n"))
+            .collect::<String>();
+        let redacted = redact_secret_patterns(&input);
+        assert_eq!(redacted.matches("[redacted]").count(), 1_000);
+        assert!(redacted.contains("echo"));
+        assert!(redacted.contains("中文"));
     }
 
     #[test]
