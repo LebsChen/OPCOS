@@ -128,6 +128,21 @@ pub struct AuditEvent {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ArtifactRecord {
+    pub id: String,
+    pub session_id: String,
+    pub turn_id: i64,
+    pub call_id: String,
+    pub host_id: String,
+    pub path: String,
+    pub size_bytes: Option<i64>,
+    pub sha256: Option<String>,
+    pub mime: Option<String>,
+    pub kind: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct TranscriptRecord {
     pub kind: String,
     pub payload: serde_json::Value,
@@ -381,6 +396,8 @@ pub trait SessionStore {
     fn load_grants(&self, session_id: &str) -> Result<Vec<GrantRecord>, StoreError>;
     fn append_usage(&self, usage: &UsageRecord) -> Result<(), StoreError>;
     fn load_usage(&self, session_id: &str) -> Result<Vec<UsageRecord>, StoreError>;
+    fn upsert_artifact(&self, artifact: &ArtifactRecord) -> Result<(), StoreError>;
+    fn load_artifacts(&self, session_id: &str) -> Result<Vec<ArtifactRecord>, StoreError>;
     fn update_session_status(
         &self,
         session_id: &str,
@@ -880,6 +897,20 @@ impl SqliteStore {
                output_tokens INTEGER NOT NULL,
                duration_ms INTEGER NOT NULL,
                recorded_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS artifacts (
+               id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL,
+               turn_id INTEGER NOT NULL,
+               call_id TEXT NOT NULL,
+               host_id TEXT NOT NULL,
+               path TEXT NOT NULL,
+               size_bytes INTEGER,
+               sha256 TEXT,
+               mime TEXT,
+               kind TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               UNIQUE(host_id, path)
              );",
             )?;
             let session_columns = table_columns(&connection, "sessions")?;
@@ -1324,6 +1355,67 @@ impl SessionStore for SqliteStore {
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
+
+    fn upsert_artifact(&self, artifact: &ArtifactRecord) -> Result<(), StoreError> {
+        self.connection.lock().expect("sqlite mutex poisoned").execute(
+            "INSERT INTO artifacts(id,session_id,turn_id,call_id,host_id,path,size_bytes,sha256,mime,kind,created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+             ON CONFLICT(host_id,path) DO UPDATE SET
+               id=excluded.id,
+               session_id=excluded.session_id,
+               turn_id=excluded.turn_id,
+               call_id=excluded.call_id,
+               size_bytes=excluded.size_bytes,
+               sha256=excluded.sha256,
+               mime=excluded.mime,
+               kind=excluded.kind,
+               created_at=excluded.created_at",
+            params![
+                artifact.id,
+                artifact.session_id,
+                artifact.turn_id,
+                artifact.call_id,
+                artifact.host_id,
+                artifact.path,
+                artifact.size_bytes,
+                artifact.sha256,
+                artifact.mime,
+                artifact.kind,
+                artifact.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn load_artifacts(&self, session_id: &str) -> Result<Vec<ArtifactRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT id,session_id,turn_id,call_id,host_id,path,size_bytes,sha256,mime,kind,created_at
+             FROM artifacts WHERE session_id=?1 ORDER BY created_at DESC",
+        )?;
+        let rows = statement.query_map([session_id], |row| {
+            Ok(ArtifactRecord {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                turn_id: row.get(2)?,
+                call_id: row.get(3)?,
+                host_id: row.get(4)?,
+                path: row.get(5)?,
+                size_bytes: row.get(6)?,
+                sha256: row.get(7)?,
+                mime: row.get(8)?,
+                kind: row.get(9)?,
+                created_at: row.get::<_, String>(10)?.parse().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        10,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
 }
 
 #[cfg(test)]
@@ -1701,6 +1793,34 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "approval_allowed");
         assert_eq!(events[0].payload["call_id"], "call-1");
+    }
+
+    #[test]
+    fn artifacts_store_references_and_upserts_by_host_path() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let first = ArtifactRecord {
+            id: "artifact-1".into(),
+            session_id: "session-artifact".into(),
+            turn_id: 1,
+            call_id: "call-1".into(),
+            host_id: "remote".into(),
+            path: "reports/out.txt".into(),
+            size_bytes: Some(4),
+            sha256: None,
+            mime: Some("text/plain".into()),
+            kind: "text".into(),
+            created_at: Utc::now(),
+        };
+        store.upsert_artifact(&first).unwrap();
+        let mut second = first.clone();
+        second.id = "artifact-2".into();
+        second.call_id = "call-2".into();
+        second.size_bytes = Some(8);
+        store.upsert_artifact(&second).unwrap();
+        let artifacts = store.load_artifacts("session-artifact").unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].id, "artifact-2");
+        assert_eq!(artifacts[0].size_bytes, Some(8));
     }
 
     #[test]

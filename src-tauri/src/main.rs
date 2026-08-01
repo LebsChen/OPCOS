@@ -24,7 +24,7 @@ use opcos_engine::{
     orchestration::{BoardPhase, BoardTask},
     orchestration::{CoordinationRuntime, Envelope, Role},
 };
-use opcos_hosts::{DEFAULT_EXEC_TIMEOUT_SECONDS, Host, LocalHost};
+use opcos_hosts::{DEFAULT_EXEC_TIMEOUT_SECONDS, Host, LocalHost, RvmHost};
 use opcos_policy::PermissionMode;
 use opcos_provider::anthropic::AnthropicProvider;
 use opcos_provider::bedrock::BedrockProvider;
@@ -35,7 +35,9 @@ use opcos_rvm::{
     ExecRequest, HttpRvmClient, IdeBootstrap, PersistentShell, RvmClient, RvmClientConfig, WsKind,
     WsParams, join_remote_path,
 };
-use opcos_store::{KeyringSecretStore, SecretStore, SessionRecord, SessionStore, SqliteStore};
+use opcos_store::{
+    ArtifactRecord, KeyringSecretStore, SecretStore, SessionRecord, SessionStore, SqliteStore,
+};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1565,6 +1567,179 @@ async fn read_transcript(
         })
 }
 
+fn artifact_kind(path: &str) -> (&'static str, Option<&'static str>) {
+    match path
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "md" | "markdown" => ("markdown", Some("text/markdown")),
+        "html" | "htm" => ("html", Some("text/html")),
+        "json" => ("code", Some("application/json")),
+        "csv" => ("csv", Some("text/csv")),
+        "png" => ("image", Some("image/png")),
+        "jpg" | "jpeg" => ("image", Some("image/jpeg")),
+        "gif" => ("image", Some("image/gif")),
+        "svg" => ("image", Some("image/svg+xml")),
+        "pdf" => ("pdf", Some("application/pdf")),
+        "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "sh" | "css" => ("code", Some("text/plain")),
+        _ => ("text", Some("text/plain")),
+    }
+}
+
+fn shell_artifact_path(command: &str) -> Option<String> {
+    let tokens = command.split_whitespace().collect::<Vec<_>>();
+    for (index, token) in tokens.iter().enumerate() {
+        if matches!(*token, ">" | ">>" | "tee") {
+            let path = tokens.get(index + 1)?.trim_matches(['"', '\'']);
+            if !path.is_empty() && path != "/dev/null" && path != "NUL" {
+                return Some(path.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn record_artifacts(state: &DesktopState, session_id: &str, host_id: &str) -> Result<(), String> {
+    for call in state
+        .store
+        .load_tool_calls(session_id)
+        .map_err(|error| error.to_string())?
+    {
+        let Some(result) = call.result.as_ref() else {
+            continue;
+        };
+        if result.get("error").is_some() {
+            continue;
+        }
+        let path = match call.name.as_str() {
+            "write_file" => call
+                .arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            "run_shell" | "exec" => call
+                .arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .and_then(shell_artifact_path),
+            _ => None,
+        };
+        let Some(path) = path else {
+            continue;
+        };
+        let (kind, mime) = artifact_kind(&path);
+        let size_bytes = if call.name == "write_file" {
+            result.get("size").and_then(Value::as_i64).or_else(|| {
+                call.arguments
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(|content| content.len() as i64)
+            })
+        } else {
+            result.get("size").and_then(Value::as_i64)
+        };
+        state
+            .store
+            .upsert_artifact(&ArtifactRecord {
+                id: format!("{host_id}:{path}"),
+                session_id: session_id.to_owned(),
+                turn_id: call.message_sequence,
+                call_id: call.call_id,
+                host_id: host_id.to_owned(),
+                path,
+                size_bytes,
+                sha256: None,
+                mime: mime.map(str::to_owned),
+                kind: kind.to_owned(),
+                created_at: Utc::now(),
+            })
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+async fn artifact_host(
+    state: &DesktopState,
+    session_id: &str,
+) -> Result<(Box<dyn Host>, String), String> {
+    let session = session_for(state, session_id)?;
+    let host_id = session.host_id;
+    if host_id == "local" {
+        let workspace = if session.workspace.is_empty() {
+            std::env::current_dir()
+                .map_err(|error| format!("local workspace unavailable: {error}"))?
+        } else {
+            PathBuf::from(session.workspace)
+        };
+        let host = LocalHost::new(workspace).map_err(|error| error.to_string())?;
+        host.health().await.map_err(|error| error.to_string())?;
+        return Ok((Box::new(host), host_id));
+    }
+    let client = client_for(state, &host_id)?;
+    let health = client
+        .health()
+        .await
+        .map_err(|error| format!("remote host unavailable: {error}"))?;
+    let workspace = if session.workspace.is_empty() {
+        health
+            .workspace
+            .ok_or_else(|| "remote host did not provide a workspace".to_owned())?
+    } else {
+        session.workspace
+    };
+    let client = client.with_workspace(workspace.clone());
+    Ok((
+        Box::new(RvmHost::new(host_id.clone(), workspace, client)),
+        host_id,
+    ))
+}
+
+#[tauri::command]
+async fn list_artifacts(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Vec<ArtifactRecord>, String> {
+    let (_host, _host_id) = artifact_host(&state, &session_id).await?;
+    state
+        .store
+        .load_artifacts(&session_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn read_artifact(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    artifact_id: String,
+) -> Result<Value, String> {
+    let (host, host_id) = artifact_host(&state, &session_id).await?;
+    let artifact = state
+        .store
+        .load_artifacts(&session_id)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|item| item.id == artifact_id)
+        .ok_or_else(|| "artifact reference not found".to_owned())?;
+    if artifact.host_id != host_id {
+        return Err("artifact belongs to an unavailable host binding".to_owned());
+    }
+    let content = host
+        .read(&artifact.path)
+        .await
+        .map_err(|error| format!("artifact host read failed: {error}"))?;
+    Ok(json!({
+        "id": artifact.id,
+        "path": content.path,
+        "content": content.content,
+        "size": content.size,
+        "kind": artifact.kind,
+        "mime": artifact.mime,
+    }))
+}
+
 #[tauri::command]
 async fn submit_turn(
     app: tauri::AppHandle,
@@ -1600,6 +1775,7 @@ async fn submit_turn(
     );
     match engine.submit_text(request.text).await {
         Ok(_) => {
+            record_artifacts(&state, &request.session_id, &host_id)?;
             emit(
                 &app,
                 "turn_done",
@@ -1609,6 +1785,7 @@ async fn submit_turn(
             Ok(())
         }
         Err(EngineError::ApprovalPending(call_id)) => {
+            record_artifacts(&state, &request.session_id, &host_id)?;
             if let Ok(Some(pending)) = state
                 .store
                 .load_pending(&request.session_id)
@@ -1643,6 +1820,7 @@ async fn submit_turn(
             Err(message)
         }
         Err(error) => {
+            record_artifacts(&state, &request.session_id, &host_id)?;
             let message = engine_error_message(error);
             if message.contains("denied") || message.contains("policy") {
                 audit(
@@ -1777,6 +1955,7 @@ async fn resolve_approval(
     call_id: String,
     approve: bool,
 ) -> Result<(), String> {
+    let host_id = session_host_id(&state, &session_id)?;
     let engine = engine_for(&app, &state, &session_id).await?;
     let result = engine
         .resolve_approval(
@@ -1807,6 +1986,7 @@ async fn resolve_approval(
     );
     match result {
         Ok(()) => {
+            record_artifacts(&state, &session_id, &host_id)?;
             let _ = emit_pending_approval(&app, &state, &session_id)?;
             emit(
                 &app,
@@ -1818,6 +1998,7 @@ async fn resolve_approval(
         }
         Err(opcos_engine::EngineError::ApprovalPending(next_call_id)) => {
             let _ = next_call_id;
+            record_artifacts(&state, &session_id, &host_id)?;
             emit_pending_approval(&app, &state, &session_id)?;
             emit(
                 &app,
@@ -1828,7 +2009,10 @@ async fn resolve_approval(
             Ok(())
         }
         Err(opcos_engine::EngineError::ApprovalAlreadyProcessed(_)) => Ok(()),
-        Err(error) => Err(engine_error_message(error)),
+        Err(error) => {
+            record_artifacts(&state, &session_id, &host_id)?;
+            Err(engine_error_message(error))
+        }
     }
 }
 
@@ -2804,6 +2988,8 @@ async fn run_schedule_for(
         .map_err(|error| error.to_string())?;
     let engine = engine_for(app, state, &session_id).await?;
     let result = engine.submit_text(prompt).await;
+    let host_id = session_host_id(state, &session_id)?;
+    record_artifacts(state, &session_id, &host_id)?;
     let result_label = if result.is_ok() { "ok" } else { "error" };
     state
         .database
@@ -3206,6 +3392,8 @@ fn main() {
             list_sessions,
             read_transcript,
             submit_turn,
+            list_artifacts,
+            read_artifact,
             upload_text_attachment,
             interrupt,
             steering,

@@ -57,13 +57,13 @@ Den 的 config object 具有不可变版本、访问授权以及 archive/restore
 
 ### `artifact`
 
-| 字段                                    | 用途                           |
-| --------------------------------------- | ------------------------------ |
-| `id`, `session_id`, `turn_id`           | 产物和会话/turn 关联。         |
-| `host_id`, `remote_path`                | 产物所在 host 与远程路径。     |
-| `kind`, `title`, `size_bytes`, `sha256` | 类型、显示名、大小、内容指纹。 |
-| `source_tool_call_id`                   | 生成它的工具调用。             |
-| `created_at`, `deleted_at`              | 生命周期。                     |
+| 字段                                    | 用途                                                 |
+| --------------------------------------- | ---------------------------------------------------- |
+| `id`, `session_id`, `turn_id`           | 产物和会话/turn 关联。                               |
+| `host_id`, `path`                       | 产物所在 host 与路径引用。                           |
+| `kind`, `title`, `size_bytes`, `sha256` | 类型、显示名、大小、内容指纹。                       |
+| `source_tool_call_id`                   | 生成它的工具调用；`turn_id` 使用持久化工具消息序号。 |
+| `created_at`, `deleted_at`              | 生命周期。                                           |
 
 目标态只保存引用，不复制远程文件内容；读取必须重新通过 host 协议，失败显式返回［推断］。
 

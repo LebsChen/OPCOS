@@ -91,7 +91,8 @@ type RailIconName =
   | "monitor"
   | "code"
   | "grid"
-  | "globe";
+  | "globe"
+  | "file";
 
 function RailIcon({
   name,
@@ -196,6 +197,15 @@ function RailIcon({
           <circle cx="12" cy="12" r="10" />
           <line x1="2" y1="12" x2="22" y2="12" />
           <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
+        </svg>
+      );
+    case "file":
+      return (
+        <svg {...s}>
+          <path d="M5 3h9l5 5v13H5z" />
+          <path d="M14 3v6h6" />
+          <line x1="8" y1="13" x2="16" y2="13" />
+          <line x1="8" y1="17" x2="16" y2="17" />
         </svg>
       );
   }
@@ -2841,6 +2851,7 @@ type PaneRoute = {
 
 type PanelTab =
   | "info"
+  | "artifacts"
   | "pr"
   | "terminal"
   | "desktop"
@@ -2859,6 +2870,7 @@ function paneRoute(): PaneRoute | null {
   if (!sessionId || !tab) return null;
   const validTabs: PanelTab[] = [
     "info",
+    "artifacts",
     "pr",
     "terminal",
     "desktop",
@@ -2990,6 +3002,124 @@ function StandaloneInsights({
   );
 }
 
+type ArtifactRecord = {
+  id: string;
+  path: string;
+  kind: string;
+  size_bytes?: number | null;
+};
+
+function ArtifactsPane({ selected }: { selected: Session }) {
+  const [artifacts, setArtifacts] = useState<ArtifactRecord[]>([]);
+  const [opened, setOpened] = useState<ArtifactRecord | null>(null);
+  const [content, setContent] = useState<Record<string, unknown> | null>(null);
+  const [loadError, setLoadError] = useState("");
+  const refresh = () =>
+    void command<ArtifactRecord[]>("list_artifacts", { sessionId: selected.id })
+      .then((items) => {
+        setLoadError("");
+        setArtifacts(items);
+      })
+      .catch((error) => {
+        setArtifacts([]);
+        setLoadError(errorMessage(error));
+      });
+  useEffect(() => {
+    setOpened(null);
+    setContent(null);
+    refresh();
+  }, [selected.id]);
+  useEffect(() => {
+    if (!opened) return;
+    setContent(null);
+    void command<Record<string, unknown>>("read_artifact", {
+      sessionId: selected.id,
+      artifactId: opened.id,
+    })
+      .then(setContent)
+      .catch((error) => setContent({ error: errorMessage(error) }));
+  }, [selected.id, opened?.id]);
+  if (opened) {
+    return (
+      <div className="artifact-viewer">
+        <div className="artifact-head">
+          <button
+            className="artifact-icon-btn"
+            onClick={() => setOpened(null)}
+            aria-label="Back to artifacts"
+            title="Back"
+          >
+            ←
+          </button>
+          <div className="artifact-heading">
+            <div className="artifact-title">
+              <span>Artifacts</span>
+              <span className="artifact-sep">/</span>
+              <span>{opened.path.split(/[\\/]/).pop()}</span>
+            </div>
+            <div className="artifact-path">{opened.path}</div>
+          </div>
+        </div>
+        <div className="artifact-preview">
+          {!content ? (
+            <div className="rail-muted">Loading…</div>
+          ) : content.error ? (
+            <div className="rail-error">{String(content.error)}</div>
+          ) : (
+            <pre className="artifact-code">{String(content.content ?? "")}</pre>
+          )}
+        </div>
+      </div>
+    );
+  }
+  return (
+    <section className="rail-section">
+      <div className="rail-section-head">
+        <strong>
+          Artifacts{artifacts.length ? ` (${artifacts.length})` : ""}
+        </strong>
+        <button
+          className="rail-mini-btn"
+          onClick={refresh}
+          title="Refresh artifacts"
+        >
+          ↻
+        </button>
+      </div>
+      <div className="rail-section-body">
+        {loadError ? (
+          <div className="rail-error">{loadError}</div>
+        ) : artifacts.length === 0 ? (
+          <div className="rail-muted">No artifacts yet.</div>
+        ) : (
+          <div className="artifact-list">
+            {artifacts.slice(0, 16).map((artifact) => (
+              <button
+                className="artifact-row"
+                key={artifact.id}
+                onClick={() => setOpened(artifact)}
+              >
+                <span className="artifact-ico">
+                  <RailIcon name="file" size={17} />
+                </span>
+                <span className="artifact-name">
+                  {artifact.path.split(/[\\/]/).pop() || artifact.path}
+                  <span className="artifact-row-meta">
+                    {artifact.size_bytes == null
+                      ? "Size unavailable"
+                      : `${artifact.size_bytes} B`}
+                  </span>
+                </span>
+                <span className="artifact-open">Open</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
 function SessionRightPanel({
   selected,
   onError,
@@ -3030,6 +3160,7 @@ function SessionRightPanel({
     icon: RailIconName;
   }> = [
     { id: "info", label: "Info", icon: "info" },
+    { id: "artifacts", label: "Artifacts", icon: "file" },
     { id: "pr", label: "PR", icon: "branch" },
     { id: "worklog", label: "Worklog", icon: "list" },
     { id: "insights", label: "Insights", icon: "sparkle" },
@@ -3193,8 +3324,21 @@ function SessionRightPanel({
                 </div>
               </div>
             )}
+            {opened.includes("artifacts") && (
+              <div
+                className="session-pane"
+                style={{ display: panelTab === "artifacts" ? "block" : "none" }}
+              >
+                <ArtifactsPane selected={selected} />
+              </div>
+            )}
             {tabs
-              .filter((item) => item.id !== "info" && opened.includes(item.id))
+              .filter(
+                (item) =>
+                  item.id !== "info" &&
+                  item.id !== "artifacts" &&
+                  opened.includes(item.id),
+              )
               .map((item) => (
                 <div
                   className="session-pane"

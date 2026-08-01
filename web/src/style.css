@@ -985,6 +985,111 @@ h3 {
   padding: 15px 14px;
   border-bottom: 1px solid var(--color-line);
 }
+
+.artifact-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.artifact-row {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 9px;
+  padding: 8px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: var(--color-ink);
+  text-align: left;
+}
+.artifact-row:hover {
+  border-color: var(--color-line);
+  background: var(--color-panel);
+}
+.artifact-ico {
+  display: inline-flex;
+  color: var(--color-muted);
+}
+.artifact-name {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 1px;
+  overflow: hidden;
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.artifact-row-meta,
+.artifact-open {
+  color: var(--color-muted);
+  font-size: 11px;
+  font-weight: 400;
+}
+.artifact-viewer {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+}
+.artifact-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px;
+}
+.artifact-icon-btn {
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-muted);
+  cursor: pointer;
+  padding: 5px 7px;
+}
+.artifact-icon-btn:hover {
+  background: var(--color-line);
+  color: var(--color-ink);
+}
+.artifact-heading {
+  min-width: 0;
+  flex: 1;
+}
+.artifact-title {
+  display: flex;
+  gap: 7px;
+  overflow: hidden;
+  color: var(--color-ink);
+  font-size: 14px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.artifact-sep,
+.artifact-path {
+  color: var(--color-muted);
+}
+.artifact-path {
+  overflow: hidden;
+  margin-top: 2px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+}
+.artifact-preview {
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+  background: var(--color-panel);
+}
+.artifact-code {
+  margin: 0;
+  padding: 18px;
+  color: var(--color-ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
 .rail-section h3 {
   margin-bottom: 11px;
   color: var(--color-muted);
