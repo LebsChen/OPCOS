@@ -245,7 +245,7 @@ async fn execute_index_tool(
             }
             let result = host
                 .exec(ExecRequest {
-                    command: "set -o pipefail && rg -n --fixed-strings --hidden --glob '!.git/**' --glob '!node_modules/**' --glob '!target/**' --glob '!.venv/**' --glob '!dist/**' --glob '!build/**' \"$OPCOS_INDEX_QUERY\" . | awk 'NR <= 100 { print } END { print \"__OPCOS_TOTAL__\" NR }'".into(),
+                    command: "output=$(mktemp /tmp/opcos-index-search.XXXXXX); trap 'rm -f \"$output\"' 0 1 2 3 15; rg -n --fixed-strings --hidden --glob '!.git/**' --glob '!node_modules/**' --glob '!target/**' --glob '!.venv/**' --glob '!dist/**' --glob '!build/**' \"$OPCOS_INDEX_QUERY\" . > \"$output\"; status=$?; if [ \"$status\" -gt 1 ]; then cat \"$output\"; exit \"$status\"; fi; awk 'NR <= 100 { print } END { print \"__OPCOS_TOTAL__\" NR }' \"$output\"".into(),
                     cwd: Some(workspace.to_owned()),
                     timeout_seconds: 15,
                     session: None,
