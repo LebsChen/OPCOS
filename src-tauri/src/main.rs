@@ -245,7 +245,7 @@ async fn execute_index_tool(
             }
             let result = host
                 .exec(ExecRequest {
-                    command: "rg -n --fixed-strings --hidden --glob '!.git/**' --glob '!node_modules/**' --glob '!target/**' --glob '!.venv/**' --glob '!dist/**' --glob '!build/**' \"$OPCOS_INDEX_QUERY\" . | awk 'NR <= 100 { print } END { print \"__OPCOS_TOTAL__\" NR }'".into(),
+                    command: "set -o pipefail && rg -n --fixed-strings --hidden --glob '!.git/**' --glob '!node_modules/**' --glob '!target/**' --glob '!.venv/**' --glob '!dist/**' --glob '!build/**' \"$OPCOS_INDEX_QUERY\" . | awk 'NR <= 100 { print } END { print \"__OPCOS_TOTAL__\" NR }'".into(),
                     cwd: Some(workspace.to_owned()),
                     timeout_seconds: 15,
                     session: None,

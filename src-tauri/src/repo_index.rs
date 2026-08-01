@@ -109,7 +109,7 @@ pub async fn build(
     }
     let file_result = host
         .exec(ExecRequest {
-            command: "find . -type d \\( -name .git -o -name node_modules -o -name target -o -name .venv -o -name dist -o -name build \\) -prune -o -type f -printf '%p\\t%s\\n' | head -n 20001".into(),
+            command: "set -o pipefail && find . -type d \\( -name .git -o -name node_modules -o -name target -o -name .venv -o -name dist -o -name build \\) -prune -o -type f -printf '%p\\t%s\\n' | head -n 20001".into(),
             cwd: Some(workspace.to_owned()),
             timeout_seconds: 30,
             session: None,
@@ -150,7 +150,7 @@ pub async fn build(
 
     let symbol_result = host
         .exec(ExecRequest {
-            command: "rg -n --hidden --glob '!.git/**' --glob '!node_modules/**' --glob '!target/**' --glob '!.venv/**' --glob '!dist/**' --glob '!build/**' '^[[:space:]]*(export[[:space:]]+)?(async[[:space:]]+)?(fn|function|class|interface|trait|struct|enum|const|def|module)[[:space:]]+' . | head -n 20000".into(),
+            command: "set -o pipefail && rg -n --hidden --glob '!.git/**' --glob '!node_modules/**' --glob '!target/**' --glob '!.venv/**' --glob '!dist/**' --glob '!build/**' '^[[:space:]]*(export[[:space:]]+)?(async[[:space:]]+)?(fn|function|class|interface|trait|struct|enum|const|def|module)[[:space:]]+' . | head -n 20000".into(),
             cwd: Some(workspace.to_owned()),
             timeout_seconds: 30,
             session: None,
