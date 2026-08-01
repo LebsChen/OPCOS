@@ -10,6 +10,7 @@ use opcos_store::{
     UsageRecord,
 };
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -84,6 +85,7 @@ pub struct TurnEngine<P, S, E> {
     unattended: AtomicBool,
     system_instructions: Mutex<Option<String>>,
     external_tools: Mutex<Vec<Value>>,
+    active_tool_calls: Mutex<HashSet<String>>,
 }
 
 impl<P, S, E> TurnEngine<P, S, E>
@@ -126,6 +128,7 @@ where
             unattended: AtomicBool::new(false),
             system_instructions: Mutex::new(None),
             external_tools: Mutex::new(Vec::new()),
+            active_tool_calls: Mutex::new(HashSet::new()),
         }
     }
 
@@ -326,6 +329,15 @@ where
     }
     pub fn workspace(&self) -> &str {
         &self.workspace
+    }
+
+    pub async fn active_tool_call_ids(&self) -> Vec<String> {
+        self.active_tool_calls
+            .lock()
+            .await
+            .iter()
+            .cloned()
+            .collect()
     }
 
     pub async fn events_receiver(&self) -> Option<mpsc::Receiver<StreamChunk>> {
@@ -560,12 +572,7 @@ where
                     readonly.push((index, call));
                 }
                 Decision::Allow => {
-                    results[index] = Some(
-                        self.executor
-                            .execute(&call.name, call.arguments.clone())
-                            .await
-                            .unwrap_or_else(|error| json!({"error":error})),
-                    );
+                    results[index] = Some(self.execute_tool(call).await);
                 }
                 Decision::Deny => {
                     results[index] = Some(json!({"error":"tool call denied by policy"}))
@@ -573,11 +580,7 @@ where
                 Decision::NeedsUser => {
                     let completed_reads = futures_util::future::join_all(readonly.drain(..).map(
                         |(read_index, read_call): (usize, &ToolCall)| async move {
-                            let result = self
-                                .executor
-                                .execute(&read_call.name, read_call.arguments.clone())
-                                .await
-                                .unwrap_or_else(|error| json!({"error":error}));
+                            let result = self.execute_tool(read_call).await;
                             (read_index, result)
                         },
                     ))
@@ -618,11 +621,7 @@ where
         }
         let readonly_results =
             futures_util::future::join_all(readonly.into_iter().map(|(index, call)| async move {
-                let result = self
-                    .executor
-                    .execute(&call.name, call.arguments.clone())
-                    .await
-                    .unwrap_or_else(|error| json!({"error":error}));
+                let result = self.execute_tool(call).await;
                 (index, result)
             }))
             .await;
@@ -633,6 +632,17 @@ where
         self.persist_tool_results(assistant_sequence, calls, results.clone())
             .await?;
         Ok(results)
+    }
+
+    async fn execute_tool(&self, call: &ToolCall) -> Value {
+        self.active_tool_calls.lock().await.insert(call.id.clone());
+        let result = self
+            .executor
+            .execute(&call.name, call.arguments.clone())
+            .await
+            .unwrap_or_else(|error| json!({"error":error}));
+        self.active_tool_calls.lock().await.remove(&call.id);
+        result
     }
 
     async fn persist_tool_results(

@@ -246,7 +246,7 @@ fn emit(app: &tauri::AppHandle, kind: &str, session_id: Option<&str>, payload: V
         OpcosEvent {
             kind: kind.into(),
             session_id: session_id.map(str::to_owned),
-            payload: redact_approval_value(&payload),
+            payload,
         },
     );
 }
@@ -332,6 +332,22 @@ fn redact_approval_value(value: &Value) -> Value {
             Value::String(redacted)
         }
         other => other.clone(),
+    }
+}
+
+fn overlay_running_tool_status(
+    kind: &str,
+    payload: &mut Value,
+    active_call_ids: &std::collections::HashSet<String>,
+) {
+    if kind == "tool"
+        && payload
+            .get("call_id")
+            .or_else(|| payload.get("callId"))
+            .and_then(Value::as_str)
+            .is_some_and(|call_id| active_call_ids.contains(call_id))
+    {
+        payload["status"] = json!("running");
     }
 }
 
@@ -1302,10 +1318,17 @@ fn session_view_for_host(
 }
 
 #[tauri::command]
-fn read_transcript(
+async fn read_transcript(
     state: State<'_, DesktopState>,
     session_id: String,
 ) -> Result<Vec<Value>, String> {
+    let active_call_ids = {
+        let engines = state.engines.lock().await;
+        match engines.get(&session_id) {
+            Some(engine) => engine.active_tool_call_ids().await.into_iter().collect(),
+            None => std::collections::HashSet::new(),
+        }
+    };
     state
         .store
         .load_transcript(&session_id)
@@ -1315,6 +1338,7 @@ fn read_transcript(
                 .into_iter()
                 .map(|record| {
                     let mut payload = redact_approval_value(&record.payload);
+                    overlay_running_tool_status(&record.kind, &mut payload, &active_call_ids);
                     if record.kind == "approval"
                         && payload
                             .get("approval")
@@ -3102,5 +3126,23 @@ mod m7_tests {
             "curl -H \"Authorization: Bearer [redacted]\" https://api.example.com/deploy"
         );
         assert_eq!(assistant["tool_calls"][0]["result"], "Bearer [redacted]");
+    }
+
+    #[test]
+    fn active_tool_status_overrides_interrupted_only_for_in_flight_call() {
+        let mut running = json!({
+            "call_id": "call-running",
+            "status": "interrupted"
+        });
+        let active = std::collections::HashSet::from(["call-running".to_owned()]);
+        overlay_running_tool_status("tool", &mut running, &active);
+        assert_eq!(running["status"], "running");
+
+        let mut interrupted = json!({
+            "call_id": "call-finished",
+            "status": "interrupted"
+        });
+        overlay_running_tool_status("tool", &mut interrupted, &active);
+        assert_eq!(interrupted["status"], "interrupted");
     }
 }
