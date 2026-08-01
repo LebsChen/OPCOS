@@ -59,6 +59,7 @@ use tauri::{Emitter, Manager, RunEvent, State};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio_tungstenite::accept_async;
 
 const SECRET_SERVICE: &str = "com.opcos.desktop";
@@ -104,6 +105,8 @@ struct DesktopState {
     trigger_runs: AsyncMutex<HashSet<String>>,
     trigger_http_token: String,
     trigger_http_port: u16,
+    trigger_watcher_reload: Mutex<Option<std_mpsc::Sender<()>>>,
+    trigger_watcher_stop: Mutex<Option<std_mpsc::Sender<()>>>,
     surfaces: AsyncMutex<HashMap<u16, tauri::async_runtime::JoinHandle<()>>>,
     ide_proxies: AsyncMutex<HashMap<u16, tauri::async_runtime::JoinHandle<()>>>,
     coordination: AsyncMutex<HashMap<String, CoordinationRuntime>>,
@@ -5299,6 +5302,11 @@ fn save_schedule(state: State<'_, DesktopState>, schedule: ScheduleInput) -> Res
             ],
         )
         .map_err(|error| error.to_string())?;
+    if let Ok(reload) = state.trigger_watcher_reload.lock()
+        && let Some(reload) = reload.as_ref()
+    {
+        let _ = reload.send(());
+    }
     Ok(json!({"id":id,"enabled":schedule.enabled}))
 }
 
@@ -5537,6 +5545,24 @@ async fn run_schedule_for_inner(
     result.map(|_| ()).map_err(engine_error_message)
 }
 
+fn constant_time_token_eq(expected: &str, actual: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    expected.as_bytes().ct_eq(actual.as_bytes()).into()
+}
+
+fn schedule_id_for_trigger(state: &DesktopState, trigger_id: &str) -> Option<String> {
+    state
+        .database
+        .lock()
+        .ok()?
+        .query_row(
+            "SELECT id FROM schedules WHERE id=?1 OR config_object_id=?1",
+            [trigger_id],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+}
+
 async fn serve_trigger_callback(listener: TcpListener, app: tauri::AppHandle, token: String) {
     loop {
         let Ok((mut stream, _)) = listener.accept().await else {
@@ -5545,37 +5571,72 @@ async fn serve_trigger_callback(listener: TcpListener, app: tauri::AppHandle, to
         let app = app.clone();
         let token = token.clone();
         tauri::async_runtime::spawn(async move {
-            let mut buffer = vec![0_u8; 64 * 1024];
-            let Ok(size) = stream.read(&mut buffer).await else {
+            let mut buffer = Vec::with_capacity(4096);
+            let mut header_end = None;
+            while buffer.len() <= 64 * 1024 {
+                let mut chunk = [0_u8; 4096];
+                let Ok(size) = stream.read(&mut chunk).await else {
+                    return;
+                };
+                if size == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..size]);
+                if let Some(index) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                    header_end = Some(index + 4);
+                    break;
+                }
+            }
+            let Some(header_end) = header_end else {
                 return;
             };
-            let request = String::from_utf8_lossy(&buffer[..size]);
-            let authorized = request
+            let header = String::from_utf8_lossy(&buffer[..header_end]).into_owned();
+            let content_length = header
                 .lines()
-                .find_map(|line| line.strip_prefix("X-OPCOS-Trigger-Token:"))
-                .is_some_and(|value| value.trim() == token);
-            let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
-            let trigger_id = serde_json::from_str::<Value>(body)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .get("trigger_id")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
                 })
-                .or_else(|| {
-                    request
-                        .trim_start_matches('/')
-                        .split_whitespace()
-                        .next()
-                        .map(str::to_owned)
-                });
+                .unwrap_or(0);
+            while buffer.len() < header_end + content_length
+                && buffer.len() <= header_end + content_length + 64 * 1024
+            {
+                let mut chunk = [0_u8; 4096];
+                let Ok(size) = stream.read(&mut chunk).await else {
+                    return;
+                };
+                if size == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..size]);
+            }
+            if buffer.len() < header_end + content_length {
+                return;
+            }
+            let authorized = header.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("x-opcos-trigger-token")
+                    .then(|| constant_time_token_eq(&token, value.trim()))
+            }) == Some(true);
+            let body = String::from_utf8_lossy(&buffer[header_end..header_end + content_length]);
+            let trigger_id = serde_json::from_str::<Value>(&body).ok().and_then(|value| {
+                value
+                    .get("trigger_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
             let (status, response) = if authorized {
                 if let Some(trigger_id) = trigger_id {
                     let state = app.state::<DesktopState>();
-                    match run_schedule_for(&app, &state, &trigger_id).await {
-                        Ok(()) => (200, r#"{"accepted":true}"#.to_owned()),
-                        Err(error) => (500, json!({"error":error}).to_string()),
+                    if let Some(schedule_id) = schedule_id_for_trigger(&state, &trigger_id) {
+                        match run_schedule_for(&app, &state, &schedule_id).await {
+                            Ok(()) => (200, r#"{"accepted":true}"#.to_owned()),
+                            Err(error) => (500, json!({"error":error}).to_string()),
+                        }
+                    } else {
+                        (404, r#"{"error":"unknown trigger_id"}"#.to_owned())
                     }
                 } else {
                     (400, r#"{"error":"trigger_id is required"}"#.to_owned())
@@ -5595,24 +5656,46 @@ async fn serve_trigger_callback(listener: TcpListener, app: tauri::AppHandle, to
 }
 
 fn start_filesystem_triggers(app: tauri::AppHandle) {
-    let (sender, receiver) = std_mpsc::channel::<String>();
-    let state = app.state::<DesktopState>();
-    if let Ok(connection) = state.database.lock()
-        && let Ok(mut statement) = connection.prepare(
-            "SELECT o.id,v.content FROM config_object o
-             JOIN config_object_version v ON v.id=o.current_version_id
-             WHERE o.kind='trigger' AND o.status='active'",
-        )
-        && let Ok(rows) = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-    {
-        let configs = rows.flatten().collect::<Vec<_>>();
-        let watcher_sender = sender.clone();
-        std::thread::spawn(move || {
-            let mut watchers = Vec::new();
-            for row in configs {
-                let Ok(config) = serde_json::from_str::<Value>(&row.1) else {
+    let (reload_tx, reload_rx) = std_mpsc::channel::<()>();
+    let (stop_tx, stop_rx) = std_mpsc::channel::<()>();
+    let (event_tx, mut event_rx): (UnboundedSender<String>, UnboundedReceiver<String>) =
+        unbounded_channel();
+    if let Some(state) = app.try_state::<DesktopState>() {
+        if let Ok(mut reload) = state.trigger_watcher_reload.lock() {
+            *reload = Some(reload_tx);
+        }
+        if let Ok(mut stop) = state.trigger_watcher_stop.lock() {
+            *stop = Some(stop_tx);
+        }
+    }
+    let watcher_app = app.clone();
+    std::thread::spawn(move || {
+        let mut watchers = Vec::new();
+        let rebuild = |watchers: &mut Vec<notify::RecommendedWatcher>| {
+            watchers.clear();
+            let state = watcher_app.state::<DesktopState>();
+            let configs = state
+                .database
+                .lock()
+                .ok()
+                .and_then(|connection| {
+                    let mut statement = connection
+                        .prepare(
+                            "SELECT o.id,v.content FROM config_object o
+                             JOIN config_object_version v ON v.id=o.current_version_id
+                             WHERE o.kind='trigger' AND o.status='active'",
+                        )
+                        .ok()?;
+                    statement
+                        .query_map([], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })
+                        .ok()
+                        .map(|rows| rows.flatten().collect::<Vec<_>>())
+                })
+                .unwrap_or_default();
+            for (id, content) in configs {
+                let Ok(config) = serde_json::from_str::<Value>(&content) else {
                     continue;
                 };
                 if config.get("trigger").and_then(Value::as_str) != Some("filesystem")
@@ -5623,8 +5706,7 @@ fn start_filesystem_triggers(app: tauri::AppHandle) {
                 let Some(workspace) = config.get("workspace").and_then(Value::as_str) else {
                     continue;
                 };
-                let id = row.0.clone();
-                let sender = watcher_sender.clone();
+                let sender = event_tx.clone();
                 let Ok(mut watcher) = notify::RecommendedWatcher::new(
                     move |result: notify::Result<notify::Event>| {
                         if result.is_ok() {
@@ -5645,16 +5727,78 @@ fn start_filesystem_triggers(app: tauri::AppHandle) {
                     watchers.push(watcher);
                 }
             }
-            loop {
-                std::thread::park();
+        };
+        rebuild(&mut watchers);
+        loop {
+            if stop_rx.try_recv().is_ok() {
+                break;
             }
-        });
-    }
+            if reload_rx.try_recv().is_ok() {
+                rebuild(&mut watchers);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    });
     tauri::async_runtime::spawn(async move {
-        while let Ok(trigger_object_id) = receiver.recv() {
-            let schedule_id = trigger_object_id.trim_start_matches("trigger:");
-            let state = app.state::<DesktopState>();
-            let _ = run_schedule_for(&app, &state, schedule_id).await;
+        let mut pending: HashMap<String, (tokio::time::Instant, u64)> = HashMap::new();
+        loop {
+            if pending.is_empty() {
+                let Some(trigger_object_id) = event_rx.recv().await else {
+                    break;
+                };
+                pending.insert(
+                    trigger_object_id,
+                    (
+                        tokio::time::Instant::now() + std::time::Duration::from_millis(750),
+                        1,
+                    ),
+                );
+                continue;
+            }
+            let deadline = pending
+                .values()
+                .map(|(deadline, _)| *deadline)
+                .min()
+                .unwrap_or_else(tokio::time::Instant::now);
+            tokio::select! {
+                event = event_rx.recv() => {
+                    let Some(trigger_object_id) = event else { break; };
+                    let entry = pending.entry(trigger_object_id).or_insert((
+                        tokio::time::Instant::now() + std::time::Duration::from_millis(750),
+                        0,
+                    ));
+                    entry.1 += 1;
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    let now = tokio::time::Instant::now();
+                    let due = pending
+                        .iter()
+                        .filter(|(_, (deadline, _))| *deadline <= now)
+                        .map(|(id, (_, count))| (id.clone(), *count))
+                        .collect::<Vec<_>>();
+                    for (trigger_object_id, count) in due {
+                        pending.remove(&trigger_object_id);
+                        let state = app.state::<DesktopState>();
+                        if let Some(schedule_id) = schedule_id_for_trigger(&state, &trigger_object_id) {
+                            if count > 1
+                                && let Ok(connection) = state.database.lock()
+                                && let Ok(target) = connection.query_row(
+                                        "SELECT session_id FROM schedules WHERE id=?1",
+                                        [&schedule_id],
+                                        |row| row.get::<_, String>(0),
+                                    )
+                            {
+                                audit(&state, &target, "trigger_debounced", json!({
+                                    "trigger_id": trigger_object_id,
+                                    "merged_events": count,
+                                    "window_ms": 750,
+                                }));
+                            }
+                            let _ = run_schedule_for(&app, &state, &schedule_id).await;
+                        }
+                    }
+                }
+            }
         }
     });
 }
@@ -5998,16 +6142,18 @@ fn main() {
             let mcp = Arc::new(McpManager::new(Arc::new(McpCredentialAdapter {
                 store: secrets.clone(),
             })));
+            let mut trigger_token_bytes = [0_u8; 32];
+            getrandom::fill(&mut trigger_token_bytes).map_err(|error| {
+                tauri::Error::from(std::io::Error::other(format!(
+                    "failed to generate trigger token: {error}"
+                )))
+            })?;
             let trigger_http_token = format!(
-                "opcos-trigger-{:x}",
-                Sha256::digest(
-                    format!(
-                        "{}:{}",
-                        path.display(),
-                        Utc::now().timestamp_nanos_opt().unwrap_or_default()
-                    )
-                    .as_bytes(),
-                )
+                "opcos-trigger-{}",
+                trigger_token_bytes
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
             );
             let trigger_listener =
                 std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(tauri::Error::from)?;
@@ -6033,6 +6179,8 @@ fn main() {
                 coordination: AsyncMutex::new(HashMap::new()),
                 trigger_http_token: trigger_http_token.clone(),
                 trigger_http_port,
+                trigger_watcher_reload: Mutex::new(None),
+                trigger_watcher_stop: Mutex::new(None),
                 mcp: Arc::clone(&mcp),
             });
             let handle = app.handle().clone();
@@ -6170,6 +6318,11 @@ fn main() {
         .run(|app: &tauri::AppHandle, event: RunEvent| {
             if matches!(event, RunEvent::Exit) {
                 let state = app.state::<DesktopState>();
+                if let Ok(stop) = state.trigger_watcher_stop.lock()
+                    && let Some(stop) = stop.as_ref()
+                {
+                    let _ = stop.send(());
+                }
                 let mcp = Arc::clone(&state.mcp);
                 tauri::async_runtime::block_on(async move {
                     mcp.shutdown().await;
@@ -6202,6 +6355,13 @@ mod m7_tests {
             assert!(reject_dangerous_git(command).is_err(), "{command}");
         }
         assert!(reject_dangerous_git("git add -- src/lib.rs").is_ok());
+    }
+
+    #[test]
+    fn trigger_tokens_require_exact_bytes() {
+        assert!(constant_time_token_eq("token", "token"));
+        assert!(!constant_time_token_eq("token", "Token"));
+        assert!(!constant_time_token_eq("token", "token-extra"));
     }
 
     #[test]
