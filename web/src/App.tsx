@@ -30,6 +30,7 @@ import { Transcript } from "./components/Transcript";
 import { Composer } from "./components/Composer";
 import { RightRail } from "./components/RightRail";
 import { SelectMenu as OpenWorkerSelectMenu } from "./components/SelectMenu";
+import { SettingsView, type SettingsSection } from "./components/SettingsView";
 import "./openworker-tailwind.css";
 import "./openworker-styles.css";
 import "./style.css";
@@ -1082,7 +1083,8 @@ function RailSection({
   );
 }
 
-function Manage({
+function ManageSections({
+  tab,
   hosts,
   assets,
   providers,
@@ -1100,6 +1102,7 @@ function Manage({
   hostToken,
   setHostToken,
 }: {
+  tab: SettingsSection;
   hosts: Host[];
   assets: Asset[];
   providers: ProviderDescriptor[];
@@ -1117,7 +1120,6 @@ function Manage({
   hostToken: string;
   setHostToken: (value: string) => void;
 }) {
-  const [tab, setTab] = useState("provider");
   const [provider, setProvider] = useState("openai");
   const [baseUrl, setBaseUrl] = useState("");
   const [key, setKey] = useState("");
@@ -1133,7 +1135,6 @@ function Manage({
   const [confirmDeleteHostId, setConfirmDeleteHostId] = useState<string | null>(
     null,
   );
-  const tabs = ["provider", "hosts", "assets", "mcp", "secrets", "blueprint"];
   useEffect(() => {
     void command<Record<string, unknown>>("provider_settings")
       .then((value) => {
@@ -1143,340 +1144,323 @@ function Manage({
       .catch(onError);
   }, []);
   return (
-    <div className="page">
-      <PageHeader
-        title="Manage"
-        subtitle="Provider, hosts, assets, MCP, secrets, and remote blueprints"
-      />
-      <div className="manage-tabs">
-        {tabs.map((item) => (
-          <button
-            className={tab === item ? "active" : ""}
-            key={item}
-            onClick={() => setTab(item)}
+    <>
+      {tab === "provider" && (
+        <div className="form-grid">
+          <h2>Provider</h2>
+          <label>
+            Provider
+            <SelectMenu
+              value={provider}
+              onChange={setProvider}
+              options={providers.map((item) => ({
+                value: item.name,
+                label: item.title,
+              }))}
+            />
+          </label>
+          <label>
+            Base URL
+            <input
+              type="url"
+              value={baseUrl}
+              onChange={(event) => setBaseUrl(event.target.value)}
+            />
+          </label>
+          <label>
+            Provider key
+            <input
+              type="password"
+              value={key}
+              onChange={(event) => setKey(event.target.value)}
+            />
+          </label>
+          <Button
+            className="primary"
+            onClick={() =>
+              command("save_provider_settings", {
+                provider,
+                baseUrl: baseUrl || null,
+              })
+                .then(() => command("save_provider_key", { provider, key }))
+                .then(() =>
+                  command<boolean>("validate_provider_key", { provider }),
+                )
+                .then((ok) => {
+                  setKey("");
+                  setProviderStatus(
+                    ok
+                      ? "Provider key validated successfully."
+                      : "Provider key validation failed.",
+                  );
+                })
+                .catch((error) => {
+                  setKey("");
+                  setProviderStatus(
+                    `Provider validation failed: ${String(error)}`,
+                  );
+                })
+            }
           >
-            {item}
-          </button>
-        ))}
-      </div>
-      <div className="manage-card">
-        {tab === "provider" && (
+            Save and validate
+          </Button>
+          {providerStatus && (
+            <div
+              className={
+                providerStatus.includes("failed") ? "failure" : "success"
+              }
+            >
+              {providerStatus}
+            </div>
+          )}
+          <p className="muted">
+            Keys are stored by Rust and are never returned to the UI.
+          </p>
+        </div>
+      )}
+      {tab === "hosts" && (
+        <div>
+          <h2>Bound hosts</h2>
+          <form className="host-form" onSubmit={onAddHost}>
+            <input
+              value={hostName}
+              onChange={(event) => setHostName(event.target.value)}
+              placeholder="Host name"
+              required
+            />
+            <input
+              value={hostUrl}
+              onChange={(event) => setHostUrl(event.target.value)}
+              placeholder="Remote URL"
+              type="url"
+              required
+            />
+            <input
+              value={hostToken}
+              onChange={(event) => setHostToken(event.target.value)}
+              placeholder="Bearer token"
+              type="password"
+              required
+            />
+            <Button type="submit" className="primary">
+              Add host
+            </Button>
+          </form>
+          {hosts.map((host) => (
+            <div className="manage-row" key={host.id}>
+              <span>
+                <strong>{host.name}</strong>
+                <small
+                  className={
+                    host.online === true
+                      ? "status-online"
+                      : host.online === false
+                        ? "status-offline"
+                        : "status-unknown"
+                  }
+                >
+                  {hostStatusLabel(host)}
+                  {host.reason ? ` · ${host.reason}` : ""}
+                </small>
+              </span>
+              <Button
+                disabled={testingHostId === host.id}
+                onClick={() =>
+                  (() => {
+                    setTestingHostId(host.id);
+                    return onTestHost(host.id)
+                      .catch(onError)
+                      .finally(() => setTestingHostId(null));
+                  })()
+                }
+              >
+                {testingHostId === host.id ? "Testing…" : "Test"}
+              </Button>
+              {confirmDeleteHostId === host.id ? (
+                <>
+                  <Button
+                    className="danger"
+                    disabled={deletingHostId === host.id}
+                    onClick={() => {
+                      setDeletingHostId(host.id);
+                      void onDeleteHost(host.id)
+                        .catch(onError)
+                        .finally(() => {
+                          setDeletingHostId(null);
+                          setConfirmDeleteHostId(null);
+                        });
+                    }}
+                  >
+                    {deletingHostId === host.id ? "Deleting…" : "Confirm"}
+                  </Button>
+                  <Button onClick={() => setConfirmDeleteHostId(null)}>
+                    Cancel
+                  </Button>
+                </>
+              ) : (
+                <Button onClick={() => setConfirmDeleteHostId(host.id)}>
+                  Delete
+                </Button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      {tab === "assets" && (
+        <div>
+          <h2>Assets</h2>
           <div className="form-grid">
-            <h2>Provider</h2>
-            <label>
-              Provider
-              <SelectMenu
-                value={provider}
-                onChange={setProvider}
-                options={providers.map((item) => ({
-                  value: item.name,
-                  label: item.title,
-                }))}
-              />
-            </label>
-            <label>
-              Base URL
-              <input
-                type="url"
-                value={baseUrl}
-                onChange={(event) => setBaseUrl(event.target.value)}
-              />
-            </label>
-            <label>
-              Provider key
-              <input
-                type="password"
-                value={key}
-                onChange={(event) => setKey(event.target.value)}
-              />
-            </label>
+            <input
+              value={assetTitle}
+              onChange={(event) => setAssetTitle(event.target.value)}
+              placeholder="Asset title"
+            />
+            <textarea
+              value={assetBody}
+              onChange={(event) => setAssetBody(event.target.value)}
+              placeholder="Asset body"
+            />
             <Button
               className="primary"
               onClick={() =>
-                command("save_provider_settings", {
-                  provider,
-                  baseUrl: baseUrl || null,
+                command("save_asset", {
+                  id: `asset-${Date.now()}`,
+                  kind: "knowledge",
+                  title: assetTitle,
+                  body: assetBody,
+                  enabled: true,
                 })
-                  .then(() => command("save_provider_key", { provider, key }))
-                  .then(() =>
-                    command<boolean>("validate_provider_key", { provider }),
-                  )
-                  .then((ok) => {
-                    setKey("");
-                    setProviderStatus(
-                      ok
-                        ? "Provider key validated successfully."
-                        : "Provider key validation failed.",
-                    );
+                  .then(() => {
+                    setAssetTitle("");
+                    setAssetBody("");
+                    onRefresh();
                   })
-                  .catch((error) => {
-                    setKey("");
-                    setProviderStatus(
-                      `Provider validation failed: ${String(error)}`,
-                    );
-                  })
-              }
-            >
-              Save and validate
-            </Button>
-            {providerStatus && (
-              <div
-                className={
-                  providerStatus.includes("failed") ? "failure" : "success"
-                }
-              >
-                {providerStatus}
-              </div>
-            )}
-            <p className="muted">
-              Keys are stored by Rust and are never returned to the UI.
-            </p>
-          </div>
-        )}
-        {tab === "hosts" && (
-          <div>
-            <h2>Bound hosts</h2>
-            <form className="host-form" onSubmit={onAddHost}>
-              <input
-                value={hostName}
-                onChange={(event) => setHostName(event.target.value)}
-                placeholder="Host name"
-                required
-              />
-              <input
-                value={hostUrl}
-                onChange={(event) => setHostUrl(event.target.value)}
-                placeholder="Remote URL"
-                type="url"
-                required
-              />
-              <input
-                value={hostToken}
-                onChange={(event) => setHostToken(event.target.value)}
-                placeholder="Bearer token"
-                type="password"
-                required
-              />
-              <Button type="submit" className="primary">
-                Add host
-              </Button>
-            </form>
-            {hosts.map((host) => (
-              <div className="manage-row" key={host.id}>
-                <span>
-                  <strong>{host.name}</strong>
-                  <small
-                    className={
-                      host.online === true
-                        ? "status-online"
-                        : host.online === false
-                          ? "status-offline"
-                          : "status-unknown"
-                    }
-                  >
-                    {hostStatusLabel(host)}
-                    {host.reason ? ` · ${host.reason}` : ""}
-                  </small>
-                </span>
-                <Button
-                  disabled={testingHostId === host.id}
-                  onClick={() =>
-                    (() => {
-                      setTestingHostId(host.id);
-                      return onTestHost(host.id)
-                        .catch(onError)
-                        .finally(() => setTestingHostId(null));
-                    })()
-                  }
-                >
-                  {testingHostId === host.id ? "Testing…" : "Test"}
-                </Button>
-                {confirmDeleteHostId === host.id ? (
-                  <>
-                    <Button
-                      className="danger"
-                      disabled={deletingHostId === host.id}
-                      onClick={() => {
-                        setDeletingHostId(host.id);
-                        void onDeleteHost(host.id)
-                          .catch(onError)
-                          .finally(() => {
-                            setDeletingHostId(null);
-                            setConfirmDeleteHostId(null);
-                          });
-                      }}
-                    >
-                      {deletingHostId === host.id ? "Deleting…" : "Confirm"}
-                    </Button>
-                    <Button onClick={() => setConfirmDeleteHostId(null)}>
-                      Cancel
-                    </Button>
-                  </>
-                ) : (
-                  <Button onClick={() => setConfirmDeleteHostId(host.id)}>
-                    Delete
-                  </Button>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-        {tab === "assets" && (
-          <div>
-            <h2>Assets</h2>
-            <div className="form-grid">
-              <input
-                value={assetTitle}
-                onChange={(event) => setAssetTitle(event.target.value)}
-                placeholder="Asset title"
-              />
-              <textarea
-                value={assetBody}
-                onChange={(event) => setAssetBody(event.target.value)}
-                placeholder="Asset body"
-              />
-              <Button
-                className="primary"
-                onClick={() =>
-                  command("save_asset", {
-                    id: `asset-${Date.now()}`,
-                    kind: "knowledge",
-                    title: assetTitle,
-                    body: assetBody,
-                    enabled: true,
-                  })
-                    .then(() => {
-                      setAssetTitle("");
-                      setAssetBody("");
-                      onRefresh();
-                    })
-                    .catch(onError)
-                }
-              >
-                Save asset
-              </Button>
-            </div>
-            {assets.map((asset) => (
-              <div className="manage-row" key={asset.id}>
-                <span>
-                  {asset.title} <small>{asset.kind}</small>
-                </span>
-                <Button
-                  onClick={() =>
-                    command("delete_asset", { id: asset.id })
-                      .then(onRefresh)
-                      .catch(onError)
-                  }
-                >
-                  Delete
-                </Button>
-              </div>
-            ))}
-            {selected && (
-              <div className="inline-actions">
-                <Button
-                  onClick={() =>
-                    command("discover_remote_assets", {
-                      sessionId: selected.id,
-                    })
-                      .then(onRefresh)
-                      .catch(onError)
-                  }
-                >
-                  Discover remote
-                </Button>
-                <Button
-                  onClick={() =>
-                    command("import_assets", { sessionId: selected.id })
-                      .then(onRefresh)
-                      .catch(onError)
-                  }
-                >
-                  Import
-                </Button>
-                <Button
-                  onClick={() =>
-                    command("export_assets", {
-                      sessionId: selected.id,
-                      ids: assets.map((asset) => asset.id),
-                    }).catch(onError)
-                  }
-                >
-                  Export
-                </Button>
-              </div>
-            )}
-          </div>
-        )}
-        {tab === "mcp" && <McpManage selected={selected} onError={onError} />}
-        {tab === "secrets" && (
-          <div>
-            <h2>Secret metadata</h2>
-            {secrets.map((secret) => (
-              <div className="manage-row" key={secret.name}>
-                <span>{secret.name}</span>
-                <span className="muted">
-                  {secret.scope} · {secret.purpose}
-                </span>
-              </div>
-            ))}
-            <p className="muted">Secret values are never shown.</p>
-          </div>
-        )}
-        {tab === "blueprint" && (
-          <div className="form-grid">
-            <h2>Remote blueprint</h2>
-            <Button
-              onClick={() =>
-                selected &&
-                command<Record<string, unknown>>("read_blueprint", {
-                  sessionId: selected.id,
-                })
-                  .then(setBlueprint)
                   .catch(onError)
               }
             >
-              Read blueprint
+              Save asset
             </Button>
-            {blueprint && (
-              <pre className="code-block">
-                {JSON.stringify(blueprint, null, 2)}
-              </pre>
-            )}
-            <textarea
-              value={blueprintCommand}
-              onChange={(event) => setBlueprintCommand(event.target.value)}
-              placeholder="Execute a blueprint command"
-            />
+          </div>
+          {assets.map((asset) => (
+            <div className="manage-row" key={asset.id}>
+              <span>
+                {asset.title} <small>{asset.kind}</small>
+              </span>
+              <Button
+                onClick={() =>
+                  command("delete_asset", { id: asset.id })
+                    .then(onRefresh)
+                    .catch(onError)
+                }
+              >
+                Delete
+              </Button>
+            </div>
+          ))}
+          {selected && (
             <div className="inline-actions">
               <Button
-                disabled={!selected}
                 onClick={() =>
-                  selected &&
-                  command("execute_blueprint", {
+                  command("discover_remote_assets", {
                     sessionId: selected.id,
-                    command: blueprintCommand,
+                  })
+                    .then(onRefresh)
+                    .catch(onError)
+                }
+              >
+                Discover remote
+              </Button>
+              <Button
+                onClick={() =>
+                  command("import_assets", { sessionId: selected.id })
+                    .then(onRefresh)
+                    .catch(onError)
+                }
+              >
+                Import
+              </Button>
+              <Button
+                onClick={() =>
+                  command("export_assets", {
+                    sessionId: selected.id,
+                    ids: assets.map((asset) => asset.id),
                   }).catch(onError)
                 }
               >
-                Execute
-              </Button>
-              <Button
-                disabled={!selected}
-                onClick={() =>
-                  selected &&
-                  command("run_blueprint", { sessionId: selected.id }).catch(
-                    onError,
-                  )
-                }
-              >
-                Run blueprint
+                Export
               </Button>
             </div>
+          )}
+        </div>
+      )}
+      {tab === "mcp" && <McpManage selected={selected} onError={onError} />}
+      {tab === "secrets" && (
+        <div>
+          <h2>Secret metadata</h2>
+          {secrets.map((secret) => (
+            <div className="manage-row" key={secret.name}>
+              <span>{secret.name}</span>
+              <span className="muted">
+                {secret.scope} · {secret.purpose}
+              </span>
+            </div>
+          ))}
+          <p className="muted">Secret values are never shown.</p>
+        </div>
+      )}
+      {tab === "blueprint" && (
+        <div className="form-grid">
+          <h2>Remote blueprint</h2>
+          <Button
+            onClick={() =>
+              selected &&
+              command<Record<string, unknown>>("read_blueprint", {
+                sessionId: selected.id,
+              })
+                .then(setBlueprint)
+                .catch(onError)
+            }
+          >
+            Read blueprint
+          </Button>
+          {blueprint && (
+            <pre className="code-block">
+              {JSON.stringify(blueprint, null, 2)}
+            </pre>
+          )}
+          <textarea
+            value={blueprintCommand}
+            onChange={(event) => setBlueprintCommand(event.target.value)}
+            placeholder="Execute a blueprint command"
+          />
+          <div className="inline-actions">
+            <Button
+              disabled={!selected}
+              onClick={() =>
+                selected &&
+                command("execute_blueprint", {
+                  sessionId: selected.id,
+                  command: blueprintCommand,
+                }).catch(onError)
+              }
+            >
+              Execute
+            </Button>
+            <Button
+              disabled={!selected}
+              onClick={() =>
+                selected &&
+                command("run_blueprint", { sessionId: selected.id }).catch(
+                  onError,
+                )
+              }
+            >
+              Run blueprint
+            </Button>
           </div>
-        )}
-      </div>
-    </div>
+        </div>
+      )}
+    </>
   );
 }
 function McpManage({
@@ -1544,79 +1528,81 @@ function Automations({
   }, []);
   return (
     <div className="page">
-      <PageHeader
-        title="Automations"
-        subtitle="Run OPCOS playbooks on a schedule"
-      />
-      <div className="manage-card form-grid">
-        <label>
-          Name
-          <input
-            value={name}
-            onChange={(event) => setName(event.target.value)}
-          />
-        </label>
-        <label>
-          Session
-          <SelectMenu
-            value={sessionId}
-            onChange={setSessionId}
-            options={sessions.map((session) => ({
-              value: session.id,
-              label: session.title,
-            }))}
-          />
-        </label>
-        <label>
-          Playbook
-          <SelectMenu
-            value={playbookId}
-            onChange={setPlaybookId}
-            options={assets
-              .filter((asset) => asset.kind === "playbook")
-              .map((asset) => ({ value: asset.id, label: asset.title }))}
-          />
-        </label>
-        <label>
-          Cron
-          <input
-            value={cron}
-            onChange={(event) => setCron(event.target.value)}
-          />
-        </label>
-        <Button
-          className="primary"
-          onClick={() =>
-            command("save_schedule", {
-              schedule: { name, sessionId, playbookId, cron, enabled: true },
-            })
-              .then(load)
-              .catch(onError)
-          }
-        >
-          Save automation
-        </Button>
-      </div>
-      <div className="manage-card">
-        {schedules.map((schedule) => (
-          <div className="manage-row" key={schedule.id}>
-            <span>
-              <strong>{schedule.name}</strong>
-              <small>
-                {schedule.cron} · {schedule.last_result || "never run"}
-              </small>
-            </span>
-            <Button
-              onClick={() =>
-                command("run_schedule", { scheduleId: schedule.id })
-                  .then(load)
-                  .catch(onError)
-              }
-            >
-              Run now
-            </Button>
-          </div>
-        ))}
+      <div className="max-w-3xl mx-auto px-7 py-6">
+        <PageHeader
+          title="Automations"
+          subtitle="Run OPCOS playbooks on a schedule"
+        />
+        <div className="manage-card form-grid">
+          <label>
+            Name
+            <input
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+            />
+          </label>
+          <label>
+            Session
+            <SelectMenu
+              value={sessionId}
+              onChange={setSessionId}
+              options={sessions.map((session) => ({
+                value: session.id,
+                label: session.title,
+              }))}
+            />
+          </label>
+          <label>
+            Playbook
+            <SelectMenu
+              value={playbookId}
+              onChange={setPlaybookId}
+              options={assets
+                .filter((asset) => asset.kind === "playbook")
+                .map((asset) => ({ value: asset.id, label: asset.title }))}
+            />
+          </label>
+          <label>
+            Cron
+            <input
+              value={cron}
+              onChange={(event) => setCron(event.target.value)}
+            />
+          </label>
+          <Button
+            className="primary"
+            onClick={() =>
+              command("save_schedule", {
+                schedule: { name, sessionId, playbookId, cron, enabled: true },
+              })
+                .then(load)
+                .catch(onError)
+            }
+          >
+            Save automation
+          </Button>
+        </div>
+        <div className="manage-card">
+          {schedules.map((schedule) => (
+            <div className="manage-row" key={schedule.id}>
+              <span>
+                <strong>{schedule.name}</strong>
+                <small>
+                  {schedule.cron} · {schedule.last_result || "never run"}
+                </small>
+              </span>
+              <Button
+                onClick={() =>
+                  command("run_schedule", { scheduleId: schedule.id })
+                    .then(load)
+                    .catch(onError)
+                }
+              >
+                Run now
+              </Button>
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   );
@@ -1646,190 +1632,197 @@ function Activity({
       .catch(onError);
   return (
     <div className="page">
-      <PageHeader
-        title="Activity"
-        subtitle="Coordination board, worklog, and session insights"
-      />
-      <div className="activity-toolbar">
-        <input
-          value={taskId}
-          onChange={(event) => setTaskId(event.target.value)}
-          placeholder="Coordination task ID"
+      <div className="max-w-3xl mx-auto px-7 py-6">
+        <PageHeader
+          title="Activity"
+          subtitle="Coordination board, worklog, and session insights"
         />
-        <textarea
-          value={rolesText}
-          onChange={(event) => setRolesText(event.target.value)}
-          placeholder="Roles JSON"
-        />
-        <Button
-          disabled={!taskId}
-          onClick={() => {
-            try {
-              const roles = JSON.parse(rolesText);
-              void command("coordination_start", {
-                input: { taskId, roles },
-              })
-                .then(load)
-                .catch(onError);
-            } catch {
-              onError("Roles must be valid JSON.");
-            }
-          }}
-        >
-          Start board
-        </Button>
-        <Button onClick={load}>Observe</Button>
-        <input
-          value={roleId}
-          onChange={(event) => setRoleId(event.target.value)}
-          placeholder="Role ID"
-        />
-        <SelectMenu
-          value={roleState}
-          onChange={setRoleState}
-          options={["active", "sleep", "paused"].map((value) => ({
-            value,
-            label: value,
-          }))}
-        />
-        <Button
-          disabled={!taskId || !roleId}
-          onClick={() =>
-            command("coordination_set_role_state", {
-              taskId,
-              roleId,
-              stateName: roleState,
-            })
-              .then(load)
-              .catch(onError)
-          }
-        >
-          Set role
-        </Button>
-      </div>
-      <div className="board-grid">
-        <section className="board-column">
-          <h2>Roles</h2>
-          {board?.roles.map((role) => (
-            <div className="board-card" key={String(role.id)}>
-              <strong>{String(role.id)}</strong>
-              <span>Session: {String(role.session_id)}</span>
-              <span>Order: {String(role.sort_order)}</span>
-              <span>State: {String(role.state)}</span>
-            </div>
-          ))}
-        </section>
-        <section className="board-column">
-          <h2>Tasks</h2>
-          <div className="inline-actions">
-            <input
-              value={taskTitle}
-              onChange={(event) => setTaskTitle(event.target.value)}
-              placeholder="New task"
-            />
-            <input
-              value={worker}
-              onChange={(event) => setWorker(event.target.value)}
-              placeholder="Worker / assignee"
-            />
-            <input
-              value={prUrl}
-              onChange={(event) => setPrUrl(event.target.value)}
-              placeholder="Verified PR URL"
-            />
-            <Button
-              disabled={!taskId}
-              onClick={() =>
-                command("coordination_create_task", {
-                  id: `task-${Date.now()}`,
-                  title: taskTitle,
-                  requireAcceptance: true,
-                })
-                  .then(load)
-                  .catch(onError)
-              }
-            >
-              Create
-            </Button>
-          </div>
-          {board?.tasks.map((task) => (
-            <div className="board-card" key={String(task.id || task.title)}>
-              <strong>{String(task.title || task.id)}</strong>
-              <span>{String(task.phase)}</span>
-              <div className="inline-actions">
-                <Button
-                  onClick={() =>
-                    command("coordination_claim_task", { id: task.id, worker })
-                      .then(load)
-                      .catch(onError)
-                  }
-                >
-                  Claim
-                </Button>
-                <Button
-                  onClick={() =>
-                    command("coordination_complete_task", {
-                      id: task.id,
-                      worker,
-                      verifiedPrUrl: prUrl || null,
-                    })
-                      .then(load)
-                      .catch(onError)
-                  }
-                >
-                  Complete
-                </Button>
-                <Button
-                  onClick={() => {
-                    if (!task.verified_pr_url && !task.pr) {
-                      onError("Cannot accept task without a verified PR URL.");
-                      return;
-                    }
-                    void command("coordination_accept_task", { id: task.id })
-                      .then(load)
-                      .catch(onError);
-                  }}
-                >
-                  Accept
-                </Button>
-              </div>
-            </div>
-          ))}
-        </section>
-        <section className="board-column">
-          <h2>Messages</h2>
+        <div className="activity-toolbar">
+          <input
+            value={taskId}
+            onChange={(event) => setTaskId(event.target.value)}
+            placeholder="Coordination task ID"
+          />
           <textarea
-            value={message}
-            onChange={(event) => setMessage(event.target.value)}
-            placeholder="Coordination message JSON"
+            value={rolesText}
+            onChange={(event) => setRolesText(event.target.value)}
+            placeholder="Roles JSON"
           />
           <Button
             disabled={!taskId}
             onClick={() => {
               try {
-                const envelope = JSON.parse(message);
-                void command("coordination_message", { taskId, envelope })
+                const roles = JSON.parse(rolesText);
+                void command("coordination_start", {
+                  input: { taskId, roles },
+                })
                   .then(load)
                   .catch(onError);
               } catch {
-                onError("Message must be valid JSON.");
+                onError("Roles must be valid JSON.");
               }
             }}
           >
-            Send message
+            Start board
           </Button>
-          {board?.messages.map((item) => (
-            <div className="board-card" key={String(item.msg_id)}>
-              <strong>
-                {String(item.from)} → {String(item.to)}
-              </strong>
-              <span>Kind: {String(item.kind)}</span>
-              <span>Message: {String(item.msg_id)}</span>
-              <span>Reply: {String(item.reply_to || "—")}</span>
-              <pre>{JSON.stringify(item.payload, null, 2)}</pre>
+          <Button onClick={load}>Observe</Button>
+          <input
+            value={roleId}
+            onChange={(event) => setRoleId(event.target.value)}
+            placeholder="Role ID"
+          />
+          <SelectMenu
+            value={roleState}
+            onChange={setRoleState}
+            options={["active", "sleep", "paused"].map((value) => ({
+              value,
+              label: value,
+            }))}
+          />
+          <Button
+            disabled={!taskId || !roleId}
+            onClick={() =>
+              command("coordination_set_role_state", {
+                taskId,
+                roleId,
+                stateName: roleState,
+              })
+                .then(load)
+                .catch(onError)
+            }
+          >
+            Set role
+          </Button>
+        </div>
+        <div className="board-grid">
+          <section className="board-column">
+            <h2>Roles</h2>
+            {board?.roles.map((role) => (
+              <div className="board-card" key={String(role.id)}>
+                <strong>{String(role.id)}</strong>
+                <span>Session: {String(role.session_id)}</span>
+                <span>Order: {String(role.sort_order)}</span>
+                <span>State: {String(role.state)}</span>
+              </div>
+            ))}
+          </section>
+          <section className="board-column">
+            <h2>Tasks</h2>
+            <div className="inline-actions">
+              <input
+                value={taskTitle}
+                onChange={(event) => setTaskTitle(event.target.value)}
+                placeholder="New task"
+              />
+              <input
+                value={worker}
+                onChange={(event) => setWorker(event.target.value)}
+                placeholder="Worker / assignee"
+              />
+              <input
+                value={prUrl}
+                onChange={(event) => setPrUrl(event.target.value)}
+                placeholder="Verified PR URL"
+              />
+              <Button
+                disabled={!taskId}
+                onClick={() =>
+                  command("coordination_create_task", {
+                    id: `task-${Date.now()}`,
+                    title: taskTitle,
+                    requireAcceptance: true,
+                  })
+                    .then(load)
+                    .catch(onError)
+                }
+              >
+                Create
+              </Button>
             </div>
-          ))}
-        </section>
+            {board?.tasks.map((task) => (
+              <div className="board-card" key={String(task.id || task.title)}>
+                <strong>{String(task.title || task.id)}</strong>
+                <span>{String(task.phase)}</span>
+                <div className="inline-actions">
+                  <Button
+                    onClick={() =>
+                      command("coordination_claim_task", {
+                        id: task.id,
+                        worker,
+                      })
+                        .then(load)
+                        .catch(onError)
+                    }
+                  >
+                    Claim
+                  </Button>
+                  <Button
+                    onClick={() =>
+                      command("coordination_complete_task", {
+                        id: task.id,
+                        worker,
+                        verifiedPrUrl: prUrl || null,
+                      })
+                        .then(load)
+                        .catch(onError)
+                    }
+                  >
+                    Complete
+                  </Button>
+                  <Button
+                    onClick={() => {
+                      if (!task.verified_pr_url && !task.pr) {
+                        onError(
+                          "Cannot accept task without a verified PR URL.",
+                        );
+                        return;
+                      }
+                      void command("coordination_accept_task", { id: task.id })
+                        .then(load)
+                        .catch(onError);
+                    }}
+                  >
+                    Accept
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </section>
+          <section className="board-column">
+            <h2>Messages</h2>
+            <textarea
+              value={message}
+              onChange={(event) => setMessage(event.target.value)}
+              placeholder="Coordination message JSON"
+            />
+            <Button
+              disabled={!taskId}
+              onClick={() => {
+                try {
+                  const envelope = JSON.parse(message);
+                  void command("coordination_message", { taskId, envelope })
+                    .then(load)
+                    .catch(onError);
+                } catch {
+                  onError("Message must be valid JSON.");
+                }
+              }}
+            >
+              Send message
+            </Button>
+            {board?.messages.map((item) => (
+              <div className="board-card" key={String(item.msg_id)}>
+                <strong>
+                  {String(item.from)} → {String(item.to)}
+                </strong>
+                <span>Kind: {String(item.kind)}</span>
+                <span>Message: {String(item.msg_id)}</span>
+                <span>Reply: {String(item.reply_to || "—")}</span>
+                <pre>{JSON.stringify(item.payload, null, 2)}</pre>
+              </div>
+            ))}
+          </section>
+        </div>
       </div>
     </div>
   );
@@ -1853,6 +1846,7 @@ export function App() {
   const [surface, setSurface] = useState<
     "session" | "automations" | "manage" | "activity"
   >("session");
+  const [settingsTab, setSettingsTab] = useState<SettingsSection>("provider");
   const [tab, setTab] = useState<SurfaceTab>("chat");
   const [query, setQuery] = useState("");
   const [error, setError] = useState("");
@@ -2205,24 +2199,27 @@ export function App() {
             </div>
           </>
         ) : surface === "manage" ? (
-          <Manage
-            hosts={hosts}
-            assets={assets}
-            providers={providers}
-            secrets={secrets}
-            selected={selected}
-            onRefresh={() => refresh().catch(onError)}
-            onError={onError}
-            onAddHost={addHost}
-            onTestHost={testHost}
-            onDeleteHost={deleteHost}
-            hostName={hostName}
-            setHostName={setHostName}
-            hostUrl={hostUrl}
-            setHostUrl={setHostUrl}
-            hostToken={hostToken}
-            setHostToken={setHostToken}
-          />
+          <SettingsView activeTab={settingsTab} onTabChange={setSettingsTab}>
+            <ManageSections
+              tab={settingsTab}
+              hosts={hosts}
+              assets={assets}
+              providers={providers}
+              secrets={secrets}
+              selected={selected}
+              onRefresh={() => refresh().catch(onError)}
+              onError={onError}
+              onAddHost={addHost}
+              onTestHost={testHost}
+              onDeleteHost={deleteHost}
+              hostName={hostName}
+              setHostName={setHostName}
+              hostUrl={hostUrl}
+              setHostUrl={setHostUrl}
+              hostToken={hostToken}
+              setHostToken={setHostToken}
+            />
+          </SettingsView>
         ) : surface === "automations" ? (
           <Automations sessions={sessions} assets={assets} onError={onError} />
         ) : surface === "activity" ? (
