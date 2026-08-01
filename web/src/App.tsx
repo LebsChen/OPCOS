@@ -159,12 +159,14 @@ function LegacySidebar(props: {
         <input
           value={props.query}
           onChange={(event) => props.onQuery(event.target.value)}
-          placeholder="Search sessions"
+          placeholder={translate("Search sessions")}
         />
       </label>
       <div className="sidebar-scroll">
-        <div className="sidebar-label">SESSIONS</div>
-        {groups.length === 0 && <p className="muted small">No sessions yet.</p>}
+        <div className="sidebar-label">{translate("SESSIONS")}</div>
+        {groups.length === 0 && (
+          <p className="muted small">{translate("No sessions yet.")}</p>
+        )}
         {groups.map((group) => (
           <section className="session-group" key={group.hostId}>
             <div className="group-title">
@@ -185,25 +187,25 @@ function LegacySidebar(props: {
             ))}
           </section>
         ))}
-        <div className="sidebar-label hosts-label">HOSTS</div>
+        <div className="sidebar-label hosts-label">{translate("HOSTS")}</div>
         <form className="host-form" onSubmit={props.onAddHost}>
           <input
             value={props.hostName}
             onChange={(event) => props.setHostName(event.target.value)}
-            placeholder="Host name"
+            placeholder={translate("Host name")}
             required
           />
           <input
             value={props.hostUrl}
             onChange={(event) => props.setHostUrl(event.target.value)}
-            placeholder="Remote URL"
+            placeholder={translate("Remote URL")}
             type="url"
             required
           />
           <input
             value={props.hostToken}
             onChange={(event) => props.setHostToken(event.target.value)}
-            placeholder="Bearer token"
+            placeholder={translate("Bearer token")}
             type="password"
             required
           />
@@ -282,7 +284,7 @@ function LegacyNewSessionModal({
         }}
       >
         <div className="modal-head">
-          <h2>New session</h2>
+          <h2>{translate("New session")}</h2>
           <button type="button" className="close" onClick={onClose}>
             ×
           </button>
@@ -292,7 +294,7 @@ function LegacyNewSessionModal({
           <input
             value={title}
             onChange={(event) => setTitle(event.target.value)}
-            placeholder="What are you working on?"
+            placeholder={translate("What are you working on?")}
           />
         </label>
         <label>
@@ -329,7 +331,7 @@ function LegacyNewSessionModal({
           <input
             value={workspace}
             onChange={(event) => setWorkspace(event.target.value)}
-            placeholder="/workspace"
+            placeholder={translate("workspacePath")}
           />
         </label>
         <div className="modal-actions">
@@ -365,13 +367,13 @@ function LegacyTranscript({
         >
           {item.kind === "user" && (
             <>
-              <div className="who">you</div>
+              <div className="who">{translate("you")}</div>
               <div className="bubble user-bubble">{item.text}</div>
             </>
           )}
           {item.kind === "assistant" && (
             <>
-              <div className="who">assistant</div>
+              <div className="who">{translate("assistant")}</div>
               <div className="bubble assistant-bubble">
                 <ReactMarkdown remarkPlugins={[remarkGfm]}>
                   {item.text || ""}
@@ -384,7 +386,7 @@ function LegacyTranscript({
           )}
           {item.kind === "thinking" && (
             <details className="thinking">
-              <summary>Thinking</summary>
+              <summary>{translate("Thinking")}</summary>
               <div>{item.reasoning}</div>
             </details>
           )}
@@ -405,17 +407,19 @@ function LegacyTranscript({
                 <span className="tool-state">{item.status}</span>
               </summary>
               <div className="tool-body">
-                <div className="tool-label">Arguments</div>
+                <div className="tool-label">{translate("Arguments")}</div>
                 <code>{toolArgumentSummary(item.arguments)}</code>
                 {item.result !== undefined && (
                   <>
-                    <div className="tool-label">Output</div>
+                    <div className="tool-label">{translate("Output")}</div>
                     <code>{redactApproval(item.result)}</code>
                   </>
                 )}
                 {item.approval && (
                   <div className="approval-actions">
-                    <strong>Approval required. The session is paused.</strong>
+                    <strong>
+                      {translate("Approval required. The session is paused.")}
+                    </strong>
                     <div>
                       <Button
                         className="primary"
@@ -616,7 +620,7 @@ function SurfaceView({
     return (
       <div className="surface-panel">
         <div className="surface-toolbar">
-          <span>Remote Web IDE</span>
+          <span>{translate("Remote Web IDE")}</span>
           <Button
             disabled={!!idePort}
             onClick={() =>
@@ -633,14 +637,14 @@ function SurfaceView({
         </div>
         {idePort ? (
           <iframe
-            title="Remote Web IDE"
+            title={translate("Remote Web IDE")}
             src={`http://127.0.0.1:${idePort}/`}
             className="ide-frame"
           />
         ) : (
           <div className="empty-surface">
             <Icon name="code" size={32} />
-            <p>Start the remote IDE for this bound session.</p>
+            <p>{translate("Start the remote IDE for this bound session.")}</p>
           </div>
         )}
       </div>
@@ -699,7 +703,7 @@ function ReviewView({
   return (
     <div className="surface-panel review-panel">
       <div className="surface-toolbar">
-        <span>Remote review</span>
+        <span>{translate("Remote review")}</span>
         <div>
           <input value={cwd} onChange={(event) => setCwd(event.target.value)} />
           <input
@@ -724,7 +728,7 @@ function ReviewView({
       {review ? (
         <div className="review-grid">
           <div>
-            <h3>Changed files</h3>
+            <h3>{translate("Changed files")}</h3>
             {changes.map((change) => {
               const value =
                 typeof change === "string" ? change : JSON.stringify(change);
@@ -753,7 +757,11 @@ function ReviewView({
         </div>
       ) : (
         <div className="empty-surface">
-          <p>Load the remote status and changes from the bound host.</p>
+          <p>
+            {translate(
+              "Load the remote status and changes from the bound host.",
+            )}
+          </p>
         </div>
       )}
     </div>
@@ -775,7 +783,7 @@ function GitActions({
   const [pr, setPr] = useState("");
   return (
     <div className="git-actions">
-      <h3>Git workflow</h3>
+      <h3>{translate("Git workflow")}</h3>
       <SelectMenu
         value={operation}
         onChange={setOperation}
@@ -787,7 +795,7 @@ function GitActions({
       <input
         value={value}
         onChange={(event) => setValue(event.target.value)}
-        placeholder="slug, files, or commit message"
+        placeholder={translate("slug, files, or commit message")}
       />
       <Button
         onClick={() =>
@@ -807,16 +815,16 @@ function GitActions({
         Run {operation}
       </Button>
       <details>
-        <summary>Create GitHub PR</summary>
+        <summary>{translate("Create GitHub PR")}</summary>
         <input
           value={repo}
           onChange={(event) => setRepo(event.target.value)}
-          placeholder="owner/repository"
+          placeholder={translate("owner/repository")}
         />
         <input
           value={pr}
           onChange={(event) => setPr(event.target.value)}
-          placeholder="PR title"
+          placeholder={translate("PR title")}
         />
         <Button
           onClick={() =>
@@ -844,7 +852,9 @@ function GitActions({
 function DiffView({ diff }: { diff: Record<string, unknown> | null }) {
   if (!diff)
     return (
-      <div className="diff-view empty-surface">Select a changed file.</div>
+      <div className="diff-view empty-surface">
+        {translate("Select a changed file.")}
+      </div>
     );
   const text =
     typeof diff.diff === "string" ? diff.diff : JSON.stringify(diff, null, 2);
@@ -891,7 +901,7 @@ function WorklogView({
   return (
     <div className="surface-panel">
       <div className="surface-toolbar">
-        <span>Worklog timeline</span>
+        <span>{translate("Worklog timeline")}</span>
         <Button onClick={load}>
           <Icon name="refresh" /> Reload
         </Button>
@@ -904,8 +914,8 @@ function WorklogView({
       )}
       {!worklog && (
         <div className="empty-surface">
-          <p>Load the remote worklog for this session.</p>
-          <Button onClick={load}>Load worklog</Button>
+          <p>{translate("Load the remote worklog for this session.")}</p>
+          <Button onClick={load}>{translate("openWorklog")}</Button>
         </div>
       )}
       {events.map((event) => (
@@ -955,13 +965,13 @@ function LegacyRightRail({
   if (!selected)
     return (
       <aside className="right-rail">
-        <div className="empty-surface">Select a session.</div>
+        <div className="empty-surface">{translate("Select a session.")}</div>
       </aside>
     );
   const recentTools = items.filter((item) => item.kind === "tool").slice(-5);
   return (
     <aside className="right-rail">
-      <RailSection title="Progress">
+      <RailSection title={translate("Progress")}>
         <div className="progress-line">
           <span className={`status-dot ${running ? "busy" : "online"}`} />
           {running ? "Turn in progress" : "Ready"}
@@ -973,7 +983,7 @@ function LegacyRightRail({
           </div>
         ))}
       </RailSection>
-      <RailSection title="Insights">
+      <RailSection title={translate("Insights")}>
         {insights ? (
           <div className="insights">
             <span>
@@ -1002,24 +1012,24 @@ function LegacyRightRail({
             </span>
           </div>
         ) : (
-          <span className="muted">Loading…</span>
+          <span className="muted">{translate("Loading\u2026")}</span>
         )}
       </RailSection>
-      <RailSection title="Access">
+      <RailSection title={translate("Access")}>
         <dl className="access">
-          <dt>Host</dt>
+          <dt>{translate("Host")}</dt>
           <dd>{selected.host_name}</dd>
-          <dt>Workspace</dt>
+          <dt>{translate("Workspace")}</dt>
           <dd>{selected.workspace || "not configured"}</dd>
-          <dt>Mode</dt>
+          <dt>{translate("Mode")}</dt>
           <dd>{selected.mode}</dd>
-          <dt>Model</dt>
+          <dt>{translate("Model")}</dt>
           <dd>{selected.model}</dd>
         </dl>
       </RailSection>
-      <RailSection title="Assets">
+      <RailSection title={translate("Assets")}>
         {assets.length === 0 && (
-          <span className="muted">No assets configured.</span>
+          <span className="muted">{translate("No assets configured.")}</span>
         )}
         {assets.map((asset) => (
           <label className="toggle-row" key={asset.id}>
@@ -1035,7 +1045,7 @@ function LegacyRightRail({
           </label>
         ))}
       </RailSection>
-      <RailSection title="MCP tools">
+      <RailSection title={translate("MCP tools")}>
         {tools.map((tool) => {
           const name = String(tool.name || "tool");
           return (
@@ -1312,8 +1322,10 @@ function ManageSections({
                   </div>
                   <div className="settings-row">
                     <div>
-                      <strong>Base URL</strong>
-                      <small>Optional provider-compatible endpoint.</small>
+                      <strong>{translate("Base URL")}</strong>
+                      <small>
+                        {translate("Optional provider-compatible endpoint.")}
+                      </small>
                     </div>
                     <input
                       type="url"
@@ -1332,7 +1344,7 @@ function ManageSections({
                   {descriptor.needs_key && (
                     <div className="settings-row">
                       <div>
-                        <strong>Provider key</strong>
+                        <strong>{translate("Provider key")}</strong>
                         <small>
                           Stored securely and never returned to the UI.
                         </small>
@@ -1420,8 +1432,10 @@ function ManageSections({
           <div className="divide-y divide-line">
             <div className="settings-row">
               <div>
-                <strong>Provider</strong>
-                <small>Choose the model provider for new sessions.</small>
+                <strong>{translate("Provider")}</strong>
+                <small>
+                  {translate("Choose the model provider for new sessions.")}
+                </small>
               </div>
               <SelectMenu
                 value={provider}
@@ -1434,8 +1448,10 @@ function ManageSections({
             </div>
             <div className="settings-row">
               <div>
-                <strong>Base URL</strong>
-                <small>Optional provider-compatible endpoint.</small>
+                <strong>{translate("Base URL")}</strong>
+                <small>
+                  {translate("Optional provider-compatible endpoint.")}
+                </small>
               </div>
               <input
                 type="url"
@@ -1445,8 +1461,10 @@ function ManageSections({
             </div>
             <div className="settings-row">
               <div>
-                <strong>Provider key</strong>
-                <small>Stored securely and never returned to the UI.</small>
+                <strong>{translate("Provider key")}</strong>
+                <small>
+                  {translate("Stored securely and never returned to the UI.")}
+                </small>
               </div>
               <input
                 type="password"
@@ -1564,20 +1582,20 @@ function ManageSections({
                   <input
                     value={hostName}
                     onChange={(event) => setHostName(event.target.value)}
-                    placeholder="Host name"
+                    placeholder={translate("Host name")}
                     required
                   />
                   <input
                     value={hostUrl}
                     onChange={(event) => setHostUrl(event.target.value)}
-                    placeholder="Remote URL"
+                    placeholder={translate("Remote URL")}
                     type="url"
                     required
                   />
                   <input
                     value={hostToken}
                     onChange={(event) => setHostToken(event.target.value)}
-                    placeholder="Bearer token"
+                    placeholder={translate("Bearer token")}
                     type="password"
                     required
                   />
@@ -1842,7 +1860,7 @@ function ManageSections({
                     <input
                       value={assetTitle}
                       onChange={(event) => setAssetTitle(event.target.value)}
-                      placeholder="Asset title"
+                      placeholder={translate("Asset title")}
                     />
                   </label>
                   <label className="field-label">
@@ -1850,7 +1868,7 @@ function ManageSections({
                     <textarea
                       value={assetBody}
                       onChange={(event) => setAssetBody(event.target.value)}
-                      placeholder="Asset content"
+                      placeholder={translate("Asset content")}
                     />
                   </label>
                   {(assetTabKind === "knowledge" ||
@@ -1862,7 +1880,7 @@ function ManageSections({
                         onChange={(event) =>
                           setAssetTrigger(event.target.value)
                         }
-                        placeholder="Optional trigger"
+                        placeholder={translate("Optional trigger")}
                       />
                     </label>
                   )}
@@ -1871,7 +1889,7 @@ function ManageSections({
                     <input
                       value={assetScope}
                       onChange={(event) => setAssetScope(event.target.value)}
-                      placeholder="Optional scope"
+                      placeholder={translate("Optional scope")}
                     />
                   </label>
                   <Button
@@ -1936,7 +1954,7 @@ function ManageSections({
         )}
         {tab === "blueprint" && (
           <div className="form-grid">
-            <h2>Remote blueprint</h2>
+            <h2>{translate("Remote blueprint")}</h2>
             <Button
               onClick={() =>
                 selected &&
@@ -1957,7 +1975,7 @@ function ManageSections({
             <textarea
               value={blueprintCommand}
               onChange={(event) => setBlueprintCommand(event.target.value)}
-              placeholder="Execute a blueprint command"
+              placeholder={translate("Execute a blueprint command")}
             />
             <div className="inline-actions">
               <Button
@@ -2403,14 +2421,16 @@ function Activity({
                       <input
                         value={taskId}
                         onChange={(event) => setTaskId(event.target.value)}
-                        placeholder="e.g. task-123"
+                        placeholder={translate("e.g. task-123")}
                       />
                       <p className="field-help">
                         The durable coordination board to observe or update.
                       </p>
                     </div>
                     <div>
-                      <label className="field-label">Initial roles</label>
+                      <label className="field-label">
+                        {translate("Initial roles")}
+                      </label>
                       <textarea
                         value={rolesText}
                         onChange={(event) => setRolesText(event.target.value)}
@@ -2449,7 +2469,7 @@ function Activity({
                       <input
                         value={roleId}
                         onChange={(event) => setRoleId(event.target.value)}
-                        placeholder="leader"
+                        placeholder={translate("leader")}
                       />
                     </label>
                     <SelectMenu
@@ -2577,21 +2597,21 @@ function Activity({
                                 onChange={(event) =>
                                   setTaskTitle(event.target.value)
                                 }
-                                placeholder="New task"
+                                placeholder={translate("New task")}
                               />
                               <input
                                 value={worker}
                                 onChange={(event) =>
                                   setWorker(event.target.value)
                                 }
-                                placeholder="Worker / assignee"
+                                placeholder={translate("Worker / assignee")}
                               />
                               <input
                                 value={prUrl}
                                 onChange={(event) =>
                                   setPrUrl(event.target.value)
                                 }
-                                placeholder="Verified PR URL"
+                                placeholder={translate("Verified PR URL")}
                               />
                               <Button
                                 className="primary"
@@ -2692,7 +2712,7 @@ function Activity({
                   )}
                   <section className="hidden">
                     <div className="inline-actions mb-3">
-                      <input placeholder="Search tasks" />
+                      <input placeholder={translate("Search tasks")} />
                       <Button
                         className="primary"
                         onClick={() => setTaskFormOpen(true)}
@@ -2705,17 +2725,17 @@ function Activity({
                         <input
                           value={taskTitle}
                           onChange={(event) => setTaskTitle(event.target.value)}
-                          placeholder="New task"
+                          placeholder={translate("New task")}
                         />
                         <input
                           value={worker}
                           onChange={(event) => setWorker(event.target.value)}
-                          placeholder="Worker / assignee"
+                          placeholder={translate("Worker / assignee")}
                         />
                         <input
                           value={prUrl}
                           onChange={(event) => setPrUrl(event.target.value)}
-                          placeholder="Verified PR URL"
+                          placeholder={translate("Verified PR URL")}
                         />
                         <Button
                           className="primary"
@@ -2792,12 +2812,14 @@ function Activity({
                         </div>
                       ))
                     ) : (
-                      <p className="empty-state">No coordination tasks yet.</p>
+                      <p className="empty-state">
+                        {translate("No coordination tasks yet.")}
+                      </p>
                     )}
                   </section>
                   <section className="hidden">
                     <div className="inline-actions mb-3">
-                      <input placeholder="Search messages" />
+                      <input placeholder={translate("Search messages")} />
                       <Button
                         className="primary"
                         onClick={() => setMessageFormOpen(true)}
@@ -2807,7 +2829,9 @@ function Activity({
                     </div>
                     {messageFormOpen && (
                       <>
-                        <label className="field-label">Message envelope</label>
+                        <label className="field-label">
+                          {translate("Message envelope")}
+                        </label>
                         <textarea
                           value={message}
                           onChange={(event) => setMessage(event.target.value)}
@@ -2918,7 +2942,7 @@ function SessionRightPanel({
       <aside className="right-rail right-rail-collapsed">
         <button
           className="rail-toggle"
-          title="Expand session panel"
+          title={translate("Expand session panel")}
           onClick={() => setCollapsed(false)}
         >
           <Icon name="sidebarRight" />
@@ -2941,7 +2965,7 @@ function SessionRightPanel({
         ))}
         <button
           className="panel-collapse"
-          title="Collapse session panel"
+          title={translate("Collapse session panel")}
           onClick={() => setCollapsed(true)}
         >
           <Icon name="sidebarRight" />
@@ -2950,22 +2974,24 @@ function SessionRightPanel({
       <div className="session-panel-content">
         {panelTab === "info" && (
           <div className="p-4">
-            <h2 className="text-[15px] font-semibold text-ink">Session</h2>
+            <h2 className="text-[15px] font-semibold text-ink">
+              {translate("Session")}
+            </h2>
             <dl className="mt-4 space-y-3 text-[13px]">
               <div>
-                <dt className="text-muted">Status</dt>
+                <dt className="text-muted">{translate("Status")}</dt>
                 <dd>{running ? "Running" : "Ready"}</dd>
               </div>
               <div>
-                <dt className="text-muted">Host</dt>
+                <dt className="text-muted">{translate("Host")}</dt>
                 <dd>{selected.host_name}</dd>
               </div>
               <div>
-                <dt className="text-muted">Workspace</dt>
+                <dt className="text-muted">{translate("Workspace")}</dt>
                 <dd>{selected.workspace || "Not set"}</dd>
               </div>
               <div>
-                <dt className="text-muted">Model</dt>
+                <dt className="text-muted">{translate("Model")}</dt>
                 <dd>{selected.model}</dd>
               </div>
             </dl>
@@ -3417,10 +3443,10 @@ export function App() {
           <Activity selected={selected} onError={onError} />
         ) : (
           <div className="empty-main">
-            <h1>Start a session</h1>
-            <p>Choose a bound host and create an OPCOS workspace.</p>
+            <h1>{translate("startSession")}</h1>
+            <p>{translate("chooseHost")}</p>
             <Button className="primary" onClick={() => setModal(true)}>
-              <Icon name="plus" /> New session
+              <Icon name="plus" /> {translate("newSession")}
             </Button>
           </div>
         )}

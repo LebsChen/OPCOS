@@ -1055,7 +1055,11 @@ export function Sidebar(props: any) {
             title={
               props.collapsed ? "Dock sidebar (⌘B)" : "Collapse sidebar (⌘B)"
             }
-            aria-label={props.collapsed ? "Dock sidebar" : "Collapse sidebar"}
+            aria-label={
+              props.collapsed
+                ? translate("dockSidebar")
+                : translate("collapseSidebar")
+            }
             onClick={props.onCollapse}
           >
             <Icon name="sidebar" size={16} />

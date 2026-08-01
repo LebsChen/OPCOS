@@ -2,6 +2,7 @@
 // data-layer adaptation while preserving the original tab layout.
 // @ts-nocheck
 import { useEffect, useState } from "react";
+import { translate } from "../i18n";
 import {
   addMcpServer,
   allowUser,
@@ -98,7 +99,10 @@ export function ModelsTab() {
     refreshSettings();
   }, []);
 
-  if (!settings) return <div className="text-[13px] text-muted">Loading…</div>;
+  if (!settings)
+    return (
+      <div className="text-[13px] text-muted">{translate("Loading\u2026")}</div>
+    );
 
   const info = ps.info;
   const knownNames = ps.providers.map((p) => p.name);
@@ -148,15 +152,14 @@ export function ModelsTab() {
 
       {ps.sel === "openai" && settings.source === "env" && (
         <p className="text-[12px] text-muted mt-3 leading-relaxed">
-          A key is set via <code>OPENAI_API_KEY</code> in this server's
-          environment. You can override it above; the stored key is used only
-          when the environment variable is absent.
+          {translate("keySetVia")} <code>OPENAI_API_KEY</code>{" "}
+          {translate("keyEnvironment")}
         </p>
       )}
 
       {info?.configured ? (
         <div className="mt-6">
-          <div className={SEC_H + " mb-1.5"}>Models</div>
+          <div className={SEC_H + " mb-1.5"}>{translate("Models")}</div>
           <p className="text-[12px] text-muted mb-2.5 leading-relaxed">
             Ticked models show in the composer's picker; the black badge marks
             the default for new sessions.
@@ -180,7 +183,9 @@ export function ModelsTab() {
         // key unlocks is part of deciding to get one at all (owner ask, 2026-07-04).
         (info?.suggested_models?.length || 0) > 0 && (
           <div className="mt-6" data-testid="model-preview">
-            <div className={SEC_H + " mb-1.5"}>Included models</div>
+            <div className={SEC_H + " mb-1.5"}>
+              {translate("Included models")}
+            </div>
             <p className="text-[12px] text-muted mb-2.5 leading-relaxed">
               Curated, agent-capable models this provider serves — add your key
               above to enable them.
@@ -229,7 +234,9 @@ function ComposerPickerCard({
   };
   return (
     <div className="mt-6" data-testid="composer-picker">
-      <div className={SEC_H + " mb-1.5"}>In the composer's picker</div>
+      <div className={SEC_H + " mb-1.5"}>
+        {translate("In the composer's picker")}
+      </div>
       <p className="text-[12px] text-muted mb-2.5 leading-relaxed">
         The models offered when starting a session; the black badge marks the
         default. Add more from a provider's card above.
@@ -261,7 +268,7 @@ function ComposerPickerCard({
                 {tag(id)}
               </span>
               {isDefault ? (
-                <span className="mlist-default">default</span>
+                <span className="mlist-default">{translate("default")}</span>
               ) : (
                 <button
                   className="mlist-make"
@@ -459,7 +466,7 @@ function McpRow({
         <Toggle
           checked={server.enabled}
           onChange={onToggle}
-          title="Enable this server"
+          title={translate("Enable this server")}
         />
         <div className="flex-1 min-w-0">
           <div className="text-[14px] font-medium">{server.name}</div>
@@ -515,7 +522,9 @@ function McpRow({
       {tools && (
         <div className="mt-2.5 pt-2.5 border-t border-line flex flex-wrap gap-1.5">
           {tools.length === 0 && (
-            <div className="text-[12px] text-faint">No tools.</div>
+            <div className="text-[12px] text-faint">
+              {translate("No tools.")}
+            </div>
           )}
           {tools.map((t) => (
             <span
@@ -656,7 +665,9 @@ export function UnauthorizedBlock({
               <button
                 className="text-[11.5px] px-2 py-1 rounded-md bg-accent text-white"
                 data-testid={`parked-allow-deliver-${m.id}`}
-                title="Add the sender to the allow-list and deliver this message now"
+                title={translate(
+                  "Add the sender to the allow-list and deliver this message now",
+                )}
                 onClick={() => act(m.id, "allow_deliver")}
               >
                 Allow & deliver
@@ -664,7 +675,9 @@ export function UnauthorizedBlock({
               <button
                 className={BTN_BORDERED}
                 data-testid={`parked-allow-${m.id}`}
-                title="Add the sender to the allow-list; this message is discarded"
+                title={translate(
+                  "Add the sender to the allow-list; this message is discarded",
+                )}
                 onClick={() => act(m.id, "allow")}
               >
                 Allow only
@@ -672,7 +685,7 @@ export function UnauthorizedBlock({
               <button
                 className="text-[11.5px] px-2 py-1 rounded-md text-faint hover:text-danger"
                 data-testid={`parked-dismiss-${m.id}`}
-                title="Throw this message away"
+                title={translate("Throw this message away")}
                 onClick={() => act(m.id, "dismiss")}
               >
                 Dismiss
@@ -731,7 +744,7 @@ export function ListeningSessionsBlock({ c }: { c: Connector }) {
               </span>
               <button
                 className="ml-auto text-faint hover:text-danger shrink-0"
-                title="Unsubscribe this session"
+                title={translate("Unsubscribe this session")}
                 onClick={async () => {
                   await unsubscribeChannel(s.session_id, s.channel);
                   load();
@@ -774,7 +787,7 @@ export function AllowlistBlock({
   return (
     <div className="border-t border-line px-3.5 py-3 grid grid-cols-2 gap-5">
       <div>
-        <div className={SEC_H + " mb-2"}>Allowed to message</div>
+        <div className={SEC_H + " mb-2"}>{translate("Allowed to message")}</div>
         <div className="flex flex-wrap gap-1.5">
           {allowedUsers.length === 0 && (
             <span className="text-[12px] text-faint">
@@ -793,7 +806,7 @@ export function AllowlistBlock({
               {names?.[u] || u}
               <button
                 className="w-4 h-4 grid place-items-center text-faint hover:text-danger"
-                title="remove"
+                title={translate("remove")}
                 onClick={async () => {
                   await disallowUser(c.name, u, teamId);
                   onChanged();
@@ -806,7 +819,7 @@ export function AllowlistBlock({
         </div>
       </div>
       <div>
-        <div className={SEC_H + " mb-2"}>Recent senders</div>
+        <div className={SEC_H + " mb-2"}>{translate("Recent senders")}</div>
         {unknownRecent.length === 0 ? (
           <div className="text-[12px] text-faint">
             None yet. Message the bot once and it'll show here.
@@ -862,7 +875,9 @@ export function ConnectorTools({
     );
   return (
     <div className="border-t border-line px-3.5 py-3">
-      <div className={SEC_H + " mb-2"}>Tools exposed to OPCOS</div>
+      <div className={SEC_H + " mb-2"}>
+        {translate("Tools exposed to OPCOS")}
+      </div>
       <div className="space-y-1.5">
         {c.tools.map((tool) => (
           <label
@@ -953,7 +968,9 @@ export function ConnectSetup({
               : `Connect ${c.title} with one click`}
           </button>
           {c.fields.length > 0 && (
-            <div className="text-[11.5px] text-faint">or connect manually:</div>
+            <div className="text-[11.5px] text-faint">
+              {translate("or connect manually:")}
+            </div>
           )}
         </div>
       )}
@@ -998,7 +1015,9 @@ export function ConnectSetup({
             <CloudStatusPending />
           )}
           {!c.managed_paused && cloud?.signed_in && (
-            <div className="text-[11.5px] text-faint">or connect manually:</div>
+            <div className="text-[11.5px] text-faint">
+              {translate("or connect manually:")}
+            </div>
           )}
         </div>
       )}

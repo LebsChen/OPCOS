@@ -7,6 +7,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { translate } from "../i18n";
 import type { Attachment, SessionUsage } from "../types";
 const isPdfFile = () => false;
 const readFile = async () => null;
@@ -430,7 +431,7 @@ export function Composer(props: any) {
           <button
             className="shrink-0 opacity-60 hover:opacity-100"
             onClick={() => setAttachNotice(null)}
-            title="Dismiss"
+            title={translate("Dismiss")}
           >
             ✕
           </button>
@@ -485,8 +486,8 @@ export function Composer(props: any) {
           <div className="relative">
             <button
               className={iconBtn + (attachMenuOpen ? " bg-paper text-ink" : "")}
-              title="Attach"
-              aria-label="Attach"
+              title={translate("Attach")}
+              aria-label={translate("Attach")}
               onClick={() => setAttachMenuOpen((v) => !v)}
             >
               <Icon name="plus" size={17} />
@@ -557,7 +558,9 @@ export function Composer(props: any) {
           ) : null}
 
           {dictationBusy === "Transcribing…" && (
-            <span className="text-[11.5px] text-accent">Transcribing…</span>
+            <span className="text-[11.5px] text-accent">
+              {translate("Transcribing\u2026")}
+            </span>
           )}
 
           <span className="ml-auto" />
@@ -584,10 +587,12 @@ export function Composer(props: any) {
               <button
                 className="pill model-warn chip"
                 onClick={() => props.onConnectModel?.()}
-                title="Connect a model"
-                aria-label="No model connected — connect a model"
+                title={translate("Connect a model")}
+                aria-label={translate(
+                  "No model connected \u2014 connect a model",
+                )}
               >
-                <span className="pill-label">No model</span>
+                <span className="pill-label">{translate("No model")}</span>
                 <span className="model-warn-ico" aria-hidden>
                   ⚠
                 </span>
@@ -604,9 +609,11 @@ export function Composer(props: any) {
                 className="pill chip text-faint cursor-default"
                 disabled
                 data-testid="models-loading"
-                title="Fetching the model list from the server"
+                title={translate("Fetching the model list from the server")}
               >
-                <span className="pill-label">Loading models…</span>
+                <span className="pill-label">
+                  {translate("Loading models\u2026")}
+                </span>
               </button>
             ))}
 
@@ -665,7 +672,7 @@ export function Composer(props: any) {
                 !props.connected || !!dictation?.recording || !!dictationBusy
               }
               title={needsModel ? "Connect a model to send" : undefined}
-              aria-label="Send"
+              aria-label={translate("Send")}
             >
               <svg
                 width="15"
@@ -731,7 +738,7 @@ function UsageChip({
         onClick={() => setOpen((v) => !v)}
         aria-haspopup="menu"
         aria-expanded={open}
-        aria-label="Token usage"
+        aria-label={translate("Token usage")}
         title={
           pct !== null
             ? `Token usage — ${pct}% of the context window used`
@@ -817,7 +824,7 @@ function UsageChip({
               ))}
             </div>
             <div className="mt-2 pt-2 border-t border-line flex items-baseline justify-between text-[11.5px]">
-              <span className="text-faint">Total</span>
+              <span className="text-faint">{translate("Total")}</span>
               <span className="text-ink tabular-nums">
                 {formatTokens(total)} tokens
               </span>
@@ -860,7 +867,7 @@ function ModeMenu({
         onClick={() => setOpen((v) => !v)}
         aria-haspopup="menu"
         aria-expanded={open}
-        aria-label="Mode"
+        aria-label={translate("Mode")}
         title={
           `Mode: ${current?.label || mode}` +
           (unattended ? " · approvals go to the Inbox" : "")
@@ -916,7 +923,7 @@ function ModeMenu({
                   <Toggle
                     checked={!!unattended}
                     onChange={onUnattendedChange}
-                    title="Send approvals to the Inbox"
+                    title={translate("Send approvals to the Inbox")}
                   />
                 </div>
               </>
@@ -955,7 +962,11 @@ function AttachChip({ a, onRemove }: { a: Attachment; onRemove: () => void }) {
           <span className="attach-name">{a.name}</span>
         </>
       )}
-      <button className="attach-x" onClick={onRemove} title="Remove">
+      <button
+        className="attach-x"
+        onClick={onRemove}
+        title={translate("Remove")}
+      >
         ✕
       </button>
     </div>

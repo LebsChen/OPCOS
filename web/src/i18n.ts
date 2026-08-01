@@ -84,6 +84,28 @@ const messages: Record<Locale, Record<string, string>> = {
     navigationMenu: "OPCOS navigation menu",
     startPersona: "Start with a specific persona",
     choosePersona: "Choose a persona",
+    attach: "Attach",
+    connectModel: "No model connected — connect a model",
+    send: "Send",
+    tokenUsage: "Token usage",
+    mode: "Mode",
+    backArtifacts: "Back to artifacts",
+    reloadPreview: "Reload preview",
+    openDefaultApp: "Open in default app",
+    copyPath: "Copy path",
+    showFolder: "Show in folder",
+    sessionAccess: "Session access",
+    backSources: "Back to sources",
+    dockSidebar: "Dock sidebar",
+    collapseSidebar: "Collapse sidebar",
+    openWorklog: "Load worklog",
+    keySetVia: "A key is set via",
+    keyEnvironment:
+      "environment. You can override it above; the stored key is used only when the environment variable is absent.",
+    mutedSession: "Off mutes it for",
+    sessionOnly: "this session only",
+    startSession: "Start a session",
+    chooseHost: "Choose a bound host and create an OPCOS workspace.",
   },
   zh: {
     general: "通用",
@@ -162,6 +184,28 @@ const messages: Record<Locale, Record<string, string>> = {
     navigationMenu: "OPCOS 导航菜单",
     startPersona: "使用指定角色开始",
     choosePersona: "选择角色",
+    attach: "添加附件",
+    connectModel: "未连接模型 — 连接模型",
+    send: "发送",
+    tokenUsage: "Token 使用量",
+    mode: "模式",
+    backArtifacts: "返回文件",
+    reloadPreview: "重新加载预览",
+    openDefaultApp: "用默认应用打开",
+    copyPath: "复制路径",
+    showFolder: "显示所在文件夹",
+    sessionAccess: "会话访问权限",
+    backSources: "返回来源",
+    dockSidebar: "停靠侧边栏",
+    collapseSidebar: "折叠侧边栏",
+    openWorklog: "加载工作日志",
+    keySetVia: "密钥通过以下环境变量设置：",
+    keyEnvironment:
+      "环境变量。你可以在上方覆盖；仅当环境变量不存在时才使用存储的密钥。",
+    mutedSession: "关闭后仅会在",
+    sessionOnly: "本会话中静音",
+    startSession: "开始会话",
+    chooseHost: "选择已绑定的主机并创建 OPCOS 工作区。",
   },
 };
 
@@ -182,7 +226,18 @@ export function subscribeLocale(listener: () => void): () => void {
 }
 
 export function translate(key: string): string {
-  return messages[locale][key] || messages.en[key] || key;
+  const normalized = key
+    .trim()
+    .replace(/[^A-Za-z0-9]+(.)/g, (_, character: string) =>
+      character.toUpperCase(),
+    );
+  return (
+    messages[locale][key] ||
+    messages[locale][normalized] ||
+    messages.en[key] ||
+    messages.en[normalized] ||
+    key
+  );
 }
 
 setLocale(locale);

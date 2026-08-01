@@ -2,6 +2,7 @@
 // preserving the OpenWorker scheduled-view shell.
 // @ts-nocheck
 import { useEffect, useState } from "react";
+import { translate } from "../i18n";
 type Automation = any;
 type AutomationRun = any;
 const createAutomation = async () => null;
@@ -150,7 +151,7 @@ export function ScheduledView({ onOpenRun, onRunNow, initialOpenId }: Props) {
       <div className="flex items-start gap-3">
         <div className="flex-1 min-w-0">
           <PanelHead
-            title="Automations"
+            title={translate("Automations")}
             sub="Recurring tasks OPCOS runs on a schedule."
           />
         </div>
@@ -208,8 +209,8 @@ export function ScheduledView({ onOpenRun, onRunNow, initialOpenId }: Props) {
                 </span>
                 <button
                   className="sched-card-del"
-                  title="Delete automation"
-                  aria-label={`Delete ${t.title}`}
+                  title={translate("delete")}
+                  aria-label={`${translate("delete")} ${t.title}`}
                   onClick={async (e) => {
                     e.stopPropagation();
                     await deleteAutomation(t.id);
@@ -256,19 +257,21 @@ function NewAutomationForm({
       </div>
       <input
         className="tmpl-input"
-        placeholder="Title (e.g. Daily standup notes)"
+        placeholder={translate("Title (e.g. Daily standup notes)")}
         value={title}
         onChange={(e) => setTitle(e.target.value)}
       />
       <textarea
         className="tmpl-input tmpl-textarea"
-        placeholder="What should it do each run? (e.g. Summarize today's calendar and open tasks.)"
+        placeholder={translate(
+          "What should it do each run? (e.g. Summarize today's calendar and open tasks.)",
+        )}
         value={instructions}
         onChange={(e) => setInstructions(e.target.value)}
       />
       <div className="tmpl-sched">
         <label className="tmpl-field">
-          <span>At</span>
+          <span>{translate("At")}</span>
           <input
             type="time"
             className="tmpl-input tmpl-time"
@@ -277,7 +280,7 @@ function NewAutomationForm({
           />
         </label>
         <label className="tmpl-field">
-          <span>Repeat</span>
+          <span>{translate("Repeat")}</span>
           <SelectMenu
             value={freq}
             options={[
@@ -370,7 +373,9 @@ function TaskDetail({
   if (!task)
     return (
       <Shell>
-        <div className="text-[13px] text-muted">Loading…</div>
+        <div className="text-[13px] text-muted">
+          {translate("Loading\u2026")}
+        </div>
       </Shell>
     );
 
@@ -421,7 +426,7 @@ function TaskDetail({
               className="tmpl-input sched-edit-title"
               value={title}
               onChange={(e) => setTitle(e.target.value)}
-              placeholder="Title"
+              placeholder={translate("Title")}
             />
           ) : (
             <h2 className="text-[18px] font-semibold tracking-tight">
@@ -464,7 +469,7 @@ function TaskDetail({
         {editing ? (
           <div className="tmpl-sched sched-edit-sched">
             <label className="tmpl-field">
-              <span>At</span>
+              <span>{translate("At")}</span>
               <input
                 type="time"
                 className="tmpl-input tmpl-time"
@@ -473,7 +478,7 @@ function TaskDetail({
               />
             </label>
             <label className="tmpl-field">
-              <span>Repeat</span>
+              <span>{translate("Repeat")}</span>
               <SelectMenu
                 value={freq}
                 options={[
@@ -497,7 +502,7 @@ function TaskDetail({
           </div>
         )}
 
-        <div className="sa-sub">Instructions</div>
+        <div className="sa-sub">{translate("Instructions")}</div>
         {editing ? (
           <textarea
             className="tmpl-input tmpl-textarea sched-edit-instr"
@@ -510,7 +515,7 @@ function TaskDetail({
 
         {(task.always_allowed || []).length > 0 && (
           <>
-            <div className="sa-sub">Allowed without asking</div>
+            <div className="sa-sub">{translate("Allowed without asking")}</div>
             <div className="dim" style={{ marginBottom: 8, fontSize: 12.5 }}>
               Standing approvals this automation may use — everything else still
               asks first.
@@ -529,7 +534,9 @@ function TaskDetail({
                   </span>
                   <button
                     className="link"
-                    title="This automation will ask for approval again"
+                    title={translate(
+                      "This automation will ask for approval again",
+                    )}
                     onClick={async () => {
                       await updateAutomation(id, { revoke: rule.entry });
                       refresh();
@@ -543,12 +550,14 @@ function TaskDetail({
           </>
         )}
 
-        <div className="sa-sub">Runs</div>
+        <div className="sa-sub">{translate("Runs")}</div>
         <div className="dim" style={{ marginBottom: 8, fontSize: 12.5 }}>
           Each run is a live conversation — open one to see what the agent did
           and ask a follow-up.
         </div>
-        {runs.length === 0 && <div className="dim">No runs yet.</div>}
+        {runs.length === 0 && (
+          <div className="dim">{translate("No runs yet.")}</div>
+        )}
         {runs.map((r) => (
           <div
             className="sched-run open"
@@ -560,7 +569,7 @@ function TaskDetail({
                 title: task.title,
               })
             }
-            title="Open this run's conversation"
+            title={translate("Open this run's conversation")}
           >
             <div className="sched-run-row">
               <span>

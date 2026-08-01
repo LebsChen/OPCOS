@@ -13,6 +13,7 @@
 // while retaining the OpenWorker Access/RootRow layout shell.
 // @ts-nocheck
 import { useCallback, useEffect, useRef, useState } from "react";
+import { translate } from "../i18n";
 type CloudStatus = any;
 type Connector = any;
 type RecentChannel = any;
@@ -259,7 +260,7 @@ export function AccessSection({
             size={14}
             className="rail-chev"
           />
-          <span>Access</span>
+          <span>{translate("Access")}</span>
           <span
             className="ml-auto min-w-0 truncate text-[11px] font-normal text-faint"
             data-testid="access-summary"
@@ -273,7 +274,7 @@ export function AccessSection({
         <div
           className="rail-section-body"
           role="region"
-          aria-label="Session access"
+          aria-label={translate("Session access")}
         >
           {connectFor ? (
             <ConnectInline
@@ -317,7 +318,7 @@ export function AccessSection({
             <div className="space-y-4">
               {/* Sources — each toggle is a per-session override (mute for THIS session only). */}
               <div>
-                <div className={`${SEC_H} mb-1.5`}>Sources</div>
+                <div className={`${SEC_H} mb-1.5`}>{translate("Sources")}</div>
                 {connected.length === 0 && (
                   <div className="text-[12px] text-faint py-0.5">
                     No connectors enabled for this session.
@@ -359,15 +360,18 @@ export function AccessSection({
                       <Toggle
                         checked={c.enabled}
                         onChange={(next) => toggleSession(c.connector, next)}
-                        title="Enabled for this session — tap to mute here"
+                        title={translate(
+                          "Enabled for this session \u2014 tap to mute here",
+                        )}
                       />
                     </div>
                   ))}
                 </div>
                 {connected.length > 0 && (
                   <p className="text-[10.5px] text-faint mt-1 leading-snug">
-                    Off mutes it for <b>this session only</b> — the connector
-                    stays connected.
+                    {translate("mutedSession")}{" "}
+                    <b>{translate("sessionOnly")}</b> — the connector stays
+                    connected.
                   </p>
                 )}
                 {/* §32 addendum (owner ask 2026-07-13; FB-012): the catalog's long tail,
@@ -377,7 +381,7 @@ export function AccessSection({
                   <div className="mt-1.5">
                     <input
                       className="w-full px-2.5 py-1.5 rounded-lg border border-line bg-panel text-[12.5px] outline-none focus:border-accent"
-                      placeholder="Search connectors…"
+                      placeholder={translate("Search connectors\u2026")}
                       value={query}
                       onChange={(e) => setQuery(e.target.value)}
                       onKeyDown={(e) => {
@@ -443,7 +447,9 @@ export function AccessSection({
 
               {recommended.length > 0 && (
                 <div>
-                  <div className={`${SEC_H} mb-1.5`}>Recommended</div>
+                  <div className={`${SEC_H} mb-1.5`}>
+                    {translate("Recommended")}
+                  </div>
                   <div className="space-y-1">
                     {recommended.map((r) => (
                       <div
@@ -464,7 +470,9 @@ export function AccessSection({
                               {labelFor(r.connector, byName)}
                             </span>
                             {r.tier === "core" && (
-                              <span className={TAG_CORE}>core</span>
+                              <span className={TAG_CORE}>
+                                {translate("core")}
+                              </span>
                             )}
                           </div>
                           <div
@@ -498,7 +506,7 @@ export function AccessSection({
                   a quiet "+" link, structurally identical to Sources (owner ask 2026-07-13:
                   the old drawer's card wrapper read too heavy in the rail). */}
               <div data-testid="drawer-directories">
-                <div className={`${SEC_H} mb-1.5`}>Folders</div>
+                <div className={`${SEC_H} mb-1.5`}>{translate("Folders")}</div>
                 <div className="-mx-1.5">
                   {roots.map((r) => (
                     <RootRow
@@ -577,7 +585,7 @@ function ConnectInline({
       <button
         className="inline-flex items-center gap-1 text-[12px] text-faint hover:text-ink mb-2"
         onClick={onBack}
-        aria-label="Back to sources"
+        aria-label={translate("Back to sources")}
       >
         <Icon name="arrowLeft" size={13} /> Connect {c.title}
       </button>
@@ -625,7 +633,7 @@ function ChannelsInline({
       <button
         className="inline-flex items-center gap-1 text-[12px] text-faint hover:text-ink mb-2"
         onClick={onBack}
-        aria-label="Back to sources"
+        aria-label={translate("Back to sources")}
       >
         <Icon name="arrowLeft" size={13} /> {label} channels
       </button>
@@ -650,14 +658,16 @@ function ChannelsInline({
               {s.collision && (
                 <span
                   className="text-[10.5px] text-warnInk bg-warnSoft/70 border border-warnInk/15 rounded px-1 shrink-0"
-                  title="This channel is also this session's Inbox-routing target — inbound and outbound collide."
+                  title={translate(
+                    "This channel is also this session's Inbox-routing target \u2014 inbound and outbound collide.",
+                  )}
                 >
                   ⚠
                 </span>
               )}
               <button
                 className="w-5 h-5 grid place-items-center text-faint hover:text-danger shrink-0"
-                title="Stop listening"
+                title={translate("Stop listening")}
                 onClick={() => onRemove(s.channel)}
               >
                 ×
@@ -666,7 +676,7 @@ function ChannelsInline({
           ))}
         </div>
       )}
-      <div className={`${SEC_H} mt-3 mb-1.5`}>Add a channel</div>
+      <div className={`${SEC_H} mt-3 mb-1.5`}>{translate("Add a channel")}</div>
       <div className="flex items-center gap-1.5">
         <ChannelPicker
           value={draft}

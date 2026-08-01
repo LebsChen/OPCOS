@@ -1,6 +1,7 @@
 // Artifact viewer and connector integrations are unsupported in OPCOS.
 // @ts-nocheck
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import { translate } from "../i18n";
 type ArtifactContent = any;
 type ArtifactInfo = any;
 const getArtifacts = async () => [];
@@ -174,7 +175,7 @@ export function RightRail(props: any) {
       ) : (
         <>
           <RailSection
-            title="Progress"
+            title={translate("Progress")}
             open={open.progress}
             onToggle={() => setOpen({ ...open, progress: !open.progress })}
           >
@@ -199,7 +200,9 @@ export function RightRail(props: any) {
                         e.stopPropagation();
                         revealArtifact(sessionId, artifacts[0].path, "reveal");
                       }}
-                      title="Show the folder where these files are saved"
+                      title={translate(
+                        "Show the folder where these files are saved",
+                      )}
                     >
                       <Icon name="folder" size={13} />
                     </button>
@@ -210,7 +213,7 @@ export function RightRail(props: any) {
                       e.stopPropagation();
                       refreshArtifacts();
                     }}
-                    title="Refresh artifacts"
+                    title={translate("Refresh artifacts")}
                   >
                     <Icon name="refresh" size={13} />
                   </button>
@@ -218,7 +221,9 @@ export function RightRail(props: any) {
               }
             >
               {artifacts.length === 0 ? (
-                <div className="rail-muted">No previewable files yet.</div>
+                <div className="rail-muted">
+                  {translate("No previewable files yet.")}
+                </div>
               ) : (
                 <div className="artifact-list">
                   {artifacts.slice(0, 16).map((a) => (
@@ -236,7 +241,7 @@ export function RightRail(props: any) {
                           {formatBytes(a.size)} · {formatTime(a.modified_at)}
                         </span>
                       </span>
-                      <span className="artifact-open">Open</span>
+                      <span className="artifact-open">{translate("Open")}</span>
                     </button>
                   ))}
                 </div>
@@ -367,14 +372,14 @@ function ArtifactViewer({
         <button
           className="artifact-icon-btn"
           onClick={onBack}
-          aria-label="Back to artifacts"
-          title="Back"
+          aria-label={translate("Back to artifacts")}
+          title={translate("Back")}
         >
           <Icon name="arrowLeft" size={16} />
         </button>
         <div className="artifact-heading">
           <div className="artifact-title">
-            <span>Artifacts</span>
+            <span>{translate("Artifacts")}</span>
             <span className="artifact-sep">/</span>
             <span>{artifact.name}</span>
           </div>
@@ -388,8 +393,8 @@ function ArtifactViewer({
                 await onReload();
                 setReloadKey((k) => k + 1);
               }}
-              aria-label="Reload preview"
-              title="Reload"
+              aria-label={translate("Reload preview")}
+              title={translate("Reload")}
             >
               <Icon name="refresh" size={16} />
             </button>
@@ -398,8 +403,8 @@ function ArtifactViewer({
             <button
               className="artifact-icon-btn"
               onClick={() => revealArtifact(sessionId, artifact.path, "open")}
-              aria-label="Open in default app"
-              title="Open in default app"
+              aria-label={translate("Open in default app")}
+              title={translate("Open in default app")}
             >
               <Icon name="panelOpen" size={16} />
             </button>
@@ -411,16 +416,16 @@ function ArtifactViewer({
             onClick={() =>
               navigator.clipboard?.writeText(artifact.abs_path || artifact.path)
             }
-            aria-label="Copy path"
-            title="Copy full path"
+            aria-label={translate("Copy path")}
+            title={translate("Copy full path")}
           >
             <Icon name="copy" size={16} />
           </button>
           <button
             className="artifact-icon-btn"
             onClick={() => revealArtifact(sessionId, artifact.path, "reveal")}
-            aria-label="Show in folder"
-            title="Show in folder"
+            aria-label={translate("Show in folder")}
+            title={translate("Show in folder")}
           >
             <Icon name="folder" size={16} />
           </button>
@@ -428,7 +433,7 @@ function ArtifactViewer({
       </div>
       <div className="artifact-preview">
         {!content ? (
-          <div className="rail-muted">Loading...</div>
+          <div className="rail-muted">{translate("Loading...")}</div>
         ) : content.error ? (
           <div className="rail-error">{content.error}</div>
         ) : content.kind === "html" ? (
@@ -549,7 +554,11 @@ function parseCsv(text: string): string[][] {
 function CsvTable({ text }: { text: string }) {
   const rows = parseCsv(text);
   if (!rows.length)
-    return <div className="rail-muted artifact-table-note">Empty file.</div>;
+    return (
+      <div className="rail-muted artifact-table-note">
+        {translate("Empty file.")}
+      </div>
+    );
   return <GridTable rows={rows} />;
 }
 
@@ -611,7 +620,9 @@ function PdfViewer({ dataUrl }: { dataUrl: string }) {
   return (
     <div className="artifact-pdfjs">
       {loading && (
-        <div className="rail-muted artifact-table-note">Rendering PDF…</div>
+        <div className="rail-muted artifact-table-note">
+          {translate("Rendering PDF\u2026")}
+        </div>
       )}
       <div ref={holder} />
     </div>
@@ -659,7 +670,9 @@ function SheetViewer({ dataUrl }: { dataUrl: string }) {
     );
   if (!sheets)
     return (
-      <div className="rail-muted artifact-table-note">Parsing spreadsheet…</div>
+      <div className="rail-muted artifact-table-note">
+        {translate("Parsing spreadsheet\u2026")}
+      </div>
     );
   const sheet = sheets[active];
   return (
@@ -680,7 +693,9 @@ function SheetViewer({ dataUrl }: { dataUrl: string }) {
       {sheet.rows.length ? (
         <GridTable rows={sheet.rows} />
       ) : (
-        <div className="rail-muted artifact-table-note">Empty sheet.</div>
+        <div className="rail-muted artifact-table-note">
+          {translate("Empty sheet.")}
+        </div>
       )}
     </div>
   );

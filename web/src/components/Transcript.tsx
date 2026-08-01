@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { translate } from "../i18n";
 import type { ApprovalDecision, Item } from "../types";
 import { shortArgs } from "./ApprovalCard";
 import { humanizeAsk, humanizeTool, type HumanLine } from "../humanize";
@@ -42,7 +43,7 @@ function BubbleMeta({
         <button
           className="flex items-center cursor-pointer hover:text-muted"
           data-testid="bubble-copy"
-          title="Copy message"
+          title={translate("Copy message")}
           onClick={copy}
         >
           {copied ? "Copied" : <Icon name="copy" size={11} />}
@@ -229,7 +230,9 @@ function StepRow({
           <span
             className="text-[11px] text-warnInk shrink-0"
             data-testid="tool-hidden-count"
-            title="Removed by your privacy filters before the agent saw the results — agents get no trace of these."
+            title={translate(
+              "Removed by your privacy filters before the agent saw the results \u2014 agents get no trace of these.",
+            )}
           >
             {tool.hidden} hidden
           </span>
@@ -524,7 +527,7 @@ export function Transcript({ items, running, streamingText, onRetry }: Props) {
               );
             return (
               <div className="group bubble-assistant" key={bi}>
-                <div className="who">assistant</div>
+                <div className="who">{translate("assistant")}</div>
                 {item.reasoning && <ThinkingBlock text={item.reasoning} />}
                 <Markdown text={item.text} />
                 <BubbleMeta text={item.text} ts={item.ts} align="left" />
@@ -553,7 +556,7 @@ export function Transcript({ items, running, streamingText, onRetry }: Props) {
             if (!item.resolved) return null; // pending plan renders in the composer head
             return (
               <div className="bubble-assistant" key={bi}>
-                <div className="who">proposed plan</div>
+                <div className="who">{translate("proposed plan")}</div>
                 <Markdown text={item.plan} />
                 <div className="approval-inline">
                   <span
