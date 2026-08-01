@@ -73,6 +73,10 @@ OPCOS 不提供公网入站 webhook，也不把本机 agent 控制面暴露到�
 文件系统触发器只使用本机 `notify` 事件源。远程 Host 没有 inotify/事件
 通道时，该触发器明确不可用，不通过轮询伪造文件变化事件。
 
+Linear P2-4 使用出站 GraphQL + Personal API Key。PAT 只通过 SecretStore
+读取，不进入配置对象、transcript、日志或 UI 事件；Linear webhook 公网入站
+不在本地客户端实现，避免 OAuth/webhook 回调把本机控制面暴露到互联网。
+
 本地单人使用不需要 RBAC。真要做云端时照 Den［OW文］：
 
 - 三个默认角色 Owner / Admin / Member + 自定义角色；只有 Owner 能改角色。

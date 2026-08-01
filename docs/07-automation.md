@@ -20,6 +20,12 @@ Tembo 的关键设计［Tembo文］：**webhook 的整个 JSON payload 作为 ev
 本地优先的代价是没有公网入口。分两步：
 
 1. **出站轮询**（本地即可）：定期拉 GitHub / Linear / Sentry 的增量。延迟秒到分钟级，够用，且不需要任何云端。
+
+P2-4 先落地 Linear 的直接 GraphQL 连接器，而不是复用 Linear MCP：Linear 的 PAT
+认证和 issue/comment/status 能力可以在本地明确建模，且不依赖 MCP server 的部署、
+OAuth 回调或远端 transport。Linear webhook 需要公网入站，仍延后到 Cloud B；本地
+事件继续使用 P2-3 的回环触发器和用户手动/低频定时拉取。Linear PAT 只存入
+SecretStore，连接器工具缺少 PAT、网络不可达或权限不足时返回显式错误。
 2. **入站 webhook**（需要 relay）：本地只出站长连接到 relay，relay 提供稳定公网端点接事件后推给本机。不暴露本机端口。
 
 先做 1，不要因为 2 才好看就先做 2。

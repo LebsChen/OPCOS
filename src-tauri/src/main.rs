@@ -245,6 +245,12 @@ impl ToolExecutor for RemoteExecutor {
                 .await
                 .map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
                 .map_err(|error| error.to_string()),
+            "linear_get_issue"
+            | "linear_list_my_issues"
+            | "linear_comment_issue"
+            | "linear_update_issue_status" => {
+                execute_linear_tool(&self.secrets, name, arguments).await
+            }
             name if name.starts_with("mcp:") => {
                 let tool = name.trim_start_matches("mcp:");
                 self.client
@@ -338,6 +344,10 @@ impl ToolExecutor for DesktopExecutor {
                             redact_json_strings(&mut output, &value);
                         }
                         Ok(output)
+                    }
+                    "linear_get_issue" | "linear_list_my_issues" | "linear_comment_issue"
+                    | "linear_update_issue_status" => {
+                        execute_linear_tool(&executor.secrets, name, arguments).await
                     }
                     name if name.starts_with("mcp__") => executor
                         .mcp
@@ -4324,6 +4334,282 @@ async fn mcp_tools(
         .unwrap_or_default())
 }
 
+async fn linear_graphql(
+    state: &DesktopState,
+    query: &str,
+    variables: Value,
+) -> Result<Value, String> {
+    let token = state
+        .secrets
+        .get(&secret_key("asset-secret", "linear-pat"))
+        .map_err(|error| format!("Linear PAT unavailable: {error}"))?
+        .ok_or_else(|| "Linear PAT is not configured".to_owned())?;
+    linear_graphql_token(&token, query, variables).await
+}
+
+async fn linear_graphql_token(token: &str, query: &str, variables: Value) -> Result<Value, String> {
+    let response = reqwest::Client::new()
+        .post("https://api.linear.app/graphql")
+        .bearer_auth(token)
+        .json(&json!({"query": query, "variables": variables}))
+        .send()
+        .await
+        .map_err(|error| format!("Linear network error: {error}"))?;
+    let status = response.status();
+    let body = response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("Linear returned invalid JSON: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("Linear request failed ({status})"));
+    }
+    if let Some(errors) = body.get("errors").and_then(Value::as_array)
+        && !errors.is_empty()
+    {
+        let message = errors
+            .first()
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("GraphQL request failed");
+        return Err(format!("Linear GraphQL error: {message}"));
+    }
+    Ok(body.get("data").cloned().unwrap_or_else(|| json!({})))
+}
+
+async fn execute_linear_tool(
+    secrets: &KeyringSecretStore,
+    name: &str,
+    arguments: Value,
+) -> Result<Value, String> {
+    let token = secrets
+        .get(&secret_key("asset-secret", "linear-pat"))
+        .map_err(|error| format!("Linear PAT unavailable: {error}"))?
+        .ok_or_else(|| "Linear PAT is not configured".to_owned())?;
+    match name {
+        "linear_get_issue" => linear_graphql_token(
+            &token,
+            "query($identifier:String!) { issue(identifier:$identifier) { id identifier title description url priority state { id name type } assignee { id name email } team { id key name } } }",
+            json!({"identifier": arguments.get("identifier").and_then(Value::as_str).ok_or("missing identifier")?}),
+        )
+        .await
+        .map(|data| data.get("issue").cloned().unwrap_or_else(|| json!({}))),
+        "linear_list_my_issues" => linear_graphql_token(
+            &token,
+            "query($limit:Int!) { viewer { assignedIssues(first:$limit) { nodes { id identifier title description url priority state { id name type } assignee { id name email } team { id key name } } } } }",
+            json!({"limit": arguments.get("limit").and_then(Value::as_i64).unwrap_or(50).clamp(1, 100)}),
+        )
+        .await
+        .map(|data| data.pointer("/viewer/assignedIssues/nodes").cloned().unwrap_or_else(|| json!([]))),
+        "linear_comment_issue" => linear_graphql_token(
+            &token,
+            "mutation($issueId:String!,$body:String!) { commentCreate(input:{issueId:$issueId,body:$body}) { success comment { id body } } }",
+            json!({
+                "issueId": arguments.get("issue_id").and_then(Value::as_str).ok_or("missing issue_id")?,
+                "body": arguments.get("body").and_then(Value::as_str).ok_or("missing body")?,
+            }),
+        )
+        .await
+        .map(|data| data.get("commentCreate").cloned().unwrap_or_else(|| json!({}))),
+        "linear_update_issue_status" => linear_graphql_token(
+            &token,
+            "mutation($id:String!,$stateId:String!) { issueUpdate(id:$id,input:{stateId:$stateId}) { success issue { id identifier state { id name type } } } }",
+            json!({
+                "id": arguments.get("issue_id").and_then(Value::as_str).ok_or("missing issue_id")?,
+                "stateId": arguments.get("state_id").and_then(Value::as_str).ok_or("missing state_id")?,
+            }),
+        )
+        .await
+        .map(|data| data.get("issueUpdate").cloned().unwrap_or_else(|| json!({}))),
+        _ => Err(format!("Linear tool is unavailable: {name}")),
+    }
+}
+
+#[tauri::command]
+async fn linear_connection(state: State<'_, DesktopState>) -> Result<Value, String> {
+    let data = linear_graphql(&state, "query { viewer { id name email } }", json!({})).await?;
+    Ok(
+        json!({"connected": data.get("viewer").is_some_and(|value| !value.is_null()), "viewer": data.get("viewer")}),
+    )
+}
+
+#[tauri::command]
+async fn linear_get_issue(
+    state: State<'_, DesktopState>,
+    identifier: String,
+) -> Result<Value, String> {
+    let data = linear_graphql(
+        &state,
+        "query($identifier:String!) { issue(identifier:$identifier) { id identifier title description url priority state { id name type } assignee { id name email } team { id key name } } }",
+        json!({"identifier": identifier}),
+    )
+    .await?;
+    data.get("issue")
+        .cloned()
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| "Linear issue not found".into())
+}
+
+#[tauri::command]
+async fn linear_list_my_issues(
+    state: State<'_, DesktopState>,
+    limit: Option<i64>,
+) -> Result<Vec<Value>, String> {
+    let data = linear_graphql(
+        &state,
+        "query($limit:Int!) { viewer { assignedIssues(first:$limit) { nodes { id identifier title description url priority state { id name type } assignee { id name email } team { id key name } } } } }",
+        json!({"limit": limit.unwrap_or(50).clamp(1, 100)}),
+    )
+    .await?;
+    Ok(data
+        .pointer("/viewer/assignedIssues/nodes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
+#[tauri::command]
+async fn linear_comment_issue(
+    state: State<'_, DesktopState>,
+    issue_id: String,
+    body: String,
+    approved: bool,
+) -> Result<Value, String> {
+    if !approved {
+        return Err("approval required for Linear comment".into());
+    }
+    let data = linear_graphql(
+        &state,
+        "mutation($issueId:String!,$body:String!) { commentCreate(input:{issueId:$issueId,body:$body}) { success comment { id body } } }",
+        json!({"issueId": issue_id, "body": body}),
+    )
+    .await?;
+    audit(
+        &state,
+        "",
+        "linear_comment_created",
+        json!({"issue_id": issue_id}),
+    );
+    Ok(data
+        .get("commentCreate")
+        .cloned()
+        .unwrap_or_else(|| json!({})))
+}
+
+#[tauri::command]
+async fn linear_update_issue_status(
+    state: State<'_, DesktopState>,
+    issue_id: String,
+    state_id: String,
+    approved: bool,
+) -> Result<Value, String> {
+    if !approved {
+        return Err("approval required for Linear status change".into());
+    }
+    let data = linear_graphql(
+        &state,
+        "mutation($id:String!,$stateId:String!) { issueUpdate(id:$id,input:{stateId:$stateId}) { success issue { id identifier state { id name type } } } }",
+        json!({"id": issue_id, "stateId": state_id}),
+    )
+    .await?;
+    audit(
+        &state,
+        "",
+        "linear_issue_status_updated",
+        json!({"issue_id": issue_id, "state_id": state_id}),
+    );
+    Ok(data
+        .get("issueUpdate")
+        .cloned()
+        .unwrap_or_else(|| json!({})))
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn linear_create_session_from_issue(
+    state: State<'_, DesktopState>,
+    identifier: String,
+    host_id: String,
+    workspace: String,
+    title: Option<String>,
+    model: Option<String>,
+    provider: Option<String>,
+    mode: Option<String>,
+    harness: Option<String>,
+) -> Result<String, String> {
+    let data = linear_graphql(
+        &state,
+        "query($identifier:String!) { issue(identifier:$identifier) { id identifier title } }",
+        json!({"identifier": identifier}),
+    )
+    .await?;
+    let issue = data
+        .get("issue")
+        .cloned()
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| "Linear issue not found".to_owned())?;
+    let session_id = format!(
+        "session-linear-{}",
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let host_name = host_name(&connection, &host_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "remote host not found; session was not created".to_owned())?;
+    drop(connection);
+    let now = Utc::now();
+    state
+        .store
+        .save_session(&SessionRecord {
+            session_id: session_id.clone(),
+            workspace,
+            model: model.unwrap_or_else(|| "auto".into()),
+            mode: mode.unwrap_or_else(|| "Interactive".into()),
+            harness: harness.unwrap_or_else(|| "builtin".into()),
+            title: title.unwrap_or_else(|| {
+                format!(
+                    "Linear {} · {}",
+                    issue
+                        .get("identifier")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&identifier),
+                    issue
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Issue")
+                )
+            }),
+            extra_roots: vec![],
+            grants: json!({}),
+            pinned: false,
+            archived: false,
+            origin: Some("linear".into()),
+            origin_label: Some(identifier.clone()),
+            compaction: json!({}),
+            host_id,
+            provider,
+            external_session_id: None,
+            run_state: "idle".into(),
+            stop_reason: "none".into(),
+            created_at: now,
+            updated_at: now,
+        })
+        .map_err(|error| error.to_string())?;
+    audit(
+        &state,
+        &session_id,
+        "linear_issue_session_created",
+        json!({
+            "identifier": identifier,
+            "issue_id": issue.get("id"),
+            "host_name": host_name,
+        }),
+    );
+    Ok(session_id)
+}
+
 #[tauri::command]
 async fn list_mcp_servers(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
     let snapshots = state
@@ -6274,6 +6560,12 @@ fn main() {
             import_assets,
             discover_remote_assets,
             mcp_tools,
+            linear_connection,
+            linear_get_issue,
+            linear_list_my_issues,
+            linear_comment_issue,
+            linear_update_issue_status,
+            linear_create_session_from_issue,
             list_mcp_servers,
             retry_mcp_server,
             set_mcp_tool_enabled,
