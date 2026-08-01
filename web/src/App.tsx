@@ -1858,7 +1858,7 @@ function Automations({
           ))}
         </nav>
         <div className="flex-1 min-w-0 overflow-y-auto">
-          <div className="max-w-3xl mx-auto px-7 py-6">
+          <div className="w-full px-7 py-6">
             <PageHeader
               title={automationTab === "schedules" ? "Schedules" : "Runs"}
               subtitle={
@@ -2094,7 +2094,7 @@ function Activity({
           ))}
         </nav>
         <div className="flex-1 min-w-0 overflow-y-auto">
-          <div className="max-w-3xl mx-auto px-7 py-6">
+          <div className="w-full px-7 py-6">
             <PageHeader
               title={activityTab[0].toUpperCase() + activityTab.slice(1)}
               subtitle={
