@@ -920,13 +920,12 @@ async fn create_netrc(
     workspace: &str,
     password: &str,
 ) -> Result<String, HarnessError> {
-    let filename = format!(".opcos-netrc-{}", uuid::Uuid::new_v4().simple());
     let path = host
-        .join(&filename)
+        .temp_file("opcos-netrc")
         .map_err(|error| HarnessError::External(error.to_string()))?;
-    if !host.contains(&path) {
+    if !host.contains_temp(&path) {
         return Err(HarnessError::External(
-            "OpenCode netrc path escaped host workspace".into(),
+            "OpenCode netrc path is outside the host temporary directory".into(),
         ));
     }
     host.write(&path, &netrc_contents(password))

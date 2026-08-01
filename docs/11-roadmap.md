@@ -109,6 +109,8 @@
   - OpenCode 未安装、主机缺少 `process_stream` 或服务启动/端口回读失败时显式不可用，不创建假入口；
   - Basic 认证只引用受保护的 `OPENCODE_SERVER_PASSWORD` 环境变量，不进入 argv、URL 或 curl 命令文本；
   - permission 先按 `messageID`/`callID` 回查 tool part，补全失败只保留 pending 并发 `ApprovalEnrichmentFailed`；
+  - 桌面会话创建时持久化 `builtin`/`opencode` 选择；进行中的会话不允许切换 harness，避免混用 transcript 和外部 session 状态；
+  - OpenCode 的临时 netrc 位于目标 Host 的系统临时目录，不写入 workspace；
   - 需要验证远程 `/pty-ws` 承载 NDJSON 是否可靠；若不可靠，考虑远程端口转发或等价 Host 通道；
   - 远程 HTTP 端口如何安全访问仍是未决设计，本轮不解决；
   - 已否决 `/api/expose-port` + cloudflared：公网暴露 agent 控制面会引入 URL 泄露、隧道生命周期和 cloudflared 可用性风险；目标方案为 Host 上的 `curl`（普通请求走 `Host::exec`，SSE 走 `Host::spawn`）；

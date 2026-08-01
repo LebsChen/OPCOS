@@ -14,6 +14,7 @@ export type Session = {
   model: string;
   provider?: string | null;
   mode: string;
+  harness: string;
   workspace?: string;
   run_state?: string;
   stop_reason?: string;

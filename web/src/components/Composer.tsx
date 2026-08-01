@@ -100,6 +100,13 @@ const mergeAttachments = (
 
 interface Props {
   mode: string;
+  harness?: string;
+  harnessOptions?: Array<{
+    id: string;
+    label: string;
+    available: boolean;
+    reason?: string;
+  }>;
   model: string;
   models?: string[];
   modelLabels?: Record<string, string>; // curated display names (raw id when absent)
@@ -120,6 +127,7 @@ interface Props {
   secrets?: Array<{ name: string }>;
   onUploadFile?: (file: File) => Promise<string>;
   onModeChange?: (mode: string) => void;
+  onHarnessChange?: (harness: string) => void;
   onModelChange: (model: string) => void;
   // When set (Code/Cowork), the Mode menu is shown. The folder/roots + branch controls left the
   // composer for the Session settings drawer (§22) — folder access is standing session config.
@@ -563,6 +571,30 @@ export function Composer(props: Props) {
               onUnattendedChange={props.onUnattendedChange}
             />
           ) : null}
+          {!dictation?.recording &&
+            props.harness &&
+            props.onHarnessChange &&
+            props.harnessOptions?.length && (
+              <select
+                className="chip"
+                title="Harness"
+                value={props.harness}
+                onChange={(event) =>
+                  props.onHarnessChange?.(event.target.value)
+                }
+              >
+                {props.harnessOptions.map((option) => (
+                  <option
+                    key={option.id}
+                    value={option.id}
+                    disabled={!option.available}
+                  >
+                    {option.label}
+                    {!option.available ? " (unavailable)" : ""}
+                  </option>
+                ))}
+              </select>
+            )}
 
           {dictationBusy === "Transcribing…" && (
             <span className="text-[11.5px] text-accent">

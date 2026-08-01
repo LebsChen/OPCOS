@@ -4015,6 +4015,13 @@ function AppContent() {
   const [homeProvider, setHomeProvider] = useState("");
   const [homeModel, setHomeModel] = useState("auto");
   const [homeMode, setHomeMode] = useState("Interactive");
+  const [homeHarness, setHomeHarness] = useState("builtin");
+  const [harnessOptions, setHarnessOptions] = useState<
+    Array<{ id: string; label: string; available: boolean; reason?: string }>
+  >([]);
+  const [selectedHarnessOptions, setSelectedHarnessOptions] = useState<
+    Array<{ id: string; label: string; available: boolean; reason?: string }>
+  >([]);
   const [homeWorkspace, setHomeWorkspace] = useState("");
   const [secretBackend, setSecretBackend] = useState("");
   const generation = useRef(0);
@@ -4075,6 +4082,30 @@ function AppContent() {
   useEffect(() => {
     if (!homeHostId && hosts[0]) setHomeHostId(hosts[0].id);
   }, [hosts, homeHostId]);
+  useEffect(() => {
+    if (!homeHostId) return;
+    void command<
+      Array<{ id: string; label: string; available: boolean; reason?: string }>
+    >("harness_options", { hostId: homeHostId })
+      .then((options) => {
+        setHarnessOptions(options);
+        if (
+          !options.some(
+            (option) => option.id === homeHarness && option.available,
+          )
+        )
+          setHomeHarness("builtin");
+      })
+      .catch(() => setHarnessOptions([]));
+  }, [homeHostId]);
+  useEffect(() => {
+    if (!selected) return;
+    void command<
+      Array<{ id: string; label: string; available: boolean; reason?: string }>
+    >("harness_options", { hostId: selected.host_id })
+      .then(setSelectedHarnessOptions)
+      .catch(() => setSelectedHarnessOptions([]));
+  }, [selected?.id, selected?.host_id]);
   useEffect(() => {
     if (!homeProvider && providers[0]) setHomeProvider(providers[0].name);
   }, [providers, homeProvider]);
@@ -4274,6 +4305,7 @@ function AppContent() {
         model: homeModel || "auto",
         provider: homeProvider || null,
         mode: homeMode,
+        harness: homeHarness,
         workspace: homeWorkspace || null,
       });
       setSelected(next);
@@ -4515,6 +4547,8 @@ function AppContent() {
                 </div>
                 <Composer
                   mode={selected.mode}
+                  harness={selected.harness}
+                  harnessOptions={selectedHarnessOptions}
                   model={selected.model}
                   models={models.map((item) => item.id)}
                   modelLabels={Object.fromEntries(
@@ -4529,6 +4563,14 @@ function AppContent() {
                       mode,
                     })
                       .then(() => setSelected({ ...selected, mode }))
+                      .catch(onError);
+                  }}
+                  onHarnessChange={(harness) => {
+                    void command("change_harness", {
+                      sessionId: selected.id,
+                      harness,
+                    })
+                      .then(() => setSelected({ ...selected, harness }))
                       .catch(onError);
                   }}
                   unattended={unattended}
@@ -4664,6 +4706,26 @@ function AppContent() {
                         setHomePlusOpen(false);
                       }}
                     />
+                    <select
+                      className="chip"
+                      title="Harness"
+                      value={homeHarness}
+                      onChange={(event) => setHomeHarness(event.target.value)}
+                    >
+                      {(harnessOptions.length
+                        ? harnessOptions
+                        : [{ id: "builtin", label: "Builtin", available: true }]
+                      ).map((option) => (
+                        <option
+                          key={option.id}
+                          value={option.id}
+                          disabled={!option.available}
+                        >
+                          {option.label}
+                          {!option.available ? " (unavailable)" : ""}
+                        </option>
+                      ))}
+                    </select>
                     <select
                       className="chip"
                       title="绑定主机"

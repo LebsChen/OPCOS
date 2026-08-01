@@ -192,6 +192,8 @@ pub trait Host: Send + Sync {
     async fn ls(&self, path: Option<&str>) -> Result<DirectoryListing, HostError>;
     fn join(&self, child: &str) -> Result<String, HostError>;
     fn contains(&self, candidate: &str) -> bool;
+    fn temp_file(&self, prefix: &str) -> Result<String, HostError>;
+    fn contains_temp(&self, candidate: &str) -> bool;
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -402,6 +404,19 @@ impl Host for RvmHost {
             .path(candidate)
             .is_ok()
     }
+
+    fn temp_file(&self, prefix: &str) -> Result<String, HostError> {
+        let filename = format!("/{prefix}-{}", Uuid::new_v4().simple());
+        let path = format!("/tmp{filename}");
+        if !path.starts_with("/tmp/") {
+            return Err(HostError::Path("temporary path rejected".into()));
+        }
+        Ok(path)
+    }
+
+    fn contains_temp(&self, candidate: &str) -> bool {
+        candidate.starts_with("/tmp/") && !candidate[5..].contains('/')
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -460,7 +475,13 @@ impl LocalHost {
                     .ok_or_else(|| HostError::Path("path has no file name".into()))?,
             )
         };
-        if canonical != self.root && !canonical.starts_with(&self.root) {
+        let temp_root = std::env::temp_dir();
+        let is_opcos_temp = canonical.parent().is_some_and(|parent| parent == temp_root)
+            && canonical
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("opcos-"));
+        if canonical != self.root && !canonical.starts_with(&self.root) && !is_opcos_temp {
             return Err(HostError::Path("path is outside local workspace".into()));
         }
         Ok(canonical)
@@ -734,7 +755,17 @@ impl Host for LocalHost {
     }
 
     fn contains(&self, candidate: &str) -> bool {
-        self.secure_path(candidate).is_ok()
+        self.secure_path(candidate)
+            .is_ok_and(|path| path == self.root || path.starts_with(&self.root))
+    }
+
+    fn temp_file(&self, prefix: &str) -> Result<String, HostError> {
+        let path = std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4().simple()));
+        Ok(path.display().to_string())
+    }
+
+    fn contains_temp(&self, candidate: &str) -> bool {
+        Path::new(candidate).parent() == Some(std::env::temp_dir().as_path())
     }
 }
 
@@ -1541,6 +1572,17 @@ mod tests {
         assert!(command.contains("(OPCOS_SECRET='value'; export OPCOS_SECRET; eval"));
         #[cfg(windows)]
         assert!(command.contains("setlocal") && command.contains("endlocal"));
+    }
+
+    #[test]
+    fn temporary_paths_are_outside_workspace_and_contained() {
+        let root = tempfile_dir();
+        let host = LocalHost::new(&root).unwrap();
+        let path = host.temp_file("opcos-netrc").unwrap();
+        assert!(!host.contains(&path));
+        assert!(host.contains_temp(&path));
+        assert!(!path.starts_with(&root.display().to_string()));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(windows)]
