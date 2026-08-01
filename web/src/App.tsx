@@ -2884,80 +2884,6 @@ function SessionRightPanel({
   };
   return (
     <aside className="right-rail session-right-panel" style={{ width }}>
-      <div className="session-icon-rail">
-        <div className="rail-group" aria-label="Information">
-          {informationTabs.map((item) => (
-            <button
-              key={item.id}
-              className={`rail-btn${panelTab === item.id ? " active" : ""}`}
-              title={item.label}
-              onClick={() => {
-                openTab(item.id);
-              }}
-            >
-              <Icon name={item.icon} />
-            </button>
-          ))}
-        </div>
-        <div className="rail-sep" />
-        <div className="rail-group" aria-label="Workspace">
-          {workspaceTabs.map((item) => (
-            <button
-              key={item.id}
-              className={`rail-btn${panelTab === item.id ? " active" : ""}`}
-              title={item.label}
-              onClick={() => openTab(item.id)}
-            >
-              <Icon name={item.icon} />
-            </button>
-          ))}
-        </div>
-        <div className="rail-sep" />
-        <div className="rail-group" aria-label="Remote host capabilities">
-          {remoteTabs.map((item) => (
-            <button
-              key={item.id}
-              className={`rail-btn${panelTab === item.id ? " active" : ""}`}
-              title={item.label}
-              onClick={() => openTab(item.id)}
-            >
-              <Icon name={item.icon} />
-            </button>
-          ))}
-        </div>
-        <button
-          className="rail-btn panel-collapse"
-          title={translate("Collapse session panel")}
-          onClick={() => {
-            onCollapsedChange?.(true);
-          }}
-        >
-          <Icon name="sidebarRight" />
-        </button>
-      </div>
-      <div
-        className="session-panel-resizer"
-        role="separator"
-        aria-label="Resize session panel"
-        onPointerDown={(event) => {
-          event.currentTarget.setPointerCapture(event.pointerId);
-          const startX = event.clientX;
-          const startWidth = width;
-          const move = (moveEvent: PointerEvent) => {
-            const next = Math.min(
-              460,
-              Math.max(308, startWidth + startX - moveEvent.clientX),
-            );
-            onWidthChange(next);
-          };
-          const stop = () => {
-            window.removeEventListener("pointermove", move);
-            window.removeEventListener("pointerup", stop);
-          };
-          window.addEventListener("pointermove", move);
-          window.addEventListener("pointerup", stop, { once: true });
-        }}
-      />
       <div className="session-panel-drawer">
         <div className="drawer-head">
           <strong className="drawer-title">
@@ -3079,6 +3005,78 @@ function SessionRightPanel({
               </div>
             ))}
         </div>
+      </div>
+      <div
+        className="session-panel-resizer"
+        role="separator"
+        aria-label="Resize session panel"
+        onPointerDown={(event) => {
+          event.currentTarget.setPointerCapture(event.pointerId);
+          const startX = event.clientX;
+          const startWidth = width;
+          const move = (moveEvent: PointerEvent) => {
+            const next = Math.min(
+              460,
+              Math.max(308, startWidth + startX - moveEvent.clientX),
+            );
+            onWidthChange(next);
+          };
+          const stop = () => {
+            window.removeEventListener("pointermove", move);
+            window.removeEventListener("pointerup", stop);
+          };
+          window.addEventListener("pointermove", move);
+          window.addEventListener("pointerup", stop, { once: true });
+        }}
+      />
+      <div className="session-icon-rail">
+        <div className="rail-group" aria-label="Information">
+          {informationTabs.map((item) => (
+            <button
+              key={item.id}
+              className={`rail-btn${panelTab === item.id ? " active" : ""}`}
+              title={item.label}
+              onClick={() => openTab(item.id)}
+            >
+              <Icon name={item.icon} />
+            </button>
+          ))}
+        </div>
+        <div className="rail-sep" />
+        <div className="rail-group" aria-label="Workspace">
+          {workspaceTabs.map((item) => (
+            <button
+              key={item.id}
+              className={`rail-btn${panelTab === item.id ? " active" : ""}`}
+              title={item.label}
+              onClick={() => openTab(item.id)}
+            >
+              <Icon name={item.icon} />
+            </button>
+          ))}
+        </div>
+        <div className="rail-sep" />
+        <div className="rail-group" aria-label="Remote host capabilities">
+          {remoteTabs.map((item) => (
+            <button
+              key={item.id}
+              className={`rail-btn${panelTab === item.id ? " active" : ""}`}
+              title={item.label}
+              onClick={() => openTab(item.id)}
+            >
+              <Icon name={item.icon} />
+            </button>
+          ))}
+        </div>
+        <button
+          className="rail-btn panel-collapse"
+          title={translate("Collapse session panel")}
+          onClick={() => {
+            onCollapsedChange?.(true);
+          }}
+        >
+          <Icon name="sidebarRight" />
+        </button>
       </div>
     </aside>
   );
