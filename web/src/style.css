@@ -166,7 +166,20 @@ button:disabled {
   letter-spacing: -0.02em;
 }
 .brand-wordmark {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   color: var(--color-ink);
+}
+.brand-logo {
+  display: block;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  background: currentColor;
+  color: var(--color-accent);
+  -webkit-mask: url("/opcos-logo-mark.svg") center / contain no-repeat;
+  mask: url("/opcos-logo-mark.svg") center / contain no-repeat;
 }
 .brand-mark {
   color: var(--color-accent);

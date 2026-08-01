@@ -1016,6 +1016,7 @@ export function Sidebar(props: SidebarProps) {
         data-tauri-drag-region
       >
         <div className="brand-wordmark text-[15px] flex-1">
+          <span className="brand-logo" aria-hidden="true" />
           OPCOS<span className="beta-tag">BETA</span>
         </div>
         {/* Collapse (dock) / pin the sidebar. ⌘B mirrors this. */}
