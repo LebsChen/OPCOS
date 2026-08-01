@@ -1184,7 +1184,7 @@ function ManageSections({
       </header>
       <div
         className={
-          tab === "provider" || tab === "blueprint"
+          tab === "appearance" || tab === "provider" || tab === "blueprint"
             ? "rounded-xl2 border border-line bg-panel p-5"
             : ""
         }
