@@ -2,6 +2,7 @@
   --color-panel: var(--panel);
   --color-panel-raised: var(--panel);
   --color-line: var(--line);
+  --color-selected: var(--line-strong);
   --color-ink: var(--ink);
   --color-muted: var(--muted);
   --color-faint: var(--faint);
@@ -11,6 +12,7 @@
   --color-danger-soft: var(--danger-soft);
   --color-ok: var(--ok);
   --color-warn: var(--warn-ink);
+  --radius-sm: 7px;
   font-family:
     Inter,
     ui-sans-serif,
@@ -676,13 +678,47 @@ h3 {
 .session-icon-rail {
   width: 44px;
   min-width: 44px;
+  flex-shrink: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 4px;
   padding: 10px 0;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
   border-left: 1px solid var(--color-line);
   background: var(--panel);
+}
+.session-icon-rail::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+.session-icon-rail {
+  scrollbar-width: none;
+}
+.rail-btn {
+  display: flex;
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--color-muted);
+  font-size: 15px;
+  transition: all 0.2s;
+}
+.rail-btn:hover {
+  background: var(--paper);
+  color: var(--color-accent);
+}
+.rail-btn.active {
+  background: var(--color-selected);
+  color: var(--color-ink);
 }
 .rail-group {
   display: flex;
@@ -732,8 +768,37 @@ h3 {
   border-bottom: 1px solid var(--color-line);
 }
 .drawer-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--color-ink);
   font-size: 13px;
+  font-weight: 600;
+  text-align: left;
+}
+.drawer-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 8px;
+}
+.drawer-action {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  place-items: center;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--color-muted);
+}
+.drawer-action:hover {
+  background: var(--paper);
+  color: var(--color-ink);
 }
 .session-pane,
 .session-pane > .surface-panel {
@@ -776,6 +841,24 @@ h3 {
   min-height: 0;
   flex: 1;
   overflow: auto;
+}
+.standalone-pane {
+  display: flex;
+  width: 100vw;
+  height: 100vh;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--paper);
+  color: var(--color-ink);
+}
+.standalone-pane .tab-body {
+  min-width: 0;
+  flex: 1;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 14px;
 }
 
 .field {

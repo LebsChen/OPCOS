@@ -2633,6 +2633,162 @@ function Field({ k, v }: { k: string; v: string }) {
   );
 }
 
+type PaneRoute = {
+  sessionId: string;
+  tab: PanelTab;
+};
+
+type PanelTab =
+  | "info"
+  | "pr"
+  | "terminal"
+  | "desktop"
+  | "ide"
+  | "review"
+  | "worklog"
+  | "browser"
+  | "insights";
+
+function paneRoute(): PaneRoute | null {
+  const hash = window.location.hash;
+  if (!hash.startsWith("#/pane?")) return null;
+  const params = new URLSearchParams(hash.slice("#/pane?".length));
+  const sessionId = params.get("session");
+  const tab = params.get("tab") as PanelTab | null;
+  if (!sessionId || !tab) return null;
+  const validTabs: PanelTab[] = [
+    "info",
+    "pr",
+    "terminal",
+    "desktop",
+    "ide",
+    "review",
+    "worklog",
+    "browser",
+    "insights",
+  ];
+  return validTabs.includes(tab) ? { sessionId, tab } : null;
+}
+
+function StandalonePane({ route }: { route: PaneRoute }) {
+  const [selected, setSelected] = useState<Session | null>(null);
+  const [providers, setProviders] = useState<ProviderDescriptor[]>([]);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    void Promise.all([
+      command<Session[]>("list_sessions"),
+      command<ProviderDescriptor[]>("provider_descriptors"),
+    ])
+      .then(([sessions, nextProviders]) => {
+        setSelected(
+          sessions.find((session) => session.id === route.sessionId) ?? null,
+        );
+        setProviders(nextProviders);
+      })
+      .catch((reason) => setError(errorMessage(reason)));
+  }, [route.sessionId]);
+
+  const close = () => {
+    void import("@tauri-apps/api/window")
+      .then(({ getCurrentWindow }) => getCurrentWindow().close())
+      .catch(() => window.close());
+  };
+
+  return (
+    <main className="standalone-pane">
+      <header className="drawer-head">
+        <strong className="drawer-title">{route.tab}</strong>
+        <button
+          className="drawer-action"
+          title="关闭窗口"
+          aria-label="关闭窗口"
+          onClick={close}
+        >
+          <Icon name="x" />
+        </button>
+      </header>
+      <div className="tab-body">
+        {error && <div className="error-banner">{error}</div>}
+        {!error && !selected && <div className="muted">Loading…</div>}
+        {selected && route.tab === "info" && (
+          <div className="info">
+            <Field k={translate("Session ID")} v={selected.id} />
+            <Field k={translate("Status")} v="Ready" />
+            <Field k={translate("Host")} v={selected.host_name} />
+            <Field
+              k={translate("Workspace")}
+              v={selected.workspace || translate("Not set")}
+            />
+            <Field k={translate("Model")} v={selected.model} />
+            <div className="field">
+              <label>Provider</label>
+              <select
+                value={selected.provider || ""}
+                onChange={() => undefined}
+                aria-label="Provider"
+              >
+                <option value="">Global default</option>
+                {providers.map((provider) => (
+                  <option key={provider.name} value={provider.name}>
+                    {provider.title}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+        )}
+        {selected && route.tab === "insights" && (
+          <StandaloneInsights
+            selected={selected}
+            onError={(reason) => setError(errorMessage(reason))}
+          />
+        )}
+        {selected && route.tab !== "info" && route.tab !== "insights" && (
+          <SurfaceView
+            tab={route.tab as SurfaceTab | "pr"}
+            selected={selected}
+            onError={(reason) => setError(errorMessage(reason))}
+          />
+        )}
+      </div>
+    </main>
+  );
+}
+
+function StandaloneInsights({
+  selected,
+  onError,
+}: {
+  selected: Session;
+  onError: (error: unknown) => void;
+}) {
+  const [insights, setInsights] = useState<Record<string, unknown> | null>(
+    null,
+  );
+  useEffect(() => {
+    void command<Record<string, unknown>>("session_insights", {
+      sessionId: selected.id,
+    })
+      .then(setInsights)
+      .catch(onError);
+  }, [selected.id, onError]);
+  if (!insights) return <div className="muted">Loading…</div>;
+  return (
+    <div className="info">
+      {Object.entries(insights)
+        .filter(([key]) => key !== "session_id")
+        .map(([key, value]) => (
+          <Field
+            key={key}
+            k={key}
+            v={typeof value === "string" ? value : JSON.stringify(value)}
+          />
+        ))}
+    </div>
+  );
+}
+
 function SessionRightPanel({
   selected,
   onError,
@@ -2654,16 +2810,6 @@ function SessionRightPanel({
   width: number;
   onWidthChange: (width: number) => void;
 }) {
-  type PanelTab =
-    | "info"
-    | "pr"
-    | "terminal"
-    | "desktop"
-    | "ide"
-    | "review"
-    | "worklog"
-    | "browser"
-    | "insights";
   const [panelTab, setPanelTab] = useState<PanelTab>("info");
   const [opened, setOpened] = useState<PanelTab[]>(["info"]);
   const [insights, setInsights] = useState<Record<string, unknown> | null>(
@@ -2723,6 +2869,18 @@ function SessionRightPanel({
   const openTab = (id: PanelTab) => {
     setPanelTab(id);
     setOpened((items) => (items.includes(id) ? items : [...items, id]));
+  };
+  const openStandalonePane = async () => {
+    const url = new URL(window.location.href);
+    url.search = "";
+    url.hash = `/pane?session=${encodeURIComponent(selected.id)}&tab=${panelTab}`;
+    const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+    new WebviewWindow(`opcos-pane-${panelTab}-${Date.now()}`, {
+      url: url.toString(),
+      title: `${tabs.find((item) => item.id === panelTab)?.label || panelTab} · OPCOS`,
+      width: 900,
+      height: 700,
+    });
   };
   return (
     <aside className="right-rail session-right-panel" style={{ width }}>
@@ -2806,15 +2964,26 @@ function SessionRightPanel({
             {tabs.find((item) => item.id === panelTab)?.label}
           </strong>
           {running && <span className="live-pill">Live</span>}
-          <button
-            className="panel-collapse"
-            title={translate("Collapse session panel")}
-            onClick={() => {
-              onCollapsedChange?.(true);
-            }}
-          >
-            <Icon name="x" />
-          </button>
+          <div className="drawer-actions">
+            <button
+              className="drawer-action"
+              title="在独立窗口打开"
+              aria-label="在独立窗口打开"
+              onClick={() => void openStandalonePane().catch(onError)}
+            >
+              <Icon name="panelOpen" />
+            </button>
+            <button
+              className="drawer-action"
+              title={translate("Collapse session panel")}
+              aria-label={translate("Collapse session panel")}
+              onClick={() => {
+                onCollapsedChange?.(true);
+              }}
+            >
+              <Icon name="x" />
+            </button>
+          </div>
         </div>
         <div className="session-panel-content">
           {opened.includes("info") && (
@@ -3574,9 +3743,10 @@ function AppContent() {
 }
 
 export function App() {
+  const route = paneRoute();
   return (
     <AppErrorBoundary>
-      <AppContent />
+      {route ? <StandalonePane route={route} /> : <AppContent />}
     </AppErrorBoundary>
   );
 }

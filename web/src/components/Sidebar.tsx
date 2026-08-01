@@ -1015,6 +1015,9 @@ export function Sidebar(props: SidebarProps) {
         className="brand px-3.5 pt-2.5 pb-2 flex items-center gap-2"
         data-tauri-drag-region
       >
+        <div className="brand-wordmark text-[15px] flex-1">
+          OPCOS<span className="beta-tag">BETA</span>
+        </div>
         {/* Collapse (dock) / pin the sidebar. ⌘B mirrors this. */}
         {props.onCollapse && (
           <button
@@ -1032,9 +1035,6 @@ export function Sidebar(props: SidebarProps) {
             <Icon name="sidebar" size={16} />
           </button>
         )}
-        <div className="brand-wordmark text-[15px]">
-          OPCOS<span className="beta-tag">BETA</span>
-        </div>
       </div>
 
       {/* New session: split button — primary starts the last-used persona; ▾ picks a specific one. */}
