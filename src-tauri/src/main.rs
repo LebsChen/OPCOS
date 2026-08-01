@@ -317,22 +317,108 @@ fn redact_approval_value(value: &Value) -> Value {
                 .collect(),
         ),
         Value::Array(values) => Value::Array(values.iter().map(redact_approval_value).collect()),
-        Value::String(value) => {
-            let mut redacted = value.clone();
-            if let Some(index) = redacted.to_ascii_lowercase().find("bearer ") {
-                let end = redacted[index + 7..]
-                    .find(|character: char| {
-                        character.is_whitespace()
-                            || matches!(character, '"' | '\'' | ')' | ']' | '}')
-                    })
-                    .map(|offset| index + 7 + offset)
-                    .unwrap_or(redacted.len());
-                redacted.replace_range(index + 7..end, "[redacted]");
-            }
-            Value::String(redacted)
-        }
+        Value::String(value) => Value::String(redact_secret_patterns(value)),
         other => other.clone(),
     }
+}
+
+fn redact_secret_patterns(value: &str) -> String {
+    let mut redacted = value.to_owned();
+    for marker in [
+        "--api-key=",
+        "--password=",
+        "--token=",
+        "x-api-key:",
+        "password=",
+        "github_token=",
+        "token=",
+        "secret=",
+        "bearer ",
+        "basic ",
+    ] {
+        redact_after_marker(&mut redacted, marker);
+    }
+    let mut search_from = 0;
+    while let Some(relative) = redacted.to_ascii_lowercase()[search_from..].find("-u ") {
+        let start = search_from + relative + 3;
+        let end = redacted[start..]
+            .find(char::is_whitespace)
+            .map(|offset| start + offset)
+            .unwrap_or(redacted.len());
+        if let Some(separator) = redacted[start..end].find(':') {
+            let secret_start = start + separator + 1;
+            redacted.replace_range(secret_start..end, "[redacted]");
+        }
+        search_from = end;
+        if search_from >= redacted.len() {
+            break;
+        }
+    }
+    redacted
+}
+
+fn redact_after_marker(value: &mut String, marker: &str) {
+    let marker_len = marker.len();
+    let requires_boundary = matches!(marker, "token=" | "password=" | "secret=");
+    let mut search_from = 0;
+    loop {
+        let lower = value.to_ascii_lowercase();
+        let Some(relative) = lower[search_from..].find(marker) else {
+            break;
+        };
+        let marker_start = search_from + relative;
+        if requires_boundary
+            && marker_start > 0
+            && (value.as_bytes()[marker_start - 1].is_ascii_alphanumeric()
+                || value.as_bytes()[marker_start - 1] == b'_'
+                || value.as_bytes()[marker_start - 1] == b'-')
+        {
+            search_from = marker_start + 1;
+            continue;
+        }
+        let secret_start = marker_start + marker_len;
+        let secret_start = secret_start
+            + value[secret_start..]
+                .find(|character: char| !character.is_whitespace())
+                .unwrap_or(value.len() - secret_start);
+        let secret_end = value[secret_start..]
+            .find(|character: char| {
+                character.is_whitespace() || matches!(character, '"' | '\'' | ')' | ']' | '}' | ',')
+            })
+            .map(|offset| secret_start + offset)
+            .unwrap_or(value.len());
+        if secret_start < secret_end {
+            value.replace_range(secret_start..secret_end, "[redacted]");
+            search_from = secret_start + "[redacted]".len();
+        } else {
+            break;
+        }
+    }
+}
+
+fn emit_approval_decision(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    session_id: &str,
+    call_id: &str,
+    approve: bool,
+) {
+    emit(
+        app,
+        "approval_resolved",
+        Some(session_id),
+        json!({"call_id":call_id,"approve":approve}),
+    );
+    audit(
+        state,
+        session_id,
+        if approve {
+            "approval_allowed"
+        } else {
+            "approval_denied"
+        },
+        json!({"call_id": call_id, "approved": approve}),
+    );
 }
 
 fn overlay_running_tool_status(
@@ -1549,44 +1635,14 @@ async fn resolve_approval(
         .map(|_| ());
     match result {
         Ok(()) => {
-            emit(
-                &app,
-                "approval_resolved",
-                Some(&session_id),
-                json!({"call_id":call_id,"approve":approve}),
-            );
-            audit(
-                &state,
-                &session_id,
-                if approve {
-                    "approval_allowed"
-                } else {
-                    "approval_denied"
-                },
-                json!({"call_id": call_id, "approved": approve}),
-            );
+            emit_approval_decision(&app, &state, &session_id, &call_id, approve);
             let _ = emit_pending_approval(&app, &state, &session_id)?;
             emit(&app, "turn_done", Some(&session_id), json!({}));
             Ok(())
         }
         Err(opcos_engine::EngineError::ApprovalPending(next_call_id)) => {
             let _ = next_call_id;
-            emit(
-                &app,
-                "approval_resolved",
-                Some(&session_id),
-                json!({"call_id":call_id,"approve":approve}),
-            );
-            audit(
-                &state,
-                &session_id,
-                if approve {
-                    "approval_allowed"
-                } else {
-                    "approval_denied"
-                },
-                json!({"call_id": call_id, "approved": approve}),
-            );
+            emit_approval_decision(&app, &state, &session_id, &call_id, approve);
             emit_pending_approval(&app, &state, &session_id)?;
             emit(&app, "turn_done", Some(&session_id), json!({}));
             Ok(())
@@ -1596,7 +1652,10 @@ async fn resolve_approval(
             emit(&app, "turn_done", Some(&session_id), json!({}));
             Ok(())
         }
-        Err(error) => Err(engine_error_message(error)),
+        Err(error) => {
+            emit_approval_decision(&app, &state, &session_id, &call_id, approve);
+            Err(engine_error_message(error))
+        }
     }
 }
 
@@ -3149,6 +3208,40 @@ mod m7_tests {
             "curl -H \"Authorization: Bearer [redacted]\" https://api.example.com/deploy"
         );
         assert_eq!(assistant["tool_calls"][0]["result"], "Bearer [redacted]");
+    }
+
+    #[test]
+    fn transcript_redacts_common_shell_credential_forms_without_hiding_commands() {
+        let cases = [
+            (
+                "curl -u user:ghp_xxx https://api.example.com",
+                "curl -u user:[redacted] https://api.example.com",
+            ),
+            (
+                "curl -H \"X-Api-Key: xxx\" https://api.example.com",
+                "curl -H \"X-Api-Key: [redacted]\" https://api.example.com",
+            ),
+            (
+                "curl -H \"Authorization: Basic dXNlcjpwYXNz\" https://api.example.com",
+                "curl -H \"Authorization: Basic [redacted]\" https://api.example.com",
+            ),
+            (
+                "run --token=abc --password=pwd --api-key=key",
+                "run --token=[redacted] --password=[redacted] --api-key=[redacted]",
+            ),
+            (
+                "export TOKEN=abc GITHUB_TOKEN=def && deploy --path /workspace",
+                "export TOKEN=[redacted] GITHUB_TOKEN=[redacted] && deploy --path /workspace",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(redact_secret_patterns(input), expected);
+            assert!(
+                redact_secret_patterns(input).contains("deploy")
+                    || redact_secret_patterns(input).contains("curl")
+                    || redact_secret_patterns(input).contains("run")
+            );
+        }
     }
 
     #[test]
