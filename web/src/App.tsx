@@ -2075,7 +2075,9 @@ function McpManage({
           <>
             {servers
               .filter((server) =>
-                String(server.name).toLowerCase().includes(search.toLowerCase()),
+                String(server.name)
+                  .toLowerCase()
+                  .includes(search.toLowerCase()),
               )
               .map((server) => (
                 <div className="manage-row px-4" key={String(server.id)}>
@@ -2092,7 +2094,9 @@ function McpManage({
                         serverId: String(server.id),
                       })
                         .then(() =>
-                          command<Array<Record<string, unknown>>>("list_mcp_servers"),
+                          command<Array<Record<string, unknown>>>(
+                            "list_mcp_servers",
+                          ),
                         )
                         .then(setServers)
                         .catch(onError)
