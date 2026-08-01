@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { Icon, type IconName } from "./Icon";
 
 export type SettingsSection =
+  | "appearance"
   | "provider"
   | "hosts"
   | "agents"
@@ -13,6 +14,7 @@ export type SettingsSection =
   | "blueprint";
 
 const tabs: Array<{ key: SettingsSection; label: string; icon: IconName }> = [
+  { key: "appearance", label: "General", icon: "sliders" },
   { key: "provider", label: "Provider", icon: "sparkle" },
   { key: "hosts", label: "Hosts", icon: "folder" },
   { key: "agents", label: "AGENTS.md", icon: "fileCode" },

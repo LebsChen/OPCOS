@@ -1118,6 +1118,18 @@ function ManageSections({
   const [remoteAssetAction, setRemoteAssetAction] = useState<
     "discovering" | "importing" | "exporting" | null
   >(null);
+  const [theme, setTheme] = useState<"light" | "dark" | "auto">(() => {
+    const stored = localStorage.getItem("opcos.theme");
+    return stored === "dark" || stored === "auto" ? stored : "light";
+  });
+  useEffect(() => {
+    localStorage.setItem("opcos.theme", theme);
+    const dark =
+      theme === "dark" ||
+      (theme === "auto" &&
+        window.matchMedia("(prefers-color-scheme: dark)").matches);
+    document.documentElement.dataset.theme = dark ? "dark" : "light";
+  }, [theme]);
   const [blueprint, setBlueprint] = useState<Record<string, unknown> | null>(
     null,
   );
@@ -1144,6 +1156,7 @@ function ManageSections({
       "Inspect secret metadata without exposing secret values.",
     ],
     blueprint: ["Blueprint", "Read and manage the selected host blueprint."],
+    appearance: ["General", "Set the appearance of the OPCOS workbench."],
   };
   const assetKinds = ["agents", "knowledge", "playbook", "skill"] as const;
   const assetTabKind = assetKinds.includes(tab as (typeof assetKinds)[number])
@@ -1176,6 +1189,28 @@ function ManageSections({
             : ""
         }
       >
+        {tab === "appearance" && (
+          <div className="divide-y divide-line">
+            <div className="settings-row">
+              <div>
+                <strong>Theme</strong>
+                <small>Choose the light, dark, or system appearance.</small>
+              </div>
+              <div className="seg">
+                {(["light", "dark", "auto"] as const).map((value) => (
+                  <button
+                    key={value}
+                    className={theme === value ? "active" : ""}
+                    onClick={() => setTheme(value)}
+                    type="button"
+                  >
+                    {value[0].toUpperCase() + value.slice(1)}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
         {tab === "provider" && (
           <div className="divide-y divide-line">
             <div className="settings-row">
@@ -2099,22 +2134,26 @@ function Activity({
         </nav>
         <div className="flex-1 min-w-0 overflow-y-auto">
           <div className="w-full px-7 py-6">
-            <PageHeader
-              title={activityTab[0].toUpperCase() + activityTab.slice(1)}
-              subtitle={
-                (
-                  {
-                    board: "Start or observe the active coordination board.",
-                    roles: "Review board roles and their current state.",
-                    tasks:
-                      "Create, claim, complete, and verify coordination tasks.",
-                    messages: "Send and review coordination messages.",
-                    worklog: "Inspect the remote session worklog timeline.",
-                    insights: "Review cross-session activity insights.",
-                  } as const
-                )[activityTab]
-              }
-            />
+            <header className="mb-5">
+              <h1 className="text-[22px] font-semibold text-ink">
+                {activityTab[0].toUpperCase() + activityTab.slice(1)}
+              </h1>
+              <p className="text-[13px] text-muted mt-1">
+                {
+                  (
+                    {
+                      board: "Start or observe the active coordination board.",
+                      roles: "Review board roles and their current state.",
+                      tasks:
+                        "Create, claim, complete, and verify coordination tasks.",
+                      messages: "Send and review coordination messages.",
+                      worklog: "Inspect the remote session worklog timeline.",
+                      insights: "Review cross-session activity insights.",
+                    } as const
+                  )[activityTab]
+                }
+              </p>
+            </header>
             {activityTab === "worklog" && (
               <CollectionPage
                 search=""
@@ -2256,9 +2295,191 @@ function Activity({
                       empty="No roles loaded yet. Start or observe a board."
                     />
                   )}
-                  <section
-                    className={`board-column ${activityTab !== "tasks" ? "hidden" : ""}`}
-                  >
+                  {activityTab === "tasks" && (
+                    <CollectionPage
+                      search=""
+                      onSearch={() => undefined}
+                      searchPlaceholder="Search tasks"
+                      primary={
+                        <Button
+                          className="primary"
+                          onClick={() => setTaskFormOpen(true)}
+                        >
+                          New task
+                        </Button>
+                      }
+                      rows={
+                        board?.tasks.length ? (
+                          <>
+                            {board.tasks.map((task) => (
+                              <div
+                                className="manage-row px-4"
+                                key={String(task.id || task.title)}
+                              >
+                                <span>
+                                  <strong>
+                                    {String(task.title || task.id)}
+                                  </strong>
+                                  <small>{String(task.phase)}</small>
+                                </span>
+                                <span className="inline-actions">
+                                  <Button
+                                    className="bordered"
+                                    onClick={() =>
+                                      command("coordination_claim_task", {
+                                        id: task.id,
+                                        worker,
+                                      })
+                                        .then(load)
+                                        .catch(onError)
+                                    }
+                                  >
+                                    Claim
+                                  </Button>
+                                  <Button
+                                    className="bordered"
+                                    onClick={() =>
+                                      command("coordination_complete_task", {
+                                        id: task.id,
+                                        worker,
+                                        verifiedPrUrl: prUrl || null,
+                                      })
+                                        .then(load)
+                                        .catch(onError)
+                                    }
+                                  >
+                                    Complete
+                                  </Button>
+                                </span>
+                              </div>
+                            ))}
+                          </>
+                        ) : null
+                      }
+                      empty="No coordination tasks yet."
+                      form={
+                        taskFormOpen ? (
+                          <div className="rounded-xl2 border border-line bg-panel p-5">
+                            <div className="inline-actions">
+                              <input
+                                value={taskTitle}
+                                onChange={(event) =>
+                                  setTaskTitle(event.target.value)
+                                }
+                                placeholder="New task"
+                              />
+                              <input
+                                value={worker}
+                                onChange={(event) =>
+                                  setWorker(event.target.value)
+                                }
+                                placeholder="Worker / assignee"
+                              />
+                              <input
+                                value={prUrl}
+                                onChange={(event) =>
+                                  setPrUrl(event.target.value)
+                                }
+                                placeholder="Verified PR URL"
+                              />
+                              <Button
+                                className="primary"
+                                disabled={!taskId}
+                                onClick={() =>
+                                  command("coordination_create_task", {
+                                    id: `task-${Date.now()}`,
+                                    title: taskTitle,
+                                    requireAcceptance: true,
+                                  })
+                                    .then(load)
+                                    .catch(onError)
+                                }
+                              >
+                                Create
+                              </Button>
+                            </div>
+                          </div>
+                        ) : undefined
+                      }
+                    />
+                  )}
+                  {activityTab === "messages" && (
+                    <CollectionPage
+                      search=""
+                      onSearch={() => undefined}
+                      searchPlaceholder="Search messages"
+                      primary={
+                        <Button
+                          className="primary"
+                          onClick={() => setMessageFormOpen(true)}
+                        >
+                          New message
+                        </Button>
+                      }
+                      rows={
+                        board?.messages.length ? (
+                          <>
+                            {board.messages.map((item) => (
+                              <div
+                                className="manage-row px-4"
+                                key={String(item.msg_id)}
+                              >
+                                <span>
+                                  <strong>
+                                    {String(item.from)} → {String(item.to)}
+                                  </strong>
+                                  <small>
+                                    Kind: {String(item.kind)} · Message:{" "}
+                                    {String(item.msg_id)}
+                                  </small>
+                                </span>
+                              </div>
+                            ))}
+                          </>
+                        ) : null
+                      }
+                      empty="No coordination messages yet."
+                      form={
+                        messageFormOpen ? (
+                          <div className="rounded-xl2 border border-line bg-panel p-5">
+                            <label className="field-label">
+                              Message envelope
+                            </label>
+                            <textarea
+                              value={message}
+                              onChange={(event) =>
+                                setMessage(event.target.value)
+                              }
+                              placeholder='{"kind":"status","payload":{}}'
+                            />
+                            <Button
+                              className="bordered"
+                              disabled={!taskId}
+                              onClick={() => {
+                                try {
+                                  const envelope = JSON.parse(message);
+                                  void command("coordination_message", {
+                                    taskId,
+                                    envelope,
+                                  })
+                                    .then(() => {
+                                      setMessageFormOpen(false);
+                                      return load();
+                                    })
+                                    .catch(onError);
+                                } catch {
+                                  onError("Message must be valid JSON.");
+                                }
+                              }}
+                            >
+                              Send message
+                            </Button>
+                          </div>
+                        ) : undefined
+                      }
+                    />
+                  )}
+                  <section className="hidden">
                     <div className="inline-actions mb-3">
                       <input placeholder="Search tasks" />
                       <Button
@@ -2363,9 +2584,7 @@ function Activity({
                       <p className="empty-state">No coordination tasks yet.</p>
                     )}
                   </section>
-                  <section
-                    className={`board-column ${activityTab !== "messages" ? "hidden" : ""}`}
-                  >
+                  <section className="hidden">
                     <div className="inline-actions mb-3">
                       <input placeholder="Search messages" />
                       <Button
