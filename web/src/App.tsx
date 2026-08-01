@@ -3674,7 +3674,7 @@ function AppContent() {
                       value={homeHostId}
                       onChange={(event) => setHomeHostId(event.target.value)}
                     >
-                      <option value="">主机: 未选择</option>
+                      <option value="">未选择</option>
                       {hosts.map((host) => (
                         <option key={host.id} value={host.id}>
                           {host.name}
@@ -3687,7 +3687,7 @@ function AppContent() {
                       value={homeProvider}
                       onChange={(event) => setHomeProvider(event.target.value)}
                     >
-                      <option value="">Provider: 默认</option>
+                      <option value="">默认</option>
                       {providers.map((provider) => (
                         <option key={provider.name} value={provider.name}>
                           {provider.title}
@@ -3700,7 +3700,7 @@ function AppContent() {
                       value={homeModel}
                       onChange={(event) => setHomeModel(event.target.value)}
                     >
-                      <option value="auto">模型: Auto</option>
+                      <option value="auto">Auto</option>
                       {models.map((model) => (
                         <option key={model.id} value={model.id}>
                           {model.label}
@@ -3713,8 +3713,8 @@ function AppContent() {
                       value={homeMode}
                       onChange={(event) => setHomeMode(event.target.value)}
                     >
-                      <option value="Interactive">模式: Interactive</option>
-                      <option value="Auto">模式: Auto</option>
+                      <option value="Interactive">Interactive</option>
+                      <option value="Auto">Auto</option>
                     </select>
                     <input
                       className="chip workspace-chip"
