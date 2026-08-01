@@ -97,6 +97,9 @@ interface Props {
   onSend: (text: string, attachments?: Attachment[]) => void;
   onSteer?: (text: string, attachments?: Attachment[]) => void;
   onInterrupt: () => void;
+  assets?: Array<{ kind: string; title: string }>;
+  secrets?: Array<{ name: string }>;
+  onUploadFile?: (file: File) => Promise<string>;
   onModeChange?: (mode: string) => void;
   onModelChange: (model: string) => void;
   // When set (Code/Cowork), the Mode menu is shown. The folder/roots + branch controls left the
@@ -125,6 +128,7 @@ interface Props {
 export function Composer(props: Props) {
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [plusOpen, setPlusOpen] = useState(false);
   const [dictation, setDictation] = useState<DictationStatus | null>(null);
   const [dictationBusy, setDictationBusy] = useState<string | null>(null);
   const [dictationError, setDictationError] = useState<string | null>(null);
@@ -299,16 +303,42 @@ export function Composer(props: Props) {
     if (next.length) setAttachments((a) => mergeAttachments(a, next));
   };
 
-  // The "+" menu offers typed shortcuts; each just narrows the OS picker's filter.
-  const pickFiles = (accept: string) => {
-    setAttachMenuOpen(false);
-    if (fileInput.current) {
-      fileInput.current.accept = accept;
-      fileInput.current.click();
-    }
+  const needsModel = props.modelReady === false;
+
+  const insertReference = (value: string) => {
+    setText((current) =>
+      current.trim() ? `${current.trimEnd()} ${value}` : value,
+    );
+    setPlusOpen(false);
+    textareaRef.current?.focus();
   };
 
-  const needsModel = props.modelReady === false;
+  const uploadFile = async (file: File) => {
+    if (!props.onUploadFile) return;
+    if (file.size > 256 * 1024) {
+      setAttachNotice("Text attachments are limited to 256 KiB.");
+      return;
+    }
+    if (
+      !file.type.startsWith("text/") &&
+      !/\.(md|txt|json|ya?ml|csv|log|rs|ts|tsx|js|py|go|toml)$/i.test(file.name)
+    ) {
+      setAttachNotice("Only text attachments are supported.");
+      return;
+    }
+    try {
+      const path = await props.onUploadFile(file);
+      setAttachments((current) => [
+        ...current,
+        { kind: "text", name: file.name, text: "" },
+      ]);
+      insertReference(`[Attached file: ${path}]`);
+    } catch (error) {
+      setAttachNotice(
+        error instanceof Error ? error.message : "Attachment upload failed.",
+      );
+    }
+  };
 
   const submit = () => {
     const t = text.trim();
@@ -453,8 +483,37 @@ export function Composer(props: Props) {
           rows={1}
         />
 
+        <div className="pending-files">
+          {attachments.map((attachment, index) => (
+            <span className="pill att-pill" key={`${attachment.name}-${index}`}>
+              <span>{attachment.name}</span>
+              <button
+                className="pill-x"
+                type="button"
+                title="Remove attachment reference"
+                onClick={() =>
+                  setAttachments((current) =>
+                    current.filter((_, itemIndex) => itemIndex !== index),
+                  )
+                }
+              >
+                ×
+              </button>
+            </span>
+          ))}
+        </div>
+
         {/* Mode, model, and send/steer controls are the real OPCOS composer actions. */}
         <div className="composer-row">
+          <PlusMenu
+            open={plusOpen}
+            onOpenChange={setPlusOpen}
+            onUpload={uploadFile}
+            onInsert={insertReference}
+            assets={props.assets}
+            secrets={props.secrets}
+            session
+          />
           {/* Listening replaces the quiet middle controls with a LIVE waveform (mic RMS,
               polled ~10Hz, scrolling left) + elapsed time (§37). */}
           {dictation?.recording ? (
@@ -582,43 +641,18 @@ export function Composer(props: Props) {
           )}
 
           {/* send / stop */}
-          {props.running ? (
-            <button className="btn danger" onClick={props.onInterrupt}>
-              ⏹ Stop
-            </button>
-          ) : (
-            <button
-              className={
-                "w-7 h-7 rounded-full grid place-items-center shrink-0 transition-colors " +
-                (hasContent &&
-                props.connected &&
-                !dictation?.recording &&
-                !dictationBusy
-                  ? "bg-accent text-white hover:brightness-105"
-                  : "bg-paper border border-line text-faint")
-              }
-              onClick={submit}
-              disabled={
-                !props.connected || !!dictation?.recording || !!dictationBusy
-              }
-              title={needsModel ? "Connect a model to send" : undefined}
-              aria-label={translate("Send")}
-            >
-              <svg
-                width="15"
-                height="15"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth={2}
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                aria-hidden="true"
-              >
-                <path d="M12 19V5M5 12l7-7 7 7" />
-              </svg>
-            </button>
-          )}
+          <SendButton
+            running={props.running}
+            disabled={
+              !props.connected ||
+              !!dictation?.recording ||
+              !!dictationBusy ||
+              (!hasContent && !props.running)
+            }
+            onSend={submit}
+            onInterrupt={props.onInterrupt}
+            title={needsModel ? "Connect a model to send" : undefined}
+          />
         </div>
       </div>
       <span className="sr-only" role="status" aria-live="polite">
@@ -627,6 +661,164 @@ export function Composer(props: Props) {
           : dictationBusy || ""}
       </span>
     </div>
+  );
+}
+
+export function SendButton({
+  running,
+  disabled,
+  onSend,
+  onInterrupt,
+  title,
+}: {
+  running: boolean;
+  disabled?: boolean;
+  onSend: () => void;
+  onInterrupt: () => void;
+  title?: string;
+}) {
+  return (
+    <button
+      className={`send-btn${running ? " sending" : ""}`}
+      type="button"
+      onClick={running ? onInterrupt : onSend}
+      disabled={disabled && !running}
+      title={title}
+      aria-label={running ? "Stop" : "Send"}
+    >
+      {running ? (
+        <span aria-hidden="true">■</span>
+      ) : (
+        <svg
+          width="15"
+          height="15"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={2}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+        >
+          <path d="M12 19V5M5 12l7-7 7 7" />
+        </svg>
+      )}
+    </button>
+  );
+}
+
+export function PlusMenu({
+  open,
+  onOpenChange,
+  onUpload,
+  onInsert,
+  assets = [],
+  secrets = [],
+  session = false,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onUpload?: (file: File) => void | Promise<void>;
+  onInsert: (value: string) => void;
+  assets?: Array<{ kind: string; title: string }>;
+  secrets?: Array<{ name: string }>;
+  session?: boolean;
+}) {
+  const fileRef = useRef<HTMLInputElement>(null);
+  const wrapRef = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const close = (event: MouseEvent) => {
+      if (!wrapRef.current?.contains(event.target as Node)) onOpenChange(false);
+    };
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, [open, onOpenChange]);
+  const upload = () => {
+    onOpenChange(false);
+    fileRef.current?.click();
+  };
+  const assetItems = assets.filter((asset) =>
+    ["agents", "knowledge", "playbook", "skill"].includes(asset.kind),
+  );
+  return (
+    <span className="plus-menu-wrap" ref={wrapRef}>
+      <input
+        ref={fileRef}
+        type="file"
+        accept=".md,.txt,.json,.yaml,.yml,.csv,.log,.rs,.ts,.tsx,.js,.py,.go,.toml,text/*"
+        hidden
+        onChange={(event) => {
+          const file = event.target.files?.[0];
+          event.target.value = "";
+          if (file) void onUpload?.(file);
+        }}
+      />
+      <button
+        className="icon-btn"
+        type="button"
+        aria-label="More composer actions"
+        title="More composer actions"
+        onClick={() => onOpenChange(!open)}
+      >
+        +
+      </button>
+      {open && (
+        <div className="plus-menu">
+          {session && onUpload && (
+            <button type="button" onClick={upload}>
+              <span className="pm-icon">＋</span>
+              Upload text attachment
+            </button>
+          )}
+          {assetItems.length > 0 && (
+            <>
+              <div className="pm-divider" />
+              {assetItems.map((asset) => (
+                <button
+                  type="button"
+                  key={`${asset.kind}:${asset.title}`}
+                  onClick={() =>
+                    onInsert(
+                      asset.kind === "agents"
+                        ? "@AGENTS.md"
+                        : `@${asset.kind}:${asset.title}`,
+                    )
+                  }
+                >
+                  <span className="pm-icon">@</span>
+                  {asset.kind === "agents" ? "AGENTS.md" : asset.title}
+                </button>
+              ))}
+            </>
+          )}
+          {secrets.length > 0 && (
+            <>
+              <div className="pm-divider" />
+              {secrets.map((secret) => (
+                <button
+                  type="button"
+                  key={secret.name}
+                  onClick={() => onInsert(`secret:session:${secret.name}`)}
+                >
+                  <span className="pm-icon">⌕</span>
+                  {secret.name}
+                </button>
+              ))}
+            </>
+          )}
+          {!session && (
+            <>
+              <div className="pm-divider" />
+              <button type="button" onClick={() => onInsert("@")}>
+                <span className="pm-icon">@</span>
+                Insert asset reference
+              </button>
+            </>
+          )}
+        </div>
+      )}
+    </span>
   );
 }
 

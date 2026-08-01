@@ -31,7 +31,7 @@ use opcos_provider::registry;
 use opcos_provider::{Provider, ProviderConfig};
 use opcos_rvm::{
     ExecRequest, HttpRvmClient, IdeBootstrap, PersistentShell, RvmClient, RvmClientConfig, WsKind,
-    WsParams,
+    WsParams, join_remote_path,
 };
 use opcos_store::{KeyringSecretStore, SecretStore, SessionStore, SqliteStore};
 use rusqlite::{Connection, params};
@@ -1398,6 +1398,65 @@ async fn submit_turn(
             Err(message)
         }
     }
+}
+
+#[tauri::command]
+async fn upload_text_attachment(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    file_name: String,
+    content: String,
+) -> Result<String, String> {
+    if file_name.is_empty()
+        || file_name == "."
+        || file_name == ".."
+        || file_name.contains(['/', '\\', '\0'])
+    {
+        return Err("attachment name must be a single file name".into());
+    }
+    if file_name.len() > 160 {
+        return Err("attachment name is too long".into());
+    }
+    if content.len() > 256 * 1024 {
+        return Err("text attachments are limited to 256 KiB".into());
+    }
+    let (host_id, workspace) = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        connection
+            .query_row(
+                "SELECT host_id,workspace FROM sessions WHERE id=?1",
+                [&session_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|_| "session not found".to_owned())?
+    };
+    let client = client_for(&state, &host_id)?;
+    let workspace = if workspace.is_empty() {
+        client
+            .health()
+            .await
+            .map_err(|error| format!("remote host unavailable: {error}"))?
+            .workspace
+            .ok_or_else(|| "remote host did not provide a workspace".to_owned())?
+    } else {
+        workspace
+    };
+    let path = join_remote_path(
+        &workspace,
+        &format!(
+            ".opcos-upload-{}-{file_name}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ),
+    );
+    client
+        .with_workspace(workspace)
+        .write(&path, &content)
+        .await
+        .map_err(|error| format!("remote attachment upload failed: {error}"))?;
+    Ok(path)
 }
 
 #[tauri::command]
@@ -2935,6 +2994,7 @@ fn main() {
             list_sessions,
             read_transcript,
             submit_turn,
+            upload_text_attachment,
             interrupt,
             steering,
             resolve_approval,

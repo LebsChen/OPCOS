@@ -30,7 +30,7 @@ import {
 } from "./transcript";
 import { Sidebar } from "./components/Sidebar";
 import { Transcript } from "./components/Transcript";
-import { Composer } from "./components/Composer";
+import { Composer, PlusMenu, SendButton } from "./components/Composer";
 import { SelectMenu as OpenWorkerSelectMenu } from "./components/SelectMenu";
 import { SettingsView, type SettingsSection } from "./components/SettingsView";
 import { Icon } from "./components/Icon";
@@ -2883,10 +2883,7 @@ function SessionRightPanel({
     });
   };
   return (
-    <aside
-      className="right-shell right-rail session-right-panel"
-      style={{ width }}
-    >
+    <aside className="right-shell right-rail session-right-panel">
       <div className="right-panel session-panel-drawer">
         <div className="drawer-head">
           <strong className="drawer-title">
@@ -3154,6 +3151,7 @@ function AppContent() {
     [],
   );
   const [homeInput, setHomeInput] = useState("");
+  const [homePlusOpen, setHomePlusOpen] = useState(false);
   const [homeHostId, setHomeHostId] = useState("");
   const [homeProvider, setHomeProvider] = useState("");
   const [homeModel, setHomeModel] = useState("auto");
@@ -3463,6 +3461,14 @@ function AppContent() {
       onError(submitFailureMessage(reason));
     });
   };
+  const uploadTextAttachment = async (file: File) => {
+    if (!selected) throw new Error("Select a session before uploading.");
+    return command<string>("upload_text_attachment", {
+      sessionId: selected.id,
+      fileName: file.name,
+      content: await file.text(),
+    });
+  };
   const steer = (text: string) => {
     if (!selected) return;
     void command("steering", { sessionId: selected.id, text }).catch(onError);
@@ -3594,6 +3600,9 @@ function AppContent() {
                       onError,
                     )
                   }
+                  assets={assets}
+                  secrets={secrets}
+                  onUploadFile={uploadTextAttachment}
                   resetKey={selected.id}
                 />
               </div>
@@ -3646,6 +3655,19 @@ function AppContent() {
                     }}
                   />
                   <div className="composer-row">
+                    <PlusMenu
+                      open={homePlusOpen}
+                      onOpenChange={setHomePlusOpen}
+                      onInsert={(value) =>
+                        setHomeInput((current) =>
+                          current.trim()
+                            ? `${current.trimEnd()} ${value}`
+                            : value,
+                        )
+                      }
+                      assets={assets}
+                      secrets={secrets}
+                    />
                     <select
                       className="chip"
                       title="绑定主机"
@@ -3702,14 +3724,13 @@ function AppContent() {
                       placeholder="Workspace"
                     />
                     <span className="spacer" />
-                    <button
-                      className={`send-btn${running ? " sending" : ""}`}
-                      disabled={running || !homeInput.trim() || !homeHostId}
-                      onClick={() => void submitHome()}
+                    <SendButton
+                      running={running}
+                      disabled={!homeInput.trim() || !homeHostId}
+                      onSend={() => void submitHome()}
+                      onInterrupt={() => undefined}
                       title="发送并创建会话"
-                    >
-                      {running ? "…" : "↑"}
-                    </button>
+                    />
                   </div>
                 </div>
               </div>
