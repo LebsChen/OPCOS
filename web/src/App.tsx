@@ -1746,7 +1746,7 @@ function Automations({
           {(["schedules", "runs"] as const).map((item) => (
             <button
               key={item}
-              className={`w-full text-left px-2.5 py-2 rounded-lg text-[13px] ${
+              className={`w-full text-left px-2.5 py-2 rounded-lg text-[13px] flex items-center gap-2 ${
                 automationTab === item
                   ? "bg-paper text-accent font-medium"
                   : "text-muted hover:bg-paper hover:text-ink"
@@ -1920,7 +1920,7 @@ function Activity({
           ).map((item) => (
             <button
               key={item}
-              className={`w-full text-left px-2.5 py-2 rounded-lg text-[13px] ${activityTab === item ? "bg-paper text-accent font-medium" : "text-muted hover:bg-paper hover:text-ink"}`}
+              className={`w-full text-left px-2.5 py-2 rounded-lg text-[13px] flex items-center gap-2 ${activityTab === item ? "bg-paper text-accent font-medium" : "text-muted hover:bg-paper hover:text-ink"}`}
               onClick={() => {
                 setActivityTab(item);
                 if (item === "worklog" && selected)
