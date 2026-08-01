@@ -77,8 +77,8 @@ clone → initialize → maintenance → post-build → pre-push
 
 - `clone`、`initialize`、`post-build`、`pre-push` 是硬失败；
 - `maintenance` 是软失败，失败命令会审计并继续执行后续命令；
-- `post-build` 失败不生成可复用快照或环境就绪标记；
-- `initialize` 失败不缓存结果，下次仍重新执行；
+- `post-build` 失败不生成可复用快照或环境就绪标记；当前 OPCOS 尚无环境复用/快照机制，因此暂无缓存可失效；
+- `initialize` 失败不缓存结果，下次仍重新执行；当前 OPCOS 尚无环境就绪缓存，因此该语义待环境复用机制引入后生效；
 - `pre-push` 按顺序执行，首条非零命令立即阻止 push；
 - 阶段开始、命令结束/失败、阶段结束/失败均写入 `audit_events`；
 - audit/transcript/UI 输出沿用现有脱敏出口；

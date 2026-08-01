@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-pub use opcos_rvm::DEFAULT_EXEC_TIMEOUT_SECONDS;
 use opcos_rvm::{
     Capabilities as RvmCapabilities, CommandResult, DirectoryListing, ExecRequest, ExecResult,
     FileContent, Health, HttpRvmClient, RvmClient, RvmError,
 };
+pub use opcos_rvm::{DEFAULT_EXEC_TIMEOUT_SECONDS, LIFECYCLE_EXEC_TIMEOUT_SECONDS};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -98,6 +98,7 @@ pub struct LifecycleCommandResult {
 pub async fn execute_lifecycle_stage(
     host: &dyn Host,
     stage: LifecycleStage,
+    cwd: Option<String>,
     commands: impl IntoIterator<Item = String>,
 ) -> Result<Vec<LifecycleCommandResult>, HostError> {
     let soft_failure = stage.is_soft_failure();
@@ -107,8 +108,8 @@ pub async fn execute_lifecycle_stage(
         let (exit_code, stdout, stderr, timed_out) = match host
             .exec(ExecRequest {
                 command: command.clone(),
-                cwd: None,
-                timeout_seconds: DEFAULT_EXEC_TIMEOUT_SECONDS,
+                cwd: cwd.clone(),
+                timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
                 session: None,
                 env: None,
             })
@@ -917,6 +918,7 @@ mod tests {
         let results = execute_lifecycle_stage(
             &host,
             LifecycleStage::Maintenance,
+            None,
             vec![shell_failure_command(), shell_output_command("continued")],
         )
         .await
@@ -935,6 +937,7 @@ mod tests {
         let results = execute_lifecycle_stage(
             &host,
             LifecycleStage::PrePush,
+            None,
             vec![shell_failure_command(), shell_output_command("blocked")],
         )
         .await

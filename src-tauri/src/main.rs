@@ -25,7 +25,8 @@ use opcos_engine::{
     orchestration::{CoordinationRuntime, Envelope, Role},
 };
 use opcos_hosts::{
-    DEFAULT_EXEC_TIMEOUT_SECONDS, Host, LifecycleStage, LocalHost, RvmHost, execute_lifecycle_stage,
+    DEFAULT_EXEC_TIMEOUT_SECONDS, Host, LIFECYCLE_EXEC_TIMEOUT_SECONDS, LifecycleStage, LocalHost,
+    RvmHost, execute_lifecycle_stage,
 };
 use opcos_mcp::{
     McpCredentialStore, McpManager, McpServerConfig, qualified_tool_name, stable_server_key,
@@ -2539,17 +2540,17 @@ async fn artifact_host(
 async fn lifecycle_host(
     state: &DesktopState,
     session_id: &str,
-) -> Result<(Box<dyn Host>, String), String> {
+) -> Result<(Box<dyn Host>, String, String), String> {
     let session = session_for(state, session_id)?;
     let host_id = session.host_id;
     if host_id == "local" {
         if session.workspace.is_empty() {
             return Err("local lifecycle requires an explicit workspace directory".into());
         }
-        let host =
-            LocalHost::new(PathBuf::from(session.workspace)).map_err(|error| error.to_string())?;
+        let workspace = session.workspace;
+        let host = LocalHost::new(PathBuf::from(&workspace)).map_err(|error| error.to_string())?;
         host.health().await.map_err(|error| error.to_string())?;
-        return Ok((Box::new(host), host_id));
+        return Ok((Box::new(host), host_id, workspace));
     }
     let client = client_for(state, &host_id)?;
     let health = client
@@ -2565,8 +2566,9 @@ async fn lifecycle_host(
     };
     let client = client.with_workspace(workspace.clone());
     Ok((
-        Box::new(RvmHost::new(host_id.clone(), workspace, client)),
+        Box::new(RvmHost::new(host_id.clone(), workspace.clone(), client)),
         host_id,
+        workspace,
     ))
 }
 
@@ -3726,7 +3728,7 @@ async fn read_blueprint(
     state: State<'_, DesktopState>,
     session_id: String,
 ) -> Result<Value, String> {
-    let (host, _) = lifecycle_host(&state, &session_id).await?;
+    let (host, _, _) = lifecycle_host(&state, &session_id).await?;
     let content = host
         .read(".devin/blueprint.yaml")
         .await
@@ -3747,12 +3749,12 @@ async fn execute_blueprint(
     if command.trim().is_empty() {
         return Err("blueprint command cannot be empty".into());
     }
-    let (host, host_id) = lifecycle_host(&state, &session_id).await?;
+    let (host, host_id, _) = lifecycle_host(&state, &session_id).await?;
     let result = host
         .exec(opcos_rvm::ExecRequest {
             command: command.clone(),
             cwd,
-            timeout_seconds: DEFAULT_EXEC_TIMEOUT_SECONDS,
+            timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
             session: None,
             env: None,
         })
@@ -3774,6 +3776,11 @@ async fn execute_blueprint(
         })),
     );
     if result.result.timed_out || result.result.exit_code != 0 {
+        if result.result.timed_out {
+            return Err(format!(
+                "blueprint command timed out after {LIFECYCLE_EXEC_TIMEOUT_SECONDS} seconds: `{command}`"
+            ));
+        }
         return Err(format!(
             "blueprint command failed: `{command}` exited with code {}",
             result.result.exit_code
@@ -3786,9 +3793,10 @@ async fn run_lifecycle_stage(
     state: &DesktopState,
     session_id: &str,
     stage: LifecycleStage,
+    cwd: String,
     commands: Vec<String>,
 ) -> Result<Value, String> {
-    let (host, host_id) = lifecycle_host(state, session_id).await?;
+    let (host, host_id, _) = lifecycle_host(state, session_id).await?;
     let started_at = Utc::now();
     audit(
         state,
@@ -3801,7 +3809,7 @@ async fn run_lifecycle_stage(
             "started_at": started_at.to_rfc3339(),
         }),
     );
-    let results = match execute_lifecycle_stage(host.as_ref(), stage, commands).await {
+    let results = match execute_lifecycle_stage(host.as_ref(), stage, Some(cwd), commands).await {
         Ok(results) => results,
         Err(error) => {
             audit(
@@ -3859,9 +3867,16 @@ async fn run_lifecycle_stage(
                 "host_id": host_id,
                 "command": result.command,
                 "exit_code": result.exit_code,
+                "timed_out": result.timed_out,
                 "elapsed_ms": elapsed_ms,
             })),
         );
+        if result.timed_out {
+            return Err(format!(
+                "lifecycle {stage:?} blocked: `{}` timed out after {LIFECYCLE_EXEC_TIMEOUT_SECONDS} seconds",
+                result.command
+            ));
+        }
         return Err(format!(
             "lifecycle {stage:?} blocked by `{}` with exit code {}",
             result.command, result.exit_code
@@ -3885,8 +3900,9 @@ async fn run_configured_lifecycle_stage(
     state: &DesktopState,
     session_id: &str,
     stage: LifecycleStage,
+    cwd: Option<String>,
 ) -> Result<Value, String> {
-    let (host, _) = lifecycle_host(state, session_id).await?;
+    let (host, _, workspace) = lifecycle_host(state, session_id).await?;
     let blueprint = parse_blueprint(
         &host
             .read(".devin/blueprint.yaml")
@@ -3910,7 +3926,7 @@ async fn run_configured_lifecycle_stage(
         }
         LifecycleStage::PrePush => blueprint.pre_push,
     };
-    run_lifecycle_stage(state, session_id, stage, commands).await
+    run_lifecycle_stage(state, session_id, stage, cwd.unwrap_or(workspace), commands).await
 }
 
 #[tauri::command]
@@ -3924,9 +3940,8 @@ async fn run_blueprint(
         LifecycleStage::Initialize,
         LifecycleStage::Maintenance,
         LifecycleStage::PostBuild,
-        LifecycleStage::PrePush,
     ] {
-        let result = run_configured_lifecycle_stage(&state, &session_id, stage).await?;
+        let result = run_configured_lifecycle_stage(&state, &session_id, stage, None).await?;
         stages.insert(format!("{stage:?}"), result);
     }
     Ok(json!({"status":"ok","stages":stages}))
@@ -3950,7 +3965,13 @@ async fn git_workflow(
     secret_names: Option<Vec<String>>,
 ) -> Result<Value, String> {
     if operation == "push" {
-        run_configured_lifecycle_stage(&state, &session_id, LifecycleStage::PrePush).await?;
+        run_configured_lifecycle_stage(
+            &state,
+            &session_id,
+            LifecycleStage::PrePush,
+            Some(cwd.clone()),
+        )
+        .await?;
     }
     let host_id = session_host_id(&state, &session_id)?;
     let client = client_for(&state, &host_id)?.with_workspace(cwd.clone());
@@ -4050,7 +4071,7 @@ async fn github_pull_request(
     token_secret: String,
 ) -> Result<Value, String> {
     if let Some(session_id) = session_id {
-        run_configured_lifecycle_stage(&state, &session_id, LifecycleStage::PrePush).await?;
+        run_configured_lifecycle_stage(&state, &session_id, LifecycleStage::PrePush, None).await?;
     }
     let token = state
         .secrets
