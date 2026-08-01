@@ -1285,12 +1285,10 @@ async fn engine_for(
         .or(descriptor.default_base_url)
         .unwrap_or_default();
     let (workspace, executor, remote_client, allowed_tools) = if host_id == "local" {
-        let workspace = if session_workspace.is_empty() {
-            std::env::current_dir()
-                .map_err(|error| format!("local workspace unavailable: {error}"))?
-        } else {
-            PathBuf::from(session_workspace)
-        };
+        if session_workspace.is_empty() {
+            return Err("local session requires an explicit workspace directory".into());
+        }
+        let workspace = PathBuf::from(session_workspace);
         let host = LocalHost::new(&workspace).map_err(|error| error.to_string())?;
         let _ = host.health().await.map_err(|error| error.to_string())?;
         let capabilities = host
@@ -1798,18 +1796,17 @@ fn create_session(
     );
     let model = model.unwrap_or_else(|| "auto".into());
     let mode = mode.unwrap_or_else(|| "Interactive".into());
-    let host_name = if host_id == "local" {
-        "本机".to_owned()
-    } else {
-        state
-            .database
-            .lock()
-            .map_err(|_| "database lock poisoned")?
-            .query_row("SELECT name FROM hosts WHERE id=?1", [&host_id], |row| {
-                row.get(0)
-            })
-            .map_err(|_| "remote host not found; session was not created".to_owned())?
-    };
+    if host_id == "local" && workspace.as_deref().is_none_or(str::is_empty) {
+        return Err("local session requires an explicit workspace directory".into());
+    }
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let host_name = host_name(&connection, &host_id)
+        .map_err(|error| format!("{error}; session was not created"))?
+        .ok_or_else(|| "remote host not found; session was not created".to_owned())?;
+    drop(connection);
     let now = Utc::now();
     state
         .store
@@ -1879,14 +1876,8 @@ fn session_view_for_host(
     connection: &Connection,
     session: SessionRecord,
 ) -> Result<Option<SessionView>, String> {
-    let host_name = match connection.query_row(
-        "SELECT name FROM hosts WHERE id=?1",
-        [&session.host_id],
-        |row| row.get::<_, String>(0),
-    ) {
-        Ok(name) => name,
-        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
-        Err(error) => return Err(error.to_string()),
+    let Some(host_name) = host_name(connection, &session.host_id)? else {
+        return Ok(None);
     };
     Ok(Some(SessionView {
         id: session.session_id,
@@ -1900,6 +1891,19 @@ fn session_view_for_host(
         run_state: session.run_state,
         stop_reason: session.stop_reason,
     }))
+}
+
+fn host_name(connection: &Connection, host_id: &str) -> Result<Option<String>, String> {
+    if host_id == "local" {
+        return Ok(Some("本机".into()));
+    }
+    match connection.query_row("SELECT name FROM hosts WHERE id=?1", [host_id], |row| {
+        row.get::<_, String>(0)
+    }) {
+        Ok(name) => Ok(Some(name)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 #[tauri::command]
@@ -2015,6 +2019,7 @@ fn shell_artifact_paths(command: &str) -> Vec<String> {
                     && !path.is_empty()
                     && path != "/dev/null"
                     && path != "NUL"
+                    && !path.starts_with('&')
                 {
                     paths.push(path.clone());
                 }
@@ -2033,6 +2038,7 @@ fn shell_artifact_paths(command: &str) -> Vec<String> {
                     && !path.is_empty()
                     && path != "/dev/null"
                     && path != "NUL"
+                    && !path.starts_with('&')
                 {
                     paths.push(path.clone());
                 }
@@ -2146,6 +2152,44 @@ async fn record_artifacts(
     Ok(())
 }
 
+async fn record_artifacts_best_effort(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    session_id: &str,
+    host_id: &str,
+    calls: Vec<ToolCallRecord>,
+) {
+    if let Err(error) = record_artifacts(state, session_id, host_id, calls).await {
+        emit(
+            app,
+            "notice",
+            Some(session_id),
+            json!({"kind":"artifact_registration_failed","text":error}),
+        );
+    }
+}
+
+fn approval_artifact_calls(
+    state: &DesktopState,
+    session_id: &str,
+    call_id: &str,
+    sequence_before: i64,
+) -> Result<Vec<ToolCallRecord>, String> {
+    let mut calls = state
+        .store
+        .load_tool_calls_after(session_id, sequence_before)
+        .map_err(|error| error.to_string())?;
+    if let Some(call) = state
+        .store
+        .load_tool_call(session_id, call_id)
+        .map_err(|error| error.to_string())?
+        && !calls.iter().any(|item| item.call_id == call.call_id)
+    {
+        calls.push(call);
+    }
+    Ok(calls)
+}
+
 async fn artifact_host(
     state: &DesktopState,
     session_id: &str,
@@ -2211,8 +2255,14 @@ async fn read_artifact(
     if artifact.host_id != host_id {
         return Err("artifact belongs to an unavailable host binding".to_owned());
     }
+    let path = host
+        .join(&artifact.path)
+        .map_err(|error| format!("artifact path rejected: {error}"))?;
+    if !host.contains(&path) {
+        return Err("artifact path is outside the bound workspace".into());
+    }
     let content = host
-        .read(&artifact.path)
+        .read(&path)
         .await
         .map_err(|error| format!("artifact host read failed: {error}"))?;
     Ok(json!({
@@ -2232,24 +2282,27 @@ async fn submit_turn(
     request: SubmitRequest,
 ) -> Result<(), String> {
     let host_id = session_host_id(&state, &request.session_id)?;
-    let client = client_for(&state, &host_id)?;
-    if let Err(error) = client.health().await {
-        let _ = state
-            .store
-            .update_session_status(&request.session_id, "error", "host_unavailable");
-        emit(
-            &app,
-            "notice",
-            Some(&request.session_id),
-            json!({"kind":"error","text":"Remote host unavailable"}),
-        );
-        emit(
-            &app,
-            "turn_done",
-            Some(&request.session_id),
-            session_status_payload(&state, &request.session_id),
-        );
-        return Err(format!("remote host unavailable: {error}"));
+    if host_id != "local" {
+        let client = client_for(&state, &host_id)?;
+        if let Err(error) = client.health().await {
+            let _ =
+                state
+                    .store
+                    .update_session_status(&request.session_id, "error", "host_unavailable");
+            emit(
+                &app,
+                "notice",
+                Some(&request.session_id),
+                json!({"kind":"error","text":"Remote host unavailable"}),
+            );
+            emit(
+                &app,
+                "turn_done",
+                Some(&request.session_id),
+                session_status_payload(&state, &request.session_id),
+            );
+            return Err(format!("remote host unavailable: {error}"));
+        }
     }
     let sequence_before = state
         .store
@@ -2268,7 +2321,7 @@ async fn submit_turn(
                 .store
                 .load_tool_calls_after(&request.session_id, sequence_before)
                 .map_err(|error| error.to_string())?;
-            record_artifacts(&state, &request.session_id, &host_id, calls).await?;
+            record_artifacts_best_effort(&app, &state, &request.session_id, &host_id, calls).await;
             emit(
                 &app,
                 "turn_done",
@@ -2282,7 +2335,7 @@ async fn submit_turn(
                 .store
                 .load_tool_calls_after(&request.session_id, sequence_before)
                 .map_err(|error| error.to_string())?;
-            record_artifacts(&state, &request.session_id, &host_id, calls).await?;
+            record_artifacts_best_effort(&app, &state, &request.session_id, &host_id, calls).await;
             if let Ok(Some(pending)) = state
                 .store
                 .load_pending(&request.session_id)
@@ -2321,7 +2374,7 @@ async fn submit_turn(
                 .store
                 .load_tool_calls_after(&request.session_id, sequence_before)
                 .map_err(|error| error.to_string())?;
-            record_artifacts(&state, &request.session_id, &host_id, calls).await?;
+            record_artifacts_best_effort(&app, &state, &request.session_id, &host_id, calls).await;
             let message = engine_error_message(error);
             if message.contains("denied") || message.contains("policy") {
                 audit(
@@ -2405,10 +2458,6 @@ async fn interrupt(
 ) -> Result<(), String> {
     let engine = engine_for(&app, &state, &session_id).await?;
     engine.interrupt();
-    state
-        .store
-        .update_session_status(&session_id, "interrupted", "interrupted_by_user")
-        .map_err(|error| error.to_string())?;
     audit(
         &state,
         &session_id,
@@ -2439,11 +2488,15 @@ async fn steering(
     emit(&app, "steering", Some(&session_id), json!({"text":text}));
     let handle = app.clone();
     let session = session_id.clone();
-    let store = Arc::clone(&state.store);
     tauri::async_runtime::spawn(async move {
-        let _ = completion.await;
-        let payload = session_status_payload_from_store(&store, &session);
-        emit(&handle, "turn_done", Some(&session), payload);
+        if let Ok((run_state, stop_reason)) = completion.await {
+            emit(
+                &handle,
+                "turn_done",
+                Some(&session),
+                json!({"run_state": run_state, "stop_reason": stop_reason}),
+            );
+        }
     });
     Ok(())
 }
@@ -2457,6 +2510,10 @@ async fn resolve_approval(
     approve: bool,
 ) -> Result<(), String> {
     let host_id = session_host_id(&state, &session_id)?;
+    let sequence_before = state
+        .store
+        .max_message_notice_sequence(&session_id)
+        .map_err(|error| error.to_string())?;
     let engine = engine_for(&app, &state, &session_id).await?;
     let result = engine
         .resolve_approval(
@@ -2487,13 +2544,8 @@ async fn resolve_approval(
     );
     match result {
         Ok(()) => {
-            let calls = state
-                .store
-                .load_tool_call(&session_id, &call_id)
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .collect();
-            record_artifacts(&state, &session_id, &host_id, calls).await?;
+            let calls = approval_artifact_calls(&state, &session_id, &call_id, sequence_before)?;
+            record_artifacts_best_effort(&app, &state, &session_id, &host_id, calls).await;
             let _ = emit_pending_approval(&app, &state, &session_id)?;
             emit(
                 &app,
@@ -2505,13 +2557,8 @@ async fn resolve_approval(
         }
         Err(opcos_engine::EngineError::ApprovalPending(next_call_id)) => {
             let _ = next_call_id;
-            let calls = state
-                .store
-                .load_tool_call(&session_id, &call_id)
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .collect();
-            record_artifacts(&state, &session_id, &host_id, calls).await?;
+            let calls = approval_artifact_calls(&state, &session_id, &call_id, sequence_before)?;
+            record_artifacts_best_effort(&app, &state, &session_id, &host_id, calls).await;
             emit_pending_approval(&app, &state, &session_id)?;
             emit(
                 &app,
@@ -2523,13 +2570,8 @@ async fn resolve_approval(
         }
         Err(opcos_engine::EngineError::ApprovalAlreadyProcessed(_)) => Ok(()),
         Err(error) => {
-            let calls = state
-                .store
-                .load_tool_call(&session_id, &call_id)
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .collect();
-            record_artifacts(&state, &session_id, &host_id, calls).await?;
+            let calls = approval_artifact_calls(&state, &session_id, &call_id, sequence_before)?;
+            record_artifacts_best_effort(&app, &state, &session_id, &host_id, calls).await;
             Err(engine_error_message(error))
         }
     }
@@ -3854,7 +3896,7 @@ async fn run_schedule_for(
         .store
         .load_tool_calls_after(&session_id, sequence_before)
         .map_err(|error| error.to_string())?;
-    record_artifacts(state, &session_id, &host_id, calls).await?;
+    record_artifacts_best_effort(app, state, &session_id, &host_id, calls).await;
     let result_label = if result.is_ok() { "ok" } else { "error" };
     let finished_at = Utc::now().to_rfc3339();
     state
