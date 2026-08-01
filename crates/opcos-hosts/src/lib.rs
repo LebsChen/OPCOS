@@ -464,31 +464,51 @@ impl LocalHost {
                 stdout: BufReader::new(stdout),
                 marker,
             };
-            shell
+            let write_result = match shell
                 .stdin
                 .write_all(
                     format!(
                         "{}\n",
-                        persistent_command(command, env, &shell.marker, cwd, change_cwd)
+                        persistent_command(command, env, &shell.marker, cwd, change_cwd)?
                     )
                     .as_bytes(),
                 )
-                .await?;
-            shell.stdin.flush().await?;
+                .await
+            {
+                Ok(()) => shell.stdin.flush().await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = write_result {
+                let _ = shell._child.kill().await;
+                let _ = shell._child.wait().await;
+                return Err(HostError::Io(error));
+            }
             sessions.insert(session.to_owned(), shell);
         } else {
-            let shell = sessions.get_mut(session).expect("session exists");
-            shell
-                .stdin
-                .write_all(
-                    format!(
-                        "{}\n",
-                        persistent_command(command, env, &shell.marker, cwd, change_cwd)
+            let write_result = {
+                let shell = sessions.get_mut(session).expect("session exists");
+                match shell
+                    .stdin
+                    .write_all(
+                        format!(
+                            "{}\n",
+                            persistent_command(command, env, &shell.marker, cwd, change_cwd)?
+                        )
+                        .as_bytes(),
                     )
-                    .as_bytes(),
-                )
-                .await?;
-            shell.stdin.flush().await?;
+                    .await
+                {
+                    Ok(()) => shell.stdin.flush().await,
+                    Err(error) => Err(error),
+                }
+            };
+            if let Err(error) = write_result {
+                if let Some(mut shell) = sessions.remove(session) {
+                    let _ = shell._child.kill().await;
+                    let _ = shell._child.wait().await;
+                }
+                return Err(HostError::Io(error));
+            }
         }
         let result = {
             let shell = sessions.get_mut(session).expect("session exists");
@@ -592,8 +612,14 @@ fn persistent_command(
     marker: &str,
     cwd: &Path,
     change_cwd: bool,
-) -> String {
-    let prefix = persistent_env_prefix(env);
+) -> Result<String, HostError> {
+    let prefix = persistent_env_prefix(env)?;
+    #[cfg(not(windows))]
+    let env_suffix = if matches!(env, Some(Value::Object(values)) if !values.is_empty()) {
+        ")"
+    } else {
+        ""
+    };
     #[cfg(windows)]
     {
         let directory = if change_cwd {
@@ -601,7 +627,9 @@ fn persistent_command(
         } else {
             String::new()
         };
-        format!("{prefix}{directory}{command} 2>&1 & echo {marker}:%ERRORLEVEL%:%CD%")
+        Ok(format!(
+            "{prefix}{directory}{command} 2>&1 & echo {marker}:!ERRORLEVEL!:!CD! & endlocal"
+        ))
     }
     #[cfg(not(windows))]
     {
@@ -613,37 +641,63 @@ fn persistent_command(
         } else {
             String::new()
         };
-        format!(
-            "{prefix}{directory}{command} 2>&1; __opcos_exit=$?; printf '{marker}:%s:%s\\n' \"$__opcos_exit\" \"$PWD\""
-        )
+        Ok(format!(
+            "{prefix}{directory}{command} 2>&1{env_suffix}; __opcos_exit=$?; printf '{marker}:%s:%s\\n' \"$__opcos_exit\" \"$PWD\""
+        ))
     }
 }
 
-fn persistent_env_prefix(env: Option<&Value>) -> String {
+fn persistent_env_prefix(env: Option<&Value>) -> Result<String, HostError> {
     let Some(Value::Object(values)) = env else {
-        return String::new();
+        #[cfg(windows)]
+        {
+            return Ok("setlocal EnableDelayedExpansion && ".into());
+        }
+        #[cfg(not(windows))]
+        {
+            return Ok(String::new());
+        }
     };
-    values
+    let prefix = values
         .iter()
         .filter_map(|(key, value)| value.as_str().map(|value| (key, value)))
-        .map(|(key, value)| {
+        .map(|(key, value)| -> Result<String, HostError> {
             #[cfg(windows)]
             {
-                format!("set \"{}={}\" && ", key, value.replace('"', "\"\""))
+                if key.chars().any(|ch| "&|<>^%!\"".contains(ch))
+                    || value.chars().any(|ch| "&|<>^%!\"".contains(ch))
+                {
+                    return Err(HostError::InvalidResponse(
+                        "persistent shell environment contains unsupported cmd characters".into(),
+                    ));
+                }
+                Ok(format!("set \"{key}={value}\" && "))
             }
             #[cfg(not(windows))]
             {
-                format!("export {}='{}'; ", key, value.replace('\'', "'\\''"))
+                Ok(format!("{}='{}' ", key, value.replace('\'', "'\\''")))
             }
         })
-        .collect()
+        .collect::<Result<String, _>>()?;
+    #[cfg(windows)]
+    {
+        Ok(format!("setlocal EnableDelayedExpansion && {prefix}"))
+    }
+    #[cfg(not(windows))]
+    {
+        if prefix.is_empty() {
+            Ok(prefix)
+        } else {
+            Ok(format!("({prefix}"))
+        }
+    }
 }
 
 async fn spawn_persistent_shell(cwd: &Path) -> Result<(Child, ChildStdin, ChildStdout), HostError> {
     #[cfg(windows)]
     let mut process = {
         let mut process = Command::new("cmd");
-        process.args(["/Q", "/D", "/K"]).current_dir(cwd);
+        process.args(["/Q", "/D", "/V:ON", "/K"]).current_dir(cwd);
         process
     };
     #[cfg(not(windows))]
@@ -854,12 +908,12 @@ mod tests {
 
     #[cfg(windows)]
     fn shell_print_env_command() -> String {
-        "echo %OPCOS_SECRET_TEST%".into()
+        "echo !OPCOS_SECRET_TEST!".into()
     }
 
     #[cfg(not(windows))]
     fn shell_print_env_command() -> String {
-        "printf '%s' \"$OPCOS_SECRET_TEST\"".into()
+        "printenv OPCOS_SECRET_TEST".into()
     }
 
     #[cfg(windows)]
@@ -946,6 +1000,33 @@ mod tests {
         assert_eq!(results[0].exit_code, 7);
         assert!(!results[0].continued);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persistent_environment_is_command_scoped() {
+        let command = persistent_command(
+            "echo ok",
+            Some(&serde_json::json!({"OPCOS_SECRET": "value"})),
+            "__marker__",
+            Path::new("."),
+            false,
+        )
+        .unwrap();
+        #[cfg(not(windows))]
+        assert!(!command.contains("export OPCOS_SECRET"));
+        #[cfg(windows)]
+        assert!(command.contains("setlocal") && command.contains("endlocal"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_persistent_command_uses_delayed_expansion() {
+        let command =
+            persistent_command("exit /b 7", None, "__marker__", Path::new("."), false).unwrap();
+        assert!(!command.contains("%ERRORLEVEL%"));
+        assert!(!command.contains("%CD%"));
+        assert!(command.contains("!ERRORLEVEL!"));
+        assert!(command.contains("!CD!"));
     }
 
     fn tempfile_dir() -> PathBuf {
