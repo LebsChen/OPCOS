@@ -327,7 +327,7 @@ export function ApprovalCard({
 
       {item.resolved ? (
         <div className="resolved">
-          Approved: {item.resolved.replace("_", " ")}
+          {item.resolved === "allow" ? "Approved" : "Declined"}
         </div>
       ) : (
         <Buttons

@@ -16,7 +16,7 @@ use std::sync::{
 };
 use std::time::Instant;
 use thiserror::Error;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 pub mod orchestration;
 
@@ -76,6 +76,7 @@ pub struct TurnEngine<P, S, E> {
     model: Mutex<String>,
     interrupted: AtomicBool,
     steering: Mutex<Vec<String>>,
+    steering_waiters: Arc<std::sync::Mutex<Vec<oneshot::Sender<()>>>>,
     events: mpsc::Sender<StreamChunk>,
     receiver: Mutex<Option<mpsc::Receiver<StreamChunk>>>,
     sequence: Mutex<i64>,
@@ -117,6 +118,7 @@ where
             model: Mutex::new(model.into()),
             interrupted: AtomicBool::new(false),
             steering: Mutex::new(Vec::new()),
+            steering_waiters: Arc::new(std::sync::Mutex::new(Vec::new())),
             events,
             receiver: Mutex::new(Some(receiver)),
             sequence: Mutex::new(initial_sequence),
@@ -212,8 +214,18 @@ where
         }
     }
 
-    pub async fn queue_steering(&self, text: impl Into<String>) {
-        self.steering.lock().await.push(text.into());
+    pub async fn queue_steering(
+        &self,
+        text: impl Into<String>,
+    ) -> Result<oneshot::Receiver<()>, EngineError> {
+        let text = text.into();
+        let (sender, receiver) = oneshot::channel();
+        self.steering_waiters
+            .lock()
+            .expect("steering waiters mutex poisoned")
+            .push(sender);
+        self.steering.lock().await.push(text);
+        Ok(receiver)
     }
 
     pub fn save_grant(
@@ -321,6 +333,9 @@ where
     }
 
     async fn run_loop(&self, mut messages: Vec<Value>) -> Result<AssistantTurn, EngineError> {
+        let _completion = SteeringCompletion {
+            waiters: Arc::clone(&self.steering_waiters),
+        };
         let mut usage: Option<TokenUsage> = None;
         for _ in 0..12 {
             if self.interrupted.load(Ordering::SeqCst) {
@@ -825,6 +840,24 @@ fn downgrade_images(value: &mut Value) {
 struct PartialOutput {
     text: Option<String>,
     reasoning: Option<String>,
+}
+
+struct SteeringCompletion {
+    waiters: Arc<std::sync::Mutex<Vec<oneshot::Sender<()>>>>,
+}
+
+impl Drop for SteeringCompletion {
+    fn drop(&mut self) {
+        let waiters = std::mem::take(
+            &mut *self
+                .waiters
+                .lock()
+                .expect("steering waiters mutex poisoned"),
+        );
+        for waiter in waiters {
+            let _ = waiter.send(());
+        }
+    }
 }
 
 #[cfg(test)]

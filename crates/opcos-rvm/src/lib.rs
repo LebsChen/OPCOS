@@ -708,10 +708,12 @@ impl HttpRvmClient {
         let mut request = self
             .http
             .get(url)
-            .header(header::AUTHORIZATION, self.config.auth_header())
             .header(header::ACCEPT, "text/html")
             .header(header::USER_AGENT, "OPCOS/0.1")
             .header("Sec-Fetch-Mode", "navigate");
+        if cookies.is_empty() {
+            request = request.header(header::AUTHORIZATION, self.config.auth_header());
+        }
         if !cookies.is_empty() {
             request = request.header(header::COOKIE, cookies.join("; "));
         }
@@ -788,13 +790,15 @@ impl HttpRvmClient {
             .as_str()
             .into_client_request()
             .map_err(|error| RvmError::WebSocket(error.to_string()))?;
-        request.headers_mut().insert(
-            header::AUTHORIZATION,
-            self.config
-                .auth_header()
-                .parse()
-                .map_err(|_| RvmError::WebSocket("invalid authorization header".into()))?,
-        );
+        if cookies.is_empty() {
+            request.headers_mut().insert(
+                header::AUTHORIZATION,
+                self.config
+                    .auth_header()
+                    .parse()
+                    .map_err(|_| RvmError::WebSocket("invalid authorization header".into()))?,
+            );
+        }
         if !cookies.is_empty() {
             request.headers_mut().insert(
                 header::COOKIE,

@@ -59,6 +59,9 @@ button:disabled {
   overflow: hidden;
   background: var(--color-panel);
 }
+.app.session-layout {
+  grid-template-columns: 276px minmax(0, 1fr) 256px;
+}
 .app.surface-layout {
   grid-template-columns: 276px minmax(500px, 1fr);
 }
@@ -315,6 +318,36 @@ select:focus {
   min-height: 0;
   background: var(--paper);
 }
+.main-topbar {
+  position: relative;
+  inset: auto;
+  height: auto;
+  min-height: 64px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--color-line);
+  background: var(--paper);
+  backdrop-filter: none;
+}
+.main-topbar-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.main-workspace {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+}
+.main-chat {
+  flex: 1;
+  min-width: 0;
+  padding-top: 0;
+}
+.main-scroll {
+  padding: 24px 8% 24px;
+}
 .session-header,
 .page-header {
   display: flex;
@@ -389,7 +422,10 @@ h3 {
   flex: 1;
   min-height: 0;
   overflow: auto;
-  padding: 25px max(24px, 7vw) 18px;
+  max-width: 768px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 0;
 }
 .transcript-item {
   margin: 0 0 18px;
@@ -552,15 +588,54 @@ h3 {
 }
 .right-rail {
   min-width: 0;
-  overflow: auto;
+  overflow: hidden;
   border-left: 1px solid var(--color-line);
   background: var(--panel);
 }
 
 .session-right-panel {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   min-width: 0;
+}
+.session-icon-rail {
+  width: 44px;
+  min-width: 44px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 10px 0;
+  border-left: 1px solid var(--color-line);
+  background: var(--panel);
+}
+.session-icon-rail .panel-collapse {
+  margin-top: auto;
+}
+.session-panel-drawer {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  overflow: hidden;
+}
+.drawer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 46px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--color-line);
+}
+.drawer-title {
+  color: var(--color-ink);
+  font-size: 13px;
+}
+.session-pane,
+.session-pane > .surface-panel {
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
 }
 
 .session-panel-tabs {
@@ -608,6 +683,14 @@ h3 {
 
 .app.right-panel-collapsed {
   grid-template-columns: 276px minmax(0, 1fr);
+}
+.app.right-panel-collapsed > .right-rail-collapsed {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 44px;
+  z-index: 20;
 }
 
 .right-rail-collapsed .rail-toggle {

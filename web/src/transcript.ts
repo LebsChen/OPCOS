@@ -216,16 +216,21 @@ export function reduceStreamEvent(
       typeof payload.kind === "string" ? payload.kind : event.kind;
     if (event.kind === "approval_resolved") {
       const callId = typeof payload.call_id === "string" ? payload.call_id : "";
-      return next.map((item) =>
-        item.kind === "tool" && item.callId === callId
-          ? {
-              ...item,
-              status: payload.approve === true ? "ok" : "error",
-              approval: false,
-              resolved: payload.approve === true ? "allow" : "deny",
-            }
-          : item,
-      );
+      return next
+        .filter(
+          (item) =>
+            !(item.kind === "notice" && item.noticeKind === "approval_pending"),
+        )
+        .map((item) =>
+          item.kind === "tool" && item.callId === callId
+            ? {
+                ...item,
+                status: payload.approve === true ? "ok" : "error",
+                approval: false,
+                resolved: payload.approve === true ? "allow" : "deny",
+              }
+            : item,
+        );
     }
     next.push({
       id: `event:notice:${next.length}`,

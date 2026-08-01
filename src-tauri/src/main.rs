@@ -531,10 +531,30 @@ async fn ide_asset(
     Path(path): Path<String>,
     uri: Uri,
 ) -> Response {
+    ide_asset_route(state, path, uri, "/ide/static/").await
+}
+
+async fn ide_out_asset(
+    AxumState(state): AxumState<IdeProxyState>,
+    Path(path): Path<String>,
+    uri: Uri,
+) -> Response {
+    ide_asset_route(state, path, uri, "/ide/out/").await
+}
+
+async fn ide_resources_asset(
+    AxumState(state): AxumState<IdeProxyState>,
+    Path(path): Path<String>,
+    uri: Uri,
+) -> Response {
+    ide_asset_route(state, path, uri, "/ide/resources/").await
+}
+
+async fn ide_asset_route(state: IdeProxyState, path: String, uri: Uri, prefix: &str) -> Response {
     let route = if path == "vscode-remote-resource" {
         "/vscode-remote-resource".to_owned()
     } else {
-        format!("/ide/static/{path}")
+        format!("{prefix}{path}")
     };
     let query = uri
         .query()
@@ -631,8 +651,8 @@ async fn serve_ide_proxy(listener: TcpListener, state: IdeProxyState) {
         .route("/", any(ide_root))
         .route("/ide/", any(ide_document))
         .route("/static/{*path}", any(ide_asset))
-        .route("/out/{*path}", any(ide_asset))
-        .route("/resources/{*path}", any(ide_asset))
+        .route("/out/{*path}", any(ide_out_asset))
+        .route("/resources/{*path}", any(ide_resources_asset))
         .route("/extensions/{*path}", any(ide_asset))
         .route("/node_modules/{*path}", any(ide_asset))
         .route("/vscode-remote-resource", any(ide_asset))
@@ -1332,8 +1352,17 @@ async fn steering(
     text: String,
 ) -> Result<(), String> {
     let engine = engine_for(&app, &state, &session_id).await?;
-    engine.queue_steering(text.clone()).await;
+    let completion = engine
+        .queue_steering(text.clone())
+        .await
+        .map_err(engine_error_message)?;
     emit(&app, "steering", Some(&session_id), json!({"text":text}));
+    let handle = app.clone();
+    let session = session_id.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = completion.await;
+        emit(&handle, "turn_done", Some(&session), json!({}));
+    });
     Ok(())
 }
 

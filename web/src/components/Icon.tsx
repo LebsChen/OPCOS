@@ -8,6 +8,12 @@ export type IconName =
   | "sidebarRight"
   | "signOut"
   | "chat"
+  | "terminal"
+  | "monitor"
+  | "globe"
+  | "diff"
+  | "board"
+  | "info"
   | "diamond"
   | "search"
   | "folder"
@@ -218,6 +224,48 @@ export function Icon({
       return (
         <svg {...s}>
           <path d="M8.5 8.5 4.5 12l4 3.5M15.5 8.5l4 3.5-4 3.5" />
+        </svg>
+      );
+    case "terminal":
+      return (
+        <svg {...s}>
+          <rect x="3.5" y="4.5" width="17" height="15" rx="2.5" />
+          <path d="m7 9 3 3-3 3M12.5 15H17" />
+        </svg>
+      );
+    case "monitor":
+      return (
+        <svg {...s}>
+          <rect x="3.5" y="4.5" width="17" height="12" rx="2" />
+          <path d="M8 20h8M12 16.5V20" />
+        </svg>
+      );
+    case "globe":
+      return (
+        <svg {...s}>
+          <circle cx="12" cy="12" r="8.5" />
+          <path d="M3.8 12h16.4M12 3.5c2.2 2.3 3.3 5.1 3.3 8.5S14.2 18.2 12 20.5M12 3.5C9.8 5.8 8.7 8.6 8.7 12s1.1 6.2 3.3 8.5" />
+        </svg>
+      );
+    case "diff":
+      return (
+        <svg {...s}>
+          <path d="M7 4v16M17 4v16M4 8h6M14 16h6" />
+          <path d="m7 4-2 2 2 2M17 20l2-2-2-2" />
+        </svg>
+      );
+    case "board":
+      return (
+        <svg {...s}>
+          <rect x="4" y="4" width="16" height="16" rx="2" />
+          <path d="M8 8h3v3H8zM13 8h3v3h-3zM8 13h3v3H8zM13 13h3v3h-3z" />
+        </svg>
+      );
+    case "info":
+      return (
+        <svg {...s}>
+          <circle cx="12" cy="12" r="8.5" />
+          <path d="M12 10.5v5M12 7.5h.01" />
         </svg>
       );
     case "chat":

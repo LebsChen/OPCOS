@@ -170,7 +170,7 @@ function SurfaceView({
   useEffect(() => {
     if (tab !== "terminal" || !port || !terminalHost.current) return;
     const terminal = new Terminal({
-      convertEol: true,
+      convertEol: false,
       cursorBlink: true,
       theme: { background: "#11151d", foreground: "#d7dbe5" },
     });
@@ -201,13 +201,13 @@ function SurfaceView({
       socket.close();
       terminal.dispose();
     };
-  }, [tab, port]);
+  }, [selected.id, port]);
   useEffect(() => {
-    if (tab !== "desktop" || !port || !vncHost.current) return;
+    if (!port || !vncHost.current) return;
     const rfb = new RFB(vncHost.current, `ws://127.0.0.1:${port}`);
     rfb.scaleViewport = true;
     return () => rfb.disconnect();
-  }, [tab, port]);
+  }, [selected.id, port]);
   if (tab === "terminal" || tab === "desktop" || tab === "browser")
     return (
       <div className="surface-panel">
@@ -2394,69 +2394,73 @@ function SessionRightPanel({
   selected,
   onError,
   running,
+  providers,
+  onProviderChange,
   onCollapsedChange,
 }: {
   selected: Session;
   onError: (error: unknown) => void;
   running: boolean;
+  providers: ProviderDescriptor[];
+  onProviderChange: (provider: string) => void;
   onCollapsedChange?: (collapsed: boolean) => void;
 }) {
-  const [panelTab, setPanelTab] = useState<
-    | "info"
-    | "terminal"
-    | "desktop"
-    | "ide"
-    | "review"
-    | "worklog"
-    | "browser"
-    | "board"
-  >("info");
+  type PanelTab =
+    "info" | "terminal" | "desktop" | "ide" | "review" | "worklog" | "browser";
+  const [panelTab, setPanelTab] = useState<PanelTab>("info");
   const [collapsed, setCollapsed] = useState(false);
+  const [opened, setOpened] = useState<PanelTab[]>(["info"]);
   const tabs: Array<{
     id: typeof panelTab;
     label: string;
     icon: Parameters<typeof Icon>[0]["name"];
   }> = [
-    { id: "info", label: "Info", icon: "inbox" },
-    { id: "terminal", label: "Shell", icon: "code" },
-    { id: "desktop", label: "Desktop", icon: "image" },
-    { id: "ide", label: "Web IDE", icon: "fileCode" },
-    { id: "review", label: "Diff", icon: "search" },
+    { id: "info", label: "Info", icon: "info" },
+    { id: "terminal", label: "Shell", icon: "terminal" },
+    { id: "desktop", label: "Desktop", icon: "monitor" },
+    { id: "ide", label: "Web IDE", icon: "code" },
+    { id: "review", label: "Diff", icon: "diff" },
     { id: "worklog", label: "Worklog", icon: "clock" },
-    { id: "browser", label: "Browser", icon: "folder" },
-    { id: "board", label: "Board", icon: "audit" },
+    { id: "browser", label: "Browser", icon: "globe" },
   ];
   if (collapsed) {
     return (
-      <aside className="right-rail right-rail-collapsed">
-        <button
-          className="rail-toggle"
-          title={translate("Expand session panel")}
-          onClick={() => {
-            setCollapsed(false);
-            onCollapsedChange?.(false);
-          }}
-        >
-          <Icon name="sidebarRight" />
-        </button>
+      <aside className="right-rail session-right-panel right-rail-collapsed">
+        <div className="session-icon-rail">
+          <button
+            className="rail-btn"
+            title={translate("Expand session panel")}
+            onClick={() => {
+              setCollapsed(false);
+              onCollapsedChange?.(false);
+            }}
+          >
+            <Icon name="sidebarRight" />
+          </button>
+        </div>
       </aside>
     );
   }
   return (
     <aside className="right-rail session-right-panel">
-      <div className="session-panel-tabs">
+      <div className="session-icon-rail">
         {tabs.map((item) => (
           <button
             key={item.id}
-            className={panelTab === item.id ? "active" : ""}
+            className={`rail-btn${panelTab === item.id ? " active" : ""}`}
             title={item.label}
-            onClick={() => setPanelTab(item.id)}
+            onClick={() => {
+              setPanelTab(item.id);
+              setOpened((items) =>
+                items.includes(item.id) ? items : [...items, item.id],
+              );
+            }}
           >
             <Icon name={item.icon} />
           </button>
         ))}
         <button
-          className="panel-collapse"
+          className="rail-btn panel-collapse"
           title={translate("Collapse session panel")}
           onClick={() => {
             setCollapsed(true);
@@ -2466,44 +2470,90 @@ function SessionRightPanel({
           <Icon name="sidebarRight" />
         </button>
       </div>
-      <div className="session-panel-content">
-        {panelTab === "info" && (
-          <div className="p-4">
-            <h2 className="text-[15px] font-semibold text-ink">
-              {translate("Session")}
-            </h2>
-            <dl className="mt-4 space-y-3 text-[13px]">
-              <div>
-                <dt className="text-muted">{translate("Status")}</dt>
-                <dd>{running ? "Running" : "Ready"}</dd>
+      <div className="session-panel-drawer">
+        <div className="drawer-head">
+          <strong className="drawer-title">
+            {tabs.find((item) => item.id === panelTab)?.label}
+          </strong>
+          <button
+            className="panel-collapse"
+            title={translate("Collapse session panel")}
+            onClick={() => {
+              setCollapsed(true);
+              onCollapsedChange?.(true);
+            }}
+          >
+            <Icon name="x" />
+          </button>
+        </div>
+        <div className="session-panel-content">
+          {opened.includes("info") && (
+            <div
+              className="session-pane"
+              style={{ display: panelTab === "info" ? "block" : "none" }}
+            >
+              <div className="p-4">
+                <h2 className="text-[15px] font-semibold text-ink">
+                  {translate("Session")}
+                </h2>
+                <dl className="mt-4 space-y-3 text-[13px]">
+                  <div>
+                    <dt className="text-muted">{translate("Status")}</dt>
+                    <dd>{running ? "Running" : "Ready"}</dd>
+                  </div>
+                  <div>
+                    <dt className="text-muted">{translate("Host")}</dt>
+                    <dd>{selected.host_name}</dd>
+                  </div>
+                  <div>
+                    <dt className="text-muted">{translate("Workspace")}</dt>
+                    <dd>{selected.workspace || "Not set"}</dd>
+                  </div>
+                  <div>
+                    <dt className="text-muted">{translate("Model")}</dt>
+                    <dd>{selected.model}</dd>
+                  </div>
+                  <div>
+                    <dt className="text-muted">Provider</dt>
+                    <dd>
+                      <OpenWorkerSelectMenu
+                        value={selected.provider || ""}
+                        onChange={onProviderChange}
+                        options={[
+                          { value: "", label: "Global default" },
+                          ...providers.map((item) => ({
+                            value: item.name,
+                            label: item.title,
+                          })),
+                        ]}
+                        ariaLabel="Provider"
+                      />
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="text-muted">Access</dt>
+                    <dd>Commands run on the bound remote host.</dd>
+                  </div>
+                </dl>
               </div>
-              <div>
-                <dt className="text-muted">{translate("Host")}</dt>
-                <dd>{selected.host_name}</dd>
+            </div>
+          )}
+          {tabs
+            .filter((item) => item.id !== "info" && opened.includes(item.id))
+            .map((item) => (
+              <div
+                className="session-pane"
+                key={item.id}
+                style={{ display: panelTab === item.id ? "flex" : "none" }}
+              >
+                <SurfaceView
+                  tab={item.id as Exclude<SurfaceTab, "chat">}
+                  selected={selected}
+                  onError={onError}
+                />
               </div>
-              <div>
-                <dt className="text-muted">{translate("Workspace")}</dt>
-                <dd>{selected.workspace || "Not set"}</dd>
-              </div>
-              <div>
-                <dt className="text-muted">{translate("Model")}</dt>
-                <dd>{selected.model}</dd>
-              </div>
-            </dl>
-          </div>
-        )}
-        {panelTab !== "info" && panelTab !== "board" && (
-          <SurfaceView
-            tab={panelTab === "review" ? "review" : panelTab}
-            selected={selected}
-            onError={onError}
-          />
-        )}
-        {panelTab === "board" && (
-          <div className="p-4 text-[13px] text-muted">
-            Coordination Board is available from Activity → Board.
-          </div>
-        )}
+            ))}
+        </div>
       </div>
     </aside>
   );
@@ -2541,7 +2591,6 @@ function AppContent() {
     "session" | "automations" | "manage" | "activity"
   >("session");
   const [settingsTab, setSettingsTab] = useState<SettingsSection>("provider");
-  const [tab, setTab] = useState<SurfaceTab>("chat");
   const [query, setQuery] = useState("");
   const [error, setError] = useState("");
   const [running, setRunning] = useState(false);
@@ -2816,15 +2865,6 @@ function AppContent() {
     if (!selected) return;
     void command("steering", { sessionId: selected.id, text }).catch(onError);
   };
-  const tabs: Array<{ id: SurfaceTab; label: string; icon: string }> = [
-    { id: "chat", label: "Chat", icon: "send" },
-    { id: "terminal", label: "Terminal", icon: "terminal" },
-    { id: "desktop", label: "Desktop", icon: "desktop" },
-    { id: "browser", label: "Browser", icon: "browser" },
-    { id: "ide", label: "IDE", icon: "code" },
-    { id: "review", label: "Review", icon: "search" },
-    { id: "worklog", label: "Worklog", icon: "activity" },
-  ];
   return (
     <div
       className={`app ${surface === "session" ? "session-layout" : "surface-layout"}${rightPanelCollapsed ? " right-panel-collapsed" : ""}`}
@@ -2856,7 +2896,6 @@ function AppContent() {
           if (!next) return;
           setSelected(next);
           setSurface("session");
-          setTab("chat");
         }}
         onNew={() => setModal(true)}
         onTest={(host: Host) =>
@@ -2883,114 +2922,32 @@ function AppContent() {
       <main className="main">
         {surface === "session" && selected ? (
           <>
-            <header className="session-header">
+            <header className="main-topbar session-header">
               <div>
                 <h1>{selected.title}</h1>
                 <p>
-                  Bound permanently to <strong>{selected.host_name}</strong> ·{" "}
-                  {selected.workspace || "workspace not set"}
+                  {selected.host_name} ·{" "}
+                  {selected.workspace || "workspace not set"} · {selected.model}
                 </p>
               </div>
-              <div className="header-actions">
+              <div className="main-topbar-actions">
                 {secretBackend && (
                   <span className="backend-badge">
                     Secrets: {secretBackend}
                   </span>
                 )}
-                <label>
-                  Provider
-                  <OpenWorkerSelectMenu
-                    value={selected.provider || ""}
-                    onChange={(provider) =>
-                      command("change_provider", {
-                        sessionId: selected.id,
-                        provider: provider || null,
-                      })
-                        .then(() => setSelected({ ...selected, provider }))
-                        .catch(onError)
-                    }
-                    options={[
-                      { value: "", label: "Global default" },
-                      ...providers.map((item) => ({
-                        value: item.name,
-                        label: item.title,
-                      })),
-                    ]}
-                    ariaLabel="Provider"
-                  />
-                </label>
-                <label>
-                  Model
-                  <OpenWorkerSelectMenu
-                    value={selected.model}
-                    onChange={(model) =>
-                      command("change_model", { sessionId: selected.id, model })
-                        .then(() => setSelected({ ...selected, model }))
-                        .catch(onError)
-                    }
-                    options={[
-                      ...[
-                        { id: selected.model, label: selected.model },
-                        ...models,
-                      ]
-                        .filter(
-                          (model, index, values) =>
-                            values.findIndex((item) => item.id === model.id) ===
-                            index,
-                        )
-                        .map((model) => ({
-                          value: model.id,
-                          label: model.label,
-                        })),
-                    ]}
-                    ariaLabel="Model"
-                  />
-                  <input
-                    key={selected.model}
-                    defaultValue={selected.model}
-                    placeholder={translate("customModel")}
-                    onBlur={(event) => {
-                      const model = event.target.value.trim();
-                      if (!model || model === selected.model) return;
-                      void command("change_model", {
-                        sessionId: selected.id,
-                        model,
-                      })
-                        .then(() => setSelected({ ...selected, model }))
-                        .catch(onError);
-                    }}
-                  />
-                </label>
-                {running && (
-                  <Button
-                    onClick={() =>
-                      command("interrupt", { sessionId: selected.id }).catch(
-                        onError,
-                      )
-                    }
-                  >
-                    <Icon name="stop" /> Interrupt
-                  </Button>
-                )}
+                <button
+                  className="icon-button"
+                  title={translate("Toggle session panel")}
+                  onClick={() => setRightPanelCollapsed((value) => !value)}
+                >
+                  <Icon name="sidebarRight" />
+                </button>
               </div>
             </header>
-            <nav className="surface-tabs">
-              {tabs.map((item) => (
-                <button
-                  className={tab === item.id ? "active" : ""}
-                  key={item.id}
-                  onClick={() => setTab(item.id)}
-                >
-                  <Icon
-                    name={item.icon as import("./components/Icon").IconName}
-                  />
-                  {item.label}
-                </button>
-              ))}
-            </nav>
-            <div className="main-content">
-              {tab === "chat" ? (
-                <>
+            <div className="main-workspace">
+              <div className="main-chat">
+                <div className="main-scroll">
                   <Transcript
                     items={transcriptItems}
                     running={running}
@@ -3003,36 +2960,34 @@ function AppContent() {
                       }).catch(onError);
                     }}
                   />
-                  <Composer
-                    mode={selected.mode}
-                    model={selected.model}
-                    models={models.map((item) => item.id)}
-                    modelLabels={Object.fromEntries(
-                      models.map((item) => [item.id, item.label]),
-                    )}
-                    connected={Boolean(selected)}
-                    running={running}
-                    onSend={submit}
-                    onSteer={steer}
-                    onModelChange={(model) => {
-                      void command("change_model", {
-                        sessionId: selected.id,
-                        model,
-                      })
-                        .then(() => setSelected({ ...selected, model }))
-                        .catch(onError);
-                    }}
-                    onInterrupt={() =>
-                      command("interrupt", { sessionId: selected.id }).catch(
-                        onError,
-                      )
-                    }
-                    resetKey={selected.id}
-                  />
-                </>
-              ) : (
-                <SurfaceView tab={tab} selected={selected} onError={onError} />
-              )}
+                </div>
+                <Composer
+                  mode={selected.mode}
+                  model={selected.model}
+                  models={models.map((item) => item.id)}
+                  modelLabels={Object.fromEntries(
+                    models.map((item) => [item.id, item.label]),
+                  )}
+                  connected={Boolean(selected)}
+                  running={running}
+                  onSend={submit}
+                  onSteer={steer}
+                  onModelChange={(model) => {
+                    void command("change_model", {
+                      sessionId: selected.id,
+                      model,
+                    })
+                      .then(() => setSelected({ ...selected, model }))
+                      .catch(onError);
+                  }}
+                  onInterrupt={() =>
+                    command("interrupt", { sessionId: selected.id }).catch(
+                      onError,
+                    )
+                  }
+                  resetKey={selected.id}
+                />
+              </div>
             </div>
           </>
         ) : surface === "manage" ? (
@@ -3081,6 +3036,15 @@ function AppContent() {
         <SessionRightPanel
           selected={selected}
           running={running}
+          providers={providers}
+          onProviderChange={(provider) =>
+            command("change_provider", {
+              sessionId: selected.id,
+              provider: provider || null,
+            })
+              .then(() => setSelected({ ...selected, provider }))
+              .catch(onError)
+          }
           onError={onError}
           onCollapsedChange={setRightPanelCollapsed}
         />
