@@ -2364,6 +2364,17 @@ async fn change_harness(
     {
         return Err("harness cannot change while approval or question requests are pending".into());
     }
+    if !state
+        .store
+        .load_messages(&session_id)
+        .map_err(|error| error.to_string())?
+        .is_empty()
+    {
+        return Err(
+            "harness can only be changed before the first turn; create a new session to preserve transcript state"
+                .into(),
+        );
+    }
     if harness == "opencode" {
         let options = harness_options(state.clone(), session.host_id.clone()).await?;
         let option = options
