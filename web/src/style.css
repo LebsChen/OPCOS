@@ -64,7 +64,11 @@ button:disabled {
 .app.session-layout {
   grid-template-columns: 276px minmax(320px, 1fr);
 }
-.app.session-layout .main {
+.app.session-layout > .main {
+  margin-right: 0;
+}
+.app.session-layout .main-topbar,
+.app.session-layout .main-chat {
   margin-right: var(--right-panel-width, 360px);
 }
 .app.surface-layout {
@@ -679,6 +683,7 @@ h3 {
   overflow: hidden;
 }
 .app.right-panel-collapsed .session-right-panel {
+  right: 16px;
   width: 44px;
 }
 .right-panel,
@@ -716,6 +721,7 @@ h3 {
 }
 .session-icon-rail {
   scrollbar-width: none;
+  overflow-y: hidden;
 }
 .rail-btn {
   display: flex;
@@ -941,7 +947,10 @@ h3 {
 .app.nav-collapsed.session-layout.right-panel-collapsed {
   grid-template-columns: 276px minmax(320px, 1fr);
 }
-.app.nav-collapsed.session-layout.right-panel-collapsed .main {
+.app.session-layout.right-panel-collapsed .main-topbar,
+.app.session-layout.right-panel-collapsed .main-chat,
+.app.nav-collapsed.session-layout.right-panel-collapsed .main-topbar,
+.app.nav-collapsed.session-layout.right-panel-collapsed .main-chat {
   margin-right: 44px;
 }
 
@@ -1375,13 +1384,10 @@ input.workspace-chip {
 
 @media (max-width: 1100px) {
   .app.session-layout {
-    grid-template-columns: 220px minmax(280px, 1fr) var(
-        --right-panel-width,
-        308px
-      );
+    grid-template-columns: 220px minmax(280px, 1fr);
   }
   .app.session-layout.right-panel-collapsed {
-    grid-template-columns: 220px minmax(280px, 1fr) 44px;
+    grid-template-columns: 220px minmax(280px, 1fr);
   }
   .surface-panel {
     padding-inline: 12px;
