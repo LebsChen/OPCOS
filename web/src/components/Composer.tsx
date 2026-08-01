@@ -19,7 +19,7 @@ const totalTokens = (value: SessionUsage) =>
     (sum, item) => sum + item.input + item.output,
     0,
   );
-import { Dropdown, type Option } from "./Dropdown";
+import type { Option } from "./Dropdown";
 import { Icon } from "./Icon";
 import { Toggle } from "./Toggle";
 type DictationStatus = {
@@ -512,7 +512,6 @@ export function Composer(props: Props) {
             onInsert={insertReference}
             assets={props.assets}
             secrets={props.secrets}
-            session
           />
           {/* Listening replaces the quiet middle controls with a LIVE waveform (mic RMS,
               polled ~10Hz, scrolling left) + elapsed time (§37). */}
@@ -587,12 +586,18 @@ export function Composer(props: Props) {
                 </span>
               </button>
             ) : modelsLoaded ? (
-              <Dropdown
+              <select
+                className="chip model-chip"
+                title="模型"
                 value={props.model}
-                options={modelOptions}
-                onChange={props.onModelChange}
-                align="right"
-              />
+                onChange={(event) => props.onModelChange(event.target.value)}
+              >
+                {modelOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
             ) : (
               <button
                 className="pill chip text-faint cursor-default"
@@ -714,7 +719,6 @@ export function PlusMenu({
   onInsert,
   assets = [],
   secrets = [],
-  session = false,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -722,7 +726,6 @@ export function PlusMenu({
   onInsert: (value: string) => void;
   assets?: Array<{ kind: string; title: string }>;
   secrets?: Array<{ name: string }>;
-  session?: boolean;
 }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const wrapRef = useRef<HTMLSpanElement>(null);
@@ -757,64 +760,69 @@ export function PlusMenu({
       <button
         className="icon-btn"
         type="button"
-        aria-label="More composer actions"
-        title="More composer actions"
+        aria-label="更多功能"
+        title="更多功能"
         onClick={() => onOpenChange(!open)}
       >
         +
       </button>
       {open && (
         <div className="plus-menu">
-          {session && onUpload && (
+          {onUpload && (
             <button type="button" onClick={upload}>
               <span className="pm-icon">＋</span>
-              Upload text attachment
+              上传附件
             </button>
           )}
-          {assetItems.length > 0 && (
-            <>
-              <div className="pm-divider" />
-              {assetItems.map((asset) => (
+          <div className="pm-divider" />
+          {[
+            { kind: "agents", label: "AGENTS.md", reference: "@AGENTS.md" },
+            { kind: "knowledge", label: "知识库", reference: "@Knowledge" },
+            { kind: "playbook", label: "运行手册", reference: "@Playbook" },
+            { kind: "skill", label: "技能", reference: "@Skill" },
+          ].map((category) => {
+            const matching = assetItems.filter(
+              (asset) => asset.kind === category.kind,
+            );
+            return matching.length > 0 ? (
+              matching.map((asset) => (
                 <button
                   type="button"
                   key={`${asset.kind}:${asset.title}`}
-                  onClick={() =>
-                    onInsert(
-                      asset.kind === "agents"
-                        ? "@AGENTS.md"
-                        : `@${asset.kind}:${asset.title}`,
-                    )
-                  }
+                  onClick={() => onInsert(`@${asset.kind}:${asset.title}`)}
                 >
                   <span className="pm-icon">@</span>
-                  {asset.kind === "agents" ? "AGENTS.md" : asset.title}
+                  {category.label}: {asset.title}
                 </button>
-              ))}
-            </>
-          )}
-          {secrets.length > 0 && (
-            <>
-              <div className="pm-divider" />
-              {secrets.map((secret) => (
-                <button
-                  type="button"
-                  key={secret.name}
-                  onClick={() => onInsert(`secret:session:${secret.name}`)}
-                >
-                  <span className="pm-icon">⌕</span>
-                  {secret.name}
-                </button>
-              ))}
-            </>
-          )}
-          {!session && (
-            <>
-              <div className="pm-divider" />
-              <button type="button" onClick={() => onInsert("@")}>
+              ))
+            ) : (
+              <button
+                type="button"
+                key={category.kind}
+                onClick={() => onInsert(category.reference)}
+              >
                 <span className="pm-icon">@</span>
-                Insert asset reference
+                {category.label}
               </button>
-            </>
+            );
+          })}
+          <div className="pm-divider" />
+          {secrets.length > 0 ? (
+            secrets.map((secret) => (
+              <button
+                type="button"
+                key={secret.name}
+                onClick={() => onInsert(`secret:session:${secret.name}`)}
+              >
+                <span className="pm-icon">⌕</span>
+                密钥：{secret.name}
+              </button>
+            ))
+          ) : (
+            <button type="button" disabled>
+              <span className="pm-icon">⌕</span>
+              密钥引用（暂无已配置密钥）
+            </button>
           )}
         </div>
       )}

@@ -3152,6 +3152,7 @@ function AppContent() {
   );
   const [homeInput, setHomeInput] = useState("");
   const [homePlusOpen, setHomePlusOpen] = useState(false);
+  const [homeAttachment, setHomeAttachment] = useState<File | null>(null);
   const [homeHostId, setHomeHostId] = useState("");
   const [homeProvider, setHomeProvider] = useState("");
   const [homeModel, setHomeModel] = useState("auto");
@@ -3369,8 +3370,17 @@ function AppContent() {
       setSurface("session");
       setHomeInput("");
       await refresh();
+      let requestText = text;
+      if (homeAttachment) {
+        const path = await uploadTextAttachmentForSession(
+          next.id,
+          homeAttachment,
+        );
+        requestText = `${requestText}\n\n[Attached file: ${path}]`;
+        setHomeAttachment(null);
+      }
       await command("submit_turn", {
-        request: { session_id: next.id, text },
+        request: { session_id: next.id, text: requestText },
       });
     } catch (reason) {
       setRunning(false);
@@ -3461,13 +3471,19 @@ function AppContent() {
       onError(submitFailureMessage(reason));
     });
   };
-  const uploadTextAttachment = async (file: File) => {
-    if (!selected) throw new Error("Select a session before uploading.");
+  const uploadTextAttachmentForSession = async (
+    sessionId: string,
+    file: File,
+  ) => {
     return command<string>("upload_text_attachment", {
-      sessionId: selected.id,
+      sessionId,
       fileName: file.name,
       content: await file.text(),
     });
+  };
+  const uploadTextAttachment = async (file: File) => {
+    if (!selected) throw new Error("Select a session before uploading.");
+    return uploadTextAttachmentForSession(selected.id, file);
   };
   const steer = (text: string) => {
     if (!selected) return;
@@ -3654,6 +3670,21 @@ function AppContent() {
                       }
                     }}
                   />
+                  {homeAttachment && (
+                    <div className="pending-files">
+                      <span className="pill att-pill">
+                        <span>{homeAttachment.name}</span>
+                        <button
+                          className="pill-x"
+                          type="button"
+                          title="移除附件"
+                          onClick={() => setHomeAttachment(null)}
+                        >
+                          ×
+                        </button>
+                      </span>
+                    </div>
+                  )}
                   <div className="composer-row">
                     <PlusMenu
                       open={homePlusOpen}
@@ -3667,6 +3698,10 @@ function AppContent() {
                       }
                       assets={assets}
                       secrets={secrets}
+                      onUpload={(file) => {
+                        setHomeAttachment(file);
+                        setHomePlusOpen(false);
+                      }}
                     />
                     <select
                       className="chip"
