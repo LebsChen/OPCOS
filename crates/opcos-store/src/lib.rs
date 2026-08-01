@@ -653,6 +653,15 @@ impl SqliteStore {
             .map_err(StoreError::from)
     }
 
+    pub fn count_audit_kind(&self, session_id: &str, kind: &str) -> Result<i64, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        Ok(connection.query_row(
+            "SELECT COUNT(*) FROM audit_events WHERE session_id=?1 AND kind=?2",
+            params![session_id, kind],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let connection = Connection::open_in_memory()?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
@@ -1611,6 +1620,36 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "approval_allowed");
         assert_eq!(events[0].payload["call_id"], "call-1");
+    }
+
+    #[test]
+    fn audit_kind_count_is_not_limited_by_transcript_page_size() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        for index in 0..600 {
+            store
+                .append_audit(
+                    "session-audit-count",
+                    if index % 2 == 0 {
+                        "approval_allowed"
+                    } else {
+                        "approval_denied"
+                    },
+                    &serde_json::json!({"index": index}),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .count_audit_kind("session-audit-count", "approval_allowed")
+                .unwrap(),
+            300
+        );
+        assert_eq!(
+            store
+                .count_audit_kind("session-audit-count", "approval_denied")
+                .unwrap(),
+            300
+        );
     }
 
     #[test]

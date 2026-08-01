@@ -342,6 +342,12 @@ fn redact_secret_patterns(value: &str) -> String {
             cursor += 1;
             continue;
         }
+        if let Some((value_start, value_end)) = secret_assignment(value, cursor) {
+            output.push_str(&value[cursor..value_start]);
+            output.push_str("[redacted]");
+            cursor = value_end;
+            continue;
+        }
         if value[cursor..].starts_with("-u ") {
             let token_start = cursor + 3;
             let token_end = credential_end(value, token_start);
@@ -381,6 +387,42 @@ fn redact_secret_patterns(value: &str) -> String {
         cursor += next;
     }
     output
+}
+
+fn secret_assignment(value: &str, cursor: usize) -> Option<(usize, usize)> {
+    let bytes = value.as_bytes();
+    let first = *bytes.get(cursor)?;
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return None;
+    }
+    if cursor > 0 {
+        let previous = bytes[cursor - 1];
+        if previous.is_ascii_alphanumeric() || previous == b'_' || previous == b'-' {
+            return None;
+        }
+    }
+    let mut end = cursor;
+    while let Some(byte) = bytes.get(end) {
+        if byte.is_ascii_alphanumeric() || *byte == b'_' {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    if bytes.get(end) != Some(&b'=') {
+        return None;
+    }
+    let name = &bytes[cursor..end];
+    let suffixes = ["TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL"];
+    if !suffixes.iter().any(|suffix| {
+        name.len() >= suffix.len()
+            && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
+    }) {
+        return None;
+    }
+    let value_start = skip_whitespace(value, end + 1);
+    let value_end = credential_end(value, value_start);
+    (value_start < value_end).then_some((value_start, value_end))
 }
 
 fn ascii_starts_with_ignore_case(value: &str, marker: &str) -> bool {
@@ -2676,11 +2718,14 @@ fn session_insights(state: State<'_, DesktopState>, session_id: String) -> Resul
         .len() as i64;
     let approval_count = state
         .store
-        .load_audit(Some(&session_id))
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .filter(|event| event.kind.contains("approval"))
-        .count() as i64;
+        .count_audit_kind(&session_id, "approval_allowed")
+        .and_then(|allowed| {
+            state
+                .store
+                .count_audit_kind(&session_id, "approval_denied")
+                .map(|denied| allowed + denied)
+        })
+        .map_err(|error| error.to_string())?;
     let usage = state
         .store
         .load_usage(&session_id)
@@ -3281,6 +3326,15 @@ mod m7_tests {
         assert_eq!(redacted.matches("[redacted]").count(), 1_000);
         assert!(redacted.contains("echo"));
         assert!(redacted.contains("中文"));
+    }
+
+    #[test]
+    fn transcript_redaction_covers_prefixed_secret_assignments() {
+        let input = "MY_TOKEN=one RVM_TOKEN=two API_SECRET=three AUTH_TOKEN=four --key=visible";
+        assert_eq!(
+            redact_secret_patterns(input),
+            "MY_TOKEN=[redacted] RVM_TOKEN=[redacted] API_SECRET=[redacted] AUTH_TOKEN=[redacted] --key=visible"
+        );
     }
 
     #[test]
