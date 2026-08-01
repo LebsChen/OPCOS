@@ -77,7 +77,7 @@ pub struct TurnEngine<P, S, E> {
     executor: Arc<E>,
     session_id: String,
     workspace: String,
-    mode: PermissionMode,
+    mode: Mutex<PermissionMode>,
     model: Mutex<String>,
     interrupted: AtomicBool,
     steering: Mutex<Vec<String>>,
@@ -139,7 +139,7 @@ where
             executor,
             session_id,
             workspace: workspace.into(),
-            mode,
+            mode: Mutex::new(mode),
             model: Mutex::new(model.into()),
             interrupted: AtomicBool::new(false),
             steering: Mutex::new(Vec::new()),
@@ -521,6 +521,10 @@ where
         self.unattended.store(unattended, Ordering::SeqCst);
     }
 
+    pub async fn set_mode(&self, mode: PermissionMode) {
+        *self.mode.lock().await = mode;
+    }
+
     fn save_pending(&self, pending: &PendingRecord) -> Result<(), EngineError> {
         self.store
             .save_pending(pending)
@@ -804,7 +808,8 @@ where
                 return Err(EngineError::ApprovalPending(call.id.clone()));
             }
             let risk = tool_risk(&call.name);
-            match decide(self.mode, risk, unattended, &grants, &call.name) {
+            let mode = *self.mode.lock().await;
+            match decide(mode, risk, unattended, &grants, &call.name) {
                 Decision::Allow
                     if matches!(risk, ToolRisk::Read | ToolRisk::Search | ToolRisk::GitRead) =>
                 {
@@ -1586,6 +1591,7 @@ mod tests {
         let pending = engine.execute_tools(1, &[ask]).await;
         assert!(matches!(pending, Err(EngineError::ApprovalPending(id)) if id == "ask-1"));
         assert_eq!(store.load_pending("s").unwrap()[0].state, "ask_user");
+        assert_eq!(store.list_inbox().unwrap()[0].kind, "question");
     }
 
     #[test]

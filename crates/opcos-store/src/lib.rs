@@ -487,6 +487,8 @@ pub trait SessionStore {
     fn set_unattended(&self, session_id: &str, unattended: bool) -> Result<(), StoreError>;
     fn is_unattended(&self, session_id: &str) -> Result<bool, StoreError>;
     fn list_inbox(&self) -> Result<Vec<InboxRecord>, StoreError>;
+    fn get_inbox(&self, session_id: &str, call_id: &str)
+    -> Result<Option<InboxRecord>, StoreError>;
     fn resolve_inbox(
         &self,
         session_id: &str,
@@ -1390,7 +1392,7 @@ impl SessionStore for SqliteStore {
                     WHEN ?3='propose_plan' THEN 'plan'
                     WHEN ?3 IN ('request_directory','request_workspace') THEN 'directory'
                     ELSE 'approval' END,
-               json_object('tool',?3),'inline',?6,NULL,NULL)",
+               json(?4),'inline',?6,NULL,NULL)",
             params![pending.session_id, pending.call_id, pending.tool,
                 serde_json::to_string(&pending.arguments)?, pending.state, Utc::now().to_rfc3339()],
         )?;
@@ -1545,6 +1547,44 @@ impl SessionStore for SqliteStore {
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn get_inbox(
+        &self,
+        session_id: &str,
+        call_id: &str,
+    ) -> Result<Option<InboxRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .query_row(
+                "SELECT session_id,call_id,kind,tool,payload,state,visibility,created_at,resolution,resolved_at
+                 FROM pending
+                 WHERE visibility='inbox' AND session_id=?1 AND call_id=?2",
+                params![session_id, call_id],
+                |row| {
+                    let payload: String = row.get(4)?;
+                    Ok(InboxRecord {
+                        session_id: row.get(0)?,
+                        call_id: row.get(1)?,
+                        kind: row.get(2)?,
+                        tool: row.get(3)?,
+                        payload: serde_json::from_str(&payload).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                4,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?,
+                        state: row.get(5)?,
+                        visibility: row.get(6)?,
+                        created_at: row.get(7)?,
+                        resolution: row.get(8)?,
+                        resolved_at: row.get(9)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
     }
 
     fn resolve_inbox(
@@ -2106,6 +2146,15 @@ mod tests {
         let items = store.list_inbox().unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].state, "pending");
+        assert_eq!(items[0].payload["command"], "echo hi");
+        assert_eq!(
+            store
+                .get_inbox("unattended", "call-1")
+                .unwrap()
+                .unwrap()
+                .call_id,
+            "call-1"
+        );
         assert!(
             store
                 .resolve_inbox("unattended", "call-1", "allow")

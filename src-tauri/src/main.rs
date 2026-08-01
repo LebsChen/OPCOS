@@ -2775,6 +2775,12 @@ async fn submit_turn(
                 .store
                 .is_unattended(&request.session_id)
                 .map_err(|error| error.to_string())?;
+            let pending_kind = state
+                .store
+                .get_inbox(&request.session_id, &call_id)
+                .map_err(|error| error.to_string())?
+                .map(|item| item.kind)
+                .unwrap_or_else(|| "approval".into());
             if unattended {
                 state
                     .store
@@ -2784,7 +2790,7 @@ async fn submit_turn(
                     &state,
                     &request.session_id,
                     "pending_item_delivered",
-                    json!({"call_id": call_id, "visibility": "inbox"}),
+                    json!({"call_id": call_id, "kind": pending_kind, "visibility": "inbox"}),
                 );
             }
             let calls = state
@@ -2797,7 +2803,16 @@ async fn submit_turn(
                     &app,
                     "notice",
                     Some(&request.session_id),
-                    json!({"kind":"approval_pending","text":"Approval required; delivered to Inbox"}),
+                    json!({
+                        "kind": pending_kind,
+                        "text": if pending_kind == "question" {
+                            "Question delivered to Inbox"
+                        } else if pending_kind == "plan" {
+                            "Plan confirmation delivered to Inbox"
+                        } else {
+                            "Approval required; delivered to Inbox"
+                        }
+                    }),
                 );
                 emit(
                     &app,
@@ -3103,15 +3118,36 @@ async fn set_unattended(
 }
 
 #[tauri::command]
-fn change_mode(
+async fn change_mode(
+    app: tauri::AppHandle,
     state: State<'_, DesktopState>,
     session_id: String,
     mode: String,
 ) -> Result<(), String> {
+    let permission_mode = match mode.to_ascii_lowercase().as_str() {
+        "discuss" => opcos_policy::PermissionMode::Discuss,
+        "plan" => opcos_policy::PermissionMode::Plan,
+        "interactive" => opcos_policy::PermissionMode::Interactive,
+        "auto" => opcos_policy::PermissionMode::Auto,
+        "custom" => opcos_policy::PermissionMode::Custom,
+        _ => return Err(format!("unsupported permission mode: {mode}")),
+    };
+    if let Some(engine) = state.engines.lock().await.get(&session_id).cloned() {
+        engine.set_mode(permission_mode).await;
+    }
     state
         .store
         .update_session_mode(&session_id, &mode)
         .map_err(|error| error.to_string())
+        .map(|_| {
+            audit(&state, &session_id, "mode_changed", json!({"mode": mode}));
+            emit(
+                &app,
+                "mode_changed",
+                Some(&session_id),
+                json!({"mode": mode}),
+            );
+        })
 }
 
 #[tauri::command]
@@ -3124,10 +3160,8 @@ async fn resolve_inbox(
 ) -> Result<(), String> {
     let item = state
         .store
-        .list_inbox()
+        .get_inbox(&session_id, &call_id)
         .map_err(|error| error.to_string())?
-        .into_iter()
-        .find(|item| item.session_id == session_id && item.call_id == call_id)
         .ok_or_else(|| "inbox item not found".to_owned())?;
     if item.state == "resolved" || item.state == "expired" {
         return Ok(());
