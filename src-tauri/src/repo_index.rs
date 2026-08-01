@@ -109,7 +109,7 @@ pub async fn build(
     }
     let file_result = host
         .exec(ExecRequest {
-            command: "set -o pipefail && find . -type d \\( -name .git -o -name node_modules -o -name target -o -name .venv -o -name dist -o -name build \\) -prune -o -type f -printf '%p\\t%s\\n' | head -n 20001".into(),
+            command: "state=$(mktemp /tmp/opcos-index-count.XXXXXX); trap 'rm -f \"$state\"' 0 1 2 3 15; printf 0 > \"$state\"; find . -type d \\( -name .git -o -name node_modules -o -name target -o -name .venv -o -name dist -o -name build \\) -prune -o \\( -exec sh -c 'n=$(cat \"$1\"); [ \"$n\" -ge 20000 ] && exit 1; size=$(wc -c < \"$2\"); printf \"%s\\t%s\\n\" \"$2\" \"$size\"; printf \"%s\\n\" \"$((n + 1))\" > \"$1\"' sh \"$state\" {} \\; -o -quit \\)".into(),
             cwd: Some(workspace.to_owned()),
             timeout_seconds: 30,
             session: None,
@@ -150,7 +150,7 @@ pub async fn build(
 
     let symbol_result = host
         .exec(ExecRequest {
-            command: "set -o pipefail && rg -n --hidden --glob '!.git/**' --glob '!node_modules/**' --glob '!target/**' --glob '!.venv/**' --glob '!dist/**' --glob '!build/**' '^[[:space:]]*(export[[:space:]]+)?(async[[:space:]]+)?(fn|function|class|interface|trait|struct|enum|const|def|module)[[:space:]]+' . | head -n 20000".into(),
+            command: "output=$(mktemp /tmp/opcos-index-symbols.XXXXXX); trap 'rm -f \"$output\"' 0 1 2 3 15; rg -n --hidden --glob '!.git/**' --glob '!node_modules/**' --glob '!target/**' --glob '!.venv/**' --glob '!dist/**' --glob '!build/**' --max-count 200 '^[[:space:]]*(export[[:space:]]+)?(async[[:space:]]+)?(fn|function|class|interface|trait|struct|enum|const|def|module)[[:space:]]+' . > \"$output\"; status=$?; if [ \"$status\" -gt 1 ]; then cat \"$output\"; exit \"$status\"; fi; head -c 8388608 \"$output\"".into(),
             cwd: Some(workspace.to_owned()),
             timeout_seconds: 30,
             session: None,
@@ -287,6 +287,7 @@ fn glob_match(pattern: &str, path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opcos_hosts::LocalHost;
 
     #[test]
     fn index_path_is_stable_and_workspace_scoped() {
@@ -317,5 +318,18 @@ mod tests {
         };
         assert_eq!(glob(&index, "src/*").len(), 1);
         assert_eq!(glob(&index, "*.md").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn local_host_builds_a_real_ready_index() {
+        let host = LocalHost::new(env!("CARGO_MANIFEST_DIR")).expect("local host");
+        let root = std::env::temp_dir().join(format!("opcos-index-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let index = build(&root, "local", env!("CARGO_MANIFEST_DIR"), &host)
+            .await
+            .expect("local repository index");
+        assert!(matches!(index.status.as_str(), "ready" | "limited"));
+        assert!(!index.files.is_empty());
+        let _ = std::fs::remove_dir_all(root);
     }
 }
