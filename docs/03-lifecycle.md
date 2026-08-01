@@ -22,7 +22,8 @@
 run_state:    idle | running | interrupted | error
 stop_reason:  none | waiting_for_user | waiting_for_approval | finished
               | interrupted_by_user | host_unavailable | provider_error
-              | policy_denied | context_exhausted
+              | policy_denied | context_exhausted | internal_error
+              | max_iterations
 ```
 
 约束：

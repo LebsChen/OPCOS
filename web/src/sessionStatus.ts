@@ -19,6 +19,10 @@ export function sessionStatusLabel(
       return "策略拒绝";
     case "context_exhausted":
       return "上下文已耗尽";
+    case "internal_error":
+      return "内部错误";
+    case "max_iterations":
+      return "达到最大轮次";
     case "none":
       if (runState === "running") return "运行中";
       if (runState === "error") return "运行出错";

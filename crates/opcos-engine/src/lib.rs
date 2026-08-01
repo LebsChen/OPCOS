@@ -27,6 +27,8 @@ pub enum EngineError {
     Provider(#[from] ProviderError),
     #[error("store: {0}")]
     Store(String),
+    #[error("context exhausted: {0}")]
+    ContextExhausted(String),
     #[error("engine interrupted")]
     Interrupted,
     #[error("maximum iterations reached")]
@@ -177,7 +179,7 @@ where
         self.interrupted.store(false, Ordering::SeqCst);
         self.policy_denied.store(false, Ordering::SeqCst);
         self.set_session_status("running", "none");
-        let result = self.run_loop(self.provider_messages()?).await;
+        let result = async { self.run_loop(self.provider_messages()?).await }.await;
         self.set_status_after_turn(&result);
         result
     }
@@ -185,6 +187,12 @@ where
     pub async fn resume_pending_turn(&self) -> Result<Option<AssistantTurn>, EngineError> {
         self.set_session_status("running", "none");
         self.policy_denied.store(false, Ordering::SeqCst);
+        let result = self.resume_pending_turn_inner().await;
+        self.set_status_after_turn(&result);
+        result
+    }
+
+    async fn resume_pending_turn_inner(&self) -> Result<Option<AssistantTurn>, EngineError> {
         let messages = self
             .store
             .load_resume_messages(&self.session_id)
@@ -197,7 +205,6 @@ where
                     .and_then(Value::as_array)
                     .is_some_and(|calls| !calls.is_empty())
         }) else {
-            self.set_session_status("idle", "finished");
             return Ok(None);
         };
         let result_ids = messages
@@ -230,7 +237,6 @@ where
             })
             .collect::<Vec<_>>();
         if calls.is_empty() {
-            self.set_session_status("idle", "finished");
             Ok(None)
         } else {
             let sequence = assistant.sequence;
@@ -247,16 +253,20 @@ where
                     .map_err(|error| EngineError::Store(error.to_string()))?;
             }
             self.execute_tools(sequence, &calls).await?;
-            let result = self.run_loop(self.provider_messages()?).await.map(Some);
-            self.set_status_after_turn(&result);
-            result
+            Ok(Some(self.run_loop(self.provider_messages()?).await?))
         }
     }
 
     fn set_session_status(&self, run_state: &str, stop_reason: &str) {
-        let _ = self
-            .store
-            .update_session_status(&self.session_id, run_state, stop_reason);
+        if let Err(error) =
+            self.store
+                .update_session_status(&self.session_id, run_state, stop_reason)
+        {
+            eprintln!(
+                "opcos-engine: failed to persist session status for {}: {}",
+                self.session_id, error
+            );
+        }
     }
 
     fn set_status_after_turn<T>(&self, result: &Result<T, EngineError>) {
@@ -281,15 +291,12 @@ where
             }
             Err(EngineError::Interrupted) => ("interrupted", "interrupted_by_user"),
             Err(EngineError::Provider(_)) => ("error", "provider_error"),
-            Err(EngineError::Store(message)) if message.contains("compact") => {
-                ("error", "context_exhausted")
-            }
-            Err(EngineError::Store(_)) | Err(EngineError::MaxIterations) => {
-                ("error", "provider_error")
-            }
+            Err(EngineError::ContextExhausted(_)) => ("error", "context_exhausted"),
+            Err(EngineError::Store(_)) => ("error", "internal_error"),
+            Err(EngineError::MaxIterations) => ("error", "max_iterations"),
             Err(EngineError::ApprovalAlreadyProcessed(_)) => ("idle", "waiting_for_approval"),
         };
-        if self.policy_denied.load(Ordering::SeqCst) {
+        if result.is_ok() && self.policy_denied.load(Ordering::SeqCst) {
             self.set_session_status("idle", "policy_denied");
             return;
         }
@@ -468,7 +475,10 @@ where
                 return Err(EngineError::Interrupted);
             }
             if self.should_compact(&messages, usage.as_ref()) {
-                messages = self.compact_context(messages).await?;
+                messages = self
+                    .compact_context(messages)
+                    .await
+                    .map_err(|error| EngineError::ContextExhausted(error.to_string()))?;
             }
             let request = ProviderRequest {
                 model: self.model.lock().await.clone(),
@@ -554,7 +564,10 @@ where
                     self.notice("error", "Provider request failed".into())
                         .await?;
                     if matches!(error, ProviderError::ContextOverflow) {
-                        messages = self.compact_context(messages).await?;
+                        messages = self
+                            .compact_context(messages)
+                            .await
+                            .map_err(|error| EngineError::ContextExhausted(error.to_string()))?;
                         continue;
                     }
                     return Err(error.into());

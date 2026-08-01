@@ -97,6 +97,10 @@
 | `steering`          | `{text}`。                                                                       |
 | `turn_done`         | `{run_state,stop_reason}`，必须是本 turn 最后事件；两字段是引擎产出的原始枚举。  |
 
+`stop_reason` 除生命周期原因外还包括 `internal_error`（store/engine 自身失败）
+与 `max_iterations`（达到引擎最大轮次）；前端必须按未知值安全降级，不能把
+内部错误显示成 `provider_error` 或 `finished`。
+
 事件序列和审批延续规则不在本篇重复，见 [03-lifecycle.md](03-lifecycle.md)。`submit_turn`、`resolve_approval`、`steering` 都会确保完成路径发 `turn_done`。
 
 Cloud-Dev 的 PTY 做法是动态事件名 `term-data-{id}`（byte array）与 `term-exit-{id}`（空 payload）［CD码］。OPCOS 使用固定事件名 + session/call 字段，把路由维度放进 JSON，而不是为每个 session 创建新 channel［推断］；这样更适合审计、重连和 Tauri listener 管理。
