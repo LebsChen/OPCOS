@@ -2,6 +2,11 @@ import type { ReactNode } from "react";
 import { Icon, type IconName } from "./Icon";
 import { translate } from "../i18n";
 
+// Shell source: OpenWorker surfaces/gui/src/components/SettingsView.tsx:85-123.
+// The body pages are OPCOS-only asset/host surfaces, so their data adapters stay
+// local while the reference subnav, centered content width, and row vocabulary
+// remain unchanged.
+
 export type SettingsSection =
   | "appearance"
   | "provider"
@@ -65,7 +70,7 @@ export function SettingsView({
         ))}
       </nav>
       <div className="flex-1 min-w-0 overflow-y-auto hairline-scroll">
-        <div className="w-full px-7 py-6">{children}</div>
+        <div className="max-w-3xl mx-auto w-full px-7 py-6">{children}</div>
       </div>
     </main>
   );

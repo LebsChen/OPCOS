@@ -986,7 +986,7 @@ h3 {
    OPCOS-specific; its width is the only layout value supplied by the adapter. */
 .app.session-layout .main-topbar {
   position: absolute;
-  inset: 0 var(--right-panel-width, 360px) auto 0;
+  inset: 0 0 auto 0;
   height: 48px;
   min-height: 0;
   padding: 0 14px 0 20px;
@@ -1000,7 +1000,7 @@ h3 {
   padding-top: 48px;
 }
 .app.session-layout .main-scroll {
-  padding: 24px 8% 24px;
+  padding: 24px 22px;
 }
 .rail-section {
   padding: 15px 14px;
