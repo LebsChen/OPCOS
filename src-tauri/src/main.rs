@@ -348,6 +348,8 @@ fn overlay_running_tool_status(
             .is_some_and(|call_id| active_call_ids.contains(call_id))
     {
         payload["status"] = json!("running");
+    } else if kind == "tool" && payload["status"] == "unresolved" {
+        payload["status"] = json!("interrupted");
     }
 }
 
@@ -3140,7 +3142,7 @@ mod m7_tests {
 
         let mut interrupted = json!({
             "call_id": "call-finished",
-            "status": "interrupted"
+            "status": "unresolved"
         });
         overlay_running_tool_status("tool", &mut interrupted, &active);
         assert_eq!(interrupted["status"], "interrupted");

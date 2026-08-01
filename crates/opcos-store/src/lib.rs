@@ -790,7 +790,7 @@ impl SqliteStore {
                         } else if call.result.is_some() {
                             "ok"
                         } else {
-                            "interrupted"
+                            "unresolved"
                         },
                         "approval": approval.is_some(),
                     }),
@@ -1491,7 +1491,7 @@ mod tests {
             .find(|record| record.payload["call_id"] == "call-interrupted")
             .unwrap();
         assert_eq!(interrupted.kind, "tool");
-        assert_eq!(interrupted.payload["status"], "interrupted");
+        assert_eq!(interrupted.payload["status"], "unresolved");
         let pending_ids = transcript
             .iter()
             .filter(|record| record.kind == "approval")

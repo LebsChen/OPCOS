@@ -276,6 +276,10 @@ where
             .load_pending(&self.session_id)
             .map_err(|error| EngineError::Store(error.to_string()))?
         {
+            self.active_tool_calls
+                .lock()
+                .await
+                .insert(item.call_id.clone());
             let result = if item.call_id == call_id && outcome == ApprovalOutcome::Approve {
                 self.execute_tool(&ToolCall {
                     id: item.call_id.clone(),
@@ -307,6 +311,7 @@ where
             self.store
                 .complete_tool_call(&self.session_id, message_sequence, &call.id, &result)
                 .map_err(|error| EngineError::Store(error.to_string()))?;
+            self.active_tool_calls.lock().await.remove(&call.id);
         }
         self.run_loop(self.provider_messages()?).await
     }
@@ -340,6 +345,13 @@ where
             .iter()
             .cloned()
             .collect()
+    }
+
+    async fn track_tool_calls(&self, calls: &[ToolCall]) {
+        self.active_tool_calls
+            .lock()
+            .await
+            .extend(calls.iter().map(|call| call.id.clone()));
     }
 
     pub async fn events_receiver(&self) -> Option<mpsc::Receiver<StreamChunk>> {
@@ -518,6 +530,7 @@ where
         assistant_sequence: i64,
         calls: &[ToolCall],
     ) -> Result<Vec<Value>, EngineError> {
+        self.track_tool_calls(calls).await;
         let mut results: Vec<Option<Value>> = (0..calls.len()).map(|_| None).collect();
         let mut readonly = Vec::new();
         let grants = self
@@ -637,14 +650,10 @@ where
     }
 
     async fn execute_tool(&self, call: &ToolCall) -> Value {
-        self.active_tool_calls.lock().await.insert(call.id.clone());
-        let result = self
-            .executor
+        self.executor
             .execute(&call.name, call.arguments.clone())
             .await
-            .unwrap_or_else(|error| json!({"error":error}));
-        self.active_tool_calls.lock().await.remove(&call.id);
-        result
+            .unwrap_or_else(|error| json!({"error":error}))
     }
 
     async fn persist_tool_results(
@@ -660,6 +669,7 @@ where
             self.store
                 .complete_tool_call(&self.session_id, assistant_sequence, &call.id, &result)
                 .map_err(|error| EngineError::Store(error.to_string()))?;
+            self.active_tool_calls.lock().await.remove(&call.id);
         }
         Ok(())
     }
