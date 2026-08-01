@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use opcos_rvm::{RvmClient, RvmError};
+use opcos_rvm::{DEFAULT_EXEC_TIMEOUT_SECONDS, RvmClient, RvmError};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -162,8 +162,13 @@ pub trait McpTransportClient: Send {
         name: &str,
         arguments: Value,
     ) -> Result<McpToolResult, McpClientError>;
+    async fn is_alive(&mut self) -> bool {
+        true
+    }
     async fn close(&mut self);
 }
+
+type SharedMcpClient = Arc<Mutex<Box<dyn McpTransportClient>>>;
 
 #[derive(Debug, Serialize)]
 pub struct JsonRpcError {
@@ -272,9 +277,24 @@ impl StdioClient {
         if let Some(cwd) = &config.cwd {
             cmd.current_dir(cwd);
         }
+        cmd.kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|_| McpClientError::ProcessStart)?;
-        let stdin = child.stdin.take().ok_or(McpClientError::ProcessStart)?;
-        let stdout = child.stdout.take().ok_or(McpClientError::ProcessStart)?;
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Err(McpClientError::ProcessStart);
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Err(McpClientError::ProcessStart);
+            }
+        };
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr);
@@ -293,14 +313,12 @@ impl StdioClient {
     async fn request(&mut self, method: &str, params: Value) -> Result<Value, McpClientError> {
         let id = self.next_id;
         self.next_id += 1;
-        let body = serde_json::to_vec(&json!({
+        let request = json!({
             "jsonrpc": "2.0", "id": id, "method": method, "params": params
-        }))
-        .map_err(|_| McpClientError::InvalidResponse)?;
-        self.stdin
-            .write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())
-            .await
-            .map_err(|_| McpClientError::Disconnected)?;
+        });
+        let expected_id = Value::from(id);
+        let mut body = serde_json::to_vec(&request).map_err(|_| McpClientError::InvalidResponse)?;
+        body.push(b'\n');
         self.stdin
             .write_all(&body)
             .await
@@ -309,35 +327,41 @@ impl StdioClient {
             .flush()
             .await
             .map_err(|_| McpClientError::Disconnected)?;
-        let mut content_length = None;
         loop {
             let mut line = String::new();
             self.stdout
                 .read_line(&mut line)
                 .await
                 .map_err(|_| McpClientError::Disconnected)?;
-            if line.is_empty() {
+            if line.trim().is_empty() {
                 return Err(McpClientError::ProcessExited);
             }
-            if line == "\r\n" {
-                break;
+            let response: Value =
+                serde_json::from_str(line.trim()).map_err(|_| McpClientError::InvalidResponse)?;
+            if response.get("id") != Some(&expected_id) {
+                continue;
             }
-            if let Some(value) = line.strip_prefix("Content-Length:") {
-                content_length = value.trim().parse::<usize>().ok();
+            if response.get("error").is_some() {
+                return Err(McpClientError::Transport);
             }
+            return Ok(response.get("result").cloned().unwrap_or(response));
         }
-        let length = content_length.ok_or(McpClientError::InvalidResponse)?;
-        let mut response = vec![0; length];
-        self.stdout
-            .read_exact(&mut response)
+    }
+
+    async fn notify(&mut self, method: &str, params: Value) -> Result<(), McpClientError> {
+        let mut body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0", "method": method, "params": params
+        }))
+        .map_err(|_| McpClientError::InvalidResponse)?;
+        body.push(b'\n');
+        self.stdin
+            .write_all(&body)
             .await
             .map_err(|_| McpClientError::Disconnected)?;
-        let response: Value =
-            serde_json::from_slice(&response).map_err(|_| McpClientError::InvalidResponse)?;
-        if response.get("error").is_some() {
-            return Err(McpClientError::Transport);
-        }
-        Ok(response.get("result").cloned().unwrap_or(response))
+        self.stdin
+            .flush()
+            .await
+            .map_err(|_| McpClientError::Disconnected)
     }
 }
 
@@ -345,7 +369,7 @@ impl StdioClient {
 impl McpTransportClient for StdioClient {
     async fn initialize(&mut self) -> Result<(), McpClientError> {
         tokio::time::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(DEFAULT_EXEC_TIMEOUT_SECONDS),
             self.request(
                 "initialize",
                 json!({
@@ -357,12 +381,12 @@ impl McpTransportClient for StdioClient {
         )
         .await
         .map_err(|_| McpClientError::Timeout)??;
-        Ok(())
+        self.notify("notifications/initialized", json!({})).await
     }
 
     async fn list_tools(&mut self) -> Result<Vec<McpTool>, McpClientError> {
         let value = tokio::time::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(DEFAULT_EXEC_TIMEOUT_SECONDS),
             self.request("tools/list", json!({})),
         )
         .await
@@ -377,12 +401,23 @@ impl McpTransportClient for StdioClient {
         arguments: Value,
     ) -> Result<McpToolResult, McpClientError> {
         let value = tokio::time::timeout(
-            Duration::from_secs(120),
+            Duration::from_secs(DEFAULT_EXEC_TIMEOUT_SECONDS),
             self.request("tools/call", json!({"name": name, "arguments": arguments})),
         )
         .await
         .map_err(|_| McpClientError::Timeout)??;
         serde_json::from_value(value).map_err(|_| McpClientError::InvalidResponse)
+    }
+
+    async fn is_alive(&mut self) -> bool {
+        match self.child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) => {
+                let _ = self.child.wait().await;
+                false
+            }
+            Err(_) => false,
+        }
     }
 
     async fn close(&mut self) {
@@ -396,6 +431,7 @@ struct HttpClient {
     url: String,
     headers: HeaderMap,
     next_id: u64,
+    session_id: Option<String>,
 }
 
 impl HttpClient {
@@ -405,7 +441,16 @@ impl HttpClient {
     ) -> Result<Self, McpClientError> {
         let url = config.url.clone().ok_or(McpClientError::InvalidConfig)?;
         let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::ACCEPT,
+            HeaderValue::from_static("application/json, text/event-stream"),
+        );
         for (name, value) in &config.headers {
+            if name.eq_ignore_ascii_case("authorization")
+                || name.eq_ignore_ascii_case("proxy-authorization")
+            {
+                return Err(McpClientError::InvalidConfig);
+            }
             let name = HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| McpClientError::InvalidConfig)?;
             let value = HeaderValue::from_str(value).map_err(|_| McpClientError::InvalidConfig)?;
@@ -423,36 +468,101 @@ impl HttpClient {
             url,
             headers,
             next_id: 1,
+            session_id: None,
         })
     }
 
     async fn request(&mut self, method: &str, params: Value) -> Result<Value, McpClientError> {
         let id = self.next_id;
         self.next_id += 1;
-        let response = self
-            .client
-            .post(&self.url)
-            .headers(self.headers.clone())
-            .json(&json!({
-                "jsonrpc": "2.0", "id": id, "method": method, "params": params
-            }))
-            .send()
-            .await
-            .map_err(|_| McpClientError::Disconnected)?;
+        let mut headers = self.headers.clone();
+        if let Some(session_id) = &self.session_id {
+            headers.insert(
+                HeaderName::from_static("mcp-session-id"),
+                HeaderValue::from_str(session_id).map_err(|_| McpClientError::InvalidConfig)?,
+            );
+        }
+        let response = tokio::time::timeout(
+            Duration::from_secs(DEFAULT_EXEC_TIMEOUT_SECONDS),
+            self.client
+                .post(&self.url)
+                .headers(headers)
+                .json(&json!({
+                    "jsonrpc": "2.0", "id": id, "method": method, "params": params
+                }))
+                .send(),
+        )
+        .await
+        .map_err(|_| McpClientError::Timeout)?
+        .map_err(|_| McpClientError::Disconnected)?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             return Err(McpClientError::AuthRequired);
         }
         if !response.status().is_success() {
             return Err(McpClientError::Transport);
         }
-        let value: Value = response
-            .json()
-            .await
-            .map_err(|_| McpClientError::InvalidResponse)?;
+        if let Some(session_id) = response.headers().get("mcp-session-id") {
+            self.session_id = Some(
+                session_id
+                    .to_str()
+                    .map_err(|_| McpClientError::InvalidResponse)?
+                    .to_owned(),
+            );
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let body = tokio::time::timeout(
+            Duration::from_secs(DEFAULT_EXEC_TIMEOUT_SECONDS),
+            response.bytes(),
+        )
+        .await
+        .map_err(|_| McpClientError::Timeout)?
+        .map_err(|_| McpClientError::Disconnected)?;
+        let value = if content_type.starts_with("text/event-stream") {
+            body.split(|byte| *byte == b'\n')
+                .filter_map(|line| line.strip_prefix(b"data:"))
+                .filter_map(|line| serde_json::from_slice::<Value>(line.trim_ascii()).ok())
+                .next_back()
+                .ok_or(McpClientError::InvalidResponse)?
+        } else {
+            serde_json::from_slice(&body).map_err(|_| McpClientError::InvalidResponse)?
+        };
         if value.get("error").is_some() {
             return Err(McpClientError::Transport);
         }
         Ok(value.get("result").cloned().unwrap_or(value))
+    }
+
+    async fn notify(&mut self, method: &str, params: Value) -> Result<(), McpClientError> {
+        let mut headers = self.headers.clone();
+        if let Some(session_id) = &self.session_id {
+            headers.insert(
+                HeaderName::from_static("mcp-session-id"),
+                HeaderValue::from_str(session_id).map_err(|_| McpClientError::InvalidConfig)?,
+            );
+        }
+        let response = tokio::time::timeout(
+            Duration::from_secs(DEFAULT_EXEC_TIMEOUT_SECONDS),
+            self.client
+                .post(&self.url)
+                .headers(headers)
+                .json(&json!({"jsonrpc": "2.0", "method": method, "params": params}))
+                .send(),
+        )
+        .await
+        .map_err(|_| McpClientError::Timeout)?
+        .map_err(|_| McpClientError::Disconnected)?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(McpClientError::AuthRequired);
+        }
+        if !response.status().is_success() && response.status() != reqwest::StatusCode::ACCEPTED {
+            return Err(McpClientError::Transport);
+        }
+        Ok(())
     }
 }
 
@@ -467,7 +577,8 @@ impl McpTransportClient for HttpClient {
             }),
         )
         .await
-        .map(|_| ())
+        .map(|_| ())?;
+        self.notify("notifications/initialized", json!({})).await
     }
     async fn list_tools(&mut self) -> Result<Vec<McpTool>, McpClientError> {
         let value = self.request("tools/list", json!({})).await?;
@@ -485,13 +596,18 @@ impl McpTransportClient for HttpClient {
         )
         .map_err(|_| McpClientError::InvalidResponse)
     }
+
+    async fn is_alive(&mut self) -> bool {
+        true
+    }
     async fn close(&mut self) {}
 }
 
 pub struct McpManager<S> {
     credentials: Arc<S>,
-    clients: Mutex<HashMap<String, Box<dyn McpTransportClient>>>,
+    clients: Mutex<HashMap<String, SharedMcpClient>>,
     tools: Mutex<HashMap<(String, String), Vec<McpTool>>>,
+    active_versions: Mutex<HashMap<String, String>>,
     statuses: Mutex<HashMap<String, McpServerSnapshot>>,
     watchers: Mutex<HashMap<String, JoinHandle<()>>>,
 }
@@ -502,6 +618,7 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             credentials,
             clients: Mutex::new(HashMap::new()),
             tools: Mutex::new(HashMap::new()),
+            active_versions: Mutex::new(HashMap::new()),
             statuses: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
         }
@@ -553,8 +670,17 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             McpTransport::Stdio => Box::new(StdioClient::spawn(config).await?),
             McpTransport::StreamableHttp => Box::new(HttpClient::new(config, credentials)?),
         };
-        client.initialize().await?;
-        let mut tools = client.list_tools().await?;
+        if let Err(error) = client.initialize().await {
+            client.close().await;
+            return Err(error);
+        }
+        let mut tools = match client.list_tools().await {
+            Ok(tools) => tools,
+            Err(error) => {
+                client.close().await;
+                return Err(error);
+            }
+        };
         for tool in &mut tools {
             tool.server_id = config.object_id.clone();
         }
@@ -568,10 +694,19 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             (config.object_id.clone(), version_id.to_owned()),
             tools.clone(),
         );
+        self.active_versions
+            .lock()
+            .await
+            .insert(config.object_id.clone(), version_id.to_owned());
+        let old_client = self.clients.lock().await.remove(&config.object_id);
+        if let Some(old_client) = old_client {
+            let mut old_client = old_client.lock().await;
+            old_client.close().await;
+        }
         self.clients
             .lock()
             .await
-            .insert(config.object_id.clone(), client);
+            .insert(config.object_id.clone(), Arc::new(Mutex::new(client)));
         self.statuses.lock().await.insert(
             config.object_id.clone(),
             McpServerSnapshot {
@@ -676,11 +811,16 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
         if !connected {
             return Err(McpClientError::Disconnected);
         }
-        let mut clients = self.clients.lock().await;
-        let client = clients
-            .get_mut(object_id)
+        let client = self
+            .clients
+            .lock()
+            .await
+            .get(object_id)
+            .cloned()
             .ok_or(McpClientError::Disconnected)?;
+        let mut client = client.lock().await;
         let result = client.call_tool(original_name, arguments).await;
+        drop(client);
         if result.is_err()
             && let Some(snapshot) = self.statuses.lock().await.get_mut(object_id)
         {
@@ -695,12 +835,18 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
         qualified_name: &str,
         arguments: Value,
     ) -> Result<McpToolResult, McpClientError> {
+        let active_versions = self.active_versions.lock().await;
         let catalog = self.tools.lock().await;
-        let (server_id, original_name) = catalog
-            .values()
-            .flatten()
-            .find(|tool| tool.qualified_name == qualified_name)
-            .map(|tool| (tool.server_id.clone(), tool.name.clone()))
+        let (server_id, original_name) = active_versions
+            .iter()
+            .filter_map(|(server_id, version_id)| {
+                catalog
+                    .get(&(server_id.clone(), version_id.clone()))?
+                    .iter()
+                    .find(|tool| tool.qualified_name == qualified_name)
+                    .map(|tool| (server_id.clone(), tool.name.clone()))
+            })
+            .next()
             .ok_or(McpClientError::Disconnected)?;
         drop(catalog);
         self.call(&server_id, &original_name, arguments).await
@@ -714,7 +860,8 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
         if let Some(watcher) = self.watchers.lock().await.remove(object_id) {
             watcher.abort();
         }
-        if let Some(mut client) = self.clients.lock().await.remove(object_id) {
+        if let Some(client) = self.clients.lock().await.remove(object_id) {
+            let mut client = client.lock().await;
             client.close().await;
         }
     }
@@ -731,7 +878,8 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             let mut clients = self.clients.lock().await;
             std::mem::take(&mut *clients)
         };
-        for (_, mut client) in clients {
+        for (_, client) in clients {
+            let mut client = client.lock().await;
             client.close().await;
         }
     }
@@ -743,31 +891,37 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
         let watcher_config = config.clone();
         let watcher_version = version_id.clone();
         let watcher = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
                 interval.tick().await;
                 let result = {
-                    let mut clients = manager.clients.lock().await;
-                    let Some(client) = clients.get_mut(&watcher_key) else {
+                    let Some(client) = manager.clients.lock().await.get(&watcher_key).cloned()
+                    else {
                         break;
                     };
-                    client.list_tools().await
+                    let mut client = client.lock().await;
+                    client.is_alive().await
                 };
-                if result.is_ok() {
-                    if let Some(snapshot) = manager.statuses.lock().await.get_mut(&watcher_key) {
-                        snapshot.status = McpServerStatus::Connected;
-                        snapshot.retry_attempt = 0;
-                        snapshot.last_error = None;
-                    }
+                let connected = manager
+                    .statuses
+                    .lock()
+                    .await
+                    .get(&watcher_key)
+                    .is_some_and(|snapshot| snapshot.status == McpServerStatus::Connected);
+                if result && connected {
                     continue;
                 }
-                if let Some(mut client) = manager.clients.lock().await.remove(&watcher_key) {
+                if let Some(client) = manager.clients.lock().await.remove(&watcher_key) {
+                    let mut client = client.lock().await;
                     client.close().await;
                 }
                 if let Some(snapshot) = manager.statuses.lock().await.get_mut(&watcher_key) {
                     snapshot.status = McpServerStatus::Disconnected;
-                    snapshot.last_error = Some("MCP transport disconnected".into());
+                    if !result {
+                        snapshot.last_error = Some("MCP transport disconnected".into());
+                    }
                 }
+                let mut reconnected = false;
                 for attempt in 0..=7 {
                     if attempt > 0 {
                         if let Some(snapshot) = manager.statuses.lock().await.get_mut(&watcher_key)
@@ -782,10 +936,26 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
                         .await
                         .is_ok()
                     {
+                        manager
+                            .statuses
+                            .lock()
+                            .await
+                            .entry(watcher_key.clone())
+                            .and_modify(|snapshot| {
+                                snapshot.status = McpServerStatus::Connected;
+                                snapshot.retry_attempt = 0;
+                                snapshot.last_error = None;
+                            });
+                        reconnected = true;
                         break;
                     }
                 }
-                break;
+                if !reconnected {
+                    if let Some(snapshot) = manager.statuses.lock().await.get_mut(&watcher_key) {
+                        snapshot.status = McpServerStatus::Failed;
+                    }
+                    break;
+                }
             }
         });
         if let Some(previous) = self.watchers.lock().await.insert(watcher_id, watcher) {
@@ -984,6 +1154,83 @@ mod tests {
         let mut client = StdioClient::spawn(&config).await.unwrap();
         client.close().await;
         assert!(client.child.try_wait().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn stdio_uses_line_framing_and_skips_notifications() {
+        let config = McpServerConfig {
+            object_id: "server-a".into(),
+            server_key: "abc123".into(),
+            name: "server-a".into(),
+            transport: McpTransport::Stdio,
+            command: Some("/bin/sh".into()),
+            args: vec![
+                "-c".into(),
+                r#"while IFS= read -r line; do case "$line" in *'"method":"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","method":"notice","params":{}}'; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}';; *'"method":"tools/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":99,"method":"notice"}'; printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}';; esac; done"#.into(),
+            ],
+            env: HashMap::new(),
+            cwd: None,
+            url: None,
+            headers: HashMap::new(),
+            enabled: true,
+            include_tools: None,
+            exclude_tools: None,
+            requires_approval: true,
+            auth: None,
+        };
+        let mut client = StdioClient::spawn(&config).await.unwrap();
+        client.initialize().await.unwrap();
+        assert!(client.list_tools().await.unwrap().is_empty());
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn failed_stdio_initialize_can_be_explicitly_cleaned_up() {
+        let config = McpServerConfig {
+            object_id: "server-a".into(),
+            server_key: "abc123".into(),
+            name: "server-a".into(),
+            transport: McpTransport::Stdio,
+            command: Some("/bin/sh".into()),
+            args: vec!["-c".into(), "printf 'not-json\\n'; sleep 60".into()],
+            env: HashMap::new(),
+            cwd: None,
+            url: None,
+            headers: HashMap::new(),
+            enabled: true,
+            include_tools: None,
+            exclude_tools: None,
+            requires_approval: true,
+            auth: None,
+        };
+        let mut client = StdioClient::spawn(&config).await.unwrap();
+        assert!(client.initialize().await.is_err());
+        client.close().await;
+        assert!(client.child.try_wait().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn manager_closes_stdio_client_when_initialize_fails() {
+        let config = McpServerConfig {
+            object_id: "server-a".into(),
+            server_key: "abc123".into(),
+            name: "server-a".into(),
+            transport: McpTransport::Stdio,
+            command: Some("/bin/sh".into()),
+            args: vec!["-c".into(), "printf 'not-json\\n'; sleep 60".into()],
+            env: HashMap::new(),
+            cwd: None,
+            url: None,
+            headers: HashMap::new(),
+            enabled: true,
+            include_tools: None,
+            exclude_tools: None,
+            requires_approval: true,
+            auth: None,
+        };
+        let manager = Arc::new(McpManager::new(Arc::new(NoCredentials)));
+        assert!(manager.connect(&config, "v1").await.is_err());
+        assert!(manager.clients.lock().await.is_empty());
     }
 
     #[tokio::test]
