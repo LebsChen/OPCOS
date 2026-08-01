@@ -2856,6 +2856,115 @@ function PageHeader({ title, subtitle }: { title: string; subtitle: string }) {
   );
 }
 
+function SessionRightPanel({
+  selected,
+  onError,
+  running,
+}: {
+  selected: Session;
+  onError: (error: unknown) => void;
+  running: boolean;
+}) {
+  const [panelTab, setPanelTab] = useState<
+    | "info"
+    | "terminal"
+    | "desktop"
+    | "ide"
+    | "review"
+    | "worklog"
+    | "browser"
+    | "board"
+  >("info");
+  const [collapsed, setCollapsed] = useState(false);
+  const tabs: Array<{
+    id: typeof panelTab;
+    label: string;
+    icon: Parameters<typeof Icon>[0]["name"];
+  }> = [
+    { id: "info", label: "Info", icon: "inbox" },
+    { id: "terminal", label: "Shell", icon: "code" },
+    { id: "desktop", label: "Desktop", icon: "image" },
+    { id: "ide", label: "Web IDE", icon: "fileCode" },
+    { id: "review", label: "Diff", icon: "search" },
+    { id: "worklog", label: "Worklog", icon: "clock" },
+    { id: "browser", label: "Browser", icon: "folder" },
+    { id: "board", label: "Board", icon: "audit" },
+  ];
+  if (collapsed) {
+    return (
+      <aside className="right-rail right-rail-collapsed">
+        <button
+          className="rail-toggle"
+          title="Expand session panel"
+          onClick={() => setCollapsed(false)}
+        >
+          <Icon name="sidebarRight" />
+        </button>
+      </aside>
+    );
+  }
+  return (
+    <aside className="right-rail session-right-panel">
+      <div className="session-panel-tabs">
+        {tabs.map((item) => (
+          <button
+            key={item.id}
+            className={panelTab === item.id ? "active" : ""}
+            title={item.label}
+            onClick={() => setPanelTab(item.id)}
+          >
+            <Icon name={item.icon} />
+          </button>
+        ))}
+        <button
+          className="panel-collapse"
+          title="Collapse session panel"
+          onClick={() => setCollapsed(true)}
+        >
+          <Icon name="sidebarRight" />
+        </button>
+      </div>
+      <div className="session-panel-content">
+        {panelTab === "info" && (
+          <div className="p-4">
+            <h2 className="text-[15px] font-semibold text-ink">Session</h2>
+            <dl className="mt-4 space-y-3 text-[13px]">
+              <div>
+                <dt className="text-muted">Status</dt>
+                <dd>{running ? "Running" : "Ready"}</dd>
+              </div>
+              <div>
+                <dt className="text-muted">Host</dt>
+                <dd>{selected.host_name}</dd>
+              </div>
+              <div>
+                <dt className="text-muted">Workspace</dt>
+                <dd>{selected.workspace || "Not set"}</dd>
+              </div>
+              <div>
+                <dt className="text-muted">Model</dt>
+                <dd>{selected.model}</dd>
+              </div>
+            </dl>
+          </div>
+        )}
+        {panelTab !== "info" && panelTab !== "board" && (
+          <SurfaceView
+            tab={panelTab === "review" ? "review" : panelTab}
+            selected={selected}
+            onError={onError}
+          />
+        )}
+        {panelTab === "board" && (
+          <div className="p-4 text-[13px] text-muted">
+            Coordination Board is available from Activity → Board.
+          </div>
+        )}
+      </div>
+    </aside>
+  );
+}
+
 export function App() {
   const [hosts, setHosts] = useState<Host[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -3299,21 +3408,10 @@ export function App() {
           </div>
         )}
       </main>
-      {surface === "session" && (
-        <RightRail
+      {surface === "session" && selected && (
+        <SessionRightPanel
           selected={selected}
           running={running}
-          items={activeItems}
-          assets={assets}
-          onAsset={toggleAsset}
-          onMcp={(name: string, enabled: boolean) =>
-            selected &&
-            command("set_mcp_tool_enabled", {
-              sessionId: selected.id,
-              name,
-              enabled,
-            }).catch(onError)
-          }
           onError={onError}
         />
       )}

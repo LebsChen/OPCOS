@@ -560,6 +560,62 @@ h3 {
   border-left: 1px solid var(--color-line);
   background: #151a23;
 }
+
+.session-right-panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.session-panel-tabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 8px;
+  border-bottom: 1px solid var(--color-line);
+}
+
+.session-panel-tabs button {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border-radius: 7px;
+  color: var(--color-muted);
+}
+
+.session-panel-tabs button:hover,
+.session-panel-tabs button.active {
+  color: var(--color-ink);
+  background: var(--color-paper);
+}
+
+.session-panel-tabs .panel-collapse {
+  margin-left: auto;
+}
+
+.session-panel-content {
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+}
+
+.right-rail-collapsed {
+  display: flex;
+  justify-content: flex-start;
+  align-items: center;
+  padding-top: 8px;
+}
+
+.right-rail-collapsed .rail-toggle {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  margin: 0 auto;
+  place-items: center;
+  border-radius: 7px;
+  color: var(--color-muted);
+}
 .rail-section {
   padding: 15px 14px;
   border-bottom: 1px solid var(--color-line);
