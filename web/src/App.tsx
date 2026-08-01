@@ -1169,7 +1169,13 @@ function ManageSections({
         </h1>
         <p className="text-[13px] text-muted mt-1">{sectionCopy[tab][1]}</p>
       </header>
-      <div className="rounded-xl2 border border-line bg-panel p-5">
+      <div
+        className={
+          tab === "provider" || tab === "blueprint"
+            ? "rounded-xl2 border border-line bg-panel p-5"
+            : ""
+        }
+      >
         {tab === "provider" && (
           <div className="divide-y divide-line">
             <div className="settings-row">
