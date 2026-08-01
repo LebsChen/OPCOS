@@ -12,9 +12,18 @@ use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
 pub const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
+
+pub fn reconnect_delay(attempt: u32) -> Duration {
+    if attempt == 0 {
+        Duration::ZERO
+    } else {
+        (Duration::from_millis(500) * 2u32.saturating_pow(attempt - 1)).min(MAX_RECONNECT_DELAY)
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
@@ -484,6 +493,7 @@ pub struct McpManager<S> {
     clients: Mutex<HashMap<String, Box<dyn McpTransportClient>>>,
     tools: Mutex<HashMap<(String, String), Vec<McpTool>>>,
     statuses: Mutex<HashMap<String, McpServerSnapshot>>,
+    watchers: Mutex<HashMap<String, JoinHandle<()>>>,
 }
 
 impl<S: McpCredentialStore + 'static> McpManager<S> {
@@ -493,15 +503,38 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             clients: Mutex::new(HashMap::new()),
             tools: Mutex::new(HashMap::new()),
             statuses: Mutex::new(HashMap::new()),
+            watchers: Mutex::new(HashMap::new()),
         }
     }
 
     pub async fn connect(
+        self: &Arc<Self>,
+        config: &McpServerConfig,
+        version_id: &str,
+    ) -> Result<Vec<McpTool>, McpClientError> {
+        let tools = self.connect_inner(config, version_id).await?;
+        self.start_liveness(config.clone(), version_id.to_owned())
+            .await;
+        Ok(tools)
+    }
+
+    async fn connect_inner(
         &self,
         config: &McpServerConfig,
         version_id: &str,
     ) -> Result<Vec<McpTool>, McpClientError> {
         if !config.enabled {
+            self.statuses.lock().await.insert(
+                config.object_id.clone(),
+                McpServerSnapshot {
+                    object_id: config.object_id.clone(),
+                    name: config.name.clone(),
+                    status: McpServerStatus::Disabled,
+                    last_error: None,
+                    retry_attempt: 0,
+                    tool_count: 0,
+                },
+            );
             return Err(McpClientError::Disconnected);
         }
         self.statuses.lock().await.insert(
@@ -554,7 +587,7 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
     }
 
     pub async fn connect_with_retry(
-        &self,
+        self: &Arc<Self>,
         config: &McpServerConfig,
         version_id: &str,
         max_attempts: u32,
@@ -581,10 +614,20 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
                         },
                     );
                     if attempt >= max_attempts {
+                        self.statuses.lock().await.insert(
+                            config.object_id.clone(),
+                            McpServerSnapshot {
+                                object_id: config.object_id.clone(),
+                                name: config.name.clone(),
+                                status: McpServerStatus::Failed,
+                                last_error: Some(error.to_string()),
+                                retry_attempt: attempt,
+                                tool_count: 0,
+                            },
+                        );
                         return Err(error);
                     }
-                    let delay = (Duration::from_millis(500) * 2u32.saturating_pow(attempt))
-                        .min(MAX_RECONNECT_DELAY);
+                    let delay = reconnect_delay(attempt);
                     self.statuses.lock().await.insert(
                         config.object_id.clone(),
                         McpServerSnapshot {
@@ -611,17 +654,40 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             .cloned()
     }
 
+    pub async fn seed_cached_tools(&self, object_id: &str, version_id: &str, tools: Vec<McpTool>) {
+        self.tools
+            .lock()
+            .await
+            .insert((object_id.to_owned(), version_id.to_owned()), tools);
+    }
+
     pub async fn call(
         &self,
         object_id: &str,
         original_name: &str,
         arguments: Value,
     ) -> Result<McpToolResult, McpClientError> {
+        let connected = self
+            .statuses
+            .lock()
+            .await
+            .get(object_id)
+            .is_some_and(|snapshot| snapshot.status == McpServerStatus::Connected);
+        if !connected {
+            return Err(McpClientError::Disconnected);
+        }
         let mut clients = self.clients.lock().await;
         let client = clients
             .get_mut(object_id)
             .ok_or(McpClientError::Disconnected)?;
-        client.call_tool(original_name, arguments).await
+        let result = client.call_tool(original_name, arguments).await;
+        if result.is_err()
+            && let Some(snapshot) = self.statuses.lock().await.get_mut(object_id)
+        {
+            snapshot.status = McpServerStatus::Disconnected;
+            snapshot.last_error = Some("MCP transport disconnected".into());
+        }
+        result
     }
 
     pub async fn call_qualified(
@@ -645,8 +711,85 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
     }
 
     pub async fn disconnect(&self, object_id: &str) {
+        if let Some(watcher) = self.watchers.lock().await.remove(object_id) {
+            watcher.abort();
+        }
         if let Some(mut client) = self.clients.lock().await.remove(object_id) {
             client.close().await;
+        }
+    }
+
+    pub async fn shutdown(&self) {
+        let watchers = {
+            let mut watchers = self.watchers.lock().await;
+            std::mem::take(&mut *watchers)
+        };
+        for (_, watcher) in watchers {
+            watcher.abort();
+        }
+        let clients = {
+            let mut clients = self.clients.lock().await;
+            std::mem::take(&mut *clients)
+        };
+        for (_, mut client) in clients {
+            client.close().await;
+        }
+    }
+
+    async fn start_liveness(self: &Arc<Self>, config: McpServerConfig, version_id: String) {
+        let manager = Arc::clone(self);
+        let watcher_id = config.object_id.clone();
+        let watcher_key = watcher_id.clone();
+        let watcher_config = config.clone();
+        let watcher_version = version_id.clone();
+        let watcher = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                let result = {
+                    let mut clients = manager.clients.lock().await;
+                    let Some(client) = clients.get_mut(&watcher_key) else {
+                        break;
+                    };
+                    client.list_tools().await
+                };
+                if result.is_ok() {
+                    if let Some(snapshot) = manager.statuses.lock().await.get_mut(&watcher_key) {
+                        snapshot.status = McpServerStatus::Connected;
+                        snapshot.retry_attempt = 0;
+                        snapshot.last_error = None;
+                    }
+                    continue;
+                }
+                if let Some(mut client) = manager.clients.lock().await.remove(&watcher_key) {
+                    client.close().await;
+                }
+                if let Some(snapshot) = manager.statuses.lock().await.get_mut(&watcher_key) {
+                    snapshot.status = McpServerStatus::Disconnected;
+                    snapshot.last_error = Some("MCP transport disconnected".into());
+                }
+                for attempt in 0..=7 {
+                    if attempt > 0 {
+                        if let Some(snapshot) = manager.statuses.lock().await.get_mut(&watcher_key)
+                        {
+                            snapshot.status = McpServerStatus::Reconnecting;
+                            snapshot.retry_attempt = attempt;
+                        }
+                        tokio::time::sleep(reconnect_delay(attempt - 1)).await;
+                    }
+                    if manager
+                        .connect_inner(&watcher_config, &watcher_version)
+                        .await
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+                break;
+            }
+        });
+        if let Some(previous) = self.watchers.lock().await.insert(watcher_id, watcher) {
+            previous.abort();
         }
     }
 }
@@ -702,6 +845,15 @@ mod tests {
     use super::*;
 
     struct Noop;
+
+    struct NoCredentials;
+
+    #[async_trait::async_trait]
+    impl McpCredentialStore for NoCredentials {
+        async fn get(&self, _: &str) -> Result<Option<HashMap<String, String>>, McpClientError> {
+            Ok(None)
+        }
+    }
 
     #[async_trait::async_trait]
     impl RvmClient for Noop {
@@ -784,5 +936,71 @@ mod tests {
             response.result.unwrap()["protocolVersion"],
             PROTOCOL_VERSION
         );
+    }
+
+    #[test]
+    fn reconnect_backoff_is_bounded_and_resets_after_stability() {
+        assert_eq!(reconnect_delay(0), Duration::ZERO);
+        assert_eq!(reconnect_delay(1), Duration::from_millis(500));
+        assert_eq!(reconnect_delay(2), Duration::from_secs(1));
+        assert_eq!(reconnect_delay(3), Duration::from_secs(2));
+        assert_eq!(reconnect_delay(7), Duration::from_secs(30));
+        assert_eq!(reconnect_delay(20), MAX_RECONNECT_DELAY);
+        assert_eq!(reconnect_delay(0), Duration::ZERO);
+    }
+
+    #[test]
+    fn unavailable_server_tools_are_filtered_from_catalog() {
+        let tools = vec![McpTool {
+            name: "search".into(),
+            description: None,
+            input_schema: json!({"type":"object"}),
+            server_id: "server-a".into(),
+            qualified_name: "mcp__abc__search".into(),
+        }];
+        assert!(filter_tools(tools, None, None).len() == 1);
+        assert!(filter_tools(Vec::new(), None, None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn stdio_close_kills_and_waits_for_child() {
+        let config = McpServerConfig {
+            object_id: "server-a".into(),
+            server_key: "abc123".into(),
+            name: "server-a".into(),
+            transport: McpTransport::Stdio,
+            command: Some("/bin/sh".into()),
+            args: vec!["-c".into(), "sleep 60".into()],
+            env: HashMap::new(),
+            cwd: None,
+            url: None,
+            headers: HashMap::new(),
+            enabled: true,
+            include_tools: None,
+            exclude_tools: None,
+            requires_approval: true,
+            auth: None,
+        };
+        let mut client = StdioClient::spawn(&config).await.unwrap();
+        client.close().await;
+        assert!(client.child.try_wait().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn cache_is_keyed_by_server_object_and_config_version() {
+        let manager = McpManager::new(Arc::new(NoCredentials));
+        let tool = McpTool {
+            name: "search".into(),
+            description: None,
+            input_schema: json!({"type":"object"}),
+            server_id: "server-a".into(),
+            qualified_name: "mcp__abc__search".into(),
+        };
+        manager
+            .seed_cached_tools("server-a", "v1", vec![tool])
+            .await;
+        assert!(manager.cached_tools("server-a", "v1").await.is_some());
+        assert!(manager.cached_tools("server-a", "v2").await.is_none());
+        assert!(manager.cached_tools("server-b", "v1").await.is_none());
     }
 }

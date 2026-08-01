@@ -2,6 +2,38 @@
 
 ## 5.1 OPCOS 作为 MCP client
 
+P1-2 uses `config_object(kind='mcp')` as the single source of truth. Non-sensitive
+transport configuration is stored in the immutable version content; bearer/OAuth
+credentials are stored only in SecretStore. Runtime discovery is kept separately
+in `mcp_tool_cache`, keyed by `(server_object_id, config_version_id)`, so changing
+an object version invalidates the discovery result without mutating history.
+
+The desktop owns one long-lived `McpManager`. Enabled servers are initialized at
+application startup and are shut down on application exit. Stdio shutdown always
+kills and waits for the child process. Server state remains visible even when
+disconnected:
+
+```text
+disabled → starting → connected
+                    ↘ disconnected → reconnecting → connected
+                    ↘ auth_required / failed
+```
+
+Reconnect delays are immediate, 500ms, 1s, 2s, 4s, 8s, 16s, then capped at
+30s. A stable connection resets the consecutive-failure counter. Unavailable
+servers retain their configuration and UI status, but their tools are excluded
+from provider requests; there is no automatic failover.
+
+Independent server tools use stable provider names:
+
+```text
+mcp__<server_key>__<tool_name>
+```
+
+`server_key` is immutable and generated from the object ID. Tool names are
+sanitized to provider-safe characters, with deterministic collision handling.
+Calls resolve the qualified name back to exactly one configured server.
+
 配置格式对齐 OpenWorker 的 `mcpServers` JSON。OpenWorker 使用全局 `~/.config/coworker/mcp.json` 与 workspace `<workspace>/.coworker/mcp.json`，后者覆盖前者同名 server［OWK码］。OPCOS 应采用同样的合并规则，但配置文件只保存非敏感配置。
 
 ```json

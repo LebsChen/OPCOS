@@ -25,7 +25,9 @@ use opcos_engine::{
     orchestration::{CoordinationRuntime, Envelope, Role},
 };
 use opcos_hosts::{DEFAULT_EXEC_TIMEOUT_SECONDS, Host, LocalHost, RvmHost};
-use opcos_mcp::{McpCredentialStore, McpManager, McpServerConfig, stable_server_key};
+use opcos_mcp::{
+    McpCredentialStore, McpManager, McpServerConfig, qualified_tool_name, stable_server_key,
+};
 use opcos_policy::PermissionMode;
 use opcos_provider::anthropic::AnthropicProvider;
 use opcos_provider::bedrock::BedrockProvider;
@@ -47,7 +49,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tauri::{Emitter, Manager, State};
+use tauri::{Emitter, Manager, RunEvent, State};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_tungstenite::accept_async;
@@ -93,6 +95,7 @@ struct DesktopState {
     surfaces: AsyncMutex<HashMap<u16, tauri::async_runtime::JoinHandle<()>>>,
     ide_proxies: AsyncMutex<HashMap<u16, tauri::async_runtime::JoinHandle<()>>>,
     coordination: AsyncMutex<HashMap<String, CoordinationRuntime>>,
+    mcp: Arc<McpManager<McpCredentialAdapter>>,
 }
 
 #[derive(Clone)]
@@ -235,7 +238,7 @@ impl ToolExecutor for RemoteExecutor {
                 .mcp
                 .call_qualified(name, arguments)
                 .await
-                .map(|result| result.content)
+                .map(|result| redact_approval_value(&result.content))
                 .map_err(|error| error.to_string()),
             _ => Err(format!("remote tool is unavailable: {name}")),
         }
@@ -317,7 +320,7 @@ impl ToolExecutor for DesktopExecutor {
                         .mcp
                         .call_qualified(name, arguments)
                         .await
-                        .map(|result| result.content)
+                        .map(|result| redact_approval_value(&result.content))
                         .map_err(|error| error.to_string()),
                     _ => Err(format!("local tool is unavailable: {name}")),
                 }
@@ -336,6 +339,115 @@ fn redact_json_strings(value: &mut Value, secret: &str) {
             .values_mut()
             .for_each(|item| redact_json_strings(item, secret)),
         _ => {}
+    }
+}
+
+async fn initialize_mcp(app: &tauri::AppHandle) {
+    let state = app.state::<DesktopState>();
+    let configs = {
+        let Ok(connection) = state.database.lock() else {
+            return;
+        };
+        let Ok(mut statement) = connection.prepare(
+            "SELECT o.id,o.name,COALESCE(o.server_key,''),o.current_version_id,v.content
+             FROM config_object o
+             JOIN config_object_version v ON v.id=o.current_version_id
+             WHERE o.kind='mcp' AND o.status='active'",
+        ) else {
+            return;
+        };
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    serde_json::from_str::<Value>(&row.get::<_, String>(4)?)
+                        .unwrap_or_else(|_| json!({})),
+                ))
+            })
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>()
+    };
+    for (object_id, name, server_key, version_id, mut content) in configs {
+        let server_key = if server_key.is_empty() {
+            stable_server_key(&object_id)
+        } else {
+            server_key
+        };
+        content["object_id"] = Value::String(object_id.clone());
+        content["name"] = Value::String(name);
+        content["server_key"] = Value::String(server_key.clone());
+        let Ok(config) = serde_json::from_value::<McpServerConfig>(content) else {
+            continue;
+        };
+        let cached = {
+            let Ok(connection) = state.database.lock() else {
+                continue;
+            };
+            let Ok(mut statement) = connection.prepare(
+                "SELECT tool_name,description,input_schema_json
+                 FROM mcp_tool_cache
+                 WHERE server_object_id=?1 AND config_version_id=?2",
+            ) else {
+                continue;
+            };
+            statement
+                .query_map(params![object_id, version_id], |row| {
+                    Ok(opcos_mcp::McpTool {
+                        name: row.get(0)?,
+                        description: row.get(1)?,
+                        input_schema: serde_json::from_str(&row.get::<_, String>(2)?)
+                            .unwrap_or_else(|_| json!({})),
+                        server_id: object_id.clone(),
+                        qualified_name: qualified_tool_name(&server_key, &row.get::<_, String>(0)?),
+                    })
+                })
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>()
+        };
+        if !cached.is_empty() {
+            state
+                .mcp
+                .seed_cached_tools(&object_id, &version_id, cached)
+                .await;
+        }
+        if let Ok(tools) = state.mcp.connect_with_retry(&config, &version_id, 0).await {
+            let Ok(connection) = state.database.lock() else {
+                continue;
+            };
+            let Ok(transaction) = connection.unchecked_transaction() else {
+                continue;
+            };
+            let _ = transaction.execute(
+                "DELETE FROM mcp_tool_cache
+                 WHERE server_object_id=?1 AND config_version_id=?2",
+                params![object_id, version_id],
+            );
+            for tool in tools {
+                let _ = transaction.execute(
+                    "INSERT INTO mcp_tool_cache
+                     (server_object_id,config_version_id,tool_name,description,input_schema_json,discovered_at)
+                     VALUES (?1,?2,?3,?4,?5,?6)",
+                    params![
+                        object_id,
+                        version_id,
+                        tool.name,
+                        tool.description,
+                        serde_json::to_string(&tool.input_schema).unwrap_or_else(|_| "{}".into()),
+                        Utc::now().to_rfc3339()
+                    ],
+                );
+            }
+            let _ = transaction.commit();
+        }
     }
 }
 
@@ -1388,9 +1500,7 @@ async fn engine_for(
         .or(configured_base_url)
         .or(descriptor.default_base_url)
         .unwrap_or_default();
-    let mcp_runtime = Arc::new(McpManager::new(Arc::new(McpCredentialAdapter {
-        store: state.secrets.clone(),
-    })));
+    let mcp_runtime = Arc::clone(&state.mcp);
     let (workspace, executor, remote_client, allowed_tools) = if host_id == "local" {
         if session_workspace.is_empty() {
             return Err("local session requires an explicit workspace directory".into());
@@ -1589,6 +1699,25 @@ async fn engine_for(
             .map_err(|error| error.to_string())?
     };
     let mut independent_tools = Vec::new();
+    let enabled_mcp_tools = state
+        .database
+        .lock()
+        .ok()
+        .and_then(|connection| {
+            connection
+                .prepare("SELECT name FROM mcp_session_tools WHERE session_id=?1 AND enabled=1")
+                .ok()
+                .and_then(|mut statement| {
+                    statement
+                        .query_map([session_id], |row| row.get::<_, String>(0))
+                        .ok()
+                        .map(|rows| {
+                            rows.filter_map(Result::ok)
+                                .collect::<std::collections::HashSet<_>>()
+                        })
+                })
+        })
+        .unwrap_or_default();
     for (object_id, name, server_key, version_id, mut content) in mcp_configs {
         content["object_id"] = Value::String(object_id);
         content["name"] = Value::String(name);
@@ -1605,14 +1734,26 @@ async fn engine_for(
             .connect_with_retry(&config, &version_id, 0)
             .await
         {
-            independent_tools.extend(tools.into_iter().map(|tool| {
-                json!({
-                    "name": tool.name,
-                    "qualified_name": tool.qualified_name,
-                    "description": tool.description.unwrap_or_default(),
-                    "inputSchema": tool.input_schema,
-                })
-            }));
+            independent_tools.extend(
+                tools
+                    .into_iter()
+                    .map(|tool| {
+                        json!({
+                            "name": tool.name,
+                            "qualified_name": tool.qualified_name,
+                            "description": tool.description.unwrap_or_default(),
+                            "inputSchema": tool.input_schema,
+                        })
+                    })
+                    .filter(|tool| {
+                        enabled_mcp_tools.is_empty()
+                            || enabled_mcp_tools.contains(
+                                tool.get("qualified_name")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default(),
+                            )
+                    }),
+            );
         }
     }
     if !independent_tools.is_empty() {
@@ -3377,7 +3518,14 @@ async fn mcp_tools(
 }
 
 #[tauri::command]
-fn list_mcp_servers(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
+async fn list_mcp_servers(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
+    let snapshots = state
+        .mcp
+        .statuses()
+        .await
+        .into_iter()
+        .map(|snapshot| (snapshot.object_id.clone(), snapshot))
+        .collect::<HashMap<_, _>>();
     let connection = state
         .database
         .lock()
@@ -3396,15 +3544,23 @@ fn list_mcp_servers(state: State<'_, DesktopState>) -> Result<Vec<Value>, String
         .query_map([], |row| {
             let content: Value = serde_json::from_str::<Value>(&row.get::<_, String>(5)?)
                 .unwrap_or_else(|_| json!({}));
+            let object_id = row.get::<_, String>(0)?;
+            let snapshot = snapshots.get(&object_id);
             Ok(json!({
-                "id": row.get::<_, String>(0)?,
+                "id": object_id,
                 "name": row.get::<_, String>(1)?,
                 "server_key": row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                "status": if row.get::<_, String>(3)? == "active" {
-                    "configured"
-                } else {
-                    "disabled"
-                },
+                "status": snapshot
+                    .map(|value| serde_json::to_value(&value.status).unwrap_or(json!("failed")))
+                    .unwrap_or_else(|| {
+                        if row.get::<_, String>(3).unwrap_or_default() == "active" {
+                            json!("starting")
+                        } else {
+                            json!("disabled")
+                        }
+                    }),
+                "last_error": snapshot.and_then(|value| value.last_error.clone()),
+                "tool_count": snapshot.map(|value| value.tool_count).unwrap_or_default(),
                 "version_id": row.get::<_, String>(4)?,
                 "transport": content.get("transport").or_else(|| content.get("type")),
                 "url": content.get("url"),
@@ -3466,10 +3622,8 @@ async fn retry_mcp_server(
     config["name"] = Value::String(name.clone());
     let parsed: McpServerConfig =
         serde_json::from_value(config).map_err(|error| format!("invalid MCP config: {error}"))?;
-    let manager = McpManager::new(Arc::new(McpCredentialAdapter {
-        store: state.secrets.clone(),
-    }));
-    let tools = manager
+    let tools = state
+        .mcp
         .connect_with_retry(&parsed, &version_id, 2)
         .await
         .map_err(|error| format!("MCP server retry failed: {error}"))?;
@@ -4581,6 +4735,9 @@ fn main() {
             let secrets = KeyringSecretStore::with_fallback(SECRET_SERVICE, secret_path);
             let secret_backend = secrets.backend();
             eprintln!("secret_backend={secret_backend}");
+            let mcp = Arc::new(McpManager::new(Arc::new(McpCredentialAdapter {
+                store: secrets.clone(),
+            })));
             app.manage(DesktopState {
                 database: Mutex::new(database),
                 secrets,
@@ -4589,8 +4746,13 @@ fn main() {
                 surfaces: AsyncMutex::new(HashMap::new()),
                 ide_proxies: AsyncMutex::new(HashMap::new()),
                 coordination: AsyncMutex::new(HashMap::new()),
+                mcp: Arc::clone(&mcp),
             });
             let handle = app.handle().clone();
+            let mcp_handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                initialize_mcp(&mcp_handle).await;
+            });
             tauri::async_runtime::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
                 loop {
@@ -4703,8 +4865,17 @@ fn main() {
             ide_bootstrap,
             start_ide_proxy
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running OPCOS");
+        .build(tauri::generate_context!())
+        .expect("error while building OPCOS")
+        .run(|app: &tauri::AppHandle, event: RunEvent| {
+            if matches!(event, RunEvent::Exit) {
+                let state = app.state::<DesktopState>();
+                let mcp = Arc::clone(&state.mcp);
+                tauri::async_runtime::block_on(async move {
+                    mcp.shutdown().await;
+                });
+            }
+        });
 }
 
 #[cfg(test)]
