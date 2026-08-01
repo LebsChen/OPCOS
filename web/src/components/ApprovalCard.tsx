@@ -26,7 +26,12 @@ const TOOL_VERBS: Record<string, string> = {
 };
 
 // §35: routine workspace writes render as a compact ROW; everything else is a full card.
-const FILE_WRITES = new Set(["write_file", "replace_in_file", "apply_patch", "apply_unified_diff"]);
+const FILE_WRITES = new Set([
+  "write_file",
+  "replace_in_file",
+  "apply_patch",
+  "apply_unified_diff",
+]);
 // Actions that leave the Mac get the warm border + explicit destination note.
 const EXTERNAL = new Set(["send_message", "send_file"]);
 
@@ -45,7 +50,11 @@ function permissionLines(args: any): PermissionLine[] {
   if (!Array.isArray(raw)) return [];
   return raw
     .filter((p) => p && typeof p === "object" && p.tool && p.target)
-    .map((p) => ({ tool: String(p.tool), target: String(p.target), access: String(p.access || "read") }));
+    .map((p) => ({
+      tool: String(p.tool),
+      target: String(p.target),
+      access: String(p.access || "read"),
+    }));
 }
 
 export function TitleText({ line }: { line: HumanLine }) {
@@ -65,14 +74,26 @@ export function scopeNote(
   args: any,
   category?: string,
 ): { text: string; external: boolean } {
-  if (category === "connector") return { text: "acts on a connected service", external: true };
+  if (category === "connector")
+    return { text: "acts on a connected service", external: true };
   if (EXTERNAL.has(name)) {
     const platform = String(args?.target ?? "").split(":")[0];
-    const names: Record<string, string> = { slack: "Slack", telegram: "Telegram" };
-    return { text: `leaves this Mac → ${names[platform] || platform || "a connected chat"}`, external: true };
+    const names: Record<string, string> = {
+      slack: "Slack",
+      telegram: "Telegram",
+    };
+    return {
+      text: `leaves this Mac → ${names[platform] || platform || "a connected chat"}`,
+      external: true,
+    };
   }
   const overwrite = name === "write_file" && args?.overwrite;
-  return { text: "stays on this Mac" + (overwrite ? " · overwrites the existing file" : ""), external: false };
+  return {
+    text:
+      "stays on this Mac" +
+      (overwrite ? " · overwrites the existing file" : ""),
+    external: false,
+  };
 }
 
 // The proposed content/command, straight from the tool call's ARGS — the file/action
@@ -82,20 +103,30 @@ export function scopeNote(
 const PREVIEW_LINES = 5;
 const PREVIEW_CHARS = 420;
 
-export function PreviewBlock({ text, mono = true }: { text: string; mono?: boolean }) {
+export function PreviewBlock({
+  text,
+  mono = true,
+}: {
+  text: string;
+  mono?: boolean;
+}) {
   const [all, setAll] = useState(false);
   const lines = text.split("\n");
   const clipped = lines.length > PREVIEW_LINES || text.length > PREVIEW_CHARS;
   let shown = text;
   if (!all && clipped) {
     shown = lines.slice(0, PREVIEW_LINES).join("\n");
-    if (shown.length > PREVIEW_CHARS) shown = shown.slice(0, PREVIEW_CHARS).trimEnd() + "…";
+    if (shown.length > PREVIEW_CHARS)
+      shown = shown.slice(0, PREVIEW_CHARS).trimEnd() + "…";
   }
   return (
     <div className={"approval-prev" + (mono ? "" : " prose")}>
       {shown}
       {clipped && (
-        <button className="approval-prev-more" onClick={() => setAll((v) => !v)}>
+        <button
+          className="approval-prev-more"
+          onClick={() => setAll((v) => !v)}
+        >
           {all
             ? "show less"
             : lines.length > PREVIEW_LINES
@@ -135,7 +166,10 @@ function Buttons({
   const offerStanding = !!(runTask && item.standingTarget);
   return (
     <div className="approval-btns">
-      <button className="btn approval-primary" onClick={() => onApprove("once")}>
+      <button
+        className="btn approval-primary"
+        onClick={() => onApprove("once")}
+      >
         {primaryLabel}
       </button>
       {offerStanding && (
@@ -190,27 +224,46 @@ export function ApprovalCard({
   const [peek, setPeek] = useState(false);
   const title = humanizeApprovalTitle(item.name, item.args);
   const scope = scopeNote(item.name, item.args, item.category);
-  const grants = item.name === "create_scheduled_task" ? permissionLines(item.args) : [];
+  const grants =
+    item.name === "create_scheduled_task" ? permissionLines(item.args) : [];
   // "requires approval" is the engine's default boilerplate — only surface a real reason.
-  const reason = item.reason && item.reason !== "requires approval" ? item.reason : "";
+  const reason =
+    item.reason && item.reason !== "requires approval" ? item.reason : "";
   const offerStanding = !!(runTask && item.standingTarget);
   const dock = compact ? " approval-dock" : "";
 
   // §35 compact row: routine workspace writes — one line, preview expands inline from the
   // tool args. Standing/grant flows keep the full card (they carry §25 consent weight).
-  const content = typeof item.args?.content === "string" ? item.args.content : "";
-  if (FILE_WRITES.has(item.name) && !offerStanding && !grants.length && !item.resolved) {
+  const content =
+    typeof item.args?.content === "string" ? item.args.content : "";
+  if (
+    FILE_WRITES.has(item.name) &&
+    !offerStanding &&
+    !grants.length &&
+    !item.resolved
+  ) {
     return (
-      <div className={"approval approval-row" + dock} data-testid="approval-row">
+      <div
+        className={"approval approval-row" + dock}
+        data-testid="approval-row"
+      >
         <div className="approval-row-line">
           <TitleText line={title} />
           {content && (
-            <button className="approval-peek" onClick={() => setPeek((v) => !v)}>
+            <button
+              className="approval-peek"
+              onClick={() => setPeek((v) => !v)}
+            >
               preview {peek ? "▴" : "▾"}
             </button>
           )}
           <span className="spacer" />
-          <Buttons item={item} onApprove={onApprove} runTask={runTask} primaryLabel="Allow" />
+          <Buttons
+            item={item}
+            onApprove={onApprove}
+            runTask={runTask}
+            primaryLabel="Allow"
+          />
         </div>
         {peek && content && <PreviewBlock text={content} />}
         {reason && <div className="approval-reason">{reason}</div>}
@@ -219,7 +272,11 @@ export function ApprovalCard({
   }
 
   return (
-    <div className={"approval" + (scope.external ? " approval-external" : "") + dock}>
+    <div
+      className={
+        "approval" + (scope.external ? " approval-external" : "") + dock
+      }
+    >
       <div className="approval-top">
         <div className="approval-heading">
           <span className="approval-ico" title={`Tool: ${item.name}`}>
@@ -227,7 +284,9 @@ export function ApprovalCard({
           </span>
           <TitleText line={title} />
         </div>
-        <span className={"approval-scope" + (scope.external ? " out" : "")}>{scope.text}</span>
+        <span className={"approval-scope" + (scope.external ? " out" : "")}>
+          {scope.text}
+        </span>
       </div>
 
       {/* Tool-shaped previews — the proposal, not an args dump. */}
@@ -241,11 +300,16 @@ export function ApprovalCard({
             <span className="ico">
               <Icon name="file" size={13} />
             </span>
-            {String(item.args?.path ?? "").split("/").pop() || "file"}
+            {String(item.args?.path ?? "")
+              .split("/")
+              .pop() || "file"}
             {item.args?.as_screenshot ? " · as a PNG screenshot" : ""}
           </span>
           {item.args?.comment && (
-            <MessagePreview text={String(item.args.comment)} label="With the message" />
+            <MessagePreview
+              text={String(item.args.comment)}
+              label="With the message"
+            />
           )}
         </>
       )}
@@ -257,13 +321,20 @@ export function ApprovalCard({
         <div className="approval-grants" data-testid="approval-grants">
           {grants.map((g, i) => (
             <div className="approval-grant" key={i} data-access={g.access}>
-              <span className={"grant-mark" + (g.access === "write" ? " write" : "")}>
+              <span
+                className={
+                  "grant-mark" + (g.access === "write" ? " write" : "")
+                }
+              >
                 {g.access === "write" ? "✓" : "·"}
               </span>
               <span className="grant-line">
-                {TOOL_VERBS[g.tool] || g.tool} <code className="approval-tool">{g.target}</code>
+                {TOOL_VERBS[g.tool] || g.tool}{" "}
+                <code className="approval-tool">{g.target}</code>
                 <span className="grant-note">
-                  {g.access === "write" ? " — always allowed once you approve" : " — read-only"}
+                  {g.access === "write"
+                    ? " — always allowed once you approve"
+                    : " — read-only"}
                 </span>
               </span>
             </div>
@@ -274,13 +345,22 @@ export function ApprovalCard({
       {!FILE_WRITES.has(item.name) &&
         !["run_shell", "send_message", "send_file"].includes(item.name) &&
         !grants.length &&
-        shortArgs(item.args) && <div className="approval-rest">{shortArgs(item.args)}</div>}
+        shortArgs(item.args) && (
+          <div className="approval-rest">{shortArgs(item.args)}</div>
+        )}
       {reason && <div className="approval-reason">{reason}</div>}
 
       {item.resolved ? (
-        <div className="resolved">Approved: {item.resolved.replace("_", " ")}</div>
+        <div className="resolved">
+          Approved: {item.resolved.replace("_", " ")}
+        </div>
       ) : (
-        <Buttons item={item} onApprove={onApprove} runTask={runTask} primaryLabel="Allow once" />
+        <Buttons
+          item={item}
+          onApprove={onApprove}
+          runTask={runTask}
+          primaryLabel="Allow once"
+        />
       )}
     </div>
   );

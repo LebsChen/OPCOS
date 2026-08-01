@@ -3,7 +3,10 @@
 // a transparent per-conversation scratch dir, with real folders added as roots when needed —
 // no folder gate, ever. (The old workspace enum — git/project/deliverable/none — collapsed
 // into family; owner decision 2026-07-03, UX-DECISIONS §16.)
-export function isProjectScoped(p?: { workspace?: string; family?: string }): boolean {
+export function isProjectScoped(p?: {
+  workspace?: string;
+  family?: string;
+}): boolean {
   return p?.family === "code";
 }
 

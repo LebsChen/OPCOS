@@ -11,6 +11,22 @@ import { baseName } from "../paths";
 const byRecent = (a: SessionInfo, b: SessionInfo) =>
   (b.updated_at || "").localeCompare(a.updated_at || "");
 
+export function filterSessionsLocally(
+  sessions: SessionInfo[],
+  query: string,
+): SessionInfo[] {
+  const q = query.trim().toLowerCase();
+  return sessions
+    .filter((session) => !session.session_id.startsWith("__"))
+    .filter(
+      (session) =>
+        !q ||
+        (session.title || session.session_id).toLowerCase().includes(q) ||
+        session.workspace.toLowerCase().includes(q),
+    )
+    .sort(byRecent);
+}
+
 export function SearchModal({
   sessions,
   personas,
@@ -38,18 +54,14 @@ export function SearchModal({
       : shortPersonaName(personaOf(s.agent)?.name, s.agent);
 
   const q = query.trim().toLowerCase();
-  const real = sessions.filter(
-    (s) => !s.session_id.startsWith("__") && !s.archived,
-  );
+  const real = sessions.filter((s) => !s.session_id.startsWith("__"));
   const match = (s: SessionInfo) =>
     !q ||
     (s.title || s.session_id).toLowerCase().includes(q) ||
     tagFor(s).toLowerCase().includes(q);
 
-  const filtered = real.filter(match);
-  const pinned = filtered.filter((s) => s.pinned).sort(byRecent);
-  const recent = filtered.filter((s) => !s.pinned).sort(byRecent);
-  const ordered = [...pinned, ...recent]; // flat order drives keyboard nav + ⌘N
+  const filtered = filterSessionsLocally(real, q).filter(match);
+  const ordered = filtered;
 
   // Reset the highlight whenever the result set changes.
   useEffect(() => {
@@ -136,24 +148,7 @@ export function SearchModal({
               No chats found.
             </div>
           ) : (
-            <>
-              {pinned.length > 0 && (
-                <div className="px-2">
-                  <div className="px-2 py-1 text-[11px] uppercase tracking-[0.05em] text-faint font-semibold">
-                    Pinned chats
-                  </div>
-                  {pinned.map((s, i) => row(s, i))}
-                </div>
-              )}
-              {recent.length > 0 && (
-                <div className="px-2 mt-1">
-                  <div className="px-2 py-1 text-[11px] uppercase tracking-[0.05em] text-faint font-semibold">
-                    Recent chats
-                  </div>
-                  {recent.map((s, i) => row(s, pinned.length + i))}
-                </div>
-              )}
-            </>
+            <div className="px-2">{ordered.map((s, i) => row(s, i))}</div>
           )}
         </div>
       </div>
