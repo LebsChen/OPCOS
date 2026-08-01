@@ -722,6 +722,18 @@ h3 {
   scrollbar-width: none;
   overflow-y: auto;
 }
+.session-right-panel.drawer-collapsed .session-icon-rail {
+  position: absolute;
+  inset: 0;
+  right: 0;
+  width: 44px;
+  min-width: 44px;
+  flex: 0 0 44px;
+  overflow: hidden !important;
+}
+.session-right-panel.drawer-collapsed .session-panel-resizer {
+  display: none;
+}
 .rail-btn {
   display: flex;
   flex-shrink: 0;
