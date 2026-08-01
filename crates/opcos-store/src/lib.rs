@@ -54,6 +54,8 @@ pub struct SessionRecord {
     pub compaction: serde_json::Value,
     pub host_id: String,
     pub provider: Option<String>,
+    pub run_state: String,
+    pub stop_reason: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -189,8 +191,10 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> Result<SessionRecord, rusqlite::
         })?,
         host_id: row.get(12)?,
         provider: row.get(13)?,
-        created_at: parse_timestamp(row.get(14)?)?,
-        updated_at: parse_timestamp(row.get(15)?)?,
+        run_state: row.get(14)?,
+        stop_reason: row.get(15)?,
+        created_at: parse_timestamp(row.get(16)?)?,
+        updated_at: parse_timestamp(row.get(17)?)?,
     })
 }
 
@@ -377,6 +381,12 @@ pub trait SessionStore {
     fn load_grants(&self, session_id: &str) -> Result<Vec<GrantRecord>, StoreError>;
     fn append_usage(&self, usage: &UsageRecord) -> Result<(), StoreError>;
     fn load_usage(&self, session_id: &str) -> Result<Vec<UsageRecord>, StoreError>;
+    fn update_session_status(
+        &self,
+        session_id: &str,
+        run_state: &str,
+        stop_reason: &str,
+    ) -> Result<(), StoreError>;
 }
 
 pub trait SecretStore: Send + Sync {
@@ -894,6 +904,8 @@ impl SqliteStore {
                compaction TEXT NOT NULL,
                host_id TEXT NOT NULL,
                provider TEXT,
+               run_state TEXT NOT NULL DEFAULT 'idle',
+               stop_reason TEXT NOT NULL DEFAULT 'none',
                created_at TEXT NOT NULL,
                updated_at TEXT NOT NULL
              );
@@ -920,6 +932,19 @@ impl SqliteStore {
                 .any(|column| column == "provider")
             {
                 connection.execute("ALTER TABLE sessions ADD COLUMN provider TEXT", [])?;
+            }
+            let session_columns = table_columns(&connection, "sessions")?;
+            if !session_columns.iter().any(|column| column == "run_state") {
+                connection.execute(
+                    "ALTER TABLE sessions ADD COLUMN run_state TEXT NOT NULL DEFAULT 'idle'",
+                    [],
+                )?;
+            }
+            if !session_columns.iter().any(|column| column == "stop_reason") {
+                connection.execute(
+                    "ALTER TABLE sessions ADD COLUMN stop_reason TEXT NOT NULL DEFAULT 'none'",
+                    [],
+                )?;
             }
             if table_exists(&connection, "sessions_legacy_p0_1")? {
                 migrate_legacy_sessions(&connection)?;
@@ -964,7 +989,7 @@ impl SqliteStore {
 
     pub fn save_session(&self, session: &SessionRecord) -> Result<(), StoreError> {
         self.connection.lock().expect("sqlite mutex poisoned").execute(
-            "INSERT OR REPLACE INTO sessions(session_id,workspace,model,mode,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+            "INSERT OR REPLACE INTO sessions(session_id,workspace,model,mode,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,run_state,stop_reason,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             params![
                 session.session_id,
                 session.workspace,
@@ -980,6 +1005,8 @@ impl SqliteStore {
                 serde_json::to_string(&session.compaction)?,
                 session.host_id,
                 session.provider,
+                session.run_state,
+                session.stop_reason,
                 session.created_at.to_rfc3339(),
                 session.updated_at.to_rfc3339(),
             ],
@@ -990,7 +1017,7 @@ impl SqliteStore {
     pub fn load_session(&self, session_id: &str) -> Result<Option<SessionRecord>, StoreError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let result = connection.query_row(
-            "SELECT session_id,workspace,model,mode,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,created_at,updated_at FROM sessions WHERE session_id=?1",
+            "SELECT session_id,workspace,model,mode,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,run_state,stop_reason,created_at,updated_at FROM sessions WHERE session_id=?1",
             [session_id],
             session_from_row,
         );
@@ -1004,7 +1031,7 @@ impl SqliteStore {
     pub fn load_sessions(&self) -> Result<Vec<SessionRecord>, StoreError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT session_id,workspace,model,mode,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,created_at,updated_at FROM sessions ORDER BY created_at DESC",
+            "SELECT session_id,workspace,model,mode,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,run_state,stop_reason,created_at,updated_at FROM sessions ORDER BY created_at DESC",
         )?;
         let rows = statement.query_map([], session_from_row)?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -1029,9 +1056,34 @@ impl SqliteStore {
         }
         Ok(())
     }
+
+    pub fn update_session_status(
+        &self,
+        session_id: &str,
+        run_state: &str,
+        stop_reason: &str,
+    ) -> Result<(), StoreError> {
+        let changed = self.connection.lock().expect("sqlite mutex poisoned").execute(
+            "UPDATE sessions SET run_state=?1, stop_reason=?2, updated_at=?3 WHERE session_id=?4",
+            params![run_state, stop_reason, Utc::now().to_rfc3339(), session_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::SessionNotFound(session_id.into()));
+        }
+        Ok(())
+    }
 }
 
 impl SessionStore for SqliteStore {
+    fn update_session_status(
+        &self,
+        session_id: &str,
+        run_state: &str,
+        stop_reason: &str,
+    ) -> Result<(), StoreError> {
+        SqliteStore::update_session_status(self, session_id, run_state, stop_reason)
+    }
+
     fn append_message(&self, message: &StoredMessage) -> Result<(), StoreError> {
         self.connection.lock().expect("sqlite mutex poisoned").execute(
             "INSERT INTO messages(session_id,sequence,role,content,display_only) VALUES (?1,?2,?3,?4,?5)",
@@ -1296,6 +1348,8 @@ mod tests {
             compaction: serde_json::json!({}),
             host_id: "antec".into(),
             provider: Some("openai".into()),
+            run_state: "idle".into(),
+            stop_reason: "none".into(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1420,6 +1474,8 @@ mod tests {
         let session = store.load_session("old-1").unwrap().unwrap();
         assert_eq!(session.workspace, "");
         assert_eq!(session.provider, None);
+        assert_eq!(session.run_state, "idle");
+        assert_eq!(session.stop_reason, "none");
         assert!(!session.created_at.to_rfc3339().is_empty());
         drop(store);
         let _ = fs::remove_file(path);

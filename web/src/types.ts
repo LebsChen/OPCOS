@@ -109,6 +109,7 @@ export interface SessionInfo {
   attention?: number;
   // working = in-flight turn; sleeping = a self-wake is pending; idle = neither. A count-less dot.
   liveness?: "working" | "sleeping" | "idle";
+  stop_reason?: string;
   // Channels this session listens to (inbound subscriptions).
   subscriptions?: string[];
   // §31: set when the session was spawned by a platform mention rather than the user —

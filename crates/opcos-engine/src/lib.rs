@@ -159,17 +159,27 @@ where
 
     pub async fn submit_text(&self, text: impl Into<String>) -> Result<AssistantTurn, EngineError> {
         self.interrupted.store(false, Ordering::SeqCst);
+        self.set_session_status("running", "none");
         let value = json!({"role":"user","content":[{"type":"text","text":text.into()}]});
-        self.append("user", value).await?;
-        self.run_loop(self.provider_messages()?).await
+        let result = async {
+            self.append("user", value).await?;
+            self.run_loop(self.provider_messages()?).await
+        }
+        .await;
+        self.set_status_after_turn(&result);
+        result
     }
 
     pub async fn retry(&self) -> Result<AssistantTurn, EngineError> {
         self.interrupted.store(false, Ordering::SeqCst);
-        self.run_loop(self.provider_messages()?).await
+        self.set_session_status("running", "none");
+        let result = self.run_loop(self.provider_messages()?).await;
+        self.set_status_after_turn(&result);
+        result
     }
 
     pub async fn resume_pending_turn(&self) -> Result<Option<AssistantTurn>, EngineError> {
+        self.set_session_status("running", "none");
         let messages = self
             .store
             .load_resume_messages(&self.session_id)
@@ -182,6 +192,7 @@ where
                     .and_then(Value::as_array)
                     .is_some_and(|calls| !calls.is_empty())
         }) else {
+            self.set_session_status("idle", "finished");
             return Ok(None);
         };
         let result_ids = messages
@@ -214,6 +225,7 @@ where
             })
             .collect::<Vec<_>>();
         if calls.is_empty() {
+            self.set_session_status("idle", "finished");
             Ok(None)
         } else {
             let sequence = assistant.sequence;
@@ -230,8 +242,33 @@ where
                     .map_err(|error| EngineError::Store(error.to_string()))?;
             }
             self.execute_tools(sequence, &calls).await?;
-            Ok(Some(self.run_loop(self.provider_messages()?).await?))
+            let result = self.run_loop(self.provider_messages()?).await.map(Some);
+            self.set_status_after_turn(&result);
+            result
         }
+    }
+
+    fn set_session_status(&self, run_state: &str, stop_reason: &str) {
+        let _ = self
+            .store
+            .update_session_status(&self.session_id, run_state, stop_reason);
+    }
+
+    fn set_status_after_turn<T>(&self, result: &Result<T, EngineError>) {
+        let (run_state, stop_reason) = match result {
+            Ok(_) => ("idle", "finished"),
+            Err(EngineError::ApprovalPending(_)) => ("idle", "waiting_for_approval"),
+            Err(EngineError::Interrupted) => ("interrupted", "interrupted_by_user"),
+            Err(EngineError::Provider(_)) => ("error", "provider_error"),
+            Err(EngineError::Store(message)) if message.contains("compact") => {
+                ("error", "context_exhausted")
+            }
+            Err(EngineError::Store(_)) | Err(EngineError::MaxIterations) => {
+                ("error", "provider_error")
+            }
+            Err(EngineError::ApprovalAlreadyProcessed(_)) => ("idle", "waiting_for_approval"),
+        };
+        self.set_session_status(run_state, stop_reason);
     }
 
     pub async fn queue_steering(
