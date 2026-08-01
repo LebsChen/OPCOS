@@ -1126,6 +1126,7 @@ function ManageSections({
   const [confirmDeleteHostId, setConfirmDeleteHostId] = useState<string | null>(
     null,
   );
+  const [hostFormOpen, setHostFormOpen] = useState(false);
   const sectionCopy: Record<SettingsSection, [string, string]> = {
     provider: [
       "Provider",
@@ -1169,9 +1170,12 @@ function ManageSections({
       </header>
       <div className="rounded-xl2 border border-line bg-panel p-5">
         {tab === "provider" && (
-          <div className="form-grid">
-            <label>
-              Provider
+          <div className="divide-y divide-line">
+            <div className="settings-row">
+              <div>
+                <strong>Provider</strong>
+                <small>Choose the model provider for new sessions.</small>
+              </div>
               <SelectMenu
                 value={provider}
                 onChange={setProvider}
@@ -1180,52 +1184,60 @@ function ManageSections({
                   label: item.title,
                 }))}
               />
-            </label>
-            <label>
-              Base URL
+            </div>
+            <div className="settings-row">
+              <div>
+                <strong>Base URL</strong>
+                <small>Optional provider-compatible endpoint.</small>
+              </div>
               <input
                 type="url"
                 value={baseUrl}
                 onChange={(event) => setBaseUrl(event.target.value)}
               />
-            </label>
-            <label>
-              Provider key
+            </div>
+            <div className="settings-row">
+              <div>
+                <strong>Provider key</strong>
+                <small>Stored securely and never returned to the UI.</small>
+              </div>
               <input
                 type="password"
                 value={key}
                 onChange={(event) => setKey(event.target.value)}
               />
-            </label>
-            <Button
-              className="primary"
-              onClick={() =>
-                command("save_provider_settings", {
-                  provider,
-                  baseUrl: baseUrl || null,
-                })
-                  .then(() => command("save_provider_key", { provider, key }))
-                  .then(() =>
-                    command<boolean>("validate_provider_key", { provider }),
-                  )
-                  .then((ok) => {
-                    setKey("");
-                    setProviderStatus(
-                      ok
-                        ? "Provider key validated successfully."
-                        : "Provider key validation failed.",
-                    );
+            </div>
+            <div className="settings-row justify-end">
+              <Button
+                className="primary"
+                onClick={() =>
+                  command("save_provider_settings", {
+                    provider,
+                    baseUrl: baseUrl || null,
                   })
-                  .catch((error) => {
-                    setKey("");
-                    setProviderStatus(
-                      `Provider validation failed: ${errorMessage(error)}`,
-                    );
-                  })
-              }
-            >
-              Save and validate
-            </Button>
+                    .then(() => command("save_provider_key", { provider, key }))
+                    .then(() =>
+                      command<boolean>("validate_provider_key", { provider }),
+                    )
+                    .then((ok) => {
+                      setKey("");
+                      setProviderStatus(
+                        ok
+                          ? "Provider key validated successfully."
+                          : "Provider key validation failed.",
+                      );
+                    })
+                    .catch((error) => {
+                      setKey("");
+                      setProviderStatus(
+                        `Provider validation failed: ${errorMessage(error)}`,
+                      );
+                    })
+                }
+              >
+                Save and validate
+              </Button>
+            </div>
             {providerStatus && (
               <div
                 className={
@@ -1235,98 +1247,100 @@ function ManageSections({
                 {providerStatus}
               </div>
             )}
-            <p className="muted">
-              Keys are stored by Rust and are never returned to the UI.
-            </p>
           </div>
         )}
         {tab === "hosts" && (
-          <div>
-            <h2>Bound hosts</h2>
-            <form className="host-form" onSubmit={onAddHost}>
-              <input
-                value={hostName}
-                onChange={(event) => setHostName(event.target.value)}
-                placeholder="Host name"
-                required
-              />
-              <input
-                value={hostUrl}
-                onChange={(event) => setHostUrl(event.target.value)}
-                placeholder="Remote URL"
-                type="url"
-                required
-              />
-              <input
-                value={hostToken}
-                onChange={(event) => setHostToken(event.target.value)}
-                placeholder="Bearer token"
-                type="password"
-                required
-              />
-              <Button type="submit" className="primary">
+          <ListPage
+            search=""
+            onSearch={() => undefined}
+            searchPlaceholder="Search hosts"
+            primary={
+              <Button className="primary" onClick={() => setHostFormOpen(true)}>
                 Add host
               </Button>
-            </form>
-            {hosts.map((host) => (
-              <div className="manage-row" key={host.id}>
-                <span>
-                  <strong>{host.name}</strong>
-                  <small
-                    className={
-                      host.online === true
-                        ? "status-online"
-                        : host.online === false
-                          ? "status-offline"
-                          : "status-unknown"
-                    }
-                  >
-                    {hostStatusLabel(host)}
-                    {host.reason ? ` · ${host.reason}` : ""}
-                  </small>
-                </span>
-                <Button
-                  disabled={testingHostId === host.id}
-                  onClick={() =>
-                    (() => {
-                      setTestingHostId(host.id);
-                      return onTestHost(host.id)
-                        .catch(onError)
-                        .finally(() => setTestingHostId(null));
-                    })()
-                  }
+            }
+            rows={
+              hosts.length ? (
+                <>
+                  {hosts.map((host) => (
+                    <div className="manage-row px-4" key={host.id}>
+                      <span>
+                        <strong>{host.name}</strong>
+                        <small>
+                          <span
+                            className={
+                              host.online === true
+                                ? "status-online"
+                                : host.online === false
+                                  ? "status-offline"
+                                  : "status-unknown"
+                            }
+                          >
+                            {hostStatusLabel(host)}
+                          </span>
+                        </small>
+                      </span>
+                      <Button
+                        disabled={testingHostId === host.id}
+                        onClick={() => {
+                          setTestingHostId(host.id);
+                          void onTestHost(host.id)
+                            .catch(onError)
+                            .finally(() => setTestingHostId(null));
+                        }}
+                      >
+                        {testingHostId === host.id ? "Testing…" : "Test"}
+                      </Button>
+                      <Button
+                        className="danger"
+                        onClick={() => setConfirmDeleteHostId(host.id)}
+                      >
+                        {confirmDeleteHostId === host.id
+                          ? "Confirm delete"
+                          : "Delete"}
+                      </Button>
+                    </div>
+                  ))}
+                </>
+              ) : null
+            }
+            empty="No hosts configured yet."
+            form={
+              hostFormOpen ? (
+                <form
+                  className="manage-card form-grid"
+                  onSubmit={(event) => {
+                    onAddHost(event);
+                    setHostFormOpen(false);
+                  }}
                 >
-                  {testingHostId === host.id ? "Testing…" : "Test"}
-                </Button>
-                {confirmDeleteHostId === host.id ? (
-                  <>
-                    <Button
-                      className="danger"
-                      disabled={deletingHostId === host.id}
-                      onClick={() => {
-                        setDeletingHostId(host.id);
-                        void onDeleteHost(host.id)
-                          .catch(onError)
-                          .finally(() => {
-                            setDeletingHostId(null);
-                            setConfirmDeleteHostId(null);
-                          });
-                      }}
-                    >
-                      {deletingHostId === host.id ? "Deleting…" : "Confirm"}
-                    </Button>
-                    <Button onClick={() => setConfirmDeleteHostId(null)}>
-                      Cancel
-                    </Button>
-                  </>
-                ) : (
-                  <Button onClick={() => setConfirmDeleteHostId(host.id)}>
-                    Delete
+                  <input
+                    value={hostName}
+                    onChange={(event) => setHostName(event.target.value)}
+                    placeholder="Host name"
+                    required
+                  />
+                  <input
+                    value={hostUrl}
+                    onChange={(event) => setHostUrl(event.target.value)}
+                    placeholder="Remote URL"
+                    type="url"
+                    required
+                  />
+                  <input
+                    value={hostToken}
+                    onChange={(event) => setHostToken(event.target.value)}
+                    placeholder="Bearer token"
+                    type="password"
+                    required
+                  />
+                  <Button type="submit" className="primary">
+                    Add host
                   </Button>
-                )}
-              </div>
-            ))}
-          </div>
+                </form>
+              ) : undefined
+            }
+          />
         )}
         {assetKinds.includes(tab as (typeof assetKinds)[number]) && (
           <div>
