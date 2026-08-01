@@ -2,12 +2,23 @@ import type { ReactNode } from "react";
 import { Icon, type IconName } from "./Icon";
 
 export type SettingsSection =
-  "provider" | "hosts" | "assets" | "mcp" | "secrets" | "blueprint";
+  | "provider"
+  | "hosts"
+  | "agents"
+  | "knowledge"
+  | "playbook"
+  | "skill"
+  | "mcp"
+  | "secrets"
+  | "blueprint";
 
 const tabs: Array<{ key: SettingsSection; label: string; icon: IconName }> = [
   { key: "provider", label: "Provider", icon: "sparkle" },
   { key: "hosts", label: "Hosts", icon: "folder" },
-  { key: "assets", label: "Assets", icon: "folder" },
+  { key: "agents", label: "AGENTS.md", icon: "fileCode" },
+  { key: "knowledge", label: "Knowledge", icon: "file" },
+  { key: "playbook", label: "Playbook", icon: "table" },
+  { key: "skill", label: "Skill", icon: "sparkle" },
   { key: "mcp", label: "MCP", icon: "plug" },
   { key: "secrets", label: "Secrets", icon: "shield" },
   { key: "blueprint", label: "Blueprint", icon: "code" },

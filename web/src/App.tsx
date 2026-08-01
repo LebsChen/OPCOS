@@ -73,6 +73,13 @@ async function command<T>(
   name: string,
   args?: Record<string, unknown>,
 ): Promise<T> {
+  if (
+    !(window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__
+  ) {
+    // Browser/CDP preview has no desktop command bridge. Keep preview effects
+    // inert instead of surfacing an environment-only invoke error to users.
+    return new Promise<T>(() => {});
+  }
   return invoke<T>(name, args);
 }
 
@@ -1153,7 +1160,10 @@ function ManageSections({
       "Choose a provider and validate its connection key.",
     ],
     hosts: ["Hosts", "Bind and test the remote hosts used by OPCOS sessions."],
-    assets: ["Assets", "Manage reusable knowledge and playbook assets."],
+    agents: ["AGENTS.md", "Repository-wide operating guidance for the host."],
+    knowledge: ["Knowledge", "Reusable reference material added to context."],
+    playbook: ["Playbook", "Repeatable workflows available to automation."],
+    skill: ["Skill", "Focused capability and instruction bundles."],
     mcp: ["MCP", "Control the tools exposed by the selected remote host."],
     secrets: [
       "Secrets",
@@ -1161,6 +1171,10 @@ function ManageSections({
     ],
     blueprint: ["Blueprint", "Read and manage the selected host blueprint."],
   };
+  const assetKinds = ["agents", "knowledge", "playbook", "skill"] as const;
+  const assetTabKind = assetKinds.includes(tab as (typeof assetKinds)[number])
+    ? (tab as Asset["kind"])
+    : "knowledge";
   useEffect(() => {
     void command<Record<string, unknown>>("provider_settings")
       .then((value) => {
@@ -1338,7 +1352,7 @@ function ManageSections({
             ))}
           </div>
         )}
-        {tab === "assets" && (
+        {assetKinds.includes(tab as (typeof assetKinds)[number]) && (
           <div>
             {(
               [
@@ -1363,104 +1377,95 @@ function ManageSections({
                   "A focused capability or instruction bundle available to the agent.",
                 ],
               ] as const
-            ).map(([kind, label, description]) => (
-              <section
-                className="mb-5 rounded-xl2 border border-line bg-paper p-4"
-                key={kind}
-              >
-                <h2 className="text-[15px] font-semibold text-ink">{label}</h2>
-                <p className="field-help">{description}</p>
-                {assets
-                  .filter((asset) => asset.kind === kind)
-                  .map((asset) => (
-                    <div className="manage-row" key={asset.id}>
-                      <span>
-                        <strong>{asset.title}</strong>
-                        <small>
-                          {asset.enabled ? "Enabled" : "Disabled"}
-                          {asset.trigger ? ` · ${asset.trigger}` : ""}
-                        </small>
-                      </span>
-                      <span className="inline-actions">
-                        <Button
-                          className="bordered"
-                          disabled={assetPending === asset.id}
-                          onClick={() => {
-                            if (!selected) {
-                              onError(
-                                "Select a session before changing asset access.",
-                              );
-                              return;
-                            }
-                            setAssetPending(asset.id);
-                            void command("set_asset_enabled", {
-                              sessionId: selected.id,
-                              assetId: asset.id,
-                              enabled: !asset.enabled,
-                            })
-                              .then(() => onRefresh())
-                              .catch(onError)
-                              .finally(() => setAssetPending(null));
-                          }}
-                        >
-                          {assetPending === asset.id
-                            ? "Saving…"
-                            : asset.enabled
-                              ? "Disable"
-                              : "Enable"}
-                        </Button>
-                        <Button
-                          className="bordered"
-                          onClick={() => {
-                            setEditingAssetId(asset.id);
-                            setAssetKind(asset.kind);
-                            setAssetTitle(asset.title);
-                            setAssetBody(asset.body);
-                            setAssetTrigger(asset.trigger);
-                            setAssetScope(asset.scope);
-                          }}
-                        >
-                          Edit
-                        </Button>
-                        <Button
-                          className="danger"
-                          disabled={assetPending === asset.id}
-                          onClick={() => {
-                            setAssetPending(asset.id);
-                            void command("delete_asset", { id: asset.id })
-                              .then(onRefresh)
-                              .catch(onError)
-                              .finally(() => setAssetPending(null));
-                          }}
-                        >
-                          Delete
-                        </Button>
-                      </span>
-                    </div>
-                  ))}
-                {!assets.some((asset) => asset.kind === kind) && (
-                  <p className="empty-state">No {label} assets yet.</p>
-                )}
-              </section>
-            ))}
+            )
+              .filter(([kind]) => kind === assetTabKind)
+              .map(([kind, label, description]) => (
+                <section
+                  className="mb-5 rounded-xl2 border border-line bg-paper p-4"
+                  key={kind}
+                >
+                  <h2 className="text-[15px] font-semibold text-ink">
+                    {label}
+                  </h2>
+                  <p className="field-help">{description}</p>
+                  {assets
+                    .filter((asset) => asset.kind === kind)
+                    .map((asset) => (
+                      <div className="manage-row" key={asset.id}>
+                        <span>
+                          <strong>{asset.title}</strong>
+                          <small>
+                            {asset.enabled ? "Enabled" : "Disabled"}
+                            {asset.trigger ? ` · ${asset.trigger}` : ""}
+                          </small>
+                        </span>
+                        <span className="inline-actions">
+                          <Button
+                            className="bordered"
+                            disabled={assetPending === asset.id}
+                            onClick={() => {
+                              if (!selected) {
+                                onError(
+                                  "Select a session before changing asset access.",
+                                );
+                                return;
+                              }
+                              setAssetPending(asset.id);
+                              void command("set_asset_enabled", {
+                                sessionId: selected.id,
+                                assetId: asset.id,
+                                enabled: !asset.enabled,
+                              })
+                                .then(() => onRefresh())
+                                .catch(onError)
+                                .finally(() => setAssetPending(null));
+                            }}
+                          >
+                            {assetPending === asset.id
+                              ? "Saving…"
+                              : asset.enabled
+                                ? "Disable"
+                                : "Enable"}
+                          </Button>
+                          <Button
+                            className="bordered"
+                            onClick={() => {
+                              setEditingAssetId(asset.id);
+                              setAssetKind(asset.kind);
+                              setAssetTitle(asset.title);
+                              setAssetBody(asset.body);
+                              setAssetTrigger(asset.trigger);
+                              setAssetScope(asset.scope);
+                            }}
+                          >
+                            Edit
+                          </Button>
+                          <Button
+                            className="danger"
+                            disabled={assetPending === asset.id}
+                            onClick={() => {
+                              setAssetPending(asset.id);
+                              void command("delete_asset", { id: asset.id })
+                                .then(onRefresh)
+                                .catch(onError)
+                                .finally(() => setAssetPending(null));
+                            }}
+                          >
+                            Delete
+                          </Button>
+                        </span>
+                      </div>
+                    ))}
+                  {!assets.some((asset) => asset.kind === kind) && (
+                    <p className="empty-state">No {label} assets yet.</p>
+                  )}
+                </section>
+              ))}
             <div className="rounded-xl2 border border-line bg-panel p-5">
               <h2 className="text-[15px] font-semibold text-ink">
                 {editingAssetId ? "Edit asset" : "New asset"}
               </h2>
               <div className="form-grid mt-4">
-                <label className="field-label">
-                  Kind
-                  <SelectMenu
-                    value={assetKind}
-                    onChange={(value) => setAssetKind(value as Asset["kind"])}
-                    options={[
-                      { value: "agents", label: "AGENTS.md" },
-                      { value: "knowledge", label: "Knowledge" },
-                      { value: "playbook", label: "Playbook" },
-                      { value: "skill", label: "Skill" },
-                    ]}
-                  />
-                </label>
                 <label className="field-label">
                   Title
                   <input
@@ -1477,7 +1482,7 @@ function ManageSections({
                     placeholder="Asset content"
                   />
                 </label>
-                {(assetKind === "knowledge" || assetKind === "skill") && (
+                {(assetTabKind === "knowledge" || assetTabKind === "skill") && (
                   <label className="field-label">
                     Trigger
                     <input
@@ -1500,7 +1505,7 @@ function ManageSections({
                   onClick={() =>
                     command("save_asset", {
                       id: editingAssetId || `asset-${Date.now()}`,
-                      kind: assetKind,
+                      kind: assetTabKind,
                       title: assetTitle,
                       body: assetBody,
                       trigger: assetTrigger || null,
