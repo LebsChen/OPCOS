@@ -35,6 +35,37 @@ export type MessageSource = {
   [key: string]: unknown;
 };
 
+export type Persona = {
+  id: string;
+  name?: string;
+  family?: string;
+  icon?: string;
+  enabled?: boolean;
+  [key: string]: any;
+};
+
+export type Automation = {
+  id: string;
+  name?: string;
+  title?: string;
+  enabled?: boolean;
+  [key: string]: any;
+};
+
+export type CloudStatus = {
+  signed_in?: boolean;
+  email?: string;
+  name?: string;
+  [key: string]: any;
+};
+
+export type RecentWorkspace = {
+  path: string;
+  title?: string;
+};
+
+export type SurfaceVisibility = Record<string, boolean>;
+
 // "always_task" persists to the owning automation's task record (standing scoped
 // approval, UX-DECISIONS §25) — offered only on automation-run approval cards, in-app.
 export type ApprovalDecision =

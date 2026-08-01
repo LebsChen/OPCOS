@@ -2008,13 +2008,13 @@ function App() {
         selected={selected}
         query={query}
         onQuery={setQuery}
-        onSelect={(session) => {
+        onSelect={(session: Session) => {
           setSelected(session);
           setSurface("session");
           setTab("chat");
         }}
         onNew={() => setModal(true)}
-        onTest={(host) =>
+        onTest={(host: Host) =>
           command<Host>("test_host", { hostId: host.id })
             .then((next) =>
               setHosts((items) =>
