@@ -683,7 +683,6 @@ h3 {
   overflow: hidden;
 }
 .app.right-panel-collapsed .session-right-panel {
-  right: 16px;
   width: 44px;
 }
 .right-panel,
@@ -721,7 +720,7 @@ h3 {
 }
 .session-icon-rail {
   scrollbar-width: none;
-  overflow-y: hidden;
+  overflow-y: auto;
 }
 .rail-btn {
   display: flex;
