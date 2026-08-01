@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "identifier": "com.opcos.desktop",
   "build": {
-    "beforeDevCommand": "npm run dev --prefix web",
-    "beforeBuildCommand": "npm run build --prefix web",
+    "beforeDevCommand": "npm run dev --prefix ../web",
+    "beforeBuildCommand": "npm run build --prefix ../web",
     "devUrl": "http://localhost:1420",
     "frontendDist": "../web/dist"
   },
@@ -22,7 +22,7 @@
     }
   },
   "bundle": {
-    "active": false,
+    "active": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
