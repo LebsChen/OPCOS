@@ -1578,13 +1578,19 @@ async fn steering(
     let handle = app.clone();
     let session = session_id.clone();
     tauri::async_runtime::spawn(async move {
-        if let Ok((run_state, stop_reason)) = completion.await {
-            emit(
+        match completion.await {
+            Ok((run_state, stop_reason)) => emit(
                 &handle,
                 "turn_done",
                 Some(&session),
                 json!({"run_state": run_state, "stop_reason": stop_reason}),
-            );
+            ),
+            Err(_) => emit(
+                &handle,
+                "turn_done",
+                Some(&session),
+                json!({"run_state":"error","stop_reason":"internal_error"}),
+            ),
         }
     });
     Ok(())
