@@ -1385,7 +1385,7 @@ function ManageSections({
                   key={kind}
                 >
                   <h2 className="text-[15px] font-semibold text-ink">
-                    {label}
+                    Saved items
                   </h2>
                   <p className="field-help">{description}</p>
                   {assets
@@ -1728,6 +1728,9 @@ function Automations({
     assets.find((asset) => asset.kind === "playbook")?.id || "",
   );
   const [cron, setCron] = useState("0 * * * *");
+  const [automationTab, setAutomationTab] = useState<"schedules" | "runs">(
+    "schedules",
+  );
   const load = () =>
     command<Schedule[]>("list_schedules").then(setSchedules).catch(onError);
   useEffect(() => {
@@ -1735,80 +1738,133 @@ function Automations({
   }, []);
   return (
     <div className="page">
-      <div className="max-w-3xl mx-auto px-7 py-6">
-        <PageHeader
-          title="Automations"
-          subtitle="Run OPCOS playbooks on a schedule"
-        />
-        <div className="manage-card form-grid">
-          <label>
-            Name
-            <input
-              value={name}
-              onChange={(event) => setName(event.target.value)}
-            />
-          </label>
-          <label>
-            Session
-            <SelectMenu
-              value={sessionId}
-              onChange={setSessionId}
-              options={sessions.map((session) => ({
-                value: session.id,
-                label: session.title,
-              }))}
-            />
-          </label>
-          <label>
-            Playbook
-            <SelectMenu
-              value={playbookId}
-              onChange={setPlaybookId}
-              options={assets
-                .filter((asset) => asset.kind === "playbook")
-                .map((asset) => ({ value: asset.id, label: asset.title }))}
-            />
-          </label>
-          <label>
-            Cron
-            <input
-              value={cron}
-              onChange={(event) => setCron(event.target.value)}
-            />
-          </label>
-          <Button
-            className="primary"
-            onClick={() =>
-              command("save_schedule", {
-                schedule: { name, sessionId, playbookId, cron, enabled: true },
-              })
-                .then(load)
-                .catch(onError)
-            }
-          >
-            Save automation
-          </Button>
-        </div>
-        <div className="manage-card">
-          {schedules.map((schedule) => (
-            <div className="manage-row" key={schedule.id}>
-              <span>
-                <strong>{schedule.name}</strong>
-                <small>
-                  {schedule.cron} · {schedule.last_result || "never run"}
-                </small>
-              </span>
-              <Button
-                onClick={() =>
-                  command("run_schedule", { scheduleId: schedule.id })
-                    .then(load)
-                    .catch(onError)
-                }
-              >
-                Run now
-              </Button>
-            </div>
+      <div className="flex min-h-full">
+        <nav className="page-subnav w-[208px] shrink-0 border-r border-line bg-panel/40 px-3 py-4">
+          <div className="px-2 text-[13.5px] font-semibold mb-3 flex items-center gap-2">
+            <Icon name="clock" size={16} /> Automations
+          </div>
+          {(["schedules", "runs"] as const).map((item) => (
+            <button
+              key={item}
+              className={`w-full text-left px-2.5 py-2 rounded-lg text-[13px] ${
+                automationTab === item
+                  ? "bg-paper text-accent font-medium"
+                  : "text-muted hover:bg-paper hover:text-ink"
+              }`}
+              onClick={() => setAutomationTab(item)}
+            >
+              {item === "schedules" ? "Schedules" : "Runs"}
+            </button>
           ))}
+        </nav>
+        <div className="flex-1 min-w-0 overflow-y-auto">
+          <div className="max-w-3xl mx-auto px-7 py-6">
+            <PageHeader
+              title={automationTab === "schedules" ? "Schedules" : "Runs"}
+              subtitle="Run OPCOS playbooks on a schedule"
+            />
+            {automationTab === "schedules" ? (
+              <>
+                <div className="manage-card form-grid">
+                  <label>
+                    Name
+                    <input
+                      value={name}
+                      onChange={(event) => setName(event.target.value)}
+                    />
+                  </label>
+                  <label>
+                    Session
+                    <SelectMenu
+                      value={sessionId}
+                      onChange={setSessionId}
+                      options={sessions.map((session) => ({
+                        value: session.id,
+                        label: session.title,
+                      }))}
+                    />
+                  </label>
+                  <label>
+                    Playbook
+                    <SelectMenu
+                      value={playbookId}
+                      onChange={setPlaybookId}
+                      options={assets
+                        .filter((asset) => asset.kind === "playbook")
+                        .map((asset) => ({
+                          value: asset.id,
+                          label: asset.title,
+                        }))}
+                    />
+                  </label>
+                  <label>
+                    Cron
+                    <input
+                      value={cron}
+                      onChange={(event) => setCron(event.target.value)}
+                    />
+                  </label>
+                  <Button
+                    className="primary"
+                    onClick={() =>
+                      command("save_schedule", {
+                        schedule: {
+                          name,
+                          sessionId,
+                          playbookId,
+                          cron,
+                          enabled: true,
+                        },
+                      })
+                        .then(load)
+                        .catch(onError)
+                    }
+                  >
+                    Save automation
+                  </Button>
+                </div>
+                <div className="manage-card">
+                  {schedules.map((schedule) => (
+                    <div className="manage-row" key={schedule.id}>
+                      <span>
+                        <strong>{schedule.name}</strong>
+                        <small>
+                          {schedule.cron} ·{" "}
+                          {schedule.last_result || "never run"}
+                        </small>
+                      </span>
+                      <Button
+                        onClick={() =>
+                          command("run_schedule", { scheduleId: schedule.id })
+                            .then(load)
+                            .catch(onError)
+                        }
+                      >
+                        Run now
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <div className="rounded-xl2 border border-line bg-panel p-5">
+                <p className="empty-state">
+                  Run history is reported by the selected schedule when
+                  available.
+                </p>
+                {schedules.map((schedule) => (
+                  <div className="manage-row" key={schedule.id}>
+                    <span>
+                      <strong>{schedule.name}</strong>
+                      <small>
+                        {schedule.last_result || "No run recorded yet"}
+                      </small>
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>
@@ -1833,246 +1889,336 @@ function Activity({
   const [rolesText, setRolesText] = useState(
     '[{"id":"leader","sort_order":0,"session_id":"","state":"Active"}]',
   );
+  const [activityTab, setActivityTab] = useState<
+    "board" | "roles" | "tasks" | "messages" | "worklog" | "insights"
+  >("board");
+  const [worklog, setWorklog] = useState<Record<string, unknown> | null>(null);
+  const [insights, setInsights] = useState<Record<string, unknown> | null>(
+    null,
+  );
   const load = () =>
     command<Coordination>("coordination_snapshot", { taskId })
       .then(setBoard)
       .catch(onError);
   return (
     <div className="page">
-      <div className="max-w-3xl mx-auto px-7 py-6">
-        <PageHeader
-          title="Activity"
-          subtitle="Coordination board, worklog, and session insights"
-        />
-        <div className="rounded-xl2 border border-line bg-panel p-5 space-y-4">
-          <div>
-            <label className="field-label">Coordination task ID</label>
-            <input
-              value={taskId}
-              onChange={(event) => setTaskId(event.target.value)}
-              placeholder="e.g. task-123"
-            />
-            <p className="field-help">
-              The durable coordination board to observe or update.
-            </p>
+      <div className="flex min-h-full">
+        <nav className="page-subnav w-[208px] shrink-0 border-r border-line bg-panel/40 px-3 py-4">
+          <div className="px-2 text-[13.5px] font-semibold mb-3 flex items-center gap-2">
+            <Icon name="activity" size={16} /> Activity
           </div>
-          <div>
-            <label className="field-label">Initial roles</label>
-            <textarea
-              value={rolesText}
-              onChange={(event) => setRolesText(event.target.value)}
-              placeholder='[{"id":"leader","sort_order":0,"session_id":"","state":"Active"}]'
-            />
-            <p className="field-help">
-              Use the JSON shape shown above when starting a new board.
-            </p>
-          </div>
-          <Button
-            disabled={!taskId}
-            onClick={() => {
-              try {
-                const roles = JSON.parse(rolesText);
-                void command("coordination_start", {
-                  input: { taskId, roles },
-                })
-                  .then(load)
-                  .catch(onError);
-              } catch {
-                onError("Roles must be valid JSON.");
-              }
-            }}
-          >
-            Start board
-          </Button>
-          <Button className="bordered" onClick={load}>
-            Observe
-          </Button>
-          <label className="field-label">
-            Role ID
-            <input
-              value={roleId}
-              onChange={(event) => setRoleId(event.target.value)}
-              placeholder="leader"
-            />
-          </label>
-          <SelectMenu
-            value={roleState}
-            onChange={setRoleState}
-            options={["active", "sleep", "paused"].map((value) => ({
-              value,
-              label: value,
-            }))}
-          />
-          <Button
-            className="bordered"
-            disabled={!taskId || !roleId}
-            onClick={() =>
-              command("coordination_set_role_state", {
-                taskId,
-                roleId,
-                stateName: roleState,
-              })
-                .then(load)
-                .catch(onError)
-            }
-          >
-            Set role
-          </Button>
-        </div>
-        <div className="board-grid mt-5">
-          <section className="board-column rounded-xl2 border border-line bg-panel p-4">
-            <h2>Roles</h2>
-            {board?.roles.length ? (
-              board.roles.map((role) => (
-                <div className="board-card" key={String(role.id)}>
-                  <strong>{String(role.id)}</strong>
-                  <span>Session: {String(role.session_id)}</span>
-                  <span>Order: {String(role.sort_order)}</span>
-                  <span>State: {String(role.state)}</span>
-                </div>
-              ))
-            ) : (
-              <p className="empty-state">
-                No roles loaded yet. Start or observe a board.
-              </p>
-            )}
-          </section>
-          <section className="board-column rounded-xl2 border border-line bg-panel p-4">
-            <h2>Tasks</h2>
-            <div className="inline-actions">
-              <input
-                value={taskTitle}
-                onChange={(event) => setTaskTitle(event.target.value)}
-                placeholder="New task"
-              />
-              <input
-                value={worker}
-                onChange={(event) => setWorker(event.target.value)}
-                placeholder="Worker / assignee"
-              />
-              <input
-                value={prUrl}
-                onChange={(event) => setPrUrl(event.target.value)}
-                placeholder="Verified PR URL"
-              />
-              <Button
-                className="primary"
-                disabled={!taskId}
-                onClick={() =>
-                  command("coordination_create_task", {
-                    id: `task-${Date.now()}`,
-                    title: taskTitle,
-                    requireAcceptance: true,
+          {(
+            [
+              "board",
+              "roles",
+              "tasks",
+              "messages",
+              "worklog",
+              "insights",
+            ] as const
+          ).map((item) => (
+            <button
+              key={item}
+              className={`w-full text-left px-2.5 py-2 rounded-lg text-[13px] ${activityTab === item ? "bg-paper text-accent font-medium" : "text-muted hover:bg-paper hover:text-ink"}`}
+              onClick={() => {
+                setActivityTab(item);
+                if (item === "worklog" && selected)
+                  void command<Record<string, unknown>>("session_worklog", {
+                    sessionId: selected.id,
+                    afterId: "",
+                    limit: 200,
                   })
-                    .then(load)
-                    .catch(onError)
-                }
-              >
-                Create
-              </Button>
-            </div>
-            {board?.tasks.length ? (
-              board.tasks.map((task) => (
-                <div className="board-card" key={String(task.id || task.title)}>
-                  <strong>{String(task.title || task.id)}</strong>
-                  <span>{String(task.phase)}</span>
-                  <div className="inline-actions">
-                    <Button
-                      className="bordered"
-                      onClick={() =>
-                        command("coordination_claim_task", {
-                          id: task.id,
-                          worker,
-                        })
-                          .then(load)
-                          .catch(onError)
-                      }
-                    >
-                      Claim
-                    </Button>
-                    <Button
-                      className="bordered"
-                      onClick={() =>
-                        command("coordination_complete_task", {
-                          id: task.id,
-                          worker,
-                          verifiedPrUrl: prUrl || null,
-                        })
-                          .then(load)
-                          .catch(onError)
-                      }
-                    >
-                      Complete
-                    </Button>
-                    <Button
-                      className="bordered"
-                      onClick={() => {
-                        if (!task.verified_pr_url && !task.pr) {
-                          onError(
-                            "Cannot accept task without a verified PR URL.",
-                          );
-                          return;
-                        }
-                        void command("coordination_accept_task", {
-                          id: task.id,
+                    .then(setWorklog)
+                    .catch(onError);
+                if (item === "insights" && selected)
+                  void command<Record<string, unknown>>("session_insights", {
+                    sessionId: selected.id,
+                  })
+                    .then(setInsights)
+                    .catch(onError);
+              }}
+            >
+              {item[0].toUpperCase() + item.slice(1)}
+            </button>
+          ))}
+        </nav>
+        <div className="flex-1 min-w-0 overflow-y-auto">
+          <div className="max-w-3xl mx-auto px-7 py-6">
+            <PageHeader
+              title={activityTab[0].toUpperCase() + activityTab.slice(1)}
+              subtitle="Coordination, worklog, and session insights"
+            />
+            {activityTab === "worklog" && (
+              <div className="rounded-xl2 border border-line bg-panel p-5">
+                {!selected ? (
+                  <p className="empty-state">
+                    Select a session to load its worklog.
+                  </p>
+                ) : (
+                  <pre>{JSON.stringify(worklog, null, 2)}</pre>
+                )}
+              </div>
+            )}
+            {activityTab === "insights" && (
+              <div className="rounded-xl2 border border-line bg-panel p-5">
+                {!selected ? (
+                  <p className="empty-state">
+                    Select a session to load insights.
+                  </p>
+                ) : (
+                  <pre>{JSON.stringify(insights, null, 2)}</pre>
+                )}
+              </div>
+            )}
+            {activityTab !== "worklog" && activityTab !== "insights" && (
+              <>
+                <div className="rounded-xl2 border border-line bg-panel p-5 space-y-4">
+                  <div>
+                    <label className="field-label">Coordination task ID</label>
+                    <input
+                      value={taskId}
+                      onChange={(event) => setTaskId(event.target.value)}
+                      placeholder="e.g. task-123"
+                    />
+                    <p className="field-help">
+                      The durable coordination board to observe or update.
+                    </p>
+                  </div>
+                  <div>
+                    <label className="field-label">Initial roles</label>
+                    <textarea
+                      value={rolesText}
+                      onChange={(event) => setRolesText(event.target.value)}
+                      placeholder='[{"id":"leader","sort_order":0,"session_id":"","state":"Active"}]'
+                    />
+                    <p className="field-help">
+                      Use the JSON shape shown above when starting a new board.
+                    </p>
+                  </div>
+                  <Button
+                    disabled={!taskId}
+                    onClick={() => {
+                      try {
+                        const roles = JSON.parse(rolesText);
+                        void command("coordination_start", {
+                          input: { taskId, roles },
                         })
                           .then(load)
                           .catch(onError);
+                      } catch {
+                        onError("Roles must be valid JSON.");
+                      }
+                    }}
+                  >
+                    Start board
+                  </Button>
+                  <Button className="bordered" onClick={load}>
+                    Observe
+                  </Button>
+                  <label className="field-label">
+                    Role ID
+                    <input
+                      value={roleId}
+                      onChange={(event) => setRoleId(event.target.value)}
+                      placeholder="leader"
+                    />
+                  </label>
+                  <SelectMenu
+                    value={roleState}
+                    onChange={setRoleState}
+                    options={["active", "sleep", "paused"].map((value) => ({
+                      value,
+                      label: value,
+                    }))}
+                  />
+                  <Button
+                    className="bordered"
+                    disabled={!taskId || !roleId}
+                    onClick={() =>
+                      command("coordination_set_role_state", {
+                        taskId,
+                        roleId,
+                        stateName: roleState,
+                      })
+                        .then(load)
+                        .catch(onError)
+                    }
+                  >
+                    Set role
+                  </Button>
+                </div>
+                <div className="board-grid mt-5">
+                  <section
+                    className={`board-column rounded-xl2 border border-line bg-panel p-4 ${activityTab !== "board" && activityTab !== "roles" ? "hidden" : ""}`}
+                  >
+                    <h2>Roles</h2>
+                    {board?.roles.length ? (
+                      board.roles.map((role) => (
+                        <div className="board-card" key={String(role.id)}>
+                          <strong>{String(role.id)}</strong>
+                          <span>Session: {String(role.session_id)}</span>
+                          <span>Order: {String(role.sort_order)}</span>
+                          <span>State: {String(role.state)}</span>
+                        </div>
+                      ))
+                    ) : (
+                      <p className="empty-state">
+                        No roles loaded yet. Start or observe a board.
+                      </p>
+                    )}
+                  </section>
+                  <section
+                    className={`board-column rounded-xl2 border border-line bg-panel p-4 ${activityTab !== "board" && activityTab !== "tasks" ? "hidden" : ""}`}
+                  >
+                    <h2>Tasks</h2>
+                    <div className="inline-actions">
+                      <input
+                        value={taskTitle}
+                        onChange={(event) => setTaskTitle(event.target.value)}
+                        placeholder="New task"
+                      />
+                      <input
+                        value={worker}
+                        onChange={(event) => setWorker(event.target.value)}
+                        placeholder="Worker / assignee"
+                      />
+                      <input
+                        value={prUrl}
+                        onChange={(event) => setPrUrl(event.target.value)}
+                        placeholder="Verified PR URL"
+                      />
+                      <Button
+                        className="primary"
+                        disabled={!taskId}
+                        onClick={() =>
+                          command("coordination_create_task", {
+                            id: `task-${Date.now()}`,
+                            title: taskTitle,
+                            requireAcceptance: true,
+                          })
+                            .then(load)
+                            .catch(onError)
+                        }
+                      >
+                        Create
+                      </Button>
+                    </div>
+                    {board?.tasks.length ? (
+                      board.tasks.map((task) => (
+                        <div
+                          className="board-card"
+                          key={String(task.id || task.title)}
+                        >
+                          <strong>{String(task.title || task.id)}</strong>
+                          <span>{String(task.phase)}</span>
+                          <div className="inline-actions">
+                            <Button
+                              className="bordered"
+                              onClick={() =>
+                                command("coordination_claim_task", {
+                                  id: task.id,
+                                  worker,
+                                })
+                                  .then(load)
+                                  .catch(onError)
+                              }
+                            >
+                              Claim
+                            </Button>
+                            <Button
+                              className="bordered"
+                              onClick={() =>
+                                command("coordination_complete_task", {
+                                  id: task.id,
+                                  worker,
+                                  verifiedPrUrl: prUrl || null,
+                                })
+                                  .then(load)
+                                  .catch(onError)
+                              }
+                            >
+                              Complete
+                            </Button>
+                            <Button
+                              className="bordered"
+                              onClick={() => {
+                                if (!task.verified_pr_url && !task.pr) {
+                                  onError(
+                                    "Cannot accept task without a verified PR URL.",
+                                  );
+                                  return;
+                                }
+                                void command("coordination_accept_task", {
+                                  id: task.id,
+                                })
+                                  .then(load)
+                                  .catch(onError);
+                              }}
+                            >
+                              Accept
+                            </Button>
+                          </div>
+                        </div>
+                      ))
+                    ) : (
+                      <p className="empty-state">No coordination tasks yet.</p>
+                    )}
+                  </section>
+                  <section
+                    className={`board-column rounded-xl2 border border-line bg-panel p-4 ${activityTab !== "board" && activityTab !== "messages" ? "hidden" : ""}`}
+                  >
+                    <h2>Messages</h2>
+                    <label className="field-label">Message envelope</label>
+                    <textarea
+                      value={message}
+                      onChange={(event) => setMessage(event.target.value)}
+                      placeholder='{"kind":"status","payload":{}}'
+                    />
+                    <p className="field-help">
+                      Messages use the coordination envelope accepted by the
+                      remote host.
+                    </p>
+                    <Button
+                      className="bordered"
+                      disabled={!taskId}
+                      onClick={() => {
+                        try {
+                          const envelope = JSON.parse(message);
+                          void command("coordination_message", {
+                            taskId,
+                            envelope,
+                          })
+                            .then(load)
+                            .catch(onError);
+                        } catch {
+                          onError("Message must be valid JSON.");
+                        }
                       }}
                     >
-                      Accept
+                      Send message
                     </Button>
-                  </div>
+                    {board?.messages.length ? (
+                      board.messages.map((item) => (
+                        <div className="board-card" key={String(item.msg_id)}>
+                          <strong>
+                            {String(item.from)} → {String(item.to)}
+                          </strong>
+                          <span>Kind: {String(item.kind)}</span>
+                          <span>Message: {String(item.msg_id)}</span>
+                          <span>Reply: {String(item.reply_to || "—")}</span>
+                          <pre>{JSON.stringify(item.payload, null, 2)}</pre>
+                        </div>
+                      ))
+                    ) : (
+                      <p className="empty-state">
+                        No coordination messages yet.
+                      </p>
+                    )}
+                  </section>
                 </div>
-              ))
-            ) : (
-              <p className="empty-state">No coordination tasks yet.</p>
+              </>
             )}
-          </section>
-          <section className="board-column rounded-xl2 border border-line bg-panel p-4">
-            <h2>Messages</h2>
-            <label className="field-label">Message envelope</label>
-            <textarea
-              value={message}
-              onChange={(event) => setMessage(event.target.value)}
-              placeholder='{"kind":"status","payload":{}}'
-            />
-            <p className="field-help">
-              Messages use the coordination envelope accepted by the remote
-              host.
-            </p>
-            <Button
-              className="bordered"
-              disabled={!taskId}
-              onClick={() => {
-                try {
-                  const envelope = JSON.parse(message);
-                  void command("coordination_message", { taskId, envelope })
-                    .then(load)
-                    .catch(onError);
-                } catch {
-                  onError("Message must be valid JSON.");
-                }
-              }}
-            >
-              Send message
-            </Button>
-            {board?.messages.length ? (
-              board.messages.map((item) => (
-                <div className="board-card" key={String(item.msg_id)}>
-                  <strong>
-                    {String(item.from)} → {String(item.to)}
-                  </strong>
-                  <span>Kind: {String(item.kind)}</span>
-                  <span>Message: {String(item.msg_id)}</span>
-                  <span>Reply: {String(item.reply_to || "—")}</span>
-                  <pre>{JSON.stringify(item.payload, null, 2)}</pre>
-                </div>
-              ))
-            ) : (
-              <p className="empty-state">No coordination messages yet.</p>
-            )}
-          </section>
+          </div>
         </div>
       </div>
     </div>
