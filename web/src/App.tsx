@@ -1127,6 +1127,17 @@ function ManageSections({
   const [providerStatus, setProviderStatus] = useState("");
   const [assetTitle, setAssetTitle] = useState("");
   const [assetBody, setAssetBody] = useState("");
+  const [assetKind, setAssetKind] = useState<Asset["kind"]>("knowledge");
+  const [assetTrigger, setAssetTrigger] = useState("");
+  const [assetScope, setAssetScope] = useState("");
+  const [editingAssetId, setEditingAssetId] = useState<string | null>(null);
+  const [assetPending, setAssetPending] = useState<string | null>(null);
+  const [discoveredAssets, setDiscoveredAssets] = useState<Asset[] | null>(
+    null,
+  );
+  const [remoteAssetAction, setRemoteAssetAction] = useState<
+    "discovering" | "importing" | "exporting" | null
+  >(null);
   const [blueprint, setBlueprint] = useState<Record<string, unknown> | null>(
     null,
   );
@@ -1329,88 +1340,257 @@ function ManageSections({
         )}
         {tab === "assets" && (
           <div>
-            <h2>Assets</h2>
-            <div className="form-grid">
-              <input
-                value={assetTitle}
-                onChange={(event) => setAssetTitle(event.target.value)}
-                placeholder="Asset title"
-              />
-              <textarea
-                value={assetBody}
-                onChange={(event) => setAssetBody(event.target.value)}
-                placeholder="Asset body"
-              />
-              <Button
-                className="primary"
-                onClick={() =>
-                  command("save_asset", {
-                    id: `asset-${Date.now()}`,
-                    kind: "knowledge",
-                    title: assetTitle,
-                    body: assetBody,
-                    enabled: true,
-                  })
-                    .then(() => {
-                      setAssetTitle("");
-                      setAssetBody("");
-                      onRefresh();
-                    })
-                    .catch(onError)
-                }
+            {(
+              [
+                [
+                  "agents",
+                  "AGENTS.md",
+                  "Repository-wide instructions loaded as the host's operating guidance.",
+                ],
+                [
+                  "knowledge",
+                  "Knowledge",
+                  "Reusable reference material added to the knowledge context.",
+                ],
+                [
+                  "playbook",
+                  "Playbook",
+                  "A repeatable workflow that can be run by an automation.",
+                ],
+                [
+                  "skill",
+                  "Skill",
+                  "A focused capability or instruction bundle available to the agent.",
+                ],
+              ] as const
+            ).map(([kind, label, description]) => (
+              <section
+                className="mb-5 rounded-xl2 border border-line bg-paper p-4"
+                key={kind}
               >
-                Save asset
-              </Button>
-            </div>
-            {assets.map((asset) => (
-              <div className="manage-row" key={asset.id}>
-                <span>
-                  {asset.title} <small>{asset.kind}</small>
-                </span>
+                <h2 className="text-[15px] font-semibold text-ink">{label}</h2>
+                <p className="field-help">{description}</p>
+                {assets
+                  .filter((asset) => asset.kind === kind)
+                  .map((asset) => (
+                    <div className="manage-row" key={asset.id}>
+                      <span>
+                        <strong>{asset.title}</strong>
+                        <small>
+                          {asset.enabled ? "Enabled" : "Disabled"}
+                          {asset.trigger ? ` · ${asset.trigger}` : ""}
+                        </small>
+                      </span>
+                      <span className="inline-actions">
+                        <Button
+                          className="bordered"
+                          disabled={assetPending === asset.id}
+                          onClick={() => {
+                            if (!selected) {
+                              onError(
+                                "Select a session before changing asset access.",
+                              );
+                              return;
+                            }
+                            setAssetPending(asset.id);
+                            void command("set_asset_enabled", {
+                              sessionId: selected.id,
+                              assetId: asset.id,
+                              enabled: !asset.enabled,
+                            })
+                              .then(() => onRefresh())
+                              .catch(onError)
+                              .finally(() => setAssetPending(null));
+                          }}
+                        >
+                          {assetPending === asset.id
+                            ? "Saving…"
+                            : asset.enabled
+                              ? "Disable"
+                              : "Enable"}
+                        </Button>
+                        <Button
+                          className="bordered"
+                          onClick={() => {
+                            setEditingAssetId(asset.id);
+                            setAssetKind(asset.kind);
+                            setAssetTitle(asset.title);
+                            setAssetBody(asset.body);
+                            setAssetTrigger(asset.trigger);
+                            setAssetScope(asset.scope);
+                          }}
+                        >
+                          Edit
+                        </Button>
+                        <Button
+                          className="danger"
+                          disabled={assetPending === asset.id}
+                          onClick={() => {
+                            setAssetPending(asset.id);
+                            void command("delete_asset", { id: asset.id })
+                              .then(onRefresh)
+                              .catch(onError)
+                              .finally(() => setAssetPending(null));
+                          }}
+                        >
+                          Delete
+                        </Button>
+                      </span>
+                    </div>
+                  ))}
+                {!assets.some((asset) => asset.kind === kind) && (
+                  <p className="empty-state">No {label} assets yet.</p>
+                )}
+              </section>
+            ))}
+            <div className="rounded-xl2 border border-line bg-panel p-5">
+              <h2 className="text-[15px] font-semibold text-ink">
+                {editingAssetId ? "Edit asset" : "New asset"}
+              </h2>
+              <div className="form-grid mt-4">
+                <label className="field-label">
+                  Kind
+                  <SelectMenu
+                    value={assetKind}
+                    onChange={(value) => setAssetKind(value as Asset["kind"])}
+                    options={[
+                      { value: "agents", label: "AGENTS.md" },
+                      { value: "knowledge", label: "Knowledge" },
+                      { value: "playbook", label: "Playbook" },
+                      { value: "skill", label: "Skill" },
+                    ]}
+                  />
+                </label>
+                <label className="field-label">
+                  Title
+                  <input
+                    value={assetTitle}
+                    onChange={(event) => setAssetTitle(event.target.value)}
+                    placeholder="Asset title"
+                  />
+                </label>
+                <label className="field-label">
+                  Body
+                  <textarea
+                    value={assetBody}
+                    onChange={(event) => setAssetBody(event.target.value)}
+                    placeholder="Asset content"
+                  />
+                </label>
+                {(assetKind === "knowledge" || assetKind === "skill") && (
+                  <label className="field-label">
+                    Trigger
+                    <input
+                      value={assetTrigger}
+                      onChange={(event) => setAssetTrigger(event.target.value)}
+                      placeholder="Optional trigger"
+                    />
+                  </label>
+                )}
+                <label className="field-label">
+                  Scope
+                  <input
+                    value={assetScope}
+                    onChange={(event) => setAssetScope(event.target.value)}
+                    placeholder="Optional scope"
+                  />
+                </label>
                 <Button
+                  className="primary"
                   onClick={() =>
-                    command("delete_asset", { id: asset.id })
-                      .then(onRefresh)
+                    command("save_asset", {
+                      id: editingAssetId || `asset-${Date.now()}`,
+                      kind: assetKind,
+                      title: assetTitle,
+                      body: assetBody,
+                      trigger: assetTrigger || null,
+                      scope: assetScope || null,
+                      enabled: true,
+                    })
+                      .then(() => {
+                        setAssetTitle("");
+                        setAssetBody("");
+                        setAssetTrigger("");
+                        setAssetScope("");
+                        setEditingAssetId(null);
+                        onRefresh();
+                      })
                       .catch(onError)
                   }
                 >
-                  Delete
+                  {editingAssetId ? "Save changes" : "Create asset"}
                 </Button>
               </div>
-            ))}
+            </div>
             {selected && (
               <div className="inline-actions">
                 <Button
+                  className="bordered"
+                  disabled={remoteAssetAction !== null}
                   onClick={() =>
-                    command("discover_remote_assets", {
-                      sessionId: selected.id,
-                    })
-                      .then(onRefresh)
-                      .catch(onError)
+                    (() => {
+                      setRemoteAssetAction("discovering");
+                      return command("discover_remote_assets", {
+                        sessionId: selected.id,
+                      })
+                        .then((bundle) => {
+                          setDiscoveredAssets(bundle as Asset[]);
+                          return onRefresh();
+                        })
+                        .catch(onError)
+                        .finally(() => setRemoteAssetAction(null));
+                    })()
                   }
                 >
-                  Discover remote
+                  {remoteAssetAction === "discovering"
+                    ? "Discovering…"
+                    : "Discover remote"}
                 </Button>
                 <Button
+                  className="bordered"
+                  disabled={remoteAssetAction !== null}
                   onClick={() =>
-                    command("import_assets", { sessionId: selected.id })
-                      .then(onRefresh)
-                      .catch(onError)
+                    (() => {
+                      setRemoteAssetAction("importing");
+                      return command("import_assets", {
+                        sessionId: selected.id,
+                      })
+                        .then((bundle) => {
+                          setDiscoveredAssets(bundle as Asset[]);
+                          return onRefresh();
+                        })
+                        .catch(onError)
+                        .finally(() => setRemoteAssetAction(null));
+                    })()
                   }
                 >
-                  Import
+                  {remoteAssetAction === "importing" ? "Importing…" : "Import"}
                 </Button>
                 <Button
+                  className="bordered"
+                  disabled={remoteAssetAction !== null}
                   onClick={() =>
-                    command("export_assets", {
-                      sessionId: selected.id,
-                      ids: assets.map((asset) => asset.id),
-                    }).catch(onError)
+                    (() => {
+                      setRemoteAssetAction("exporting");
+                      return command("export_assets", {
+                        sessionId: selected.id,
+                        ids: assets.map((asset) => asset.id),
+                      })
+                        .then(() => setDiscoveredAssets([]))
+                        .catch(onError)
+                        .finally(() => setRemoteAssetAction(null));
+                    })()
                   }
                 >
-                  Export
+                  {remoteAssetAction === "exporting" ? "Exporting…" : "Export"}
                 </Button>
               </div>
+            )}
+            {discoveredAssets && (
+              <p className="field-help">
+                Remote discovery completed. Import uses the backend bundle and
+                imports its supported entries.
+              </p>
             )}
           </div>
         )}
