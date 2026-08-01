@@ -81,7 +81,7 @@ pub struct TurnEngine<P, S, E> {
     model: Mutex<String>,
     interrupted: AtomicBool,
     steering: Mutex<Vec<String>>,
-    steering_waiters: Arc<std::sync::Mutex<Vec<oneshot::Sender<()>>>>,
+    steering_waiters: SteeringWaiters,
     events: mpsc::Sender<StreamChunk>,
     receiver: Mutex<Option<mpsc::Receiver<StreamChunk>>>,
     sequence: Mutex<i64>,
@@ -93,6 +93,8 @@ pub struct TurnEngine<P, S, E> {
     active_tool_calls: StdMutex<HashSet<String>>,
     policy_denied: AtomicBool,
 }
+
+type SteeringWaiters = Arc<std::sync::Mutex<Vec<oneshot::Sender<(String, String)>>>>;
 
 struct ActiveToolCallGuard<'a> {
     calls: &'a StdMutex<HashSet<String>>,
@@ -177,7 +179,7 @@ where
             self.run_loop(self.provider_messages()?).await
         }
         .await;
-        self.set_status_after_turn(&result);
+        self.finish_turn(&result);
         result
     }
 
@@ -186,7 +188,7 @@ where
         self.policy_denied.store(false, Ordering::SeqCst);
         self.set_session_status("running", "none");
         let result = async { self.run_loop(self.provider_messages()?).await }.await;
-        self.set_status_after_turn(&result);
+        self.finish_turn(&result);
         result
     }
 
@@ -194,7 +196,7 @@ where
         self.set_session_status("running", "none");
         self.policy_denied.store(false, Ordering::SeqCst);
         let result = self.resume_pending_turn_inner().await;
-        self.set_status_after_turn(&result);
+        self.finish_turn(&result);
         result
     }
 
@@ -275,7 +277,7 @@ where
         }
     }
 
-    fn set_status_after_turn<T>(&self, result: &Result<T, EngineError>) {
+    fn turn_status<T>(&self, result: &Result<T, EngineError>) -> (&'static str, &'static str) {
         let (run_state, stop_reason) = match result {
             Ok(_) => ("idle", "finished"),
             Err(EngineError::ApprovalPending(call_id)) => {
@@ -303,16 +305,31 @@ where
             Err(EngineError::ApprovalAlreadyProcessed(_)) => ("idle", "waiting_for_approval"),
         };
         if result.is_ok() && self.policy_denied.load(Ordering::SeqCst) {
-            self.set_session_status("idle", "policy_denied");
-            return;
+            return ("idle", "policy_denied");
         }
+        (run_state, stop_reason)
+    }
+
+    fn finish_turn<T>(&self, result: &Result<T, EngineError>) {
+        let (run_state, stop_reason) = self.turn_status(result);
         self.set_session_status(run_state, stop_reason);
+        if !matches!(result, Err(EngineError::ApprovalAlreadyProcessed(_))) {
+            let waiters = std::mem::take(
+                &mut *self
+                    .steering_waiters
+                    .lock()
+                    .expect("steering waiters mutex poisoned"),
+            );
+            for waiter in waiters {
+                let _ = waiter.send((run_state.to_owned(), stop_reason.to_owned()));
+            }
+        }
     }
 
     pub async fn queue_steering(
         &self,
         text: impl Into<String>,
-    ) -> Result<oneshot::Receiver<()>, EngineError> {
+    ) -> Result<oneshot::Receiver<(String, String)>, EngineError> {
         let text = text.into();
         let (sender, receiver) = oneshot::channel();
         self.steering_waiters
@@ -338,6 +355,20 @@ where
     }
 
     pub async fn resolve_approval(
+        &self,
+        call_id: &str,
+        outcome: ApprovalOutcome,
+    ) -> Result<AssistantTurn, EngineError> {
+        self.set_session_status("running", "none");
+        self.policy_denied.store(false, Ordering::SeqCst);
+        let result = self.resolve_approval_inner(call_id, outcome).await;
+        if !matches!(result, Err(EngineError::ApprovalAlreadyProcessed(_))) {
+            self.finish_turn(&result);
+        }
+        result
+    }
+
+    async fn resolve_approval_inner(
         &self,
         call_id: &str,
         outcome: ApprovalOutcome,
@@ -470,9 +501,6 @@ where
     }
 
     async fn run_loop(&self, mut messages: Vec<Value>) -> Result<AssistantTurn, EngineError> {
-        let _completion = SteeringCompletion {
-            waiters: Arc::clone(&self.steering_waiters),
-        };
         let mut usage: Option<TokenUsage> = None;
         for _ in 0..12 {
             if self.interrupted.load(Ordering::SeqCst) {
@@ -1028,24 +1056,6 @@ fn downgrade_images(value: &mut Value) {
 struct PartialOutput {
     text: Option<String>,
     reasoning: Option<String>,
-}
-
-struct SteeringCompletion {
-    waiters: Arc<std::sync::Mutex<Vec<oneshot::Sender<()>>>>,
-}
-
-impl Drop for SteeringCompletion {
-    fn drop(&mut self) {
-        let waiters = std::mem::take(
-            &mut *self
-                .waiters
-                .lock()
-                .expect("steering waiters mutex poisoned"),
-        );
-        for waiter in waiters {
-            let _ = waiter.send(());
-        }
-    }
 }
 
 #[cfg(test)]

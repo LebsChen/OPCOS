@@ -1726,10 +1726,6 @@ async fn interrupt(
 ) -> Result<(), String> {
     let engine = engine_for(&app, &state, &session_id).await?;
     engine.interrupt();
-    state
-        .store
-        .update_session_status(&session_id, "interrupted", "interrupted_by_user")
-        .map_err(|error| error.to_string())?;
     audit(
         &state,
         &session_id,
@@ -1760,11 +1756,15 @@ async fn steering(
     emit(&app, "steering", Some(&session_id), json!({"text":text}));
     let handle = app.clone();
     let session = session_id.clone();
-    let store = Arc::clone(&state.store);
     tauri::async_runtime::spawn(async move {
-        let _ = completion.await;
-        let payload = session_status_payload_from_store(&store, &session);
-        emit(&handle, "turn_done", Some(&session), payload);
+        if let Ok((run_state, stop_reason)) = completion.await {
+            emit(
+                &handle,
+                "turn_done",
+                Some(&session),
+                json!({"run_state": run_state, "stop_reason": stop_reason}),
+            );
+        }
     });
     Ok(())
 }
