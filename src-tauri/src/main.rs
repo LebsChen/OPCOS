@@ -252,6 +252,53 @@ fn secret_key(prefix: &str, id: &str) -> String {
     format!("{prefix}:{id}")
 }
 
+fn redact_approval_value(value: &Value) -> Value {
+    match value {
+        Value::Object(values) => Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| {
+                    let sensitive = key.to_ascii_lowercase().contains("token")
+                        || key.to_ascii_lowercase().contains("key")
+                        || key.to_ascii_lowercase().contains("password")
+                        || key.to_ascii_lowercase().contains("secret");
+                    (
+                        key.clone(),
+                        if sensitive {
+                            Value::String("[redacted]".into())
+                        } else {
+                            redact_approval_value(value)
+                        },
+                    )
+                })
+                .collect(),
+        ),
+        Value::Array(values) => {
+            Value::Array(values.iter().map(redact_approval_value).collect())
+        }
+        Value::String(value) => {
+            let mut redacted = value.clone();
+            if let Some(index) = redacted.to_ascii_lowercase().find("bearer ") {
+                let end = redacted[index + 7..]
+                    .find(char::is_whitespace)
+                    .map(|offset| index + 7 + offset)
+                    .unwrap_or(redacted.len());
+                redacted.replace_range(index + 7..end, "[redacted]");
+            }
+            Value::String(redacted)
+        }
+        other => other.clone(),
+    }
+}
+
+fn approval_risk(tool: &str) -> &'static str {
+    match tool {
+        "write_file" | "edit" => "write",
+        "run_shell" => "execute",
+        _ => "external",
+    }
+}
+
 fn init_database(path: PathBuf) -> Result<Connection, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -843,14 +890,22 @@ fn save_host(
         )
         .map_err(|error| error.to_string())?;
     drop(connection);
-    state
+    if let Err(error) = state
         .secrets
         .set(&secret_key("rvm-token", &id), &token)
-        .map_err(|error| error.to_string())?;
-    state
-        .secrets
-        .set(&secret_key("rvm-url", &id), &url)
-        .map_err(|error| error.to_string())?;
+    {
+        if let Ok(connection) = state.database.lock() {
+            let _ = connection.execute("DELETE FROM hosts WHERE id=?1", [&id]);
+        }
+        return Err(error.to_string());
+    }
+    if let Err(error) = state.secrets.set(&secret_key("rvm-url", &id), &url) {
+        let _ = state.secrets.delete(&secret_key("rvm-token", &id));
+        if let Ok(connection) = state.database.lock() {
+            let _ = connection.execute("DELETE FROM hosts WHERE id=?1", [&id]);
+        }
+        return Err(error.to_string());
+    }
     Ok(HostView {
         id,
         name,
@@ -1063,10 +1118,30 @@ fn read_transcript(
         .store
         .load_messages(&session_id)
         .map_err(|error| error.to_string())?;
-    Ok(messages
+    let mut transcript = messages
         .into_iter()
         .map(|message| json!({"kind":message.role,"payload":message.content}))
-        .collect())
+        .collect::<Vec<_>>();
+    transcript.extend(
+        state
+            .store
+            .load_pending(&session_id)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|pending| {
+                json!({
+                    "kind":"approval",
+                    "payload":{
+                        "call_id":pending.call_id,
+                        "tool":pending.tool,
+                        "arguments":redact_approval_value(&pending.arguments),
+                        "risk":approval_risk(&pending.tool),
+                        "reason":"Tool action requires approval"
+                    }
+                })
+            }),
+    );
+    Ok(transcript)
 }
 
 #[tauri::command]
@@ -1102,6 +1177,34 @@ async fn submit_turn(
     );
     match engine.submit_text(request.text).await {
         Ok(_) => Ok(()),
+        Err(EngineError::ApprovalPending(call_id)) => {
+            if let Ok(Some(pending)) = state
+                .store
+                .load_pending(&request.session_id)
+                .map(|items| items.into_iter().find(|item| item.call_id == call_id))
+            {
+                emit(
+                    &app,
+                    "approval",
+                    Some(&request.session_id),
+                    json!({
+                        "call_id":pending.call_id,
+                        "tool":pending.tool,
+                        "arguments":redact_approval_value(&pending.arguments),
+                        "risk":approval_risk(&pending.tool),
+                        "reason":"Tool action requires approval"
+                    }),
+                );
+            }
+            let message = "Approval required before this tool can continue".to_owned();
+            emit(
+                &app,
+                "notice",
+                Some(&request.session_id),
+                json!({"kind":"approval_pending","text":message}),
+            );
+            Err(message)
+        }
         Err(error) => {
             let message = engine_error_message(error);
             emit(
@@ -1199,6 +1302,25 @@ async fn change_model(
 #[tauri::command]
 fn provider_descriptors() -> Vec<registry::ProviderDescriptor> {
     registry::descriptors()
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ModelDescriptor {
+    id: String,
+    label: String,
+    provider: String,
+}
+
+#[tauri::command]
+fn provider_models(provider: String) -> Vec<ModelDescriptor> {
+    opcos_provider::matrix::models_for_provider(&provider)
+        .into_iter()
+        .map(|model| ModelDescriptor {
+            id: model.id.into(),
+            label: model.label.into(),
+            provider: model.provider.into(),
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -2467,9 +2589,13 @@ fn main() {
                     Box::new(std::io::Error::other(error.to_string()));
                 tauri::Error::Setup(cause.into())
             })?);
+            let mut secret_path = path.clone();
+            secret_path.set_file_name("secrets.enc");
+            let secrets = KeyringSecretStore::with_fallback(SECRET_SERVICE, secret_path);
+            let secret_backend = secrets.backend();
             app.manage(DesktopState {
                 database: Mutex::new(database),
-                secrets: KeyringSecretStore::new(SECRET_SERVICE),
+                secrets,
                 store,
                 engines: AsyncMutex::new(HashMap::new()),
                 surfaces: AsyncMutex::new(HashMap::new()),
@@ -2517,7 +2643,7 @@ fn main() {
                 app.handle(),
                 "system",
                 None,
-                json!({"text":"OPCOS started"}),
+                json!({"text":"OPCOS started","secret_backend":secret_backend}),
             );
             Ok(())
         })
@@ -2534,6 +2660,7 @@ fn main() {
             resolve_approval,
             change_model,
             provider_descriptors,
+            provider_models,
             list_assets,
             save_asset,
             delete_asset,
