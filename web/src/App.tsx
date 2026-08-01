@@ -1753,7 +1753,10 @@ function Automations({
               }`}
               onClick={() => setAutomationTab(item)}
             >
-              <Icon name={item === "schedules" ? "clock" : "audit"} size={15} />
+              <Icon
+                name={item === "schedules" ? "clock" : "folder"}
+                size={15}
+              />
               {item === "schedules" ? "Schedules" : "Runs"}
             </button>
           ))}
@@ -1762,7 +1765,11 @@ function Automations({
           <div className="max-w-3xl mx-auto px-7 py-6">
             <PageHeader
               title={automationTab === "schedules" ? "Schedules" : "Runs"}
-              subtitle="Run OPCOS playbooks on a schedule"
+              subtitle={
+                automationTab === "schedules"
+                  ? "Create and manage recurring OPCOS playbook runs."
+                  : "Review the latest results reported by scheduled runs."
+              }
             />
             {automationTab === "schedules" ? (
               <>
@@ -1943,12 +1950,12 @@ function Activity({
                 name={
                   (
                     {
-                      board: "table",
+                      board: "sliders",
                       roles: "folder",
-                      tasks: "audit",
-                      messages: "chat",
+                      tasks: "code",
+                      messages: "gear",
                       worklog: "clock",
-                      insights: "sparkle",
+                      insights: "shield",
                     } as const
                   )[item]
                 }
@@ -1962,7 +1969,19 @@ function Activity({
           <div className="max-w-3xl mx-auto px-7 py-6">
             <PageHeader
               title={activityTab[0].toUpperCase() + activityTab.slice(1)}
-              subtitle="Coordination, worklog, and session insights"
+              subtitle={
+                (
+                  {
+                    board: "Start or observe the active coordination board.",
+                    roles: "Review board roles and their current state.",
+                    tasks:
+                      "Create, claim, complete, and verify coordination tasks.",
+                    messages: "Send and review coordination messages.",
+                    worklog: "Inspect the remote session worklog timeline.",
+                    insights: "Review cross-session activity insights.",
+                  } as const
+                )[activityTab]
+              }
             />
             {activityTab === "worklog" && (
               <div className="rounded-xl2 border border-line bg-panel p-5">
@@ -2068,7 +2087,7 @@ function Activity({
                     </Button>
                   </div>
                 )}
-                <div className="board-grid mt-5">
+                <div className="mt-5 grid grid-cols-1 gap-4">
                   <section
                     className={`board-column rounded-xl2 border border-line bg-panel p-4 ${activityTab !== "roles" ? "hidden" : ""}`}
                   >
