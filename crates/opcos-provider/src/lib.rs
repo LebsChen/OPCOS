@@ -244,6 +244,25 @@ pub trait Provider: Send + Sync {
     fn capabilities(&self, model: &str) -> Caps;
 }
 
+#[async_trait]
+impl<T: Provider + ?Sized> Provider for Box<T> {
+    async fn complete(&self, request: ProviderRequest) -> Result<AssistantTurn, ProviderError> {
+        (**self).complete(request).await
+    }
+
+    async fn stream(
+        &self,
+        request: ProviderRequest,
+        output: tokio::sync::mpsc::Sender<StreamChunk>,
+    ) -> Result<AssistantTurn, ProviderError> {
+        (**self).stream(request, output).await
+    }
+
+    fn capabilities(&self, model: &str) -> Caps {
+        (**self).capabilities(model)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

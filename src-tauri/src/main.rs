@@ -25,7 +25,8 @@ use opcos_engine::{
     orchestration::{CoordinationRuntime, Envelope, Role},
 };
 use opcos_policy::PermissionMode;
-use opcos_provider::ProviderConfig;
+use opcos_provider::{Provider, ProviderConfig};
+use opcos_provider::anthropic::AnthropicProvider;
 use opcos_provider::openai::OpenAiProvider;
 use opcos_provider::registry;
 use opcos_rvm::{
@@ -87,7 +88,7 @@ struct DesktopState {
     coordination: AsyncMutex<HashMap<String, CoordinationRuntime>>,
 }
 
-type GuiEngine = TurnEngine<OpenAiProvider, SqliteStore, RemoteExecutor>;
+type GuiEngine = TurnEngine<Box<dyn Provider>, SqliteStore, RemoteExecutor>;
 
 struct RemoteExecutor {
     client: HttpRvmClient,
@@ -220,6 +221,7 @@ struct SessionView {
     host_id: String,
     host_name: String,
     model: String,
+    provider: Option<String>,
     mode: String,
     workspace: String,
 }
@@ -392,6 +394,18 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                 "ALTER TABLE sessions ADD COLUMN workspace TEXT NOT NULL DEFAULT ''",
                 [],
             )
+            .map_err(|error| error.to_string())?;
+    }
+    let has_provider: bool = connection
+        .prepare("PRAGMA table_info(sessions)")
+        .and_then(|mut statement| {
+            let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+            Ok(rows.flatten().any(|name| name == "provider"))
+        })
+        .map_err(|error| error.to_string())?;
+    if !has_provider {
+        connection
+            .execute("ALTER TABLE sessions ADD COLUMN provider TEXT", [])
             .map_err(|error| error.to_string())?;
     }
     Ok(connection)
@@ -636,14 +650,14 @@ async fn engine_for(
             return Ok(Arc::clone(engine));
         }
     }
-    let (host_id, model, mode, session_workspace) = {
+    let (host_id, model, mode, session_workspace, session_provider) = {
         let connection = state
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?;
         connection
             .query_row(
-                "SELECT host_id,model,mode,workspace FROM sessions WHERE id=?1",
+                "SELECT host_id,model,mode,workspace,provider FROM sessions WHERE id=?1",
                 [session_id],
                 |row| {
                     Ok((
@@ -651,6 +665,7 @@ async fn engine_for(
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                     ))
                 },
             )
@@ -661,20 +676,21 @@ async fn engine_for(
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?;
-        let provider = connection
+        let provider = session_provider.unwrap_or_else(|| connection
             .query_row(
                 "SELECT value FROM settings WHERE key='provider.id'",
                 [],
                 |row| row.get::<_, String>(0),
             )
-            .unwrap_or_else(|_| "openai".into());
+            .unwrap_or_else(|_| "openai".into()));
         let base_url = connection
             .query_row(
-                "SELECT value FROM settings WHERE key='provider.base_url'",
+                &format!("SELECT value FROM settings WHERE key='provider.base_url.{}'", provider),
                 [],
                 |row| row.get::<_, String>(0),
             )
-            .ok();
+            .ok()
+            .or_else(|| connection.query_row("SELECT value FROM settings WHERE key='provider.base_url'", [], |row| row.get::<_, String>(0)).ok());
         (provider, base_url)
     };
     let descriptor = registry::descriptors()
@@ -713,7 +729,13 @@ async fn engine_for(
         .get(&secret_key("provider-key", &provider_id))
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "provider key is not configured; open Provider settings first".to_owned())?;
-    let provider = OpenAiProvider::new(ProviderConfig::new(base_url, key));
+    let provider: Box<dyn Provider> = match descriptor.name.as_str() {
+        "anthropic" => Box::new(AnthropicProvider::new(ProviderConfig::new(base_url, key))),
+        _name if descriptor.openai_compatible => {
+            Box::new(OpenAiProvider::new(ProviderConfig::new(base_url, key)))
+        }
+        name => return Err(format!("provider {name} is not supported for sessions")),
+    };
     let permission_mode = match mode.as_str() {
         "Discuss" => PermissionMode::Discuss,
         "Plan" => PermissionMode::Plan,
@@ -1081,6 +1103,7 @@ fn create_session(
     title: String,
     host_id: String,
     model: Option<String>,
+    provider: Option<String>,
     mode: Option<String>,
     workspace: Option<String>,
 ) -> Result<SessionView, String> {
@@ -1101,8 +1124,8 @@ fn create_session(
         .map_err(|_| "remote host not found; session was not created".to_owned())?;
     connection
         .execute(
-            "INSERT INTO sessions(id,title,host_id,model,mode,workspace,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            params![id, title, host_id, model, mode, workspace.clone().unwrap_or_default(), Utc::now().to_rfc3339()],
+            "INSERT INTO sessions(id,title,host_id,model,provider,mode,workspace,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![id, title, host_id, model, provider, mode, workspace.clone().unwrap_or_default(), Utc::now().to_rfc3339()],
         )
         .map_err(|error| error.to_string())?;
     Ok(SessionView {
@@ -1111,6 +1134,7 @@ fn create_session(
         host_id,
         host_name,
         model,
+        provider,
         mode,
         workspace: workspace.unwrap_or_default(),
     })
@@ -1123,7 +1147,7 @@ fn list_sessions(state: State<'_, DesktopState>) -> Result<Vec<SessionView>, Str
         .lock()
         .map_err(|_| "database lock poisoned")?;
     let mut statement = connection
-        .prepare("SELECT s.id,s.title,s.host_id,h.name,s.model,s.mode,s.workspace FROM sessions s JOIN hosts h ON h.id=s.host_id ORDER BY s.created_at DESC")
+        .prepare("SELECT s.id,s.title,s.host_id,h.name,s.model,s.provider,s.mode,s.workspace FROM sessions s JOIN hosts h ON h.id=s.host_id ORDER BY s.created_at DESC")
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map([], |row| {
@@ -1133,8 +1157,9 @@ fn list_sessions(state: State<'_, DesktopState>) -> Result<Vec<SessionView>, Str
                 host_id: row.get(2)?,
                 host_name: row.get(3)?,
                 model: row.get(4)?,
-                mode: row.get(5)?,
-                workspace: row.get(6)?,
+                provider: row.get(5)?,
+                mode: row.get(6)?,
+                workspace: row.get(7)?,
             })
         })
         .map_err(|error| error.to_string())?;
@@ -1329,6 +1354,33 @@ async fn change_model(
         Some(&session_id),
         json!({"kind":"model_switch","text":format!("Switched to {model}")}),
     );
+    Ok(())
+}
+
+#[tauri::command]
+async fn change_provider(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    provider: Option<String>,
+) -> Result<(), String> {
+    if let Some(ref name) = provider
+        && !registry::descriptors().iter().any(|item| item.name == *name)
+    {
+        return Err("unknown provider".into());
+    }
+    {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        connection
+            .execute(
+                "UPDATE sessions SET provider=?1 WHERE id=?2",
+                params![provider, session_id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    state.engines.lock().await.remove(&session_id);
     Ok(())
 }
 
@@ -2732,6 +2784,7 @@ fn main() {
             steering,
             resolve_approval,
             change_model,
+            change_provider,
             provider_descriptors,
             provider_models,
             list_assets,

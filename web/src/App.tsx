@@ -3028,6 +3028,7 @@ export function App() {
     title: string,
     hostId: string,
     model: string,
+    provider: string,
     mode: string,
     workspace: string,
   ) => {
@@ -3036,6 +3037,7 @@ export function App() {
         title,
         hostId,
         model,
+        provider: provider || null,
         mode,
         workspace: workspace || null,
       });
@@ -3152,6 +3154,28 @@ export function App() {
                     Secrets: {secretBackend}
                   </span>
                 )}
+                <label>
+                  Provider
+                  <OpenWorkerSelectMenu
+                    value={selected.provider || ""}
+                    onChange={(provider) =>
+                      command("change_provider", {
+                        sessionId: selected.id,
+                        provider: provider || null,
+                      })
+                        .then(() => setSelected({ ...selected, provider }))
+                        .catch(onError)
+                    }
+                    options={[
+                      { value: "", label: "Global default" },
+                      ...providers.map((item) => ({
+                        value: item.name,
+                        label: item.title,
+                      })),
+                    ]}
+                    ariaLabel="Provider"
+                  />
+                </label>
                 <label>
                   Model
                   <OpenWorkerSelectMenu
@@ -3296,9 +3320,11 @@ export function App() {
       {modal && (
         <NewSessionModal
           hosts={hosts}
+          providers={providers}
+          models={models}
           onClose={() => setModal(false)}
-          onCreate={(title, hostId, model, mode, workspace) =>
-            void createSession(title, hostId, model, mode, workspace)
+          onCreate={(title, hostId, model, provider, mode, workspace) =>
+            void createSession(title, hostId, model, provider, mode, workspace)
           }
         />
       )}

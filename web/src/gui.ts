@@ -11,6 +11,7 @@ export type Session = {
   host_id: string;
   host_name: string;
   model: string;
+  provider?: string | null;
   mode: string;
   workspace?: string;
 };
