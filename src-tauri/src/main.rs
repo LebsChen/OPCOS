@@ -203,26 +203,101 @@ async fn execute_index_tool(
     {
         return Err("repository index is stale; run repo_index_refresh before searching".into());
     }
+    let limited = |mut results: Vec<Value>| {
+        let omitted = results.len().saturating_sub(repo_index::MAX_RESULTS);
+        results.truncate(repo_index::MAX_RESULTS);
+        json!({"results": results, "omitted": omitted})
+    };
     let artifact_ref = format!("repo-index://{host_id}/{workspace}");
     match name {
         "repo_index_find_symbol" => Ok(json!({
             "status": index.status,
             "built_at": index.built_at,
-            "results": repo_index::find_symbol(&index, arguments.get("query").and_then(Value::as_str).ok_or("missing query")?),
+            "matches": limited(repo_index::find_symbol(&index, host_id, arguments.get("query").and_then(Value::as_str).ok_or("missing query")?)),
             "artifact_ref": artifact_ref,
         })),
         "repo_index_glob" => Ok(json!({
             "status": index.status,
             "built_at": index.built_at,
-            "results": repo_index::glob(&index, arguments.get("pattern").and_then(Value::as_str).ok_or("missing pattern")?),
+            "matches": limited(repo_index::glob(&index, arguments.get("pattern").and_then(Value::as_str).ok_or("missing pattern")?)),
             "artifact_ref": artifact_ref,
         })),
-        "repo_index_search" => Ok(json!({
-            "status": index.status,
-            "built_at": index.built_at,
-            "results": repo_index::search(&index, arguments.get("query").and_then(Value::as_str).ok_or("missing query")?),
-            "artifact_ref": artifact_ref,
-        })),
+        "repo_index_search" => {
+            let query = arguments
+                .get("query")
+                .and_then(Value::as_str)
+                .filter(|query| !query.is_empty())
+                .ok_or("missing query")?;
+            let probe = host
+                .exec(ExecRequest {
+                    command: "command -v rg".into(),
+                    cwd: Some(workspace.to_owned()),
+                    timeout_seconds: 5,
+                    session: None,
+                    env: None,
+                })
+                .await
+                .map_err(|error| format!("repository content search probe failed: {error}"))?;
+            if probe.result.exit_code != 0 {
+                return Err(
+                    "repository content search is unavailable: host is missing ripgrep (rg)".into(),
+                );
+            }
+            let result = host
+                .exec(ExecRequest {
+                    command: "rg -n --fixed-strings --hidden --glob '!.git/**' --glob '!node_modules/**' --glob '!target/**' --glob '!.venv/**' --glob '!dist/**' --glob '!build/**' \"$OPCOS_INDEX_QUERY\" . | awk 'NR <= 100 { print } END { print \"__OPCOS_TOTAL__\" NR }'".into(),
+                    cwd: Some(workspace.to_owned()),
+                    timeout_seconds: 15,
+                    session: None,
+                    env: Some(json!({"OPCOS_INDEX_QUERY": query})),
+                })
+                .await
+                .map_err(|error| format!("repository content search failed: {error}"))?;
+            if result.result.exit_code != 0 && result.result.exit_code != 1 {
+                return Err(format!(
+                    "repository content search failed: {}",
+                    result.result.stderr.trim()
+                ));
+            }
+            let mut total = 0usize;
+            let matches = result
+                .result
+                .stdout
+                .lines()
+                .filter_map(|line| {
+                    if let Some(value) = line.strip_prefix("__OPCOS_TOTAL__") {
+                        total = value.parse().unwrap_or(0);
+                        return None;
+                    }
+                    let mut parts = line.splitn(3, ':');
+                    let path = parts.next()?.trim_start_matches("./").to_owned();
+                    let line_number = parts.next()?.parse::<u32>().ok()?;
+                    let text = parts.next()?.to_owned();
+                    Some(json!({
+                        "path": path,
+                        "line": line_number,
+                        "text": text,
+                    }))
+                })
+                .collect::<Vec<_>>();
+            let mut matches = matches;
+            for item in &mut matches {
+                if let (Some(path), Some(line)) = (
+                    item.get("path").and_then(Value::as_str),
+                    item.get("line").and_then(Value::as_u64),
+                ) {
+                    item["artifact_ref"] = json!(format!("repo-index://{host_id}/{path}#L{line}"));
+                }
+            }
+            let omitted = total.saturating_sub(matches.len());
+            matches.truncate(repo_index::MAX_RESULTS);
+            Ok(json!({
+                "status": index.status,
+                "built_at": index.built_at,
+                "matches": {"results": matches, "omitted": omitted},
+                "artifact_ref": artifact_ref,
+            }))
+        }
         _ => {
             let _ = host;
             Err(format!("repository index tool is unavailable: {name}"))

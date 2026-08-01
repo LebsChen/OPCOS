@@ -11,6 +11,7 @@ use std::{
 const MAX_FILES: usize = 20_000;
 const MAX_FILE_BYTES: i64 = 10 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_RESULTS: usize = 100;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct RepoIndex {
@@ -74,6 +75,38 @@ pub async fn build(
     workspace: &str,
     host: &dyn Host,
 ) -> Result<RepoIndex, String> {
+    let health = host
+        .health()
+        .await
+        .map_err(|error| format!("repository index host check failed: {error}"))?;
+    let platform = health.platform.unwrap_or_default().to_ascii_lowercase();
+    if !platform.contains("linux") && !platform.contains("unix") {
+        let error = format!(
+            "repository index is unavailable on host platform '{}': GNU find metadata scanning is required",
+            if platform.is_empty() {
+                "unknown"
+            } else {
+                &platform
+            }
+        );
+        mark_unavailable(root, host_id, workspace, &error)?;
+        return Err(error);
+    }
+    let rg_probe = host
+        .exec(ExecRequest {
+            command: "command -v rg".into(),
+            cwd: Some(workspace.to_owned()),
+            timeout_seconds: 5,
+            session: None,
+            env: None,
+        })
+        .await
+        .map_err(|error| format!("repository index ripgrep probe failed: {error}"))?;
+    if rg_probe.result.exit_code != 0 {
+        let error = "repository index is unavailable: host is missing ripgrep (rg)".to_owned();
+        mark_unavailable(root, host_id, workspace, &error)?;
+        return Err(error);
+    }
     let file_result = host
         .exec(ExecRequest {
             command: "find . -type d \\( -name .git -o -name node_modules -o -name target -o -name .venv -o -name dist -o -name build \\) -prune -o -type f -printf '%p\\t%s\\n' | head -n 20001".into(),
@@ -84,6 +117,14 @@ pub async fn build(
         })
         .await
         .map_err(|error| format!("repository index file scan failed: {error}"))?;
+    if file_result.result.exit_code != 0 {
+        let error = format!(
+            "repository index file scan failed on host: {}",
+            file_result.result.stderr.trim()
+        );
+        mark_unavailable(root, host_id, workspace, &error)?;
+        return Err(error);
+    }
     let file_stdout = file_result.result.stdout;
     let mut files = Vec::new();
     let mut truncated = false;
@@ -117,6 +158,14 @@ pub async fn build(
         })
         .await
         .map_err(|error| format!("repository index symbol scan failed: {error}"))?;
+    if symbol_result.result.exit_code != 0 {
+        let error = format!(
+            "repository index symbol scan failed on host: {}",
+            symbol_result.result.stderr.trim()
+        );
+        mark_unavailable(root, host_id, workspace, &error)?;
+        return Err(error);
+    }
     let symbol_stdout = symbol_result.result.stdout;
     let mut symbols = Vec::new();
     for line in symbol_stdout.lines() {
@@ -152,6 +201,27 @@ pub async fn build(
     Ok(index)
 }
 
+fn mark_unavailable(
+    root: &Path,
+    host_id: &str,
+    workspace: &str,
+    error: &str,
+) -> Result<(), String> {
+    save(
+        root,
+        &RepoIndex {
+            host_id: host_id.to_owned(),
+            workspace: workspace.to_owned(),
+            built_at: Utc::now(),
+            status: "unavailable".into(),
+            files: Vec::new(),
+            symbols: Vec::new(),
+            truncated: false,
+            error: Some(error.to_owned()),
+        },
+    )
+}
+
 pub fn glob(index: &RepoIndex, pattern: &str) -> Vec<Value> {
     index
         .files
@@ -167,7 +237,7 @@ pub fn glob(index: &RepoIndex, pattern: &str) -> Vec<Value> {
         .collect()
 }
 
-pub fn find_symbol(index: &RepoIndex, query: &str) -> Vec<Value> {
+pub fn find_symbol(index: &RepoIndex, host_id: &str, query: &str) -> Vec<Value> {
     let query = query.to_ascii_lowercase();
     index
         .symbols
@@ -176,26 +246,16 @@ pub fn find_symbol(index: &RepoIndex, query: &str) -> Vec<Value> {
             symbol.text.to_ascii_lowercase().contains(&query)
                 || symbol.path.to_ascii_lowercase().contains(&query)
         })
-        .map(symbol_value)
+        .map(|symbol| symbol_value(host_id, symbol))
         .collect()
 }
 
-pub fn search(index: &RepoIndex, query: &str) -> Vec<Value> {
-    let query = query.to_ascii_lowercase();
-    index
-        .symbols
-        .iter()
-        .filter(|symbol| symbol.text.to_ascii_lowercase().contains(&query))
-        .map(symbol_value)
-        .collect()
-}
-
-fn symbol_value(symbol: &IndexSymbol) -> Value {
+fn symbol_value(host_id: &str, symbol: &IndexSymbol) -> Value {
     serde_json::json!({
         "path": symbol.path,
         "line": symbol.line,
         "text": symbol.text,
-        "artifact_ref": format!("repo-index://{}#{}:{}", symbol.path, symbol.line, symbol.text),
+        "artifact_ref": format!("repo-index://{host_id}/{}#L{}", symbol.path, symbol.line),
     })
 }
 

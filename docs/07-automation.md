@@ -32,19 +32,7 @@ policy creates a pending approval/Inbox item before execution. There is no
 frontend boolean that can authorize a comment or status change; a client-supplied
 `approved` flag is not an approval.
 
-## 7.5 仓库索引（P2-5）
-
-仓库索引是派生数据，存放在应用配置目录的 `repository-indexes/` 下，以
-`host_id + workspace` 的哈希隔离；不会写进仓库或会话数据库。索引建立始终
-通过绑定的 `Host` 执行：远程 Host 只在远端运行受限的 `find`/`rg` 元数据扫描，
-传回文件路径、大小和符号行，不把全仓库文件内容打包拉回本机，也不运行本地
-embedding。默认上限为 20,000 个文件、单文件 10 MiB 和 30 秒扫描时间，超限
-状态为 `limited` 并如实返回。
-
-模型可使用只读的 `repo_index_find_symbol`、`repo_index_glob` 和
-`repo_index_search`；结果带 `repo-index://` 引用，不把整文件内容塞进 transcript。
-本机会话检查 git 工作树变化并将索引标为 `stale`，用户可显式刷新；远程 Host
-没有事件通道，只支持按需显式刷新，不轮询伪造变更。
+2. **入站 webhook**（需要 relay）：本地只出站长连接到 relay，relay 提供稳定公网端点接事件后推给本机。不暴露本机端口。
 
 ## 7.4 仓库索引（P2-5）
 
@@ -56,10 +44,13 @@ embedding。默认上限为 20,000 个文件、单文件 10 MiB 和 30 秒扫描
 状态为 `limited` 并如实返回。
 
 模型可使用只读的 `repo_index_find_symbol`、`repo_index_glob` 和
-`repo_index_search`；结果带 `repo-index://` 引用，不把整文件内容塞进 transcript。
+`repo_index_search`；前两者查索引，后者按需经 Host 运行带固定字符串参数的
+`rg` 做真实内容检索。结果带统一的 `repo-index://<host>/<path>#L<line>` 引用，
+不把整文件内容塞进 transcript，每次最多返回 100 条并报告省略数量。
 本机会话检查 git 工作树变化并将索引标为 `stale`，用户可显式刷新；远程 Host
-没有事件通道，只支持按需显式刷新，不轮询伪造变更。
-2. **入站 webhook**（需要 relay）：本地只出站长连接到 relay，relay 提供稳定公网端点接事件后推给本机。不暴露本机端口。
+没有事件通道，只支持按需显式刷新，不轮询伪造变更。当前索引构建要求 Linux/Unix
+GNU `find` 与 `rg`；Windows/macOS 或缺少 `rg` 的主机会明确显示不可用，不会保存
+空的 `ready` 索引。
 
 先做 1，不要因为 2 才好看就先做 2。
 
