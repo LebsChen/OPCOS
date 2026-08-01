@@ -1091,6 +1091,7 @@ function Manage({
   onRefresh,
   onError,
   onAddHost,
+  onTestHost,
   hostName,
   setHostName,
   hostUrl,
@@ -1106,6 +1107,7 @@ function Manage({
   onRefresh: () => void;
   onError: (error: unknown) => void;
   onAddHost: (event: FormEvent) => void;
+  onTestHost: (hostId: string) => Promise<Host>;
   hostName: string;
   setHostName: (value: string) => void;
   hostUrl: string;
@@ -1124,6 +1126,7 @@ function Manage({
     null,
   );
   const [blueprintCommand, setBlueprintCommand] = useState("");
+  const [testingHostId, setTestingHostId] = useState<string | null>(null);
   const tabs = ["provider", "hosts", "assets", "mcp", "secrets", "blueprint"];
   useEffect(() => {
     void command<Record<string, unknown>>("provider_settings")
@@ -1254,16 +1257,27 @@ function Manage({
             </form>
             {hosts.map((host) => (
               <div className="manage-row" key={host.id}>
-                <span>{host.name}</span>
-                <span className="muted">{hostStatusLabel(host)}</span>
+                <span>
+                  <strong>{host.name}</strong>
+                  <small
+                    className={host.online === false ? "failure" : "muted"}
+                  >
+                    {hostStatusLabel(host)}
+                    {host.reason ? ` · ${host.reason}` : ""}
+                  </small>
+                </span>
                 <Button
+                  disabled={testingHostId === host.id}
                   onClick={() =>
-                    command<Host>("test_host", { hostId: host.id })
-                      .then(() => onRefresh())
-                      .catch(onError)
+                    (() => {
+                      setTestingHostId(host.id);
+                      return onTestHost(host.id)
+                        .catch(onError)
+                        .finally(() => setTestingHostId(null));
+                    })()
                   }
                 >
-                  Test
+                  {testingHostId === host.id ? "Testing…" : "Test"}
                 </Button>
               </div>
             ))}
@@ -1922,6 +1936,27 @@ export function App() {
       onError(submitFailureMessage(reason));
     }
   };
+  const testHost = async (hostId: string) => {
+    try {
+      const next = await command<Host>("test_host", { hostId });
+      setHosts((items) =>
+        items.map((item) => (item.id === next.id ? next : item)),
+      );
+      if (next.online === false && next.reason) onError(next.reason);
+      return next;
+    } catch (reason) {
+      const message = submitFailureMessage(reason);
+      setHosts((items) =>
+        items.map((item) =>
+          item.id === hostId
+            ? { ...item, online: false, reason: message }
+            : item,
+        ),
+      );
+      onError(message);
+      throw reason;
+    }
+  };
   const createSession = async (
     title: string,
     hostId: string,
@@ -2137,6 +2172,7 @@ export function App() {
             onRefresh={() => refresh().catch(onError)}
             onError={onError}
             onAddHost={addHost}
+            onTestHost={testHost}
             hostName={hostName}
             setHostName={setHostName}
             hostUrl={hostUrl}

@@ -273,9 +273,7 @@ fn redact_approval_value(value: &Value) -> Value {
                 })
                 .collect(),
         ),
-        Value::Array(values) => {
-            Value::Array(values.iter().map(redact_approval_value).collect())
-        }
+        Value::Array(values) => Value::Array(values.iter().map(redact_approval_value).collect()),
         Value::String(value) => {
             let mut redacted = value.clone();
             if let Some(index) = redacted.to_ascii_lowercase().find("bearer ") {
@@ -418,12 +416,18 @@ fn client_for(state: &DesktopState, host_id: &str) -> Result<HttpRvmClient, Stri
         .secrets
         .get(&secret_key("rvm-url", host_id))
         .map_err(|error| error.to_string())?
-        .ok_or_else(|| "remote host URL is not configured".to_owned())?;
+        .ok_or_else(|| {
+            "Remote host credentials are missing; delete this host and add it again with its URL and token."
+                .to_owned()
+        })?;
     let token = state
         .secrets
         .get(&secret_key("rvm-token", host_id))
         .map_err(|error| error.to_string())?
-        .ok_or_else(|| "remote host token is not configured".to_owned())?;
+        .ok_or_else(|| {
+            "Remote host credentials are missing; delete this host and add it again with its URL and token."
+                .to_owned()
+        })?;
     let parsed = url::Url::parse(&url).map_err(|_| "remote host URL is invalid".to_owned())?;
     let config = RvmClientConfig::new(parsed, token).map_err(|error| error.to_string())?;
     HttpRvmClient::new(config).map_err(|error| error.to_string())
@@ -890,10 +894,7 @@ fn save_host(
         )
         .map_err(|error| error.to_string())?;
     drop(connection);
-    if let Err(error) = state
-        .secrets
-        .set(&secret_key("rvm-token", &id), &token)
-    {
+    if let Err(error) = state.secrets.set(&secret_key("rvm-token", &id), &token) {
         if let Ok(connection) = state.database.lock() {
             let _ = connection.execute("DELETE FROM hosts WHERE id=?1", [&id]);
         }
@@ -2593,6 +2594,7 @@ fn main() {
             secret_path.set_file_name("secrets.enc");
             let secrets = KeyringSecretStore::with_fallback(SECRET_SERVICE, secret_path);
             let secret_backend = secrets.backend();
+            eprintln!("secret_backend={secret_backend}");
             app.manage(DesktopState {
                 database: Mutex::new(database),
                 secrets,

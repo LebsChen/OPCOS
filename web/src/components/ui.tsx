@@ -1,4 +1,5 @@
 import React from "react";
+import { SelectMenu as OpenWorkerSelectMenu } from "./SelectMenu";
 
 export function Icon({ name, size = 16 }: { name: string; size?: number }) {
   const paths: Record<string, string> = {
@@ -54,17 +55,12 @@ export function SelectMenu({
   options: Array<{ value: string; label: string }>;
 }) {
   return (
-    <select
-      className="select"
+    <OpenWorkerSelectMenu
       value={value}
-      onChange={(event) => onChange(event.target.value)}
-    >
-      {options.map((option) => (
-        <option value={option.value} key={option.value}>
-          {option.label}
-        </option>
-      ))}
-    </select>
+      onChange={onChange}
+      options={options}
+      ariaLabel="Select option"
+    />
   );
 }
 

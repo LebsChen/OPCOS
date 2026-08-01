@@ -4,7 +4,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import type {
   Automation,
-  CloudStatus,
   Persona,
   RecentWorkspace,
   SurfaceVisibility,
@@ -18,19 +17,12 @@ import { baseName } from "../paths";
 import { showPersonas } from "../flags";
 
 const AUTOMATIONS_CHANGED = "opcos://automations-changed";
-const CLOUD_CHANGED = "opcos://cloud-changed";
-const INBOX_UNLOCK = "opcos://inbox-unlock";
 const PERSONAS_CHANGED = "opcos://personas-changed";
 const ConnectorIcon = (_props: Record<string, unknown>) => null;
-const getCloudStatus = async () => null;
 const getAutomations = async () => [];
 const getPersonas = async () => [];
 const getSettings = async (): Promise<Record<string, any>> => ({});
 const setNavLayout = async (_layout?: string) => undefined;
-const cloudLogin = async () => undefined;
-const cloudLogout = async () => undefined;
-const waitForCloudSignIn = (_callback: (value: unknown) => void) => undefined;
-const announceCloudChanged = () => undefined;
 
 // Session surfaces shown as accordions, in display order. The surfaced personas drive this list
 // (so third-party / Ops personas appear); the hardcoded set is the fallback before personas load.
@@ -198,34 +190,7 @@ export function Sidebar(props: any) {
   };
   const [searchModalOpen, setSearchModalOpen] = useState(false);
   const [appMenuOpen, setAppMenuOpen] = useState(false);
-  // The account row (§26): cloud sign-in status drives the avatar/name/dot; refreshed on
   // focus and whenever the menu opens (sign-in completes out-of-band in the browser).
-  const [cloud, setCloud] = useState<CloudStatus | null>(null);
-  // Inbox chip sticky unlock (§26): absent until the product first parks an item (or a
-  // session first goes Unattended), then permanent. Per-device, like nav collapse.
-  const [inboxUnlocked, setInboxUnlocked] = useState(
-    () => localStorage.getItem("ocw:inbox-unlocked") === "1",
-  );
-  const refreshCloud = () =>
-    getCloudStatus()
-      .then(setCloud)
-      .catch(() => {});
-  useEffect(() => {
-    refreshCloud();
-    const onFocus = () => refreshCloud();
-    window.addEventListener("focus", onFocus);
-    window.addEventListener(CLOUD_CHANGED, onFocus);
-    const unlock = () => {
-      localStorage.setItem("ocw:inbox-unlocked", "1");
-      setInboxUnlocked(true);
-    };
-    window.addEventListener(INBOX_UNLOCK, unlock);
-    return () => {
-      window.removeEventListener("focus", onFocus);
-      window.removeEventListener(CLOUD_CHANGED, onFocus);
-      window.removeEventListener(INBOX_UNLOCK, unlock);
-    };
-  }, []);
   // UX-023: automations feed the nav row's badge + the Scheduled band. The 15s poll
   // is the baseline; mutations announce AUTOMATIONS_CHANGED for an instant refresh
   // (mark-seen must clear the badge the moment the detail opens).
@@ -407,13 +372,6 @@ export function Sidebar(props: any) {
     </button>
   );
 
-  // Display identity for the account row: the cloud profile only carries the email, so the
-  // row shows the capitalized local part ("rohit@…" → "Rohit"); the menu header shows it all.
-  const accountEmail = cloud?.signed_in ? cloud.account : "";
-  const accountName = accountEmail
-    ? accountEmail.split("@")[0].replace(/^./, (c) => c.toUpperCase())
-    : "";
-
   // Roll the per-session attention/liveness up to the persona header and the footer Inbox: the
   // accent count bubbles (sum), the liveness dot aggregates (working wins over sleeping).
   const attnByPersona = new Map<string, number>();
@@ -433,15 +391,6 @@ export function Sidebar(props: any) {
     )
       liveByPersona.set(s.agent, "sleeping");
   }
-
-  // First pending item ever observed → the inbox chip unlocks and stays (§26 sticky unlock).
-  useEffect(() => {
-    if (totalAttention > 0 && !inboxUnlocked) {
-      localStorage.setItem("ocw:inbox-unlocked", "1");
-      setInboxUnlocked(true);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [totalAttention]);
 
   // Body data is keyed to the BROWSED persona (only one body renders at a time). Pinned sessions are
   // EXCLUDED here: they live in the cross-persona Pinned band only, so they don't repeat inside the
@@ -1112,7 +1061,7 @@ export function Sidebar(props: any) {
           </button>
         )}
         <div className="brand-wordmark text-[15px]">
-          OpenWorker<span className="beta-tag">BETA</span>
+          OPCOS<span className="beta-tag">BETA</span>
         </div>
       </div>
 
@@ -1286,73 +1235,22 @@ export function Sidebar(props: any) {
               (appMenuOpen ? "bg-paper text-ink" : "hover:bg-paper")
             }
             data-testid="account-row"
-            onClick={() => {
-              if (!appMenuOpen) refreshCloud();
-              setAppMenuOpen((v) => !v);
-            }}
+            onClick={() => setAppMenuOpen((v) => !v)}
             aria-haspopup="menu"
             aria-expanded={appMenuOpen}
-            aria-label={
-              cloud?.signed_in
-                ? `Account: ${accountEmail}`
-                : "Account: not signed in"
-            }
+            aria-label="OPCOS navigation menu"
           >
             <span
               className={
                 "w-6 h-6 rounded-full grid place-items-center text-[10.5px] font-semibold shrink-0 " +
-                (cloud?.signed_in
-                  ? "bg-accentSoft text-accent"
-                  : "bg-paper text-faint border border-line")
+                "bg-accentSoft text-accent"
               }
               aria-hidden
             >
-              {cloud?.signed_in ? accountName.slice(0, 1).toUpperCase() : "?"}
+              O
             </span>
-            <span
-              className={"truncate " + (cloud?.signed_in ? "" : "text-muted")}
-            >
-              {cloud?.signed_in ? accountName : "Not signed in"}
-            </span>
-            {cloud?.signed_in && (
-              <span
-                className="w-[7px] h-[7px] rounded-full bg-ok shrink-0"
-                title="Signed in to OpenWorker Cloud"
-                aria-hidden
-              />
-            )}
+            <span className="truncate">OPCOS</span>
             <span className="flex-1" />
-            {inboxUnlocked && (
-              <span
-                className={
-                  "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11.5px] shrink-0 cursor-pointer " +
-                  (totalAttention > 0
-                    ? "bg-accentSoft text-accent font-semibold"
-                    : "text-faint hover:text-ink")
-                }
-                data-testid="inbox-chip"
-                role="button"
-                aria-label={
-                  totalAttention > 0
-                    ? `Inbox — ${totalAttention} items need you`
-                    : "Inbox"
-                }
-                title={
-                  totalAttention > 0
-                    ? `Inbox — ${totalAttention} items need you`
-                    : "Inbox"
-                }
-                onClick={(e) => {
-                  // The chip goes STRAIGHT to Inbox — the menu is the row's target, not the chip's.
-                  e.stopPropagation();
-                  setAppMenuOpen(false);
-                  props.onOpenInbox();
-                }}
-              >
-                <Icon name="inbox" size={13} />
-                {totalAttention > 0 ? totalAttention : null}
-              </span>
-            )}
             <Icon
               name="chevronDown"
               size={14}

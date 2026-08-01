@@ -157,10 +157,7 @@ impl KeyringSecretStore {
         Self::with_optional_fallback(service, Some(path.into()))
     }
 
-    fn with_optional_fallback(
-        service: impl Into<String>,
-        path: Option<PathBuf>,
-    ) -> Self {
+    fn with_optional_fallback(service: impl Into<String>, path: Option<PathBuf>) -> Self {
         let service = service.into();
         let keyring_available = keyring::Entry::new(&service, "opcos-secret-store-probe")
             .map(|entry| {
@@ -190,9 +187,9 @@ impl KeyringSecretStore {
     }
 
     fn fallback(&self) -> Result<&EncryptedFileSecretStore, StoreError> {
-        self.fallback.as_deref().ok_or_else(|| {
-            StoreError::Keyring("secure secret storage is unavailable".into())
-        })
+        self.fallback
+            .as_deref()
+            .ok_or_else(|| StoreError::Keyring("secure secret storage is unavailable".into()))
     }
 }
 
@@ -270,14 +267,16 @@ impl EncryptedFileSecretStore {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
         if bytes.len() < 16 || &bytes[..4] != b"OCS1" {
-            return Err(StoreError::Encrypted("encrypted secret file is invalid".into()));
+            return Err(StoreError::Encrypted(
+                "encrypted secret file is invalid".into(),
+            ));
         }
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes.copy_from_slice(&bytes[4..16]);
-        let key = LessSafeKey::new(
-            UnboundKey::new(&aead::AES_256_GCM, &self.key)
-                .map_err(|_| StoreError::Encrypted("secret cipher initialization failed".into()))?,
-        );
+        let key =
+            LessSafeKey::new(UnboundKey::new(&aead::AES_256_GCM, &self.key).map_err(|_| {
+                StoreError::Encrypted("secret cipher initialization failed".into())
+            })?);
         let nonce = Nonce::assume_unique_for_key(nonce_bytes);
         let plaintext = key
             .open_in_place(nonce, Aad::empty(), &mut bytes[16..])
@@ -291,10 +290,10 @@ impl EncryptedFileSecretStore {
         SystemRandom::new()
             .fill(&mut nonce_bytes)
             .map_err(|_| StoreError::Encrypted("secret nonce generation failed".into()))?;
-        let key = LessSafeKey::new(
-            UnboundKey::new(&aead::AES_256_GCM, &self.key)
-                .map_err(|_| StoreError::Encrypted("secret cipher initialization failed".into()))?,
-        );
+        let key =
+            LessSafeKey::new(UnboundKey::new(&aead::AES_256_GCM, &self.key).map_err(|_| {
+                StoreError::Encrypted("secret cipher initialization failed".into())
+            })?);
         let nonce = Nonce::assume_unique_for_key(nonce_bytes);
         key.seal_in_place_append_tag(nonce, Aad::empty(), &mut plaintext)
             .map_err(|_| StoreError::Encrypted("secret encryption failed".into()))?;
@@ -805,10 +804,7 @@ mod tests {
 
     #[test]
     fn encrypted_secret_store_round_trips_and_reports_missing_keys() {
-        let path = std::env::temp_dir().join(format!(
-            "opcos-secret-test-{}",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("opcos-secret-test-{}", std::process::id()));
         let _ = fs::remove_file(&path);
         let store = EncryptedFileSecretStore::new(path.clone());
         assert_eq!(store.get("missing").unwrap(), None);
@@ -824,6 +820,15 @@ mod tests {
         assert_eq!(reopened.get("token").unwrap().as_deref(), Some("value"));
         reopened.delete("token").unwrap();
         assert_eq!(reopened.get("token").unwrap(), None);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn keyring_backend_probe_reports_runtime_backend() {
+        let path = std::env::temp_dir().join(format!("opcos-keyring-probe-{}", std::process::id()));
+        let store = KeyringSecretStore::with_fallback("opcos-test", path.clone());
+        println!("secret_backend={}", store.backend());
+        assert!(matches!(store.backend(), "keyring" | "encrypted-file"));
         let _ = fs::remove_file(path);
     }
 }

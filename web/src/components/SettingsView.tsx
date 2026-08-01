@@ -2,6 +2,7 @@
 // the OPCOS data-layer adaptation.
 // @ts-nocheck
 import { useEffect, useState } from "react";
+import { SelectMenu } from "./SelectMenu";
 import {
   getSettings,
   getTrustedWorkspaces,
@@ -993,19 +994,16 @@ function CompactionCard() {
 
       <div className="mt-3 flex items-center gap-2.5">
         <span className="text-[13px] text-ink">Summarizer model</span>
-        <select
+        <SelectMenu
           value={cfg.compaction_model}
           data-testid="compaction-model"
-          className="px-2 py-1.5 rounded-lg border border-line bg-paper text-[13px] text-ink outline-none focus:border-accent"
-          onChange={(e) => save({ compaction_model: e.target.value })}
-        >
-          <option value="">Session&rsquo;s own model (default)</option>
-          {models.map((m) => (
-            <option key={m} value={m}>
-              {modelLabel(m)}
-            </option>
-          ))}
-        </select>
+          options={[
+            { value: "", label: "Session's own model (default)" },
+            ...models.map((m) => ({ value: m, label: modelLabel(m) })),
+          ]}
+          ariaLabel="Summarizer model"
+          onChange={(value) => save({ compaction_model: value })}
+        />
       </div>
       <div className={FIELD_HELP}>
         The summary is written by this model. The default follows whatever model

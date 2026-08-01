@@ -12,6 +12,7 @@ const markAutomationSeen = async () => undefined;
 const announceAutomationsChanged = () => undefined;
 const updateAutomation = async () => null;
 import { Icon } from "./Icon";
+import { SelectMenu } from "./SelectMenu";
 const PanelHead = ({ children }: { children: React.ReactNode }) => (
   <>{children}</>
 );
@@ -278,15 +279,16 @@ function NewAutomationForm({
         </label>
         <label className="tmpl-field">
           <span>Repeat</span>
-          <select
-            className="tmpl-input tmpl-select"
+          <SelectMenu
             value={freq}
-            onChange={(e) => setFreq(e.target.value)}
-          >
-            <option value="daily">Every day</option>
-            <option value="weekdays">Weekdays</option>
-            <option value="weekends">Weekends</option>
-          </select>
+            options={[
+              { value: "daily", label: "Every day" },
+              { value: "weekdays", label: "Weekdays" },
+              { value: "weekends", label: "Weekends" },
+            ]}
+            ariaLabel="Repeat frequency"
+            onChange={setFreq}
+          />
         </label>
       </div>
       <div className="tmpl-form-actions">
@@ -473,15 +475,16 @@ function TaskDetail({
             </label>
             <label className="tmpl-field">
               <span>Repeat</span>
-              <select
-                className="tmpl-input tmpl-select"
+              <SelectMenu
                 value={freq}
-                onChange={(e) => setFreq(e.target.value)}
-              >
-                <option value="daily">Every day</option>
-                <option value="weekdays">Weekdays</option>
-                <option value="weekends">Weekends</option>
-              </select>
+                options={[
+                  { value: "daily", label: "Every day" },
+                  { value: "weekdays", label: "Weekdays" },
+                  { value: "weekends", label: "Weekends" },
+                ]}
+                ariaLabel="Repeat frequency"
+                onChange={setFreq}
+              />
             </label>
           </div>
         ) : (
