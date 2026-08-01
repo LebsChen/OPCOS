@@ -296,7 +296,9 @@ function TurnGroup({
       .map((it) => it.callId),
   );
   const running =
-    live || (tools.some((t) => t.status === "…") && !deniedCalls.size);
+    live ||
+    (tools.some((t) => classifyStepStatus(t.status) === "running") &&
+      !deniedCalls.size);
   const [userToggle, setUserToggle] = useState<boolean | null>(null);
   const open = userToggle ?? false;
   const lastNarr = [...items]

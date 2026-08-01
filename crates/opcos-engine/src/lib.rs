@@ -33,6 +33,8 @@ pub enum EngineError {
     MaxIterations,
     #[error("approval pending for tool call {0}")]
     ApprovalPending(String),
+    #[error("approval already processed: {0}")]
+    ApprovalAlreadyProcessed(String),
 }
 
 #[async_trait]
@@ -286,10 +288,17 @@ where
             .map(|message| message.sequence)
             .ok_or_else(|| EngineError::Store("approval assistant message not found".into()))?;
         let mut calls = Vec::new();
-        let pending = self
+        let target = self
             .store
-            .load_pending(&self.session_id)
-            .map_err(|error| EngineError::Store(error.to_string()))?;
+            .take_pending(&self.session_id, call_id)
+            .map_err(|error| EngineError::Store(error.to_string()))?
+            .ok_or_else(|| EngineError::ApprovalAlreadyProcessed(call_id.to_owned()))?;
+        let mut pending = vec![target];
+        pending.extend(
+            self.store
+                .load_pending(&self.session_id)
+                .map_err(|error| EngineError::Store(error.to_string()))?,
+        );
         let active = self.track_tool_calls(
             &pending
                 .iter()
@@ -300,7 +309,7 @@ where
                 })
                 .collect::<Vec<_>>(),
         );
-        for item in pending {
+        for (index, item) in pending.into_iter().enumerate() {
             let result = if item.call_id == call_id && outcome == ApprovalOutcome::Approve {
                 self.execute_tool(&ToolCall {
                     id: item.call_id.clone(),
@@ -321,9 +330,11 @@ where
                 },
                 result,
             ));
-            self.store
-                .delete_pending(&self.session_id, &item.call_id)
-                .map_err(|error| EngineError::Store(error.to_string()))?;
+            if index > 0 {
+                self.store
+                    .delete_pending(&self.session_id, &item.call_id)
+                    .map_err(|error| EngineError::Store(error.to_string()))?;
+            }
         }
         for (call, result) in calls {
             let value = json!({"role":"tool","content":[{"type":"tool_result",
@@ -1172,11 +1183,13 @@ mod tests {
     struct BlockingTools {
         started: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[async_trait]
     impl ToolExecutor for BlockingTools {
         async fn execute(&self, _: &str, _: Value) -> Result<Value, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             self.started.notify_one();
             self.release.notified().await;
             Ok(json!("done"))
@@ -1206,12 +1219,14 @@ mod tests {
             .unwrap();
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let engine = Arc::new(TurnEngine::new(
             FakeProvider,
             store,
             Arc::new(BlockingTools {
                 started: started.clone(),
                 release: release.clone(),
+                calls: calls.clone(),
             }),
             "s",
             "/workspace",
@@ -1231,6 +1246,13 @@ mod tests {
         release.notify_one();
         task.await.unwrap().unwrap();
         assert!(engine.active_tool_call_ids().await.is_empty());
+        assert!(matches!(
+            engine
+                .resolve_approval("approved-1", ApprovalOutcome::Approve)
+                .await,
+            Err(EngineError::ApprovalAlreadyProcessed(id)) if id == "approved-1"
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

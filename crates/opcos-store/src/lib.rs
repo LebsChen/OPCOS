@@ -4,7 +4,7 @@ use ring::{
     digest,
     rand::{SecureRandom, SystemRandom},
 };
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -366,6 +366,11 @@ pub trait SessionStore {
     fn save_pending(&self, pending: &PendingRecord) -> Result<(), StoreError>;
     fn load_pending(&self, session_id: &str) -> Result<Vec<PendingRecord>, StoreError>;
     fn delete_pending(&self, session_id: &str, call_id: &str) -> Result<(), StoreError>;
+    fn take_pending(
+        &self,
+        session_id: &str,
+        call_id: &str,
+    ) -> Result<Option<PendingRecord>, StoreError>;
     fn save_compaction(&self, state: &CompactionRecord) -> Result<(), StoreError>;
     fn load_compaction(&self, session_id: &str) -> Result<Option<CompactionRecord>, StoreError>;
     fn save_grant(&self, grant: &GrantRecord) -> Result<(), StoreError>;
@@ -1144,6 +1149,46 @@ impl SessionStore for SqliteStore {
                 params![session_id, call_id],
             )?;
         Ok(())
+    }
+
+    fn take_pending(
+        &self,
+        session_id: &str,
+        call_id: &str,
+    ) -> Result<Option<PendingRecord>, StoreError> {
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction()?;
+        let pending = transaction
+            .query_row(
+                "SELECT session_id,call_id,tool,arguments,state
+                 FROM pending WHERE session_id=?1 AND call_id=?2",
+                params![session_id, call_id],
+                |row| {
+                    let arguments: String = row.get(3)?;
+                    Ok(PendingRecord {
+                        session_id: row.get(0)?,
+                        call_id: row.get(1)?,
+                        tool: row.get(2)?,
+                        arguments: serde_json::from_str(&arguments).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                3,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?,
+                        state: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        if pending.is_some() {
+            transaction.execute(
+                "DELETE FROM pending WHERE session_id=?1 AND call_id=?2",
+                params![session_id, call_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(pending)
     }
 
     fn save_compaction(&self, state: &CompactionRecord) -> Result<(), StoreError> {

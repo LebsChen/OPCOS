@@ -1575,6 +1575,7 @@ async fn resolve_approval(
             emit(&app, "turn_done", Some(&session_id), json!({}));
             Ok(())
         }
+        Err(opcos_engine::EngineError::ApprovalAlreadyProcessed(_)) => Ok(()),
         Err(error) => Err(engine_error_message(error)),
     }
 }
