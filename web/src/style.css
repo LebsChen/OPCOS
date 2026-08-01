@@ -720,7 +720,22 @@ h3 {
 }
 .session-icon-rail {
   scrollbar-width: none;
-  overflow-y: auto;
+  overflow-y: hidden;
+}
+.session-right-panel:not(.drawer-collapsed) {
+  display: block;
+}
+.session-right-panel:not(.drawer-collapsed) .session-panel-drawer {
+  width: calc(100% - 44px);
+  margin-right: 44px;
+}
+.session-right-panel:not(.drawer-collapsed) .session-icon-rail {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 44px;
+  min-width: 44px;
 }
 .session-right-panel.drawer-collapsed .session-icon-rail {
   position: absolute;
