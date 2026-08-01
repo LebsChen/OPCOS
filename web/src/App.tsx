@@ -2969,6 +2969,14 @@ function SessionRightPanel({
     { id: "browser", label: "Browser", icon: "grid" },
   ];
   const tabs = [...informationTabs, ...workspaceTabs, ...remoteTabs];
+  const workspaceTabIds: PanelTab[] = [
+    "review",
+    "terminal",
+    "desktop",
+    "ide",
+    "browser",
+  ];
+  const isWorkspaceTab = workspaceTabIds.includes(panelTab);
   const openTab = (id: PanelTab) => {
     if (!collapsed && panelTab === id) {
       onCollapsedChange?.(true);
@@ -3002,14 +3010,16 @@ function SessionRightPanel({
             </strong>
             {running && <span className="live-pill">Live</span>}
             <div className="drawer-actions">
-              <button
-                className="drawer-action"
-                title="在独立窗口打开"
-                aria-label="在独立窗口打开"
-                onClick={() => void openStandalonePane().catch(onError)}
-              >
-                <Icon name="panelOpen" />
-              </button>
+              {isWorkspaceTab && (
+                <button
+                  className="drawer-action"
+                  title="放大（独立窗口打开）"
+                  aria-label="放大（独立窗口打开）"
+                  onClick={() => void openStandalonePane().catch(onError)}
+                >
+                  <Icon name="windowOpen" />
+                </button>
+              )}
               <button
                 className="drawer-action"
                 title={translate("Collapse session panel")}

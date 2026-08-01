@@ -32,6 +32,7 @@ export type IconName =
   | "refresh"
   | "panelClose"
   | "panelOpen"
+  | "windowOpen"
   | "plug"
   | "audit"
   | "chevronRight"
@@ -340,6 +341,13 @@ export function Icon({
         <svg {...s}>
           <rect x="4" y="5" width="16" height="14" rx="2" />
           <path d="M9.5 5v14M16 10l-3 2 3 2" />
+        </svg>
+      );
+    case "windowOpen":
+      return (
+        <svg {...s} strokeWidth={2}>
+          <rect x="8" y="8" width="11" height="11" rx="2" />
+          <path d="M5 15.5H4.8A1.8 1.8 0 0 1 3 13.7V4.8A1.8 1.8 0 0 1 4.8 3h8.9A1.8 1.8 0 0 1 15.5 4.8V5" />
         </svg>
       );
     case "plug":
