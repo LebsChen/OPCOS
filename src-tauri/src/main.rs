@@ -441,8 +441,11 @@ fn session_for(state: &DesktopState, session_id: &str) -> Result<SessionRecord, 
 }
 
 fn session_status_payload(state: &DesktopState, session_id: &str) -> Value {
-    state
-        .store
+    session_status_payload_from_store(&state.store, session_id)
+}
+
+fn session_status_payload_from_store(store: &SqliteStore, session_id: &str) -> Value {
+    store
         .load_session(session_id)
         .ok()
         .flatten()
@@ -452,7 +455,7 @@ fn session_status_payload(state: &DesktopState, session_id: &str) -> Value {
                 "stop_reason": session.stop_reason,
             })
         })
-        .unwrap_or_else(|| json!({"run_state":"error","stop_reason":"provider_error"}))
+        .unwrap_or_else(|| json!({"run_state":"error","stop_reason":"internal_error"}))
 }
 
 fn session_host_id(state: &DesktopState, session_id: &str) -> Result<String, String> {
@@ -1581,17 +1584,7 @@ async fn steering(
     let store = Arc::clone(&state.store);
     tauri::async_runtime::spawn(async move {
         let _ = completion.await;
-        let payload = store
-            .load_session(&session)
-            .ok()
-            .flatten()
-            .map(|session| {
-                json!({
-                    "run_state": session.run_state,
-                    "stop_reason": session.stop_reason,
-                })
-            })
-            .unwrap_or_else(|| json!({"run_state":"error","stop_reason":"provider_error"}));
+        let payload = session_status_payload_from_store(&store, &session);
         emit(&handle, "turn_done", Some(&session), payload);
     });
     Ok(())
