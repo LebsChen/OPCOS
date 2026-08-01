@@ -23,6 +23,7 @@
 - 改：`opcos-engine`、`opcos-store`、`web/src`
 - 做：`run_state`（`idle|running|interrupted|error`）× `stop_reason`（见 [03](03-lifecycle.md) 3.2），持久化原始枚举；UI 用 `stop_reason` 区分「等你回话 / 等审批 / 跑完了 / 主机不可用」。
 - 验收：四种 `stop_reason` 各能在 UI 上被区分出来；`host_unavailable` 不被显示成「已完成」。
+- grok-build 参照：采用 actor command/event、snapshot、turn capture、dangling-tool 修复与 request-hash replay 的边界；不引入第三套状态词汇，仍以本节二维状态为唯一 UI 契约。［GB码］［推断］
 
 ### P0-3 Host trait 与本机 host
 
@@ -46,11 +47,13 @@
 
 - 做：五套资产收敛到 `config_object` + 不可变 `config_object_version`（[06](06-capability-model.md)、[01](01-data-model.md)）；UI 仍保留五个入口但走同一套组件；技能改「先给清单、命中再读全文」。
 - 验收：编辑资产产生新版本、旧版本可回滚；30 个技能时上下文不膨胀（只注入清单）。
+- grok-build 参照：采用 optional patch precedence、managed ownership、validation report 与 atomic write。［GB码］［推断］
 
 ### P1-2 MCP client 完整化
 
 - 做：global（`~/.config/opcos/mcp.json`）与 workspace（`<ws>/.opcos/mcp.json`）配置层叠、同名 workspace 覆盖 global；transport `stdio` / `http` / `streamable-http` / `sse`；OAuth token 进 SecretStore **不写配置文件**；tool discovery + 逐 tool 审批（[05](05-mcp.md)）。
 - 验收：接入一个真实 MCP server，工具可发现、可逐个审批；配置文件中无任何 token。
+- grok-build 参照：加入 typed init progress、liveness、server diff refresh、OAuth 跨进程/进程内去重；credential 仍只进 OPCOS SecretStore。［GB码］［推断］
 
 ### P1-3 生命周期阶段与 pre-push 门禁
 
@@ -74,8 +77,8 @@
 - **P2-1 Harness 可插拔**：`opcos-harness`，内置 + Claude Code / Codex / OpenCode 子进程，统一事件流（参照 Tembo 的 6 种 harness）。
 - **P2-2 自动化三类触发**：定时（已有）+ 出站事件轮询（GitHub / Linear / Sentry）+ webhook（需 relay，见 P3）。payload 以结构化 event context 传入，不压成一句 prompt。
 - **P2-3 连接器框架**：适配器接口 + OAuth（手工 token 路径永远保留）+ token 只进 SecretStore。先做一个真集成，不做空壳。
-- **P2-4 插件打包**：`plugin` / `plugin_member`，支持从 GitHub 仓库导入导出；MCP server URL 只能来自插件自己的配置对象。
-- **P2-5 仓库索引与语义检索**：`opcos-context`，知识按触发条件注入（对标 Devin DeepWiki）。
+- **P2-4 插件打包**：`plugin` / `plugin_member`，支持从 GitHub 仓库导入导出；MCP server URL 只能来自插件自己的配置对象。grok-build 参照 marketplace relative path containment、transactional install/update、source/scan 类型边界。［GB码］［推断］
+- **P2-5 仓库索引与语义检索**：`opcos-context`，知识按触发条件注入（对标 Devin DeepWiki）。grok-build 参照先做增量 file-event/index-manager/scope-graph，再做 embedding、query expansion 和 memory archive。［GB码］［推断］
 
 ## P3 —— OPCOS Cloud（可完全关闭）
 
