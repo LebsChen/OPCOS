@@ -143,6 +143,24 @@ describe("OPCOS transcript folding", () => {
     expect(items[0]).toMatchObject({
       callId: "call-danger",
       status: "ok",
+      resolved: "allow",
+    });
+  });
+
+  it("keeps a denied approval as a resolved historical item", () => {
+    let items = reduceStreamEvent([], {
+      kind: "approval",
+      payload: { call_id: "call-denied", tool: "write_file", arguments: {} },
+    });
+    items = reduceStreamEvent(items, {
+      kind: "approval_resolved",
+      payload: { call_id: "call-denied", approve: false },
+    });
+    expect(items[0]).toMatchObject({
+      callId: "call-denied",
+      status: "error",
+      resolved: "deny",
+      approval: false,
     });
   });
 });

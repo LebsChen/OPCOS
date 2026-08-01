@@ -35,7 +35,7 @@ const FILE_WRITES = new Set([
   "apply_patch",
   "apply_unified_diff",
 ]);
-// Actions that leave the Mac get the warm border + explicit destination note.
+// Actions that leave the bound remote host get the warm border + destination note.
 const EXTERNAL = new Set(["send_message", "send_file"]);
 
 type ApprovalItem = Extract<Item, { kind: "approval" }>;
@@ -88,14 +88,14 @@ export function scopeNote(
       telegram: "Telegram",
     };
     return {
-      text: `leaves this Mac → ${names[platform] || platform || "a connected chat"}`,
+      text: `leaves the remote host → ${names[platform] || platform || "a connected chat"}`,
       external: true,
     };
   }
   const overwrite = name === "write_file" && args?.overwrite;
   return {
     text:
-      "stays on this Mac" +
+      "runs on the bound remote host" +
       (overwrite ? " · overwrites the existing file" : ""),
     external: false,
   };
@@ -167,44 +167,14 @@ function Buttons({
   runTask?: { id: string; title: string } | null;
   primaryLabel: string;
 }) {
-  const connector = item.category === "connector";
-  const offerStanding = !!(runTask && item.standingTarget);
   return (
     <div className="approval-btns">
       <button
         className="btn approval-primary"
-        onClick={() => onApprove("once")}
+        onClick={() => onApprove("allow")}
       >
         {primaryLabel}
       </button>
-      {offerStanding && (
-        <button
-          className="btn"
-          title={`Always allow ${item.name} → ${item.standingTarget} for “${runTask?.title || "this automation"}” — revoke any time on its Automations page`}
-          onClick={() => onApprove("always_task")}
-        >
-          Allow every time
-        </button>
-      )}
-      {/* In a run context the task-persistent grant replaces the session-scoped one —
-          a run session is ephemeral, and two adjacent "always" buttons would blur
-          exactly the scope distinction §25 exists to draw. Same rule for run_shell:
-          the command-scoped button below is the specific (safer) grant, so the
-          tool-wide one stays out of the card. */}
-      {!connector && !offerStanding && item.name !== "run_shell" && (
-        <button
-          className="btn"
-          title={`Always allow ${TOOL_VERBS[item.name]?.toLowerCase() || item.name} for this session`}
-          onClick={() => onApprove("always_tool")}
-        >
-          Always allow
-        </button>
-      )}
-      {item.name === "run_shell" && (
-        <button className="btn" onClick={() => onApprove("always_command")}>
-          Always allow this command
-        </button>
-      )}
       <span className="spacer" />
       <button className="btn quiet-deny" onClick={() => onApprove("deny")}>
         Deny

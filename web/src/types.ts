@@ -68,8 +68,7 @@ export type SurfaceVisibility = Record<string, boolean>;
 
 // "always_task" persists to the owning automation's task record (standing scoped
 // approval, UX-DECISIONS §25) — offered only on automation-run approval cards, in-app.
-export type ApprovalDecision =
-  "once" | "deny" | "always_tool" | "always_command" | "always_task";
+export type ApprovalDecision = "allow" | "deny";
 
 export interface TodoItem {
   content: string;

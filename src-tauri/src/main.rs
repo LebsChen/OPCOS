@@ -630,6 +630,7 @@ async fn serve_ide_proxy(listener: TcpListener, state: IdeProxyState) {
     let router = Router::new()
         .route("/", any(ide_root))
         .route("/ide/", any(ide_document))
+        .route("/static/{*path}", any(ide_asset))
         .route("/out/{*path}", any(ide_asset))
         .route("/resources/{*path}", any(ide_asset))
         .route("/extensions/{*path}", any(ide_asset))
@@ -1345,7 +1346,7 @@ async fn resolve_approval(
     approve: bool,
 ) -> Result<(), String> {
     let engine = engine_for(&app, &state, &session_id).await?;
-    engine
+    let result = engine
         .resolve_approval(
             &call_id,
             if approve {
@@ -1355,15 +1356,48 @@ async fn resolve_approval(
             },
         )
         .await
-        .map(|_| ())
-        .map_err(engine_error_message)?;
+        .map(|_| ());
     emit(
         &app,
         "approval_resolved",
         Some(&session_id),
         json!({"call_id":call_id,"approve":approve}),
     );
-    Ok(())
+    match result {
+        Ok(()) => {
+            emit(&app, "turn_done", Some(&session_id), json!({}));
+            Ok(())
+        }
+        Err(opcos_engine::EngineError::ApprovalPending(next_call_id)) => {
+            if let Some(pending) = state
+                .store
+                .load_pending(&session_id)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|item| item.call_id == next_call_id)
+            {
+                emit(
+                    &app,
+                    "approval",
+                    Some(&session_id),
+                    json!({
+                        "call_id": pending.call_id,
+                        "tool": pending.tool,
+                        "arguments": redact_approval_value(&pending.arguments),
+                    }),
+                );
+            }
+            emit(
+                &app,
+                "notice",
+                Some(&session_id),
+                json!({"kind":"approval_pending"}),
+            );
+            emit(&app, "turn_done", Some(&session_id), json!({}));
+            Ok(())
+        }
+        Err(error) => Err(engine_error_message(error)),
+    }
 }
 
 #[tauri::command]

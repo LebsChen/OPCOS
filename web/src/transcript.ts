@@ -4,6 +4,7 @@ export type TranscriptKind =
   "user" | "assistant" | "thinking" | "tool" | "notice" | "approval";
 
 export type ToolState = "running" | "ok" | "error" | "pending";
+export type ApprovalResolution = "allow" | "deny";
 
 export type TranscriptViewItem = {
   id: string;
@@ -17,6 +18,7 @@ export type TranscriptViewItem = {
   status?: ToolState;
   noticeKind?: string;
   approval?: boolean;
+  resolved?: ApprovalResolution;
 };
 
 type RawItem = { kind: string; payload: Record<string, unknown> };
@@ -220,6 +222,7 @@ export function reduceStreamEvent(
               ...item,
               status: payload.approve === true ? "ok" : "error",
               approval: false,
+              resolved: payload.approve === true ? "allow" : "deny",
             }
           : item,
       );
@@ -327,6 +330,16 @@ export function reduceStreamEvent(
     calls.forEach((call, index) => {
       const callId =
         typeof call.id === "string" ? call.id : `call-${next.length}-${index}`;
+      const existing = next.find(
+        (item) => item.kind === "tool" && item.callId === callId,
+      );
+      if (existing && existing.kind === "tool") {
+        existing.toolName =
+          typeof call.name === "string" ? call.name : existing.toolName;
+        existing.arguments = call.arguments;
+        existing.status = "ok";
+        return;
+      }
       next.push({
         id: stableId("tool", next.length, callId),
         kind: "tool",
@@ -337,6 +350,14 @@ export function reduceStreamEvent(
         approval: true,
       });
     });
+    const steeringIndex = next.findIndex(
+      (item) => item.kind === "user" && item.id.startsWith("event:steering:"),
+    );
+    if (steeringIndex >= 0) {
+      const [steering] = next.splice(steeringIndex, 1);
+      const assistantIndex = next.indexOf(assistant);
+      next.splice(assistantIndex, 0, steering);
+    }
   }
   return next;
 }

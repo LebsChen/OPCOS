@@ -177,8 +177,8 @@ function SurfaceView({
     terminal.open(terminalHost.current);
     const socket = new WebSocket(`ws://127.0.0.1:${port}`);
     socket.binaryType = "arraybuffer";
-    const pending: string[] = [];
-    const send = (data: string) => {
+    const pending: Array<string | Uint8Array> = [];
+    const send = (data: string | Uint8Array) => {
       if (socket.readyState === WebSocket.OPEN) socket.send(data);
       else pending.push(data);
     };
@@ -191,7 +191,8 @@ function SurfaceView({
           ? event.data
           : new Uint8Array(event.data as ArrayBuffer),
       );
-    const input = terminal.onData(send);
+    const encoder = new TextEncoder();
+    const input = terminal.onData((data) => send(encoder.encode(data)));
     terminal.onResize(({ cols, rows }) =>
       send(JSON.stringify({ type: "resize", cols, rows })),
     );
@@ -2393,10 +2394,12 @@ function SessionRightPanel({
   selected,
   onError,
   running,
+  onCollapsedChange,
 }: {
   selected: Session;
   onError: (error: unknown) => void;
   running: boolean;
+  onCollapsedChange?: (collapsed: boolean) => void;
 }) {
   const [panelTab, setPanelTab] = useState<
     | "info"
@@ -2429,7 +2432,10 @@ function SessionRightPanel({
         <button
           className="rail-toggle"
           title={translate("Expand session panel")}
-          onClick={() => setCollapsed(false)}
+          onClick={() => {
+            setCollapsed(false);
+            onCollapsedChange?.(false);
+          }}
         >
           <Icon name="sidebarRight" />
         </button>
@@ -2452,7 +2458,10 @@ function SessionRightPanel({
         <button
           className="panel-collapse"
           title={translate("Collapse session panel")}
-          onClick={() => setCollapsed(true)}
+          onClick={() => {
+            setCollapsed(true);
+            onCollapsedChange?.(true);
+          }}
         >
           <Icon name="sidebarRight" />
         </button>
@@ -2536,6 +2545,7 @@ function AppContent() {
   const [query, setQuery] = useState("");
   const [error, setError] = useState("");
   const [running, setRunning] = useState(false);
+  const [rightPanelCollapsed, setRightPanelCollapsed] = useState(false);
   const [modal, setModal] = useState(false);
   const [hostName, setHostName] = useState("");
   const [hostUrl, setHostUrl] = useState("");
@@ -2736,13 +2746,14 @@ function AppContent() {
           text: "",
           reasoning: item.reasoning || item.text || "",
         });
-      if (item.kind === "tool" && item.approval)
+      if (item.kind === "tool" && (item.approval || item.resolved))
         output.push({
           kind: "approval",
           callId: item.callId,
           name: item.toolName || "approval",
           args: item.arguments,
           reason: item.text || "Tool action requires approval",
+          resolved: item.resolved,
         });
       else if (item.kind === "tool")
         output.push({
@@ -2760,7 +2771,7 @@ function AppContent() {
           name: item.toolName || "approval",
           args: item.arguments,
           reason: item.text || "",
-          resolved: item.status === "ok" ? "once" : undefined,
+          resolved: item.status === "ok" ? "allow" : undefined,
         });
       if (item.kind === "notice")
         output.push({
@@ -2816,7 +2827,7 @@ function AppContent() {
   ];
   return (
     <div
-      className={`app ${surface === "session" ? "session-layout" : "surface-layout"}`}
+      className={`app ${surface === "session" ? "session-layout" : "surface-layout"}${rightPanelCollapsed ? " right-panel-collapsed" : ""}`}
     >
       <Sidebar
         hosts={hosts}
@@ -2988,7 +2999,7 @@ function AppContent() {
                       void command("resolve_approval", {
                         sessionId: selected.id,
                         callId: item.callId,
-                        approve: decision === "once",
+                        approve: decision === "allow",
                       }).catch(onError);
                     }}
                   />
@@ -3071,6 +3082,7 @@ function AppContent() {
           selected={selected}
           running={running}
           onError={onError}
+          onCollapsedChange={setRightPanelCollapsed}
         />
       )}
       {modal && (
