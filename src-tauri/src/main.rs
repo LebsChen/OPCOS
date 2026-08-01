@@ -1395,6 +1395,18 @@ async fn submit_turn(
         let _ = state
             .store
             .update_session_status(&request.session_id, "error", "host_unavailable");
+        emit(
+            &app,
+            "notice",
+            Some(&request.session_id),
+            json!({"kind":"error","text":"Remote host unavailable"}),
+        );
+        emit(
+            &app,
+            "turn_done",
+            Some(&request.session_id),
+            session_status_payload(&state, &request.session_id),
+        );
         return Err(format!("remote host unavailable: {error}"));
     }
     let engine = engine_for(&app, &state, &request.session_id).await?;

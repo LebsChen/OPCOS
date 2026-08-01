@@ -88,6 +88,7 @@ pub struct TurnEngine<P, S, E> {
     system_instructions: Mutex<Option<String>>,
     external_tools: Mutex<Vec<Value>>,
     active_tool_calls: StdMutex<HashSet<String>>,
+    policy_denied: AtomicBool,
 }
 
 struct ActiveToolCallGuard<'a> {
@@ -146,6 +147,7 @@ where
             system_instructions: Mutex::new(None),
             external_tools: Mutex::new(Vec::new()),
             active_tool_calls: StdMutex::new(HashSet::new()),
+            policy_denied: AtomicBool::new(false),
         }
     }
 
@@ -159,6 +161,7 @@ where
 
     pub async fn submit_text(&self, text: impl Into<String>) -> Result<AssistantTurn, EngineError> {
         self.interrupted.store(false, Ordering::SeqCst);
+        self.policy_denied.store(false, Ordering::SeqCst);
         self.set_session_status("running", "none");
         let value = json!({"role":"user","content":[{"type":"text","text":text.into()}]});
         let result = async {
@@ -172,6 +175,7 @@ where
 
     pub async fn retry(&self) -> Result<AssistantTurn, EngineError> {
         self.interrupted.store(false, Ordering::SeqCst);
+        self.policy_denied.store(false, Ordering::SeqCst);
         self.set_session_status("running", "none");
         let result = self.run_loop(self.provider_messages()?).await;
         self.set_status_after_turn(&result);
@@ -180,6 +184,7 @@ where
 
     pub async fn resume_pending_turn(&self) -> Result<Option<AssistantTurn>, EngineError> {
         self.set_session_status("running", "none");
+        self.policy_denied.store(false, Ordering::SeqCst);
         let messages = self
             .store
             .load_resume_messages(&self.session_id)
@@ -257,7 +262,23 @@ where
     fn set_status_after_turn<T>(&self, result: &Result<T, EngineError>) {
         let (run_state, stop_reason) = match result {
             Ok(_) => ("idle", "finished"),
-            Err(EngineError::ApprovalPending(_)) => ("idle", "waiting_for_approval"),
+            Err(EngineError::ApprovalPending(call_id)) => {
+                let waiting_for_user = self
+                    .store
+                    .load_pending(&self.session_id)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .any(|pending| pending.call_id == *call_id && pending.tool == "ask_user");
+                (
+                    "idle",
+                    if waiting_for_user {
+                        "waiting_for_user"
+                    } else {
+                        "waiting_for_approval"
+                    },
+                )
+            }
             Err(EngineError::Interrupted) => ("interrupted", "interrupted_by_user"),
             Err(EngineError::Provider(_)) => ("error", "provider_error"),
             Err(EngineError::Store(message)) if message.contains("compact") => {
@@ -268,6 +289,10 @@ where
             }
             Err(EngineError::ApprovalAlreadyProcessed(_)) => ("idle", "waiting_for_approval"),
         };
+        if self.policy_denied.load(Ordering::SeqCst) {
+            self.set_session_status("idle", "policy_denied");
+            return;
+        }
         self.set_session_status(run_state, stop_reason);
     }
 
@@ -678,6 +703,7 @@ where
                     results[index] = Some(self.execute_tool(call).await);
                 }
                 Decision::Deny => {
+                    self.policy_denied.store(true, Ordering::SeqCst);
                     results[index] = Some(json!({"error":"tool call denied by policy"}))
                 }
                 Decision::NeedsUser => {

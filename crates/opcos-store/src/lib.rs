@@ -1357,6 +1357,40 @@ mod tests {
     }
 
     #[test]
+    fn session_status_round_trips_as_raw_values() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let now = Utc::now();
+        store
+            .save_session(&SessionRecord {
+                session_id: "status-session".into(),
+                workspace: "/workspace".into(),
+                model: "test".into(),
+                mode: "Interactive".into(),
+                title: "Status".into(),
+                extra_roots: vec![],
+                grants: serde_json::json!({}),
+                pinned: false,
+                archived: false,
+                origin: None,
+                origin_label: None,
+                compaction: serde_json::json!({}),
+                host_id: "host".into(),
+                provider: None,
+                run_state: "future_run_state".into(),
+                stop_reason: "future_stop_reason".into(),
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        store
+            .update_session_status("status-session", "error", "host_unavailable")
+            .unwrap();
+        let session = store.load_session("status-session").unwrap().unwrap();
+        assert_eq!(session.run_state, "error");
+        assert_eq!(session.stop_reason, "host_unavailable");
+    }
+
+    #[test]
     fn legacy_desktop_migration_is_idempotent() {
         let path = std::env::temp_dir().join(format!(
             "opcos-store-migration-{}-{}.db",
