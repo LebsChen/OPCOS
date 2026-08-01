@@ -80,6 +80,126 @@ type Coordination = {
   messages: Array<Record<string, unknown>>;
 };
 
+type RailIconName =
+  | "info"
+  | "branch"
+  | "list"
+  | "sparkle"
+  | "diff"
+  | "terminal"
+  | "monitor"
+  | "code"
+  | "grid"
+  | "globe";
+
+function RailIcon({
+  name,
+  size = 16,
+  className,
+}: {
+  name: RailIconName;
+  size?: number;
+  className?: string;
+}) {
+  const s = {
+    width: size,
+    height: size,
+    viewBox: "0 0 24 24",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 2,
+    strokeLinecap: "round" as const,
+    strokeLinejoin: "round" as const,
+    className,
+    "aria-hidden": true,
+  };
+
+  switch (name) {
+    case "info":
+      return (
+        <svg {...s}>
+          <circle cx="12" cy="12" r="10" />
+          <line x1="12" y1="16" x2="12" y2="12" />
+          <line x1="12" y1="8" x2="12.01" y2="8" />
+        </svg>
+      );
+    case "branch":
+      return (
+        <svg {...s}>
+          <line x1="6" y1="3" x2="6" y2="15" />
+          <circle cx="18" cy="6" r="3" />
+          <circle cx="6" cy="18" r="3" />
+          <path d="M18 9a9 9 0 0 1-9 9" />
+        </svg>
+      );
+    case "list":
+      return (
+        <svg {...s}>
+          <line x1="8" y1="6" x2="21" y2="6" />
+          <line x1="8" y1="12" x2="21" y2="12" />
+          <line x1="8" y1="18" x2="21" y2="18" />
+          <line x1="3" y1="6" x2="3.01" y2="6" />
+          <line x1="3" y1="12" x2="3.01" y2="12" />
+          <line x1="3" y1="18" x2="3.01" y2="18" />
+        </svg>
+      );
+    case "sparkle":
+      return (
+        <svg {...s}>
+          <path d="M12 3l1.9 5.7a2 2 0 0 0 1.3 1.3L21 12l-5.8 1.9a2 2 0 0 0-1.3 1.3L12 21l-1.9-5.8a2 2 0 0 0-1.3-1.3L3 12l5.8-1.9a2 2 0 0 0 1.3-1.3z" />
+        </svg>
+      );
+    case "diff":
+      return (
+        <svg {...s}>
+          <line x1="12" y1="3" x2="12" y2="9" />
+          <line x1="9" y1="6" x2="15" y2="6" />
+          <line x1="9" y1="18" x2="15" y2="18" />
+          <line x1="4" y1="12" x2="20" y2="12" />
+        </svg>
+      );
+    case "terminal":
+      return (
+        <svg {...s}>
+          <polyline points="4 17 10 11 4 5" />
+          <line x1="12" y1="19" x2="20" y2="19" />
+        </svg>
+      );
+    case "monitor":
+      return (
+        <svg {...s}>
+          <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
+          <line x1="8" y1="21" x2="16" y2="21" />
+          <line x1="12" y1="17" x2="12" y2="21" />
+        </svg>
+      );
+    case "code":
+      return (
+        <svg {...s}>
+          <polyline points="16 18 22 12 16 6" />
+          <polyline points="8 6 2 12 8 18" />
+        </svg>
+      );
+    case "grid":
+      return (
+        <svg {...s}>
+          <rect x="3" y="3" width="7" height="7" />
+          <rect x="14" y="3" width="7" height="7" />
+          <rect x="14" y="14" width="7" height="7" />
+          <rect x="3" y="14" width="7" height="7" />
+        </svg>
+      );
+    case "globe":
+      return (
+        <svg {...s}>
+          <circle cx="12" cy="12" r="10" />
+          <line x1="2" y1="12" x2="22" y2="12" />
+          <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
+        </svg>
+      );
+  }
+}
+
 async function command<T>(
   name: string,
   args?: Record<string, unknown>,
@@ -2826,27 +2946,27 @@ function SessionRightPanel({
   const informationTabs: Array<{
     id: typeof panelTab;
     label: string;
-    icon: Parameters<typeof Icon>[0]["name"];
+    icon: RailIconName;
   }> = [
     { id: "info", label: "Info", icon: "info" },
     { id: "pr", label: "PR", icon: "branch" },
-    { id: "worklog", label: "Worklog", icon: "clock" },
+    { id: "worklog", label: "Worklog", icon: "list" },
     { id: "insights", label: "Insights", icon: "sparkle" },
   ];
   const workspaceTabs: Array<{
     id: typeof panelTab;
     label: string;
-    icon: Parameters<typeof Icon>[0]["name"];
+    icon: RailIconName;
   }> = [{ id: "review", label: "Diff", icon: "diff" }];
   const remoteTabs: Array<{
     id: typeof panelTab;
     label: string;
-    icon: Parameters<typeof Icon>[0]["name"];
+    icon: RailIconName;
   }> = [
     { id: "terminal", label: "Shell", icon: "terminal" },
     { id: "desktop", label: "Desktop", icon: "monitor" },
     { id: "ide", label: "Web IDE", icon: "code" },
-    { id: "browser", label: "Browser", icon: "globe" },
+    { id: "browser", label: "Browser", icon: "grid" },
   ];
   const tabs = [...informationTabs, ...workspaceTabs, ...remoteTabs];
   if (collapsed) {
@@ -3038,7 +3158,7 @@ function SessionRightPanel({
               title={item.label}
               onClick={() => openTab(item.id)}
             >
-              <Icon name={item.icon} />
+              <RailIcon name={item.icon} />
             </button>
           ))}
         </div>
@@ -3051,7 +3171,7 @@ function SessionRightPanel({
               title={item.label}
               onClick={() => openTab(item.id)}
             >
-              <Icon name={item.icon} />
+              <RailIcon name={item.icon} />
             </button>
           ))}
         </div>
@@ -3064,7 +3184,7 @@ function SessionRightPanel({
               title={item.label}
               onClick={() => openTab(item.id)}
             >
-              <Icon name={item.icon} />
+              <RailIcon name={item.icon} />
             </button>
           ))}
         </div>

@@ -733,12 +733,12 @@ h3 {
   transition: all 0.2s;
 }
 .rail-btn:hover {
-  background: var(--paper);
+  background: rgba(13, 13, 13, 0.08);
   color: var(--color-accent);
 }
 .rail-btn.active {
-  background: var(--color-selected);
-  color: var(--color-ink);
+  background: var(--selected);
+  color: var(--fg);
 }
 .rail-group {
   display: flex;
@@ -752,11 +752,15 @@ h3 {
   border-top: 1px solid var(--color-line);
 }
 .session-panel-resizer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  bottom: 0;
   width: 5px;
-  margin-left: -2px;
   cursor: col-resize;
   z-index: 2;
-  border-left: 1px solid var(--color-line);
+  border-right: 1px solid var(--color-line);
+  background: transparent;
 }
 .session-panel-resizer:hover {
   background: var(--color-accent-soft);
