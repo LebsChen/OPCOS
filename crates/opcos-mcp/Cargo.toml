@@ -1,0 +1,12 @@
+[package]
+name = "opcos-mcp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+opcos-rvm = { path = "../opcos-rvm" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

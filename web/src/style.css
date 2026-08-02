@@ -1,0 +1,21 @@
+:root {
+  font-family: system-ui, sans-serif;
+  color: #e8e8e8;
+  background: #181818;
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  max-width: 720px;
+  margin: 20vh auto;
+  padding: 2rem;
+}
+
+output {
+  display: block;
+  margin-top: 2rem;
+  color: #9fe3a1;
+}

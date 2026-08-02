@@ -1,0 +1,14 @@
+[package]
+name = "opcos-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+opcos-policy = { path = "../opcos-policy" }
+opcos-provider = { path = "../opcos-provider" }
+opcos-store = { path = "../opcos-store" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
