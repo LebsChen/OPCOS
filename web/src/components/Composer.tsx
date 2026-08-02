@@ -54,6 +54,10 @@ const getDictationStatus = async (): Promise<DictationStatus | null> => null;
 const startDictation = async (): Promise<DictationStatus | null> => null;
 const stopDictation = async (): Promise<string | null> => null;
 
+// Visual source: OpenWorker surfaces/gui/src/components/Composer.tsx:1-813.
+// OPCOS keeps the composer shell, controls, and class names and adapts only
+// invoke-backed session actions, harness selection, assets, and attachments.
+
 // Plan + Custom hidden for this release (owner ask 2026-07-22): Plan's approval flow isn't
 // polished enough to ship, and Custom (config.toml auto-allow rules) is a power-user mode
 // with no in-app explanation. The server still honors both — a session already in one of

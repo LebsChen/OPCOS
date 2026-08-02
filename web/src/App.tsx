@@ -926,6 +926,9 @@ function ManageSections({
   hostToken: string;
   setHostToken: (value: string) => void;
 }) {
+  // Body shell follows OpenWorker SettingsView.tsx:85-123. Asset-specific
+  // rows use the existing CollectionPage/manage-row vocabulary because these
+  // OPCOS configuration objects have no one-to-one reference component.
   const [provider, setProvider] = useState("openai");
   const [baseUrl, setBaseUrl] = useState("");
   const [key, setKey] = useState("");
@@ -1104,7 +1107,7 @@ function ManageSections({
     ).then((entries) => setProviderModelOptions(Object.fromEntries(entries)));
   }, [providers]);
   return (
-    <section>
+    <section className="settings-body">
       <header className="mb-5">
         <h1 className="text-[22px] font-semibold text-ink">
           {sectionCopy[tab][0]}
@@ -2777,6 +2780,9 @@ function Activity({
   selected: Session | null;
   onError: (error: unknown) => void;
 }) {
+  // Activity shell follows OpenWorker AuditView.tsx:20-64 and Cloud-Dev
+  // RemotePanes.tsx:496-526 for timeline vocabulary; coordination controls
+  // and durable command adapters are OPCOS-specific.
   const [taskId, setTaskId] = useState("");
   const [board, setBoard] = useState<Coordination | null>(null);
   const [roleId, setRoleId] = useState("");
@@ -2803,7 +2809,7 @@ function Activity({
       .then(setBoard)
       .catch(onError);
   return (
-    <div className="page">
+    <main className="flex-1 min-w-0 flex bg-paper">
       <div className="flex min-h-full">
         <nav className="page-subnav w-[208px] shrink-0 border-r border-line bg-panel/40 px-3 py-4">
           <div className="px-2 text-[13.5px] font-semibold mb-3 flex items-center gap-2">
@@ -2867,8 +2873,8 @@ function Activity({
             </button>
           ))}
         </nav>
-        <div className="flex-1 min-w-0 overflow-y-auto">
-          <div className="w-full px-7 py-6">
+        <div className="flex-1 min-w-0 overflow-y-auto hairline-scroll">
+          <div className="activity-body max-w-4xl mx-auto w-full px-7 py-6">
             <header className="mb-5">
               <h1 className="text-[22px] font-semibold text-ink">
                 {activityTab[0].toUpperCase() + activityTab.slice(1)}
@@ -3426,7 +3432,7 @@ function Activity({
           </div>
         </div>
       </div>
-    </div>
+    </main>
   );
 }
 function PageHeader({ title, subtitle }: { title: string; subtitle: string }) {
@@ -4756,29 +4762,49 @@ function AppContent() {
       <main className="main">
         {surface === "session" && selected ? (
           <>
-            <header className="main-topbar session-header">
-              <div>
-                <h1>{selected.title}</h1>
-                <p>
-                  {selected.host_name} ·{" "}
-                  {selected.workspace || "workspace not set"} · {selected.model}
-                </p>
-                <p className="surface-status muted">
-                  {sessionStatusLabel(selected.run_state, selected.stop_reason)}
-                </p>
+            {/* OpenWorker session topbar: surfaces/gui/src/App.tsx:1365-1442.
+                Only the facts and Tauri panel action are adapted to OPCOS. */}
+            <header className="main-topbar">
+              <div className="main-topbar-side">
+                {navCollapsed && (
+                  <button
+                    className="topbar-icon-btn"
+                    onClick={toggleNav}
+                    aria-label="Show sidebar"
+                    title="Show sidebar"
+                  >
+                    <Icon name="sidebar" size={16} />
+                  </button>
+                )}
               </div>
-              <div className="main-topbar-actions">
+              <div className="main-title">
+                <span className="main-title-text" title={selected.title}>
+                  {selected.title}
+                </span>
+                <span className="title-sub" data-testid="session-subtitle">
+                  {[
+                    selected.host_name,
+                    selected.workspace || "workspace not set",
+                    selected.model,
+                    sessionStatusLabel(
+                      selected.run_state,
+                      selected.stop_reason,
+                    ),
+                  ].join(" · ")}
+                </span>
+              </div>
+              <div className="main-topbar-side main-topbar-actions">
                 {secretBackend && (
                   <span className="backend-badge">
                     Secrets: {secretBackend}
                   </span>
                 )}
                 <button
-                  className="icon-button"
+                  className="topbar-icon-btn"
                   title={translate("Toggle session panel")}
                   onClick={() => setDrawerCollapsed((value) => !value)}
                 >
-                  <Icon name="sidebarRight" />
+                  <Icon name="sidebarRight" size={16} />
                 </button>
               </div>
             </header>
