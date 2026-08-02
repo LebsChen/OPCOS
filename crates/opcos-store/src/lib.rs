@@ -1,8 +1,16 @@
 use chrono::{DateTime, Utc};
+use ring::{
+    aead::{self, Aad, LessSafeKey, Nonce, UnboundKey},
+    digest,
+    rand::{SecureRandom, SystemRandom},
+};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
-use std::sync::Mutex;
+use std::collections::BTreeMap;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -13,6 +21,10 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("keyring error: {0}")]
     Keyring(String),
+    #[error("encrypted secret store error: {0}")]
+    Encrypted(String),
+    #[error("secret store I/O error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -99,6 +111,14 @@ pub struct UsageRecord {
     pub recorded_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AuditEvent {
+    pub session_id: String,
+    pub sequence: i64,
+    pub kind: String,
+    pub payload: serde_json::Value,
+}
+
 pub trait SessionStore {
     fn append_message(&self, message: &StoredMessage) -> Result<(), StoreError>;
     fn load_messages(&self, session_id: &str) -> Result<Vec<StoredMessage>, StoreError>;
@@ -132,39 +152,199 @@ pub trait SecretStore: Send + Sync {
 #[derive(Clone)]
 pub struct KeyringSecretStore {
     service: String,
+    fallback: Option<Arc<EncryptedFileSecretStore>>,
+    keyring_available: bool,
 }
 
 impl KeyringSecretStore {
     pub fn new(service: impl Into<String>) -> Self {
+        Self::with_optional_fallback(service, None)
+    }
+
+    pub fn with_fallback(service: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+        Self::with_optional_fallback(service, Some(path.into()))
+    }
+
+    fn with_optional_fallback(service: impl Into<String>, path: Option<PathBuf>) -> Self {
+        let service = service.into();
+        let keyring_available = keyring::Entry::new(&service, "opcos-secret-store-probe")
+            .map(|entry| {
+                if entry.set_password("probe").is_err() {
+                    return false;
+                }
+                let readable = entry.get_password().is_ok();
+                let _ = entry.delete_credential();
+                readable
+            })
+            .unwrap_or(false);
         Self {
-            service: service.into(),
+            fallback: path.map(|path| Arc::new(EncryptedFileSecretStore::new(path))),
+            service,
+            keyring_available,
         }
+    }
+
+    pub fn backend(&self) -> &'static str {
+        if self.keyring_available {
+            "keyring"
+        } else if self.fallback.is_some() {
+            "encrypted-file"
+        } else {
+            "unavailable"
+        }
+    }
+
+    fn fallback(&self) -> Result<&EncryptedFileSecretStore, StoreError> {
+        self.fallback
+            .as_deref()
+            .ok_or_else(|| StoreError::Keyring("secure secret storage is unavailable".into()))
     }
 }
 
 impl SecretStore for KeyringSecretStore {
     fn get(&self, key: &str) -> Result<Option<String>, StoreError> {
+        if !self.keyring_available {
+            return self.fallback()?.get(key);
+        }
         let entry = keyring::Entry::new(&self.service, key)
             .map_err(|error| StoreError::Keyring(error.to_string()))?;
         match entry.get_password() {
             Ok(value) => Ok(Some(value)),
             Err(keyring::Error::NoEntry) => Ok(None),
-            Err(error) => Err(StoreError::Keyring(error.to_string())),
+            Err(_) => self.fallback()?.get(key),
         }
     }
 
     fn set(&self, key: &str, value: &str) -> Result<(), StoreError> {
-        keyring::Entry::new(&self.service, key)
+        if !self.keyring_available {
+            return self.fallback()?.set(key, value);
+        }
+        match keyring::Entry::new(&self.service, key)
             .map_err(|error| StoreError::Keyring(error.to_string()))?
             .set_password(value)
-            .map_err(|error| StoreError::Keyring(error.to_string()))
+        {
+            Ok(()) => Ok(()),
+            Err(_) => self.fallback()?.set(key, value),
+        }
     }
 
     fn delete(&self, key: &str) -> Result<(), StoreError> {
-        keyring::Entry::new(&self.service, key)
+        if !self.keyring_available {
+            return self.fallback()?.delete(key);
+        }
+        match keyring::Entry::new(&self.service, key)
             .map_err(|error| StoreError::Keyring(error.to_string()))?
             .delete_credential()
-            .map_err(|error| StoreError::Keyring(error.to_string()))
+        {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(_) => self.fallback()?.delete(key),
+        }
+    }
+}
+
+struct EncryptedFileSecretStore {
+    path: PathBuf,
+    key: [u8; 32],
+    lock: Mutex<()>,
+}
+
+impl EncryptedFileSecretStore {
+    fn new(path: PathBuf) -> Self {
+        let machine_id = fs::read_to_string("/etc/machine-id")
+            .or_else(|_| fs::read_to_string("/var/lib/dbus/machine-id"))
+            .unwrap_or_else(|_| std::env::var("USER").unwrap_or_else(|_| "opcos".into()));
+        let material = format!("opcos-secret-store\0{machine_id}");
+        let digest = digest::digest(&digest::SHA256, material.as_bytes());
+        let mut key = [0u8; 32];
+        key.copy_from_slice(digest.as_ref());
+        Self {
+            path,
+            key,
+            lock: Mutex::new(()),
+        }
+    }
+
+    fn read_values(&self) -> Result<BTreeMap<String, String>, StoreError> {
+        let mut file = match OpenOptions::new().read(true).open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(BTreeMap::new());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        if bytes.len() < 16 || &bytes[..4] != b"OCS1" {
+            return Err(StoreError::Encrypted(
+                "encrypted secret file is invalid".into(),
+            ));
+        }
+        let mut nonce_bytes = [0u8; 12];
+        nonce_bytes.copy_from_slice(&bytes[4..16]);
+        let key =
+            LessSafeKey::new(UnboundKey::new(&aead::AES_256_GCM, &self.key).map_err(|_| {
+                StoreError::Encrypted("secret cipher initialization failed".into())
+            })?);
+        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+        let plaintext = key
+            .open_in_place(nonce, Aad::empty(), &mut bytes[16..])
+            .map_err(|_| StoreError::Encrypted("encrypted secret file cannot be opened".into()))?;
+        serde_json::from_slice(plaintext).map_err(StoreError::from)
+    }
+
+    fn write_values(&self, values: &BTreeMap<String, String>) -> Result<(), StoreError> {
+        let mut plaintext = serde_json::to_vec(values)?;
+        let mut nonce_bytes = [0u8; 12];
+        SystemRandom::new()
+            .fill(&mut nonce_bytes)
+            .map_err(|_| StoreError::Encrypted("secret nonce generation failed".into()))?;
+        let key =
+            LessSafeKey::new(UnboundKey::new(&aead::AES_256_GCM, &self.key).map_err(|_| {
+                StoreError::Encrypted("secret cipher initialization failed".into())
+            })?);
+        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+        key.seal_in_place_append_tag(nonce, Aad::empty(), &mut plaintext)
+            .map_err(|_| StoreError::Encrypted("secret encryption failed".into()))?;
+        let mut output = b"OCS1".to_vec();
+        output.extend_from_slice(&nonce_bytes);
+        output.extend_from_slice(&plaintext);
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&self.path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(&output)?;
+        file.sync_all()?;
+        Ok(())
+    }
+}
+
+impl SecretStore for EncryptedFileSecretStore {
+    fn get(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let _guard = self.lock.lock().expect("secret mutex poisoned");
+        Ok(self.read_values()?.get(key).cloned())
+    }
+
+    fn set(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        let _guard = self.lock.lock().expect("secret mutex poisoned");
+        let mut values = self.read_values()?;
+        values.insert(key.to_owned(), value.to_owned());
+        self.write_values(&values)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), StoreError> {
+        let _guard = self.lock.lock().expect("secret mutex poisoned");
+        let mut values = self.read_values()?;
+        values.remove(key);
+        self.write_values(&values)
     }
 }
 
@@ -181,6 +361,53 @@ impl SqliteStore {
         };
         store.migrate()?;
         Ok(store)
+    }
+
+    pub fn append_audit(
+        &self,
+        session_id: &str,
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(), StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let sequence: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM audit_events WHERE session_id=?1",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        connection.execute(
+            "INSERT INTO audit_events(session_id,sequence,kind,payload) VALUES (?1,?2,?3,?4)",
+            params![session_id, sequence, kind, serde_json::to_string(payload)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_audit(&self, session_id: Option<&str>) -> Result<Vec<AuditEvent>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT session_id,sequence,kind,payload
+             FROM audit_events
+             WHERE (?1 IS NULL OR session_id=?1)
+             ORDER BY rowid DESC
+             LIMIT 500",
+        )?;
+        let rows = statement.query_map([session_id], |row| {
+            let payload: String = row.get(3)?;
+            Ok(AuditEvent {
+                session_id: row.get(0)?,
+                sequence: row.get(1)?,
+                kind: row.get(2)?,
+                payload: serde_json::from_str(&payload).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     pub fn open_in_memory() -> Result<Self, StoreError> {
@@ -628,5 +855,51 @@ mod tests {
         assert_eq!(records[0].input_tokens, 12);
         assert_eq!(records[0].output_tokens, 7);
         assert_eq!(records[0].duration_ms, 345);
+    }
+
+    #[test]
+    fn audit_events_round_trip_without_secret_values() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .append_audit(
+                "session-audit",
+                "approval_allowed",
+                &serde_json::json!({"call_id":"call-1","approved":true}),
+            )
+            .unwrap();
+        let events = store.load_audit(Some("session-audit")).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "approval_allowed");
+        assert_eq!(events[0].payload["call_id"], "call-1");
+    }
+
+    #[test]
+    fn encrypted_secret_store_round_trips_and_reports_missing_keys() {
+        let path = std::env::temp_dir().join(format!("opcos-secret-test-{}", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let store = EncryptedFileSecretStore::new(path.clone());
+        assert_eq!(store.get("missing").unwrap(), None);
+        store.set("token", "value").unwrap();
+        assert_eq!(store.get("token").unwrap().as_deref(), Some("value"));
+        let permissions = fs::metadata(&path).unwrap().permissions();
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&permissions) & 0o777,
+            0o600
+        );
+        let reopened = EncryptedFileSecretStore::new(path.clone());
+        assert_eq!(reopened.get("token").unwrap().as_deref(), Some("value"));
+        reopened.delete("token").unwrap();
+        assert_eq!(reopened.get("token").unwrap(), None);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn keyring_backend_probe_reports_runtime_backend() {
+        let path = std::env::temp_dir().join(format!("opcos-keyring-probe-{}", std::process::id()));
+        let store = KeyringSecretStore::with_fallback("opcos-test", path.clone());
+        println!("secret_backend={}", store.backend());
+        assert!(matches!(store.backend(), "keyring" | "encrypted-file"));
+        let _ = fs::remove_file(path);
     }
 }

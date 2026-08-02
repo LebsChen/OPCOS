@@ -25,12 +25,14 @@ use opcos_engine::{
     orchestration::{CoordinationRuntime, Envelope, Role},
 };
 use opcos_policy::PermissionMode;
-use opcos_provider::ProviderConfig;
+use opcos_provider::anthropic::AnthropicProvider;
+use opcos_provider::bedrock::BedrockProvider;
 use opcos_provider::openai::OpenAiProvider;
 use opcos_provider::registry;
+use opcos_provider::{Provider, ProviderConfig};
 use opcos_rvm::{
     ExecRequest, HttpRvmClient, IdeBootstrap, PersistentShell, RvmClient, RvmClientConfig, WsKind,
-    WsParams,
+    WsParams, join_remote_path,
 };
 use opcos_store::{KeyringSecretStore, SecretStore, SessionStore, SqliteStore};
 use rusqlite::{Connection, params};
@@ -87,7 +89,7 @@ struct DesktopState {
     coordination: AsyncMutex<HashMap<String, CoordinationRuntime>>,
 }
 
-type GuiEngine = TurnEngine<OpenAiProvider, SqliteStore, RemoteExecutor>;
+type GuiEngine = TurnEngine<Box<dyn Provider>, SqliteStore, RemoteExecutor>;
 
 struct RemoteExecutor {
     client: HttpRvmClient,
@@ -220,6 +222,7 @@ struct SessionView {
     host_id: String,
     host_name: String,
     model: String,
+    provider: Option<String>,
     mode: String,
     workspace: String,
 }
@@ -248,8 +251,93 @@ fn emit(app: &tauri::AppHandle, kind: &str, session_id: Option<&str>, payload: V
     );
 }
 
+fn audit(state: &DesktopState, session_id: &str, kind: &str, payload: Value) {
+    let _ = state.store.append_audit(session_id, kind, &payload);
+}
+
+fn emit_pending_approval(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    session_id: &str,
+) -> Result<bool, String> {
+    let pending = state
+        .store
+        .load_pending(session_id)
+        .map_err(|error| error.to_string())?;
+    let Some(pending) = pending.into_iter().next() else {
+        return Ok(false);
+    };
+    emit(
+        app,
+        "approval",
+        Some(session_id),
+        json!({
+            "call_id": pending.call_id,
+            "tool": pending.tool,
+            "arguments": redact_approval_value(&pending.arguments),
+            "risk": approval_risk(&pending.tool),
+            "reason": "Tool action requires approval",
+        }),
+    );
+    emit(
+        app,
+        "notice",
+        Some(session_id),
+        json!({
+            "kind": "approval_pending",
+            "text": "Approval required before this tool can continue"
+        }),
+    );
+    Ok(true)
+}
+
 fn secret_key(prefix: &str, id: &str) -> String {
     format!("{prefix}:{id}")
+}
+
+fn redact_approval_value(value: &Value) -> Value {
+    match value {
+        Value::Object(values) => Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| {
+                    let sensitive = key.to_ascii_lowercase().contains("token")
+                        || key.to_ascii_lowercase().contains("key")
+                        || key.to_ascii_lowercase().contains("password")
+                        || key.to_ascii_lowercase().contains("secret");
+                    (
+                        key.clone(),
+                        if sensitive {
+                            Value::String("[redacted]".into())
+                        } else {
+                            redact_approval_value(value)
+                        },
+                    )
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.iter().map(redact_approval_value).collect()),
+        Value::String(value) => {
+            let mut redacted = value.clone();
+            if let Some(index) = redacted.to_ascii_lowercase().find("bearer ") {
+                let end = redacted[index + 7..]
+                    .find(char::is_whitespace)
+                    .map(|offset| index + 7 + offset)
+                    .unwrap_or(redacted.len());
+                redacted.replace_range(index + 7..end, "[redacted]");
+            }
+            Value::String(redacted)
+        }
+        other => other.clone(),
+    }
+}
+
+fn approval_risk(tool: &str) -> &'static str {
+    match tool {
+        "write_file" | "edit" => "write",
+        "run_shell" => "execute",
+        _ => "external",
+    }
 }
 
 fn init_database(path: PathBuf) -> Result<Connection, String> {
@@ -349,6 +437,18 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
             )
             .map_err(|error| error.to_string())?;
     }
+    let has_provider: bool = connection
+        .prepare("PRAGMA table_info(sessions)")
+        .and_then(|mut statement| {
+            let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+            Ok(rows.flatten().any(|name| name == "provider"))
+        })
+        .map_err(|error| error.to_string())?;
+    if !has_provider {
+        connection
+            .execute("ALTER TABLE sessions ADD COLUMN provider TEXT", [])
+            .map_err(|error| error.to_string())?;
+    }
     Ok(connection)
 }
 
@@ -371,12 +471,18 @@ fn client_for(state: &DesktopState, host_id: &str) -> Result<HttpRvmClient, Stri
         .secrets
         .get(&secret_key("rvm-url", host_id))
         .map_err(|error| error.to_string())?
-        .ok_or_else(|| "remote host URL is not configured".to_owned())?;
+        .ok_or_else(|| {
+            "Remote host credentials are missing; delete this host and add it again with its URL and token."
+                .to_owned()
+        })?;
     let token = state
         .secrets
         .get(&secret_key("rvm-token", host_id))
         .map_err(|error| error.to_string())?
-        .ok_or_else(|| "remote host token is not configured".to_owned())?;
+        .ok_or_else(|| {
+            "Remote host credentials are missing; delete this host and add it again with its URL and token."
+                .to_owned()
+        })?;
     let parsed = url::Url::parse(&url).map_err(|_| "remote host URL is invalid".to_owned())?;
     let config = RvmClientConfig::new(parsed, token).map_err(|error| error.to_string())?;
     HttpRvmClient::new(config).map_err(|error| error.to_string())
@@ -466,10 +572,30 @@ async fn ide_asset(
     Path(path): Path<String>,
     uri: Uri,
 ) -> Response {
+    ide_asset_route(state, path, uri, "/ide/static/").await
+}
+
+async fn ide_out_asset(
+    AxumState(state): AxumState<IdeProxyState>,
+    Path(path): Path<String>,
+    uri: Uri,
+) -> Response {
+    ide_asset_route(state, path, uri, "/ide/out/").await
+}
+
+async fn ide_resources_asset(
+    AxumState(state): AxumState<IdeProxyState>,
+    Path(path): Path<String>,
+    uri: Uri,
+) -> Response {
+    ide_asset_route(state, path, uri, "/ide/resources/").await
+}
+
+async fn ide_asset_route(state: IdeProxyState, path: String, uri: Uri, prefix: &str) -> Response {
     let route = if path == "vscode-remote-resource" {
         "/vscode-remote-resource".to_owned()
     } else {
-        format!("/ide/static/{path}")
+        format!("{prefix}{path}")
     };
     let query = uri
         .query()
@@ -488,6 +614,19 @@ async fn ide_asset(
         Ok(bytes) => Response::new(Body::from(bytes)),
         Err(_) => StatusCode::BAD_GATEWAY.into_response(),
     }
+}
+
+fn ide_asset_upstream_route(route: &str) -> String {
+    if let Some(path) = route.strip_prefix("/out/") {
+        return format!("/ide/out/{path}");
+    }
+    if let Some(path) = route.strip_prefix("/resources/") {
+        return format!("/ide/resources/{path}");
+    }
+    if let Some(path) = route.strip_prefix("/static/") {
+        return format!("/ide/static/{path}");
+    }
+    route.to_owned()
 }
 
 async fn ide_relay_socket(mut browser: WebSocket, state: IdeProxyState, route: String) {
@@ -565,8 +704,9 @@ async fn serve_ide_proxy(listener: TcpListener, state: IdeProxyState) {
     let router = Router::new()
         .route("/", any(ide_root))
         .route("/ide/", any(ide_document))
-        .route("/out/{*path}", any(ide_asset))
-        .route("/resources/{*path}", any(ide_asset))
+        .route("/static/{*path}", any(ide_asset))
+        .route("/out/{*path}", any(ide_out_asset))
+        .route("/resources/{*path}", any(ide_resources_asset))
         .route("/extensions/{*path}", any(ide_asset))
         .route("/node_modules/{*path}", any(ide_asset))
         .route("/vscode-remote-resource", any(ide_asset))
@@ -585,14 +725,14 @@ async fn engine_for(
             return Ok(Arc::clone(engine));
         }
     }
-    let (host_id, model, mode, session_workspace) = {
+    let (host_id, model, mode, session_workspace, session_provider) = {
         let connection = state
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?;
         connection
             .query_row(
-                "SELECT host_id,model,mode,workspace FROM sessions WHERE id=?1",
+                "SELECT host_id,model,mode,workspace,provider FROM sessions WHERE id=?1",
                 [session_id],
                 |row| {
                     Ok((
@@ -600,6 +740,7 @@ async fn engine_for(
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                     ))
                 },
             )
@@ -610,20 +751,34 @@ async fn engine_for(
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?;
-        let provider = connection
-            .query_row(
-                "SELECT value FROM settings WHERE key='provider.id'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap_or_else(|_| "openai".into());
+        let provider = session_provider.unwrap_or_else(|| {
+            connection
+                .query_row(
+                    "SELECT value FROM settings WHERE key='provider.id'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap_or_else(|_| "openai".into())
+        });
         let base_url = connection
             .query_row(
-                "SELECT value FROM settings WHERE key='provider.base_url'",
+                &format!(
+                    "SELECT value FROM settings WHERE key='provider.base_url.{}'",
+                    provider
+                ),
                 [],
                 |row| row.get::<_, String>(0),
             )
-            .ok();
+            .ok()
+            .or_else(|| {
+                connection
+                    .query_row(
+                        "SELECT value FROM settings WHERE key='provider.base_url'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok()
+            });
         (provider, base_url)
     };
     let descriptor = registry::descriptors()
@@ -634,9 +789,7 @@ async fn engine_for(
         .ok()
         .or(configured_base_url)
         .or(descriptor.default_base_url)
-        .ok_or_else(|| {
-            "provider base URL is not configured; open Provider settings first".to_owned()
-        })?;
+        .unwrap_or_default();
     let client = client_for(state, &host_id)?;
     let health = client
         .health()
@@ -657,12 +810,59 @@ async fn engine_for(
         client: executor_client.clone(),
         secrets: state.secrets.clone(),
     });
-    let key = state
-        .secrets
-        .get(&secret_key("provider-key", &provider_id))
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "provider key is not configured; open Provider settings first".to_owned())?;
-    let provider = OpenAiProvider::new(ProviderConfig::new(base_url, key));
+    let provider: Box<dyn Provider> = match descriptor.name.as_str() {
+        "bedrock" => {
+            let region = std::env::var("AWS_REGION")
+                .ok()
+                .or_else(|| {
+                    state
+                        .database
+                        .lock()
+                        .ok()
+                        .and_then(|connection| {
+                            connection
+                                .query_row(
+                                    "SELECT value FROM settings WHERE key='provider.region.bedrock'",
+                                    [],
+                                    |row| row.get::<_, String>(0),
+                                )
+                                .ok()
+                        })
+                })
+                .ok_or_else(|| {
+                    "Amazon Bedrock is not connected: configure AWS_REGION and AWS credentials in the environment."
+                        .to_owned()
+                })?;
+            Box::new(BedrockProvider::new(region))
+        }
+        "vertex" => {
+            return Err(
+                "Google Vertex AI is not connected yet: service-account authentication is not supported by the current secret store."
+                    .into(),
+            );
+        }
+        "anthropic" => {
+            let key = state
+                .secrets
+                .get(&secret_key("provider-key", &provider_id))
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    "provider key is not configured; open Provider settings first".to_owned()
+                })?;
+            Box::new(AnthropicProvider::new(ProviderConfig::new(base_url, key)))
+        }
+        _name if descriptor.openai_compatible => {
+            let key = state
+                .secrets
+                .get(&secret_key("provider-key", &provider_id))
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    "provider key is not configured; open Provider settings first".to_owned()
+                })?;
+            Box::new(OpenAiProvider::new(ProviderConfig::new(base_url, key)))
+        }
+        name => return Err(format!("provider {name} is not supported for sessions")),
+    };
     let permission_mode = match mode.as_str() {
         "Discuss" => PermissionMode::Discuss,
         "Plan" => PermissionMode::Plan,
@@ -843,14 +1043,25 @@ fn save_host(
         )
         .map_err(|error| error.to_string())?;
     drop(connection);
-    state
-        .secrets
-        .set(&secret_key("rvm-token", &id), &token)
-        .map_err(|error| error.to_string())?;
-    state
-        .secrets
-        .set(&secret_key("rvm-url", &id), &url)
-        .map_err(|error| error.to_string())?;
+    if let Err(error) = state.secrets.set(&secret_key("rvm-token", &id), &token) {
+        if let Ok(connection) = state.database.lock() {
+            let _ = connection.execute("DELETE FROM hosts WHERE id=?1", [&id]);
+        }
+        return Err(error.to_string());
+    }
+    if let Err(error) = state.secrets.set(&secret_key("rvm-url", &id), &url) {
+        let _ = state.secrets.delete(&secret_key("rvm-token", &id));
+        if let Ok(connection) = state.database.lock() {
+            let _ = connection.execute("DELETE FROM hosts WHERE id=?1", [&id]);
+        }
+        return Err(error.to_string());
+    }
+    audit(
+        &state,
+        "",
+        "host_created",
+        json!({"host_id": id, "name": name}),
+    );
     Ok(HostView {
         id,
         name,
@@ -862,7 +1073,7 @@ fn save_host(
 #[tauri::command]
 async fn test_host(state: State<'_, DesktopState>, host_id: String) -> Result<HostView, String> {
     let client = client_for(&state, &host_id)?;
-    let health = client.health().await.map_err(|error| error.to_string());
+    let info = client.info().await.map_err(|error| error.to_string());
     let connection = state
         .database
         .lock()
@@ -872,20 +1083,65 @@ async fn test_host(state: State<'_, DesktopState>, host_id: String) -> Result<Ho
             row.get(0)
         })
         .map_err(|error| error.to_string())?;
-    match health {
-        Ok(health) => Ok(HostView {
+    match info {
+        Ok(info) => Ok(HostView {
             id: host_id,
             name,
             online: Some(true),
-            reason: Some(format!("{} {:?}", health.status, health.capabilities)),
+            reason: Some(format!(
+                "{} {}",
+                info.hostname.as_deref().unwrap_or("remote host"),
+                info.platform.as_deref().unwrap_or("unknown platform")
+            )),
         }),
-        Err(error) => Ok(HostView {
-            id: host_id,
-            name,
-            online: Some(false),
-            reason: Some(error),
-        }),
+        Err(error) => {
+            let lower = error.to_ascii_lowercase();
+            let reason = if lower.contains("401") || lower.contains("unauthorized") {
+                format!("remote host authentication failed: {error}")
+            } else {
+                error
+            };
+            Ok(HostView {
+                id: host_id,
+                name,
+                online: Some(false),
+                reason: Some(reason),
+            })
+        }
     }
+}
+
+#[tauri::command]
+fn delete_host(state: State<'_, DesktopState>, host_id: String) -> Result<(), String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let exists: bool = connection
+        .query_row(
+            "SELECT COUNT(*) FROM hosts WHERE id=?1",
+            [&host_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| error.to_string())?
+        > 0;
+    if !exists {
+        return Err("remote host not found".into());
+    }
+    connection
+        .execute("DELETE FROM hosts WHERE id=?1", [&host_id])
+        .map_err(|error| error.to_string())?;
+    drop(connection);
+    state
+        .secrets
+        .delete(&secret_key("rvm-token", &host_id))
+        .map_err(|error| error.to_string())?;
+    state
+        .secrets
+        .delete(&secret_key("rvm-url", &host_id))
+        .map_err(|error| error.to_string())?;
+    audit(&state, "", "host_deleted", json!({"host_id": host_id}));
+    Ok(())
 }
 
 #[tauri::command]
@@ -972,6 +1228,30 @@ async fn start_ide_proxy(
         .ide_bootstrap(&folder_uri)
         .await
         .map_err(|error| error.to_string())?;
+    let asset_route = bootstrap
+        .html
+        .split(['"', '\''])
+        .find(|part| {
+            (part.starts_with("/out/") || part.starts_with("/resources/"))
+                && part
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|name| name.split(['?', '#']).next().unwrap_or("").contains('.'))
+        })
+        .map(str::to_owned)
+        .ok_or_else(|| "Remote Web IDE returned no loadable workbench asset paths.".to_owned())?;
+    let asset_upstream_route = ide_asset_upstream_route(&asset_route);
+    client
+        .ide_request_bytes(
+            &asset_upstream_route,
+            &bootstrap.cookies,
+            &bootstrap.proxy_token,
+        )
+        .await
+        .map_err(|_| {
+            "Remote Web IDE bootstrap succeeded, but the bound host rejected its workbench assets."
+                .to_owned()
+        })?;
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .map_err(|error| error.to_string())?;
@@ -993,6 +1273,7 @@ fn create_session(
     title: String,
     host_id: String,
     model: Option<String>,
+    provider: Option<String>,
     mode: Option<String>,
     workspace: Option<String>,
 ) -> Result<SessionView, String> {
@@ -1013,16 +1294,23 @@ fn create_session(
         .map_err(|_| "remote host not found; session was not created".to_owned())?;
     connection
         .execute(
-            "INSERT INTO sessions(id,title,host_id,model,mode,workspace,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            params![id, title, host_id, model, mode, workspace.clone().unwrap_or_default(), Utc::now().to_rfc3339()],
+            "INSERT INTO sessions(id,title,host_id,model,provider,mode,workspace,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![id, title, host_id, model, provider, mode, workspace.clone().unwrap_or_default(), Utc::now().to_rfc3339()],
         )
         .map_err(|error| error.to_string())?;
+    audit(
+        &state,
+        &id,
+        "session_created",
+        json!({"session_id": id, "host_id": host_id, "model": model}),
+    );
     Ok(SessionView {
         id,
         title,
         host_id,
         host_name,
         model,
+        provider,
         mode,
         workspace: workspace.unwrap_or_default(),
     })
@@ -1035,7 +1323,7 @@ fn list_sessions(state: State<'_, DesktopState>) -> Result<Vec<SessionView>, Str
         .lock()
         .map_err(|_| "database lock poisoned")?;
     let mut statement = connection
-        .prepare("SELECT s.id,s.title,s.host_id,h.name,s.model,s.mode,s.workspace FROM sessions s JOIN hosts h ON h.id=s.host_id ORDER BY s.created_at DESC")
+        .prepare("SELECT s.id,s.title,s.host_id,h.name,s.model,s.provider,s.mode,s.workspace FROM sessions s JOIN hosts h ON h.id=s.host_id ORDER BY s.created_at DESC")
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map([], |row| {
@@ -1045,8 +1333,9 @@ fn list_sessions(state: State<'_, DesktopState>) -> Result<Vec<SessionView>, Str
                 host_id: row.get(2)?,
                 host_name: row.get(3)?,
                 model: row.get(4)?,
-                mode: row.get(5)?,
-                workspace: row.get(6)?,
+                provider: row.get(5)?,
+                mode: row.get(6)?,
+                workspace: row.get(7)?,
             })
         })
         .map_err(|error| error.to_string())?;
@@ -1063,10 +1352,30 @@ fn read_transcript(
         .store
         .load_messages(&session_id)
         .map_err(|error| error.to_string())?;
-    Ok(messages
+    let mut transcript = messages
         .into_iter()
         .map(|message| json!({"kind":message.role,"payload":message.content}))
-        .collect())
+        .collect::<Vec<_>>();
+    transcript.extend(
+        state
+            .store
+            .load_pending(&session_id)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|pending| {
+                json!({
+                    "kind":"approval",
+                    "payload":{
+                        "call_id":pending.call_id,
+                        "tool":pending.tool,
+                        "arguments":redact_approval_value(&pending.arguments),
+                        "risk":approval_risk(&pending.tool),
+                        "reason":"Tool action requires approval"
+                    }
+                })
+            }),
+    );
+    Ok(transcript)
 }
 
 #[tauri::command]
@@ -1101,18 +1410,118 @@ async fn submit_turn(
         json!({"role":"user","text":request.text}),
     );
     match engine.submit_text(request.text).await {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            emit(&app, "turn_done", Some(&request.session_id), json!({}));
+            Ok(())
+        }
+        Err(EngineError::ApprovalPending(call_id)) => {
+            if let Ok(Some(pending)) = state
+                .store
+                .load_pending(&request.session_id)
+                .map(|items| items.into_iter().find(|item| item.call_id == call_id))
+            {
+                emit(
+                    &app,
+                    "approval",
+                    Some(&request.session_id),
+                    json!({
+                        "call_id":pending.call_id,
+                        "tool":pending.tool,
+                        "arguments":redact_approval_value(&pending.arguments),
+                        "risk":approval_risk(&pending.tool),
+                        "reason":"Tool action requires approval"
+                    }),
+                );
+            }
+            let message = "Approval required before this tool can continue".to_owned();
+            emit(
+                &app,
+                "notice",
+                Some(&request.session_id),
+                json!({"kind":"approval_pending","text":message}),
+            );
+            emit(&app, "turn_done", Some(&request.session_id), json!({}));
+            Err(message)
+        }
         Err(error) => {
             let message = engine_error_message(error);
+            if message.contains("denied") || message.contains("policy") {
+                audit(
+                    &state,
+                    &request.session_id,
+                    "tool_policy_denied",
+                    json!({"message": message}),
+                );
+            }
             emit(
                 &app,
                 "notice",
                 Some(&request.session_id),
                 json!({"kind":"error","text":message}),
             );
+            emit(&app, "turn_done", Some(&request.session_id), json!({}));
             Err(message)
         }
     }
+}
+
+#[tauri::command]
+async fn upload_text_attachment(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    file_name: String,
+    content: String,
+) -> Result<String, String> {
+    if file_name.is_empty()
+        || file_name == "."
+        || file_name == ".."
+        || file_name.contains(['/', '\\', '\0'])
+    {
+        return Err("attachment name must be a single file name".into());
+    }
+    if file_name.len() > 160 {
+        return Err("attachment name is too long".into());
+    }
+    if content.len() > 256 * 1024 {
+        return Err("text attachments are limited to 256 KiB".into());
+    }
+    let (host_id, workspace) = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        connection
+            .query_row(
+                "SELECT host_id,workspace FROM sessions WHERE id=?1",
+                [&session_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|_| "session not found".to_owned())?
+    };
+    let client = client_for(&state, &host_id)?;
+    let workspace = if workspace.is_empty() {
+        client
+            .health()
+            .await
+            .map_err(|error| format!("remote host unavailable: {error}"))?
+            .workspace
+            .ok_or_else(|| "remote host did not provide a workspace".to_owned())?
+    } else {
+        workspace
+    };
+    let path = join_remote_path(
+        &workspace,
+        &format!(
+            ".opcos-upload-{}-{file_name}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ),
+    );
+    client
+        .with_workspace(workspace)
+        .write(&path, &content)
+        .await
+        .map_err(|error| format!("remote attachment upload failed: {error}"))?;
+    Ok(path)
 }
 
 #[tauri::command]
@@ -1123,6 +1532,12 @@ async fn interrupt(
 ) -> Result<(), String> {
     let engine = engine_for(&app, &state, &session_id).await?;
     engine.interrupt();
+    audit(
+        &state,
+        &session_id,
+        "session_interrupted",
+        json!({"session_id": session_id}),
+    );
     emit(
         &app,
         "notice",
@@ -1140,8 +1555,17 @@ async fn steering(
     text: String,
 ) -> Result<(), String> {
     let engine = engine_for(&app, &state, &session_id).await?;
-    engine.queue_steering(text.clone()).await;
+    let completion = engine
+        .queue_steering(text.clone())
+        .await
+        .map_err(engine_error_message)?;
     emit(&app, "steering", Some(&session_id), json!({"text":text}));
+    let handle = app.clone();
+    let session = session_id.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = completion.await;
+        emit(&handle, "turn_done", Some(&session), json!({}));
+    });
     Ok(())
 }
 
@@ -1154,7 +1578,7 @@ async fn resolve_approval(
     approve: bool,
 ) -> Result<(), String> {
     let engine = engine_for(&app, &state, &session_id).await?;
-    engine
+    let result = engine
         .resolve_approval(
             &call_id,
             if approve {
@@ -1164,15 +1588,37 @@ async fn resolve_approval(
             },
         )
         .await
-        .map(|_| ())
-        .map_err(engine_error_message)?;
+        .map(|_| ());
     emit(
         &app,
         "approval_resolved",
         Some(&session_id),
         json!({"call_id":call_id,"approve":approve}),
     );
-    Ok(())
+    audit(
+        &state,
+        &session_id,
+        if approve {
+            "approval_allowed"
+        } else {
+            "approval_denied"
+        },
+        json!({"call_id": call_id, "approved": approve}),
+    );
+    match result {
+        Ok(()) => {
+            let _ = emit_pending_approval(&app, &state, &session_id)?;
+            emit(&app, "turn_done", Some(&session_id), json!({}));
+            Ok(())
+        }
+        Err(opcos_engine::EngineError::ApprovalPending(next_call_id)) => {
+            let _ = next_call_id;
+            emit_pending_approval(&app, &state, &session_id)?;
+            emit(&app, "turn_done", Some(&session_id), json!({}));
+            Ok(())
+        }
+        Err(error) => Err(engine_error_message(error)),
+    }
 }
 
 #[tauri::command]
@@ -1197,8 +1643,56 @@ async fn change_model(
 }
 
 #[tauri::command]
+async fn change_provider(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    provider: Option<String>,
+) -> Result<(), String> {
+    if let Some(ref name) = provider
+        && !registry::descriptors()
+            .iter()
+            .any(|item| item.name == *name)
+    {
+        return Err("unknown provider".into());
+    }
+    {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        connection
+            .execute(
+                "UPDATE sessions SET provider=?1 WHERE id=?2",
+                params![provider, session_id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    state.engines.lock().await.remove(&session_id);
+    Ok(())
+}
+
+#[tauri::command]
 fn provider_descriptors() -> Vec<registry::ProviderDescriptor> {
     registry::descriptors()
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ModelDescriptor {
+    id: String,
+    label: String,
+    provider: String,
+}
+
+#[tauri::command]
+fn provider_models(provider: String) -> Vec<ModelDescriptor> {
+    opcos_provider::matrix::models_for_provider(&provider)
+        .into_iter()
+        .map(|model| ModelDescriptor {
+            id: model.id.into(),
+            label: model.label.into(),
+            provider: model.provider.into(),
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -2267,6 +2761,30 @@ fn session_insights(state: State<'_, DesktopState>, session_id: String) -> Resul
 }
 
 #[tauri::command]
+fn audit_events(
+    state: State<'_, DesktopState>,
+    session_id: Option<String>,
+) -> Result<Vec<Value>, String> {
+    state
+        .store
+        .load_audit(session_id.as_deref())
+        .map(|events| {
+            events
+                .into_iter()
+                .map(|event| {
+                    json!({
+                        "session_id": event.session_id,
+                        "sequence": event.sequence,
+                        "kind": event.kind,
+                        "payload": event.payload,
+                    })
+                })
+                .collect()
+        })
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn save_secret_metadata(
     state: State<'_, DesktopState>,
     name: String,
@@ -2327,7 +2845,29 @@ fn save_provider_key(
     state
         .secrets
         .set(&secret_key("provider-key", &provider), &key)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    audit(
+        &state,
+        "",
+        "provider_key_saved",
+        json!({"provider": provider}),
+    );
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_provider_key(state: State<'_, DesktopState>, provider: String) -> Result<(), String> {
+    state
+        .secrets
+        .delete(&secret_key("provider-key", &provider))
+        .map_err(|error| error.to_string())?;
+    audit(
+        &state,
+        "",
+        "provider_key_deleted",
+        json!({"provider": provider}),
+    );
+    Ok(())
 }
 
 #[tauri::command]
@@ -2351,6 +2891,37 @@ fn provider_settings(state: State<'_, DesktopState>) -> Result<Value, String> {
         )
         .ok();
     Ok(json!({"provider":provider,"base_url":base_url}))
+}
+
+#[tauri::command]
+fn provider_configurations(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned".to_owned())?;
+    registry::descriptors()
+        .into_iter()
+        .map(|descriptor| {
+            let key_name = secret_key("provider-key", &descriptor.name);
+            let configured = state
+                .secrets
+                .get(&key_name)
+                .map_err(|error| error.to_string())?
+                .is_some();
+            let key = format!("provider.base_url.{}", descriptor.name);
+            let base_url = connection
+                .query_row("SELECT value FROM settings WHERE key=?1", [&key], |row| {
+                    row.get::<_, String>(0)
+                })
+                .ok()
+                .or(descriptor.default_base_url.clone());
+            Ok(json!({
+                "provider": descriptor.name,
+                "base_url": base_url,
+                "configured": configured,
+            }))
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -2384,6 +2955,13 @@ fn save_provider_settings(
         .execute(
             "INSERT OR REPLACE INTO settings(key,value) VALUES ('provider.base_url',?1)",
             [&base_url],
+        )
+        .map_err(|error| error.to_string())?;
+    let scoped_key = format!("provider.base_url.{provider}");
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES (?1,?2)",
+            [&scoped_key, &base_url],
         )
         .map_err(|error| error.to_string())?;
     Ok(())
@@ -2467,9 +3045,14 @@ fn main() {
                     Box::new(std::io::Error::other(error.to_string()));
                 tauri::Error::Setup(cause.into())
             })?);
+            let mut secret_path = path.clone();
+            secret_path.set_file_name("secrets.enc");
+            let secrets = KeyringSecretStore::with_fallback(SECRET_SERVICE, secret_path);
+            let secret_backend = secrets.backend();
+            eprintln!("secret_backend={secret_backend}");
             app.manage(DesktopState {
                 database: Mutex::new(database),
-                secrets: KeyringSecretStore::new(SECRET_SERVICE),
+                secrets,
                 store,
                 engines: AsyncMutex::new(HashMap::new()),
                 surfaces: AsyncMutex::new(HashMap::new()),
@@ -2517,7 +3100,7 @@ fn main() {
                 app.handle(),
                 "system",
                 None,
-                json!({"text":"OPCOS started"}),
+                json!({"text":"OPCOS started","secret_backend":secret_backend}),
             );
             Ok(())
         })
@@ -2525,15 +3108,19 @@ fn main() {
             list_hosts,
             save_host,
             test_host,
+            delete_host,
             create_session,
             list_sessions,
             read_transcript,
             submit_turn,
+            upload_text_attachment,
             interrupt,
             steering,
             resolve_approval,
             change_model,
+            change_provider,
             provider_descriptors,
+            provider_models,
             list_assets,
             save_asset,
             delete_asset,
@@ -2553,6 +3140,7 @@ fn main() {
             review_file_diff,
             session_worklog,
             session_insights,
+            audit_events,
             save_schedule,
             list_schedules,
             run_schedule,
@@ -2568,8 +3156,10 @@ fn main() {
             save_secret_metadata,
             list_secret_metadata,
             provider_settings,
+            provider_configurations,
             save_provider_settings,
             save_provider_key,
+            delete_provider_key,
             validate_provider_key,
             start_surface,
             ide_bootstrap,
@@ -2611,5 +3201,21 @@ mod m7_tests {
         assert!(!ASKPASS_SCRIPT.contains(token));
         assert!(ASKPASS_SCRIPT.contains("OPCOS_GIT_PASSWORD"));
         assert!(ASKPASS_SCRIPT.contains("OPCOS_GIT_USERNAME"));
+    }
+
+    #[test]
+    fn ide_preflight_uses_the_same_upstream_prefix_as_asset_proxy() {
+        assert_eq!(
+            ide_asset_upstream_route("/out/nls.messages.js"),
+            "/ide/out/nls.messages.js"
+        );
+        assert_eq!(
+            ide_asset_upstream_route("/resources/workbench.css?x=1"),
+            "/ide/resources/workbench.css?x=1"
+        );
+        assert_eq!(
+            ide_asset_upstream_route("/static/out/workbench.js"),
+            "/ide/static/out/workbench.js"
+        );
     }
 }

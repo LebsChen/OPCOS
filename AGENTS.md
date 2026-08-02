@@ -7,6 +7,7 @@ cargo build
 cargo test
 cargo clippy --workspace --all-targets -- -D warnings
 (cd web && npm install && npx tsc --noEmit && npm run build)
+(cd web && npm run format:check)
 ```
 
 ## Hard constraints

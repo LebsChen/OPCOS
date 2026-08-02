@@ -12,11 +12,25 @@ import {
 
 describe("GUI boundary behavior", () => {
   it("does not offer local fallback for an offline remote host", () => {
-    expect(hostFailureMessage({ id: "h", name: "Remote", online: false, reason: "connection refused" })).toBe("connection refused");
+    expect(
+      hostFailureMessage({
+        id: "h",
+        name: "Remote",
+        online: false,
+        reason: "connection refused",
+      }),
+    ).toBe("connection refused");
   });
 
   it("permits only the original host binding", () => {
-    const session = { id: "s", title: "task", host_id: "remote-a", host_name: "A", model: "auto", mode: "Interactive" };
+    const session = {
+      id: "s",
+      title: "task",
+      host_id: "remote-a",
+      host_name: "A",
+      model: "auto",
+      mode: "Interactive",
+    };
     expect(canRebindSession(session, "remote-a")).toBe(true);
     expect(canRebindSession(session, "remote-b")).toBe(false);
   });
@@ -27,18 +41,26 @@ describe("GUI boundary behavior", () => {
   });
 
   it("redacts approval secrets before display", () => {
-    expect(redactApproval({ token: "secret", command: "echo ok" })).toContain("[redacted]");
-    expect(redactApproval({ token: "secret", command: "echo ok" })).not.toContain("secret");
+    expect(redactApproval({ token: "secret", command: "echo ok" })).toContain(
+      "[redacted]",
+    );
+    expect(
+      redactApproval({ token: "secret", command: "echo ok" }),
+    ).not.toContain("secret");
   });
 
   it("shows missing provider configuration instead of an assistant success", () => {
-    expect(submitFailureMessage("provider key is not configured; open Provider settings first")).toContain(
-      "Provider key is not configured",
-    );
+    expect(
+      submitFailureMessage(
+        "provider key is not configured; open Provider settings first",
+      ),
+    ).toContain("Provider key is not configured");
   });
 
   it("requires a base URL when the registry has no default", () => {
-    expect(providerBaseUrlError("", false)).toContain("base URL is not configured");
+    expect(providerBaseUrlError("", false)).toContain(
+      "base URL is not configured",
+    );
     expect(providerBaseUrlError("", true)).toBeNull();
   });
 
