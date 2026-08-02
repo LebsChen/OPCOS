@@ -34,4 +34,5 @@ opcos-provider = { path = "../crates/opcos-provider" }
 opcos-rvm = { path = "../crates/opcos-rvm" }
 opcos-mcp = { path = "../crates/opcos-mcp" }
 opcos-store = { path = "../crates/opcos-store" }
+opcos-cloud-broker = { path = "../crates/opcos-cloud-broker" }
 url.workspace = true

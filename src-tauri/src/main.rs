@@ -55,7 +55,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
-use tauri::{Emitter, Manager, RunEvent, State};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
+use tauri_plugin_opener::OpenerExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex as AsyncMutex;
@@ -113,6 +114,137 @@ struct DesktopState {
     coordination: AsyncMutex<HashMap<String, CoordinationRuntime>>,
     index_root: PathBuf,
     mcp: Arc<McpManager<McpCredentialAdapter>>,
+    cloud_enabled: Mutex<bool>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CloudStatus {
+    enabled: bool,
+    connected: bool,
+}
+
+fn cloud_secret_key(provider: &str) -> String {
+    secret_key("cloud-oauth", provider)
+}
+
+fn cloud_random_verifier() -> Result<String, String> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).map_err(|error| error.to_string())?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn cloud_pkce_challenge(verifier: &str) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+#[tauri::command]
+fn cloud_status(state: State<'_, DesktopState>, provider: String) -> Result<CloudStatus, String> {
+    let enabled = *state
+        .cloud_enabled
+        .lock()
+        .map_err(|_| "cloud state lock poisoned")?;
+    let connected = state
+        .secrets
+        .get(&cloud_secret_key(&provider))
+        .map_err(|error| error.to_string())?
+        .is_some();
+    Ok(CloudStatus { enabled, connected })
+}
+
+#[tauri::command]
+fn cloud_set_enabled(state: State<'_, DesktopState>, enabled: bool) -> Result<CloudStatus, String> {
+    *state
+        .cloud_enabled
+        .lock()
+        .map_err(|_| "cloud state lock poisoned")? = enabled;
+    let connected = state
+        .secrets
+        .get(&cloud_secret_key("linear"))
+        .map_err(|error| error.to_string())?
+        .is_some();
+    Ok(CloudStatus { enabled, connected })
+}
+
+#[tauri::command]
+async fn cloud_authorize(
+    app: AppHandle,
+    state: State<'_, DesktopState>,
+    provider: String,
+    broker_url: String,
+    redirect_uri: String,
+) -> Result<CloudStatus, String> {
+    if !*state
+        .cloud_enabled
+        .lock()
+        .map_err(|_| "cloud state lock poisoned")?
+    {
+        return Err("Cloud is disabled".into());
+    }
+    let verifier = cloud_random_verifier()?;
+    let challenge = cloud_pkce_challenge(&verifier);
+    let start = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/oauth/sessions",
+            broker_url.trim_end_matches('/')
+        ))
+        .json(&json!({
+            "provider": provider,
+            "redirect_uri": redirect_uri,
+            "code_challenge": challenge,
+        }))
+        .send()
+        .await
+        .map_err(|_| "Cloud broker is unavailable".to_owned())?;
+    if !start.status().is_success() {
+        return Err("Cloud broker rejected the OAuth request".into());
+    }
+    let start: opcos_cloud_broker::StartResponse = start
+        .json()
+        .await
+        .map_err(|_| "Cloud broker returned an invalid OAuth request".to_owned())?;
+    app.opener()
+        .open_url(start.authorize_url, None::<&str>)
+        .map_err(|error| error.to_string())?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    let mut delay = std::time::Duration::from_secs(1);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err("Cloud OAuth authorization expired".into());
+        }
+        tokio::time::sleep(delay).await;
+        let response = reqwest::Client::new()
+            .get(format!(
+                "{}/v1/oauth/sessions/{}",
+                broker_url.trim_end_matches('/'),
+                start.session_code
+            ))
+            .query(&[("code_verifier", verifier.as_str())])
+            .send()
+            .await
+            .map_err(|_| "Cloud broker polling failed".to_owned())?;
+        if response.status() == reqwest::StatusCode::ACCEPTED {
+            delay = (delay * 2).min(std::time::Duration::from_secs(15));
+            continue;
+        }
+        if !response.status().is_success() {
+            return Err("Cloud OAuth authorization failed".into());
+        }
+        let token: opcos_cloud_broker::TokenResponse = response
+            .json()
+            .await
+            .map_err(|_| "Cloud broker returned an invalid token".to_owned())?;
+        state
+            .secrets
+            .set(
+                &cloud_secret_key(&provider),
+                &serde_json::to_string(&token).unwrap(),
+            )
+            .map_err(|error| error.to_string())?;
+        return Ok(CloudStatus {
+            enabled: true,
+            connected: true,
+        });
+    }
 }
 
 #[derive(Clone)]
@@ -6696,6 +6828,7 @@ fn main() {
                 trigger_watcher_reload: Mutex::new(None),
                 trigger_watcher_stop: Mutex::new(None),
                 mcp: Arc::clone(&mcp),
+                cloud_enabled: Mutex::new(false),
             });
             let handle = app.handle().clone();
             let trigger_handle = handle.clone();
@@ -6823,6 +6956,9 @@ fn main() {
             coordination_accept_task,
             save_secret_metadata,
             list_secret_metadata,
+            cloud_status,
+            cloud_set_enabled,
+            cloud_authorize,
             provider_settings,
             provider_configurations,
             save_provider_settings,

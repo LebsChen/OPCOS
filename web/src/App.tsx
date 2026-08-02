@@ -946,6 +946,15 @@ function ManageSections({
   const [providerModels, setProviderModels] = useState<Record<string, string>>(
     {},
   );
+  const [cloudEnabled, setCloudEnabled] = useState(false);
+  const [cloudConnected, setCloudConnected] = useState(false);
+  const [cloudBrokerUrl, setCloudBrokerUrl] = useState(
+    () => localStorage.getItem("opcos:cloud-broker-url") || "",
+  );
+  const [cloudRedirectUri, setCloudRedirectUri] = useState(
+    () => localStorage.getItem("opcos:cloud-redirect-uri") || "",
+  );
+  const [cloudStatus, setCloudStatus] = useState("");
   const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
   const [assetTitle, setAssetTitle] = useState("");
   const [assetBody, setAssetBody] = useState("");
@@ -1052,6 +1061,10 @@ function ManageSections({
       "Inspect secret metadata without exposing secret values.",
     ],
     blueprint: ["Blueprint", "Read and manage the selected host blueprint."],
+    cloud: [
+      "Cloud",
+      "Optional OAuth broker. Cloud is disabled by default and never required for local work.",
+    ],
     appearance: [translate("general"), translate("appearanceDescription")],
   };
   const assetKinds = [
@@ -1106,6 +1119,17 @@ function ManageSections({
       ),
     ).then((entries) => setProviderModelOptions(Object.fromEntries(entries)));
   }, [providers]);
+  useEffect(() => {
+    if (tab !== "cloud") return;
+    void command<{ enabled: boolean; connected: boolean }>("cloud_status", {
+      provider: "linear",
+    })
+      .then((status) => {
+        setCloudEnabled(status.enabled);
+        setCloudConnected(status.connected);
+      })
+      .catch(onError);
+  }, [tab, onError]);
   return (
     <section className="settings-body">
       <header className="mb-5">
@@ -1467,6 +1491,107 @@ function ManageSections({
                 }
               >
                 {providerStatus}
+              </div>
+            )}
+            {tab === "cloud" && (
+              <div className="space-y-3">
+                <div className="settings-row">
+                  <div>
+                    <strong>Cloud broker</strong>
+                    <small>
+                      Optional OAuth callback broker. Cloud is disabled by
+                      default; local hosts and sessions never depend on it.
+                    </small>
+                  </div>
+                  <button
+                    className={`toggle ${cloudEnabled ? "on" : ""}`}
+                    onClick={() => {
+                      void command<{ enabled: boolean; connected: boolean }>(
+                        "cloud_set_enabled",
+                        { enabled: !cloudEnabled },
+                      )
+                        .then((status) => {
+                          setCloudEnabled(status.enabled);
+                          setCloudConnected(status.connected);
+                        })
+                        .catch(onError);
+                    }}
+                    type="button"
+                    aria-pressed={cloudEnabled}
+                  >
+                    {cloudEnabled ? "Enabled" : "Disabled"}
+                  </button>
+                </div>
+                <div className="form-grid">
+                  <label className="field-label">
+                    Broker URL
+                    <input
+                      type="url"
+                      value={cloudBrokerUrl}
+                      onChange={(event) => {
+                        setCloudBrokerUrl(event.target.value);
+                        localStorage.setItem(
+                          "opcos:cloud-broker-url",
+                          event.target.value,
+                        );
+                      }}
+                      placeholder="https://your-broker.example"
+                      disabled={!cloudEnabled}
+                    />
+                  </label>
+                  <label className="field-label">
+                    Registered redirect URI
+                    <input
+                      type="url"
+                      value={cloudRedirectUri}
+                      onChange={(event) => {
+                        setCloudRedirectUri(event.target.value);
+                        localStorage.setItem(
+                          "opcos:cloud-redirect-uri",
+                          event.target.value,
+                        );
+                      }}
+                      placeholder="https://your-broker.example/oauth/callback"
+                      disabled={!cloudEnabled}
+                    />
+                  </label>
+                  <div className="inline-actions">
+                    <Button
+                      className="primary"
+                      disabled={
+                        !cloudEnabled ||
+                        !cloudBrokerUrl.trim() ||
+                        !cloudRedirectUri.trim()
+                      }
+                      onClick={() => {
+                        setCloudStatus("");
+                        void command<{ enabled: boolean; connected: boolean }>(
+                          "cloud_authorize",
+                          {
+                            provider: "linear",
+                            brokerUrl: cloudBrokerUrl.trim(),
+                            redirectUri: cloudRedirectUri.trim(),
+                          },
+                        )
+                          .then((status) => {
+                            setCloudConnected(status.connected);
+                            setCloudStatus("OAuth connection stored locally.");
+                          })
+                          .catch((error) => setCloudStatus(String(error)));
+                      }}
+                    >
+                      Connect Linear
+                    </Button>
+                    <span className="text-[12px] text-muted">
+                      {cloudConnected ? "Connected locally" : "Not connected"}
+                    </span>
+                  </div>
+                  {cloudStatus && (
+                    <div className="rounded-lg border border-line bg-paper px-3 py-2 text-[12px] text-muted">
+                      {cloudStatus}
+                    </div>
+                  )}
+                </div>
               </div>
             )}
           </div>

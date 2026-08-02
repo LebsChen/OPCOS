@@ -3307,6 +3307,7 @@ dependencies = [
  "keyring",
  "notify",
  "opcos-assets",
+ "opcos-cloud-broker",
  "opcos-engine",
  "opcos-hosts",
  "opcos-mcp",
@@ -3339,6 +3340,23 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "thiserror 2.0.19",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "opcos-cloud-broker"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "getrandom 0.3.4",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
  "tokio",
  "url",
 ]
@@ -4025,6 +4043,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls 0.26.4",

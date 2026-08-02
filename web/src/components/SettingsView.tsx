@@ -20,7 +20,8 @@ export type SettingsSection =
   | "connectors"
   | "index"
   | "secrets"
-  | "blueprint";
+  | "blueprint"
+  | "cloud";
 
 const tabs: Array<{ key: SettingsSection; label: string; icon: IconName }> = [
   { key: "appearance", label: "general", icon: "sliders" },
@@ -36,6 +37,7 @@ const tabs: Array<{ key: SettingsSection; label: string; icon: IconName }> = [
   { key: "index", label: "index", icon: "search" },
   { key: "secrets", label: "secrets", icon: "shield" },
   { key: "blueprint", label: "blueprint", icon: "code" },
+  { key: "cloud", label: "cloud", icon: "globe" },
 ];
 
 export function SettingsView({

@@ -61,3 +61,53 @@ OPCOS 面临同样的拓扑（本机 UI + 远程执行），设计 OAuth 时必�
 - 特权路由（SSO / SCIM / API keys / 角色 / 计费）要求**最近 15 分钟内创建的会话**。
 - 审计负载剔除 bearer token、API key、SCIM token、SAML 证书。
 - 至少保留两个 Owner；Admin 默认不自动获得安全配置权限。
+
+## 9.6 P3 Cloud A：托管 OAuth broker（已实现本地流程）
+
+Cloud A 是可选的 OAuth 回调 broker，不是云端 agent、事件 relay 或执行平面。Cloud 默认关闭；关闭时 OPCOS 的 Host、会话、工具、审批、Inbox、连接器手工 token 路径和本地存储全部照常工作。
+
+实现位置：
+
+- `crates/opcos-cloud-broker`：可自托管的 broker，使用：
+  ```sh
+  cargo run -p opcos-cloud-broker
+  ```
+- `src-tauri/src/main.rs`：桌面端 Cloud 开关、授权启动、轮询和本地 SecretStore 写入。
+- Settings → Cloud：沿用现有 Settings sub-nav、`settings-row`、`form-grid` 和按钮 class；未打开开关时不会启动授权请求。
+
+### 流程
+
+1. 本机生成 OS CSPRNG PKCE verifier，并只向 broker 发送 S256 challenge。
+2. broker 生成一次性 CSPRNG `session_code` 和 OAuth `state`，返回 authorize URL。
+3. 浏览器访问 provider，provider 回调 broker 的 `/oauth/callback`。
+4. 本机以指数退避轮询 `session_code`；broker 先验证 PKCE，再交换 provider code。
+5. broker 将 token 仅作为一次性响应返回；本机立即写入本地 keyring/加密 SecretStore，broker 内存中的 session 随即删除。
+
+Session code 有五分钟 TTL、一次性消费和常量时间比较。OAuth state 也使用常量时间匹配。broker 不把 access token、refresh token、verifier 或 client secret 写入日志、错误或 URL；provider client secret 只存在 broker 的运行时配置中。
+
+由于 OAuth authorization-code exchange 需要 OAuth app 的 client secret，broker 在轮询完成时会短暂接收 verifier 以验证发起方并完成 exchange；verifier 不落库、不记录，且 token 不在 broker 侧持久化。这是“凭据不落云”的边界：用户 token 只落本地 SecretStore，broker 只托管 OAuth app 凭据和短生命周期交换状态。
+
+本轮没有公网部署，也没有硬编码域名。自托管 broker 的 `public_base_url`、provider client id/secret、authorize URL 和 token URL 全部通过环境变量配置。回环测试覆盖：创建 session、state callback、PKCE poll、token 一次性返回和二次消费失败。
+
+### 尚未实现
+
+- Cloud B：事件 relay / webhook 公网入站；
+- Cloud C：云端执行 fleet；
+- Cloud D：配置对象分发、组织授权和云端同步；
+- 生产公网 broker 部署、域名、TLS 和 provider-specific OAuth app 配置。
+
+启动自托管 broker 时需要显式提供配置，不存在默认公网域名：
+
+```sh
+OPCOS_BROKER_BIND=127.0.0.1:8787 \
+OPCOS_BROKER_PUBLIC_BASE_URL=https://broker.example \
+OPCOS_BROKER_PROVIDER=linear \
+OPCOS_OAUTH_CLIENT_ID=... \
+OPCOS_OAUTH_CLIENT_SECRET=... \
+OPCOS_OAUTH_AUTHORIZE_URL=https://provider.example/oauth/authorize \
+OPCOS_OAUTH_TOKEN_URL=https://provider.example/oauth/token \
+OPCOS_OAUTH_SCOPES='read write' \
+cargo run -p opcos-cloud-broker
+```
+
+示例中的域名只是配置占位符，不属于 OPCOS 内置地址；client secret 只通过 broker 进程环境注入，不进入仓库或客户端。
