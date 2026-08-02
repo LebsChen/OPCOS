@@ -3229,6 +3229,7 @@ dependencies = [
  "keyring",
  "opcos-assets",
  "opcos-engine",
+ "opcos-hosts",
  "opcos-policy",
  "opcos-provider",
  "opcos-rvm",
@@ -3276,6 +3277,19 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "opcos-hosts"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "opcos-rvm",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]

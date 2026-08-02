@@ -1,6 +1,7 @@
 export type Host = {
   id: string;
   name: string;
+  builtin?: boolean;
   online?: boolean;
   reason?: string;
 };

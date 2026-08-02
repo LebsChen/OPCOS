@@ -2,7 +2,8 @@
 
 ## 4.1 统一 host 抽象
 
-目标态由 `LocalHost`、`RvmHost`、`CloudWorker` 实现同一个 trait；这是设计约束，不代表三个实现当前都存在［推断］。
+目标态由 `LocalHost`、`RvmHost`、`CloudWorker` 实现同一个 trait；当前 `LocalHost` 与
+`RvmHost` 已落在 `opcos-hosts`，`CloudWorker` 仍是后续扩展［推断］。
 
 ```rust
 trait Host {
@@ -78,18 +79,18 @@ Cloud-Dev agent 除 health 外由统一 auth middleware 检查 bearer token；�
 
 ## 4.4 OPCOS 实现矩阵
 
-| 能力                           | OPCOS 现状                          | 目标                               |
-| ------------------------------ | ----------------------------------- | ---------------------------------- |
-| health/info/capabilities       | 已有 RVM client 调用                | 统一 `Host` trait                  |
-| exec/exec-sync                 | 已有；远程不可用显式错误            | 统一超时、session handle           |
-| read/write/ls                  | 已有部分文件操作                    | 全部使用 `RemotePath` 代数         |
-| PTY/VNC/CDP                    | Tauri surface relay 已有            | capability gate、生命周期统一      |
-| screenshot/computer-use        | 通过 RVM/engine 路径接入            | 明确 capability 和结果类型         |
-| LSP/DAP/browser                | MCP/协议层未形成统一 OPCOS trait    | 增加 capability-specific adapter   |
-| Web IDE                        | IDE proxy 已有                      | 与 host 生命周期和 token gate 统一 |
-| upload/download/storage/deploy | upload、asset export 等已有         | artifact 引用和错误模型统一        |
-| LocalHost                      | 未确认存在完整本机 session executor | 明确实现后才允许 Local 选择        |
-| CloudWorker                    | 未实现                              | 仅在 cloud 形态启用后增加          |
+| 能力                           | OPCOS 现状                                  | 目标                               |
+| ------------------------------ | ------------------------------------------- | ---------------------------------- |
+| health/info/capabilities       | 已有 RVM client 调用                        | 统一 `Host` trait                  |
+| exec/exec-sync                 | 已有；远程不可用显式错误                    | 统一超时、session handle           |
+| read/write/ls                  | 已有部分文件操作                            | 全部使用 `RemotePath` 代数         |
+| PTY/VNC/CDP                    | Tauri surface relay 已有                    | capability gate、生命周期统一      |
+| screenshot/computer-use        | 通过 RVM/engine 路径接入                    | 明确 capability 和结果类型         |
+| LSP/DAP/browser                | MCP/协议层未形成统一 OPCOS trait            | 增加 capability-specific adapter   |
+| Web IDE                        | IDE proxy 已有                              | 与 host 生命周期和 token gate 统一 |
+| upload/download/storage/deploy | upload、asset export 等已有                 | artifact 引用和错误模型统一        |
+| LocalHost                      | `opcos-hosts` 进程内实现 exec/read/write/ls | capability 探测与会话能力继续扩展  |
+| CloudWorker                    | 未实现                                      | 仅在 cloud 形态启用后增加          |
 
 Den 的 `activity-heartbeat` 是设计参照：worker 主动上报 `lastActiveAt`、`openSessionCount`、`isActiveRecently`，而不是控制面猜测健康［OW文］。OPCOS 本地 host 同样应保存最后主动健康时间［推断］。
 

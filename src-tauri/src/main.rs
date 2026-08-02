@@ -16,7 +16,7 @@ use base64::Engine;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use opcos_assets::{
-    AssetBundle, InstructionSource, KnowledgeEntry, Playbook, SkillEntry,
+    AssetBundle, AssetError, InstructionSource, KnowledgeEntry, Playbook, SkillEntry,
     discover as discover_assets, parse_blueprint,
 };
 use opcos_engine::{
@@ -24,6 +24,7 @@ use opcos_engine::{
     orchestration::{BoardPhase, BoardTask},
     orchestration::{CoordinationRuntime, Envelope, Role},
 };
+use opcos_hosts::{DEFAULT_EXEC_TIMEOUT_SECONDS, Host, LocalHost, RvmHost};
 use opcos_policy::PermissionMode;
 use opcos_provider::anthropic::AnthropicProvider;
 use opcos_provider::bedrock::BedrockProvider;
@@ -89,12 +90,52 @@ struct DesktopState {
     coordination: AsyncMutex<HashMap<String, CoordinationRuntime>>,
 }
 
-type GuiEngine = TurnEngine<Box<dyn Provider>, SqliteStore, RemoteExecutor>;
+type GuiEngine = TurnEngine<Box<dyn Provider>, SqliteStore, DesktopExecutor>;
 
 struct RemoteExecutor {
     client: HttpRvmClient,
     shell: AsyncMutex<PersistentShell<HttpRvmClient>>,
     secrets: KeyringSecretStore,
+}
+
+struct LocalExecutor {
+    host: LocalHost,
+    secrets: KeyringSecretStore,
+    session_id: String,
+}
+
+enum DesktopExecutor {
+    Remote(Box<RemoteExecutor>),
+    Local(LocalExecutor),
+}
+
+struct HostAssetReader<'a> {
+    host: &'a dyn Host,
+}
+
+#[async_trait]
+impl opcos_assets::RemoteAssetReader for HostAssetReader<'_> {
+    async fn read(&self, path: &str) -> Result<String, AssetError> {
+        self.host
+            .read(path)
+            .await
+            .map(|content| content.content)
+            .map_err(|error| AssetError::Invalid(error.to_string()))
+    }
+
+    async fn list(&self, path: Option<&str>) -> Result<Vec<(String, bool)>, AssetError> {
+        self.host
+            .ls(path)
+            .await
+            .map(|listing| {
+                listing
+                    .items
+                    .into_iter()
+                    .map(|entry| (entry.name, entry.dir))
+                    .collect()
+            })
+            .map_err(|error| AssetError::Invalid(error.to_string()))
+    }
 }
 
 #[derive(Clone)]
@@ -194,6 +235,84 @@ impl ToolExecutor for RemoteExecutor {
     }
 }
 
+#[async_trait]
+impl ToolExecutor for DesktopExecutor {
+    async fn execute(&self, name: &str, arguments: Value) -> Result<Value, String> {
+        match self {
+            Self::Remote(executor) => executor.execute(name, arguments).await,
+            Self::Local(executor) => {
+                let argument = |key: &str| {
+                    arguments
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| format!("missing string argument: {key}"))
+                };
+                match name {
+                    "read_file" => executor
+                        .host
+                        .read(argument("path")?)
+                        .await
+                        .map(|value| {
+                            json!({"path":value.path,"content":value.content,"size":value.size})
+                        })
+                        .map_err(|error| error.to_string()),
+                    "write_file" => executor
+                        .host
+                        .write(argument("path")?, argument("content")?)
+                        .await
+                        .map_err(|error| error.to_string()),
+                    "list_dir" => executor
+                        .host
+                        .ls(arguments.get("path").and_then(Value::as_str))
+                        .await
+                        .map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
+                        .map_err(|error| error.to_string()),
+                    "run_shell" | "exec" => {
+                        let names = arguments
+                            .get("secret_names")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>();
+                        let mut env = serde_json::Map::new();
+                        let mut values = Vec::new();
+                        for name in names {
+                            let value = executor
+                                .secrets
+                                .get(&secret_key("asset-secret", name))
+                                .map_err(|error| error.to_string())?
+                                .ok_or_else(|| format!("secret is not configured: {name}"))?;
+                            env.insert(name.to_owned(), Value::String(value.clone()));
+                            values.push(value);
+                        }
+                        let result = executor
+                            .host
+                            .exec(ExecRequest {
+                                command: argument("command")?.into(),
+                                cwd: arguments
+                                    .get("cwd")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                                timeout_seconds: DEFAULT_EXEC_TIMEOUT_SECONDS,
+                                session: Some(format!("opcos-local-{}", executor.session_id)),
+                                env: Some(Value::Object(env)),
+                            })
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        let mut output = serde_json::to_value(result).unwrap_or(Value::Null);
+                        for value in values {
+                            redact_json_strings(&mut output, &value);
+                        }
+                        Ok(output)
+                    }
+                    _ => Err(format!("local tool is unavailable: {name}")),
+                }
+            }
+        }
+    }
+}
+
 fn redact_json_strings(value: &mut Value, secret: &str) {
     match value {
         Value::String(text) => *text = text.replace(secret, "[REDACTED]"),
@@ -211,6 +330,7 @@ fn redact_json_strings(value: &mut Value, secret: &str) {
 struct HostView {
     id: String,
     name: String,
+    builtin: bool,
     online: Option<bool>,
     reason: Option<String>,
 }
@@ -609,6 +729,9 @@ fn session_host_id(state: &DesktopState, session_id: &str) -> Result<String, Str
 }
 
 fn client_for(state: &DesktopState, host_id: &str) -> Result<HttpRvmClient, String> {
+    if host_id == "local" {
+        return Err("本机 host 不支持该能力".into());
+    }
     let connection = state
         .database
         .lock()
@@ -861,6 +984,42 @@ async fn serve_ide_proxy(listener: TcpListener, state: IdeProxyState) {
     let _ = axum::serve(listener, router).await;
 }
 
+async fn asset_host_for_session(
+    state: &DesktopState,
+    session_id: &str,
+) -> Result<(Box<dyn Host>, String), String> {
+    let session = session_for(state, session_id)?;
+    if session.host_id == "local" {
+        if session.workspace.is_empty() {
+            return Err("local session requires an explicit workspace directory".into());
+        }
+        let workspace = PathBuf::from(session.workspace);
+        let host = LocalHost::new(&workspace).map_err(|error| error.to_string())?;
+        host.health().await.map_err(|error| error.to_string())?;
+        return Ok((Box::new(host), workspace.display().to_string()));
+    }
+    let client = client_for(state, &session.host_id)?;
+    let health = client
+        .health()
+        .await
+        .map_err(|error| format!("remote host unavailable: {error}"))?;
+    let workspace = if session.workspace.is_empty() {
+        health
+            .workspace
+            .ok_or_else(|| "remote host did not provide a workspace".to_owned())?
+    } else {
+        session.workspace
+    };
+    Ok((
+        Box::new(RvmHost::new(
+            session.host_id,
+            workspace.clone(),
+            client.with_workspace(workspace.clone()),
+        )),
+        workspace,
+    ))
+}
+
 async fn engine_for(
     app: &tauri::AppHandle,
     state: &DesktopState,
@@ -922,28 +1081,70 @@ async fn engine_for(
         .or(configured_base_url)
         .or(descriptor.default_base_url)
         .unwrap_or_default();
-    let client = client_for(state, &host_id)?;
-    let health = client.health().await.map_err(|error| {
-        let _ = state
-            .store
-            .update_session_status(session_id, "error", "host_unavailable");
-        format!("remote host unavailable: {error}")
-    })?;
-    let workspace = if session_workspace.is_empty() {
-        health.workspace.unwrap_or_else(|| "/workspace".into())
+    let (workspace, executor, remote_client, allowed_tools) = if host_id == "local" {
+        if session_workspace.is_empty() {
+            return Err("local session requires an explicit workspace directory".into());
+        }
+        let workspace = PathBuf::from(session_workspace);
+        let host = LocalHost::new(&workspace).map_err(|error| error.to_string())?;
+        let _ = host.health().await.map_err(|error| error.to_string())?;
+        let capabilities = host
+            .capabilities()
+            .await
+            .map_err(|error| error.to_string())?;
+        let allowed_tools = capabilities
+            .items
+            .iter()
+            .filter(|item| item.available)
+            .filter_map(|item| match item.name.as_str() {
+                "read" => Some("read_file".to_owned()),
+                "write" => Some("write_file".to_owned()),
+                "ls" => Some("list_dir".to_owned()),
+                "exec" | "exec_sync" => Some("run_shell".to_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut allowed_tools = allowed_tools;
+        allowed_tools.extend(["propose_plan".to_owned(), "ask_user".to_owned()]);
+        (
+            workspace.display().to_string(),
+            Arc::new(DesktopExecutor::Local(LocalExecutor {
+                host,
+                secrets: state.secrets.clone(),
+                session_id: session_id.to_owned(),
+            })),
+            None,
+            Some(allowed_tools),
+        )
     } else {
-        session_workspace
+        let client = client_for(state, &host_id)?;
+        let health = client.health().await.map_err(|error| {
+            let _ = state
+                .store
+                .update_session_status(session_id, "error", "host_unavailable");
+            format!("remote host unavailable: {error}")
+        })?;
+        let workspace = if session_workspace.is_empty() {
+            health.workspace.unwrap_or_else(|| "/workspace".into())
+        } else {
+            session_workspace
+        };
+        let executor_client = client.clone().with_workspace(workspace.clone());
+        (
+            workspace.clone(),
+            Arc::new(DesktopExecutor::Remote(Box::new(RemoteExecutor {
+                shell: AsyncMutex::new(PersistentShell::new(
+                    executor_client.clone(),
+                    format!("opcos-{session_id}"),
+                    Some(workspace.clone()),
+                )),
+                client: executor_client.clone(),
+                secrets: state.secrets.clone(),
+            }))),
+            Some(executor_client),
+            None,
+        )
     };
-    let executor_client = client.clone().with_workspace(workspace.clone());
-    let executor = Arc::new(RemoteExecutor {
-        shell: AsyncMutex::new(PersistentShell::new(
-            executor_client.clone(),
-            format!("opcos-{session_id}"),
-            Some(workspace.clone()),
-        )),
-        client: executor_client.clone(),
-        secrets: state.secrets.clone(),
-    });
     let provider: Box<dyn Provider> = match descriptor.name.as_str() {
         "bedrock" => {
             let region = std::env::var("AWS_REGION")
@@ -1013,9 +1214,13 @@ async fn engine_for(
         permission_mode,
         model,
     ));
-    if let Ok(response) = executor_client
-        .mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
-        .await
+    if let Some(allowed_tools) = allowed_tools {
+        engine.set_allowed_tools(allowed_tools).await;
+    }
+    if let Some(executor_client) = &remote_client
+        && let Ok(response) = executor_client
+            .mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
+            .await
     {
         let all_tools = response
             .get("result")
@@ -1043,7 +1248,15 @@ async fn engine_for(
             .collect();
         engine.set_external_tools(selected).await;
     }
-    if let Ok(mut bundle) = discover_assets(&executor_client, &workspace).await {
+    if let Ok((asset_host, asset_workspace)) = asset_host_for_session(state, session_id).await
+        && let Ok(mut bundle) = discover_assets(
+            &HostAssetReader {
+                host: asset_host.as_ref(),
+            },
+            &asset_workspace,
+        )
+        .await
+    {
         let local_assets = state
             .database
             .lock()
@@ -1134,13 +1347,29 @@ fn list_hosts(state: State<'_, DesktopState>) -> Result<Vec<HostView>, String> {
             Ok(HostView {
                 id: row.get(0)?,
                 name: row.get(1)?,
+                builtin: false,
                 online: None,
                 reason: None,
             })
         })
         .map_err(|error| error.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())
+    let mut hosts = vec![HostView {
+        id: "local".into(),
+        name: "本机".into(),
+        builtin: true,
+        online: Some(true),
+        reason: Some("In-process LocalHost".into()),
+    }];
+    hosts.extend(
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|mut host| {
+                host.builtin = false;
+                host
+            }),
+    );
+    Ok(hosts)
 }
 
 #[tauri::command]
@@ -1157,6 +1386,9 @@ fn save_host(
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         )
     });
+    if id == "local" {
+        return Err("本机是内置 host，不能修改绑定".into());
+    }
     let connection = state
         .database
         .lock()
@@ -1199,6 +1431,7 @@ fn save_host(
     Ok(HostView {
         id,
         name,
+        builtin: false,
         online: None,
         reason: None,
     })
@@ -1206,6 +1439,15 @@ fn save_host(
 
 #[tauri::command]
 async fn test_host(state: State<'_, DesktopState>, host_id: String) -> Result<HostView, String> {
+    if host_id == "local" {
+        return Ok(HostView {
+            id: host_id,
+            name: "本机".into(),
+            builtin: true,
+            online: Some(true),
+            reason: Some("In-process LocalHost".into()),
+        });
+    }
     let client = client_for(&state, &host_id)?;
     let info = client.info().await.map_err(|error| error.to_string());
     let connection = state
@@ -1221,6 +1463,7 @@ async fn test_host(state: State<'_, DesktopState>, host_id: String) -> Result<Ho
         Ok(info) => Ok(HostView {
             id: host_id,
             name,
+            builtin: false,
             online: Some(true),
             reason: Some(format!(
                 "{} {}",
@@ -1238,6 +1481,7 @@ async fn test_host(state: State<'_, DesktopState>, host_id: String) -> Result<Ho
             Ok(HostView {
                 id: host_id,
                 name,
+                builtin: false,
                 online: Some(false),
                 reason: Some(reason),
             })
@@ -1247,6 +1491,9 @@ async fn test_host(state: State<'_, DesktopState>, host_id: String) -> Result<Ho
 
 #[tauri::command]
 fn delete_host(state: State<'_, DesktopState>, host_id: String) -> Result<(), String> {
+    if host_id == "local" {
+        return Err("本机是内置 host，不能删除".into());
+    }
     let connection = state
         .database
         .lock()
@@ -1393,14 +1640,17 @@ fn create_session(
     );
     let model = model.unwrap_or_else(|| "auto".into());
     let mode = mode.unwrap_or_else(|| "Interactive".into());
-    let host_name: String = state
+    if host_id == "local" && workspace.as_deref().is_none_or(str::is_empty) {
+        return Err("local session requires an explicit workspace directory".into());
+    }
+    let connection = state
         .database
         .lock()
-        .map_err(|_| "database lock poisoned")?
-        .query_row("SELECT name FROM hosts WHERE id=?1", [&host_id], |row| {
-            row.get(0)
-        })
-        .map_err(|_| "remote host not found; session was not created".to_owned())?;
+        .map_err(|_| "database lock poisoned")?;
+    let host_name = host_name(&connection, &host_id)
+        .map_err(|error| format!("{error}; session was not created"))?
+        .ok_or_else(|| "remote host not found; session was not created".to_owned())?;
+    drop(connection);
     let now = Utc::now();
     state
         .store
@@ -1470,14 +1720,8 @@ fn session_view_for_host(
     connection: &Connection,
     session: SessionRecord,
 ) -> Result<Option<SessionView>, String> {
-    let host_name = match connection.query_row(
-        "SELECT name FROM hosts WHERE id=?1",
-        [&session.host_id],
-        |row| row.get::<_, String>(0),
-    ) {
-        Ok(name) => name,
-        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
-        Err(error) => return Err(error.to_string()),
+    let Some(host_name) = host_name(connection, &session.host_id)? else {
+        return Ok(None);
     };
     Ok(Some(SessionView {
         id: session.session_id,
@@ -1491,6 +1735,19 @@ fn session_view_for_host(
         run_state: session.run_state,
         stop_reason: session.stop_reason,
     }))
+}
+
+fn host_name(connection: &Connection, host_id: &str) -> Result<Option<String>, String> {
+    if host_id == "local" {
+        return Ok(Some("本机".into()));
+    }
+    match connection.query_row("SELECT name FROM hosts WHERE id=?1", [host_id], |row| {
+        row.get::<_, String>(0)
+    }) {
+        Ok(name) => Ok(Some(name)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 #[tauri::command]
@@ -1539,24 +1796,27 @@ async fn submit_turn(
     request: SubmitRequest,
 ) -> Result<(), String> {
     let host_id = session_host_id(&state, &request.session_id)?;
-    let client = client_for(&state, &host_id)?;
-    if let Err(error) = client.health().await {
-        let _ = state
-            .store
-            .update_session_status(&request.session_id, "error", "host_unavailable");
-        emit(
-            &app,
-            "notice",
-            Some(&request.session_id),
-            json!({"kind":"error","text":"Remote host unavailable"}),
-        );
-        emit(
-            &app,
-            "turn_done",
-            Some(&request.session_id),
-            session_status_payload(&state, &request.session_id),
-        );
-        return Err(format!("remote host unavailable: {error}"));
+    if host_id != "local" {
+        let client = client_for(&state, &host_id)?;
+        if let Err(error) = client.health().await {
+            let _ =
+                state
+                    .store
+                    .update_session_status(&request.session_id, "error", "host_unavailable");
+            emit(
+                &app,
+                "notice",
+                Some(&request.session_id),
+                json!({"kind":"error","text":"Remote host unavailable"}),
+            );
+            emit(
+                &app,
+                "turn_done",
+                Some(&request.session_id),
+                session_status_payload(&state, &request.session_id),
+            );
+            return Err(format!("remote host unavailable: {error}"));
+        }
     }
     let engine = engine_for(&app, &state, &request.session_id).await?;
     emit(
@@ -2300,7 +2560,7 @@ async fn git_workflow(
                     path.replace('\'', "''")
                 ),
                 cwd: None,
-                timeout_seconds: 30,
+                timeout_seconds: DEFAULT_EXEC_TIMEOUT_SECONDS,
                 session: None,
                 env: None,
             })

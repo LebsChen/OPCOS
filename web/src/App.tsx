@@ -1380,7 +1380,7 @@ function ManageSections({
                         </small>
                       </span>
                       <Button
-                        disabled={testingHostId === host.id}
+                        disabled={host.builtin || testingHostId === host.id}
                         onClick={() => {
                           setTestingHostId(host.id);
                           void onTestHost(host.id)
@@ -1392,6 +1392,7 @@ function ManageSections({
                       </Button>
                       <Button
                         className="danger"
+                        disabled={host.builtin}
                         onClick={() => {
                           if (confirmDeleteHostId === host.id) {
                             void onDeleteHost(host.id)

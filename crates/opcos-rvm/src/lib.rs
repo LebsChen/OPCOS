@@ -308,6 +308,8 @@ pub struct WsParams {
 
 pub type RvmWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
+pub const DEFAULT_EXEC_TIMEOUT_SECONDS: u64 = 30;
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PtyResize {
     #[serde(rename = "type")]
@@ -535,7 +537,7 @@ where
             .exec_sync(ExecRequest {
                 command: command.to_owned(),
                 cwd,
-                timeout_seconds: 30,
+                timeout_seconds: DEFAULT_EXEC_TIMEOUT_SECONDS,
                 session: Some(self.session.clone()),
                 env,
             })
@@ -1196,7 +1198,7 @@ mod tests {
         let request = ExecRequest {
             command: "echo hello".into(),
             cwd: None,
-            timeout_seconds: 30,
+            timeout_seconds: DEFAULT_EXEC_TIMEOUT_SECONDS,
             session: None,
             env: None,
         };

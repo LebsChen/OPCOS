@@ -89,6 +89,7 @@ pub struct TurnEngine<P, S, E> {
     unattended: AtomicBool,
     system_instructions: Mutex<Option<String>>,
     external_tools: Mutex<Vec<Value>>,
+    allowed_tools: Mutex<Option<HashSet<String>>>,
     active_tool_calls: StdMutex<HashSet<String>>,
     policy_denied: AtomicBool,
 }
@@ -149,6 +150,7 @@ where
             unattended: AtomicBool::new(false),
             system_instructions: Mutex::new(None),
             external_tools: Mutex::new(Vec::new()),
+            allowed_tools: Mutex::new(None),
             active_tool_calls: StdMutex::new(HashSet::new()),
             policy_denied: AtomicBool::new(false),
         }
@@ -160,6 +162,10 @@ where
 
     pub async fn set_external_tools(&self, tools: Vec<Value>) {
         *self.external_tools.lock().await = tools;
+    }
+
+    pub async fn set_allowed_tools(&self, tools: impl IntoIterator<Item = String>) {
+        *self.allowed_tools.lock().await = Some(tools.into_iter().collect());
     }
 
     pub async fn submit_text(&self, text: impl Into<String>) -> Result<AssistantTurn, EngineError> {
@@ -511,6 +517,11 @@ where
                     if let Ok(external) = self.external_tools.try_lock() {
                         tools.extend(external.iter().cloned().map(mcp_tool_definition));
                     }
+                    let allowed = self.allowed_tools.try_lock().ok();
+                    tools = filter_allowed_tools(
+                        tools,
+                        allowed.as_ref().and_then(|value| value.as_ref()),
+                    );
                     tools
                 },
                 settings: json!({}),
@@ -995,6 +1006,18 @@ fn tool_definitions() -> Vec<Value> {
     ]
 }
 
+fn filter_allowed_tools(mut tools: Vec<Value>, allowed: Option<&HashSet<String>>) -> Vec<Value> {
+    if let Some(allowed) = allowed {
+        tools.retain(|tool| {
+            tool.get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .is_some_and(|name| allowed.contains(name))
+        });
+    }
+    tools
+}
+
 fn mcp_tool_definition(tool: Value) -> Value {
     let name = tool
         .get("name")
@@ -1035,6 +1058,29 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use opcos_store::{SessionRecord, SessionStore, SqliteStore};
+
+    #[test]
+    fn host_capability_filter_removes_unsupported_tools() {
+        let allowed = HashSet::from([
+            "read_file".to_owned(),
+            "propose_plan".to_owned(),
+            "ask_user".to_owned(),
+        ]);
+        let tools = filter_allowed_tools(tool_definitions(), Some(&allowed));
+        let names = tools
+            .iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .collect::<HashSet<_>>();
+        assert!(names.contains("read_file"));
+        assert!(names.contains("propose_plan"));
+        assert!(!names.contains("run_shell"));
+        assert!(!names.contains("write_file"));
+        assert!(!names.contains("list_dir"));
+    }
 
     #[derive(Clone)]
     struct FakeProvider;
