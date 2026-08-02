@@ -1,8 +1,7 @@
 use async_trait::async_trait;
 use opcos_policy::{Decision, PermissionMode, classify};
-use opcos_provider::{AssistantTurn, Provider, ProviderError, ProviderRequest, StreamChunk};
+use opcos_provider::{AssistantTurn, Caps, Provider, ProviderError, ProviderRequest, StreamChunk};
 use opcos_store::SessionRecord;
-use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -56,7 +55,7 @@ where
 
     pub fn interrupt(&self) {}
 
-    pub fn capabilities(&self) -> Value {
-        self.provider.capabilities()
+    pub fn capabilities(&self, model: &str) -> Caps {
+        self.provider.capabilities(model)
     }
 }
