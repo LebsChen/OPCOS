@@ -980,6 +980,17 @@ function ManageSections({
   const [remoteAssetAction, setRemoteAssetAction] = useState<
     "discovering" | "importing" | "exporting" | null
   >(null);
+  const [devinKey, setDevinKey] = useState("");
+  const [devinKeyConfigured, setDevinKeyConfigured] = useState(false);
+  const [devinKeyStatus, setDevinKeyStatus] = useState("");
+  const [devinAssetItems, setDevinAssetItems] = useState<
+    Array<Record<string, unknown>>
+  >([]);
+  const [devinAssetOpen, setDevinAssetOpen] = useState(false);
+  const [devinAssetLoading, setDevinAssetLoading] = useState(false);
+  const [devinAssetImporting, setDevinAssetImporting] = useState<string | null>(
+    null,
+  );
   const [theme, setTheme] = useState<"light" | "dark" | "auto">(() => {
     const stored = localStorage.getItem("opcos.theme");
     return stored === "dark" || stored === "auto" ? stored : "light";
@@ -994,6 +1005,12 @@ function ManageSections({
   }, [theme]);
   const [locale, setCurrentLocale] = useState(getLocale());
   useEffect(() => subscribeLocale(() => setCurrentLocale(getLocale())), []);
+  useEffect(() => {
+    if (tab !== "connectors") return;
+    void command<Record<string, unknown>>("devin_integration_status")
+      .then((status) => setDevinKeyConfigured(status.configured === true))
+      .catch(onError);
+  }, [tab, onError]);
   const [blueprint, setBlueprint] = useState<Record<string, unknown> | null>(
     null,
   );
@@ -1074,6 +1091,37 @@ function ManageSections({
     assetTabKind === "agents"
       ? "规则"
       : assetTabKind[0].toUpperCase() + assetTabKind.slice(1);
+  const loadDevinAssets = () => {
+    const kind = assetTabKind === "playbook" ? "playbooks" : "knowledge";
+    setDevinAssetLoading(true);
+    void command<Array<Record<string, unknown>>>(
+      kind === "playbooks" ? "devin_playbooks_list" : "devin_knowledge_list",
+    )
+      .then((items) => {
+        setDevinAssetItems(items);
+        setDevinAssetOpen(true);
+      })
+      .catch(onError)
+      .finally(() => setDevinAssetLoading(false));
+  };
+  const importDevinAsset = (item: Record<string, unknown>) => {
+    const sourceId = String(item.id || Date.now());
+    const kind = assetTabKind;
+    setDevinAssetImporting(sourceId);
+    void command("save_asset", {
+      id: `devin-${kind}-${sourceId}`,
+      kind,
+      title: String(item.title || item.name || "Devin asset"),
+      body: String(item.body || ""),
+      trigger: null,
+      scope: null,
+      scopeKind: "global",
+      enabled: true,
+    })
+      .then(onRefresh)
+      .catch(onError)
+      .finally(() => setDevinAssetImporting(null));
+  };
   useEffect(() => {
     if (tab !== "instructions") return;
     setInstructionsDraft(
@@ -1767,51 +1815,64 @@ function ManageSections({
                     kind === "agents" ? "搜索规则" : `Search ${label}`
                   }
                   actions={
-                    tab === "knowledge" ? (
+                    tab === "knowledge" || tab === "playbook" ? (
                       <div className="inline-actions">
+                        {tab === "knowledge" && (
+                          <>
+                            <Button
+                              className="bordered"
+                              disabled={remoteAssetAction !== null || !selected}
+                              onClick={() =>
+                                (() => {
+                                  setRemoteAssetAction("discovering");
+                                  return command("discover_remote_assets", {
+                                    sessionId: selected!.id,
+                                  })
+                                    .then((bundle) => {
+                                      setDiscoveredAssets(bundle as Asset[]);
+                                      return onRefresh();
+                                    })
+                                    .catch(onError)
+                                    .finally(() => setRemoteAssetAction(null));
+                                })()
+                              }
+                            >
+                              {remoteAssetAction === "discovering"
+                                ? "Discovering…"
+                                : "Discover remote"}
+                            </Button>
+                            <Button
+                              className="bordered"
+                              disabled={remoteAssetAction !== null || !selected}
+                              onClick={() =>
+                                (() => {
+                                  setRemoteAssetAction("importing");
+                                  return command("import_assets", {
+                                    sessionId: selected!.id,
+                                  })
+                                    .then((bundle) => {
+                                      setDiscoveredAssets(bundle as Asset[]);
+                                      return onRefresh();
+                                    })
+                                    .catch(onError)
+                                    .finally(() => setRemoteAssetAction(null));
+                                })()
+                              }
+                            >
+                              {remoteAssetAction === "importing"
+                                ? "Importing…"
+                                : "Import"}
+                            </Button>
+                          </>
+                        )}
                         <Button
                           className="bordered"
-                          disabled={remoteAssetAction !== null || !selected}
-                          onClick={() =>
-                            (() => {
-                              setRemoteAssetAction("discovering");
-                              return command("discover_remote_assets", {
-                                sessionId: selected!.id,
-                              })
-                                .then((bundle) => {
-                                  setDiscoveredAssets(bundle as Asset[]);
-                                  return onRefresh();
-                                })
-                                .catch(onError)
-                                .finally(() => setRemoteAssetAction(null));
-                            })()
-                          }
+                          disabled={devinAssetLoading}
+                          onClick={loadDevinAssets}
                         >
-                          {remoteAssetAction === "discovering"
-                            ? "Discovering…"
-                            : "Discover remote"}
-                        </Button>
-                        <Button
-                          className="bordered"
-                          disabled={remoteAssetAction !== null || !selected}
-                          onClick={() =>
-                            (() => {
-                              setRemoteAssetAction("importing");
-                              return command("import_assets", {
-                                sessionId: selected!.id,
-                              })
-                                .then((bundle) => {
-                                  setDiscoveredAssets(bundle as Asset[]);
-                                  return onRefresh();
-                                })
-                                .catch(onError)
-                                .finally(() => setRemoteAssetAction(null));
-                            })()
-                          }
-                        >
-                          {remoteAssetAction === "importing"
-                            ? "Importing…"
-                            : "Import"}
+                          {devinAssetLoading
+                            ? "Loading Devin…"
+                            : "从 Devin 导入"}
                         </Button>
                         <Button
                           className="bordered"
@@ -2028,6 +2089,52 @@ function ManageSections({
                   }
                 />
               ))}
+            {devinAssetOpen && (tab === "knowledge" || tab === "playbook") && (
+              <div className="manage-card mt-4">
+                <div className="flex items-center justify-between">
+                  <strong>
+                    Devin{" "}
+                    {assetTabKind === "playbook" ? "Playbooks" : "Knowledge"}
+                  </strong>
+                  <Button
+                    className="bordered"
+                    onClick={() => {
+                      setDevinAssetOpen(false);
+                      setDevinAssetItems([]);
+                    }}
+                  >
+                    Close
+                  </Button>
+                </div>
+                {devinAssetItems.map((item) => {
+                  const itemId = String(item.id);
+                  return (
+                    <div className="manage-row mt-2" key={itemId}>
+                      <span>
+                        <strong>
+                          {String(item.title || item.name || itemId)}
+                        </strong>
+                        <small>{String(item.body || "").slice(0, 160)}</small>
+                      </span>
+                      <Button
+                        className="bordered"
+                        disabled={devinAssetImporting === itemId}
+                        onClick={() => importDevinAsset(item)}
+                      >
+                        {devinAssetImporting === itemId
+                          ? "Importing…"
+                          : "Import"}
+                      </Button>
+                    </div>
+                  );
+                })}
+                {!devinAssetItems.length && (
+                  <p className="px-4 py-6 text-[13px] text-muted">
+                    No Devin assets found.
+                  </p>
+                )}
+              </div>
+            )}
             {versionHistoryAsset && (
               <div className="manage-card mt-4">
                 <div className="flex items-center justify-between">
@@ -2220,6 +2327,64 @@ function ManageSections({
         {tab === "mcp" && <McpManage selected={selected} onError={onError} />}
         {tab === "connectors" && (
           <div className="space-y-5">
+            <div className="rounded-xl2 border border-line bg-panel p-5">
+              <h2 className="text-[15px] font-semibold text-ink">
+                Devin integrations
+              </h2>
+              <p className="muted mt-1">
+                Store a Devin API key securely to import Knowledge and Playbooks
+                and connect Devin MCP.
+              </p>
+              <div className="form-grid mt-4">
+                <label className="field-label">
+                  Devin API key
+                  <input
+                    type="password"
+                    value={devinKey}
+                    onChange={(event) => setDevinKey(event.target.value)}
+                    placeholder={
+                      devinKeyConfigured ? "Stored securely" : "devin_…"
+                    }
+                  />
+                </label>
+                <div className="flex gap-2 items-end">
+                  <Button
+                    className="primary"
+                    onClick={() =>
+                      command("devin_integration_save", { apiKey: devinKey })
+                        .then(() => {
+                          setDevinKey("");
+                          setDevinKeyConfigured(true);
+                          setDevinKeyStatus("Devin API key saved securely.");
+                        })
+                        .catch((error) => {
+                          setDevinKeyStatus(String(error));
+                          onError(error);
+                        })
+                    }
+                  >
+                    Save key
+                  </Button>
+                </div>
+              </div>
+              {devinKeyStatus && (
+                <div
+                  className={
+                    devinKeyStatus.includes("failed") ||
+                    devinKeyStatus.includes("cannot")
+                      ? "failure mt-3"
+                      : "success mt-3"
+                  }
+                >
+                  {devinKeyStatus}
+                </div>
+              )}
+              <div className="muted mt-3">
+                {devinKeyConfigured
+                  ? "Configured securely; the key value is not displayed."
+                  : "Not configured."}
+              </div>
+            </div>
             <div className="rounded-xl2 border border-line bg-panel p-5">
               <h2 className="text-[15px] font-semibold text-ink">Linear</h2>
               <p className="muted mt-1">
@@ -2497,6 +2662,7 @@ function McpManage({
   const [tools, setTools] = useState<Array<Record<string, unknown>>>([]);
   const [servers, setServers] = useState<Array<Record<string, unknown>>>([]);
   const [search, setSearch] = useState("");
+  const [devinMcpSaving, setDevinMcpSaving] = useState(false);
   useEffect(() => {
     void command<Array<Record<string, unknown>>>("list_mcp_servers")
       .then(setServers)
@@ -2511,79 +2677,136 @@ function McpManage({
   const filtered = tools.filter((tool) =>
     String(tool.name).toLowerCase().includes(search.toLowerCase()),
   );
+  const addDevinMcp = () => {
+    setDevinMcpSaving(true);
+    void command("devin_mcp_configure")
+      .then(() =>
+        command("save_asset", {
+          id: "devin-mcp",
+          kind: "mcp",
+          title: "Devin MCP",
+          body: JSON.stringify({
+            object_id: "devin-mcp",
+            server_key: "devin",
+            name: "Devin MCP",
+            transport: "streamable-http",
+            command: null,
+            args: [],
+            env: {},
+            cwd: null,
+            url: "https://mcp.devin.ai/mcp",
+            headers: {},
+            enabled: true,
+            requires_approval: true,
+          }),
+          trigger: null,
+          scope: null,
+          scopeKind: "global",
+          enabled: true,
+        }),
+      )
+      .then(() => command<Array<Record<string, unknown>>>("list_mcp_servers"))
+      .then(setServers)
+      .catch(onError)
+      .finally(() => setDevinMcpSaving(false));
+  };
   return (
-    <CollectionPage
-      search={search}
-      onSearch={setSearch}
-      searchPlaceholder={translate("searchMcp")}
-      rows={
-        filtered.length || servers.length ? (
-          <>
-            {servers
-              .filter((server) =>
-                String(server.name)
-                  .toLowerCase()
-                  .includes(search.toLowerCase()),
-              )
-              .map((server) => (
-                <div className="manage-row px-4" key={String(server.id)}>
+    <>
+      <div className="manage-card mb-4">
+        <div className="manage-row px-4">
+          <span>
+            <strong>Devin MCP</strong>
+            <small>https://mcp.devin.ai/mcp · Streamable HTTP</small>
+          </span>
+          <Button
+            className="bordered"
+            disabled={
+              devinMcpSaving ||
+              servers.some((server) => String(server.id) === "devin-mcp")
+            }
+            onClick={addDevinMcp}
+          >
+            {devinMcpSaving
+              ? "Adding…"
+              : servers.some((server) => String(server.id) === "devin-mcp")
+                ? "Added"
+                : "Add Devin MCP"}
+          </Button>
+        </div>
+      </div>
+      <CollectionPage
+        search={search}
+        onSearch={setSearch}
+        searchPlaceholder={translate("searchMcp")}
+        rows={
+          filtered.length || servers.length ? (
+            <>
+              {servers
+                .filter((server) =>
+                  String(server.name)
+                    .toLowerCase()
+                    .includes(search.toLowerCase()),
+                )
+                .map((server) => (
+                  <div className="manage-row px-4" key={String(server.id)}>
+                    <span>
+                      <strong>{String(server.name)}</strong>
+                      <small>
+                        {String(server.transport || "remote")} ·{" "}
+                        {String(server.status || "configured")}
+                      </small>
+                    </span>
+                    <Button
+                      onClick={() =>
+                        command("retry_mcp_server", {
+                          serverId: String(server.id),
+                        })
+                          .then(() =>
+                            command<Array<Record<string, unknown>>>(
+                              "list_mcp_servers",
+                            ),
+                          )
+                          .then(setServers)
+                          .catch(onError)
+                      }
+                    >
+                      Retry
+                    </Button>
+                  </div>
+                ))}
+              {filtered.map((tool) => (
+                <div className="manage-row px-4" key={String(tool.name)}>
                   <span>
-                    <strong>{String(server.name)}</strong>
+                    <strong>{String(tool.name)}</strong>
                     <small>
-                      {String(server.transport || "remote")} ·{" "}
-                      {String(server.status || "configured")}
+                      {String(tool.transport || "remote")} ·{" "}
+                      {String(tool.command || tool.url || "host-provided")} ·
+                      Enabled
                     </small>
                   </span>
                   <Button
                     onClick={() =>
-                      command("retry_mcp_server", {
-                        serverId: String(server.id),
-                      })
-                        .then(() =>
-                          command<Array<Record<string, unknown>>>(
-                            "list_mcp_servers",
-                          ),
-                        )
-                        .then(setServers)
-                        .catch(onError)
+                      command("set_mcp_tool_enabled", {
+                        sessionId: selected?.id,
+                        name: String(tool.name),
+                        enabled: true,
+                      }).catch(onError)
                     }
                   >
-                    Retry
+                    Enable
                   </Button>
                 </div>
               ))}
-            {filtered.map((tool) => (
-              <div className="manage-row px-4" key={String(tool.name)}>
-                <span>
-                  <strong>{String(tool.name)}</strong>
-                  <small>
-                    {String(tool.transport || "remote")} ·{" "}
-                    {String(tool.command || tool.url || "host-provided")} ·
-                    Enabled
-                  </small>
-                </span>
-                <Button
-                  onClick={() =>
-                    command("set_mcp_tool_enabled", {
-                      sessionId: selected?.id,
-                      name: String(tool.name),
-                      enabled: true,
-                    }).catch(onError)
-                  }
-                >
-                  Enable
-                </Button>
-              </div>
-            ))}
-          </>
-        ) : null
-      }
-      empty={
-        selected
-          ? "No MCP tools available."
-          : "Select a session to inspect its host MCP tools."
-      }
-    />
+            </>
+          ) : null
+        }
+        empty={
+          selected
+            ? "No MCP tools available."
+            : "Select a session to inspect its host MCP tools."
+        }
+      />
+    </>
   );
 }
 

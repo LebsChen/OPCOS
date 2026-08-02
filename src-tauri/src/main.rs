@@ -63,6 +63,9 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio_tungstenite::accept_async;
 
 const SECRET_SERVICE: &str = "com.opcos.desktop";
+const DEVIN_API_BASE: &str = "https://api.devin.ai";
+const DEVIN_MCP_URL: &str = "https://mcp.devin.ai/mcp";
+const DEVIN_MCP_SERVER_ID: &str = "devin-mcp";
 const ASKPASS_SCRIPT: &str = "if (($args -join ' ') -match 'Username') { $env:OPCOS_GIT_USERNAME } else { $env:OPCOS_GIT_PASSWORD }";
 mod repo_index;
 mod scheduler;
@@ -741,6 +744,70 @@ fn emit_pending_approval(
 
 fn secret_key(prefix: &str, id: &str) -> String {
     format!("{prefix}:{id}")
+}
+
+async fn devin_api_request(state: &DesktopState, path: &str) -> Result<Value, String> {
+    let api_key = state
+        .secrets
+        .get(&secret_key("devin-api-key", "default"))
+        .map_err(|error| error.to_string())?
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Devin API key is not configured".to_owned())?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response = client
+        .get(format!("{DEVIN_API_BASE}{path}"))
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .map_err(|error| format!("Devin API request failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Devin API request failed with status {}",
+            response.status()
+        ));
+    }
+    response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("invalid Devin API response: {error}"))
+}
+
+fn devin_items(value: Value, kind: &str) -> Vec<Value> {
+    let items = value
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    items
+        .into_iter()
+        .filter_map(|item| {
+            let id = item
+                .get("id")
+                .or_else(|| item.get(format!("{kind}_id")))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let name = item
+                .get("name")
+                .or_else(|| item.get("title"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let body = item
+                .get("body")
+                .or_else(|| item.get("content"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            if id.is_empty() || name.is_empty() {
+                return None;
+            }
+            Some(json!({"id": id, "name": name, "title": name, "body": body}))
+        })
+        .collect()
 }
 
 fn redact_approval_value(value: &Value) -> Value {
@@ -2373,6 +2440,67 @@ fn list_hosts(state: State<'_, DesktopState>) -> Result<Vec<HostView>, String> {
             }),
     );
     Ok(hosts)
+}
+
+#[tauri::command]
+fn devin_integration_status(state: State<'_, DesktopState>) -> Result<Value, String> {
+    let configured = state
+        .secrets
+        .get(&secret_key("devin-api-key", "default"))
+        .map_err(|error| error.to_string())?
+        .is_some_and(|value| !value.is_empty());
+    Ok(json!({
+        "configured": configured,
+        "api_base": DEVIN_API_BASE,
+        "mcp_url": DEVIN_MCP_URL,
+    }))
+}
+
+#[tauri::command]
+fn devin_integration_save(state: State<'_, DesktopState>, api_key: String) -> Result<(), String> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return Err("Devin API key cannot be empty".into());
+    }
+    state
+        .secrets
+        .set(&secret_key("devin-api-key", "default"), api_key)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn devin_knowledge_list(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
+    Ok(devin_items(
+        devin_api_request(&state, "/v1/knowledge").await?,
+        "knowledge",
+    ))
+}
+
+#[tauri::command]
+async fn devin_playbooks_list(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
+    Ok(devin_items(
+        devin_api_request(&state, "/v1/playbooks").await?,
+        "playbook",
+    ))
+}
+
+#[tauri::command]
+fn devin_mcp_configure(state: State<'_, DesktopState>) -> Result<(), String> {
+    let api_key = state
+        .secrets
+        .get(&secret_key("devin-api-key", "default"))
+        .map_err(|error| error.to_string())?
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Devin API key is not configured".to_owned())?;
+    let credentials = serde_json::to_string(&json!({"bearer_token": api_key}))
+        .map_err(|error| error.to_string())?;
+    state
+        .secrets
+        .set(
+            &secret_key("mcp-credential", DEVIN_MCP_SERVER_ID),
+            &credentials,
+        )
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -6954,6 +7082,11 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             list_hosts,
+            devin_integration_status,
+            devin_integration_save,
+            devin_knowledge_list,
+            devin_playbooks_list,
+            devin_mcp_configure,
             save_host,
             host_binding,
             test_host,
