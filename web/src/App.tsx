@@ -995,6 +995,16 @@ function ManageSections({
     null,
   );
   const [hostFormOpen, setHostFormOpen] = useState(false);
+  const [linearPat, setLinearPat] = useState("");
+  const [linearStatus, setLinearStatus] = useState("");
+  const [linearIssueId, setLinearIssueId] = useState("");
+  const [linearIssue, setLinearIssue] = useState<Record<
+    string,
+    unknown
+  > | null>(null);
+  const [linearIssues, setLinearIssues] = useState<
+    Array<Record<string, unknown>>
+  >([]);
   const sectionCopy: Record<SettingsSection, [string, string]> = {
     provider: [
       "Provider",
@@ -1007,6 +1017,10 @@ function ManageSections({
     playbook: ["Playbook", "Repeatable workflows available to automation."],
     skill: ["Skill", "Focused capability and instruction bundles."],
     mcp: ["MCP", "Control the tools exposed by the selected remote host."],
+    connectors: [
+      "Connectors",
+      "Linear is connected locally with a Personal API Key. Other connectors are not integrated.",
+    ],
     secrets: [
       "Secrets",
       "Inspect secret metadata without exposing secret values.",
@@ -2136,6 +2150,135 @@ function ManageSections({
           </div>
         )}
         {tab === "mcp" && <McpManage selected={selected} onError={onError} />}
+        {tab === "connectors" && (
+          <div className="space-y-5">
+            <div className="rounded-xl2 border border-line bg-panel p-5">
+              <h2 className="text-[15px] font-semibold text-ink">Linear</h2>
+              <p className="muted mt-1">
+                Direct GraphQL integration using a Personal API Key stored in
+                SecretStore. No OAuth callback or public listener is used.
+              </p>
+              <div className="form-grid mt-4">
+                <label className="field-label">
+                  Linear Personal API Key
+                  <input
+                    type="password"
+                    value={linearPat}
+                    onChange={(event) => setLinearPat(event.target.value)}
+                    placeholder="lin_api_…"
+                  />
+                </label>
+                <div className="flex gap-2 items-end">
+                  <Button
+                    className="primary"
+                    onClick={() =>
+                      command("save_secret_metadata", {
+                        name: "linear-pat",
+                        scope: "global",
+                        purpose: "Linear connector Personal API Key",
+                        value: linearPat,
+                      })
+                        .then(() => {
+                          setLinearPat("");
+                          setLinearStatus("Linear key saved in SecretStore.");
+                        })
+                        .catch(onError)
+                    }
+                  >
+                    Save key
+                  </Button>
+                  <Button
+                    className="bordered"
+                    onClick={() =>
+                      command<Record<string, unknown>>("linear_connection")
+                        .then((value) => {
+                          const viewer = value.viewer as
+                            Record<string, unknown> | undefined;
+                          setLinearStatus(
+                            value.connected
+                              ? `Connected as ${String(viewer?.name || "Linear user")}.`
+                              : "Linear connection failed.",
+                          );
+                        })
+                        .catch((error) => {
+                          setLinearStatus(String(error));
+                          onError(error);
+                        })
+                    }
+                  >
+                    Test connection
+                  </Button>
+                </div>
+              </div>
+              {linearStatus && <p className="mt-3 text-sm">{linearStatus}</p>}
+            </div>
+            <div className="rounded-xl2 border border-line bg-panel p-5">
+              <h3 className="text-[14px] font-semibold text-ink">
+                Issue tools
+              </h3>
+              <div className="flex gap-2 mt-3">
+                <input
+                  value={linearIssueId}
+                  onChange={(event) => setLinearIssueId(event.target.value)}
+                  placeholder="Issue identifier, e.g. ENG-123"
+                />
+                <Button
+                  className="bordered"
+                  onClick={() =>
+                    command<Record<string, unknown>>("linear_get_issue", {
+                      identifier: linearIssueId,
+                    })
+                      .then(setLinearIssue)
+                      .catch(onError)
+                  }
+                >
+                  Read issue
+                </Button>
+                <Button
+                  className="bordered"
+                  onClick={() =>
+                    command<Array<Record<string, unknown>>>(
+                      "linear_list_my_issues",
+                      { limit: 50 },
+                    )
+                      .then(setLinearIssues)
+                      .catch(onError)
+                  }
+                >
+                  List mine
+                </Button>
+              </div>
+              {linearIssue && (
+                <pre className="code-block mt-3">
+                  {JSON.stringify(linearIssue, null, 2)}
+                </pre>
+              )}
+              {linearIssues.length > 0 && (
+                <div className="manage-list mt-3">
+                  {linearIssues.map((issue) => (
+                    <div className="manage-row" key={String(issue.id)}>
+                      <span>
+                        <strong>
+                          {String(issue.identifier)} · {String(issue.title)}
+                        </strong>
+                        <small>{String(issue.url || "")}</small>
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            {["Slack", "Jira", "Sentry"].map((name) => (
+              <div className="manage-row px-4" key={name}>
+                <span>
+                  <strong>{name}</strong>
+                  <small>Not integrated</small>
+                </span>
+                <span className="muted">Unavailable</span>
+              </div>
+            ))}
+          </div>
+        )}
         {tab === "secrets" && (
           <CollectionPage
             search=""

@@ -12,6 +12,7 @@ export type SettingsSection =
   | "playbook"
   | "skill"
   | "mcp"
+  | "connectors"
   | "secrets"
   | "blueprint";
 
@@ -25,6 +26,7 @@ const tabs: Array<{ key: SettingsSection; label: string; icon: IconName }> = [
   { key: "playbook", label: "playbook", icon: "table" },
   { key: "skill", label: "skill", icon: "sparkle" },
   { key: "mcp", label: "mcp", icon: "plug" },
+  { key: "connectors", label: "connectors", icon: "globe" },
   { key: "secrets", label: "secrets", icon: "shield" },
   { key: "blueprint", label: "blueprint", icon: "code" },
 ];
