@@ -1,7 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { normalizeTranscript, reduceStreamEvent } from "./transcript";
+import {
+  classifyStepStatus,
+  normalizeTranscript,
+  reduceStreamEvent,
+} from "./transcript";
 
 describe("OPCOS transcript folding", () => {
+  it.each([
+    ["running", "running"],
+    ["…", "running"],
+    ["ok", "ok"],
+    ["interrupted", "failed"],
+    ["error", "failed"],
+  ] as const)("classifies %s tool steps for rendering", (status, expected) => {
+    expect(classifyStepStatus(status)).toBe(expected);
+  });
+
   it("pairs persisted tool calls with their results", () => {
     const items = normalizeTranscript([
       {
@@ -35,6 +49,65 @@ describe("OPCOS transcript folding", () => {
     expect(items.filter((item) => item.kind === "tool")).toHaveLength(1);
     expect(items[1]).toMatchObject({
       callId: "call-1",
+      status: "ok",
+      result: "ok",
+    });
+  });
+
+  it("renders interrupted store tool rows as failed tool items", () => {
+    const items = normalizeTranscript([
+      {
+        kind: "tool",
+        payload: {
+          call_id: "call-interrupted",
+          tool: "run_shell",
+          arguments: { command: "echo hi" },
+          result: null,
+          status: "interrupted",
+          approval: false,
+        },
+      },
+    ]);
+    expect(items).toContainEqual(
+      expect.objectContaining({
+        kind: "tool",
+        callId: "call-interrupted",
+        status: "interrupted",
+      }),
+    );
+  });
+
+  it("merges store tool rows into the assistant tool card by call id", () => {
+    const items = normalizeTranscript([
+      {
+        kind: "assistant",
+        payload: {
+          role: "assistant",
+          content: "",
+          tool_calls: [
+            {
+              id: "call-merge",
+              name: "run_shell",
+              arguments: { command: "pwd" },
+            },
+          ],
+        },
+      },
+      {
+        kind: "tool",
+        payload: {
+          call_id: "call-merge",
+          tool: "run_shell",
+          arguments: { command: "pwd" },
+          result: "ok",
+          status: "ok",
+          approval: false,
+        },
+      },
+    ]);
+    expect(items.filter((item) => item.kind === "tool")).toHaveLength(1);
+    expect(items.find((item) => item.kind === "tool")).toMatchObject({
+      callId: "call-merge",
       status: "ok",
       result: "ok",
     });

@@ -10,8 +10,9 @@ use opcos_store::{
     UsageRecord,
 };
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::sync::{
-    Arc,
+    Arc, Mutex as StdMutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Instant;
@@ -32,6 +33,8 @@ pub enum EngineError {
     MaxIterations,
     #[error("approval pending for tool call {0}")]
     ApprovalPending(String),
+    #[error("approval already processed: {0}")]
+    ApprovalAlreadyProcessed(String),
 }
 
 #[async_trait]
@@ -84,6 +87,22 @@ pub struct TurnEngine<P, S, E> {
     unattended: AtomicBool,
     system_instructions: Mutex<Option<String>>,
     external_tools: Mutex<Vec<Value>>,
+    active_tool_calls: StdMutex<HashSet<String>>,
+}
+
+struct ActiveToolCallGuard<'a> {
+    calls: &'a StdMutex<HashSet<String>>,
+    ids: Vec<String>,
+}
+
+impl Drop for ActiveToolCallGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut calls) = self.calls.lock() {
+            for id in &self.ids {
+                calls.remove(id);
+            }
+        }
+    }
 }
 
 impl<P, S, E> TurnEngine<P, S, E>
@@ -104,9 +123,8 @@ where
         let (events, receiver) = mpsc::channel(256);
         let session_id = session_id.into();
         let initial_sequence = store
-            .load_messages(&session_id)
+            .max_message_notice_sequence(&session_id)
             .ok()
-            .and_then(|messages| messages.into_iter().map(|message| message.sequence).max())
             .unwrap_or(0);
         Self {
             provider,
@@ -126,6 +144,7 @@ where
             unattended: AtomicBool::new(false),
             system_instructions: Mutex::new(None),
             external_tools: Mutex::new(Vec::new()),
+            active_tool_calls: StdMutex::new(HashSet::new()),
         }
     }
 
@@ -268,16 +287,35 @@ where
             .map(|message| message.sequence)
             .ok_or_else(|| EngineError::Store("approval assistant message not found".into()))?;
         let mut calls = Vec::new();
-        for item in self
+        let target = self
             .store
-            .load_pending(&self.session_id)
+            .take_pending(&self.session_id, call_id)
             .map_err(|error| EngineError::Store(error.to_string()))?
-        {
+            .ok_or_else(|| EngineError::ApprovalAlreadyProcessed(call_id.to_owned()))?;
+        let mut pending = vec![target];
+        pending.extend(
+            self.store
+                .load_pending(&self.session_id)
+                .map_err(|error| EngineError::Store(error.to_string()))?,
+        );
+        let active = self.track_tool_calls(
+            &pending
+                .iter()
+                .map(|item| ToolCall {
+                    id: item.call_id.clone(),
+                    name: item.tool.clone(),
+                    arguments: item.arguments.clone(),
+                })
+                .collect::<Vec<_>>(),
+        );
+        for (index, item) in pending.into_iter().enumerate() {
             let result = if item.call_id == call_id && outcome == ApprovalOutcome::Approve {
-                self.executor
-                    .execute(&item.tool, item.arguments.clone())
-                    .await
-                    .unwrap_or_else(|error| json!({"error": error}))
+                self.execute_tool(&ToolCall {
+                    id: item.call_id.clone(),
+                    name: item.tool.clone(),
+                    arguments: item.arguments.clone(),
+                })
+                .await
             } else if item.call_id == call_id {
                 json!({"error":"tool call denied by user"})
             } else {
@@ -291,9 +329,11 @@ where
                 },
                 result,
             ));
-            self.store
-                .delete_pending(&self.session_id, &item.call_id)
-                .map_err(|error| EngineError::Store(error.to_string()))?;
+            if index > 0 {
+                self.store
+                    .delete_pending(&self.session_id, &item.call_id)
+                    .map_err(|error| EngineError::Store(error.to_string()))?;
+            }
         }
         for (call, result) in calls {
             let value = json!({"role":"tool","content":[{"type":"tool_result",
@@ -303,6 +343,7 @@ where
                 .complete_tool_call(&self.session_id, message_sequence, &call.id, &result)
                 .map_err(|error| EngineError::Store(error.to_string()))?;
         }
+        drop(active);
         self.run_loop(self.provider_messages()?).await
     }
 
@@ -326,6 +367,26 @@ where
     }
     pub fn workspace(&self) -> &str {
         &self.workspace
+    }
+
+    pub async fn active_tool_call_ids(&self) -> Vec<String> {
+        self.active_tool_calls
+            .lock()
+            .expect("active tool mutex poisoned")
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    fn track_tool_calls(&self, calls: &[ToolCall]) -> ActiveToolCallGuard<'_> {
+        self.active_tool_calls
+            .lock()
+            .expect("active tool mutex poisoned")
+            .extend(calls.iter().map(|call| call.id.clone()));
+        ActiveToolCallGuard {
+            calls: &self.active_tool_calls,
+            ids: calls.iter().map(|call| call.id.clone()).collect(),
+        }
     }
 
     pub async fn events_receiver(&self) -> Option<mpsc::Receiver<StreamChunk>> {
@@ -504,6 +565,7 @@ where
         assistant_sequence: i64,
         calls: &[ToolCall],
     ) -> Result<Vec<Value>, EngineError> {
+        let _active = self.track_tool_calls(calls);
         let mut results: Vec<Option<Value>> = (0..calls.len()).map(|_| None).collect();
         let mut readonly = Vec::new();
         let grants = self
@@ -532,10 +594,25 @@ where
                         state: call.name.clone(),
                     })
                     .map_err(|error| EngineError::Store(error.to_string()))?;
+                let completed_reads = futures_util::future::join_all(readonly.drain(..).map(
+                    |(read_index, read_call): (usize, &ToolCall)| async move {
+                        let result = self.execute_tool(read_call).await;
+                        (read_index, result)
+                    },
+                ))
+                .await;
+                for (read_index, result) in completed_reads {
+                    results[read_index] = Some(result);
+                }
                 let completed = results
                     .iter()
                     .take(index)
-                    .filter_map(|result| result.clone())
+                    .enumerate()
+                    .filter_map(|(index, result)| {
+                        result
+                            .clone()
+                            .map(|result| (calls[index].id.clone(), result))
+                    })
                     .collect::<Vec<_>>();
                 self.persist_tool_results(assistant_sequence, &calls[..index], completed)
                     .await?;
@@ -560,12 +637,7 @@ where
                     readonly.push((index, call));
                 }
                 Decision::Allow => {
-                    results[index] = Some(
-                        self.executor
-                            .execute(&call.name, call.arguments.clone())
-                            .await
-                            .unwrap_or_else(|error| json!({"error":error})),
-                    );
+                    results[index] = Some(self.execute_tool(call).await);
                 }
                 Decision::Deny => {
                     results[index] = Some(json!({"error":"tool call denied by policy"}))
@@ -573,11 +645,7 @@ where
                 Decision::NeedsUser => {
                     let completed_reads = futures_util::future::join_all(readonly.drain(..).map(
                         |(read_index, read_call): (usize, &ToolCall)| async move {
-                            let result = self
-                                .executor
-                                .execute(&read_call.name, read_call.arguments.clone())
-                                .await
-                                .unwrap_or_else(|error| json!({"error":error}));
+                            let result = self.execute_tool(read_call).await;
                             (read_index, result)
                         },
                     ))
@@ -588,7 +656,12 @@ where
                     let completed = results
                         .iter()
                         .take(index)
-                        .filter_map(|result| result.clone())
+                        .enumerate()
+                        .filter_map(|(index, result)| {
+                            result
+                                .clone()
+                                .map(|result| (calls[index].id.clone(), result))
+                        })
                         .collect::<Vec<_>>();
                     self.persist_tool_results(assistant_sequence, &calls[..index], completed)
                         .await?;
@@ -618,30 +691,45 @@ where
         }
         let readonly_results =
             futures_util::future::join_all(readonly.into_iter().map(|(index, call)| async move {
-                let result = self
-                    .executor
-                    .execute(&call.name, call.arguments.clone())
-                    .await
-                    .unwrap_or_else(|error| json!({"error":error}));
+                let result = self.execute_tool(call).await;
                 (index, result)
             }))
             .await;
         for (index, result) in readonly_results {
             results[index] = Some(result);
         }
-        let results = results.into_iter().map(Option::unwrap).collect::<Vec<_>>();
-        self.persist_tool_results(assistant_sequence, calls, results.clone())
+        let persisted = results
+            .iter()
+            .enumerate()
+            .filter_map(|(index, result)| {
+                result
+                    .clone()
+                    .map(|result| (calls[index].id.clone(), result))
+            })
+            .collect::<Vec<_>>();
+        self.persist_tool_results(assistant_sequence, calls, persisted)
             .await?;
-        Ok(results)
+        Ok(results.into_iter().map(Option::unwrap).collect())
+    }
+
+    async fn execute_tool(&self, call: &ToolCall) -> Value {
+        self.executor
+            .execute(&call.name, call.arguments.clone())
+            .await
+            .unwrap_or_else(|error| json!({"error":error}))
     }
 
     async fn persist_tool_results(
         &self,
         assistant_sequence: i64,
         calls: &[ToolCall],
-        results: Vec<Value>,
+        results: Vec<(String, Value)>,
     ) -> Result<(), EngineError> {
-        for (call, result) in calls.iter().zip(results) {
+        for (call_id, result) in results {
+            let call = calls
+                .iter()
+                .find(|call| call.id == call_id)
+                .ok_or_else(|| EngineError::Store(format!("tool call not found: {call_id}")))?;
             let value = json!({"role":"tool","content":[{"type":"tool_result",
                 "tool_use_id":call.id,"content":[{"type":"text","text":result.to_string()}]}]});
             self.append("tool", value).await?;
@@ -914,6 +1002,51 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn restart_seeds_sequence_after_trailing_notice() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .append_message(&StoredMessage {
+                session_id: "sequence-session".into(),
+                sequence: 1,
+                role: "user".into(),
+                content: json!({"role":"user","text":"before"}),
+                display_only: false,
+            })
+            .unwrap();
+        store
+            .append_notice(&opcos_store::NoticeRecord {
+                session_id: "sequence-session".into(),
+                sequence: 2,
+                kind: "interrupted".into(),
+                content: "Turn interrupted".into(),
+            })
+            .unwrap();
+        let restarted = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "sequence-session",
+            "/workspace",
+            PermissionMode::Interactive,
+            "fake",
+        );
+        restarted.submit_text("after").await.unwrap();
+        let messages = store.load_messages("sequence-session").unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 4]
+        );
+        let transcript = store.load_transcript("sequence-session").unwrap();
+        assert_eq!(transcript[0].kind, "user");
+        assert_eq!(transcript[1].kind, "notice");
+        assert_eq!(transcript[2].kind, "user");
+        assert_eq!(transcript[3].kind, "assistant");
+    }
+
     #[derive(Clone)]
     struct ApprovalProvider {
         calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -1091,6 +1224,130 @@ mod tests {
         assert!(results.contains("read-2"));
     }
 
+    struct BlockingTools {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for BlockingTools {
+        async fn execute(&self, _: &str, _: Value) -> Result<Value, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(json!("done"))
+        }
+    }
+
+    #[tokio::test]
+    async fn approved_tool_is_tracked_until_its_result_is_persisted() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .append_message(&StoredMessage {
+                session_id: "s".into(),
+                sequence: 1,
+                role: "assistant".into(),
+                content: json!({"tool_calls":[{"id":"approved-1"}]}),
+                display_only: false,
+            })
+            .unwrap();
+        store
+            .save_pending(&PendingRecord {
+                session_id: "s".into(),
+                call_id: "approved-1".into(),
+                tool: "write_file".into(),
+                arguments: json!({"path":"x","content":"x"}),
+                state: "pending".into(),
+            })
+            .unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = Arc::new(TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(BlockingTools {
+                started: started.clone(),
+                release: release.clone(),
+                calls: calls.clone(),
+            }),
+            "s",
+            "/workspace",
+            PermissionMode::Interactive,
+            "fake",
+        ));
+        let task = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .resolve_approval("approved-1", ApprovalOutcome::Approve)
+                    .await
+            })
+        };
+        started.notified().await;
+        assert_eq!(engine.active_tool_call_ids().await, vec!["approved-1"]);
+        release.notify_one();
+        task.await.unwrap().unwrap();
+        assert!(engine.active_tool_call_ids().await.is_empty());
+        assert!(matches!(
+            engine
+                .resolve_approval("approved-1", ApprovalOutcome::Approve)
+                .await,
+            Err(EngineError::ApprovalAlreadyProcessed(id)) if id == "approved-1"
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn persisted_results_match_call_ids_when_an_intermediate_slot_is_empty() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let calls = vec![
+            ToolCall {
+                id: "first".into(),
+                name: "read_file".into(),
+                arguments: json!({}),
+            },
+            ToolCall {
+                id: "second".into(),
+                name: "read_file".into(),
+                arguments: json!({}),
+            },
+        ];
+        for call in &calls {
+            store
+                .append_tool_call(&opcos_store::ToolCallRecord {
+                    session_id: "s".into(),
+                    message_sequence: 1,
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    result: None,
+                })
+                .unwrap();
+        }
+        engine
+            .persist_tool_results(
+                1,
+                &calls,
+                vec![("second".into(), json!({"matched":"second"}))],
+            )
+            .await
+            .unwrap();
+        let records = store.load_tool_calls("s").unwrap();
+        assert_eq!(records[0].result, None);
+        assert_eq!(records[1].result, Some(json!({"matched":"second"})));
+    }
+
     #[tokio::test]
     async fn plan_and_ask_user_are_durable_pending_turns() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
@@ -1106,13 +1363,40 @@ mod tests {
             PermissionMode::Auto,
             "fake",
         );
-        let call = ToolCall {
-            id: "plan-1".into(),
-            name: "propose_plan".into(),
-            arguments: json!({"plan":"inspect"}),
-        };
-        let pending = engine.execute_tools(1, &[call]).await;
+        let calls = vec![
+            ToolCall {
+                id: "read-before-plan".into(),
+                name: "read_file".into(),
+                arguments: json!({}),
+            },
+            ToolCall {
+                id: "plan-1".into(),
+                name: "propose_plan".into(),
+                arguments: json!({"plan":"inspect"}),
+            },
+        ];
+        for call in &calls {
+            store
+                .append_tool_call(&opcos_store::ToolCallRecord {
+                    session_id: "s".into(),
+                    message_sequence: 1,
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    result: None,
+                })
+                .unwrap();
+        }
+        let pending = engine.execute_tools(1, &calls).await;
         assert!(matches!(pending, Err(EngineError::ApprovalPending(id)) if id == "plan-1"));
+        assert!(engine.active_tool_call_ids().await.is_empty());
+        assert!(
+            store
+                .load_tool_calls("s")
+                .unwrap()
+                .iter()
+                .any(|call| { call.call_id == "read-before-plan" && call.result.is_some() })
+        );
         assert_eq!(store.load_pending("s").unwrap()[0].state, "propose_plan");
         store.delete_pending("s", "plan-1").unwrap();
         let ask = ToolCall {

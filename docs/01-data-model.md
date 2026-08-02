@@ -6,22 +6,22 @@
 
 `SqliteStore::migrate` 当前创建 10 张表（`crates/opcos-store/src/lib.rs:461-539`）。
 
-| 表                  | 字段                                                                                                                                                                | 用途                                                               |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
-| `schema_migrations` | `version`, `applied_at`                                                                                                                                             | 记录迁移版本。                                                     |
-| `sessions`          | `session_id`, `workspace`, `model`, `mode`, `title`, `extra_roots`, `grants`, `pinned`, `archived`, `origin`, `origin_label`, `compaction`, `host_id`, `updated_at` | 会话元数据、工作区、模型、模式、额外 root、授权、归档和绑定 host。 |
-| `messages`          | `session_id`, `sequence`, `role`, `content`, `display_only`                                                                                                         | 按 session 和 sequence 保存消息。                                  |
-| `notices`           | `session_id`, `sequence`, `kind`, `content`                                                                                                                         | 保存结构化 notice。                                                |
-| `tool_calls`        | `session_id`, `message_sequence`, `call_id`, `name`, `arguments`, `result`                                                                                          | 保存模型提出的工具调用及结果。                                     |
-| `grants`            | `session_id`, `grant_key`, `grant_value`                                                                                                                            | 保存 session 级授权/standing grant。                               |
-| `audit_events`      | `session_id`, `sequence`, `kind`, `payload`                                                                                                                         | 保存按 session 排序的审计事件。                                    |
-| `compaction_state`  | `session_id`, `state`                                                                                                                                               | 保存 session 压缩状态。                                            |
-| `pending`           | `session_id`, `call_id`, `tool`, `arguments`, `state`                                                                                                               | 保存等待审批或其它挂起的工具调用。                                 |
-| `usage_events`      | `session_id`, `input_tokens`, `output_tokens`, `duration_ms`, `recorded_at`                                                                                         | 保存 token 用量和耗时。                                            |
+| 表                  | 字段                                                                                                                                                                                          | 用途                                                                         |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `schema_migrations` | `version`, `applied_at`                                                                                                                                                                       | 记录迁移版本。                                                               |
+| `sessions`          | `session_id`, `workspace`, `model`, `mode`, `title`, `extra_roots`, `grants`, `pinned`, `archived`, `origin`, `origin_label`, `compaction`, `host_id`, `provider`, `created_at`, `updated_at` | 会话元数据、工作区、模型、provider、模式、额外 root、授权、归档和绑定 host。 |
+| `messages`          | `session_id`, `sequence`, `role`, `content`, `display_only`                                                                                                                                   | 按 session 和 sequence 保存消息。                                            |
+| `notices`           | `session_id`, `sequence`, `kind`, `content`                                                                                                                                                   | 保存结构化 notice。                                                          |
+| `tool_calls`        | `session_id`, `message_sequence`, `call_id`, `name`, `arguments`, `result`                                                                                                                    | 保存模型提出的工具调用及结果。                                               |
+| `grants`            | `session_id`, `grant_key`, `grant_value`                                                                                                                                                      | 保存 session 级授权/standing grant。                                         |
+| `audit_events`      | `session_id`, `sequence`, `kind`, `payload`                                                                                                                                                   | 保存按 session 排序的审计事件。                                              |
+| `compaction_state`  | `session_id`, `state`                                                                                                                                                                         | 保存 session 压缩状态。                                                      |
+| `pending`           | `session_id`, `call_id`, `tool`, `arguments`, `state`                                                                                                                                         | 保存等待审批或其它挂起的工具调用。                                           |
+| `usage_events`      | `session_id`, `input_tokens`, `output_tokens`, `duration_ms`, `recorded_at`                                                                                                                   | 保存 token 用量和耗时。                                                      |
 
 `messages`、`notices`、`tool_calls`、`pending` 与 `audit_events` 都采用 session 维度的复合主键或序列键；原始字符串和 JSON 文本保留在 store 中，避免只存 UI 文案。
 
-桌面 adapter 另有 SQLite 表，不属于上述 10 张 `opcos-store` 表：旧版 `main.rs` 初始化的桌面数据库包括 `hosts`、`sessions`、`transcript`、`asset_records`、`schedules`、`secret_records`、协调任务等（`src-tauri/src/main.rs:343-455`），实际没有桌面 `tool_calls` 表。重复的是桌面 `sessions`；桌面 `transcript` 与 store 的 `messages`、`notices`、`tool_calls` 在职责上重叠。P0-1 后桌面 `sessions`/`transcript` 删除，避免两套 session/tool 数据来源漂移。
+桌面 adapter 只初始化 `hosts`、`settings`、`asset_records`、`secret_records`、`mcp_session_tools`、`asset_session_selection`、`schedules`、`coord_tasks`；`sessions` 与 `transcript` 不再由桌面 schema 创建［推断］。启动时 `SqliteStore::open` 会识别旧桌面表，在同一个 SQLite transaction 中导入并删除旧表；失败会回滚并显式返回错误，避免静默丢失［推断］。
 
 ## 1.2 目标态增量
 
@@ -103,7 +103,7 @@ OPCOS 需要吸收的概念：
 4. 建 `artifact`，先由 worklog、diff、附件导出引用，不复制文件。
 5. 建 `automation`，从 `schedules` 双写一版后再切读路径。
 6. 建 `plugin`、`plugin_member`，完成本地导入/导出后再考虑远程授权。
-7. 最后合并桌面 adapter 与 `opcos-store` 的 session/tool 权威，保留回滚迁移。
+7. P0-1 已将桌面 session/transcript 迁入 `opcos-store`；后续只允许通过 store 读写会话与 transcript，保留一次性旧表导入逻辑［推断］。
 
 迁移每一步都必须可重复、可回滚；外部参照系统的云端组织、ACU 和 handoff 不进入本地迁移［推断］。
 

@@ -3,8 +3,16 @@ import { redactApproval } from "./gui";
 export type TranscriptKind =
   "user" | "assistant" | "thinking" | "tool" | "notice" | "approval";
 
-export type ToolState = "running" | "ok" | "error" | "pending";
+export type ToolState = "running" | "ok" | "error" | "pending" | "interrupted";
 export type ApprovalResolution = "allow" | "deny";
+
+export type StepStatusKind = "running" | "ok" | "failed";
+
+export function classifyStepStatus(status: string): StepStatusKind {
+  if (status === "running" || status === "…") return "running";
+  if (status === "ok") return "ok";
+  return "failed";
+}
 
 export type TranscriptViewItem = {
   id: string;
@@ -96,6 +104,58 @@ export function normalizeTranscript(raw: RawItem[]): TranscriptViewItem[] {
           typeof payload.kind === "string" ? payload.kind : record.kind,
         text: noticeText,
       });
+      return;
+    }
+    if (
+      record.kind === "tool" &&
+      (typeof payload.call_id === "string" ||
+        typeof payload.callId === "string" ||
+        typeof payload.tool === "string" ||
+        typeof payload.toolName === "string")
+    ) {
+      const callId =
+        typeof payload.call_id === "string"
+          ? payload.call_id
+          : typeof payload.callId === "string"
+            ? payload.callId
+            : `tool-${index}`;
+      const existing = output.find(
+        (item) => item.kind === "tool" && item.callId === callId,
+      );
+      if (existing?.kind === "tool") {
+        existing.toolName =
+          typeof payload.toolName === "string"
+            ? payload.toolName
+            : typeof payload.tool === "string"
+              ? payload.tool
+              : existing.toolName;
+        existing.arguments = payload.arguments ?? existing.arguments;
+        existing.result = payload.result ?? existing.result;
+        existing.status =
+          typeof payload.status === "string"
+            ? (payload.status as ToolState)
+            : existing.status;
+        existing.approval = false;
+      } else {
+        output.push({
+          id: stableId("tool", index, callId),
+          kind: "tool",
+          callId,
+          toolName:
+            typeof payload.toolName === "string"
+              ? payload.toolName
+              : typeof payload.tool === "string"
+                ? payload.tool
+                : "tool",
+          arguments: payload.arguments,
+          result: payload.result,
+          status:
+            typeof payload.status === "string"
+              ? (payload.status as ToolState)
+              : "interrupted",
+          approval: false,
+        });
+      }
       return;
     }
     if (record.kind === "approval" || role === "approval") {
