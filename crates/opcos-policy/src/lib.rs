@@ -193,4 +193,38 @@ mod tests {
             Decision::Deny
         );
     }
+
+    #[test]
+    fn unknown_mcp_tools_require_approval_outside_auto() {
+        assert_eq!(
+            decide(
+                PermissionMode::Interactive,
+                ToolRisk::External,
+                false,
+                &[],
+                "mcp:unknown"
+            ),
+            Decision::NeedsUser
+        );
+        assert_eq!(
+            decide(
+                PermissionMode::Plan,
+                ToolRisk::External,
+                false,
+                &[],
+                "mcp:unknown"
+            ),
+            Decision::NeedsUser
+        );
+        assert_eq!(
+            decide(
+                PermissionMode::Auto,
+                ToolRisk::External,
+                false,
+                &[],
+                "mcp:unknown"
+            ),
+            Decision::Allow
+        );
+    }
 }

@@ -14,6 +14,10 @@ use axum::{
 };
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
+use opcos_assets::{
+    AssetBundle, InstructionSource, KnowledgeEntry, Playbook, SkillEntry,
+    discover as discover_assets, parse_blueprint,
+};
 use opcos_engine::{AgentEngine, EngineError, ToolExecutor, TurnEngine};
 use opcos_policy::PermissionMode;
 use opcos_provider::ProviderConfig;
@@ -50,6 +54,7 @@ type GuiEngine = TurnEngine<OpenAiProvider, SqliteStore, RemoteExecutor>;
 struct RemoteExecutor {
     client: HttpRvmClient,
     shell: AsyncMutex<PersistentShell<HttpRvmClient>>,
+    secrets: KeyringSecretStore,
 }
 
 #[derive(Clone)]
@@ -85,14 +90,38 @@ impl ToolExecutor for RemoteExecutor {
                 .await
                 .map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
                 .map_err(|error| error.to_string()),
-            "run_shell" | "exec" => self
-                .shell
-                .lock()
-                .await
-                .exec(argument("command")?)
-                .await
-                .map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
-                .map_err(|error| error.to_string()),
+            "run_shell" | "exec" => {
+                let names = arguments
+                    .get("secret_names")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>();
+                let mut env = serde_json::Map::new();
+                let mut values = Vec::new();
+                for name in names {
+                    let value = self
+                        .secrets
+                        .get(&secret_key("asset-secret", name))
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| format!("secret is not configured: {name}"))?;
+                    env.insert(name.to_owned(), Value::String(value.clone()));
+                    values.push(value);
+                }
+                let result = self
+                    .shell
+                    .lock()
+                    .await
+                    .exec_with_env(argument("command")?, Some(Value::Object(env)))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let mut output = serde_json::to_value(result).unwrap_or(Value::Null);
+                for value in values {
+                    redact_json_strings(&mut output, &value);
+                }
+                Ok(output)
+            }
             "git_status" => self
                 .client
                 .git_status(argument("cwd")?)
@@ -108,8 +137,33 @@ impl ToolExecutor for RemoteExecutor {
                 .await
                 .map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
                 .map_err(|error| error.to_string()),
+            name if name.starts_with("mcp:") => {
+                let tool = name.trim_start_matches("mcp:");
+                self.client
+                    .mcp(json!({
+                        "jsonrpc": "2.0",
+                        "id": format!("opcos-{tool}"),
+                        "method": "tools/call",
+                        "params": {"name": tool, "arguments": arguments}
+                    }))
+                    .await
+                    .map_err(|error| error.to_string())
+            }
             _ => Err(format!("remote tool is unavailable: {name}")),
         }
+    }
+}
+
+fn redact_json_strings(value: &mut Value, secret: &str) {
+    match value {
+        Value::String(text) => *text = text.replace(secret, "[REDACTED]"),
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| redact_json_strings(item, secret)),
+        Value::Object(items) => items
+            .values_mut()
+            .for_each(|item| redact_json_strings(item, secret)),
+        _ => {}
     }
 }
 
@@ -129,6 +183,7 @@ struct SessionView {
     host_name: String,
     model: String,
     mode: String,
+    workspace: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -177,6 +232,7 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                host_id TEXT NOT NULL,
                model TEXT NOT NULL,
                mode TEXT NOT NULL,
+               workspace TEXT NOT NULL DEFAULT '',
                created_at TEXT NOT NULL
              );
              CREATE TABLE IF NOT EXISTS settings (
@@ -189,9 +245,50 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                kind TEXT NOT NULL,
                payload TEXT NOT NULL,
                PRIMARY KEY(session_id, sequence)
+             );
+             CREATE TABLE IF NOT EXISTS asset_records (
+               id TEXT PRIMARY KEY,
+               kind TEXT NOT NULL,
+               title TEXT NOT NULL,
+               body TEXT NOT NULL,
+               trigger TEXT NOT NULL,
+               scope TEXT NOT NULL,
+               enabled INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS secret_records (
+               name TEXT PRIMARY KEY,
+               scope TEXT NOT NULL,
+               purpose TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS mcp_session_tools (
+               session_id TEXT NOT NULL,
+               name TEXT NOT NULL,
+               enabled INTEGER NOT NULL,
+               PRIMARY KEY(session_id,name)
+             );
+             CREATE TABLE IF NOT EXISTS asset_session_selection (
+               session_id TEXT NOT NULL,
+               asset_id TEXT NOT NULL,
+               enabled INTEGER NOT NULL,
+               PRIMARY KEY(session_id,asset_id)
              );",
         )
         .map_err(|error| error.to_string())?;
+    let has_workspace: bool = connection
+        .prepare("PRAGMA table_info(sessions)")
+        .and_then(|mut statement| {
+            let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+            Ok(rows.flatten().any(|name| name == "workspace"))
+        })
+        .map_err(|error| error.to_string())?;
+    if !has_workspace {
+        connection
+            .execute(
+                "ALTER TABLE sessions ADD COLUMN workspace TEXT NOT NULL DEFAULT ''",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
     Ok(connection)
 }
 
@@ -223,6 +320,20 @@ fn client_for(state: &DesktopState, host_id: &str) -> Result<HttpRvmClient, Stri
     let parsed = url::Url::parse(&url).map_err(|_| "remote host URL is invalid".to_owned())?;
     let config = RvmClientConfig::new(parsed, token).map_err(|error| error.to_string())?;
     HttpRvmClient::new(config).map_err(|error| error.to_string())
+}
+
+fn session_workspace(state: &DesktopState, session_id: &str) -> Result<Option<String>, String> {
+    state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .query_row(
+            "SELECT workspace FROM sessions WHERE id=?1",
+            [session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|workspace| (!workspace.is_empty()).then_some(workspace))
+        .map_err(|_| "session not found".to_owned())
 }
 
 async fn relay_surface(
@@ -414,20 +525,21 @@ async fn engine_for(
             return Ok(Arc::clone(engine));
         }
     }
-    let (host_id, model, mode) = {
+    let (host_id, model, mode, session_workspace) = {
         let connection = state
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?;
         connection
             .query_row(
-                "SELECT host_id,model,mode FROM sessions WHERE id=?1",
+                "SELECT host_id,model,mode,workspace FROM sessions WHERE id=?1",
                 [session_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 },
             )
@@ -470,7 +582,11 @@ async fn engine_for(
         .health()
         .await
         .map_err(|error| format!("remote host unavailable: {error}"))?;
-    let workspace = health.workspace.unwrap_or_else(|| "/workspace".into());
+    let workspace = if session_workspace.is_empty() {
+        health.workspace.unwrap_or_else(|| "/workspace".into())
+    } else {
+        session_workspace
+    };
     let executor_client = client.clone().with_workspace(workspace.clone());
     let executor = Arc::new(RemoteExecutor {
         shell: AsyncMutex::new(PersistentShell::new(
@@ -478,7 +594,8 @@ async fn engine_for(
             format!("opcos-{session_id}"),
             Some(workspace.clone()),
         )),
-        client: executor_client,
+        client: executor_client.clone(),
+        secrets: state.secrets.clone(),
     });
     let key = state
         .secrets
@@ -498,10 +615,93 @@ async fn engine_for(
         Arc::clone(&state.store),
         executor,
         session_id,
-        workspace,
+        workspace.clone(),
         permission_mode,
         model,
     ));
+    if let Ok(response) = executor_client
+        .mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
+        .await
+    {
+        let all_tools = response
+            .get("result")
+            .and_then(|value| value.get("tools"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let enabled = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?
+            .prepare("SELECT name FROM mcp_session_tools WHERE session_id=?1 AND enabled=1")
+            .and_then(|mut statement| {
+                let rows = statement.query_map([session_id], |row| row.get::<_, String>(0))?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_default();
+        let selected = all_tools
+            .into_iter()
+            .filter(|tool| {
+                tool.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| enabled.iter().any(|item| item == name))
+            })
+            .collect();
+        engine.set_external_tools(selected).await;
+    }
+    if let Ok(mut bundle) = discover_assets(&executor_client, &workspace).await {
+        let local_assets = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?
+            .prepare(
+                "SELECT a.id,a.kind,a.title,a.body,a.trigger,a.scope
+                 FROM asset_records a
+                 LEFT JOIN asset_session_selection s
+                   ON s.asset_id=a.id AND s.session_id=?1
+                 WHERE a.enabled=1 AND COALESCE(s.enabled,1)=1",
+            )
+            .and_then(|mut statement| {
+                let rows = statement.query_map([session_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_default();
+        for (id, kind, title, body, trigger, scope) in local_assets {
+            match kind.as_str() {
+                "knowledge" => bundle.knowledge.push(KnowledgeEntry {
+                    title,
+                    body,
+                    trigger,
+                    scope,
+                    enabled: true,
+                }),
+                "playbook" => bundle.playbook = Some(Playbook { title, body }),
+                "skill" => bundle.skills.push(SkillEntry {
+                    name: title,
+                    path: id,
+                    content: body,
+                    active: true,
+                }),
+                "agents" => bundle.agents.push(InstructionSource {
+                    path: id,
+                    content: body,
+                }),
+                _ => {}
+            }
+        }
+        engine
+            .set_system_instructions(Some(bundle.system_instructions()))
+            .await;
+    }
     let mut events = engine.events();
     let handle = app.clone();
     let session = session_id.to_owned();
@@ -734,6 +934,7 @@ fn create_session(
     host_id: String,
     model: Option<String>,
     mode: Option<String>,
+    workspace: Option<String>,
 ) -> Result<SessionView, String> {
     let id = format!(
         "session-{}",
@@ -752,8 +953,8 @@ fn create_session(
         .map_err(|_| "remote host not found; session was not created".to_owned())?;
     connection
         .execute(
-            "INSERT INTO sessions(id,title,host_id,model,mode,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
-            params![id, title, host_id, model, mode, Utc::now().to_rfc3339()],
+            "INSERT INTO sessions(id,title,host_id,model,mode,workspace,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![id, title, host_id, model, mode, workspace.clone().unwrap_or_default(), Utc::now().to_rfc3339()],
         )
         .map_err(|error| error.to_string())?;
     Ok(SessionView {
@@ -763,6 +964,7 @@ fn create_session(
         host_name,
         model,
         mode,
+        workspace: workspace.unwrap_or_default(),
     })
 }
 
@@ -773,7 +975,7 @@ fn list_sessions(state: State<'_, DesktopState>) -> Result<Vec<SessionView>, Str
         .lock()
         .map_err(|_| "database lock poisoned")?;
     let mut statement = connection
-        .prepare("SELECT s.id,s.title,s.host_id,h.name,s.model,s.mode FROM sessions s JOIN hosts h ON h.id=s.host_id ORDER BY s.created_at DESC")
+        .prepare("SELECT s.id,s.title,s.host_id,h.name,s.model,s.mode,s.workspace FROM sessions s JOIN hosts h ON h.id=s.host_id ORDER BY s.created_at DESC")
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map([], |row| {
@@ -784,6 +986,7 @@ fn list_sessions(state: State<'_, DesktopState>) -> Result<Vec<SessionView>, Str
                 host_name: row.get(3)?,
                 model: row.get(4)?,
                 mode: row.get(5)?,
+                workspace: row.get(6)?,
             })
         })
         .map_err(|error| error.to_string())?;
@@ -936,6 +1139,468 @@ async fn change_model(
 #[tauri::command]
 fn provider_descriptors() -> Vec<registry::ProviderDescriptor> {
     registry::descriptors()
+}
+
+#[tauri::command]
+fn list_assets(state: State<'_, DesktopState>, kind: Option<String>) -> Result<Vec<Value>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id,kind,title,body,trigger,scope,enabled FROM asset_records
+             WHERE (?1 IS NULL OR kind=?1) ORDER BY title",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([kind], |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "kind": row.get::<_, String>(1)?,
+                "title": row.get::<_, String>(2)?,
+                "body": row.get::<_, String>(3)?,
+                "trigger": row.get::<_, String>(4)?,
+                "scope": row.get::<_, String>(5)?,
+                "enabled": row.get::<_, bool>(6)?,
+            }))
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn save_asset(
+    state: State<'_, DesktopState>,
+    id: String,
+    kind: String,
+    title: String,
+    body: String,
+    trigger: Option<String>,
+    scope: Option<String>,
+    enabled: Option<bool>,
+) -> Result<(), String> {
+    if !matches!(kind.as_str(), "knowledge" | "playbook" | "skill" | "agents") {
+        return Err("unsupported asset kind".into());
+    }
+    state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .execute(
+            "INSERT OR REPLACE INTO asset_records
+             (id,kind,title,body,trigger,scope,enabled) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                id,
+                kind,
+                title,
+                body,
+                trigger.unwrap_or_default(),
+                scope.unwrap_or_default(),
+                enabled.unwrap_or(true)
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_asset(state: State<'_, DesktopState>, id: String) -> Result<(), String> {
+    state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .execute("DELETE FROM asset_records WHERE id=?1", [id])
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn set_asset_enabled(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    asset_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .execute(
+            "INSERT OR REPLACE INTO asset_session_selection(session_id,asset_id,enabled)
+             VALUES (?1,?2,?3)",
+            params![session_id, asset_id, enabled],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn export_assets(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    ids: Vec<String>,
+) -> Result<usize, String> {
+    let host_id = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .query_row(
+            "SELECT host_id FROM sessions WHERE id=?1",
+            [session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| "session not found".to_owned())?;
+    let client = client_for(&state, &host_id)?;
+    let health = client
+        .health()
+        .await
+        .map_err(|error| format!("remote host unavailable: {error}"))?;
+    let workspace = health.workspace.unwrap_or_else(|| "/workspace".into());
+    let rows = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id,kind,title,body,trigger,scope FROM asset_records
+                 WHERE id=?1",
+            )
+            .map_err(|error| error.to_string())?;
+        ids.iter()
+            .filter_map(|id| {
+                statement
+                    .query_row([id], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                        ))
+                    })
+                    .ok()
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut exported = 0;
+    for (id, kind, title, body, trigger, scope) in rows {
+        let (directory, filename) = match kind.as_str() {
+            "knowledge" => (".agents/knowledge", format!("{id}.md")),
+            "playbook" => (".agents/playbooks", format!("{id}.md")),
+            _ => continue,
+        };
+        let content = format!(
+            "---\nid: {id}\nname: {title}\ntrigger: {trigger}\nscope: {scope}\n---\n{body}\n"
+        );
+        client
+            .write(&format!("{workspace}/{directory}/{filename}"), &content)
+            .await
+            .map_err(|error| format!("asset export failed: {error}"))?;
+        exported += 1;
+    }
+    Ok(exported)
+}
+
+#[tauri::command]
+async fn import_assets(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<AssetBundle, String> {
+    let host_id = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .query_row(
+            "SELECT host_id FROM sessions WHERE id=?1",
+            [session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| "session not found".to_owned())?;
+    let client = client_for(&state, &host_id)?;
+    let health = client
+        .health()
+        .await
+        .map_err(|error| format!("remote host unavailable: {error}"))?;
+    let workspace = health.workspace.unwrap_or_else(|| "/workspace".into());
+    let bundle = discover_assets(&client.with_workspace(workspace.clone()), &workspace)
+        .await
+        .map_err(|error| error.to_string())?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    for item in &bundle.knowledge {
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO asset_records
+                 (id,kind,title,body,trigger,scope,enabled) VALUES (?1,'knowledge',?2,?3,?4,?5,1)",
+                params![item.title, item.title, item.body, item.trigger, item.scope],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    if let Some(item) = &bundle.playbook {
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO asset_records
+                 (id,kind,title,body,trigger,scope,enabled) VALUES (?1,'playbook',?2,?3,'','',1)",
+                params![item.title, item.title, item.body],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(bundle)
+}
+
+#[tauri::command]
+async fn discover_remote_assets(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<AssetBundle, String> {
+    let host_id = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        connection
+            .query_row(
+                "SELECT host_id FROM sessions WHERE id=?1",
+                [session_id.clone()],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|_| "session not found".to_owned())?
+    };
+    let client = client_for(&state, &host_id)?;
+    let workspace = if let Some(workspace) = session_workspace(&state, &session_id)? {
+        workspace
+    } else {
+        client
+            .health()
+            .await
+            .map_err(|error| format!("remote host unavailable: {error}"))?
+            .workspace
+            .unwrap_or_else(|| "/workspace".into())
+    };
+    discover_assets(&client.with_workspace(workspace.clone()), &workspace)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn mcp_tools(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Vec<Value>, String> {
+    let host_id = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .query_row(
+            "SELECT host_id FROM sessions WHERE id=?1",
+            [session_id.clone()],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| "session not found".to_owned())?;
+    let response = client_for(&state, &host_id)?
+        .mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(response
+        .get("result")
+        .and_then(|value| value.get("tools"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
+#[tauri::command]
+fn set_mcp_tool_enabled(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    name: String,
+    enabled: bool,
+) -> Result<(), String> {
+    state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .execute(
+            "INSERT OR REPLACE INTO mcp_session_tools(session_id,name,enabled) VALUES (?1,?2,?3)",
+            params![session_id, name, enabled],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn read_blueprint(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Value, String> {
+    let host_id = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .query_row(
+            "SELECT host_id FROM sessions WHERE id=?1",
+            [session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| "session not found".to_owned())?;
+    let client = client_for(&state, &host_id)?;
+    let content = client
+        .read(".devin/blueprint.yaml")
+        .await
+        .map_err(|error| error.to_string())?
+        .content;
+    let value: serde_yaml::Value =
+        serde_yaml::from_str(&content).map_err(|error| format!("invalid blueprint: {error}"))?;
+    serde_json::to_value(value).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn execute_blueprint(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    command: String,
+    cwd: Option<String>,
+) -> Result<Value, String> {
+    if command.trim().is_empty() {
+        return Err("blueprint command cannot be empty".into());
+    }
+    let host_id = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .query_row(
+            "SELECT host_id FROM sessions WHERE id=?1",
+            [session_id.clone()],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| "session not found".to_owned())?;
+    let client = client_for(&state, &host_id)?;
+    let result = client
+        .exec_sync(opcos_rvm::ExecRequest {
+            command,
+            cwd,
+            timeout_seconds: 1800,
+            session: Some(format!("opcos-blueprint-{session_id}")),
+            env: None,
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    serde_json::to_value(result).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn run_blueprint(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Value, String> {
+    let host_id = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .query_row(
+            "SELECT host_id FROM sessions WHERE id=?1",
+            [session_id.clone()],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| "session not found".to_owned())?;
+    let client = client_for(&state, &host_id)?;
+    let blueprint = parse_blueprint(
+        &client
+            .read(".devin/blueprint.yaml")
+            .await
+            .map_err(|error| error.to_string())?
+            .content,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut completed = Vec::new();
+    for (phase, commands) in [
+        ("initialize", blueprint.initialize),
+        ("dependencies", blueprint.dependencies),
+        ("build", blueprint.build),
+    ] {
+        for (index, command) in commands.into_iter().enumerate() {
+            let result = client
+                .exec_sync(opcos_rvm::ExecRequest {
+                    command,
+                    cwd: None,
+                    timeout_seconds: 1800,
+                    session: Some(format!("opcos-blueprint-{session_id}")),
+                    env: None,
+                })
+                .await
+                .map_err(|error| format!("blueprint {phase}[{index}] failed: {error}"))?;
+            if result.result.exit_code != 0 {
+                return Err(format!(
+                    "blueprint {phase}[{index}] failed with exit code {}: {}",
+                    result.result.exit_code,
+                    result.result.stderr.trim()
+                ));
+            }
+            completed.push(json!({
+                "phase": phase,
+                "index": index,
+                "stdout": result.result.stdout,
+                "stderr": result.result.stderr,
+            }));
+        }
+    }
+    Ok(json!({"status":"ok","completed":completed}))
+}
+
+#[tauri::command]
+fn save_secret_metadata(
+    state: State<'_, DesktopState>,
+    name: String,
+    scope: String,
+    purpose: String,
+    value: String,
+) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("secret value cannot be empty".into());
+    }
+    state
+        .secrets
+        .set(&secret_key("asset-secret", &name), &value)
+        .map_err(|error| error.to_string())?;
+    state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .execute(
+            "INSERT OR REPLACE INTO secret_records(name,scope,purpose) VALUES (?1,?2,?3)",
+            params![name, scope, purpose],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn list_secret_metadata(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let mut statement = connection
+        .prepare("SELECT name,scope,purpose FROM secret_records ORDER BY name")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(json!({
+                "name": row.get::<_, String>(0)?,
+                "scope": row.get::<_, String>(1)?,
+                "purpose": row.get::<_, String>(2)?,
+            }))
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1119,6 +1784,20 @@ fn main() {
             resolve_approval,
             change_model,
             provider_descriptors,
+            list_assets,
+            save_asset,
+            delete_asset,
+            set_asset_enabled,
+            export_assets,
+            import_assets,
+            discover_remote_assets,
+            mcp_tools,
+            set_mcp_tool_enabled,
+            read_blueprint,
+            execute_blueprint,
+            run_blueprint,
+            save_secret_metadata,
+            list_secret_metadata,
             provider_settings,
             save_provider_settings,
             save_provider_key,

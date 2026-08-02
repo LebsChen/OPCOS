@@ -76,6 +76,8 @@ pub struct TurnEngine<P, S, E> {
     sequence: Mutex<i64>,
     interrupt_notify: Arc<tokio::sync::Notify>,
     unattended: AtomicBool,
+    system_instructions: Mutex<Option<String>>,
+    external_tools: Mutex<Vec<Value>>,
 }
 
 impl<P, S, E> TurnEngine<P, S, E>
@@ -115,7 +117,17 @@ where
             sequence: Mutex::new(initial_sequence),
             interrupt_notify: Arc::new(tokio::sync::Notify::new()),
             unattended: AtomicBool::new(false),
+            system_instructions: Mutex::new(None),
+            external_tools: Mutex::new(Vec::new()),
         }
+    }
+
+    pub async fn set_system_instructions(&self, instructions: Option<String>) {
+        *self.system_instructions.lock().await = instructions;
+    }
+
+    pub async fn set_external_tools(&self, tools: Vec<Value>) {
+        *self.external_tools.lock().await = tools;
     }
 
     pub async fn submit_text(&self, text: impl Into<String>) -> Result<AssistantTurn, EngineError> {
@@ -317,7 +329,13 @@ where
             let request = ProviderRequest {
                 model: self.model.lock().await.clone(),
                 messages: messages.clone(),
-                tools: tool_definitions(),
+                tools: {
+                    let mut tools = tool_definitions();
+                    if let Ok(external) = self.external_tools.try_lock() {
+                        tools.extend(external.iter().cloned().map(mcp_tool_definition));
+                    }
+                    tools
+                },
                 settings: json!({}),
             };
             let (provider_result, partial) = self.stream_turn(request).await;
@@ -603,7 +621,8 @@ where
     }
 
     fn provider_messages(&self) -> Result<Vec<Value>, EngineError> {
-        self.store
+        let mut messages: Vec<Value> = self
+            .store
             .load_resume_messages(&self.session_id)
             .map_err(|error| EngineError::Store(error.to_string()))
             .map(|items| {
@@ -623,7 +642,16 @@ where
                         content
                     })
                     .collect()
-            })
+            })?;
+        if let Ok(instructions) = self.system_instructions.try_lock()
+            && let Some(instructions) = instructions.as_ref()
+        {
+            messages.insert(
+                0,
+                json!({"role":"system","content":[{"type":"text","text":instructions}]}),
+            );
+        }
+        Ok(messages)
     }
 
     async fn compact_context(&self, messages: Vec<Value>) -> Result<Vec<Value>, EngineError> {
@@ -745,6 +773,18 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"propose_plan","description":"Propose a plan and wait for approval.","parameters":{"type":"object","properties":{"plan":{"type":"string"}},"required":["plan"]}}}),
         json!({"type":"function","function":{"name":"ask_user","description":"Ask the user a question and wait for an answer.","parameters":{"type":"object","properties":{"question":{"type":"string"}},"required":["question"]}}}),
     ]
+}
+
+fn mcp_tool_definition(tool: Value) -> Value {
+    let name = tool
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    json!({"type":"function","function":{
+        "name":format!("mcp:{name}"),
+        "description":tool.get("description").and_then(Value::as_str).unwrap_or("External MCP tool."),
+        "parameters":tool.get("inputSchema").cloned().unwrap_or_else(|| json!({"type":"object","properties":{}}))
+    }})
 }
 
 fn downgrade_images(value: &mut Value) {
