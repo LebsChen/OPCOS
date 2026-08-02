@@ -365,6 +365,10 @@ pub struct TurnEngine<P, S, E> {
     external_tools: Mutex<Vec<Value>>,
     allowed_tools: Mutex<Option<HashSet<String>>>,
     linear_tools_enabled: AtomicBool,
+    github_tools_enabled: AtomicBool,
+    telegram_tools_enabled: AtomicBool,
+    discord_tools_enabled: AtomicBool,
+    slack_tools_enabled: AtomicBool,
     active_tool_calls: StdMutex<HashSet<String>>,
     policy_denied: AtomicBool,
 }
@@ -439,6 +443,10 @@ where
             external_tools: Mutex::new(Vec::new()),
             allowed_tools: Mutex::new(None),
             linear_tools_enabled: AtomicBool::new(false),
+            github_tools_enabled: AtomicBool::new(false),
+            telegram_tools_enabled: AtomicBool::new(false),
+            discord_tools_enabled: AtomicBool::new(false),
+            slack_tools_enabled: AtomicBool::new(false),
             active_tool_calls: StdMutex::new(HashSet::new()),
             policy_denied: AtomicBool::new(false),
         }
@@ -462,6 +470,17 @@ where
 
     pub fn set_linear_tools_enabled(&self, enabled: bool) {
         self.linear_tools_enabled.store(enabled, Ordering::SeqCst);
+    }
+
+    pub fn set_connector_tools_enabled(&self, kind: &str, enabled: bool) {
+        let target = match kind {
+            "github" => &self.github_tools_enabled,
+            "telegram" => &self.telegram_tools_enabled,
+            "discord" => &self.discord_tools_enabled,
+            "slack" => &self.slack_tools_enabled,
+            _ => return,
+        };
+        target.store(enabled, Ordering::SeqCst);
     }
 
     pub async fn submit_text(&self, text: impl Into<String>) -> Result<AssistantTurn, EngineError> {
@@ -897,6 +916,28 @@ where
                                 .and_then(Value::as_str)
                                 .is_some_and(|name| name.starts_with("linear_"))
                         });
+                    }
+                    for (prefix, enabled) in [
+                        ("github_", self.github_tools_enabled.load(Ordering::SeqCst)),
+                        (
+                            "telegram_",
+                            self.telegram_tools_enabled.load(Ordering::SeqCst),
+                        ),
+                        (
+                            "discord_",
+                            self.discord_tools_enabled.load(Ordering::SeqCst),
+                        ),
+                        ("slack_", self.slack_tools_enabled.load(Ordering::SeqCst)),
+                    ] {
+                        if !enabled {
+                            tools.retain(|tool| {
+                                !tool
+                                    .get("function")
+                                    .and_then(|function| function.get("name"))
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|name| name.starts_with(prefix))
+                            });
+                        }
                     }
                     tools
                 },
@@ -1351,6 +1392,9 @@ fn tool_risk(name: &str) -> ToolRisk {
         | "git_log"
         | "linear_get_issue"
         | "linear_list_my_issues"
+        | "github_list_repositories"
+        | "github_list_issues"
+        | "slack_list_channels"
         | "repo_index_find_symbol"
         | "repo_index_glob"
         | "repo_index_search" => ToolRisk::Read,
@@ -1762,6 +1806,13 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"linear_list_my_issues","description":"List Linear issues assigned to the current user. Read-only.","parameters":{"type":"object","properties":{"limit":{"type":"integer"}}}}}),
         json!({"type":"function","function":{"name":"linear_comment_issue","description":"Add a comment to a Linear issue. Requires approval.","parameters":{"type":"object","properties":{"issue_id":{"type":"string"},"body":{"type":"string"}},"required":["issue_id","body"]}}}),
         json!({"type":"function","function":{"name":"linear_update_issue_status","description":"Change a Linear issue status. Requires approval.","parameters":{"type":"object","properties":{"issue_id":{"type":"string"},"state_id":{"type":"string"}},"required":["issue_id","state_id"]}}}),
+        json!({"type":"function","function":{"name":"github_list_repositories","description":"List repositories visible to the configured GitHub account. Read-only.","parameters":{"type":"object","properties":{}}}}),
+        json!({"type":"function","function":{"name":"github_list_issues","description":"List issues for a GitHub repository. Read-only.","parameters":{"type":"object","properties":{"owner":{"type":"string"},"repo":{"type":"string"}},"required":["owner","repo"]}}}),
+        json!({"type":"function","function":{"name":"github_create_issue","description":"Create a GitHub issue. Requires approval.","parameters":{"type":"object","properties":{"owner":{"type":"string"},"repo":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"}},"required":["owner","repo","title"]}}}),
+        json!({"type":"function","function":{"name":"telegram_send_message","description":"Send a Telegram bot message. Requires approval.","parameters":{"type":"object","properties":{"chat_id":{"type":"string"},"text":{"type":"string"}},"required":["chat_id","text"]}}}),
+        json!({"type":"function","function":{"name":"discord_send_message","description":"Send a Discord bot message to a channel. Requires approval.","parameters":{"type":"object","properties":{"channel_id":{"type":"string"},"content":{"type":"string"}},"required":["channel_id","content"]}}}),
+        json!({"type":"function","function":{"name":"slack_list_channels","description":"List Slack channels visible to the configured bot. Read-only.","parameters":{"type":"object","properties":{}}}}),
+        json!({"type":"function","function":{"name":"slack_post_message","description":"Post a Slack channel message. Requires approval.","parameters":{"type":"object","properties":{"channel":{"type":"string"},"text":{"type":"string"}},"required":["channel","text"]}}}),
         json!({"type":"function","function":{"name":"repo_index_find_symbol","description":"Find definitions and symbols in the repository index. Read-only.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}),
         json!({"type":"function","function":{"name":"repo_index_glob","description":"Find repository paths matching a glob. Read-only.","parameters":{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}}}),
         json!({"type":"function","function":{"name":"repo_index_search","description":"Search indexed symbol/content lines without loading whole files. Read-only.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}),

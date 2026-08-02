@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import {
   Component,
   FormEvent,
+  Fragment,
   ReactNode,
   useEffect,
   useMemo,
@@ -70,6 +71,10 @@ type SecretMetadata = { name: string; scope: string; purpose: string };
 type ConnectorCatalogEntry = {
   name: string;
   description: string;
+};
+type TokenConnectorStatus = {
+  connected: boolean;
+  identity?: string;
 };
 type InboxRecord = {
   session_id: string;
@@ -1179,6 +1184,13 @@ function ManageSections({
     void command<Record<string, unknown>>("devin_integration_status")
       .then((status) => setDevinKeyConfigured(status.configured === true))
       .catch(onError);
+    for (const kind of ["github", "telegram", "discord", "slack"]) {
+      void command<TokenConnectorStatus>("connector_status", { kind })
+        .then((status) =>
+          setConnectorStatuses((items) => ({ ...items, [kind]: status })),
+        )
+        .catch(() => undefined);
+    }
   }, [tab, onError]);
   const [blueprint, setBlueprint] = useState<Record<string, unknown> | null>(
     null,
@@ -1192,6 +1204,16 @@ function ManageSections({
   const [hostFormOpen, setHostFormOpen] = useState(false);
   const [linearPat, setLinearPat] = useState("");
   const [linearStatus, setLinearStatus] = useState("");
+  const [connectorTokens, setConnectorTokens] = useState<
+    Record<string, string>
+  >({});
+  const [connectorStatuses, setConnectorStatuses] = useState<
+    Record<string, TokenConnectorStatus>
+  >({});
+  const [connectorMessages, setConnectorMessages] = useState<
+    Record<string, string>
+  >({});
+  const [openConnector, setOpenConnector] = useState<string | null>(null);
   const [linearIssueId, setLinearIssueId] = useState("");
   const [linearIssue, setLinearIssue] = useState<Record<
     string,
@@ -2514,10 +2536,23 @@ function ManageSections({
               </p>
               <div className="manage-list mt-4">
                 {OPENWORKER_CONNECTORS.map((connector) => {
+                  const connectorKind = connector.name.toLowerCase();
+                  const tokenIntegrated = [
+                    "github",
+                    "telegram",
+                    "discord",
+                    "slack",
+                  ].includes(connectorKind);
                   const integrated =
-                    connector.name === "Linear" || connector.name === "Devin";
-                  const status =
-                    connector.name === "Devin"
+                    tokenIntegrated ||
+                    connector.name === "Linear" ||
+                    connector.name === "Devin";
+                  const tokenStatus = connectorStatuses[connectorKind];
+                  const status = tokenIntegrated
+                    ? tokenStatus?.connected
+                      ? `Connected as ${tokenStatus.identity || "bot"}`
+                      : "Configurable"
+                    : connector.name === "Devin"
                       ? devinKeyConfigured
                         ? "Connected"
                         : "Configurable"
@@ -2527,20 +2562,101 @@ function ManageSections({
                           : "Configurable"
                         : "Not integrated";
                   return (
-                    <div className="manage-row px-4" key={connector.name}>
-                      <span>
-                        <strong>{connector.name}</strong>
-                        <small>{connector.description}</small>
-                      </span>
-                      <span className="flex items-center gap-2">
-                        <span className="muted">{status}</span>
-                        {!integrated && (
-                          <Button className="bordered" disabled>
-                            Unavailable
+                    <Fragment key={connector.name}>
+                      <div className="manage-row px-4">
+                        <span>
+                          <strong>{connector.name}</strong>
+                          <small>{connector.description}</small>
+                        </span>
+                        <span className="flex items-center gap-2">
+                          <span className="muted">{status}</span>
+                          {tokenIntegrated ? (
+                            <Button
+                              className="bordered"
+                              onClick={() =>
+                                setOpenConnector((value) =>
+                                  value === connectorKind
+                                    ? null
+                                    : connectorKind,
+                                )
+                              }
+                            >
+                              {openConnector === connectorKind
+                                ? "Close"
+                                : "Configure"}
+                            </Button>
+                          ) : !integrated ? (
+                            <Button className="bordered" disabled>
+                              Unavailable
+                            </Button>
+                          ) : null}
+                        </span>
+                      </div>
+                      {tokenIntegrated && openConnector === connectorKind && (
+                        <div className="manage-row px-4">
+                          <label className="field-label flex-1">
+                            {connector.name} token
+                            <input
+                              type="password"
+                              value={connectorTokens[connectorKind] || ""}
+                              placeholder={
+                                tokenStatus?.connected ? "Stored securely" : ""
+                              }
+                              onChange={(event) =>
+                                setConnectorTokens((items) => ({
+                                  ...items,
+                                  [connectorKind]: event.target.value,
+                                }))
+                              }
+                            />
+                          </label>
+                          <Button
+                            className="primary self-end"
+                            onClick={() =>
+                              command<TokenConnectorStatus>("connector_save", {
+                                kind: connectorKind,
+                                token: connectorTokens[connectorKind] || "",
+                              })
+                                .then((value) => {
+                                  setConnectorStatuses((items) => ({
+                                    ...items,
+                                    [connectorKind]: value,
+                                  }));
+                                  setConnectorTokens((items) => ({
+                                    ...items,
+                                    [connectorKind]: "",
+                                  }));
+                                  setConnectorMessages((items) => ({
+                                    ...items,
+                                    [connectorKind]: `Connected as ${value.identity || "bot"}.`,
+                                  }));
+                                })
+                                .catch((error) => {
+                                  setConnectorMessages((items) => ({
+                                    ...items,
+                                    [connectorKind]: errorMessage(error),
+                                  }));
+                                })
+                            }
+                          >
+                            Save & verify
                           </Button>
-                        )}
-                      </span>
-                    </div>
+                          {connectorMessages[connectorKind] && (
+                            <small
+                              className={
+                                connectorMessages[connectorKind].startsWith(
+                                  "Connected",
+                                )
+                                  ? "success"
+                                  : "failure"
+                              }
+                            >
+                              {connectorMessages[connectorKind]}
+                            </small>
+                          )}
+                        </div>
+                      )}
+                    </Fragment>
                   );
                 })}
               </div>

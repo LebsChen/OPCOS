@@ -394,6 +394,13 @@ impl ToolExecutor for RemoteExecutor {
             | "linear_update_issue_status" => {
                 execute_linear_tool(&self.secrets, name, arguments).await
             }
+            name if name.starts_with("github_")
+                || name.starts_with("telegram_")
+                || name.starts_with("discord_")
+                || name.starts_with("slack_") =>
+            {
+                execute_connector_tool(&self.secrets, name, arguments).await
+            }
             "repo_index_find_symbol" | "repo_index_glob" | "repo_index_search" => {
                 let host = RvmHost::new(
                     self.host_id.clone(),
@@ -507,6 +514,13 @@ impl ToolExecutor for DesktopExecutor {
                     "linear_get_issue" | "linear_list_my_issues" | "linear_comment_issue"
                     | "linear_update_issue_status" => {
                         execute_linear_tool(&executor.secrets, name, arguments).await
+                    }
+                    name if name.starts_with("github_")
+                        || name.starts_with("telegram_")
+                        || name.starts_with("discord_")
+                        || name.starts_with("slack_") =>
+                    {
+                        execute_connector_tool(&executor.secrets, name, arguments).await
                     }
                     "repo_index_find_symbol" | "repo_index_glob" | "repo_index_search" => {
                         execute_index_tool(
@@ -2064,6 +2078,16 @@ async fn engine_for(
         .get(&secret_key("asset-secret", "linear-pat"))
         .map_err(|error| error.to_string())?
         .is_some();
+    let connector_tools_enabled = ["github", "telegram", "discord", "slack"]
+        .into_iter()
+        .map(|kind| {
+            state
+                .secrets
+                .get(&secret_key("connector-token", kind))
+                .map(|value| (kind, value.is_some()))
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<HashMap<_, _>, _>>()?;
     let mcp_runtime = Arc::clone(&state.mcp);
     let (workspace, executor, remote_client, allowed_tools) = if host_id == "local" {
         if session_workspace.is_empty() {
@@ -2101,6 +2125,25 @@ async fn engine_for(
                 "linear_list_my_issues".to_owned(),
                 "linear_comment_issue".to_owned(),
                 "linear_update_issue_status".to_owned(),
+            ]);
+        }
+        if connector_tools_enabled["github"] {
+            allowed_tools.extend([
+                "github_list_repositories".to_owned(),
+                "github_list_issues".to_owned(),
+                "github_create_issue".to_owned(),
+            ]);
+        }
+        if connector_tools_enabled["telegram"] {
+            allowed_tools.push("telegram_send_message".to_owned());
+        }
+        if connector_tools_enabled["discord"] {
+            allowed_tools.push("discord_send_message".to_owned());
+        }
+        if connector_tools_enabled["slack"] {
+            allowed_tools.extend([
+                "slack_list_channels".to_owned(),
+                "slack_post_message".to_owned(),
             ]);
         }
         (
@@ -2225,6 +2268,9 @@ async fn engine_for(
         model,
     ));
     engine.set_linear_tools_enabled(linear_tools_enabled);
+    for kind in ["github", "telegram", "discord", "slack"] {
+        engine.set_connector_tools_enabled(kind, connector_tools_enabled[kind]);
+    }
     engine.set_unattended(
         state
             .store
@@ -5037,6 +5083,289 @@ async fn linear_connection(state: State<'_, DesktopState>) -> Result<Value, Stri
     )
 }
 
+fn connector_token(state: &DesktopState, kind: &str) -> Result<String, String> {
+    state
+        .secrets
+        .get(&secret_key("connector-token", kind))
+        .map_err(|error| format!("{kind} token unavailable: {error}"))?
+        .ok_or_else(|| format!("{kind} token is not configured"))
+}
+
+async fn connector_json(request: reqwest::RequestBuilder, kind: &str) -> Result<Value, String> {
+    let response = request
+        .send()
+        .await
+        .map_err(|_| format!("{kind} request failed"))?;
+    let status = response.status();
+    let body = response
+        .json::<Value>()
+        .await
+        .map_err(|_| format!("{kind} returned invalid JSON"))?;
+    if !status.is_success() {
+        return Err(format!("{kind} request failed ({status})"));
+    }
+    Ok(body)
+}
+
+async fn connector_identity(state: &DesktopState, kind: &str) -> Result<Value, String> {
+    let token = connector_token(state, kind)?;
+    let client = reqwest::Client::new();
+    match kind {
+        "github" => {
+            let body = connector_json(
+                client
+                    .get("https://api.github.com/user")
+                    .bearer_auth(&token)
+                    .header("User-Agent", "OPCOS"),
+                "GitHub",
+            )
+            .await?;
+            let login = body
+                .get("login")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "GitHub response did not include login".to_owned())?;
+            Ok(json!({"connected": true, "identity": login}))
+        }
+        "telegram" => {
+            let url = format!("https://api.telegram.org/bot{token}/getMe");
+            let body = connector_json(client.get(url), "Telegram").await?;
+            if body.get("ok").and_then(Value::as_bool) != Some(true) {
+                return Err("Telegram bot token validation failed".into());
+            }
+            let user = body
+                .get("result")
+                .ok_or_else(|| "Telegram response did not include bot identity".to_owned())?;
+            let username = user
+                .get("username")
+                .and_then(Value::as_str)
+                .unwrap_or("bot");
+            Ok(json!({"connected": true, "identity": format!("@{username}")}))
+        }
+        "discord" => {
+            let body = connector_json(
+                client
+                    .get("https://discord.com/api/v10/users/@me")
+                    .bearer_auth(&token),
+                "Discord",
+            )
+            .await?;
+            let username = body
+                .get("username")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Discord response did not include username".to_owned())?;
+            Ok(json!({"connected": true, "identity": username}))
+        }
+        "slack" => {
+            let body = connector_json(
+                client
+                    .get("https://slack.com/api/auth.test")
+                    .bearer_auth(&token),
+                "Slack",
+            )
+            .await?;
+            if body.get("ok").and_then(Value::as_bool) != Some(true) {
+                return Err("Slack token validation failed".into());
+            }
+            let identity = body
+                .get("user")
+                .or_else(|| body.get("user_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("Slack bot");
+            Ok(json!({"connected": true, "identity": identity}))
+        }
+        _ => Err(format!("unsupported connector: {kind}")),
+    }
+}
+
+#[tauri::command]
+async fn connector_save(
+    state: State<'_, DesktopState>,
+    kind: String,
+    token: String,
+) -> Result<Value, String> {
+    let kind = kind.trim().to_ascii_lowercase();
+    if !matches!(kind.as_str(), "github" | "telegram" | "discord" | "slack") {
+        return Err(format!("unsupported connector: {kind}"));
+    }
+    if token.trim().is_empty() {
+        return Err("connector token cannot be empty".into());
+    }
+    let key = secret_key("connector-token", &kind);
+    let previous = state.secrets.get(&key).map_err(|error| error.to_string())?;
+    state
+        .secrets
+        .set(&key, &token)
+        .map_err(|error| error.to_string())?;
+    match connector_identity(&state, &kind).await {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            match previous {
+                Some(value) => state.secrets.set(&key, &value),
+                None => state.secrets.delete(&key),
+            }
+            .map_err(|restore_error| restore_error.to_string())?;
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command]
+async fn connector_status(state: State<'_, DesktopState>, kind: String) -> Result<Value, String> {
+    let kind = kind.trim().to_ascii_lowercase();
+    if !matches!(kind.as_str(), "github" | "telegram" | "discord" | "slack") {
+        return Err(format!("unsupported connector: {kind}"));
+    }
+    connector_identity(&state, &kind).await
+}
+
+#[tauri::command]
+async fn connector_validate(state: State<'_, DesktopState>, kind: String) -> Result<Value, String> {
+    connector_status(state, kind).await
+}
+
+async fn github_json(
+    token: &str,
+    method: reqwest::Method,
+    url: &str,
+    body: Option<Value>,
+) -> Result<Value, String> {
+    let client = reqwest::Client::new();
+    let mut request = client
+        .request(method, url)
+        .bearer_auth(token)
+        .header("User-Agent", "OPCOS")
+        .header("Accept", "application/vnd.github+json");
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    connector_json(request, "GitHub").await
+}
+
+async fn execute_connector_tool(
+    secrets: &KeyringSecretStore,
+    name: &str,
+    arguments: Value,
+) -> Result<Value, String> {
+    let kind = name.split('_').next().unwrap_or_default();
+    let token = secrets
+        .get(&secret_key("connector-token", kind))
+        .map_err(|error| format!("{kind} token unavailable: {error}"))?
+        .ok_or_else(|| format!("{kind} token is not configured"))?;
+    let client = reqwest::Client::new();
+    match name {
+        "github_list_repositories" => {
+            github_json(
+                &token,
+                reqwest::Method::GET,
+                "https://api.github.com/user/repos?per_page=50&sort=updated",
+                None,
+            )
+            .await
+        }
+        "github_list_issues" => {
+            let owner = arguments
+                .get("owner")
+                .and_then(Value::as_str)
+                .ok_or("missing owner")?;
+            let repo = arguments
+                .get("repo")
+                .and_then(Value::as_str)
+                .ok_or("missing repo")?;
+            let url = format!("https://api.github.com/repos/{owner}/{repo}/issues?state=all");
+            github_json(&token, reqwest::Method::GET, &url, None).await
+        }
+        "github_create_issue" => {
+            let owner = arguments
+                .get("owner")
+                .and_then(Value::as_str)
+                .ok_or("missing owner")?;
+            let repo = arguments
+                .get("repo")
+                .and_then(Value::as_str)
+                .ok_or("missing repo")?;
+            let title = arguments
+                .get("title")
+                .and_then(Value::as_str)
+                .ok_or("missing title")?;
+            let url = format!("https://api.github.com/repos/{owner}/{repo}/issues");
+            github_json(
+                &token,
+                reqwest::Method::POST,
+                &url,
+                Some(
+                    json!({"title": title, "body": arguments.get("body").and_then(Value::as_str)}),
+                ),
+            )
+            .await
+        }
+        "telegram_send_message" => {
+            let chat_id = arguments
+                .get("chat_id")
+                .and_then(Value::as_str)
+                .ok_or("missing chat_id")?;
+            let text = arguments
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or("missing text")?;
+            let url = format!("https://api.telegram.org/bot{token}/sendMessage");
+            connector_json(
+                client
+                    .post(url)
+                    .json(&json!({"chat_id": chat_id, "text": text})),
+                "Telegram",
+            )
+            .await
+        }
+        "discord_send_message" => {
+            let channel_id = arguments
+                .get("channel_id")
+                .and_then(Value::as_str)
+                .ok_or("missing channel_id")?;
+            let content = arguments
+                .get("content")
+                .and_then(Value::as_str)
+                .ok_or("missing content")?;
+            let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages");
+            connector_json(
+                client
+                    .post(url)
+                    .bearer_auth(&token)
+                    .json(&json!({"content": content})),
+                "Discord",
+            )
+            .await
+        }
+        "slack_list_channels" => {
+            connector_json(
+                client
+                    .get("https://slack.com/api/conversations.list")
+                    .bearer_auth(&token),
+                "Slack",
+            )
+            .await
+        }
+        "slack_post_message" => {
+            let channel = arguments
+                .get("channel")
+                .and_then(Value::as_str)
+                .ok_or("missing channel")?;
+            let text = arguments
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or("missing text")?;
+            connector_json(
+                client
+                    .post("https://slack.com/api/chat.postMessage")
+                    .bearer_auth(&token)
+                    .json(&json!({"channel": channel, "text": text})),
+                "Slack",
+            )
+            .await
+        }
+        _ => Err(format!("connector tool is unavailable: {name}")),
+    }
+}
+
 #[tauri::command]
 async fn linear_get_issue(
     state: State<'_, DesktopState>,
@@ -7138,6 +7467,9 @@ fn main() {
             import_assets,
             discover_remote_assets,
             mcp_tools,
+            connector_save,
+            connector_status,
+            connector_validate,
             linear_connection,
             linear_get_issue,
             linear_list_my_issues,
