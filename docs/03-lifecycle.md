@@ -55,6 +55,22 @@ turn_start
 - 同一个 `callId` 的重复记录要合并，不要产生两张卡片。
 - pending approval 在 store 里由 `pending` 表保存，并与 `tool_calls` 按 `call_id` 合并；`read_transcript` 转成 `kind=approval`，前端负责渲染审批卡片。
 
+### 3.3.1 全局 Instructions 与资产注入顺序
+
+全局 Instructions 使用 P1-1 的 `config_object(kind='instructions')` 与不可变
+`config_object_version`，作用域固定为 `scope_kind='global'`。会话创建/首次绑定时
+固定当时的 active version；后续编辑只影响新会话，不改变进行中的会话。
+
+系统提示的明确顺序为：
+
+1. 全局 Instructions；
+2. 工作区/仓库 Rules；
+3. Knowledge；
+4. Playbook；
+5. Skill。
+
+未设置全局 Instructions 时不生成该段，现有资产顺序与行为保持不变。
+
 ## 3.4 审批
 
 判定顺序［推断，对齐 OpenWorker 的 standing rule 思路］：

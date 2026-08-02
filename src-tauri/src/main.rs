@@ -1623,6 +1623,12 @@ fn append_session_config_assets(bundle: &mut AssetBundle, assets: Vec<SessionCon
             .unwrap_or_default()
             .to_owned();
         match kind.as_str() {
+            "instructions" => {
+                bundle.instructions = Some(InstructionSource {
+                    path: id,
+                    content: body,
+                })
+            }
             "rules" => bundle.agents.push(InstructionSource {
                 path: id,
                 content: body,
@@ -3483,13 +3489,18 @@ fn save_asset(
 ) -> Result<(), String> {
     if !matches!(
         kind.as_str(),
-        "knowledge" | "playbook" | "skill" | "agents" | "mcp"
+        "instructions" | "knowledge" | "playbook" | "skill" | "agents" | "mcp"
     ) {
         return Err("unsupported asset kind".into());
     }
     if kind == "mcp" {
         validate_mcp_content(&body)?;
     }
+    let id = if kind == "instructions" {
+        "global-instructions".to_owned()
+    } else {
+        id
+    };
     let connection = state
         .database
         .lock()
@@ -3510,6 +3521,9 @@ fn save_asset(
         _ if scope_key.is_some() => "repo",
         _ => "global",
     };
+    if kind == "instructions" && scope_kind != "global" {
+        return Err("global Instructions must use global scope".into());
+    }
     let scope_key = if scope_kind == "global" {
         None
     } else {
