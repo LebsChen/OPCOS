@@ -54,6 +54,7 @@ pub struct SessionRecord {
     pub compaction: serde_json::Value,
     pub host_id: String,
     pub provider: Option<String>,
+    pub external_session_id: Option<String>,
     pub run_state: String,
     pub stop_reason: String,
     pub created_at: DateTime<Utc>,
@@ -294,10 +295,11 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> Result<SessionRecord, rusqlite::
         })?,
         host_id: row.get(12)?,
         provider: row.get(13)?,
-        run_state: row.get(14)?,
-        stop_reason: row.get(15)?,
-        created_at: parse_timestamp(row.get(16)?)?,
-        updated_at: parse_timestamp(row.get(17)?)?,
+        external_session_id: row.get(14)?,
+        run_state: row.get(15)?,
+        stop_reason: row.get(16)?,
+        created_at: parse_timestamp(row.get(17)?)?,
+        updated_at: parse_timestamp(row.get(18)?)?,
     })
 }
 
@@ -511,6 +513,17 @@ pub trait SessionStore {
         stop_reason: &str,
     ) -> Result<(), StoreError>;
     fn update_session_mode(&self, session_id: &str, mode: &str) -> Result<(), StoreError>;
+    fn update_external_session_id(
+        &self,
+        session_id: &str,
+        external_session_id: Option<&str>,
+    ) -> Result<(), StoreError>;
+    fn append_audit(
+        &self,
+        session_id: &str,
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(), StoreError>;
 }
 
 pub trait SecretStore: Send + Sync {
@@ -1100,6 +1113,7 @@ impl SqliteStore {
                compaction TEXT NOT NULL,
                host_id TEXT NOT NULL,
                provider TEXT,
+               external_session_id TEXT,
                run_state TEXT NOT NULL DEFAULT 'idle',
                stop_reason TEXT NOT NULL DEFAULT 'none',
                created_at TEXT NOT NULL,
@@ -1132,6 +1146,15 @@ impl SqliteStore {
                 .any(|column| column == "provider")
             {
                 connection.execute("ALTER TABLE sessions ADD COLUMN provider TEXT", [])?;
+            }
+            if !table_columns(&connection, "sessions")?
+                .iter()
+                .any(|column| column == "external_session_id")
+            {
+                connection.execute(
+                    "ALTER TABLE sessions ADD COLUMN external_session_id TEXT",
+                    [],
+                )?;
             }
             let session_columns = table_columns(&connection, "sessions")?;
             if !session_columns.iter().any(|column| column == "run_state") {
@@ -1209,7 +1232,7 @@ impl SqliteStore {
 
     pub fn save_session(&self, session: &SessionRecord) -> Result<(), StoreError> {
         self.connection.lock().expect("sqlite mutex poisoned").execute(
-            "INSERT OR REPLACE INTO sessions(session_id,workspace,model,mode,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,run_state,stop_reason,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+            "INSERT OR REPLACE INTO sessions(session_id,workspace,model,mode,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             params![
                 session.session_id,
                 session.workspace,
@@ -1225,6 +1248,7 @@ impl SqliteStore {
                 serde_json::to_string(&session.compaction)?,
                 session.host_id,
                 session.provider,
+                session.external_session_id,
                 session.run_state,
                 session.stop_reason,
                 session.created_at.to_rfc3339(),
@@ -1237,7 +1261,7 @@ impl SqliteStore {
     pub fn load_session(&self, session_id: &str) -> Result<Option<SessionRecord>, StoreError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let result = connection.query_row(
-            "SELECT session_id,workspace,model,mode,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,run_state,stop_reason,created_at,updated_at FROM sessions WHERE session_id=?1",
+            "SELECT session_id,workspace,model,mode,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,created_at,updated_at FROM sessions WHERE session_id=?1",
             [session_id],
             session_from_row,
         );
@@ -1251,7 +1275,7 @@ impl SqliteStore {
     pub fn load_sessions(&self) -> Result<Vec<SessionRecord>, StoreError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT session_id,workspace,model,mode,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,run_state,stop_reason,created_at,updated_at FROM sessions ORDER BY created_at DESC",
+            "SELECT session_id,workspace,model,mode,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,created_at,updated_at FROM sessions ORDER BY created_at DESC",
         )?;
         let rows = statement.query_map([], session_from_row)?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -1270,6 +1294,25 @@ impl SqliteStore {
             .execute(
                 "UPDATE sessions SET provider=?1, updated_at=?2 WHERE session_id=?3",
                 params![provider, Utc::now().to_rfc3339(), session_id],
+            )?;
+        if changed == 0 {
+            return Err(StoreError::SessionNotFound(session_id.into()));
+        }
+        Ok(())
+    }
+
+    pub fn update_external_session_id(
+        &self,
+        session_id: &str,
+        external_session_id: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let changed = self
+            .connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "UPDATE sessions SET external_session_id=?1, updated_at=?2 WHERE session_id=?3",
+                params![external_session_id, Utc::now().to_rfc3339(), session_id],
             )?;
         if changed == 0 {
             return Err(StoreError::SessionNotFound(session_id.into()));
@@ -1317,6 +1360,23 @@ impl SessionStore for SqliteStore {
 
     fn update_session_mode(&self, session_id: &str, mode: &str) -> Result<(), StoreError> {
         SqliteStore::update_session_mode(self, session_id, mode)
+    }
+
+    fn update_external_session_id(
+        &self,
+        session_id: &str,
+        external_session_id: Option<&str>,
+    ) -> Result<(), StoreError> {
+        SqliteStore::update_external_session_id(self, session_id, external_session_id)
+    }
+
+    fn append_audit(
+        &self,
+        session_id: &str,
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(), StoreError> {
+        SqliteStore::append_audit(self, session_id, kind, payload)
     }
 
     fn append_message(&self, message: &StoredMessage) -> Result<(), StoreError> {
@@ -1796,12 +1856,25 @@ mod tests {
             compaction: serde_json::json!({}),
             host_id: "antec".into(),
             provider: Some("openai".into()),
+            external_session_id: None,
             run_state: "idle".into(),
             stop_reason: "none".into(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
         store.save_session(&session).unwrap();
+        store
+            .update_external_session_id("session-1", Some("opencode-session-1"))
+            .unwrap();
+        assert_eq!(
+            store
+                .load_session("session-1")
+                .unwrap()
+                .unwrap()
+                .external_session_id
+                .as_deref(),
+            Some("opencode-session-1")
+        );
     }
 
     #[test]
@@ -1824,6 +1897,7 @@ mod tests {
                 compaction: serde_json::json!({}),
                 host_id: "host".into(),
                 provider: None,
+                external_session_id: None,
                 run_state: "future_run_state".into(),
                 stop_reason: "future_stop_reason".into(),
                 created_at: now,

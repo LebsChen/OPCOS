@@ -10,10 +10,11 @@ use opcos_store::{
     UsageRecord,
 };
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::{
     Arc, Mutex as StdMutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Instant;
 use thiserror::Error;
@@ -85,6 +86,40 @@ pub struct HarnessTurnInput {
     pub settings: Value,
 }
 
+pub struct TurnHandle {
+    id: String,
+    receiver: TurnReceiver,
+}
+
+type TurnResult = Result<Option<AssistantTurn>, HarnessError>;
+type TurnReceiver = Arc<Mutex<Option<oneshot::Receiver<TurnResult>>>>;
+type TurnSender = oneshot::Sender<TurnResult>;
+
+impl std::fmt::Debug for TurnHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TurnHandle")
+            .field("id", &self.id)
+            .finish()
+    }
+}
+
+impl TurnHandle {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub async fn await_finished(&self) -> Result<Option<AssistantTurn>, HarnessError> {
+        let receiver = self
+            .receiver
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| HarnessError::TurnAlreadyAwaited)?;
+        receiver.await.map_err(|_| HarnessError::TurnAbandoned)?
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct HarnessResumeInput {
     pub session_id: String,
@@ -129,10 +164,110 @@ pub enum HarnessEvent {
         turn: AssistantTurn,
     },
     ApprovalRequested(HarnessApprovalRequest),
+    ApprovalEnrichmentFailed {
+        session_id: String,
+        request_id: String,
+        reason: String,
+    },
     QuestionRequested(HarnessQuestionRequest),
     Error {
         message: String,
     },
+}
+
+pub struct SessionRecorder<S> {
+    store: Arc<S>,
+    session_id: String,
+}
+
+impl<S> SessionRecorder<S>
+where
+    S: SessionStore,
+{
+    pub fn new(store: Arc<S>, session_id: impl Into<String>) -> Self {
+        Self {
+            store,
+            session_id: session_id.into(),
+        }
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn store(&self) -> Arc<S> {
+        self.store.clone()
+    }
+
+    pub fn update_status(&self, run_state: &str, stop_reason: &str) -> Result<(), EngineError> {
+        self.store
+            .update_session_status(&self.session_id, run_state, stop_reason)
+            .map_err(|error| EngineError::Store(error.to_string()))
+    }
+
+    pub fn save_pending(
+        &self,
+        pending: &PendingRecord,
+        visibility: Option<&str>,
+    ) -> Result<(), EngineError> {
+        self.store
+            .save_pending(pending)
+            .map_err(|error| EngineError::Store(error.to_string()))?;
+        if let Some(visibility) = visibility {
+            self.store
+                .set_pending_visibility(&self.session_id, &pending.call_id, visibility)
+                .map_err(|error| EngineError::Store(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    pub fn list_inbox(&self) -> Result<Vec<opcos_store::InboxRecord>, EngineError> {
+        self.store
+            .list_inbox()
+            .map_err(|error| EngineError::Store(error.to_string()))
+    }
+
+    pub fn load_pending(&self) -> Result<Vec<PendingRecord>, EngineError> {
+        self.store
+            .load_pending(&self.session_id)
+            .map_err(|error| EngineError::Store(error.to_string()))
+    }
+
+    pub fn resolve_inbox(&self, call_id: &str, resolution: &str) -> Result<bool, EngineError> {
+        self.store
+            .resolve_inbox(&self.session_id, call_id, resolution)
+            .map_err(|error| EngineError::Store(error.to_string()))
+    }
+
+    pub fn load_artifacts(&self) -> Result<Vec<opcos_store::ArtifactRecord>, EngineError> {
+        self.store
+            .load_artifacts(&self.session_id)
+            .map_err(|error| EngineError::Store(error.to_string()))
+    }
+
+    pub fn upsert_artifact(
+        &self,
+        artifact: &opcos_store::ArtifactRecord,
+    ) -> Result<(), EngineError> {
+        self.store
+            .upsert_artifact(artifact)
+            .map_err(|error| EngineError::Store(error.to_string()))
+    }
+
+    pub fn append_audit(&self, kind: &str, payload: &Value) -> Result<(), EngineError> {
+        self.store
+            .append_audit(&self.session_id, kind, payload)
+            .map_err(|error| EngineError::Store(error.to_string()))
+    }
+
+    pub fn set_external_session_id(
+        &self,
+        external_session_id: Option<&str>,
+    ) -> Result<(), EngineError> {
+        self.store
+            .update_external_session_id(&self.session_id, external_session_id)
+            .map_err(|error| EngineError::Store(error.to_string()))
+    }
 }
 
 #[derive(Debug, Error)]
@@ -143,33 +278,37 @@ pub enum HarnessError {
     EventsAlreadyTaken,
     #[error("harness session mismatch: expected {expected}, got {actual}")]
     SessionMismatch { expected: String, actual: String },
+    #[error("turn handle was already awaited")]
+    TurnAlreadyAwaited,
+    #[error("turn was abandoned before completion")]
+    TurnAbandoned,
+    #[error("pending request not found: {0}")]
+    PendingNotFound(String),
 }
 
 #[async_trait]
 pub trait Harness: Send + Sync {
     fn kind(&self) -> HarnessKind;
-    async fn start_turn(&self, input: HarnessTurnInput) -> Result<AssistantTurn, HarnessError>;
+    async fn start_turn(&self, input: HarnessTurnInput) -> Result<TurnHandle, HarnessError>;
     fn events(&self) -> Result<mpsc::Receiver<HarnessEvent>, HarnessError>;
     fn interrupt(&self);
     async fn reply_approval(
         &self,
         request_id: &str,
         outcome: ApprovalOutcome,
-    ) -> Result<AssistantTurn, HarnessError>;
+    ) -> Result<TurnHandle, HarnessError>;
     async fn reply_question(
         &self,
         request_id: &str,
         response: Value,
-    ) -> Result<AssistantTurn, HarnessError>;
-    async fn resume(
-        &self,
-        input: HarnessResumeInput,
-    ) -> Result<Option<AssistantTurn>, HarnessError>;
+    ) -> Result<TurnHandle, HarnessError>;
+    async fn resume(&self, input: HarnessResumeInput) -> Result<Option<TurnHandle>, HarnessError>;
 }
 
 pub struct TurnEngine<P, S, E> {
     provider: P,
     store: Arc<S>,
+    recorder: Arc<SessionRecorder<S>>,
     executor: Arc<E>,
     session_id: String,
     workspace: String,
@@ -241,6 +380,7 @@ where
             .unwrap_or(0);
         Self {
             provider,
+            recorder: Arc::new(SessionRecorder::new(store.clone(), session_id.clone())),
             store,
             executor,
             session_id,
@@ -376,10 +516,7 @@ where
     }
 
     fn set_session_status(&self, run_state: &str, stop_reason: &str) {
-        if let Err(error) =
-            self.store
-                .update_session_status(&self.session_id, run_state, stop_reason)
-        {
+        if let Err(error) = self.recorder.update_status(run_state, stop_reason) {
             eprintln!(
                 "opcos-engine: failed to persist session status for {}: {}",
                 self.session_id, error
@@ -644,15 +781,10 @@ where
     }
 
     fn save_pending(&self, pending: &PendingRecord) -> Result<(), EngineError> {
-        self.store
-            .save_pending(pending)
-            .map_err(|error| EngineError::Store(error.to_string()))?;
-        if self.unattended.load(Ordering::SeqCst) {
-            self.store
-                .set_pending_visibility(&self.session_id, &pending.call_id, "inbox")
-                .map_err(|error| EngineError::Store(error.to_string()))?;
-        }
-        Ok(())
+        self.recorder.save_pending(
+            pending,
+            self.unattended.load(Ordering::SeqCst).then_some("inbox"),
+        )
     }
     pub fn capabilities(&self, model: &str) -> Caps {
         self.provider.capabilities(model)
@@ -1168,7 +1300,7 @@ fn tool_risk(name: &str) -> ToolRisk {
 #[async_trait]
 impl<P, S, E> AgentEngine for TurnEngine<P, S, E>
 where
-    P: Provider + Send + Sync,
+    P: Provider + Send + Sync + 'static,
     S: SessionStore + Send + Sync + 'static,
     E: ToolExecutor + 'static,
 {
@@ -1197,11 +1329,19 @@ pub struct BuiltinHarness<P, S, E> {
     control_sender: mpsc::Sender<HarnessEvent>,
     events: mpsc::Sender<HarnessEvent>,
     receiver: Mutex<Option<mpsc::Receiver<HarnessEvent>>>,
+    next_turn_id: AtomicU64,
+    turns: Arc<Mutex<HashMap<String, TurnState>>>,
+    pending_turns: Arc<Mutex<HashMap<String, String>>>,
+}
+
+struct TurnState {
+    sender: Mutex<Option<TurnSender>>,
+    receiver: TurnReceiver,
 }
 
 impl<P, S, E> BuiltinHarness<P, S, E>
 where
-    P: Provider + Send + Sync,
+    P: Provider + Send + Sync + 'static,
     S: SessionStore + Send + Sync + 'static,
     E: ToolExecutor + 'static,
 {
@@ -1216,32 +1356,92 @@ where
             control_sender,
             events,
             receiver: Mutex::new(Some(receiver)),
+            next_turn_id: AtomicU64::new(1),
+            turns: Arc::new(Mutex::new(HashMap::new())),
+            pending_turns: Arc::new(Mutex::new(HashMap::new())),
         }
     }
+}
 
-    async fn emit_pending(&self, call_id: &str) -> Result<(), HarnessError> {
-        let Some(pending) = self.engine.pending_request(call_id)? else {
-            return Ok(());
-        };
-        let event = if pending.tool == "ask_user" {
-            HarnessEvent::QuestionRequested(HarnessQuestionRequest {
-                session_id: pending.session_id,
-                request_id: pending.call_id,
-                tool: pending.tool,
-                arguments: pending.arguments,
-            })
-        } else {
-            HarnessEvent::ApprovalRequested(HarnessApprovalRequest {
-                session_id: pending.session_id,
-                request_id: pending.call_id,
-                tool: pending.tool,
-                arguments: pending.arguments,
-            })
-        };
-        self.control_sender
-            .send(event)
+impl<P, S, E> BuiltinHarness<P, S, E>
+where
+    P: Provider + Send + Sync + 'static,
+    S: SessionStore + Send + Sync + 'static,
+    E: ToolExecutor + 'static,
+{
+    async fn resolve_pending_turn<F, Fut>(
+        &self,
+        request_id: &str,
+        operation: F,
+    ) -> Result<TurnHandle, HarnessError>
+    where
+        F: FnOnce(Arc<TurnEngine<P, S, E>>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<AssistantTurn, EngineError>> + Send + 'static,
+    {
+        let turn_id = self
+            .pending_turns
+            .lock()
             .await
-            .map_err(|_| HarnessError::EventsAlreadyTaken)
+            .remove(request_id)
+            .ok_or_else(|| HarnessError::PendingNotFound(request_id.to_owned()))?;
+        let receiver = self
+            .turns
+            .lock()
+            .await
+            .get(&turn_id)
+            .map(|state| state.receiver.clone())
+            .ok_or(HarnessError::TurnAbandoned)?;
+        let engine = self.engine.clone();
+        let turns = self.turns.clone();
+        let pending_turns = self.pending_turns.clone();
+        let controls = self.control_sender.clone();
+        let task_turn_id = turn_id.clone();
+        tokio::spawn(async move {
+            match operation(engine.clone()).await {
+                Ok(turn) => {
+                    if let Some(state) = turns.lock().await.remove(&task_turn_id)
+                        && let Some(sender) = state.sender.lock().await.take()
+                    {
+                        let _ = sender.send(Ok(Some(turn)));
+                    }
+                }
+                Err(EngineError::ApprovalPending(next_request)) => {
+                    pending_turns
+                        .lock()
+                        .await
+                        .insert(next_request.clone(), task_turn_id);
+                    if let Ok(Some(pending)) = engine.pending_request(&next_request) {
+                        let event = if pending.tool == "ask_user" {
+                            HarnessEvent::QuestionRequested(HarnessQuestionRequest {
+                                session_id: pending.session_id,
+                                request_id: pending.call_id,
+                                tool: pending.tool,
+                                arguments: pending.arguments,
+                            })
+                        } else {
+                            HarnessEvent::ApprovalRequested(HarnessApprovalRequest {
+                                session_id: pending.session_id,
+                                request_id: pending.call_id,
+                                tool: pending.tool,
+                                arguments: pending.arguments,
+                            })
+                        };
+                        let _ = controls.send(event).await;
+                    }
+                }
+                Err(error) => {
+                    if let Some(state) = turns.lock().await.remove(&task_turn_id)
+                        && let Some(sender) = state.sender.lock().await.take()
+                    {
+                        let _ = sender.send(Err(error.into()));
+                    }
+                }
+            }
+        });
+        Ok(TurnHandle {
+            id: turn_id,
+            receiver,
+        })
     }
 }
 
@@ -1282,7 +1482,7 @@ async fn send_harness_chunk(sender: &mpsc::Sender<HarnessEvent>, chunk: StreamCh
 #[async_trait]
 impl<P, S, E> Harness for BuiltinHarness<P, S, E>
 where
-    P: Provider + Send + Sync,
+    P: Provider + Send + Sync + 'static,
     S: SessionStore + Send + Sync + 'static,
     E: ToolExecutor + 'static,
 {
@@ -1290,15 +1490,77 @@ where
         HarnessKind::Builtin
     }
 
-    async fn start_turn(&self, input: HarnessTurnInput) -> Result<AssistantTurn, HarnessError> {
-        match self.engine.submit_text(input.text).await {
-            Ok(turn) => Ok(turn),
-            Err(EngineError::ApprovalPending(call_id)) => {
-                self.emit_pending(&call_id).await?;
-                Err(EngineError::ApprovalPending(call_id).into())
+    async fn start_turn(&self, input: HarnessTurnInput) -> Result<TurnHandle, HarnessError> {
+        let id = format!(
+            "{}-{}",
+            self.engine.session_id(),
+            self.next_turn_id.fetch_add(1, Ordering::Relaxed)
+        );
+        let (sender, receiver) = oneshot::channel();
+        let receiver = Arc::new(Mutex::new(Some(receiver)));
+        self.turns.lock().await.insert(
+            id.clone(),
+            TurnState {
+                sender: Mutex::new(Some(sender)),
+                receiver: receiver.clone(),
+            },
+        );
+        let handle = TurnHandle {
+            id: id.clone(),
+            receiver,
+        };
+        let engine = self.engine.clone();
+        let turns = self.turns.clone();
+        let pending_turns = self.pending_turns.clone();
+        let controls = self.control_sender.clone();
+        tokio::spawn(async move {
+            match engine.submit_text(input.text).await {
+                Ok(turn) => {
+                    if let Some(state) = turns.lock().await.remove(&id)
+                        && let Some(sender) = state.sender.lock().await.take()
+                    {
+                        let _ = sender.send(Ok(Some(turn)));
+                    }
+                }
+                Err(EngineError::ApprovalPending(call_id)) => {
+                    pending_turns
+                        .lock()
+                        .await
+                        .insert(call_id.clone(), id.clone());
+                    let pending = engine.pending_request(&call_id);
+                    if let Ok(Some(pending)) = pending {
+                        let event = if pending.tool == "ask_user" {
+                            HarnessEvent::QuestionRequested(HarnessQuestionRequest {
+                                session_id: pending.session_id,
+                                request_id: pending.call_id,
+                                tool: pending.tool,
+                                arguments: pending.arguments,
+                            })
+                        } else {
+                            HarnessEvent::ApprovalRequested(HarnessApprovalRequest {
+                                session_id: pending.session_id,
+                                request_id: pending.call_id,
+                                tool: pending.tool,
+                                arguments: pending.arguments,
+                            })
+                        };
+                        let _ = controls.send(event).await;
+                    } else if let Some(state) = turns.lock().await.remove(&id)
+                        && let Some(sender) = state.sender.lock().await.take()
+                    {
+                        let _ = sender.send(Err(HarnessError::TurnAbandoned));
+                    }
+                }
+                Err(error) => {
+                    if let Some(state) = turns.lock().await.remove(&id)
+                        && let Some(sender) = state.sender.lock().await.take()
+                    {
+                        let _ = sender.send(Err(error.into()));
+                    }
+                }
             }
-            Err(error) => Err(error.into()),
-        }
+        });
+        Ok(handle)
     }
 
     fn events(&self) -> Result<mpsc::Receiver<HarnessEvent>, HarnessError> {
@@ -1363,35 +1625,65 @@ where
         &self,
         request_id: &str,
         outcome: ApprovalOutcome,
-    ) -> Result<AssistantTurn, HarnessError> {
-        self.engine
-            .resolve_approval(request_id, outcome)
-            .await
-            .map_err(Into::into)
+    ) -> Result<TurnHandle, HarnessError> {
+        let request_id = request_id.to_owned();
+        let operation_request_id = request_id.clone();
+        self.resolve_pending_turn(&request_id, move |engine| async move {
+            engine
+                .resolve_approval(&operation_request_id, outcome)
+                .await
+        })
+        .await
     }
 
     async fn reply_question(
         &self,
         request_id: &str,
         response: Value,
-    ) -> Result<AssistantTurn, HarnessError> {
-        self.engine
-            .resolve_pending_input(request_id, response)
-            .await
-            .map_err(Into::into)
+    ) -> Result<TurnHandle, HarnessError> {
+        let request_id = request_id.to_owned();
+        let operation_request_id = request_id.clone();
+        self.resolve_pending_turn(&request_id, move |engine| async move {
+            engine
+                .resolve_pending_input(&operation_request_id, response)
+                .await
+        })
+        .await
     }
 
-    async fn resume(
-        &self,
-        input: HarnessResumeInput,
-    ) -> Result<Option<AssistantTurn>, HarnessError> {
+    async fn resume(&self, input: HarnessResumeInput) -> Result<Option<TurnHandle>, HarnessError> {
         if input.session_id != self.engine.session_id() {
             return Err(HarnessError::SessionMismatch {
                 expected: self.engine.session_id().to_owned(),
                 actual: input.session_id,
             });
         }
-        self.engine.resume_pending_turn().await.map_err(Into::into)
+        let id = format!(
+            "{}-{}",
+            self.engine.session_id(),
+            self.next_turn_id.fetch_add(1, Ordering::Relaxed)
+        );
+        let (sender, receiver) = oneshot::channel();
+        let receiver = Arc::new(Mutex::new(Some(receiver)));
+        self.turns.lock().await.insert(
+            id.clone(),
+            TurnState {
+                sender: Mutex::new(Some(sender)),
+                receiver: receiver.clone(),
+            },
+        );
+        let engine = self.engine.clone();
+        let turns = self.turns.clone();
+        let task_id = id.clone();
+        tokio::spawn(async move {
+            let result = engine.resume_pending_turn().await;
+            if let Some(state) = turns.lock().await.remove(&task_id)
+                && let Some(sender) = state.sender.lock().await.take()
+            {
+                let _ = sender.send(result.map_err(Into::into));
+            }
+        });
+        Ok(Some(TurnHandle { id, receiver }))
     }
 }
 
@@ -1782,6 +2074,7 @@ mod tests {
                 compaction: json!({}),
                 host_id: "local".into(),
                 provider: None,
+                external_session_id: None,
                 run_state: "idle".into(),
                 stop_reason: "none".into(),
                 created_at: Utc::now(),
@@ -1813,10 +2106,7 @@ mod tests {
                 ..Default::default()
             })
             .await;
-        assert!(
-            matches!(start, Err(HarnessError::Engine(EngineError::ApprovalPending(ref id))) if id == "write-1"),
-            "unexpected start result: {start:?}"
-        );
+        let _start = start.expect("start_turn should return a turn handle");
         let mut observed = Vec::new();
         let approval = tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
@@ -1835,11 +2125,20 @@ mod tests {
         assert_eq!(approval.session_id, "harness-session");
         assert_eq!(approval.tool, "write_file");
 
-        let turn = harness
+        let turn_handle = harness
             .reply_approval("write-1", ApprovalOutcome::Approve)
             .await
             .unwrap();
-        assert_eq!(turn.text.as_deref(), Some("finished"));
+        assert_eq!(
+            turn_handle
+                .await_finished()
+                .await
+                .unwrap()
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("finished")
+        );
 
         while let Ok(Some(event)) =
             tokio::time::timeout(std::time::Duration::from_millis(100), events.recv()).await
@@ -2022,6 +2321,7 @@ mod tests {
                 compaction: json!({}),
                 host_id: "local".into(),
                 provider: None,
+                external_session_id: None,
                 run_state: "idle".into(),
                 stop_reason: "none".into(),
                 created_at: Utc::now(),

@@ -23,6 +23,12 @@ Tembo 文档允许 trigger 用 `apiKey` query parameter［Tembo文］——**OPC
 
 ## 8.3 权限与审批
 
+### OpenCode 远程传输边界
+
+曾评估通过 RVM `/api/expose-port` + cloudflared 暴露远端 `opencode serve`。该方案否决：它会把具备文件读写和 shell 控制能力的 agent 控制面挂到公网，并增加隧道生命周期、cloudflared 可用性与 URL 泄露等安全失败面。OpenCode 不得复用这条路径。
+
+P2-2 的目标传输是 HTTP over Host：OpenCode 固定绑定 `127.0.0.1`，普通请求由目标 Host 上的 `curl` 经 `Host::exec` 发出，SSE 由 `Host::spawn` 执行 `curl -N` 并由上层做 SSE 分帧；不需要新的 RVM host-side 能力。服务必须设置 `OPENCODE_SERVER_PASSWORD`，密码只能通过受保护的 Host 环境注入，不能进入 argv、URL、curl 命令文本、PTY 输出、transcript、审计或日志。
+
 策略层（`opcos-policy`）在工具执行前判定，顺序见 [03](03-lifecycle.md#34-审批)。要点：
 
 - 决策只有 `allow` / `deny`。
