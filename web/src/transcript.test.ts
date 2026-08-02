@@ -182,6 +182,36 @@ describe("OPCOS transcript folding", () => {
     });
   });
 
+  it("folds tool results into the matching streaming call", () => {
+    let items = reduceStreamEvent([], {
+      kind: "stream",
+      payload: {
+        tool_call_delta: {
+          index: 0,
+          id: "call-result",
+          name: "read_file",
+          arguments_fragment: "{}",
+        },
+      },
+    });
+    items = reduceStreamEvent(items, {
+      kind: "stream",
+      payload: {
+        tool_result: {
+          call_id: "call-result",
+          result: { content: "ok" },
+        },
+      },
+    });
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      callId: "call-result",
+      result: { content: "ok" },
+      status: "ok",
+      approval: false,
+    });
+  });
+
   it("renders notices separately", () => {
     const items = reduceStreamEvent([], {
       kind: "notice",

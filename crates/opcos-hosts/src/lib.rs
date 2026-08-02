@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use futures_util::{SinkExt, StreamExt};
 use opcos_rvm::{
     Capabilities as RvmCapabilities, CommandResult, DirectoryListing, ExecRequest, ExecResult,
-    FileContent, Health, HttpRvmClient, RvmClient, RvmError,
+    FileContent, Health, HttpRvmClient, RvmClient, RvmError, RvmWebSocket, WsKind, WsParams,
 };
 pub use opcos_rvm::{DEFAULT_EXEC_TIMEOUT_SECONDS, LIFECYCLE_EXEC_TIMEOUT_SECONDS};
 use serde::{Deserialize, Serialize};
@@ -16,11 +17,12 @@ use std::{
 use thiserror::Error;
 use tokio::{
     fs,
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::Mutex,
+    sync::{Mutex, mpsc, oneshot},
     time,
 };
+use uuid::Uuid;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Capability {
@@ -53,12 +55,92 @@ pub enum HostError {
     InvalidResponse(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpawnRequest {
+    pub command: String,
+    pub cwd: Option<String>,
+    pub env: Option<Value>,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ProcessEvent {
+    Output(String),
+    Exited(Option<i32>),
+}
+
+#[async_trait]
+pub trait HostProcess: Send {
+    async fn next_event(&mut self) -> Result<Option<ProcessEvent>, HostError>;
+    async fn write_stdin(&mut self, input: &[u8]) -> Result<(), HostError>;
+    async fn interrupt(&mut self) -> Result<(), HostError>;
+}
+
+struct LocalProcess {
+    events: mpsc::Receiver<Result<ProcessEvent, HostError>>,
+    stdin: ChildStdin,
+    kill: Option<oneshot::Sender<()>>,
+}
+
+#[async_trait]
+impl HostProcess for LocalProcess {
+    async fn next_event(&mut self) -> Result<Option<ProcessEvent>, HostError> {
+        match self.events.recv().await {
+            Some(event) => event.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn write_stdin(&mut self, input: &[u8]) -> Result<(), HostError> {
+        self.stdin.write_all(input).await?;
+        self.stdin.flush().await?;
+        Ok(())
+    }
+
+    async fn interrupt(&mut self) -> Result<(), HostError> {
+        if let Some(kill) = self.kill.take() {
+            let _ = kill.send(());
+        }
+        Ok(())
+    }
+}
+
+struct RemoteProcess {
+    sink: futures_util::stream::SplitSink<RvmWebSocket, tokio_tungstenite::tungstenite::Message>,
+    events: mpsc::Receiver<Result<ProcessEvent, HostError>>,
+}
+
+#[async_trait]
+impl HostProcess for RemoteProcess {
+    async fn next_event(&mut self) -> Result<Option<ProcessEvent>, HostError> {
+        match self.events.recv().await {
+            Some(event) => event.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn write_stdin(&mut self, input: &[u8]) -> Result<(), HostError> {
+        self.sink
+            .send(tokio_tungstenite::tungstenite::Message::Binary(
+                input.to_vec().into(),
+            ))
+            .await
+            .map_err(|error| HostError::InvalidResponse(error.to_string()))
+    }
+
+    async fn interrupt(&mut self) -> Result<(), HostError> {
+        self.write_stdin(&[0x03]).await
+    }
+}
+
 #[async_trait]
 pub trait Host: Send + Sync {
     fn id(&self) -> &str;
     async fn health(&self) -> Result<Health, HostError>;
     async fn capabilities(&self) -> Result<HostCapabilities, HostError>;
     async fn exec(&self, request: ExecRequest) -> Result<ExecResult, HostError>;
+    async fn spawn(&self, request: SpawnRequest) -> Result<Box<dyn HostProcess>, HostError>;
     async fn read(&self, path: &str) -> Result<FileContent, HostError>;
     async fn write(&self, path: &str, content: &str) -> Result<Value, HostError>;
     async fn ls(&self, path: Option<&str>) -> Result<DirectoryListing, HostError>;
@@ -185,6 +267,71 @@ impl Host for RvmHost {
         Ok(self.client.exec_sync(request).await?)
     }
 
+    async fn spawn(&self, request: SpawnRequest) -> Result<Box<dyn HostProcess>, HostError> {
+        let websocket = self
+            .client
+            .open_ws(
+                WsKind::Pty,
+                WsParams {
+                    cols: Some(request.cols.max(1)),
+                    rows: Some(request.rows.max(1)),
+                    cwd: request.cwd,
+                },
+            )
+            .await?;
+        let env_path = remote_env_path(&self.workspace, request.env.as_ref())?;
+        if let Some(path) = &env_path {
+            self.client
+                .write(path, &remote_env_file(request.env.as_ref())?)
+                .await?;
+        }
+        let (mut sink, mut stream) = websocket.split();
+        let (events, receiver) = mpsc::channel(64);
+        let command = remote_spawn_command(&request.command, env_path.as_deref())?;
+        sink.send(tokio_tungstenite::tungstenite::Message::Binary(
+            format!("{command}\n").into_bytes().into(),
+        ))
+        .await
+        .map_err(|error| HostError::InvalidResponse(error.to_string()))?;
+        tokio::spawn(async move {
+            let mut decoder = Utf8Decoder::default();
+            while let Some(message) = stream.next().await {
+                match message {
+                    Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                        if let Some(text) = decoder.push(text.as_bytes())
+                            && events.send(Ok(ProcessEvent::Output(text))).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Ok(tokio_tungstenite::tungstenite::Message::Binary(bytes)) => {
+                        if let Some(text) = decoder.push(&bytes)
+                            && events.send(Ok(ProcessEvent::Output(text))).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => break,
+                    Ok(_) => {}
+                    Err(error) => {
+                        let _ = events
+                            .send(Err(HostError::InvalidResponse(error.to_string())))
+                            .await;
+                        return;
+                    }
+                }
+            }
+            if let Some(text) = decoder.finish() {
+                let _ = events.send(Ok(ProcessEvent::Output(text))).await;
+            }
+            let _ = events.send(Ok(ProcessEvent::Exited(None))).await;
+        });
+        Ok(Box::new(RemoteProcess {
+            sink,
+            events: receiver,
+        }))
+    }
+
     async fn read(&self, path: &str) -> Result<FileContent, HostError> {
         Ok(self.client.read(path).await?)
     }
@@ -281,6 +428,7 @@ impl LocalHost {
             "write",
             "ls",
             "shell_persistent",
+            "process_stream",
         ];
         let unavailable = [
             ("pty", "not implemented by the in-process LocalHost"),
@@ -297,7 +445,9 @@ impl LocalHost {
                 available: true,
                 source: "static".into(),
                 observed_at,
-                reason: None,
+                reason: (*name == "process_stream").then(|| {
+                    "uses local pipes without PTY echo; process exit codes are available".into()
+                }),
             })
             .collect::<Vec<_>>();
         items.extend(unavailable.into_iter().map(|(name, reason)| Capability {
@@ -333,6 +483,7 @@ impl Host for LocalHost {
                 "write",
                 "ls",
                 "shell_persistent",
+                "process_stream",
             ]
             .into_iter()
             .map(str::to_owned)
@@ -389,6 +540,107 @@ impl Host for LocalHost {
                 cwd: Some(cwd.display().to_string()),
             },
         })
+    }
+
+    async fn spawn(&self, request: SpawnRequest) -> Result<Box<dyn HostProcess>, HostError> {
+        let cwd = request
+            .cwd
+            .as_deref()
+            .map(|path| self.secure_path(path))
+            .transpose()?
+            .unwrap_or_else(|| self.root.clone());
+        let mut command = shell_command(&request.command, &cwd);
+        command
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(Value::Object(env)) = request.env {
+            for (key, value) in env {
+                if let Some(value) = value.as_str() {
+                    command.env(key, value);
+                }
+            }
+        }
+        let mut child = command.spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| HostError::InvalidResponse("local process stdin unavailable".into()))?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| HostError::InvalidResponse("local process stdout unavailable".into()))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| HostError::InvalidResponse("local process stderr unavailable".into()))?;
+        let (events, receiver) = mpsc::channel(64);
+        let output = events.clone();
+        tokio::spawn(async move {
+            let mut decoder = Utf8Decoder::default();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                match stdout.read(&mut buffer).await {
+                    Ok(0) => break,
+                    Ok(size) => {
+                        if let Some(text) = decoder.push(&buffer[..size])
+                            && output.send(Ok(ProcessEvent::Output(text))).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = output.send(Err(HostError::Io(error))).await;
+                        return;
+                    }
+                }
+            }
+            if let Some(text) = decoder.finish() {
+                let _ = output.send(Ok(ProcessEvent::Output(text))).await;
+            }
+        });
+        let output = events.clone();
+        tokio::spawn(async move {
+            let mut decoder = Utf8Decoder::default();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                match stderr.read(&mut buffer).await {
+                    Ok(0) => break,
+                    Ok(size) => {
+                        if let Some(text) = decoder.push(&buffer[..size])
+                            && output.send(Ok(ProcessEvent::Output(text))).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = output.send(Err(HostError::Io(error))).await;
+                        return;
+                    }
+                }
+            }
+            if let Some(text) = decoder.finish() {
+                let _ = output.send(Ok(ProcessEvent::Output(text))).await;
+            }
+        });
+        let (kill, killed) = oneshot::channel();
+        tokio::spawn(async move {
+            let code = tokio::select! {
+                result = child.wait() => result.ok().and_then(|status| status.code()),
+                _ = killed => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    None
+                }
+            };
+            let _ = events.send(Ok(ProcessEvent::Exited(code))).await;
+        });
+        Ok(Box::new(LocalProcess {
+            events: receiver,
+            stdin,
+            kill: Some(kill),
+        }))
     }
 
     async fn read(&self, path: &str) -> Result<FileContent, HostError> {
@@ -606,6 +858,97 @@ fn shell_command(command: &str, cwd: &Path) -> Command {
     }
 }
 
+#[derive(Default)]
+struct Utf8Decoder {
+    pending: Vec<u8>,
+}
+
+impl Utf8Decoder {
+    fn push(&mut self, bytes: &[u8]) -> Option<String> {
+        self.pending.extend_from_slice(bytes);
+        match std::str::from_utf8(&self.pending) {
+            Ok(text) => {
+                let text = text.to_owned();
+                self.pending.clear();
+                Some(text)
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                if valid == 0 {
+                    return None;
+                }
+                let text = String::from_utf8_lossy(&self.pending[..valid]).into_owned();
+                self.pending.drain(..valid);
+                Some(text)
+            }
+        }
+    }
+
+    fn finish(&mut self) -> Option<String> {
+        if self.pending.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8_lossy(&std::mem::take(&mut self.pending)).into_owned())
+        }
+    }
+}
+
+fn remote_spawn_command(command: &str, env_path: Option<&str>) -> Result<String, HostError> {
+    let prefix = if let Some(path) = env_path {
+        let path = shell_single_quote(path);
+        format!(
+            "chmod 600 '{path}' && set -a && . '{path}'; __opcos_env_status=$?; set +a; rm -f '{path}'; [ \"$__opcos_env_status\" -eq 0 ] || exit \"$__opcos_env_status\"; "
+        )
+    } else {
+        String::new()
+    };
+    Ok(format!("set +o history; {prefix}{command}"))
+}
+
+fn remote_env_path(workspace: &str, env: Option<&Value>) -> Result<Option<String>, HostError> {
+    let Some(Value::Object(values)) = env else {
+        return Ok(None);
+    };
+    if values.is_empty() {
+        return Ok(None);
+    }
+    let filename = format!(".opcos-env-{}.sh", Uuid::new_v4().simple());
+    let path = opcos_rvm::join_remote_path(workspace, &filename);
+    opcos_rvm::RemotePathGuard::new(workspace)
+        .path(&path)
+        .map(Some)
+        .map_err(|error| HostError::Path(error.to_string()))
+}
+
+fn remote_env_file(env: Option<&Value>) -> Result<String, HostError> {
+    let Some(Value::Object(values)) = env else {
+        return Ok(String::new());
+    };
+    values
+        .iter()
+        .filter_map(|(key, value)| value.as_str().map(|value| (key, value)))
+        .map(|(key, value)| {
+            if !is_shell_identifier(key) {
+                return Err(HostError::InvalidResponse(
+                    "process environment contains an invalid variable name".into(),
+                ));
+            }
+            Ok(format!(
+                "{}='{}'; export {};\n",
+                key,
+                shell_single_quote(value),
+                key
+            ))
+        })
+        .collect()
+}
+
+fn is_shell_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(first) if first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
 fn persistent_command(
     command: &str,
     env: Option<&Value>,
@@ -700,7 +1043,6 @@ fn persistent_env_prefix(env: Option<&Value>) -> Result<Option<String>, HostErro
     }
 }
 
-#[cfg(not(windows))]
 fn shell_single_quote(value: &str) -> String {
     value.replace('\'', "'\\''")
 }
@@ -745,6 +1087,7 @@ fn remote_capabilities(
         "write",
         "ls",
         "pty",
+        "process_stream",
         "vnc",
         "cdp",
         "browser",
@@ -762,13 +1105,22 @@ fn remote_capabilities(
         items: known
             .into_iter()
             .map(|name| {
-                let available = capabilities.available.iter().any(|item| item == name);
+                let available = capabilities.available.iter().any(|item| item == name)
+                    || (name == "process_stream"
+                        && capabilities.available.iter().any(|item| item == "pty"));
                 Capability {
                     name: name.into(),
                     available,
                     source: "remote-probe".into(),
                     observed_at,
-                    reason: (!available).then(|| "not advertised by remote host".into()),
+                    reason: if name == "process_stream" && available {
+                        Some(
+                            "uses remote PTY bytes; echo, control sequences, wrapping, and no exit code may affect structured output"
+                                .into(),
+                        )
+                    } else {
+                        (!available).then(|| "not advertised by remote host".into())
+                    },
                 }
             })
             .collect(),
@@ -778,6 +1130,19 @@ fn remote_capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_spawn_env_line_does_not_contain_secret_value() {
+        let sentinel = "opcos-secret-sentinel";
+        let env = serde_json::json!({"OPCOS_SECRET_TEST": sentinel});
+        let path = remote_env_path("/workspace", Some(&env)).unwrap().unwrap();
+        let command = remote_spawn_command("printf ready", Some(&path)).unwrap();
+        assert!(!command.contains(sentinel));
+        assert!(command.contains("set +o history"));
+        assert!(command.contains("chmod 600"));
+        assert!(command.contains(&path));
+        assert!(remote_env_file(Some(&env)).unwrap().contains(sentinel));
+    }
     use std::fs;
 
     #[tokio::test]
@@ -812,6 +1177,36 @@ mod tests {
                 .iter()
                 .any(|item| item.name == "vnc" && !item.available)
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_host_process_stream_delivers_output_and_exit() {
+        let root = tempfile_dir();
+        let host = LocalHost::new(&root).unwrap();
+        let mut process = host
+            .spawn(SpawnRequest {
+                command: shell_output_command("streamed"),
+                cwd: None,
+                env: None,
+                cols: 80,
+                rows: 24,
+            })
+            .await
+            .unwrap();
+        let mut output = String::new();
+        let mut exited = false;
+        while let Some(event) = process.next_event().await.unwrap() {
+            match event {
+                ProcessEvent::Output(text) => output.push_str(&text),
+                ProcessEvent::Exited(_) => {
+                    exited = true;
+                    break;
+                }
+            }
+        }
+        assert!(output.contains("streamed"));
+        assert!(exited);
         fs::remove_dir_all(root).unwrap();
     }
 

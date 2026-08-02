@@ -75,3 +75,21 @@ plugin_member
 2. UI 上仍保留五个入口（用户认这个心智），但走同一套组件和同一条渲染路径。
 3. 再加 `plugin` 表与导入/导出。
 4. 最后才是云端分发与授权（[09](09-cloud.md) 形态 D）。
+
+## 6.6 Harness 与 Host 进程流
+
+Harness 层只消费跨实现的事实事件：助手文本、工具调用、工具结果、挂起的审批/提问、回合结束、错误和中断。`TurnEngine` 通过 `BuiltinHarness` 提供内置实现；外部 harness 尚未接入，本轮不展示 OpenCode 入口。
+
+Host 另提供进程流能力：
+
+```rust
+async fn spawn(&self, request: SpawnRequest) -> Result<Box<dyn HostProcess>, HostError>;
+```
+
+`HostProcess` 交付增量 UTF-8 解码后的输出片段和退出事件，并支持 stdin 与 interrupt。Host 不承诺输出是干净的行，也不负责 ANSI、`\r`、PTY echo 清洗或 NDJSON 分帧；这些属于 harness 解析器。
+
+- `LocalHost` 使用普通管道，避免没有必要的 PTY 噪声。
+- `RvmHost` 使用已有 `/pty-ws` 双向 WebSocket；RVM 主机端不做修改。
+- `/pty-ws` 是终端字节流，存在 echo、控制序列和窗口宽度导致换行污染风险。P2-2 接 OpenCode 时必须先验证 `--format json` 在该通道上的可靠性。
+- 远程 PTY 的进程流没有退出码，`ProcessEvent::Exited` 始终携带 `None`；本机管道可以交付真实退出码。P2-2 再考虑用 marker 回读远程退出码。
+- 远程能力只有在主机能力表声明 `pty` 时才把 `process_stream` 标记为可用；不可用主机仍显式返回不可用，不代理到本机。

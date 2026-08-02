@@ -468,6 +468,21 @@ export function reduceStreamEvent(
     if (typeof delta.arguments_fragment === "string")
       tool.arguments = `${String(tool.arguments || "")}${delta.arguments_fragment}`;
   }
+  const toolResult = payloadObject(payload.tool_result);
+  if (Object.keys(toolResult).length > 0) {
+    const callId =
+      typeof toolResult.call_id === "string" ? toolResult.call_id : "";
+    if (callId) {
+      const tool = next.find(
+        (item) => item.kind === "tool" && item.callId === callId,
+      );
+      if (tool && tool.kind === "tool") {
+        tool.result = toolResult.result;
+        tool.status = "ok";
+        tool.approval = false;
+      }
+    }
+  }
   const turn = payloadObject(payload.turn);
   if (Object.keys(turn).length > 0) {
     const liveIndex = next.findIndex((item) => item.id === "stream:assistant");

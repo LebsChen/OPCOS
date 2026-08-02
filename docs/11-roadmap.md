@@ -90,7 +90,20 @@
 
 ## P2 —— 平台化
 
-- **P2-1 Harness 可插拔**：`opcos-harness`，内置 + Claude Code / Codex / OpenCode 子进程，统一事件流（参照 Tembo 的 6 种 harness）。
+- **P2-1 Harness 抽象与进程流**：
+  - 已落地 harness-neutral trait、事实中心事件模型与 `BuiltinHarness`（现有 `TurnEngine` 的适配器），不改变内置行为；
+  - 已落地 `Host::spawn` / `HostProcess`，本机走管道，远程走 RVM 现有 `/pty-ws`；
+  - `HostProcess` 只交付增量 UTF-8 输出和生命周期事件，不承诺干净行，不在 Host 层清洗 ANSI、`\r`、echo 或做 NDJSON 分帧；
+  - PTY 承载结构化输出存在 echo、控制序列、窗口宽度换行污染风险；
+  - 远程 PTY 进程流没有退出码，当前 `Exited` 只能报告 `None`；P2-2 再评估通过 marker 回读退出码；
+  - 本机使用无 echo 的普通管道，远程使用有终端噪声且无退出码的 PTY，两者语义一致但底层交付特性不同；
+  - 外部 harness 尚未接入，UI 不提供 OpenCode 或其他假入口；
+  - OpenCode CLI 模式因 permission/question 无法交回 OPCOS、会自动批准或拒绝而否决，不使用 `--auto` 降级。
+- **P2-2 OpenCode server harness**：
+  - 通过 Host 启动 `opencode serve`，使用 HTTP/SSE 事件流以及 permission/question API；
+  - 需要验证远程 `/pty-ws` 承载 NDJSON 是否可靠；若不可靠，考虑远程端口转发或等价 Host 通道；
+  - 远程 HTTP 端口如何安全访问仍是未决设计，本轮不解决；
+  - 必须完整接入 Inbox、审批、二维状态、审计、产物登记和中断恢复后，才提供 OpenCode 入口。
 - **P2-2 自动化三类触发**：定时（已有）+ 出站事件轮询（GitHub / Linear / Sentry）+ webhook（需 relay，见 P3）。payload 以结构化 event context 传入，不压成一句 prompt。
 - **P2-3 连接器框架**：适配器接口 + OAuth（手工 token 路径永远保留）+ token 只进 SecretStore。先做一个真集成，不做空壳。
 - **P2-4 插件打包**：`plugin` / `plugin_member`，支持从 GitHub 仓库导入导出；MCP server URL 只能来自插件自己的配置对象。grok-build 参照 marketplace relative path containment、transactional install/update、source/scan 类型边界。［GB码］［推断］
