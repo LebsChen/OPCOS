@@ -95,7 +95,11 @@
 | `tool_result`       | 工具结果 payload。                                                               |
 | `notice`            | `{kind,text}`，例如 `approval_pending`、`error`、`interrupted`、`model_switch`。 |
 | `steering`          | `{text}`。                                                                       |
-| `turn_done`         | `{}`，必须是本 turn 最后事件。                                                   |
+| `turn_done`         | `{run_state,stop_reason}`，必须是本 turn 最后事件；两字段是引擎产出的原始枚举。  |
+
+`stop_reason` 除生命周期原因外还包括 `internal_error`（store/engine 自身失败）
+与 `max_iterations`（达到引擎最大轮次）；前端必须按未知值安全降级，不能把
+内部错误显示成 `provider_error` 或 `finished`。
 
 事件序列和审批延续规则不在本篇重复，见 [03-lifecycle.md](03-lifecycle.md)。`submit_turn`、`resolve_approval`、`steering` 都会确保完成路径发 `turn_done`。
 

@@ -14,6 +14,8 @@ export type Session = {
   provider?: string | null;
   mode: string;
   workspace?: string;
+  run_state?: string;
+  stop_reason?: string;
 };
 
 export type TranscriptItem = {

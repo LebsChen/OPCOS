@@ -29,6 +29,7 @@ import {
   reduceStreamEvent,
 } from "./transcript";
 import { Sidebar } from "./components/Sidebar";
+import { sessionStatusLabel } from "./sessionStatus";
 import { Transcript } from "./components/Transcript";
 import { Composer, PlusMenu, SendButton } from "./components/Composer";
 import { SelectMenu as OpenWorkerSelectMenu } from "./components/SelectMenu";
@@ -3464,7 +3465,31 @@ function AppContent() {
         setRunning(true);
         if (payload.payload.turn) setRunning(false);
       }
-      if (payload.kind === "turn_done") setRunning(false);
+      if (payload.kind === "turn_done") {
+        setRunning(false);
+        const runState =
+          typeof payload.payload.run_state === "string"
+            ? payload.payload.run_state
+            : undefined;
+        const stopReason =
+          typeof payload.payload.stop_reason === "string"
+            ? payload.payload.stop_reason
+            : undefined;
+        if (runState || stopReason) {
+          setSessions((items) =>
+            items.map((item) =>
+              item.id === payload.session_id
+                ? { ...item, run_state: runState, stop_reason: stopReason }
+                : item,
+            ),
+          );
+          setSelected((item) =>
+            item && item.id === payload.session_id
+              ? { ...item, run_state: runState, stop_reason: stopReason }
+              : item,
+          );
+        }
+      }
       if (
         payload.kind === "approval_resolved" ||
         (payload.kind === "notice" &&
@@ -3709,6 +3734,7 @@ function AppContent() {
           archived: false,
           attention: 0,
           liveness: selected?.id === session.id && running ? "working" : "idle",
+          stop_reason: session.stop_reason,
         }))}
         agent="opcos"
         workspace={selected?.workspace || ""}
@@ -3755,6 +3781,9 @@ function AppContent() {
                 <p>
                   {selected.host_name} ·{" "}
                   {selected.workspace || "workspace not set"} · {selected.model}
+                </p>
+                <p className="surface-status muted">
+                  {sessionStatusLabel(selected.run_state, selected.stop_reason)}
                 </p>
               </div>
               <div className="main-topbar-actions">

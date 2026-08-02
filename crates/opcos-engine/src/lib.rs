@@ -27,6 +27,8 @@ pub enum EngineError {
     Provider(#[from] ProviderError),
     #[error("store: {0}")]
     Store(String),
+    #[error("context exhausted: {0}")]
+    ContextExhausted(String),
     #[error("engine interrupted")]
     Interrupted,
     #[error("maximum iterations reached")]
@@ -79,7 +81,7 @@ pub struct TurnEngine<P, S, E> {
     model: Mutex<String>,
     interrupted: AtomicBool,
     steering: Mutex<Vec<String>>,
-    steering_waiters: Arc<std::sync::Mutex<Vec<oneshot::Sender<()>>>>,
+    steering_waiters: SteeringWaiters,
     events: mpsc::Sender<StreamChunk>,
     receiver: Mutex<Option<mpsc::Receiver<StreamChunk>>>,
     sequence: Mutex<i64>,
@@ -88,7 +90,10 @@ pub struct TurnEngine<P, S, E> {
     system_instructions: Mutex<Option<String>>,
     external_tools: Mutex<Vec<Value>>,
     active_tool_calls: StdMutex<HashSet<String>>,
+    policy_denied: AtomicBool,
 }
+
+type SteeringWaiters = Arc<std::sync::Mutex<Vec<oneshot::Sender<(String, String)>>>>;
 
 struct ActiveToolCallGuard<'a> {
     calls: &'a StdMutex<HashSet<String>>,
@@ -145,6 +150,7 @@ where
             system_instructions: Mutex::new(None),
             external_tools: Mutex::new(Vec::new()),
             active_tool_calls: StdMutex::new(HashSet::new()),
+            policy_denied: AtomicBool::new(false),
         }
     }
 
@@ -158,17 +164,36 @@ where
 
     pub async fn submit_text(&self, text: impl Into<String>) -> Result<AssistantTurn, EngineError> {
         self.interrupted.store(false, Ordering::SeqCst);
+        self.policy_denied.store(false, Ordering::SeqCst);
+        self.set_session_status("running", "none");
         let value = json!({"role":"user","content":[{"type":"text","text":text.into()}]});
-        self.append("user", value).await?;
-        self.run_loop(self.provider_messages()?).await
+        let result = async {
+            self.append("user", value).await?;
+            self.run_loop(self.provider_messages()?).await
+        }
+        .await;
+        self.finish_turn(&result);
+        result
     }
 
     pub async fn retry(&self) -> Result<AssistantTurn, EngineError> {
         self.interrupted.store(false, Ordering::SeqCst);
-        self.run_loop(self.provider_messages()?).await
+        self.policy_denied.store(false, Ordering::SeqCst);
+        self.set_session_status("running", "none");
+        let result = async { self.run_loop(self.provider_messages()?).await }.await;
+        self.finish_turn(&result);
+        result
     }
 
     pub async fn resume_pending_turn(&self) -> Result<Option<AssistantTurn>, EngineError> {
+        self.set_session_status("running", "none");
+        self.policy_denied.store(false, Ordering::SeqCst);
+        let result = self.resume_pending_turn_inner().await;
+        self.finish_turn(&result);
+        result
+    }
+
+    async fn resume_pending_turn_inner(&self) -> Result<Option<AssistantTurn>, EngineError> {
         let messages = self
             .store
             .load_resume_messages(&self.session_id)
@@ -233,10 +258,69 @@ where
         }
     }
 
+    fn set_session_status(&self, run_state: &str, stop_reason: &str) {
+        if let Err(error) =
+            self.store
+                .update_session_status(&self.session_id, run_state, stop_reason)
+        {
+            eprintln!(
+                "opcos-engine: failed to persist session status for {}: {}",
+                self.session_id, error
+            );
+        }
+    }
+
+    fn turn_status<T>(&self, result: &Result<T, EngineError>) -> (&'static str, &'static str) {
+        let (run_state, stop_reason) = match result {
+            Ok(_) => ("idle", "finished"),
+            Err(EngineError::ApprovalPending(call_id)) => {
+                let waiting_for_user = self
+                    .store
+                    .load_pending(&self.session_id)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .any(|pending| pending.call_id == *call_id && pending.tool == "ask_user");
+                (
+                    "idle",
+                    if waiting_for_user {
+                        "waiting_for_user"
+                    } else {
+                        "waiting_for_approval"
+                    },
+                )
+            }
+            Err(EngineError::Interrupted) => ("interrupted", "interrupted_by_user"),
+            Err(EngineError::Provider(_)) => ("error", "provider_error"),
+            Err(EngineError::ContextExhausted(_)) => ("error", "context_exhausted"),
+            Err(EngineError::Store(_)) => ("error", "internal_error"),
+            Err(EngineError::MaxIterations) => ("error", "max_iterations"),
+            Err(EngineError::ApprovalAlreadyProcessed(_)) => ("idle", "waiting_for_approval"),
+        };
+        if result.is_ok() && self.policy_denied.load(Ordering::SeqCst) {
+            return ("idle", "policy_denied");
+        }
+        (run_state, stop_reason)
+    }
+
+    fn finish_turn<T>(&self, result: &Result<T, EngineError>) {
+        let (run_state, stop_reason) = self.turn_status(result);
+        self.set_session_status(run_state, stop_reason);
+        let waiters = std::mem::take(
+            &mut *self
+                .steering_waiters
+                .lock()
+                .expect("steering waiters mutex poisoned"),
+        );
+        for waiter in waiters {
+            let _ = waiter.send((run_state.to_owned(), stop_reason.to_owned()));
+        }
+    }
+
     pub async fn queue_steering(
         &self,
         text: impl Into<String>,
-    ) -> Result<oneshot::Receiver<()>, EngineError> {
+    ) -> Result<oneshot::Receiver<(String, String)>, EngineError> {
         let text = text.into();
         let (sender, receiver) = oneshot::channel();
         self.steering_waiters
@@ -262,6 +346,18 @@ where
     }
 
     pub async fn resolve_approval(
+        &self,
+        call_id: &str,
+        outcome: ApprovalOutcome,
+    ) -> Result<AssistantTurn, EngineError> {
+        self.set_session_status("running", "none");
+        self.policy_denied.store(false, Ordering::SeqCst);
+        let result = self.resolve_approval_inner(call_id, outcome).await;
+        self.finish_turn(&result);
+        result
+    }
+
+    async fn resolve_approval_inner(
         &self,
         call_id: &str,
         outcome: ApprovalOutcome,
@@ -394,9 +490,6 @@ where
     }
 
     async fn run_loop(&self, mut messages: Vec<Value>) -> Result<AssistantTurn, EngineError> {
-        let _completion = SteeringCompletion {
-            waiters: Arc::clone(&self.steering_waiters),
-        };
         let mut usage: Option<TokenUsage> = None;
         for _ in 0..12 {
             if self.interrupted.load(Ordering::SeqCst) {
@@ -405,7 +498,10 @@ where
                 return Err(EngineError::Interrupted);
             }
             if self.should_compact(&messages, usage.as_ref()) {
-                messages = self.compact_context(messages).await?;
+                messages = self
+                    .compact_context(messages)
+                    .await
+                    .map_err(|error| EngineError::ContextExhausted(error.to_string()))?;
             }
             let request = ProviderRequest {
                 model: self.model.lock().await.clone(),
@@ -491,7 +587,10 @@ where
                     self.notice("error", "Provider request failed".into())
                         .await?;
                     if matches!(error, ProviderError::ContextOverflow) {
-                        messages = self.compact_context(messages).await?;
+                        messages = self
+                            .compact_context(messages)
+                            .await
+                            .map_err(|error| EngineError::ContextExhausted(error.to_string()))?;
                         continue;
                     }
                     return Err(error.into());
@@ -640,6 +739,7 @@ where
                     results[index] = Some(self.execute_tool(call).await);
                 }
                 Decision::Deny => {
+                    self.policy_denied.store(true, Ordering::SeqCst);
                     results[index] = Some(json!({"error":"tool call denied by policy"}))
                 }
                 Decision::NeedsUser => {
@@ -930,29 +1030,11 @@ struct PartialOutput {
     reasoning: Option<String>,
 }
 
-struct SteeringCompletion {
-    waiters: Arc<std::sync::Mutex<Vec<oneshot::Sender<()>>>>,
-}
-
-impl Drop for SteeringCompletion {
-    fn drop(&mut self) {
-        let waiters = std::mem::take(
-            &mut *self
-                .waiters
-                .lock()
-                .expect("steering waiters mutex poisoned"),
-        );
-        for waiter in waiters {
-            let _ = waiter.send(());
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use opcos_store::{SessionStore, SqliteStore};
+    use opcos_store::{SessionRecord, SessionStore, SqliteStore};
 
     #[derive(Clone)]
     struct FakeProvider;
@@ -1244,6 +1326,28 @@ mod tests {
     async fn approved_tool_is_tracked_until_its_result_is_persisted() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         store
+            .save_session(&SessionRecord {
+                session_id: "s".into(),
+                workspace: "/workspace".into(),
+                model: "fake".into(),
+                mode: "Interactive".into(),
+                title: "Approval".into(),
+                extra_roots: vec![],
+                grants: json!({}),
+                pinned: false,
+                archived: false,
+                origin: None,
+                origin_label: None,
+                compaction: json!({}),
+                host_id: "local".into(),
+                provider: None,
+                run_state: "idle".into(),
+                stop_reason: "none".into(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+        store
             .append_message(&StoredMessage {
                 session_id: "s".into(),
                 sequence: 1,
@@ -1266,7 +1370,7 @@ mod tests {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let engine = Arc::new(TurnEngine::new(
             FakeProvider,
-            store,
+            store.clone(),
             Arc::new(BlockingTools {
                 started: started.clone(),
                 release: release.clone(),
@@ -1296,6 +1400,9 @@ mod tests {
                 .await,
             Err(EngineError::ApprovalAlreadyProcessed(id)) if id == "approved-1"
         ));
+        let session = store.load_session("s").unwrap().unwrap();
+        assert_eq!(session.run_state, "idle");
+        assert_eq!(session.stop_reason, "waiting_for_approval");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 

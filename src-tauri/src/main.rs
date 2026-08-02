@@ -225,6 +225,8 @@ struct SessionView {
     provider: Option<String>,
     mode: String,
     workspace: String,
+    run_state: String,
+    stop_reason: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -584,6 +586,24 @@ fn session_for(state: &DesktopState, session_id: &str) -> Result<SessionRecord, 
         .ok_or_else(|| "session not found".to_owned())
 }
 
+fn session_status_payload(state: &DesktopState, session_id: &str) -> Value {
+    session_status_payload_from_store(&state.store, session_id)
+}
+
+fn session_status_payload_from_store(store: &SqliteStore, session_id: &str) -> Value {
+    store
+        .load_session(session_id)
+        .ok()
+        .flatten()
+        .map(|session| {
+            json!({
+                "run_state": session.run_state,
+                "stop_reason": session.stop_reason,
+            })
+        })
+        .unwrap_or_else(|| json!({"run_state":"error","stop_reason":"internal_error"}))
+}
+
 fn session_host_id(state: &DesktopState, session_id: &str) -> Result<String, String> {
     Ok(session_for(state, session_id)?.host_id)
 }
@@ -903,10 +923,12 @@ async fn engine_for(
         .or(descriptor.default_base_url)
         .unwrap_or_default();
     let client = client_for(state, &host_id)?;
-    let health = client
-        .health()
-        .await
-        .map_err(|error| format!("remote host unavailable: {error}"))?;
+    let health = client.health().await.map_err(|error| {
+        let _ = state
+            .store
+            .update_session_status(session_id, "error", "host_unavailable");
+        format!("remote host unavailable: {error}")
+    })?;
     let workspace = if session_workspace.is_empty() {
         health.workspace.unwrap_or_else(|| "/workspace".into())
     } else {
@@ -1397,6 +1419,8 @@ fn create_session(
             compaction: json!({}),
             host_id: host_id.clone(),
             provider: provider.clone(),
+            run_state: "idle".into(),
+            stop_reason: "none".into(),
             created_at: now,
             updated_at: now,
         })
@@ -1416,6 +1440,8 @@ fn create_session(
         provider,
         mode,
         workspace: workspace.unwrap_or_default(),
+        run_state: "idle".into(),
+        stop_reason: "none".into(),
     })
 }
 
@@ -1462,6 +1488,8 @@ fn session_view_for_host(
         provider: session.provider,
         mode: session.mode,
         workspace: session.workspace,
+        run_state: session.run_state,
+        stop_reason: session.stop_reason,
     }))
 }
 
@@ -1512,10 +1540,24 @@ async fn submit_turn(
 ) -> Result<(), String> {
     let host_id = session_host_id(&state, &request.session_id)?;
     let client = client_for(&state, &host_id)?;
-    client
-        .health()
-        .await
-        .map_err(|error| format!("remote host unavailable: {error}"))?;
+    if let Err(error) = client.health().await {
+        let _ = state
+            .store
+            .update_session_status(&request.session_id, "error", "host_unavailable");
+        emit(
+            &app,
+            "notice",
+            Some(&request.session_id),
+            json!({"kind":"error","text":"Remote host unavailable"}),
+        );
+        emit(
+            &app,
+            "turn_done",
+            Some(&request.session_id),
+            session_status_payload(&state, &request.session_id),
+        );
+        return Err(format!("remote host unavailable: {error}"));
+    }
     let engine = engine_for(&app, &state, &request.session_id).await?;
     emit(
         &app,
@@ -1525,7 +1567,12 @@ async fn submit_turn(
     );
     match engine.submit_text(request.text).await {
         Ok(_) => {
-            emit(&app, "turn_done", Some(&request.session_id), json!({}));
+            emit(
+                &app,
+                "turn_done",
+                Some(&request.session_id),
+                session_status_payload(&state, &request.session_id),
+            );
             Ok(())
         }
         Err(EngineError::ApprovalPending(call_id)) => {
@@ -1554,7 +1601,12 @@ async fn submit_turn(
                 Some(&request.session_id),
                 json!({"kind":"approval_pending","text":message}),
             );
-            emit(&app, "turn_done", Some(&request.session_id), json!({}));
+            emit(
+                &app,
+                "turn_done",
+                Some(&request.session_id),
+                session_status_payload(&state, &request.session_id),
+            );
             Err(message)
         }
         Err(error) => {
@@ -1573,7 +1625,12 @@ async fn submit_turn(
                 Some(&request.session_id),
                 json!({"kind":"error","text":message}),
             );
-            emit(&app, "turn_done", Some(&request.session_id), json!({}));
+            emit(
+                &app,
+                "turn_done",
+                Some(&request.session_id),
+                session_status_payload(&state, &request.session_id),
+            );
             Err(message)
         }
     }
@@ -1667,8 +1724,20 @@ async fn steering(
     let handle = app.clone();
     let session = session_id.clone();
     tauri::async_runtime::spawn(async move {
-        let _ = completion.await;
-        emit(&handle, "turn_done", Some(&session), json!({}));
+        match completion.await {
+            Ok((run_state, stop_reason)) => emit(
+                &handle,
+                "turn_done",
+                Some(&session),
+                json!({"run_state": run_state, "stop_reason": stop_reason}),
+            ),
+            Err(_) => emit(
+                &handle,
+                "turn_done",
+                Some(&session),
+                json!({"run_state":"error","stop_reason":"internal_error"}),
+            ),
+        }
     });
     Ok(())
 }
@@ -1697,14 +1766,24 @@ async fn resolve_approval(
         Ok(()) => {
             emit_approval_decision(&app, &state, &session_id, &call_id, approve);
             let _ = emit_pending_approval(&app, &state, &session_id)?;
-            emit(&app, "turn_done", Some(&session_id), json!({}));
+            emit(
+                &app,
+                "turn_done",
+                Some(&session_id),
+                session_status_payload(&state, &session_id),
+            );
             Ok(())
         }
         Err(opcos_engine::EngineError::ApprovalPending(next_call_id)) => {
             let _ = next_call_id;
             emit_approval_decision(&app, &state, &session_id, &call_id, approve);
             emit_pending_approval(&app, &state, &session_id)?;
-            emit(&app, "turn_done", Some(&session_id), json!({}));
+            emit(
+                &app,
+                "turn_done",
+                Some(&session_id),
+                session_status_payload(&state, &session_id),
+            );
             Ok(())
         }
         Err(opcos_engine::EngineError::ApprovalAlreadyProcessed(_)) => {
@@ -3227,6 +3306,8 @@ mod m7_tests {
             compaction: json!({}),
             host_id: "deleted-host".into(),
             provider: None,
+            run_state: "idle".into(),
+            stop_reason: "none".into(),
             created_at: now,
             updated_at: now,
         };
