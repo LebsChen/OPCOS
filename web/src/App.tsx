@@ -31,6 +31,7 @@ import {
 import { Sidebar } from "./components/Sidebar";
 import { sessionStatusLabel } from "./sessionStatus";
 import { Transcript } from "./components/Transcript";
+import { ApprovalCard, PreviewBlock } from "./components/ApprovalCard";
 import { Composer, PlusMenu, SendButton } from "./components/Composer";
 import { SelectMenu as OpenWorkerSelectMenu } from "./components/SelectMenu";
 import { SettingsView, type SettingsSection } from "./components/SettingsView";
@@ -65,6 +66,26 @@ type Asset = {
   enabled: boolean;
 };
 type SecretMetadata = { name: string; scope: string; purpose: string };
+type InboxRecord = {
+  session_id: string;
+  call_id: string;
+  kind: string;
+  tool: string;
+  payload: Record<string, unknown>;
+  state: string;
+  created_at: string;
+  resolution?: string | null;
+};
+
+function relativeTime(value: string): string {
+  const elapsed = Date.now() - new Date(value).getTime();
+  const minutes = Math.max(0, Math.round(elapsed / 60_000));
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
+}
 type Schedule = {
   id: string;
   name: string;
@@ -3659,6 +3680,139 @@ class AppErrorBoundary extends Component<
   }
 }
 
+function InboxPane({
+  items,
+  sessions,
+  onResolve,
+  onOpenSession,
+}: {
+  items: InboxRecord[];
+  sessions: Session[];
+  onResolve: (item: InboxRecord, resolution: string) => void;
+  onOpenSession: (sessionId: string) => void;
+}) {
+  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const pending = items.filter((item) => item.state !== "resolved");
+  const sessionTitle = (sessionId: string) =>
+    sessions.find((session) => session.id === sessionId)?.title || sessionId;
+  return (
+    <div className="surface-panel p-4">
+      <div className="flex items-center justify-between mb-4">
+        <h2 className="text-base font-semibold">Inbox</h2>
+        <span className="text-xs text-faint">{pending.length} pending</span>
+      </div>
+      <div className="space-y-3">
+        {pending.length === 0 && <div className="muted">No pending items.</div>}
+        {pending.map((item) => (
+          <div
+            key={`${item.session_id}:${item.call_id}`}
+            className="approval rounded-xl border border-line p-3"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <strong>
+                {item.kind === "question"
+                  ? "Question"
+                  : item.kind === "plan"
+                    ? "Plan confirmation"
+                    : "Approval"}
+              </strong>
+              <span className="text-xs text-faint">{item.tool}</span>
+            </div>
+            <div className="flex items-center gap-2 mt-2 text-xs text-faint">
+              <button
+                className="hover:text-ink underline-offset-2 hover:underline"
+                onClick={() => onOpenSession(item.session_id)}
+              >
+                {sessionTitle(item.session_id)}
+              </button>
+              <span>·</span>
+              <span>{relativeTime(item.created_at)}</span>
+            </div>
+            {item.kind === "approval" ? (
+              <ApprovalCard
+                item={{
+                  kind: "approval",
+                  callId: item.call_id,
+                  name: item.tool,
+                  args: item.payload,
+                  reason: "requires approval",
+                }}
+                onApprove={(decision) => onResolve(item, decision)}
+              />
+            ) : (
+              <>
+                {item.kind === "question" && (
+                  <div className="approval-with mt-3">
+                    {String(
+                      item.payload.question ||
+                        item.payload.prompt ||
+                        "Answer required",
+                    )}
+                  </div>
+                )}
+                {item.kind === "plan" &&
+                  typeof item.payload.plan === "string" && (
+                    <PreviewBlock text={item.payload.plan} mono={false} />
+                  )}
+                {item.kind === "directory" &&
+                  typeof item.payload.path === "string" && (
+                    <PreviewBlock text={item.payload.path} />
+                  )}
+                <div className="approval-btns mt-3">
+                  {item.kind === "question" ? (
+                    <>
+                      <input
+                        className="ob-input flex-1"
+                        value={answers[item.call_id] || ""}
+                        onChange={(event) =>
+                          setAnswers((current) => ({
+                            ...current,
+                            [item.call_id]: event.target.value,
+                          }))
+                        }
+                        placeholder="Type your answer"
+                      />
+                      <button
+                        className="btn approval-primary"
+                        disabled={!answers[item.call_id]?.trim()}
+                        onClick={() => {
+                          onResolve(item, answers[item.call_id].trim());
+                          setAnswers((current) => {
+                            const next = { ...current };
+                            delete next[item.call_id];
+                            return next;
+                          });
+                        }}
+                      >
+                        Answer
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <button
+                        className="btn approval-primary"
+                        onClick={() => onResolve(item, "allow")}
+                      >
+                        Allow
+                      </button>
+                      <button
+                        className="btn quiet-deny"
+                        onClick={() => onResolve(item, "deny")}
+                      >
+                        Deny
+                      </button>
+                    </>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function AppContent() {
   const NAV_COLLAPSED_KEY = "opcos:nav-collapsed:v1";
   const [windowMaximized, setWindowMaximized] = useState(false);
@@ -3667,8 +3821,10 @@ function AppContent() {
   const [selected, setSelected] = useState<Session | null>(null);
   const [transcript, setTranscript] = useState<TranscriptViewItem[]>([]);
   const [surface, setSurface] = useState<
-    "session" | "automations" | "manage" | "activity"
+    "session" | "automations" | "manage" | "activity" | "inbox"
   >("session");
+  const [inbox, setInbox] = useState<InboxRecord[]>([]);
+  const [unattended, setUnattended] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsSection>("provider");
   const [query, setQuery] = useState("");
   const [error, setError] = useState("");
@@ -3739,19 +3895,27 @@ function AppContent() {
     };
   }, []);
   const refresh = async () => {
-    const [nextHosts, nextSessions, nextAssets, nextProviders, nextSecrets] =
-      await Promise.all([
-        command<Host[]>("list_hosts"),
-        command<Session[]>("list_sessions"),
-        command<Asset[]>("list_assets"),
-        command<ProviderDescriptor[]>("provider_descriptors"),
-        command<SecretMetadata[]>("list_secret_metadata"),
-      ]);
+    const [
+      nextHosts,
+      nextSessions,
+      nextAssets,
+      nextProviders,
+      nextSecrets,
+      nextInbox,
+    ] = await Promise.all([
+      command<Host[]>("list_hosts"),
+      command<Session[]>("list_sessions"),
+      command<Asset[]>("list_assets"),
+      command<ProviderDescriptor[]>("provider_descriptors"),
+      command<SecretMetadata[]>("list_secret_metadata"),
+      command<InboxRecord[]>("list_inbox"),
+    ]);
     setHosts(nextHosts);
     setSessions(nextSessions);
     setAssets(nextAssets);
     setProviders(nextProviders);
     setSecrets(nextSecrets);
+    setInbox(nextInbox);
     if (selected) {
       const current = nextSessions.find((item) => item.id === selected.id);
       if (current) setSelected(current);
@@ -3796,6 +3960,15 @@ function AppContent() {
         if (generation.current === currentGeneration)
           setError(errorMessage(reason));
       });
+  }, [selected?.id]);
+  useEffect(() => {
+    if (!selected) {
+      setUnattended(false);
+      return;
+    }
+    void command<boolean>("get_unattended", { sessionId: selected.id })
+      .then(setUnattended)
+      .catch((reason) => setError(errorMessage(reason)));
   }, [selected?.id]);
   useEffect(() => {
     let active = true;
@@ -4118,6 +4291,13 @@ function AppContent() {
         onSurface={setSurface}
         onManage={() => setSurface("manage")}
         onActivity={() => setSurface("activity")}
+        onOpenInbox={() => {
+          setSurface("inbox");
+          void command<InboxRecord[]>("list_inbox")
+            .then(setInbox)
+            .catch(onError);
+        }}
+        inboxActive={surface === "inbox"}
         onAutomations={() => setSurface("automations")}
         onAddHost={addHost}
         hostName={hostName}
@@ -4183,6 +4363,24 @@ function AppContent() {
                   )}
                   connected={Boolean(selected)}
                   running={running}
+                  workspace={selected.workspace}
+                  onModeChange={(mode) => {
+                    void command("change_mode", {
+                      sessionId: selected.id,
+                      mode,
+                    })
+                      .then(() => setSelected({ ...selected, mode }))
+                      .catch(onError);
+                  }}
+                  unattended={unattended}
+                  onUnattendedChange={(on) => {
+                    void command("set_unattended", {
+                      sessionId: selected.id,
+                      unattended: on,
+                    })
+                      .then(() => setUnattended(on))
+                      .catch(onError);
+                  }}
                   onSend={submit}
                   onSteer={steer}
                   onModelChange={(model) => {
@@ -4232,6 +4430,28 @@ function AppContent() {
           <Automations sessions={sessions} assets={assets} onError={onError} />
         ) : surface === "activity" ? (
           <Activity selected={selected} onError={onError} />
+        ) : surface === "inbox" ? (
+          <InboxPane
+            items={inbox}
+            sessions={sessions}
+            onOpenSession={(sessionId) => {
+              const next = sessions.find((session) => session.id === sessionId);
+              if (next) {
+                setSelected(next);
+                setSurface("session");
+              }
+            }}
+            onResolve={(item, resolution) =>
+              command("resolve_inbox", {
+                sessionId: item.session_id,
+                callId: item.call_id,
+                resolution,
+              })
+                .then(() => command<InboxRecord[]>("list_inbox"))
+                .then(setInbox)
+                .catch(onError)
+            }
+          />
         ) : (
           <div className="home">
             <div className="home-inner">

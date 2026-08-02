@@ -1210,6 +1210,12 @@ export function Sidebar(props: SidebarProps) {
                   onOpenAudit,
                   props.auditActive,
                 )}
+                {appMenuItem(
+                  "inbox",
+                  "Inbox",
+                  props.onOpenInbox ?? (() => undefined),
+                  props.inboxActive,
+                )}
               </div>
             </>
           )}
