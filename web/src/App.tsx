@@ -61,6 +61,7 @@ type Asset = {
   body: string;
   trigger: string;
   scope: string;
+  scope_kind?: string;
   enabled: boolean;
 };
 type SecretMetadata = { name: string; scope: string; purpose: string };
@@ -917,9 +918,19 @@ function ManageSections({
   const [assetKind, setAssetKind] = useState<Asset["kind"]>("knowledge");
   const [assetTrigger, setAssetTrigger] = useState("");
   const [assetScope, setAssetScope] = useState("");
+  const [assetScopeKind, setAssetScopeKind] = useState<"global" | "repo">(
+    "global",
+  );
   const [editingAssetId, setEditingAssetId] = useState<string | null>(null);
   const [assetPending, setAssetPending] = useState<string | null>(null);
   const [assetFormOpen, setAssetFormOpen] = useState(false);
+  const [versionHistoryAsset, setVersionHistoryAsset] = useState<string | null>(
+    null,
+  );
+  const [assetVersions, setAssetVersions] = useState<
+    Array<Record<string, unknown>>
+  >([]);
+  const [compareVersionId, setCompareVersionId] = useState<string | null>(null);
   const [assetSearch, setAssetSearch] = useState("");
   const [assetStatus, setAssetStatus] = useState("All");
   const [discoveredAssets, setDiscoveredAssets] = useState<Asset[] | null>(
@@ -1709,6 +1720,21 @@ function ManageSections({
                               <Button
                                 className="bordered"
                                 onClick={() => {
+                                  setVersionHistoryAsset(asset.id);
+                                  setCompareVersionId(null);
+                                  void command<Array<Record<string, unknown>>>(
+                                    "list_asset_versions",
+                                    { assetId: asset.id },
+                                  )
+                                    .then(setAssetVersions)
+                                    .catch(onError);
+                                }}
+                              >
+                                History
+                              </Button>
+                              <Button
+                                className="bordered"
+                                onClick={() => {
                                   setEditingAssetId(asset.id);
                                   setAssetFormOpen(true);
                                   setAssetKind(asset.kind);
@@ -1716,6 +1742,11 @@ function ManageSections({
                                   setAssetBody(asset.body);
                                   setAssetTrigger(asset.trigger);
                                   setAssetScope(asset.scope);
+                                  setAssetScopeKind(
+                                    asset.scope_kind === "repo"
+                                      ? "repo"
+                                      : "global",
+                                  );
                                 }}
                               >
                                 {kind === "agents" ? "编辑" : "Edit"}
@@ -1750,6 +1781,82 @@ function ManageSections({
                   }
                 />
               ))}
+            {versionHistoryAsset && (
+              <div className="manage-card mt-4">
+                <div className="flex items-center justify-between">
+                  <strong>Version history</strong>
+                  <Button
+                    className="bordered"
+                    onClick={() => {
+                      setVersionHistoryAsset(null);
+                      setAssetVersions([]);
+                      setCompareVersionId(null);
+                    }}
+                  >
+                    Close
+                  </Button>
+                </div>
+                {assetVersions.map((version) => {
+                  const versionId = String(version.id);
+                  const isCurrent =
+                    assets.find((asset) => asset.id === versionHistoryAsset)
+                      ?.body === version.content;
+                  return (
+                    <div className="manage-row mt-2" key={versionId}>
+                      <span>
+                        <strong>
+                          v{String(version.version)}
+                          {isCurrent ? " · current" : ""}
+                        </strong>
+                        <small>{String(version.created_at)}</small>
+                      </span>
+                      <span className="inline-actions">
+                        <Button
+                          className="bordered"
+                          onClick={() => {
+                            setCompareVersionId(versionId);
+                            const other = assetVersions.find(
+                              (item) => String(item.id) !== versionId,
+                            );
+                            if (other) {
+                              void command("compare_asset_versions", {
+                                assetId: versionHistoryAsset,
+                                leftVersionId: versionId,
+                                rightVersionId: String(other.id),
+                              })
+                                .then((value) => {
+                                  setCompareVersionId(
+                                    JSON.stringify(value, null, 2),
+                                  );
+                                })
+                                .catch(onError);
+                            }
+                          }}
+                        >
+                          Compare
+                        </Button>
+                        <Button
+                          className="bordered"
+                          onClick={() =>
+                            command("rollback_asset", {
+                              assetId: versionHistoryAsset,
+                              versionId,
+                            })
+                              .then(onRefresh)
+                              .catch(onError)
+                          }
+                        >
+                          Roll back
+                        </Button>
+                      </span>
+                    </div>
+                  );
+                })}
+                {compareVersionId?.startsWith("{") && (
+                  <pre className="code-block mt-3">{compareVersionId}</pre>
+                )}
+              </div>
+            )}
             {assetFormOpen && (
               <div className="rounded-xl2 border border-line bg-panel p-5">
                 <h2 className="text-[15px] font-semibold text-ink">
@@ -1793,10 +1900,22 @@ function ManageSections({
                   )}
                   <label className="field-label">
                     {assetTabKind === "agents" ? "适用范围" : "Scope"}
+                    <select
+                      value={assetScopeKind}
+                      onChange={(event) =>
+                        setAssetScopeKind(
+                          event.target.value === "repo" ? "repo" : "global",
+                        )
+                      }
+                    >
+                      <option value="global">Global</option>
+                      <option value="repo">Repository</option>
+                    </select>
                     <input
                       value={assetScope}
                       onChange={(event) => setAssetScope(event.target.value)}
-                      placeholder={translate("Optional scope")}
+                      placeholder={translate("Workspace path (absolute)")}
+                      disabled={assetScopeKind === "global"}
                     />
                   </label>
                   <Button
@@ -1809,6 +1928,7 @@ function ManageSections({
                         body: assetBody,
                         trigger: assetTrigger || null,
                         scope: assetScope || null,
+                        scopeKind: assetScopeKind,
                         enabled: true,
                       })
                         .then(() => {

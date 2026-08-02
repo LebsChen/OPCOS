@@ -16,7 +16,7 @@ use base64::Engine;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use opcos_assets::{
-    AssetBundle, AssetError, InstructionSource, KnowledgeEntry, Playbook, SkillEntry,
+    AssetBundle, InstructionSource, KnowledgeEntry, Playbook, SkillEntry,
     discover as discover_assets, parse_blueprint,
 };
 use opcos_engine::{
@@ -39,9 +39,10 @@ use opcos_store::{
     ArtifactRecord, KeyringSecretStore, SecretStore, SessionRecord, SessionStore, SqliteStore,
     ToolCallRecord,
 };
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -110,35 +111,6 @@ struct LocalExecutor {
 enum DesktopExecutor {
     Remote(Box<RemoteExecutor>),
     Local(LocalExecutor),
-}
-
-struct HostAssetReader<'a> {
-    host: &'a dyn Host,
-}
-
-#[async_trait]
-impl opcos_assets::RemoteAssetReader for HostAssetReader<'_> {
-    async fn read(&self, path: &str) -> Result<String, AssetError> {
-        self.host
-            .read(path)
-            .await
-            .map(|content| content.content)
-            .map_err(|error| AssetError::Invalid(error.to_string()))
-    }
-
-    async fn list(&self, path: Option<&str>) -> Result<Vec<(String, bool)>, AssetError> {
-        self.host
-            .ls(path)
-            .await
-            .map(|listing| {
-                listing
-                    .items
-                    .into_iter()
-                    .map(|entry| (entry.name, entry.dir))
-                    .collect()
-            })
-            .map_err(|error| AssetError::Invalid(error.to_string()))
-    }
 }
 
 #[derive(Clone)]
@@ -636,7 +608,7 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    let connection = Connection::open(path).map_err(|error| error.to_string())?;
+    let mut connection = Connection::open(path).map_err(|error| error.to_string())?;
     connection
         .execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -647,6 +619,10 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
              CREATE TABLE IF NOT EXISTS settings (
                key TEXT PRIMARY KEY,
                value TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS desktop_schema_migrations (
+               version TEXT PRIMARY KEY,
+               applied_at TEXT NOT NULL
              );
              CREATE TABLE IF NOT EXISTS asset_records (
                id TEXT PRIMARY KEY,
@@ -698,7 +674,312 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
              );",
         )
         .map_err(|error| error.to_string())?;
+    migrate_config_objects(&mut connection)?;
     Ok(connection)
+}
+
+fn content_hash(content: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(content.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+fn migrate_config_objects(connection: &mut Connection) -> Result<(), String> {
+    let migrated: bool = connection
+        .query_row(
+            "SELECT COUNT(*) FROM desktop_schema_migrations WHERE version='p1-1-config-objects'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| error.to_string())?
+        > 0;
+    if migrated {
+        let asset_table = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='asset_records'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if asset_table > 0 {
+            let asset_count: i64 = connection
+                .query_row("SELECT COUNT(*) FROM asset_records", [], |row| row.get(0))
+                .map_err(|error| error.to_string())?;
+            if asset_count > 0 {
+                return Err(format!(
+                    "legacy asset table contains {asset_count} new rows after migration; refusing to drop asset_records"
+                ));
+            }
+        }
+        connection
+            .execute("DROP TABLE IF EXISTS asset_records", [])
+            .map_err(|error| error.to_string())?;
+        remove_content_hash_unique_constraint(connection)?;
+        return Ok(());
+    }
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS config_object (
+               id TEXT PRIMARY KEY,
+               kind TEXT NOT NULL,
+               name TEXT NOT NULL,
+               scope_kind TEXT NOT NULL,
+               scope_key TEXT,
+               status TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               current_version_id TEXT
+             );
+             CREATE TABLE IF NOT EXISTS config_object_version (
+               id TEXT PRIMARY KEY,
+               object_id TEXT NOT NULL,
+               version INTEGER NOT NULL,
+               content TEXT NOT NULL,
+               content_hash TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               note TEXT NOT NULL,
+               metadata_json TEXT NOT NULL,
+               UNIQUE(object_id, version)
+             );
+             CREATE TABLE IF NOT EXISTS config_object_legacy_map (
+               legacy_asset_id TEXT PRIMARY KEY,
+               object_id TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS session_config_versions (
+               session_id TEXT NOT NULL,
+               object_id TEXT NOT NULL,
+               version_id TEXT NOT NULL,
+               PRIMARY KEY(session_id, object_id)
+             );
+             CREATE TABLE IF NOT EXISTS session_config_bindings (
+               session_id TEXT NOT NULL,
+               object_id TEXT NOT NULL,
+               PRIMARY KEY(session_id, object_id)
+             );
+             CREATE TABLE IF NOT EXISTS schedule_runs (
+               id TEXT PRIMARY KEY,
+               schedule_id TEXT NOT NULL,
+               config_object_id TEXT NOT NULL,
+               config_version_id TEXT NOT NULL,
+               started_at TEXT NOT NULL,
+               finished_at TEXT,
+               result TEXT
+             );
+             ALTER TABLE schedules ADD COLUMN config_object_id TEXT;",
+        )
+        .or_else(|error| {
+            if error.to_string().contains("duplicate column name") {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(|error: rusqlite::Error| error.to_string())?;
+    let mut statement = transaction
+        .prepare("SELECT id,kind,title,body,trigger,scope,enabled FROM asset_records")
+        .map_err(|error| error.to_string())?;
+    let assets = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, bool>(6)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(statement);
+    for (legacy_id, legacy_kind, name, content, trigger, scope, enabled) in &assets {
+        let kind = match legacy_kind.as_str() {
+            "agents" => "rules",
+            "knowledge" => "knowledge",
+            "playbook" => "runbook",
+            "skill" => "skill",
+            other => {
+                return Err(format!(
+                    "config object migration encountered unknown asset kind '{other}' for asset '{legacy_id}'"
+                ));
+            }
+        };
+        let object_id = format!("config:{legacy_id}");
+        let version_id = format!("{object_id}:v1");
+        let is_workspace_path = PathBuf::from(scope).is_absolute()
+            || scope.starts_with('/')
+            || scope
+                .as_bytes()
+                .get(1)
+                .is_some_and(|separator| *separator == b':');
+        let (scope_kind, scope_key) = if scope.is_empty() || !is_workspace_path {
+            ("global", None)
+        } else {
+            ("repo", Some(scope.as_str()))
+        };
+        let status = if *enabled { "active" } else { "disabled" };
+        let metadata = json!({"trigger": trigger, "scope": scope, "legacy_scope": scope});
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO config_object
+                 (id,kind,name,scope_kind,scope_key,status,created_at,current_version_id)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    object_id,
+                    kind,
+                    name,
+                    scope_kind,
+                    scope_key,
+                    status,
+                    Utc::now().to_rfc3339(),
+                    version_id
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO config_object_version
+                 (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+                 VALUES (?1,?2,1,?3,?4,?5,'migrated from asset_records',?6)",
+                params![
+                    version_id,
+                    object_id,
+                    content,
+                    content_hash(content),
+                    Utc::now().to_rfc3339(),
+                    serde_json::to_string(&metadata).map_err(|error| error.to_string())?
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO config_object_legacy_map(legacy_asset_id,object_id)
+                 VALUES (?1,?2)",
+                params![legacy_id, object_id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    transaction
+        .execute(
+            "UPDATE schedules SET config_object_id=(
+               SELECT object_id FROM config_object_legacy_map WHERE legacy_asset_id=schedules.playbook_id
+             ) WHERE config_object_id IS NULL",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "INSERT OR REPLACE INTO asset_session_selection(session_id,asset_id,enabled)
+             SELECT s.session_id,m.object_id,s.enabled
+             FROM asset_session_selection s
+             JOIN config_object_legacy_map m ON m.legacy_asset_id=s.asset_id",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM asset_session_selection
+             WHERE asset_id IN (SELECT legacy_asset_id FROM config_object_legacy_map)",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO session_config_versions(session_id,object_id,version_id)
+             SELECT s.session_id,s.asset_id,o.current_version_id
+             FROM asset_session_selection s
+             JOIN config_object o ON o.id=s.asset_id
+             WHERE s.enabled=1 AND o.current_version_id IS NOT NULL",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    let migrated_count: i64 = transaction
+        .query_row("SELECT COUNT(*) FROM asset_records", [], |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    let object_count: i64 = transaction
+        .query_row("SELECT COUNT(*) FROM config_object_legacy_map", [], |row| {
+            row.get(0)
+        })
+        .map_err(|error| error.to_string())?;
+    if migrated_count != object_count {
+        return Err(format!(
+            "config object migration verification failed: {migrated_count} assets, {object_count} mappings"
+        ));
+    }
+    transaction
+        .execute(
+            "ALTER TABLE asset_records RENAME TO asset_records_legacy_p1_1",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "INSERT INTO desktop_schema_migrations(version,applied_at) VALUES ('p1-1-config-objects',?1)",
+            [Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn remove_content_hash_unique_constraint(connection: &mut Connection) -> Result<(), String> {
+    let mut statement = connection
+        .prepare("PRAGMA index_list('config_object_version')")
+        .map_err(|error| error.to_string())?;
+    let indexes = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, bool>(2)?))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(statement);
+    let has_conflicting_index = indexes.into_iter().any(|(name, unique)| {
+        if !unique {
+            return false;
+        }
+        let mut columns = match connection.prepare(&format!("PRAGMA index_info('{name}')")) {
+            Ok(statement) => statement,
+            Err(_) => return false,
+        };
+        let values = columns
+            .query_map([], |row| row.get::<_, String>(2))
+            .ok()
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>().ok())
+            .unwrap_or_default();
+        values == vec!["object_id".to_owned(), "content_hash".to_owned()]
+    });
+    if !has_conflicting_index {
+        return Ok(());
+    }
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute_batch(
+            "CREATE TABLE config_object_version_rebuild (
+               id TEXT PRIMARY KEY,
+               object_id TEXT NOT NULL,
+               version INTEGER NOT NULL,
+               content TEXT NOT NULL,
+               content_hash TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               note TEXT NOT NULL,
+               metadata_json TEXT NOT NULL,
+               UNIQUE(object_id, version)
+             );
+             INSERT INTO config_object_version_rebuild
+               SELECT id,object_id,version,content,content_hash,created_at,note,metadata_json
+               FROM config_object_version;
+             DROP TABLE config_object_version;
+             ALTER TABLE config_object_version_rebuild RENAME TO config_object_version;",
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 fn session_for(state: &DesktopState, session_id: &str) -> Result<SessionRecord, String> {
@@ -987,40 +1268,143 @@ async fn serve_ide_proxy(listener: TcpListener, state: IdeProxyState) {
     let _ = axum::serve(listener, router).await;
 }
 
-async fn asset_host_for_session(
+fn bind_session_config_versions(
     state: &DesktopState,
     session_id: &str,
-) -> Result<(Box<dyn Host>, String), String> {
-    let session = session_for(state, session_id)?;
-    if session.host_id == "local" {
-        if session.workspace.is_empty() {
-            return Err("local session requires an explicit workspace directory".into());
-        }
-        let workspace = PathBuf::from(session.workspace);
-        let host = LocalHost::new(&workspace).map_err(|error| error.to_string())?;
-        host.health().await.map_err(|error| error.to_string())?;
-        return Ok((Box::new(host), workspace.display().to_string()));
+    workspace: &str,
+    host_id: &str,
+) -> Result<(), String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_config_bindings WHERE session_id=?1)",
+            [session_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if exists {
+        return Ok(());
     }
-    let client = client_for(state, &session.host_id)?;
-    let health = client
-        .health()
-        .await
-        .map_err(|error| format!("remote host unavailable: {error}"))?;
-    let workspace = if session.workspace.is_empty() {
-        health
-            .workspace
-            .ok_or_else(|| "remote host did not provide a workspace".to_owned())?
-    } else {
-        session.workspace
-    };
-    Ok((
-        Box::new(RvmHost::new(
-            session.host_id,
-            workspace.clone(),
-            client.with_workspace(workspace.clone()),
-        )),
-        workspace,
-    ))
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    let mut statement = transaction
+        .prepare(
+            "SELECT o.id,o.current_version_id,COALESCE(selection.enabled,1)
+             FROM config_object o
+             LEFT JOIN asset_session_selection selection
+               ON selection.session_id=?3 AND selection.asset_id=o.id
+             WHERE o.status='active' AND o.current_version_id IS NOT NULL
+               AND (o.scope_kind='global'
+                 OR (o.scope_kind='repo' AND o.scope_key=?1)
+                 OR (o.scope_kind='host' AND o.scope_key=?2))",
+        )
+        .map_err(|error| error.to_string())?;
+    let objects = statement
+        .query_map(params![workspace, host_id, session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(statement);
+    for (object_id, version_id, enabled) in objects {
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO session_config_bindings(session_id,object_id)
+                 VALUES (?1,?2)",
+                params![session_id, object_id],
+            )
+            .map_err(|error| error.to_string())?;
+        if enabled {
+            transaction
+                .execute(
+                    "INSERT INTO session_config_versions(session_id,object_id,version_id)
+                     VALUES (?1,?2,?3)",
+                    params![session_id, object_id, version_id],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+type SessionConfigAsset = (String, String, String, String, String);
+
+fn load_session_config_assets(
+    state: &DesktopState,
+    session_id: &str,
+) -> Result<Vec<SessionConfigAsset>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let mut statement = connection
+        .prepare(
+            "SELECT o.id,o.kind,o.name,v.content,v.metadata_json
+             FROM session_config_versions s
+             JOIN config_object o ON o.id=s.object_id
+             JOIN config_object_version v ON v.id=s.version_id
+             WHERE s.session_id=?1 AND o.status='active'",
+        )
+        .map_err(|error| error.to_string())?;
+    statement
+        .query_map([session_id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+fn append_session_config_assets(bundle: &mut AssetBundle, assets: Vec<SessionConfigAsset>) {
+    for (id, kind, title, body, metadata_json) in assets {
+        let metadata = serde_json::from_str::<Value>(&metadata_json).unwrap_or_else(|_| json!({}));
+        let trigger = metadata
+            .get("trigger")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let scope = metadata
+            .get("scope")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        match kind.as_str() {
+            "rules" => bundle.agents.push(InstructionSource {
+                path: id,
+                content: body,
+            }),
+            "knowledge" => bundle.knowledge.push(KnowledgeEntry {
+                title,
+                body,
+                trigger,
+                scope,
+                enabled: true,
+            }),
+            "runbook" => bundle.playbook = Some(Playbook { title, body }),
+            "skill" => bundle.skills.push(SkillEntry {
+                name: title,
+                path: id,
+                content: body,
+                active: true,
+            }),
+            _ => {}
+        }
+    }
 }
 
 async fn engine_for(
@@ -1040,6 +1424,19 @@ async fn engine_for(
     let mode = session.mode;
     let session_workspace = session.workspace;
     let session_provider = session.provider;
+    let resolved_workspace = if !session_workspace.is_empty() {
+        session_workspace.clone()
+    } else if host_id == "local" {
+        return Err("local session requires an explicit workspace directory".into());
+    } else {
+        client_for(state, &host_id)?
+            .health()
+            .await
+            .map_err(|error| format!("remote host unavailable: {error}"))?
+            .workspace
+            .ok_or_else(|| "remote host did not provide a workspace".to_owned())?
+    };
+    bind_session_config_versions(state, session_id, &resolved_workspace, &host_id)?;
     let (provider_id, configured_base_url) = {
         let connection = state
             .database
@@ -1251,67 +1648,20 @@ async fn engine_for(
             .collect();
         engine.set_external_tools(selected).await;
     }
-    if let Ok((asset_host, asset_workspace)) = asset_host_for_session(state, session_id).await
-        && let Ok(mut bundle) = discover_assets(
-            &HostAssetReader {
-                host: asset_host.as_ref(),
-            },
-            &asset_workspace,
-        )
-        .await
-    {
-        let local_assets = state
-            .database
-            .lock()
-            .map_err(|_| "database lock poisoned")?
-            .prepare(
-                "SELECT a.id,a.kind,a.title,a.body,a.trigger,a.scope
-                 FROM asset_records a
-                 LEFT JOIN asset_session_selection s
-                   ON s.asset_id=a.id AND s.session_id=?1
-                 WHERE a.enabled=1 AND COALESCE(s.enabled,1)=1",
-            )
-            .and_then(|mut statement| {
-                let rows = statement.query_map([session_id], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                })?;
-                rows.collect::<Result<Vec<_>, _>>()
-            })
-            .unwrap_or_default();
-        for (id, kind, title, body, trigger, scope) in local_assets {
-            match kind.as_str() {
-                "knowledge" => bundle.knowledge.push(KnowledgeEntry {
-                    title,
-                    body,
-                    trigger,
-                    scope,
-                    enabled: true,
-                }),
-                "playbook" => bundle.playbook = Some(Playbook { title, body }),
-                "skill" => bundle.skills.push(SkillEntry {
-                    name: title,
-                    path: id,
-                    content: body,
-                    active: true,
-                }),
-                "agents" => bundle.agents.push(InstructionSource {
-                    path: id,
-                    content: body,
-                }),
-                _ => {}
-            }
-        }
-        engine
-            .set_system_instructions(Some(bundle.system_instructions()))
-            .await;
-    }
+    let mut bundle = if let Some(executor_client) = &remote_client {
+        discover_assets(executor_client, &workspace)
+            .await
+            .unwrap_or_default()
+    } else {
+        AssetBundle::default()
+    };
+    append_session_config_assets(
+        &mut bundle,
+        load_session_config_assets(state, session_id).unwrap_or_default(),
+    );
+    engine
+        .set_system_instructions(Some(bundle.system_instructions()))
+        .await;
     let mut events = engine.events();
     let handle = app.clone();
     let session = session_id.to_owned();
@@ -1899,17 +2249,19 @@ fn shell_artifact_paths(command: &str) -> Vec<String> {
 
 const ARTIFACT_HASH_LIMIT: i64 = 8 * 1024 * 1024;
 
-fn artifact_hash_command(path: &str) -> String {
-    let escaped = path.replace('\'', "'\\''");
-    format!("sha256sum -- '{escaped}' 2>/dev/null || shasum -a 256 -- '{escaped}'")
-}
-
-async fn artifact_hash(host: &dyn Host, path: &str, size_bytes: Option<i64>) -> Option<String> {
+async fn artifact_hash(
+    state: &DesktopState,
+    session_id: &str,
+    path: &str,
+    size_bytes: Option<i64>,
+) -> Option<String> {
     if size_bytes.is_none_or(|size| size > ARTIFACT_HASH_LIMIT) {
         return None;
     }
+    let (host, _) = artifact_host(state, session_id).await.ok()?;
     let path = host.join(path).ok()?;
-    let command = artifact_hash_command(&path);
+    let escaped = path.replace('\'', "'\\''");
+    let command = format!("sha256sum -- '{escaped}' 2>/dev/null || shasum -a 256 -- '{escaped}'");
     let result = host
         .exec(ExecRequest {
             command,
@@ -1937,24 +2289,11 @@ async fn record_artifacts(
     host_id: &str,
     calls: Vec<ToolCallRecord>,
 ) -> Result<(), String> {
-    let (host, resolved_host_id) = artifact_host(state, session_id).await?;
-    if resolved_host_id != host_id {
-        return Err("artifact host binding changed during collection".into());
-    }
     for call in calls {
         let Some(result) = call.result.as_ref() else {
             continue;
         };
         if result.get("error").is_some() {
-            continue;
-        }
-        if matches!(call.name.as_str(), "run_shell" | "exec")
-            && result
-                .get("result")
-                .and_then(|value| value.get("exit_code"))
-                .and_then(Value::as_i64)
-                .is_some_and(|exit_code| exit_code != 0)
-        {
             continue;
         }
         let paths = match call.name.as_str() {
@@ -1988,7 +2327,7 @@ async fn record_artifacts(
             } else {
                 result.get("size").and_then(Value::as_i64)
             };
-            let sha256 = artifact_hash(host.as_ref(), &path, size_bytes).await;
+            let sha256 = artifact_hash(state, session_id, &path, size_bytes).await;
             state
                 .store
                 .upsert_artifact(&ArtifactRecord {
@@ -2164,7 +2503,7 @@ async fn submit_turn(
     }
     let sequence_before = state
         .store
-        .max_message_sequence(&request.session_id)
+        .max_message_notice_sequence(&request.session_id)
         .map_err(|error| error.to_string())?;
     let engine = engine_for(&app, &state, &request.session_id).await?;
     emit(
@@ -2347,19 +2686,13 @@ async fn steering(
     let handle = app.clone();
     let session = session_id.clone();
     tauri::async_runtime::spawn(async move {
-        match completion.await {
-            Ok((run_state, stop_reason)) => emit(
+        if let Ok((run_state, stop_reason)) = completion.await {
+            emit(
                 &handle,
                 "turn_done",
                 Some(&session),
                 json!({"run_state": run_state, "stop_reason": stop_reason}),
-            ),
-            Err(_) => emit(
-                &handle,
-                "turn_done",
-                Some(&session),
-                json!({"run_state":"error","stop_reason":"internal_error"}),
-            ),
+            );
         }
     });
     Ok(())
@@ -2376,7 +2709,7 @@ async fn resolve_approval(
     let host_id = session_host_id(&state, &session_id)?;
     let sequence_before = state
         .store
-        .max_message_sequence(&session_id)
+        .max_message_notice_sequence(&session_id)
         .map_err(|error| error.to_string())?;
     let engine = engine_for(&app, &state, &session_id).await?;
     let result = engine
@@ -2499,26 +2832,44 @@ fn provider_models(provider: String) -> Vec<ModelDescriptor> {
 
 #[tauri::command]
 fn list_assets(state: State<'_, DesktopState>, kind: Option<String>) -> Result<Vec<Value>, String> {
+    let kind = kind.map(|kind| match kind.as_str() {
+        "agents" => "rules".to_owned(),
+        "playbook" => "runbook".to_owned(),
+        other => other.to_owned(),
+    });
     let connection = state
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?;
     let mut statement = connection
         .prepare(
-            "SELECT id,kind,title,body,trigger,scope,enabled FROM asset_records
-             WHERE (?1 IS NULL OR kind=?1) ORDER BY title",
+            "SELECT o.id,o.kind,o.name,v.content,v.metadata_json,o.scope_kind,
+                    COALESCE(o.scope_key,''),o.status,o.current_version_id
+             FROM config_object o
+             JOIN config_object_version v ON v.id=o.current_version_id
+             WHERE (?1 IS NULL OR o.kind=?1) AND o.status <> 'deleted'
+             ORDER BY o.name",
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map([kind], |row| {
+            let metadata: Value = serde_json::from_str::<Value>(&row.get::<_, String>(4)?)
+                .unwrap_or_else(|_| json!({}));
             Ok(json!({
                 "id": row.get::<_, String>(0)?,
-                "kind": row.get::<_, String>(1)?,
+                "kind": match row.get::<_, String>(1)?.as_str() {
+                    "rules" => "agents",
+                    "runbook" => "playbook",
+                    other => other,
+                },
                 "title": row.get::<_, String>(2)?,
                 "body": row.get::<_, String>(3)?,
-                "trigger": row.get::<_, String>(4)?,
-                "scope": row.get::<_, String>(5)?,
-                "enabled": row.get::<_, bool>(6)?,
+                "trigger": metadata.get("trigger").and_then(Value::as_str).unwrap_or(""),
+                "scope": row.get::<_, String>(6)?,
+                "scope_kind": row.get::<_, String>(5)?,
+                "enabled": row.get::<_, String>(7)? == "active",
+                "status": row.get::<_, String>(7)?,
+                "version_id": row.get::<_, String>(8)?,
             }))
         })
         .map_err(|error| error.to_string())?;
@@ -2536,30 +2887,108 @@ fn save_asset(
     body: String,
     trigger: Option<String>,
     scope: Option<String>,
+    scope_kind: Option<String>,
     enabled: Option<bool>,
 ) -> Result<(), String> {
-    if !matches!(kind.as_str(), "knowledge" | "playbook" | "skill" | "agents") {
+    if !matches!(
+        kind.as_str(),
+        "knowledge" | "playbook" | "skill" | "agents" | "mcp"
+    ) {
         return Err("unsupported asset kind".into());
     }
-    state
+    let connection = state
         .database
         .lock()
-        .map_err(|_| "database lock poisoned")?
+        .map_err(|_| "database lock poisoned")?;
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    let object_kind = match kind.as_str() {
+        "agents" => "rules",
+        "playbook" => "runbook",
+        other => other,
+    };
+    let scope_key = scope.filter(|value| !value.is_empty());
+    let scope_kind = match scope_kind.as_deref() {
+        Some("global") => "global",
+        Some("repo") if scope_key.is_some() => "repo",
+        Some("host") if scope_key.is_some() => "host",
+        _ if scope_key.is_some() => "repo",
+        _ => "global",
+    };
+    let scope_key = if scope_kind == "global" {
+        None
+    } else {
+        scope_key
+    };
+    let status = if enabled.unwrap_or(true) {
+        "active"
+    } else {
+        "disabled"
+    };
+    let now = Utc::now().to_rfc3339();
+    transaction
         .execute(
-            "INSERT OR REPLACE INTO asset_records
-             (id,kind,title,body,trigger,scope,enabled) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            params![
-                id,
-                kind,
-                title,
-                body,
-                trigger.unwrap_or_default(),
-                scope.unwrap_or_default(),
-                enabled.unwrap_or(true)
-            ],
+            "INSERT INTO config_object
+             (id,kind,name,scope_kind,scope_key,status,created_at,current_version_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,NULL)
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name,scope_kind=excluded.scope_kind,
+               scope_key=excluded.scope_key,status=excluded.status",
+            params![id, object_kind, title, scope_kind, scope_key, status, now],
         )
         .map_err(|error| error.to_string())?;
-    Ok(())
+    let metadata = serde_json::to_string(&json!({
+        "trigger": trigger.unwrap_or_default(),
+        "scope": scope_key.clone().unwrap_or_default()
+    }))
+    .map_err(|error| error.to_string())?;
+    let hash = content_hash(&body);
+    let existing: Option<String> = transaction
+        .query_row(
+            "SELECT id FROM config_object_version
+             WHERE object_id=?1 AND content_hash=?2 AND metadata_json=?3",
+            params![id, hash, metadata],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let version_id = if let Some(version_id) = existing {
+        version_id
+    } else {
+        let version: i64 = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(version),0)+1 FROM config_object_version WHERE object_id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let version_id = format!("{id}:v{version}");
+        transaction
+            .execute(
+                "INSERT INTO config_object_version
+                 (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    version_id,
+                    id,
+                    version,
+                    body,
+                    hash,
+                    now,
+                    if version == 1 { "created" } else { "edited" },
+                    metadata
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        version_id
+    };
+    transaction
+        .execute(
+            "UPDATE config_object SET current_version_id=?1 WHERE id=?2",
+            params![version_id, id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -2568,7 +2997,10 @@ fn delete_asset(state: State<'_, DesktopState>, id: String) -> Result<(), String
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?
-        .execute("DELETE FROM asset_records WHERE id=?1", [id])
+        .execute(
+            "UPDATE config_object SET status='deleted' WHERE id=?1",
+            [id],
+        )
         .map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -2580,17 +3012,177 @@ fn set_asset_enabled(
     asset_id: String,
     enabled: bool,
 ) -> Result<(), String> {
-    state
+    let connection = state
         .database
         .lock()
-        .map_err(|_| "database lock poisoned")?
+        .map_err(|_| "database lock poisoned")?;
+    connection
         .execute(
             "INSERT OR REPLACE INTO asset_session_selection(session_id,asset_id,enabled)
              VALUES (?1,?2,?3)",
             params![session_id, asset_id, enabled],
         )
         .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO session_config_bindings(session_id,object_id)
+             VALUES (?1,?2)",
+            params![session_id, asset_id],
+        )
+        .map_err(|error| error.to_string())?;
+    if enabled {
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO session_config_versions(session_id,object_id,version_id)
+                 SELECT ?1,o.id,o.current_version_id FROM config_object o
+                 WHERE o.id=?2 AND o.current_version_id IS NOT NULL",
+                params![session_id, asset_id],
+            )
+            .map_err(|error| error.to_string())?;
+    } else {
+        connection
+            .execute(
+                "DELETE FROM session_config_versions WHERE session_id=?1 AND object_id=?2",
+                params![session_id, asset_id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
     Ok(())
+}
+
+#[tauri::command]
+fn list_asset_versions(
+    state: State<'_, DesktopState>,
+    asset_id: String,
+) -> Result<Vec<Value>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id,version,content,content_hash,created_at,note,metadata_json
+             FROM config_object_version WHERE object_id=?1 ORDER BY version DESC",
+        )
+        .map_err(|error| error.to_string())?;
+    statement
+        .query_map([asset_id], |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "version": row.get::<_, i64>(1)?,
+                "content": row.get::<_, String>(2)?,
+                "content_hash": row.get::<_, String>(3)?,
+                "created_at": row.get::<_, String>(4)?,
+                "note": row.get::<_, String>(5)?,
+                "metadata": serde_json::from_str::<Value>(&row.get::<_, String>(6)?)
+                    .unwrap_or_else(|_| json!({})),
+            }))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn compare_asset_versions(
+    state: State<'_, DesktopState>,
+    asset_id: String,
+    left_version_id: String,
+    right_version_id: String,
+) -> Result<Value, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let load = |id: &str| {
+        connection.query_row(
+            "SELECT id,version,content,metadata_json FROM config_object_version
+             WHERE object_id=?1 AND id=?2",
+            params![asset_id, id],
+            |row| {
+                Ok(json!({
+                    "id": row.get::<_, String>(0)?,
+                    "version": row.get::<_, i64>(1)?,
+                    "content": row.get::<_, String>(2)?,
+                    "metadata": serde_json::from_str::<Value>(&row.get::<_, String>(3)?)
+                        .unwrap_or_else(|_| json!({})),
+                }))
+            },
+        )
+    };
+    Ok(json!({
+        "left": load(&left_version_id).map_err(|error| error.to_string())?,
+        "right": load(&right_version_id).map_err(|error| error.to_string())?,
+    }))
+}
+
+#[tauri::command]
+fn rollback_asset(
+    state: State<'_, DesktopState>,
+    asset_id: String,
+    version_id: String,
+) -> Result<(), String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    let (content, metadata): (String, String) = transaction
+        .query_row(
+            "SELECT content,metadata_json FROM config_object_version
+             WHERE object_id=?1 AND id=?2",
+            params![asset_id, version_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| format!("version not found: {error}"))?;
+    let hash = content_hash(&content);
+    let existing: Option<String> = transaction
+        .query_row(
+            "SELECT id FROM config_object_version
+             WHERE object_id=?1 AND content_hash=?2 AND metadata_json=?3",
+            params![asset_id, hash, metadata],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let current_id = if let Some(id) = existing {
+        id
+    } else {
+        let version: i64 = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(version),0)+1 FROM config_object_version WHERE object_id=?1",
+                [&asset_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let id = format!("{asset_id}:v{version}");
+        transaction
+            .execute(
+                "INSERT INTO config_object_version
+                 (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+                 VALUES (?1,?2,?3,?4,?5,?6,'rollback',?7)",
+                params![
+                    id,
+                    asset_id,
+                    version,
+                    content,
+                    hash,
+                    Utc::now().to_rfc3339(),
+                    metadata
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        id
+    };
+    transaction
+        .execute(
+            "UPDATE config_object SET current_version_id=? WHERE id=?",
+            params![current_id, asset_id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -2613,8 +3205,11 @@ async fn export_assets(
             .map_err(|_| "database lock poisoned")?;
         let mut statement = connection
             .prepare(
-                "SELECT id,kind,title,body,trigger,scope FROM asset_records
-                 WHERE id=?1",
+                "SELECT o.id,o.kind,o.name,v.content,v.metadata_json,
+                        COALESCE(o.scope_key,'')
+                 FROM config_object o
+                 JOIN config_object_version v ON v.id=o.current_version_id
+                 WHERE o.id=?1 AND o.status <> 'deleted'",
             )
             .map_err(|error| error.to_string())?;
         ids.iter()
@@ -2635,12 +3230,17 @@ async fn export_assets(
             .collect::<Vec<_>>()
     };
     let mut exported = 0;
-    for (id, kind, title, body, trigger, scope) in rows {
+    for (id, kind, title, body, metadata_json, scope) in rows {
         let (directory, filename) = match kind.as_str() {
             "knowledge" => (".agents/knowledge", format!("{id}.md")),
-            "playbook" => (".agents/playbooks", format!("{id}.md")),
+            "runbook" => (".agents/playbooks", format!("{id}.md")),
             _ => continue,
         };
+        let metadata = serde_json::from_str::<Value>(&metadata_json).unwrap_or_else(|_| json!({}));
+        let trigger = metadata
+            .get("trigger")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         let content = format!(
             "---\nid: {id}\nname: {title}\ntrigger: {trigger}\nscope: {scope}\n---\n{body}\n"
         );
@@ -2672,24 +3272,99 @@ async fn import_assets(
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?;
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
     for item in &bundle.knowledge {
-        connection
+        let object_id = transaction
+            .query_row(
+                "SELECT id FROM config_object WHERE kind='knowledge' AND name=?1
+                 ORDER BY id LIMIT 1",
+                [&item.title],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| format!("config:{}", item.title));
+        let version_id = format!("{object_id}:v1");
+        transaction
             .execute(
-                "INSERT OR IGNORE INTO asset_records
-                 (id,kind,title,body,trigger,scope,enabled) VALUES (?1,'knowledge',?2,?3,?4,?5,1)",
-                params![item.title, item.title, item.body, item.trigger, item.scope],
+                "INSERT OR IGNORE INTO config_object
+                 (id,kind,name,scope_kind,scope_key,status,created_at,current_version_id)
+                 VALUES (?1,'knowledge',?2,?3,?4,'active',?5,?6)",
+                params![
+                    object_id,
+                    item.title,
+                    if item.scope.is_empty() {
+                        "global"
+                    } else {
+                        "repo"
+                    },
+                    if item.scope.is_empty() {
+                        None::<String>
+                    } else {
+                        Some(item.scope.clone())
+                    },
+                    Utc::now().to_rfc3339(),
+                    version_id
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO config_object_version
+             (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+             VALUES (?1,?2,1,?3,?4,?5,'imported',?6)",
+                params![
+                    version_id,
+                    object_id,
+                    item.body,
+                    content_hash(&item.body),
+                    Utc::now().to_rfc3339(),
+                    serde_json::to_string(&json!({
+                        "trigger": item.trigger, "scope": item.scope
+                    }))
+                    .map_err(|error| error.to_string())?
+                ],
             )
             .map_err(|error| error.to_string())?;
     }
     if let Some(item) = &bundle.playbook {
-        connection
+        let object_id = transaction
+            .query_row(
+                "SELECT id FROM config_object WHERE kind='runbook' AND name=?1
+                 ORDER BY id LIMIT 1",
+                [&item.title],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| format!("config:{}", item.title));
+        let version_id = format!("{object_id}:v1");
+        transaction
             .execute(
-                "INSERT OR IGNORE INTO asset_records
-                 (id,kind,title,body,trigger,scope,enabled) VALUES (?1,'playbook',?2,?3,'','',1)",
-                params![item.title, item.title, item.body],
+                "INSERT OR IGNORE INTO config_object
+                 (id,kind,name,scope_kind,scope_key,status,created_at,current_version_id)
+                 VALUES (?1,'runbook',?2,'global',NULL,'active',?3,?4)",
+                params![object_id, item.title, Utc::now().to_rfc3339(), version_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO config_object_version
+             (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+             VALUES (?1,?2,1,?3,?4,?5,'imported','{}')",
+                params![
+                    version_id,
+                    object_id,
+                    item.body,
+                    content_hash(&item.body),
+                    Utc::now().to_rfc3339()
+                ],
             )
             .map_err(|error| error.to_string())?;
     }
+    transaction.commit().map_err(|error| error.to_string())?;
     Ok(bundle)
 }
 
@@ -3319,13 +3994,35 @@ fn save_schedule(state: State<'_, DesktopState>, schedule: ScheduleInput) -> Res
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         )
     });
-    state
+    let connection = state
         .database
         .lock()
-        .map_err(|_| "database lock poisoned")?
+        .map_err(|_| "database lock poisoned")?;
+    let object_id = connection
+        .query_row(
+            "SELECT object_id FROM config_object_legacy_map WHERE legacy_asset_id=?1",
+            [&schedule.playbook_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .unwrap_or_else(|| schedule.playbook_id.clone());
+    connection
         .execute(
-            "INSERT OR REPLACE INTO schedules(id,name,session_id,playbook_id,cron,enabled,last_run,last_result) VALUES (?1,?2,?3,?4,?5,?6,COALESCE((SELECT last_run FROM schedules WHERE id=?1),NULL),COALESCE((SELECT last_result FROM schedules WHERE id=?1),NULL))",
-            params![id, schedule.name, schedule.session_id, schedule.playbook_id, schedule.cron, schedule.enabled],
+            "INSERT OR REPLACE INTO schedules
+             (id,name,session_id,playbook_id,config_object_id,cron,enabled,last_run,last_result)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,
+               COALESCE((SELECT last_run FROM schedules WHERE id=?1),NULL),
+               COALESCE((SELECT last_result FROM schedules WHERE id=?1),NULL))",
+            params![
+                id,
+                schedule.name,
+                schedule.session_id,
+                schedule.playbook_id,
+                object_id,
+                schedule.cron,
+                schedule.enabled
+            ],
         )
         .map_err(|error| error.to_string())?;
     Ok(json!({"id":id,"enabled":schedule.enabled}))
@@ -3338,7 +4035,7 @@ fn list_schedules(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> 
         .lock()
         .map_err(|_| "database lock poisoned")?;
     let mut statement = connection
-        .prepare("SELECT id,name,session_id,playbook_id,cron,enabled,last_run,last_result FROM schedules ORDER BY name")
+        .prepare("SELECT id,name,session_id,playbook_id,cron,enabled,last_run,last_result,config_object_id FROM schedules ORDER BY name")
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map([], |row| {
@@ -3351,6 +4048,7 @@ fn list_schedules(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> 
                 "enabled": row.get::<_,i64>(5)? != 0,
                 "last_run": row.get::<_,Option<String>>(6)?,
                 "last_result": row.get::<_,Option<String>>(7)?
+                ,"config_object_id": row.get::<_,Option<String>>(8)?
             }))
         })
         .map_err(|error| error.to_string())?;
@@ -3372,24 +4070,27 @@ async fn run_schedule_for(
     state: &DesktopState,
     schedule_id: &str,
 ) -> Result<(), String> {
-    let (session_id, playbook_id) = state
+    let (session_id, object_id) = state
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?
         .query_row(
-            "SELECT session_id,playbook_id FROM schedules WHERE id=?1 AND enabled=1",
+            "SELECT session_id,COALESCE(config_object_id,playbook_id)
+             FROM schedules WHERE id=?1 AND enabled=1",
             [schedule_id],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .map_err(|_| "enabled schedule not found".to_owned())?;
-    let prompt = state
+    let (version_id, prompt) = state
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?
         .query_row(
-            "SELECT body FROM asset_records WHERE id=?1",
-            [&playbook_id],
-            |row| row.get::<_, String>(0),
+            "SELECT v.id,v.content FROM config_object o
+             JOIN config_object_version v ON v.id=o.current_version_id
+             WHERE o.id=?1 AND o.kind='runbook' AND o.status='active'",
+            [&object_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .map_err(|_| "playbook not found".to_owned())?;
     state
@@ -3401,10 +4102,11 @@ async fn run_schedule_for(
             params![schedule_id, Utc::now().to_rfc3339()],
         )
         .map_err(|error| error.to_string())?;
+    let started_at = Utc::now().to_rfc3339();
     let engine = engine_for(app, state, &session_id).await?;
     let sequence_before = state
         .store
-        .max_message_sequence(&session_id)
+        .max_message_notice_sequence(&session_id)
         .map_err(|error| error.to_string())?;
     let result = engine.submit_text(prompt).await;
     let host_id = session_host_id(state, &session_id)?;
@@ -3414,6 +4116,29 @@ async fn run_schedule_for(
         .map_err(|error| error.to_string())?;
     record_artifacts_best_effort(app, state, &session_id, &host_id, calls).await;
     let result_label = if result.is_ok() { "ok" } else { "error" };
+    let finished_at = Utc::now().to_rfc3339();
+    state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .execute(
+            "INSERT INTO schedule_runs
+             (id,schedule_id,config_object_id,config_version_id,started_at,finished_at,result)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                format!(
+                    "run-{}",
+                    Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                ),
+                schedule_id,
+                object_id,
+                version_id,
+                started_at,
+                finished_at,
+                result_label
+            ],
+        )
+        .map_err(|error| error.to_string())?;
     state
         .database
         .lock()
@@ -3832,6 +4557,9 @@ fn main() {
             save_asset,
             delete_asset,
             set_asset_enabled,
+            list_asset_versions,
+            compare_asset_versions,
+            rollback_asset,
             export_assets,
             import_assets,
             discover_remote_assets,
@@ -3903,6 +4631,159 @@ mod m7_tests {
     }
 
     #[test]
+    fn config_object_migration_is_transactional_idempotent_and_retains_legacy_data() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+                 CREATE TABLE desktop_schema_migrations(version TEXT PRIMARY KEY, applied_at TEXT NOT NULL);
+                 CREATE TABLE schedules(
+                   id TEXT PRIMARY KEY, name TEXT NOT NULL, session_id TEXT NOT NULL,
+                   playbook_id TEXT NOT NULL, cron TEXT NOT NULL, enabled INTEGER NOT NULL,
+                   last_run TEXT, last_result TEXT
+                 );
+                 CREATE TABLE asset_records(
+                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, title TEXT NOT NULL,
+                   body TEXT NOT NULL, trigger TEXT NOT NULL, scope TEXT NOT NULL,
+                   enabled INTEGER NOT NULL
+                 );
+                 CREATE TABLE asset_session_selection(
+                   session_id TEXT NOT NULL, asset_id TEXT NOT NULL, enabled INTEGER NOT NULL,
+                   PRIMARY KEY(session_id, asset_id)
+                 );
+                 INSERT INTO asset_records
+                   VALUES ('a1','knowledge','Build','Use cargo','build','repo-a',1);
+                 INSERT INTO schedules
+                   VALUES ('s1','Nightly','session-1','a1','0 0 * * *',1,NULL,NULL);",
+            )
+            .unwrap();
+        migrate_config_objects(&mut connection).unwrap();
+        let indexes = connection
+            .prepare("PRAGMA index_list('config_object_version')")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, bool>(2)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        assert_eq!(indexes.iter().filter(|(unique, _)| *unique).count(), 2);
+        let migrated: (String, String, String, String) = connection
+            .query_row(
+                "SELECT o.kind,v.content,v.metadata_json,o.scope_kind
+                 FROM config_object o JOIN config_object_version v
+                 ON v.id=o.current_version_id WHERE o.id='config:a1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(migrated.0, "knowledge");
+        assert_eq!(migrated.1, "Use cargo");
+        assert!(migrated.2.contains("\"trigger\":\"build\""));
+        assert_eq!(migrated.3, "global");
+        assert!(migrated.2.contains("\"legacy_scope\":\"repo-a\""));
+        assert!(
+            connection
+                .query_row(
+                    "SELECT 1 FROM asset_records_legacy_p1_1 WHERE id='a1'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT config_object_id FROM schedules WHERE id='s1'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "config:a1"
+        );
+        migrate_config_objects(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM config_object", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn config_object_migration_rejects_unknown_kind_and_new_legacy_rows() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+                 CREATE TABLE desktop_schema_migrations(version TEXT PRIMARY KEY, applied_at TEXT NOT NULL);
+                 CREATE TABLE schedules(
+                   id TEXT PRIMARY KEY, name TEXT NOT NULL, session_id TEXT NOT NULL,
+                   playbook_id TEXT NOT NULL, cron TEXT NOT NULL, enabled INTEGER NOT NULL,
+                   last_run TEXT, last_result TEXT
+                 );
+                 CREATE TABLE asset_records(
+                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, title TEXT NOT NULL,
+                   body TEXT NOT NULL, trigger TEXT NOT NULL, scope TEXT NOT NULL,
+                   enabled INTEGER NOT NULL
+                 );
+                 CREATE TABLE asset_session_selection(
+                   session_id TEXT NOT NULL, asset_id TEXT NOT NULL, enabled INTEGER NOT NULL,
+                   PRIMARY KEY(session_id, asset_id)
+                 );
+                 INSERT INTO asset_records
+                   VALUES ('bad','future-kind','Future','data','','',1);",
+            )
+            .unwrap();
+        let error = migrate_config_objects(&mut connection).unwrap_err();
+        assert!(error.contains("unknown asset kind 'future-kind'"));
+        assert!(
+            connection
+                .query_row("SELECT 1 FROM asset_records WHERE id='bad'", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ),)
+                .is_ok()
+        );
+
+        connection.execute("DELETE FROM asset_records", []).unwrap();
+        connection
+            .execute(
+                "INSERT INTO asset_records VALUES ('a1','knowledge','Known','body','','',1)",
+                [],
+            )
+            .unwrap();
+        migrate_config_objects(&mut connection).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE asset_records(
+                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, title TEXT NOT NULL,
+                   body TEXT NOT NULL, trigger TEXT NOT NULL, scope TEXT NOT NULL,
+                   enabled INTEGER NOT NULL
+                 )",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO asset_records VALUES ('new','knowledge','New','body','','',1)",
+                [],
+            )
+            .unwrap();
+        let error = migrate_config_objects(&mut connection).unwrap_err();
+        assert!(error.contains("contains 1 new rows"));
+        assert!(
+            connection
+                .query_row("SELECT 1 FROM asset_records WHERE id='new'", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ),)
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn shell_artifact_paths_cover_attached_quoted_and_repeated_redirects() {
         assert_eq!(
             shell_artifact_paths(r#"printf x >out.txt >> "reports/final output.txt""#),
@@ -3912,13 +4793,6 @@ mod m7_tests {
             shell_artifact_paths("generate | tee -a reports/out.log"),
             vec!["reports/out.log"]
         );
-    }
-
-    #[test]
-    fn artifact_hash_command_quotes_shell_metacharacters() {
-        let command = artifact_hash_command("reports/O'Brien; $(touch hacked) final.txt");
-        assert!(command.contains("'reports/O'\\''Brien; $(touch hacked) final.txt'"));
-        assert_eq!(command.matches('\'').count() % 2, 0);
     }
 
     #[test]

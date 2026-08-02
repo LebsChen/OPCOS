@@ -25,6 +25,7 @@ opcos-engine = { path = "../crates/opcos-engine" }
 opcos-hosts = { path = "../crates/opcos-hosts" }
 opcos-assets = { path = "../crates/opcos-assets" }
 serde_yaml.workspace = true
+sha2.workspace = true
 opcos-policy = { path = "../crates/opcos-policy" }
 opcos-provider = { path = "../crates/opcos-provider" }
 opcos-rvm = { path = "../crates/opcos-rvm" }

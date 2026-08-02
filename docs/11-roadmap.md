@@ -45,7 +45,7 @@
 
 ### P1-1 配置对象迁移
 
-- 做：五套资产收敛到 `config_object` + 不可变 `config_object_version`（[06](06-capability-model.md)、[01](01-data-model.md)）；UI 仍保留五个入口但走同一套组件；技能改「先给清单、命中再读全文」。
+- 做：五套资产收敛到 `config_object` + 不可变 `config_object_version`（[06](06-capability-model.md)、[01](01-data-model.md)）；scope 使用 `scope_kind + scope_key`；会话钉具体 version，调度运行记录实际 version；UI 仍保留五个入口但走同一套 store API，并提供历史、比较和回滚；技能改「先给清单、命中再读全文」留待后续优化。
 - 验收：编辑资产产生新版本、旧版本可回滚；30 个技能时上下文不膨胀（只注入清单）。
 - grok-build 参照：采用 optional patch precedence、managed ownership、validation report 与 atomic write。［GB码］［推断］
 
