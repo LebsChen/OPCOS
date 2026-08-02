@@ -1274,7 +1274,10 @@ h3 {
   flex-wrap: wrap;
 }
 .composer-card.hero .composer-row {
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
+}
+.composer-card.hero .send-btn {
+  margin-left: auto;
 }
 .composer-row button,
 .composer-row select {
