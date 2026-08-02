@@ -3230,6 +3230,7 @@ dependencies = [
  "opcos-assets",
  "opcos-engine",
  "opcos-hosts",
+ "opcos-mcp",
  "opcos-policy",
  "opcos-provider",
  "opcos-rvm",
@@ -3299,8 +3300,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "opcos-rvm",
+ "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.19",
  "tokio",
 ]

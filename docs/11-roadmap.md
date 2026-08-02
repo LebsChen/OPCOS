@@ -54,6 +54,13 @@
 - 做：global（`~/.config/opcos/mcp.json`）与 workspace（`<ws>/.opcos/mcp.json`）配置层叠、同名 workspace 覆盖 global；transport `stdio` / `http` / `streamable-http` / `sse`；OAuth token 进 SecretStore **不写配置文件**；tool discovery + 逐 tool 审批（[05](05-mcp.md)）。
 - 验收：接入一个真实 MCP server，工具可发现、可逐个审批；配置文件中无任何 token。
 - grok-build 参照：加入 typed init progress、liveness、server diff refresh、OAuth 跨进程/进程内去重；credential 仍只进 OPCOS SecretStore。［GB码］［推断］
+- 独立 server 使用 `config_object(kind='mcp')`，凭据仅进入 SecretStore；
+- 常驻 MCP manager 负责 transport 生命周期，退出时 stdio 子进程 kill + wait；
+- 状态显式区分 `disabled/starting/connected/disconnected/reconnecting/auth_required/failed`；
+- tools/list runtime cache 按 `(server_object_id, config_version_id)` 失效；
+- 不可用 server 保留在 UI 状态列表，但工具不进入 provider request；
+- 工具名稳定为 `mcp__<server_key>__<tool_name>`，调用不自动 failover；
+- 重连采用有限退避：立即、500ms、1s、2s、4s、8s、16s，30s 封顶。
 
 ### P1-3 生命周期阶段与 pre-push 门禁
 

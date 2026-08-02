@@ -164,6 +164,10 @@ where
         *self.external_tools.lock().await = tools;
     }
 
+    pub async fn append_external_tools(&self, tools: impl IntoIterator<Item = Value>) {
+        self.external_tools.lock().await.extend(tools);
+    }
+
     pub async fn set_allowed_tools(&self, tools: impl IntoIterator<Item = String>) {
         *self.allowed_tools.lock().await = Some(tools.into_iter().collect());
     }
@@ -1023,8 +1027,17 @@ fn mcp_tool_definition(tool: Value) -> Value {
         .get("name")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
+    let qualified_name = tool
+        .get("qualified_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let provider_name = if qualified_name.is_empty() {
+        format!("mcp:{name}")
+    } else {
+        qualified_name.to_owned()
+    };
     json!({"type":"function","function":{
-        "name":format!("mcp:{name}"),
+        "name":provider_name,
         "description":tool.get("description").and_then(Value::as_str).unwrap_or("External MCP tool."),
         "parameters":tool.get("inputSchema").cloned().unwrap_or_else(|| json!({"type":"object","properties":{}}))
     }})
