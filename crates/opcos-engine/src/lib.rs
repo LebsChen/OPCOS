@@ -7,7 +7,7 @@ use opcos_provider::{
 };
 use opcos_store::{
     CompactionRecord, GrantRecord, NoticeRecord, PendingRecord, SessionStore, StoredMessage,
-    UsageRecord,
+    ToolCallRecord, UsageRecord,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -20,7 +20,10 @@ use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
+mod opencode;
 pub mod orchestration;
+
+pub use opencode::{OpenCodeHarness, OpenCodeHarnessConfig};
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -75,6 +78,7 @@ pub trait AgentEngine: Send + Sync {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HarnessKind {
     Builtin,
+    OpenCode,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -105,6 +109,10 @@ impl std::fmt::Debug for TurnHandle {
 }
 
 impl TurnHandle {
+    pub(crate) fn from_parts(id: String, receiver: TurnReceiver) -> Self {
+        Self { id, receiver }
+    }
+
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -260,6 +268,35 @@ where
             .map_err(|error| EngineError::Store(error.to_string()))
     }
 
+    pub fn append_tool_call(&self, call: &ToolCallRecord) -> Result<(), EngineError> {
+        self.store
+            .append_tool_call(call)
+            .map_err(|error| EngineError::Store(error.to_string()))
+    }
+
+    pub fn next_message_sequence(&self) -> Result<i64, EngineError> {
+        Ok(self
+            .store
+            .load_messages(&self.session_id)
+            .map_err(|error| EngineError::Store(error.to_string()))?
+            .into_iter()
+            .map(|message| message.sequence)
+            .max()
+            .unwrap_or(0)
+            + 1)
+    }
+
+    pub fn complete_tool_call(
+        &self,
+        message_sequence: i64,
+        call_id: &str,
+        result: &Value,
+    ) -> Result<(), EngineError> {
+        self.store
+            .complete_tool_call(&self.session_id, message_sequence, call_id, result)
+            .map_err(|error| EngineError::Store(error.to_string()))
+    }
+
     pub fn set_external_session_id(
         &self,
         external_session_id: Option<&str>,
@@ -284,6 +321,8 @@ pub enum HarnessError {
     TurnAbandoned,
     #[error("pending request not found: {0}")]
     PendingNotFound(String),
+    #[error("external harness: {0}")]
+    External(String),
 }
 
 #[async_trait]
@@ -2064,6 +2103,7 @@ mod tests {
                 workspace: "/workspace".into(),
                 model: "fake".into(),
                 mode: "Interactive".into(),
+                harness: "builtin".into(),
                 title: "Harness".into(),
                 extra_roots: vec![],
                 grants: json!({}),
@@ -2311,6 +2351,7 @@ mod tests {
                 workspace: "/workspace".into(),
                 model: "fake".into(),
                 mode: "Interactive".into(),
+                harness: "builtin".into(),
                 title: "Approval".into(),
                 extra_roots: vec![],
                 grants: json!({}),

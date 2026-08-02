@@ -30,6 +30,7 @@ describe("GUI boundary behavior", () => {
       host_name: "A",
       model: "auto",
       mode: "Interactive",
+      harness: "builtin",
     };
     expect(canRebindSession(session, "remote-a")).toBe(true);
     expect(canRebindSession(session, "remote-b")).toBe(false);

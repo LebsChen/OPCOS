@@ -44,6 +44,7 @@ pub struct SessionRecord {
     pub workspace: String,
     pub model: String,
     pub mode: String,
+    pub harness: String,
     pub title: String,
     pub extra_roots: Vec<ExtraRoot>,
     pub grants: serde_json::Value,
@@ -259,47 +260,48 @@ fn parse_timestamp(value: String) -> Result<DateTime<Utc>, rusqlite::Error> {
 }
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> Result<SessionRecord, rusqlite::Error> {
-    let extra_roots: String = row.get(5)?;
-    let grants: String = row.get(6)?;
-    let compaction: String = row.get(11)?;
+    let extra_roots: String = row.get(6)?;
+    let grants: String = row.get(7)?;
+    let compaction: String = row.get(12)?;
     Ok(SessionRecord {
         session_id: row.get(0)?,
         workspace: row.get(1)?,
         model: row.get(2)?,
         mode: row.get(3)?,
-        title: row.get(4)?,
+        harness: row.get(4)?,
+        title: row.get(5)?,
         extra_roots: serde_json::from_str(&extra_roots).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                5,
-                rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })?,
-        grants: serde_json::from_str(&grants).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
                 6,
                 rusqlite::types::Type::Text,
                 Box::new(error),
             )
         })?,
-        pinned: row.get::<_, i64>(7)? != 0,
-        archived: row.get::<_, i64>(8)? != 0,
-        origin: row.get(9)?,
-        origin_label: row.get(10)?,
-        compaction: serde_json::from_str(&compaction).map_err(|error| {
+        grants: serde_json::from_str(&grants).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
-                11,
+                7,
                 rusqlite::types::Type::Text,
                 Box::new(error),
             )
         })?,
-        host_id: row.get(12)?,
-        provider: row.get(13)?,
-        external_session_id: row.get(14)?,
-        run_state: row.get(15)?,
-        stop_reason: row.get(16)?,
-        created_at: parse_timestamp(row.get(17)?)?,
-        updated_at: parse_timestamp(row.get(18)?)?,
+        pinned: row.get::<_, i64>(8)? != 0,
+        archived: row.get::<_, i64>(9)? != 0,
+        origin: row.get(10)?,
+        origin_label: row.get(11)?,
+        compaction: serde_json::from_str(&compaction).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                12,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        host_id: row.get(13)?,
+        provider: row.get(14)?,
+        external_session_id: row.get(15)?,
+        run_state: row.get(16)?,
+        stop_reason: row.get(17)?,
+        created_at: parse_timestamp(row.get(18)?)?,
+        updated_at: parse_timestamp(row.get(19)?)?,
     })
 }
 
@@ -513,6 +515,7 @@ pub trait SessionStore {
         stop_reason: &str,
     ) -> Result<(), StoreError>;
     fn update_session_mode(&self, session_id: &str, mode: &str) -> Result<(), StoreError>;
+    fn update_session_harness(&self, session_id: &str, harness: &str) -> Result<(), StoreError>;
     fn update_external_session_id(
         &self,
         session_id: &str,
@@ -1103,6 +1106,7 @@ impl SqliteStore {
                workspace TEXT NOT NULL,
                model TEXT NOT NULL,
                mode TEXT NOT NULL,
+               harness TEXT NOT NULL DEFAULT 'builtin',
                title TEXT NOT NULL,
                extra_roots TEXT NOT NULL,
                grants TEXT NOT NULL,
@@ -1128,6 +1132,13 @@ impl SqliteStore {
                unattended INTEGER NOT NULL DEFAULT 0
              );",
             )?;
+            let session_columns = table_columns(&connection, "sessions")?;
+            if !session_columns.iter().any(|column| column == "harness") {
+                connection.execute(
+                    "ALTER TABLE sessions ADD COLUMN harness TEXT NOT NULL DEFAULT 'builtin'",
+                    [],
+                )?;
+            }
             let created_at_column = table_columns(&connection, "sessions")?
                 .iter()
                 .any(|column| column == "created_at");
@@ -1232,12 +1243,13 @@ impl SqliteStore {
 
     pub fn save_session(&self, session: &SessionRecord) -> Result<(), StoreError> {
         self.connection.lock().expect("sqlite mutex poisoned").execute(
-            "INSERT OR REPLACE INTO sessions(session_id,workspace,model,mode,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+            "INSERT OR REPLACE INTO sessions(session_id,workspace,model,mode,harness,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             params![
                 session.session_id,
                 session.workspace,
                 session.model,
                 session.mode,
+                session.harness,
                 session.title,
                 serde_json::to_string(&session.extra_roots)?,
                 serde_json::to_string(&session.grants)?,
@@ -1261,7 +1273,7 @@ impl SqliteStore {
     pub fn load_session(&self, session_id: &str) -> Result<Option<SessionRecord>, StoreError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let result = connection.query_row(
-            "SELECT session_id,workspace,model,mode,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,created_at,updated_at FROM sessions WHERE session_id=?1",
+            "SELECT session_id,workspace,model,mode,harness,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,created_at,updated_at FROM sessions WHERE session_id=?1",
             [session_id],
             session_from_row,
         );
@@ -1275,7 +1287,7 @@ impl SqliteStore {
     pub fn load_sessions(&self) -> Result<Vec<SessionRecord>, StoreError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT session_id,workspace,model,mode,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,created_at,updated_at FROM sessions ORDER BY created_at DESC",
+            "SELECT session_id,workspace,model,mode,harness,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,created_at,updated_at FROM sessions ORDER BY created_at DESC",
         )?;
         let rows = statement.query_map([], session_from_row)?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -1331,6 +1343,21 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub fn update_session_harness(
+        &self,
+        session_id: &str,
+        harness: &str,
+    ) -> Result<(), StoreError> {
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "UPDATE sessions SET harness=?1, updated_at=?2 WHERE session_id=?3",
+                params![harness, Utc::now().to_rfc3339(), session_id],
+            )?;
+        Ok(())
+    }
+
     pub fn update_session_status(
         &self,
         session_id: &str,
@@ -1360,6 +1387,10 @@ impl SessionStore for SqliteStore {
 
     fn update_session_mode(&self, session_id: &str, mode: &str) -> Result<(), StoreError> {
         SqliteStore::update_session_mode(self, session_id, mode)
+    }
+
+    fn update_session_harness(&self, session_id: &str, harness: &str) -> Result<(), StoreError> {
+        SqliteStore::update_session_harness(self, session_id, harness)
     }
 
     fn update_external_session_id(
@@ -1846,6 +1877,7 @@ mod tests {
             workspace: "C:\\Users\\Team".into(),
             model: "test-model".into(),
             mode: "Interactive".into(),
+            harness: "builtin".into(),
             title: "Smoke".into(),
             extra_roots: vec![],
             grants: serde_json::json!({}),
@@ -1887,6 +1919,7 @@ mod tests {
                 workspace: "/workspace".into(),
                 model: "test".into(),
                 mode: "Interactive".into(),
+                harness: "builtin".into(),
                 title: "Status".into(),
                 extra_roots: vec![],
                 grants: serde_json::json!({}),
