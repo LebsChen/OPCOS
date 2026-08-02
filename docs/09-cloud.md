@@ -78,16 +78,18 @@ Cloud A 是可选的 OAuth 回调 broker，不是云端 agent、事件 relay 或
 ### 流程
 
 1. 本机生成 OS CSPRNG PKCE verifier，并只向 broker 发送 S256 challenge。
-2. broker 生成一次性 CSPRNG `session_code` 和 OAuth `state`，返回 authorize URL。
+2. broker 生成一次性 CSPRNG `session_code` 和 OAuth `state`，返回 authorize URL；客户端请求不携带 redirect URI，本地没有回调地址。
 3. 浏览器访问 provider，provider 回调 broker 的 `/oauth/callback`。
-4. 本机以指数退避轮询 `session_code`；broker 先验证 PKCE，再交换 provider code。
+4. 本机以指数退避向 `POST /v1/oauth/sessions/token` 发送 JSON body（`session_code` + `code_verifier`）；verifier 不进入 query string，broker 先验证 PKCE，再交换 provider code。
 5. broker 将 token 仅作为一次性响应返回；本机立即写入本地 keyring/加密 SecretStore，broker 内存中的 session 随即删除。
 
 Session code 有五分钟 TTL、一次性消费和常量时间比较。OAuth state 也使用常量时间匹配。broker 不把 access token、refresh token、verifier 或 client secret 写入日志、错误或 URL；provider client secret 只存在 broker 的运行时配置中。
 
 由于 OAuth authorization-code exchange 需要 OAuth app 的 client secret，broker 在轮询完成时会短暂接收 verifier 以验证发起方并完成 exchange；verifier 不落库、不记录，且 token 不在 broker 侧持久化。这是“凭据不落云”的边界：用户 token 只落本地 SecretStore，broker 只托管 OAuth app 凭据和短生命周期交换状态。
 
-本轮没有公网部署，也没有硬编码域名。自托管 broker 的 `public_base_url`、provider client id/secret、authorize URL 和 token URL 全部通过环境变量配置。回环测试覆盖：创建 session、state callback、PKCE poll、token 一次性返回和二次消费失败。
+OAuth authorization 和 token exchange 两次都使用 broker 计算出的同一个 callback URL，避免 provider 的 `redirect_uri_mismatch`。
+
+本轮没有公网部署，也没有硬编码域名。自托管 broker 的 `public_base_url`、provider client id/secret、authorize URL 和 token URL 全部通过环境变量配置。回环测试覆盖：创建 session、state callback、正确 callback URL 的 token exchange、body 中的 PKCE verifier、token 一次性返回、过期 session 清扫和并发 session 超限（429）。
 
 ### 尚未实现
 

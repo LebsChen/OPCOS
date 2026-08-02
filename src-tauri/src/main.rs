@@ -171,7 +171,6 @@ async fn cloud_authorize(
     state: State<'_, DesktopState>,
     provider: String,
     broker_url: String,
-    redirect_uri: String,
 ) -> Result<CloudStatus, String> {
     if !*state
         .cloud_enabled
@@ -189,7 +188,6 @@ async fn cloud_authorize(
         ))
         .json(&json!({
             "provider": provider,
-            "redirect_uri": redirect_uri,
             "code_challenge": challenge,
         }))
         .send()
@@ -213,12 +211,14 @@ async fn cloud_authorize(
         }
         tokio::time::sleep(delay).await;
         let response = reqwest::Client::new()
-            .get(format!(
-                "{}/v1/oauth/sessions/{}",
-                broker_url.trim_end_matches('/'),
-                start.session_code
+            .post(format!(
+                "{}/v1/oauth/sessions/token",
+                broker_url.trim_end_matches('/')
             ))
-            .query(&[("code_verifier", verifier.as_str())])
+            .json(&json!({
+                "session_code": start.session_code,
+                "code_verifier": verifier,
+            }))
             .send()
             .await
             .map_err(|_| "Cloud broker polling failed".to_owned())?;

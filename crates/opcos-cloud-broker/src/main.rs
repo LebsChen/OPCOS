@@ -25,6 +25,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .collect(),
             },
         )]),
+        session_ttl_seconds: 300,
+        max_sessions: 1024,
     };
     run(config, bind).await?;
     Ok(())

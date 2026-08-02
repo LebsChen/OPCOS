@@ -18,6 +18,7 @@ use tokio::{net::TcpListener, sync::Mutex};
 use url::Url;
 
 const SESSION_TTL_SECONDS: i64 = 300;
+const MAX_SESSIONS: usize = 1024;
 
 #[derive(Clone, Debug)]
 pub struct ProviderConfig {
@@ -33,6 +34,8 @@ pub struct BrokerConfig {
     pub public_base_url: String,
     pub callback_path: String,
     pub providers: HashMap<String, ProviderConfig>,
+    pub session_ttl_seconds: i64,
+    pub max_sessions: usize,
 }
 
 #[derive(Clone)]
@@ -45,7 +48,6 @@ pub struct BrokerState {
 #[derive(Clone, Debug)]
 struct PendingSession {
     provider: String,
-    redirect_uri: String,
     code_challenge: String,
     state: String,
     expires_at: DateTime<Utc>,
@@ -55,7 +57,6 @@ struct PendingSession {
 #[derive(Debug, Deserialize)]
 pub struct StartRequest {
     pub provider: String,
-    pub redirect_uri: String,
     pub code_challenge: String,
 }
 
@@ -100,7 +101,7 @@ pub fn router(config: BrokerConfig) -> Router {
     };
     Router::new()
         .route("/v1/oauth/sessions", post(start_session))
-        .route("/v1/oauth/sessions/{session_code}", get(poll_session))
+        .route("/v1/oauth/sessions/token", post(poll_session))
         .route("/oauth/callback", get(oauth_callback))
         .with_state(state)
 }
@@ -123,17 +124,28 @@ async fn start_session(
         .providers
         .get(&input.provider)
         .ok_or_else(|| BrokerError::bad_request("provider is not configured"))?;
-    if input.redirect_uri.trim().is_empty()
-        || input.code_challenge.trim().is_empty()
-        || !input.redirect_uri.starts_with("http")
-    {
-        return Err(BrokerError::bad_request(
-            "redirect_uri and code_challenge are required",
-        ));
+    if input.code_challenge.trim().is_empty() {
+        return Err(BrokerError::bad_request("code_challenge is required"));
+    }
+    let now = Utc::now();
+    let mut sessions = state.sessions.lock().await;
+    sessions.retain(|_, session| session.expires_at > now);
+    let max_sessions = if state.config.max_sessions == 0 {
+        MAX_SESSIONS
+    } else {
+        state.config.max_sessions
+    };
+    if sessions.len() >= max_sessions {
+        return Err(BrokerError::too_many("too many OAuth sessions in flight"));
     }
     let session_code = random_hex(32)?;
     let state_value = random_hex(32)?;
-    let expires_at = Utc::now() + Duration::seconds(SESSION_TTL_SECONDS);
+    let ttl = if state.config.session_ttl_seconds <= 0 {
+        SESSION_TTL_SECONDS
+    } else {
+        state.config.session_ttl_seconds
+    };
+    let expires_at = now + Duration::seconds(ttl);
     let callback_url = format!(
         "{}{}",
         state.config.public_base_url.trim_end_matches('/'),
@@ -154,11 +166,10 @@ async fn start_session(
             .query_pairs_mut()
             .append_pair("scope", &provider.scopes.join(" "));
     }
-    state.sessions.lock().await.insert(
+    sessions.insert(
         session_code.clone(),
         PendingSession {
             provider: input.provider,
-            redirect_uri: input.redirect_uri,
             code_challenge: input.code_challenge,
             state: state_value,
             expires_at,
@@ -205,17 +216,16 @@ async fn oauth_callback(
 
 async fn poll_session(
     State(state): State<BrokerState>,
-    axum::extract::Path(session_code): axum::extract::Path<String>,
-    Query(query): Query<PollQuery>,
+    Json(input): Json<TokenRequest>,
 ) -> Result<Response, BrokerError> {
-    let verifier = query
+    let verifier = input
         .code_verifier
         .ok_or_else(|| BrokerError::bad_request("missing PKCE code_verifier"))?;
     let (pending, provider) = {
         let sessions = state.sessions.lock().await;
         let key = sessions
             .keys()
-            .find(|key| key.as_bytes().ct_eq(session_code.as_bytes()).into())
+            .find(|key| key.as_bytes().ct_eq(input.session_code.as_bytes()).into())
             .cloned()
             .ok_or_else(|| BrokerError::not_found("OAuth session not found"))?;
         let pending = sessions
@@ -231,11 +241,7 @@ async fn poll_session(
         (pending, provider)
     };
     if pending.expires_at <= Utc::now() {
-        state
-            .sessions
-            .lock()
-            .await
-            .retain(|_, item| item.state != pending.state);
+        state.sessions.lock().await.remove(&input.session_code);
         return Err(BrokerError::gone("OAuth session expired"));
     }
     let expected_challenge = pkce_challenge(&verifier);
@@ -256,14 +262,20 @@ async fn poll_session(
         )
             .into_response());
     };
-    let token = exchange_code(&state.http, &provider, code, &verifier, &pending).await?;
+    let callback_url = format!(
+        "{}{}",
+        state.config.public_base_url.trim_end_matches('/'),
+        state.config.callback_path
+    );
+    let token = exchange_code(&state.http, &provider, code, &verifier, &callback_url).await?;
     let mut sessions = state.sessions.lock().await;
-    sessions.retain(|_, item| item.state != pending.state);
+    sessions.remove(&input.session_code);
     Ok(Json(token).into_response())
 }
 
 #[derive(Debug, Deserialize)]
-struct PollQuery {
+struct TokenRequest {
+    session_code: String,
     code_verifier: Option<String>,
 }
 
@@ -272,14 +284,14 @@ async fn exchange_code(
     provider: &ProviderConfig,
     code: &str,
     verifier: &str,
-    pending: &PendingSession,
+    callback_url: &str,
 ) -> Result<TokenResponse, BrokerError> {
     let response = http
         .post(&provider.token_url)
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code),
-            ("redirect_uri", pending.redirect_uri.as_str()),
+            ("redirect_uri", callback_url),
             ("client_id", provider.client_id.as_str()),
             ("client_secret", provider.client_secret.as_str()),
             ("code_verifier", verifier),
@@ -349,6 +361,12 @@ impl BrokerError {
             message: message.into(),
         }
     }
+    fn too_many(message: &str) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: message.into(),
+        }
+    }
 }
 
 impl IntoResponse for BrokerError {
@@ -364,12 +382,17 @@ impl IntoResponse for BrokerError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Router, routing::post};
+    use axum::{Router, extract::Form, routing::post};
     use reqwest::Client;
     use serde_json::json;
     use tokio::time::{Duration as TokioDuration, sleep};
 
-    fn config(token_url: String, base_url: String) -> BrokerConfig {
+    fn config(
+        token_url: String,
+        base_url: String,
+        session_ttl_seconds: i64,
+        max_sessions: usize,
+    ) -> BrokerConfig {
         BrokerConfig {
             public_base_url: base_url,
             callback_path: "/oauth/callback".into(),
@@ -383,28 +406,41 @@ mod tests {
                     scopes: vec!["identity".into()],
                 },
             )]),
+            session_ttl_seconds,
+            max_sessions,
         }
     }
 
     #[tokio::test]
     async fn loopback_oauth_flow_returns_token_once_and_never_twice() {
-        let provider = Router::new().route(
-            "/token",
-            post(|| async {
-                Json(json!({"access_token":"local-test-token","token_type":"Bearer"}))
-            }),
-        );
         let provider_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let provider_base = format!("http://{}", provider_listener.local_addr().unwrap());
-        tokio::spawn(async move {
-            axum::serve(provider_listener, provider).await.unwrap();
-        });
         let broker_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let broker_addr = broker_listener.local_addr().unwrap();
         let base = format!("http://{broker_addr}");
+        let expected_redirect_uri = format!("{base}/oauth/callback");
+        let expected_for_provider = expected_redirect_uri.clone();
+        let provider = Router::new().route(
+            "/token",
+            post(|Form(form): Form<HashMap<String, String>>| async move {
+                assert_eq!(
+                    form.get("redirect_uri").map(String::as_str),
+                    Some(expected_for_provider.as_str())
+                );
+                Json(json!({"access_token":"local-test-token","token_type":"Bearer"}))
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(provider_listener, provider).await.unwrap();
+        });
         tokio::spawn(serve(
             broker_listener,
-            config(format!("{provider_base}/token"), base.clone()),
+            config(
+                format!("{provider_base}/token"),
+                base.clone(),
+                SESSION_TTL_SECONDS,
+                MAX_SESSIONS,
+            ),
         ));
         sleep(TokioDuration::from_millis(10)).await;
         let verifier = "a-strong-local-verifier";
@@ -412,7 +448,6 @@ mod tests {
             .post(format!("{base}/v1/oauth/sessions"))
             .json(&json!({
                 "provider":"test",
-                "redirect_uri":"http://127.0.0.1:9/local",
                 "code_challenge":pkce_challenge(verifier)
             }))
             .send()
@@ -437,10 +472,11 @@ mod tests {
             .unwrap();
         assert_eq!(callback.status(), StatusCode::OK);
         let token = Client::new()
-            .get(format!(
-                "{base}/v1/oauth/sessions/{}?code_verifier={verifier}",
-                start.session_code
-            ))
+            .post(format!("{base}/v1/oauth/sessions/token"))
+            .json(&json!({
+                "session_code": start.session_code,
+                "code_verifier": verifier,
+            }))
             .send()
             .await
             .unwrap();
@@ -449,14 +485,81 @@ mod tests {
             token.json::<TokenResponse>().await.unwrap().access_token,
             "local-test-token"
         );
+        assert_eq!(expected_redirect_uri, format!("{base}/oauth/callback"));
         let second = Client::new()
-            .get(format!(
-                "{base}/v1/oauth/sessions/{}?code_verifier={verifier}",
-                start.session_code
-            ))
+            .post(format!("{base}/v1/oauth/sessions/token"))
+            .json(&json!({
+                "session_code": start.session_code,
+                "code_verifier": verifier,
+            }))
             .send()
             .await
             .unwrap();
         assert_eq!(second.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn expired_sessions_are_cleaned_before_capacity_is_checked() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(serve(
+            listener,
+            config("http://127.0.0.1:9/token".into(), base.clone(), 1, 1),
+        ));
+        sleep(TokioDuration::from_millis(10)).await;
+        let client = Client::new();
+        let first = client
+            .post(format!("{base}/v1/oauth/sessions"))
+            .json(&json!({"provider":"test","code_challenge":"challenge"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        sleep(TokioDuration::from_millis(1_100)).await;
+        let second = client
+            .post(format!("{base}/v1/oauth/sessions"))
+            .json(&json!({"provider":"test","code_challenge":"challenge"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn too_many_sessions_return_too_many_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(serve(
+            listener,
+            config(
+                "http://127.0.0.1:9/token".into(),
+                base.clone(),
+                SESSION_TTL_SECONDS,
+                1,
+            ),
+        ));
+        sleep(TokioDuration::from_millis(10)).await;
+        let client = Client::new();
+        let payload = json!({"provider":"test","code_challenge":"challenge"});
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/oauth/sessions"))
+                .json(&payload)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/oauth/sessions"))
+                .json(&payload)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
     }
 }

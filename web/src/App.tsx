@@ -951,9 +951,6 @@ function ManageSections({
   const [cloudBrokerUrl, setCloudBrokerUrl] = useState(
     () => localStorage.getItem("opcos:cloud-broker-url") || "",
   );
-  const [cloudRedirectUri, setCloudRedirectUri] = useState(
-    () => localStorage.getItem("opcos:cloud-redirect-uri") || "",
-  );
   const [cloudStatus, setCloudStatus] = useState("");
   const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
   const [assetTitle, setAssetTitle] = useState("");
@@ -1539,30 +1536,10 @@ function ManageSections({
                       disabled={!cloudEnabled}
                     />
                   </label>
-                  <label className="field-label">
-                    Registered redirect URI
-                    <input
-                      type="url"
-                      value={cloudRedirectUri}
-                      onChange={(event) => {
-                        setCloudRedirectUri(event.target.value);
-                        localStorage.setItem(
-                          "opcos:cloud-redirect-uri",
-                          event.target.value,
-                        );
-                      }}
-                      placeholder="https://your-broker.example/oauth/callback"
-                      disabled={!cloudEnabled}
-                    />
-                  </label>
                   <div className="inline-actions">
                     <Button
                       className="primary"
-                      disabled={
-                        !cloudEnabled ||
-                        !cloudBrokerUrl.trim() ||
-                        !cloudRedirectUri.trim()
-                      }
+                      disabled={!cloudEnabled || !cloudBrokerUrl.trim()}
                       onClick={() => {
                         setCloudStatus("");
                         void command<{ enabled: boolean; connected: boolean }>(
@@ -1570,7 +1547,6 @@ function ManageSections({
                           {
                             provider: "linear",
                             brokerUrl: cloudBrokerUrl.trim(),
-                            redirectUri: cloudRedirectUri.trim(),
                           },
                         )
                           .then((status) => {
