@@ -90,6 +90,15 @@ pub struct GrantRecord {
     pub target: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsageRecord {
+    pub session_id: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub duration_ms: u64,
+    pub recorded_at: DateTime<Utc>,
+}
+
 pub trait SessionStore {
     fn append_message(&self, message: &StoredMessage) -> Result<(), StoreError>;
     fn load_messages(&self, session_id: &str) -> Result<Vec<StoredMessage>, StoreError>;
@@ -110,6 +119,8 @@ pub trait SessionStore {
     fn load_compaction(&self, session_id: &str) -> Result<Option<CompactionRecord>, StoreError>;
     fn save_grant(&self, grant: &GrantRecord) -> Result<(), StoreError>;
     fn load_grants(&self, session_id: &str) -> Result<Vec<GrantRecord>, StoreError>;
+    fn append_usage(&self, usage: &UsageRecord) -> Result<(), StoreError>;
+    fn load_usage(&self, session_id: &str) -> Result<Vec<UsageRecord>, StoreError>;
 }
 
 pub trait SecretStore: Send + Sync {
@@ -180,6 +191,41 @@ impl SqliteStore {
         };
         store.migrate()?;
         Ok(store)
+    }
+
+    pub fn load_tool_calls(&self, session_id: &str) -> Result<Vec<ToolCallRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT session_id,message_sequence,call_id,name,arguments,result FROM tool_calls WHERE session_id=?1 ORDER BY message_sequence,call_id",
+        )?;
+        let rows = statement.query_map([session_id], |row| {
+            let arguments: String = row.get(4)?;
+            let result: Option<String> = row.get(5)?;
+            Ok(ToolCallRecord {
+                session_id: row.get(0)?,
+                message_sequence: row.get(1)?,
+                call_id: row.get(2)?,
+                name: row.get(3)?,
+                arguments: serde_json::from_str(&arguments).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                result: result
+                    .map(|value| serde_json::from_str(&value))
+                    .transpose()
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            5,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     fn migrate(&self) -> Result<(), StoreError> {
@@ -255,6 +301,13 @@ impl SqliteStore {
                arguments TEXT NOT NULL,
                state TEXT NOT NULL,
                PRIMARY KEY(session_id, call_id)
+             );
+             CREATE TABLE IF NOT EXISTS usage_events (
+               session_id TEXT NOT NULL,
+               input_tokens INTEGER NOT NULL,
+               output_tokens INTEGER NOT NULL,
+               duration_ms INTEGER NOT NULL,
+               recorded_at TEXT NOT NULL
              );",
             )?;
         if self
@@ -473,6 +526,37 @@ impl SessionStore for SqliteStore {
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
+
+    fn append_usage(&self, usage: &UsageRecord) -> Result<(), StoreError> {
+        self.connection.lock().expect("sqlite mutex poisoned").execute(
+            "INSERT INTO usage_events(session_id,input_tokens,output_tokens,duration_ms,recorded_at) VALUES (?1,?2,?3,?4,?5)",
+            params![usage.session_id, usage.input_tokens as i64, usage.output_tokens as i64, usage.duration_ms as i64, usage.recorded_at.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    fn load_usage(&self, session_id: &str) -> Result<Vec<UsageRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT session_id,input_tokens,output_tokens,duration_ms,recorded_at FROM usage_events WHERE session_id=?1 ORDER BY recorded_at",
+        )?;
+        let rows = statement.query_map([session_id], |row| {
+            Ok(UsageRecord {
+                session_id: row.get(0)?,
+                input_tokens: row.get::<_, i64>(1)?.max(0) as u64,
+                output_tokens: row.get::<_, i64>(2)?.max(0) as u64,
+                duration_ms: row.get::<_, i64>(3)?.max(0) as u64,
+                recorded_at: row.get::<_, String>(4)?.parse().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
 }
 
 #[cfg(test)]
@@ -526,5 +610,23 @@ mod tests {
             handle.join().unwrap();
         }
         assert_eq!(store.load_messages("concurrent").unwrap().len(), 8);
+    }
+
+    #[test]
+    fn usage_records_round_trip_without_estimation() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .append_usage(&UsageRecord {
+                session_id: "usage".into(),
+                input_tokens: 12,
+                output_tokens: 7,
+                duration_ms: 345,
+                recorded_at: Utc::now(),
+            })
+            .unwrap();
+        let records = store.load_usage("usage").unwrap();
+        assert_eq!(records[0].input_tokens, 12);
+        assert_eq!(records[0].output_tokens, 7);
+        assert_eq!(records[0].duration_ms, 345);
     }
 }

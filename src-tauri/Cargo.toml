@@ -8,6 +8,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 axum.workspace = true
+base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true

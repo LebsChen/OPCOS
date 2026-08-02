@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+chrono.workspace = true
 futures-util.workspace = true
 opcos-policy = { path = "../opcos-policy" }
 opcos-provider = { path = "../opcos-provider" }

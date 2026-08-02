@@ -61,6 +61,8 @@ function App() {
   const [idePort, setIdePort] = useState<number | null>(null);
   const [assets, setAssets] = useState<Asset[]>([]);
   const [secretMetadata, setSecretMetadata] = useState<SecretMetadata[]>([]);
+  const [review, setReview] = useState<Record<string, unknown> | null>(null);
+  const [worklog, setWorklog] = useState<Record<string, unknown> | null>(null);
   const terminalHost = useRef<HTMLDivElement>(null);
   const vncHost = useRef<HTMLDivElement>(null);
 
@@ -200,6 +202,36 @@ function App() {
         folderUri: `vscode-remote://${selected.host_name}/workspace`,
       });
       setIdePort(port);
+    } catch (reason) {
+      setError(String(reason));
+    }
+  };
+
+  const refreshReview = async () => {
+    if (!selected || !selected.workspace) return;
+    try {
+      setReview(
+        await command<Record<string, unknown>>("review_snapshot", {
+          sessionId: selected.id,
+          cwd: selected.workspace,
+          base: "HEAD",
+        }),
+      );
+    } catch (reason) {
+      setError(String(reason));
+    }
+  };
+
+  const refreshWorklog = async () => {
+    if (!selected) return;
+    try {
+      setWorklog(
+        await command<Record<string, unknown>>("session_worklog", {
+          sessionId: selected.id,
+          afterId: "",
+          limit: 200,
+        }),
+      );
     } catch (reason) {
       setError(String(reason));
     }
@@ -370,7 +402,24 @@ function App() {
                 >
                   Interrupt
                 </button>
+                <button onClick={() => void refreshReview()}>Review</button>
+                <button onClick={() => void refreshWorklog()}>Worklog</button>
               </div>
+              {review && (
+                <details open>
+                  <summary>Remote review</summary>
+                  <pre>{JSON.stringify(review, null, 2)}</pre>
+                </details>
+              )}
+              {worklog && (
+                <details>
+                  <summary>
+                    Worklog timeline
+                    {worklog.window_lost ? " · window lost" : ""}
+                  </summary>
+                  <pre>{JSON.stringify(worklog, null, 2)}</pre>
+                </details>
+              )}
               <div className="transcript">
                 {transcript.map((item, index) => (
                   <article

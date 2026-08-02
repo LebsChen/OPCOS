@@ -12,6 +12,7 @@ export type Session = {
   host_name: string;
   model: string;
   mode: string;
+  workspace?: string;
 };
 
 export type TranscriptItem = {
