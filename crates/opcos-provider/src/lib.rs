@@ -149,6 +149,8 @@ pub enum ProviderError {
     Http { status: StatusCode, message: String },
     #[error("provider response was invalid: {0}")]
     Protocol(String),
+    #[error("provider context window exceeded")]
+    ContextOverflow,
     #[error("provider capability is unavailable: {0}")]
     Unsupported(String),
 }
@@ -176,6 +178,20 @@ pub(crate) fn sanitize_secret(value: &str, secret: &str) -> String {
         sanitize_error(value)
     } else {
         sanitize_error(&value.replace(secret, "[redacted]"))
+    }
+}
+
+pub(crate) fn classify_context_error(status: StatusCode, message: &str) -> Option<ProviderError> {
+    let lower = message.to_ascii_lowercase();
+    if status == StatusCode::PAYLOAD_TOO_LARGE
+        || (status.is_client_error()
+            && ["context", "token limit", "too many tokens", "max tokens"]
+                .iter()
+                .any(|marker| lower.contains(marker)))
+    {
+        Some(ProviderError::ContextOverflow)
+    } else {
+        None
     }
 }
 

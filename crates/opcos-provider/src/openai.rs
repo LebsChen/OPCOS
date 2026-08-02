@@ -1,7 +1,7 @@
 use crate::{
     AssistantTurn, Caps, Provider, ProviderConfig, ProviderError, ProviderRequest, StreamChunk,
-    TokenUsage, ToolCall, ToolCallDelta, apply_bearer_headers, client, sanitize_secret,
-    settings_object, tool_schema,
+    TokenUsage, ToolCall, ToolCallDelta, apply_bearer_headers, classify_context_error, client,
+    sanitize_secret, settings_object, tool_schema,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -60,6 +60,9 @@ impl OpenAiProvider {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
             let lower = text.to_ascii_lowercase();
+            if let Some(error) = classify_context_error(status, &text) {
+                return Err(error);
+            }
             if lower.contains("reasoning_effort")
                 && lower.contains("not supported")
                 && body.get("reasoning_effort").is_some()
@@ -91,23 +94,66 @@ impl OpenAiProvider {
 }
 
 fn strip_foreign(messages: &[Value]) -> Vec<Value> {
-    messages
+    messages.iter().map(normalize_message).collect()
+}
+
+fn normalize_message(message: &Value) -> Value {
+    let Some(object) = message.as_object() else {
+        return message.clone();
+    };
+    let mut normalized = object
         .iter()
-        .map(|message| {
-            message
-                .as_object()
-                .map(|object| {
-                    Value::Object(
-                        object
-                            .iter()
-                            .filter(|(key, _)| !key.starts_with('_'))
-                            .map(|(key, value)| (key.clone(), value.clone()))
-                            .collect(),
-                    )
-                })
-                .unwrap_or_else(|| message.clone())
-        })
-        .collect()
+        .filter(|(key, _)| !key.starts_with('_'))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    if let Some(content) = normalized.get("content").cloned()
+        && let Some(blocks) = content.as_array()
+    {
+        let text = blocks
+            .iter()
+            .filter_map(|block| {
+                block
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| block.get("text").and_then(Value::as_str).map(str::to_owned))
+                    .or_else(|| {
+                        block
+                            .get("content")
+                            .and_then(Value::as_array)
+                            .and_then(|items| {
+                                items
+                                    .iter()
+                                    .find_map(|item| item.get("text").and_then(Value::as_str))
+                                    .map(str::to_owned)
+                            })
+                    })
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        normalized.insert("content".into(), Value::String(text));
+    }
+    if let Some(calls) = normalized
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .cloned()
+    {
+        let calls = calls.into_iter().map(|call| {
+            if call.get("function").is_some() {
+                call
+            } else {
+                json!({"id":call.get("id").cloned().unwrap_or(Value::Null),
+                    "type":"function","function":{"name":call.get("name").cloned().unwrap_or(Value::String(String::new())),
+                    "arguments":call.get("arguments").map(Value::to_string).unwrap_or_else(|| "{}".into())}})
+            }
+        }).collect();
+        normalized.insert("tool_calls".into(), Value::Array(calls));
+    }
+    if normalized.get("role").and_then(Value::as_str) == Some("tool")
+        && let Some(id) = normalized.remove("tool_use_id")
+    {
+        normalized.insert("tool_call_id".into(), id);
+    }
+    Value::Object(normalized)
 }
 
 fn usage(value: Option<&Value>) -> Option<TokenUsage> {

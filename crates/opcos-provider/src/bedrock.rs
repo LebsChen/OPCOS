@@ -2,6 +2,17 @@ use crate::{
     AssistantTurn, Caps, Provider, ProviderError, ProviderRequest, StreamChunk, TokenUsage,
     ToolCall,
 };
+
+fn bedrock_provider_error(error: impl std::fmt::Display) -> ProviderError {
+    let message = error.to_string();
+    if message.to_ascii_lowercase().contains("validationexception")
+        && message.to_ascii_lowercase().contains("token")
+    {
+        ProviderError::ContextOverflow
+    } else {
+        ProviderError::Protocol(message)
+    }
+}
 use async_trait::async_trait;
 use base64::Engine;
 use serde_json::{Value, json};
@@ -605,10 +616,7 @@ impl Provider for BedrockProvider {
         if let Some(tool_config) = tool_config {
             builder = builder.tool_config(tool_config);
         }
-        let response = builder
-            .send()
-            .await
-            .map_err(|error| ProviderError::Protocol(error.to_string()))?;
+        let response = builder.send().await.map_err(bedrock_provider_error)?;
         let mut text = String::new();
         let mut reasoning = String::new();
         let mut tool_calls = Vec::new();
@@ -667,10 +675,7 @@ impl Provider for BedrockProvider {
         if let Some(tool_config) = tool_config {
             builder = builder.tool_config(tool_config);
         }
-        let response = builder
-            .send()
-            .await
-            .map_err(|error| ProviderError::Protocol(error.to_string()))?;
+        let response = builder.send().await.map_err(bedrock_provider_error)?;
         let mut events = response.stream;
         let mut assembler = BedrockAssembler::default();
         while let Some(event) = events

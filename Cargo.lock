@@ -3205,13 +3205,16 @@ name = "opcos-engine"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "opcos-policy",
  "opcos-provider",
+ "opcos-rvm",
  "opcos-store",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
+ "url",
 ]
 
 [[package]]
