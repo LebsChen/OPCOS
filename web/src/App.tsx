@@ -899,6 +899,7 @@ function ManageSections({
   onRefresh,
   onError,
   onAddHost,
+  onEditHost,
   onTestHost,
   onDeleteHost,
   hostName,
@@ -907,6 +908,8 @@ function ManageSections({
   setHostUrl,
   hostToken,
   setHostToken,
+  editingHostId,
+  setEditingHostId,
 }: {
   tab: SettingsSection;
   hosts: Host[];
@@ -917,6 +920,7 @@ function ManageSections({
   onRefresh: () => void;
   onError: (error: unknown) => void;
   onAddHost: (event: FormEvent) => void;
+  onEditHost: (host: Host) => Promise<void>;
   onTestHost: (hostId: string) => Promise<Host>;
   onDeleteHost: (hostId: string) => Promise<void>;
   hostName: string;
@@ -925,6 +929,8 @@ function ManageSections({
   setHostUrl: (value: string) => void;
   hostToken: string;
   setHostToken: (value: string) => void;
+  editingHostId: string | null;
+  setEditingHostId: (value: string | null) => void;
 }) {
   // Body shell follows OpenWorker SettingsView.tsx:85-123. Asset-specific
   // rows use the existing CollectionPage/manage-row vocabulary because these
@@ -1477,7 +1483,16 @@ function ManageSections({
             onSearch={() => undefined}
             searchPlaceholder={translate("searchHosts")}
             primary={
-              <Button className="primary" onClick={() => setHostFormOpen(true)}>
+              <Button
+                className="primary"
+                onClick={() => {
+                  setEditingHostId(null);
+                  setHostName("");
+                  setHostUrl("");
+                  setHostToken("");
+                  setHostFormOpen(true);
+                }}
+              >
                 Add host
               </Button>
             }
@@ -1502,6 +1517,17 @@ function ManageSections({
                           </span>
                         </small>
                       </span>
+                      {!host.builtin && (
+                        <Button
+                          onClick={() => {
+                            void onEditHost(host)
+                              .then(() => setHostFormOpen(true))
+                              .catch(onError);
+                          }}
+                        >
+                          Edit
+                        </Button>
+                      )}
                       <Button
                         disabled={host.builtin || testingHostId === host.id}
                         onClick={() => {
@@ -1561,12 +1587,28 @@ function ManageSections({
                   <input
                     value={hostToken}
                     onChange={(event) => setHostToken(event.target.value)}
-                    placeholder={translate("Bearer token")}
+                    placeholder={
+                      editingHostId
+                        ? "留空保持原 token"
+                        : translate("Bearer token")
+                    }
                     type="password"
-                    required
+                    required={!editingHostId}
                   />
                   <Button type="submit" className="primary">
-                    Add host
+                    {editingHostId ? "Save" : "Add host"}
+                  </Button>
+                  <Button
+                    type="button"
+                    onClick={() => {
+                      setEditingHostId(null);
+                      setHostName("");
+                      setHostUrl("");
+                      setHostToken("");
+                      setHostFormOpen(false);
+                    }}
+                  >
+                    Cancel
                   </Button>
                 </form>
               ) : undefined
@@ -4255,6 +4297,7 @@ function AppContent() {
   const [hostName, setHostName] = useState("");
   const [hostUrl, setHostUrl] = useState("");
   const [hostToken, setHostToken] = useState("");
+  const [editingHostId, setEditingHostId] = useState<string | null>(null);
   const [assets, setAssets] = useState<Asset[]>([]);
   const [providers, setProviders] = useState<ProviderDescriptor[]>([]);
   const [secrets, setSecrets] = useState<SecretMetadata[]>([]);
@@ -4507,6 +4550,7 @@ function AppContent() {
     event.preventDefault();
     try {
       await command("save_host", {
+        id: editingHostId,
         name: hostName,
         url: hostUrl,
         token: hostToken,
@@ -4515,9 +4559,17 @@ function AppContent() {
       setHostUrl("");
       setHostToken("");
       await refresh();
+      setEditingHostId(null);
     } catch (reason) {
       onError(submitFailureMessage(reason));
     }
+  };
+  const editHost = async (host: Host) => {
+    const url = await command<string>("host_binding", { hostId: host.id });
+    setHostName(host.name);
+    setHostUrl(url);
+    setHostToken("");
+    setEditingHostId(host.id);
   };
   const testHost = async (hostId: string) => {
     try {
@@ -4896,6 +4948,7 @@ function AppContent() {
               onRefresh={() => refresh().catch(onError)}
               onError={onError}
               onAddHost={addHost}
+              onEditHost={editHost}
               onTestHost={testHost}
               onDeleteHost={deleteHost}
               hostName={hostName}
@@ -4904,6 +4957,8 @@ function AppContent() {
               setHostUrl={setHostUrl}
               hostToken={hostToken}
               setHostToken={setHostToken}
+              editingHostId={editingHostId}
+              setEditingHostId={setEditingHostId}
             />
           </SettingsView>
         ) : surface === "automations" ? (

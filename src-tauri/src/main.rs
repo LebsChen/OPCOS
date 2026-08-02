@@ -2403,7 +2403,36 @@ fn save_host(
         .map_err(|error| error.to_string())?
         > 0;
     if exists {
-        return Err("remote host binding already exists and cannot be changed".into());
+        connection
+            .execute("UPDATE hosts SET name=?1 WHERE id=?2", params![name, id])
+            .map_err(|error| error.to_string())?;
+        drop(connection);
+        if !token.is_empty() {
+            state
+                .secrets
+                .set(&secret_key("rvm-token", &id), &token)
+                .map_err(|error| error.to_string())?;
+        }
+        state
+            .secrets
+            .set(&secret_key("rvm-url", &id), &url)
+            .map_err(|error| error.to_string())?;
+        audit(
+            &state,
+            "",
+            "host_updated",
+            json!({"host_id": id, "name": name}),
+        );
+        return Ok(HostView {
+            id,
+            name,
+            builtin: false,
+            online: None,
+            reason: None,
+        });
+    }
+    if token.is_empty() {
+        return Err("remote host token cannot be empty".into());
     }
     connection
         .execute(
@@ -2438,6 +2467,34 @@ fn save_host(
         online: None,
         reason: None,
     })
+}
+
+#[tauri::command]
+fn host_binding(state: State<'_, DesktopState>, host_id: String) -> Result<String, String> {
+    if host_id == "local" {
+        return Err("本机 host 不支持该能力".into());
+    }
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let exists: bool = connection
+        .query_row(
+            "SELECT COUNT(*) FROM hosts WHERE id=?1",
+            [&host_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| error.to_string())?
+        > 0;
+    if !exists {
+        return Err("remote host not found".into());
+    }
+    drop(connection);
+    state
+        .secrets
+        .get(&secret_key("rvm-url", &host_id))
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "remote host URL is missing".into())
 }
 
 #[tauri::command]
@@ -6898,6 +6955,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             list_hosts,
             save_host,
+            host_binding,
             test_host,
             delete_host,
             create_session,
