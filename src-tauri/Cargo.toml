@@ -7,6 +7,7 @@ edition.workspace = true
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
@@ -15,6 +16,8 @@ keyring.workspace = true
 rusqlite.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
+futures-util.workspace = true
+tokio-tungstenite.workspace = true
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 opcos-engine = { path = "../crates/opcos-engine" }
