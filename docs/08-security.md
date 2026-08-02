@@ -77,6 +77,10 @@ Linear P2-4 使用出站 GraphQL + Personal API Key。PAT 只通过 SecretStore
 读取，不进入配置对象、transcript、日志或 UI 事件；Linear webhook 公网入站
 不在本地客户端实现，避免 OAuth/webhook 回调把本机控制面暴露到互联网。
 
+仓库索引只保存路径、大小和符号元数据。索引扫描通过 Host 执行，远程文件不会
+全量复制到本机；忽略 `.git`、`node_modules`、`target` 等目录，并有文件数、
+单文件大小和超时上限。
+
 本地单人使用不需要 RBAC。真要做云端时照 Den［OW文］：
 
 - 三个默认角色 Owner / Admin / Member + 自定义角色；只有 Owner 能改角色。

@@ -49,7 +49,7 @@
 
 - Devin 的 ACU、quota、org billing 不进入 OPCOS 本地模型［Devin文］［推断］。
 - 不把 Python sidecar 或 OpenWorker REST server 引入 OPCOS；分层约束见 [00](00-architecture.md)。
-- 不做没有后端的 Slack/Linear/Jira/Sentry 等假入口。
+- 不做没有后端的 Slack/Jira/Sentry 等假入口；Linear 已有本地 GraphQL + SecretStore 真连接器。
 - 不提供未绑定 host/session 的任意 shell 或 secret 读取 MCP tool［推断］。
 
 ## 10.3 调研产物与规模

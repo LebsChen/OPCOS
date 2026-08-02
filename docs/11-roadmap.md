@@ -123,7 +123,7 @@
 - **P2-4 Linear 真连接器**：直接 GraphQL + SecretStore PAT，支持读 issue、列我的 issue、评论、改状态和从 issue 创建 OPCOS session；写操作经审批，Linear webhook 留给 Cloud B，Slack/Jira/Sentry 保持明确未接入。
 - **P2-3 连接器框架**：适配器接口 + OAuth（手工 token 路径永远保留）+ token 只进 SecretStore。先做一个真集成，不做空壳。
 - **P2-4 插件打包**：`plugin` / `plugin_member`，支持从 GitHub 仓库导入导出；MCP server URL 只能来自插件自己的配置对象。grok-build 参照 marketplace relative path containment、transactional install/update、source/scan 类型边界。［GB码］［推断］
-- **P2-5 仓库索引与语义检索**：`opcos-context`，知识按触发条件注入（对标 Devin DeepWiki）。grok-build 参照先做增量 file-event/index-manager/scope-graph，再做 embedding、query expansion 和 memory archive。［GB码］［推断］
+- **P2-5 仓库索引**：已实现 Host-backed 路径/符号元数据索引与只读检索工具；不做本地 embedding。语义检索与知识按触发条件注入仍是后续工作。grok-build 参照先做增量 file-event/index-manager/scope-graph，再做 embedding、query expansion 和 memory archive。［GB码］［推断］
 
 ## P3 —— OPCOS Cloud（可完全关闭）
 

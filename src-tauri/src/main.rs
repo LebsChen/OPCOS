@@ -52,7 +52,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, RunEvent, State};
@@ -64,6 +64,7 @@ use tokio_tungstenite::accept_async;
 
 const SECRET_SERVICE: &str = "com.opcos.desktop";
 const ASKPASS_SCRIPT: &str = "if (($args -join ' ') -match 'Username') { $env:OPCOS_GIT_USERNAME } else { $env:OPCOS_GIT_PASSWORD }";
+mod repo_index;
 mod scheduler;
 
 fn git_branch_name(slug: &str, timestamp: i64) -> Result<String, String> {
@@ -110,6 +111,7 @@ struct DesktopState {
     surfaces: AsyncMutex<HashMap<u16, tauri::async_runtime::JoinHandle<()>>>,
     ide_proxies: AsyncMutex<HashMap<u16, tauri::async_runtime::JoinHandle<()>>>,
     coordination: AsyncMutex<HashMap<String, CoordinationRuntime>>,
+    index_root: PathBuf,
     mcp: Arc<McpManager<McpCredentialAdapter>>,
 }
 
@@ -151,6 +153,9 @@ struct RemoteExecutor {
     shell: AsyncMutex<PersistentShell<HttpRvmClient>>,
     secrets: KeyringSecretStore,
     mcp: Arc<McpManager<McpCredentialAdapter>>,
+    index_root: PathBuf,
+    host_id: String,
+    workspace: String,
 }
 
 struct LocalExecutor {
@@ -158,11 +163,146 @@ struct LocalExecutor {
     secrets: KeyringSecretStore,
     session_id: String,
     mcp: Arc<McpManager<McpCredentialAdapter>>,
+    index_root: PathBuf,
+    workspace: String,
 }
 
 enum DesktopExecutor {
     Remote(Box<RemoteExecutor>),
     Local(LocalExecutor),
+}
+
+async fn execute_index_tool(
+    root: &FsPath,
+    host_id: &str,
+    workspace: &str,
+    host: &dyn Host,
+    name: &str,
+    arguments: Value,
+) -> Result<Value, String> {
+    let index = repo_index::load(root, host_id, workspace)?.ok_or_else(|| {
+        "repository index is unavailable; run repo_index_refresh first".to_owned()
+    })?;
+    if index.status == "error" {
+        return Err(index
+            .error
+            .unwrap_or_else(|| "repository index is unavailable".into()));
+    }
+    if host_id == "local"
+        && let Ok(result) = host
+            .exec(ExecRequest {
+                command: "git status --porcelain --untracked-files=no".into(),
+                cwd: Some(workspace.to_owned()),
+                timeout_seconds: 5,
+                session: None,
+                env: None,
+            })
+            .await
+        && result.result.exit_code == 0
+        && !result.result.stdout.trim().is_empty()
+    {
+        return Err("repository index is stale; run repo_index_refresh before searching".into());
+    }
+    let limited = |mut results: Vec<Value>| {
+        let omitted = results.len().saturating_sub(repo_index::MAX_RESULTS);
+        results.truncate(repo_index::MAX_RESULTS);
+        json!({"results": results, "omitted": omitted})
+    };
+    let artifact_ref = format!("repo-index://{host_id}/{workspace}");
+    match name {
+        "repo_index_find_symbol" => Ok(json!({
+            "status": index.status,
+            "built_at": index.built_at,
+            "matches": limited(repo_index::find_symbol(&index, host_id, arguments.get("query").and_then(Value::as_str).ok_or("missing query")?)),
+            "artifact_ref": artifact_ref,
+        })),
+        "repo_index_glob" => Ok(json!({
+            "status": index.status,
+            "built_at": index.built_at,
+            "matches": limited(repo_index::glob(&index, arguments.get("pattern").and_then(Value::as_str).ok_or("missing pattern")?)),
+            "artifact_ref": artifact_ref,
+        })),
+        "repo_index_search" => {
+            let query = arguments
+                .get("query")
+                .and_then(Value::as_str)
+                .filter(|query| !query.is_empty())
+                .ok_or("missing query")?;
+            let probe = host
+                .exec(ExecRequest {
+                    command: "command -v rg".into(),
+                    cwd: Some(workspace.to_owned()),
+                    timeout_seconds: 5,
+                    session: None,
+                    env: None,
+                })
+                .await
+                .map_err(|error| format!("repository content search probe failed: {error}"))?;
+            if probe.result.exit_code != 0 {
+                return Err(
+                    "repository content search is unavailable: host is missing ripgrep (rg)".into(),
+                );
+            }
+            let result = host
+                .exec(ExecRequest {
+                    command: "output=$(mktemp /tmp/opcos-index-search.XXXXXX); trap 'rm -f \"$output\"' 0 1 2 3 15; rg -n --fixed-strings --hidden --glob '!.git/**' --glob '!node_modules/**' --glob '!target/**' --glob '!.venv/**' --glob '!dist/**' --glob '!build/**' \"$OPCOS_INDEX_QUERY\" . > \"$output\"; status=$?; if [ \"$status\" -gt 1 ]; then cat \"$output\"; exit \"$status\"; fi; awk 'NR <= 100 { print } END { print \"__OPCOS_TOTAL__\" NR }' \"$output\"".into(),
+                    cwd: Some(workspace.to_owned()),
+                    timeout_seconds: 15,
+                    session: None,
+                    env: Some(json!({"OPCOS_INDEX_QUERY": query})),
+                })
+                .await
+                .map_err(|error| format!("repository content search failed: {error}"))?;
+            if result.result.exit_code != 0 && result.result.exit_code != 1 {
+                return Err(format!(
+                    "repository content search failed: {}",
+                    result.result.stderr.trim()
+                ));
+            }
+            let mut total = 0usize;
+            let matches = result
+                .result
+                .stdout
+                .lines()
+                .filter_map(|line| {
+                    if let Some(value) = line.strip_prefix("__OPCOS_TOTAL__") {
+                        total = value.parse().unwrap_or(0);
+                        return None;
+                    }
+                    let mut parts = line.splitn(3, ':');
+                    let path = parts.next()?.trim_start_matches("./").to_owned();
+                    let line_number = parts.next()?.parse::<u32>().ok()?;
+                    let text = parts.next()?.to_owned();
+                    Some(json!({
+                        "path": path,
+                        "line": line_number,
+                        "text": text,
+                    }))
+                })
+                .collect::<Vec<_>>();
+            let mut matches = matches;
+            for item in &mut matches {
+                if let (Some(path), Some(line)) = (
+                    item.get("path").and_then(Value::as_str),
+                    item.get("line").and_then(Value::as_u64),
+                ) {
+                    item["artifact_ref"] = json!(format!("repo-index://{host_id}/{path}#L{line}"));
+                }
+            }
+            let omitted = total.saturating_sub(matches.len());
+            matches.truncate(repo_index::MAX_RESULTS);
+            Ok(json!({
+                "status": index.status,
+                "built_at": index.built_at,
+                "matches": {"results": matches, "omitted": omitted},
+                "artifact_ref": artifact_ref,
+            }))
+        }
+        _ => {
+            let _ = host;
+            Err(format!("repository index tool is unavailable: {name}"))
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -250,6 +390,22 @@ impl ToolExecutor for RemoteExecutor {
             | "linear_comment_issue"
             | "linear_update_issue_status" => {
                 execute_linear_tool(&self.secrets, name, arguments).await
+            }
+            "repo_index_find_symbol" | "repo_index_glob" | "repo_index_search" => {
+                let host = RvmHost::new(
+                    self.host_id.clone(),
+                    self.workspace.clone(),
+                    self.client.clone(),
+                );
+                execute_index_tool(
+                    &self.index_root,
+                    &self.host_id,
+                    &self.workspace,
+                    &host,
+                    name,
+                    arguments,
+                )
+                .await
             }
             name if name.starts_with("mcp:") => {
                 let tool = name.trim_start_matches("mcp:");
@@ -348,6 +504,17 @@ impl ToolExecutor for DesktopExecutor {
                     "linear_get_issue" | "linear_list_my_issues" | "linear_comment_issue"
                     | "linear_update_issue_status" => {
                         execute_linear_tool(&executor.secrets, name, arguments).await
+                    }
+                    "repo_index_find_symbol" | "repo_index_glob" | "repo_index_search" => {
+                        execute_index_tool(
+                            &executor.index_root,
+                            "local",
+                            &executor.workspace,
+                            &executor.host,
+                            name,
+                            arguments,
+                        )
+                        .await
                     }
                     name if name.starts_with("mcp__") => executor
                         .mcp
@@ -1856,6 +2023,11 @@ async fn engine_for(
             .collect::<Vec<_>>();
         let mut allowed_tools = allowed_tools;
         allowed_tools.extend(["propose_plan".to_owned(), "ask_user".to_owned()]);
+        allowed_tools.extend([
+            "repo_index_find_symbol".to_owned(),
+            "repo_index_glob".to_owned(),
+            "repo_index_search".to_owned(),
+        ]);
         if linear_tools_enabled {
             allowed_tools.extend([
                 "linear_get_issue".to_owned(),
@@ -1871,6 +2043,8 @@ async fn engine_for(
                 secrets: state.secrets.clone(),
                 session_id: session_id.to_owned(),
                 mcp: Arc::clone(&mcp_runtime),
+                index_root: state.index_root.clone(),
+                workspace: workspace.display().to_string(),
             })),
             None,
             Some(allowed_tools),
@@ -1900,6 +2074,9 @@ async fn engine_for(
                 client: executor_client.clone(),
                 secrets: state.secrets.clone(),
                 mcp: Arc::clone(&mcp_runtime),
+                index_root: state.index_root.clone(),
+                host_id: host_id.clone(),
+                workspace: workspace.clone(),
             }))),
             Some(executor_client),
             None,
@@ -3128,6 +3305,93 @@ async fn read_artifact(
         "kind": artifact.kind,
         "mime": artifact.mime,
     }))
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RepoIndexStatus {
+    status: String,
+    built_at: Option<chrono::DateTime<Utc>>,
+    file_count: usize,
+    symbol_count: usize,
+    truncated: bool,
+    reason: Option<String>,
+}
+
+async fn repository_index_host(
+    state: &DesktopState,
+    session_id: &str,
+) -> Result<(Box<dyn Host>, String, String), String> {
+    lifecycle_host(state, session_id).await
+}
+
+#[tauri::command]
+async fn repo_index_status(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<RepoIndexStatus, String> {
+    let (host, host_id, workspace) = repository_index_host(&state, &session_id).await?;
+    let Some(mut index) = repo_index::load(&state.index_root, &host_id, &workspace)? else {
+        return Ok(RepoIndexStatus {
+            status: "not_built".into(),
+            built_at: None,
+            file_count: 0,
+            symbol_count: 0,
+            truncated: false,
+            reason: Some("Repository index has not been built.".into()),
+        });
+    };
+    if host_id == "local"
+        && let Ok(result) = host
+            .exec(ExecRequest {
+                command: "git status --porcelain --untracked-files=no".into(),
+                cwd: Some(workspace.clone()),
+                timeout_seconds: 5,
+                session: None,
+                env: None,
+            })
+            .await
+        && result.result.exit_code == 0
+        && !result.result.stdout.trim().is_empty()
+    {
+        index.status = "stale".into();
+    }
+    Ok(RepoIndexStatus {
+        status: index.status,
+        built_at: Some(index.built_at),
+        file_count: index.files.len(),
+        symbol_count: index.symbols.len(),
+        truncated: index.truncated,
+        reason: index.error,
+    })
+}
+
+#[tauri::command]
+async fn repo_index_refresh(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<RepoIndexStatus, String> {
+    let (host, host_id, workspace) = repository_index_host(&state, &session_id).await?;
+    let index = repo_index::build(&state.index_root, &host_id, &workspace, host.as_ref()).await?;
+    audit(
+        &state,
+        &session_id,
+        "repository_index_refreshed",
+        json!({
+            "host_id": host_id,
+            "workspace": workspace,
+            "file_count": index.files.len(),
+            "symbol_count": index.symbols.len(),
+            "truncated": index.truncated,
+        }),
+    );
+    Ok(RepoIndexStatus {
+        status: index.status,
+        built_at: Some(index.built_at),
+        file_count: index.files.len(),
+        symbol_count: index.symbols.len(),
+        truncated: index.truncated,
+        reason: index.error,
+    })
 }
 
 #[tauri::command]
@@ -6560,6 +6824,12 @@ fn main() {
                 surfaces: AsyncMutex::new(HashMap::new()),
                 ide_proxies: AsyncMutex::new(HashMap::new()),
                 coordination: AsyncMutex::new(HashMap::new()),
+                index_root: {
+                    let mut root = path.clone();
+                    root.set_file_name("repository-indexes");
+                    std::fs::create_dir_all(&root).map_err(tauri::Error::from)?;
+                    root
+                },
                 trigger_http_token: trigger_http_token.clone(),
                 trigger_http_port,
                 trigger_watcher_reload: Mutex::new(None),
@@ -6633,6 +6903,8 @@ fn main() {
             submit_turn,
             list_artifacts,
             read_artifact,
+            repo_index_status,
+            repo_index_refresh,
             upload_text_attachment,
             interrupt,
             steering,
