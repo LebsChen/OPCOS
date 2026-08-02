@@ -119,6 +119,7 @@
   - 已否决 `/api/expose-port` + cloudflared：公网暴露 agent 控制面会引入 URL 泄露、隧道生命周期和 cloudflared 可用性风险；目标方案为 Host 上的 `curl`（普通请求走 `Host::exec`，SSE 走 `Host::spawn`）；
   - 必须完整接入 Inbox、审批、二维状态、审计、产物登记和中断恢复后，才提供 OpenCode 入口。
 - **P2-2 自动化三类触发**：定时（已有）+ 出站事件轮询（GitHub / Linear / Sentry）+ webhook（需 relay，见 P3）。payload 以结构化 event context 传入，不压成一句 prompt。
+- **P2-3 本地事件触发**：cron、手动 macro、回环 HTTP callback 和本机 `notify` 文件变化统一落在 `trigger` 配置对象；同一 trigger 单飞，运行中重复触发跳过并审计。远程 Host 没有文件事件通道时明确不可用，不轮询凑行为；公网 webhook 留给 Cloud B relay。
 - **P2-3 连接器框架**：适配器接口 + OAuth（手工 token 路径永远保留）+ token 只进 SecretStore。先做一个真集成，不做空壳。
 - **P2-4 插件打包**：`plugin` / `plugin_member`，支持从 GitHub 仓库导入导出；MCP server URL 只能来自插件自己的配置对象。grok-build 参照 marketplace relative path containment、transactional install/update、source/scan 类型边界。［GB码］［推断］
 - **P2-5 仓库索引与语义检索**：`opcos-context`，知识按触发条件注入（对标 Devin DeepWiki）。grok-build 参照先做增量 file-event/index-manager/scope-graph，再做 embedding、query expansion 和 memory archive。［GB码］［推断］
