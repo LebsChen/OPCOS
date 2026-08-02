@@ -58,11 +58,12 @@ pub fn descriptors() -> Vec<ProviderDescriptor> {
             "ANTHROPIC_API_KEY",
             false,
         ),
-        unavailable_descriptor(
+        descriptor(
             "gemini",
             "Gemini (Google)",
+            "https://generativelanguage.googleapis.com/v1beta/openai/",
             "GEMINI_API_KEY",
-            Some("gemini-3.6-flash"),
+            true,
         ),
         ProviderDescriptor {
             name: "bedrock".into(),
@@ -87,36 +88,47 @@ pub fn descriptors() -> Vec<ProviderDescriptor> {
             "DEEPSEEK_API_KEY",
             true,
         ),
-        unavailable_descriptor(
+        descriptor(
             "kimi",
             "Kimi (Moonshot AI)",
+            "https://api.moonshot.cn/v1",
             "MOONSHOT_API_KEY",
-            Some("kimi-k2.6"),
+            true,
         ),
-        unavailable_descriptor(
+        descriptor(
             "minimax",
             "MiniMax",
+            "https://api.minimax.io/v1",
             "MINIMAX_API_KEY",
-            Some("MiniMax-M2.5"),
+            true,
         ),
-        unavailable_descriptor(
+        descriptor(
             "qwen",
             "Qwen (Alibaba)",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
             "DASHSCOPE_API_KEY",
-            Some("qwen3-max"),
+            true,
         ),
-        unavailable_descriptor("xai", "xAI (Grok)", "XAI_API_KEY", Some("grok-4.3")),
-        unavailable_descriptor(
+        descriptor(
+            "xai",
+            "xAI (Grok)",
+            "https://api.x.ai/v1",
+            "XAI_API_KEY",
+            true,
+        ),
+        descriptor(
             "mistral",
             "Mistral",
+            "https://api.mistral.ai/v1",
             "MISTRAL_API_KEY",
-            Some("mistral-large-latest"),
+            true,
         ),
-        unavailable_descriptor(
+        descriptor(
             "meta",
             "Meta (Muse Spark)",
+            "https://api.meta.ai/v1",
             "META_API_KEY",
-            Some("muse-spark-1.1"),
+            true,
         ),
         descriptor(
             "together",
@@ -125,17 +137,19 @@ pub fn descriptors() -> Vec<ProviderDescriptor> {
             "TOGETHER_API_KEY",
             true,
         ),
-        unavailable_descriptor(
+        descriptor(
             "fireworks",
             "Fireworks AI",
+            "https://api.fireworks.ai/inference/v1",
             "FIREWORKS_API_KEY",
-            Some("accounts/fireworks/models/glm-5p2"),
+            true,
         ),
-        unavailable_descriptor(
+        descriptor(
             "openrouter",
             "OpenRouter",
+            "https://openrouter.ai/api/v1",
             "OPENROUTER_API_KEY",
-            Some("z-ai/glm-5.2"),
+            true,
         ),
         ProviderDescriptor {
             name: "vertex".into(),
@@ -157,13 +171,15 @@ pub fn descriptors() -> Vec<ProviderDescriptor> {
         ProviderDescriptor {
             name: "ollama".into(),
             title: "Ollama (local models)".into(),
-            available: false,
+            available: true,
             needs_key: false,
-            default_base_url: Some("http://localhost:11434".into()),
+            default_base_url: Some("http://localhost:11434/v1".into()),
             fields: vec![field("base_url", "Ollama server URL", false, false)],
-            recommended_model: Some("qwen3-coder:30b".into()),
+            recommended_model: matrix::models_for_provider("ollama")
+                .first()
+                .map(|entry| matrix::canonical_model_id("ollama", entry.id)),
             env_key: None,
-            openai_compatible: false,
+            openai_compatible: true,
         },
     ]
 }
@@ -198,25 +214,6 @@ fn descriptor(
             .map(|entry| matrix::canonical_model_id(name, entry.id)),
         env_key: (!env.is_empty()).then_some(env.into()),
         openai_compatible: compatible,
-    }
-}
-
-fn unavailable_descriptor(
-    name: &str,
-    title: &str,
-    env: &str,
-    recommended_model: Option<&str>,
-) -> ProviderDescriptor {
-    ProviderDescriptor {
-        name: name.into(),
-        title: title.into(),
-        available: false,
-        needs_key: !env.is_empty(),
-        default_base_url: None,
-        fields: vec![field("api_key", "API key", true, !env.is_empty())],
-        recommended_model: recommended_model.map(str::to_owned),
-        env_key: (!env.is_empty()).then_some(env.into()),
-        openai_compatible: false,
     }
 }
 
@@ -340,6 +337,60 @@ pub fn capabilities(model: &str) -> Caps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compatible_provider_directory_has_official_defaults() {
+        let expected = [
+            (
+                "gemini",
+                "https://generativelanguage.googleapis.com/v1beta/openai/",
+            ),
+            ("kimi", "https://api.moonshot.cn/v1"),
+            ("minimax", "https://api.minimax.io/v1"),
+            ("qwen", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            ("xai", "https://api.x.ai/v1"),
+            ("mistral", "https://api.mistral.ai/v1"),
+            ("meta", "https://api.meta.ai/v1"),
+            ("fireworks", "https://api.fireworks.ai/inference/v1"),
+            ("openrouter", "https://openrouter.ai/api/v1"),
+        ];
+        let descriptors = descriptors();
+        for (name, base_url) in expected {
+            let descriptor = descriptors
+                .iter()
+                .find(|descriptor| descriptor.name == name)
+                .expect("provider should be registered");
+            assert!(descriptor.available, "{name} should be available");
+            assert!(
+                descriptor.openai_compatible,
+                "{name} should use OpenAI compatibility"
+            );
+            assert_eq!(descriptor.default_base_url.as_deref(), Some(base_url));
+            assert!(descriptor.needs_key, "{name} should require an API key");
+        }
+    }
+
+    #[test]
+    fn ollama_is_available_without_a_key_and_vertex_stays_unavailable() {
+        let descriptors = descriptors();
+        let ollama = descriptors
+            .iter()
+            .find(|descriptor| descriptor.name == "ollama")
+            .expect("Ollama should be registered");
+        assert!(ollama.available);
+        assert!(ollama.openai_compatible);
+        assert!(!ollama.needs_key);
+        assert_eq!(
+            ollama.default_base_url.as_deref(),
+            Some("http://localhost:11434/v1")
+        );
+
+        let vertex = descriptors
+            .iter()
+            .find(|descriptor| descriptor.name == "vertex")
+            .expect("Vertex should be registered");
+        assert!(!vertex.available);
+    }
 
     #[test]
     fn detects_keys_without_logging_them() {

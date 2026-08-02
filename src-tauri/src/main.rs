@@ -2191,13 +2191,19 @@ async fn engine_for(
             Box::new(AnthropicProvider::new(ProviderConfig::new(base_url, key)))
         }
         _name if descriptor.openai_compatible => {
-            let key = state
+            let stored_key = state
                 .secrets
                 .get(&secret_key("provider-key", &provider_id))
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| {
-                    "provider key is not configured; open Provider settings first".to_owned()
-                })?;
+                .map_err(|error| error.to_string())?;
+            let key = match stored_key {
+                Some(key) => key,
+                None if descriptor.needs_key => {
+                    return Err(
+                        "provider key is not configured; open Provider settings first".to_owned(),
+                    );
+                }
+                None => String::new(),
+            };
             Box::new(OpenAiProvider::new(ProviderConfig::new(base_url, key)))
         }
         name => return Err(format!("provider {name} is not supported for sessions")),
@@ -6828,7 +6834,8 @@ fn provider_configurations(state: State<'_, DesktopState>) -> Result<Vec<Value>,
                 .secrets
                 .get(&key_name)
                 .map_err(|error| error.to_string())?
-                .is_some();
+                .is_some()
+                || descriptor.name == "ollama";
             let key = format!("provider.base_url.{}", descriptor.name);
             let base_url = connection
                 .query_row("SELECT value FROM settings WHERE key=?1", [&key], |row| {
@@ -6893,15 +6900,17 @@ async fn validate_provider_key(
     state: State<'_, DesktopState>,
     provider: String,
 ) -> Result<bool, String> {
-    let key = state
-        .secrets
-        .get(&secret_key("provider-key", &provider))
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "provider key is not configured".to_owned())?;
     let descriptor = registry::descriptors()
         .into_iter()
         .find(|item| item.name == provider)
         .ok_or_else(|| "unknown provider".to_owned())?;
+    let key = state
+        .secrets
+        .get(&secret_key("provider-key", &provider))
+        .map_err(|error| error.to_string())?;
+    if descriptor.needs_key && key.is_none() {
+        return Err("provider key is not configured".to_owned());
+    }
     if provider == "bedrock" || descriptor.default_base_url.is_none() {
         return Ok(true);
     }
@@ -6928,11 +6937,15 @@ async fn validate_provider_key(
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let client = reqwest::Client::new();
     let request = if provider == "anthropic" {
-        client.get(url).header("x-api-key", key)
-    } else {
+        client
+            .get(url)
+            .header("x-api-key", key.as_deref().unwrap_or_default())
+    } else if let Some(key) = key {
         client
             .get(url)
             .header("Authorization", format!("Bearer {key}"))
+    } else {
+        client.get(url)
     };
     let response = request
         .send()

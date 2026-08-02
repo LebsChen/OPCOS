@@ -216,10 +216,12 @@ pub(crate) fn apply_bearer_headers(
     mut request: reqwest::RequestBuilder,
     config: &ProviderConfig,
 ) -> reqwest::RequestBuilder {
-    request = request.header(
-        header::AUTHORIZATION,
-        format!("Bearer {}", config.api_key.expose()),
-    );
+    if !config.api_key.expose().is_empty() {
+        request = request.header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", config.api_key.expose()),
+        );
+    }
     for (name, value) in &config.headers {
         request = request.header(name, value);
     }
@@ -291,5 +293,32 @@ mod tests {
             ..Default::default()
         };
         assert!(turn.extras.is_null());
+    }
+
+    #[test]
+    fn empty_api_key_does_not_add_authorization_header() {
+        let config = ProviderConfig::new("http://localhost:11434/v1", "");
+        let request = apply_bearer_headers(
+            Client::new().post("http://localhost:11434/v1/chat/completions"),
+            &config,
+        )
+        .build()
+        .expect("request should build");
+        assert!(request.headers().get(header::AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn nonempty_api_key_adds_bearer_authorization_header() {
+        let config = ProviderConfig::new("https://example.test/v1", "test-key");
+        let request = apply_bearer_headers(
+            Client::new().post("https://example.test/v1/chat/completions"),
+            &config,
+        )
+        .build()
+        .expect("request should build");
+        assert_eq!(
+            request.headers().get(header::AUTHORIZATION).unwrap(),
+            "Bearer test-key"
+        );
     }
 }

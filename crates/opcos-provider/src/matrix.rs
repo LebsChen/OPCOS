@@ -344,6 +344,12 @@ pub const MATRIX: &[ModelEntry] = &[
         },
     },
     ModelEntry {
+        id: "ollama:qwen3-coder:30b",
+        provider: "ollama",
+        label: "Qwen3 Coder 30B · Ollama",
+        capabilities: DEFAULT_CAPS,
+    },
+    ModelEntry {
         id: "bedrock:claude/anthropic.claude-sonnet-4-6-v1:0",
         provider: "bedrock",
         label: "Claude Sonnet 4.6 · AWS Bedrock",
