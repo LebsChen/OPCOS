@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-pub use opcos_rvm::DEFAULT_EXEC_TIMEOUT_SECONDS;
 use opcos_rvm::{
     Capabilities as RvmCapabilities, CommandResult, DirectoryListing, ExecRequest, ExecResult,
     FileContent, Health, HttpRvmClient, RvmClient, RvmError,
 };
+pub use opcos_rvm::{DEFAULT_EXEC_TIMEOUT_SECONDS, LIFECYCLE_EXEC_TIMEOUT_SECONDS};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -64,6 +64,88 @@ pub trait Host: Send + Sync {
     async fn ls(&self, path: Option<&str>) -> Result<DirectoryListing, HostError>;
     fn join(&self, child: &str) -> Result<String, HostError>;
     fn contains(&self, candidate: &str) -> bool;
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum LifecycleStage {
+    Clone,
+    Initialize,
+    Maintenance,
+    PostBuild,
+    PrePush,
+}
+
+impl LifecycleStage {
+    pub fn is_soft_failure(self) -> bool {
+        matches!(self, Self::Maintenance)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LifecycleCommandResult {
+    pub stage: LifecycleStage,
+    pub index: usize,
+    pub command: String,
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub timed_out: bool,
+    pub continued: bool,
+    pub elapsed_ms: u128,
+}
+
+pub async fn execute_lifecycle_stage(
+    host: &dyn Host,
+    stage: LifecycleStage,
+    cwd: Option<String>,
+    commands: impl IntoIterator<Item = String>,
+) -> Result<Vec<LifecycleCommandResult>, HostError> {
+    let soft_failure = stage.is_soft_failure();
+    let mut results = Vec::new();
+    for (index, command) in commands.into_iter().enumerate() {
+        let started = std::time::Instant::now();
+        let (exit_code, stdout, stderr, timed_out) = match host
+            .exec(ExecRequest {
+                command: command.clone(),
+                cwd: cwd.clone(),
+                timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+                session: None,
+                env: None,
+            })
+            .await
+        {
+            Ok(result) => (
+                result.result.exit_code,
+                result.result.stdout,
+                result.result.stderr,
+                result.result.timed_out,
+            ),
+            Err(error) => (
+                -1,
+                String::new(),
+                error.to_string(),
+                matches!(error, HostError::Timeout),
+            ),
+        };
+        let failed = timed_out || exit_code != 0;
+        let continued = failed && soft_failure;
+        results.push(LifecycleCommandResult {
+            stage,
+            index,
+            command,
+            exit_code,
+            stdout,
+            stderr,
+            timed_out,
+            continued,
+            elapsed_ms: started.elapsed().as_millis(),
+        });
+        if failed && !soft_failure {
+            break;
+        }
+    }
+    Ok(results)
 }
 
 #[derive(Clone)]
@@ -942,6 +1024,43 @@ mod tests {
         let host = LocalHost::new(&root).unwrap();
         assert!(!host.contains("../outside"));
         assert!(host.join("../outside").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn maintenance_failure_continues_to_next_command() {
+        let root = tempfile_dir();
+        let host = LocalHost::new(&root).unwrap();
+        let results = execute_lifecycle_stage(
+            &host,
+            LifecycleStage::Maintenance,
+            None,
+            vec![shell_failure_command(), shell_output_command("continued")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].exit_code, 7);
+        assert!(results[0].continued);
+        assert_eq!(results[1].stdout, "continued");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pre_push_failure_stops_before_following_command() {
+        let root = tempfile_dir();
+        let host = LocalHost::new(&root).unwrap();
+        let results = execute_lifecycle_stage(
+            &host,
+            LifecycleStage::PrePush,
+            None,
+            vec![shell_failure_command(), shell_output_command("blocked")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].exit_code, 7);
+        assert!(!results[0].continued);
         fs::remove_dir_all(root).unwrap();
     }
 

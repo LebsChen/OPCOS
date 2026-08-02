@@ -66,6 +66,12 @@
 
 - 做：按 [07](07-automation.md) 7.3 实现五个阶段与各自失败语义；补 `pre-push` 门禁（硬失败阻止 push）。
 - 验收：故意让 `pre-push` 失败 → push 被阻止并显示失败命令与退出码；`maintenance` 失败不阻断。
+- 阶段统一走 `Host` trait，local/remote 使用相同执行器；
+- `clone` / `initialize` / `post-build` / `pre-push` 首个失败立即终止；
+- `maintenance` 失败记录后继续后续命令；
+- `initialize` / `post-build` 失败不留下成功缓存或可复用快照标记；
+- 阶段开始、结束、失败以及每条命令的退出码和耗时写入 `audit_events`。
+- 环境复用机制引入后，再补充 initialize 成功缓存、post-build 快照与环境就绪标记；当前没有缓存可失效。
 
 ### P1-4 Inbox 与无人值守
 

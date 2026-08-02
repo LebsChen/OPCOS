@@ -51,11 +51,19 @@ pub struct SkillEntry {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Blueprint {
     #[serde(default)]
+    pub clone: Vec<String>,
+    #[serde(default)]
     pub initialize: Vec<String>,
     #[serde(default, alias = "install")]
     pub dependencies: Vec<String>,
     #[serde(default)]
     pub build: Vec<String>,
+    #[serde(default, alias = "post-build")]
+    pub post_build: Vec<String>,
+    #[serde(default)]
+    pub maintenance: Vec<String>,
+    #[serde(default, alias = "pre-push")]
+    pub pre_push: Vec<String>,
 }
 
 pub fn parse_blueprint(yaml: &str) -> Result<Blueprint, AssetError> {

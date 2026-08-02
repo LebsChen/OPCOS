@@ -66,3 +66,20 @@ OPCOS 已有 Blueprint（`read_blueprint` / `execute_blueprint` / `run_blueprint
 ## 7.4 自动化的执行绑定
 
 一条自动化必须显式绑定：**host + 仓库 + 模型/provider + 触发器 + 指令（或运行手册）**。缺任何一项就不允许保存——参照系统里最常见的用户困惑就是「自动化跑了，但不知道跑在哪台机器上、用的哪个模型」。
+
+P1-3 将五个阶段统一为 Host-backed lifecycle executor：
+
+```text
+clone → initialize → maintenance → post-build → pre-push
+```
+
+阶段命令在绑定的 `Host` 上执行，本机和远端使用同一条执行路径，不会因为远端失败而静默回落本机。每条命令使用共享执行超时；Host 超时路径负责 kill + wait，避免遗留子进程。
+
+- `clone`、`initialize`、`post-build`、`pre-push` 是硬失败；
+- `maintenance` 是软失败，失败命令会审计并继续执行后续命令；
+- `post-build` 失败不生成可复用快照或环境就绪标记；当前 OPCOS 尚无环境复用/快照机制，因此暂无缓存可失效；
+- `initialize` 失败不缓存结果，下次仍重新执行；当前 OPCOS 尚无环境就绪缓存，因此该语义待环境复用机制引入后生效；
+- `pre-push` 按顺序执行，首条非零命令立即阻止 push；
+- 阶段开始、命令结束/失败、阶段结束/失败均写入 `audit_events`；
+- audit/transcript/UI 输出沿用现有脱敏出口；
+- pre-push 错误包含失败命令原文与退出码，UI 复用现有 row/card 和错误展示。

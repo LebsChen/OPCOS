@@ -309,6 +309,7 @@ pub struct WsParams {
 pub type RvmWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 pub const DEFAULT_EXEC_TIMEOUT_SECONDS: u64 = 30;
+pub const LIFECYCLE_EXEC_TIMEOUT_SECONDS: u64 = 30 * 60;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PtyResize {

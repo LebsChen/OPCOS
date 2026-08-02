@@ -627,6 +627,7 @@ function GitActions({
   const [value, setValue] = useState("");
   const [repo, setRepo] = useState("");
   const [pr, setPr] = useState("");
+  const [lifecycleResult, setLifecycleResult] = useState<unknown>(null);
   return (
     <div className="git-actions">
       <h3>{translate("Git workflow")}</h3>
@@ -655,11 +656,18 @@ function GitActions({
                 ? value.split(",").map((item) => item.trim())
                 : null,
             message: operation === "commit" ? value : null,
-          }).catch(onError)
+          })
+            .then(setLifecycleResult)
+            .catch(onError)
         }
       >
         Run {operation}
       </Button>
+      {lifecycleResult ? (
+        <pre className="code-block">
+          {JSON.stringify(lifecycleResult, null, 2)}
+        </pre>
+      ) : null}
       <details>
         <summary>{translate("Create GitHub PR")}</summary>
         <input
@@ -675,6 +683,7 @@ function GitActions({
         <Button
           onClick={() =>
             command("github_pull_request", {
+              sessionId: selected.id,
               repo,
               title: pr,
               head: "HEAD",
@@ -2018,7 +2027,11 @@ function ManageSections({
                   command("execute_blueprint", {
                     sessionId: selected.id,
                     command: blueprintCommand,
-                  }).catch(onError)
+                  })
+                    .then((result) =>
+                      setBlueprint(result as Record<string, unknown>),
+                    )
+                    .catch(onError)
                 }
               >
                 Execute
@@ -2027,9 +2040,11 @@ function ManageSections({
                 disabled={!selected}
                 onClick={() =>
                   selected &&
-                  command("run_blueprint", { sessionId: selected.id }).catch(
-                    onError,
-                  )
+                  command<Record<string, unknown>>("run_blueprint", {
+                    sessionId: selected.id,
+                  })
+                    .then(setBlueprint)
+                    .catch(onError)
                 }
               >
                 Run blueprint
