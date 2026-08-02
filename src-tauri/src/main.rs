@@ -19,7 +19,11 @@ use opcos_assets::{
     AssetBundle, InstructionSource, KnowledgeEntry, Playbook, SkillEntry,
     discover as discover_assets, parse_blueprint,
 };
-use opcos_engine::{AgentEngine, EngineError, ToolExecutor, TurnEngine};
+use opcos_engine::{
+    AgentEngine, EngineError, ToolExecutor, TurnEngine,
+    orchestration::{BoardPhase, BoardTask},
+    orchestration::{CoordinationRuntime, Envelope, Role},
+};
 use opcos_policy::PermissionMode;
 use opcos_provider::ProviderConfig;
 use opcos_provider::openai::OpenAiProvider;
@@ -80,6 +84,7 @@ struct DesktopState {
     engines: AsyncMutex<HashMap<String, Arc<GuiEngine>>>,
     surfaces: AsyncMutex<HashMap<u16, tauri::async_runtime::JoinHandle<()>>>,
     ide_proxies: AsyncMutex<HashMap<u16, tauri::async_runtime::JoinHandle<()>>>,
+    coordination: AsyncMutex<HashMap<String, CoordinationRuntime>>,
 }
 
 type GuiEngine = TurnEngine<OpenAiProvider, SqliteStore, RemoteExecutor>;
@@ -314,6 +319,18 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                enabled INTEGER NOT NULL,
                last_run TEXT,
                last_result TEXT
+             );
+             CREATE TABLE IF NOT EXISTS coord_tasks (
+               id TEXT PRIMARY KEY,
+               title TEXT NOT NULL,
+               phase TEXT NOT NULL,
+               assignee TEXT,
+               lease_generation INTEGER NOT NULL,
+               lease_until TEXT,
+               require_acceptance INTEGER NOT NULL,
+               verified_pr_url TEXT,
+               branch TEXT,
+               pr TEXT
              );",
         )
         .map_err(|error| error.to_string())?;
@@ -1863,6 +1880,243 @@ struct ScheduleInput {
     enabled: bool,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct CoordinationStartInput {
+    task_id: String,
+    roles: Vec<Role>,
+}
+
+#[tauri::command]
+async fn coordination_start(
+    state: State<'_, DesktopState>,
+    input: CoordinationStartInput,
+) -> Result<Value, String> {
+    let runtime = CoordinationRuntime::new(input.roles).map_err(|error| error.to_string())?;
+    state
+        .coordination
+        .lock()
+        .await
+        .insert(input.task_id.clone(), runtime);
+    Ok(json!({"task_id":input.task_id,"started":true}))
+}
+
+#[tauri::command]
+async fn coordination_message(
+    state: State<'_, DesktopState>,
+    task_id: String,
+    envelope: Value,
+) -> Result<Value, String> {
+    let envelope: Envelope = serde_json::from_value(envelope)
+        .map_err(|_| "malformed coordination envelope".to_owned())?;
+    let mut runtimes = state.coordination.lock().await;
+    let runtime = runtimes
+        .get_mut(&task_id)
+        .ok_or_else(|| "coordination task is not started".to_owned())?;
+    runtime
+        .validate_and_record(&envelope, Utc::now())
+        .map_err(|error| error.to_string())?;
+    Ok(json!({"accepted":true,"msg_id":envelope.msg_id}))
+}
+
+#[tauri::command]
+async fn coordination_set_role_state(
+    state: State<'_, DesktopState>,
+    task_id: String,
+    role_id: String,
+    state_name: String,
+) -> Result<Value, String> {
+    let role_state = match state_name.as_str() {
+        "active" => opcos_engine::orchestration::RoleState::Active,
+        "sleep" => opcos_engine::orchestration::RoleState::Sleep,
+        "paused" => opcos_engine::orchestration::RoleState::Paused,
+        _ => return Err("invalid role state".into()),
+    };
+    let mut runtimes = state.coordination.lock().await;
+    let runtime = runtimes
+        .get_mut(&task_id)
+        .ok_or_else(|| "coordination task is not started".to_owned())?;
+    runtime
+        .set_role_state(&role_id, role_state)
+        .map_err(|error| error.to_string())?;
+    Ok(json!({"task_id":task_id,"role_id":role_id,"state":state_name}))
+}
+
+#[tauri::command]
+async fn coordination_snapshot(
+    state: State<'_, DesktopState>,
+    task_id: String,
+) -> Result<Value, String> {
+    let runtimes = state.coordination.lock().await;
+    let runtime = runtimes
+        .get(&task_id)
+        .ok_or_else(|| "coordination task is not started".to_owned())?;
+    let roles = runtime.roles();
+    let messages = runtime.messages();
+    let tasks = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let mut statement = connection
+            .prepare("SELECT id FROM coord_tasks ORDER BY id")
+            .map_err(|error| error.to_string())?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        ids.into_iter()
+            .filter_map(|id| load_coord_task(&connection, &id).ok())
+            .collect::<Vec<_>>()
+    };
+    Ok(json!({"task_id":task_id,"roles":roles,"tasks":tasks,"messages":messages}))
+}
+
+fn load_coord_task(connection: &Connection, id: &str) -> Result<BoardTask, String> {
+    connection
+        .query_row(
+            "SELECT id,title,phase,assignee,lease_generation,lease_until,require_acceptance,verified_pr_url,branch,pr FROM coord_tasks WHERE id=?1",
+            [id],
+            |row| {
+                let phase: String = row.get(2)?;
+                let lease_until: Option<String> = row.get(5)?;
+                Ok(BoardTask {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    phase: serde_json::from_str(&format!("\"{phase}\""))
+                        .unwrap_or(BoardPhase::Open),
+                    assignee: row.get(3)?,
+                    lease_generation: row.get::<_, i64>(4)? as u64,
+                    lease_until: lease_until.and_then(|value| value.parse().ok()),
+                    require_acceptance: row.get::<_, i64>(6)? != 0,
+                    verified_pr_url: row.get(7)?,
+                    branch: row.get(8)?,
+                    pr: row.get(9)?,
+                })
+            },
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn save_coord_task(connection: &Connection, task: &BoardTask) -> Result<(), String> {
+    let phase = serde_json::to_string(&task.phase)
+        .map_err(|error| error.to_string())?
+        .trim_matches('"')
+        .to_owned();
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO coord_tasks(id,title,phase,assignee,lease_generation,lease_until,require_acceptance,verified_pr_url,branch,pr) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                task.id,
+                task.title,
+                phase,
+                task.assignee,
+                task.lease_generation as i64,
+                task.lease_until.map(|value| value.to_rfc3339()),
+                i64::from(task.require_acceptance),
+                task.verified_pr_url,
+                task.branch,
+                task.pr,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn coordination_create_task(
+    state: State<'_, DesktopState>,
+    id: String,
+    title: String,
+    require_acceptance: bool,
+    branch: Option<String>,
+    pr: Option<String>,
+) -> Result<Value, String> {
+    let task = BoardTask {
+        id,
+        title,
+        phase: BoardPhase::Open,
+        assignee: None,
+        lease_generation: 0,
+        lease_until: None,
+        require_acceptance,
+        verified_pr_url: None,
+        branch,
+        pr,
+    };
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    save_coord_task(&connection, &task)?;
+    serde_json::to_value(task).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn coordination_claim_task(
+    state: State<'_, DesktopState>,
+    id: String,
+    worker: String,
+) -> Result<Value, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let mut task = load_coord_task(&connection, &id)?;
+    task.claim(&worker, Utc::now())
+        .map_err(|error| error.to_string())?;
+    save_coord_task(&connection, &task)?;
+    serde_json::to_value(task).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn coordination_renew_task(
+    state: State<'_, DesktopState>,
+    id: String,
+    worker: String,
+    lease_generation: u64,
+) -> Result<Value, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let mut task = load_coord_task(&connection, &id)?;
+    task.renew(&worker, lease_generation, Utc::now())
+        .map_err(|error| error.to_string())?;
+    save_coord_task(&connection, &task)?;
+    serde_json::to_value(task).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn coordination_complete_task(
+    state: State<'_, DesktopState>,
+    id: String,
+    worker: String,
+    verified_pr_url: Option<String>,
+) -> Result<Value, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let mut task = load_coord_task(&connection, &id)?;
+    task.complete(&worker, Utc::now(), verified_pr_url)
+        .map_err(|error| error.to_string())?;
+    save_coord_task(&connection, &task)?;
+    serde_json::to_value(task).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn coordination_accept_task(state: State<'_, DesktopState>, id: String) -> Result<Value, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let mut task = load_coord_task(&connection, &id)?;
+    task.accept().map_err(|error| error.to_string())?;
+    save_coord_task(&connection, &task)?;
+    serde_json::to_value(task).map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 fn save_schedule(state: State<'_, DesktopState>, schedule: ScheduleInput) -> Result<Value, String> {
     let id = schedule.id.unwrap_or_else(|| {
@@ -2220,6 +2474,7 @@ fn main() {
                 engines: AsyncMutex::new(HashMap::new()),
                 surfaces: AsyncMutex::new(HashMap::new()),
                 ide_proxies: AsyncMutex::new(HashMap::new()),
+                coordination: AsyncMutex::new(HashMap::new()),
             });
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -2301,6 +2556,15 @@ fn main() {
             save_schedule,
             list_schedules,
             run_schedule,
+            coordination_start,
+            coordination_message,
+            coordination_set_role_state,
+            coordination_snapshot,
+            coordination_create_task,
+            coordination_claim_task,
+            coordination_renew_task,
+            coordination_complete_task,
+            coordination_accept_task,
             save_secret_metadata,
             list_secret_metadata,
             provider_settings,
