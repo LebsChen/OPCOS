@@ -6811,8 +6811,6 @@ fn main() {
             trigger_listener
                 .set_nonblocking(true)
                 .map_err(tauri::Error::from)?;
-            let trigger_listener =
-                TcpListener::from_std(trigger_listener).map_err(tauri::Error::from)?;
             app.manage(DesktopState {
                 database: Mutex::new(database),
                 secrets,
@@ -6839,6 +6837,13 @@ fn main() {
             let handle = app.handle().clone();
             let trigger_handle = handle.clone();
             tauri::async_runtime::spawn(async move {
+                let trigger_listener = match TcpListener::from_std(trigger_listener) {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        eprintln!("failed to register trigger listener: {error}");
+                        return;
+                    }
+                };
                 serve_trigger_callback(trigger_listener, trigger_handle, trigger_http_token).await;
             });
             start_filesystem_triggers(app.handle().clone());
