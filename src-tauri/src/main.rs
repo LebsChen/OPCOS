@@ -4327,7 +4327,7 @@ fn provider_models(provider: String) -> Vec<ModelDescriptor> {
     opcos_provider::matrix::models_for_provider(&provider)
         .into_iter()
         .map(|model| ModelDescriptor {
-            id: model.id.into(),
+            id: opcos_provider::matrix::canonical_model_id(model.provider, model.id),
             label: model.label.into(),
             provider: model.provider.into(),
         })

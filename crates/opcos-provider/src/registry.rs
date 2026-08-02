@@ -17,6 +17,7 @@ pub struct ProviderField {
 pub struct ProviderDescriptor {
     pub name: String,
     pub title: String,
+    pub available: bool,
     pub needs_key: bool,
     pub default_base_url: Option<String>,
     pub fields: Vec<ProviderField>,
@@ -30,6 +31,7 @@ impl fmt::Debug for ProviderDescriptor {
         f.debug_struct("ProviderDescriptor")
             .field("name", &self.name)
             .field("title", &self.title)
+            .field("available", &self.available)
             .field("needs_key", &self.needs_key)
             .field("default_base_url", &self.default_base_url)
             .field("fields", &self.fields)
@@ -43,22 +45,29 @@ impl fmt::Debug for ProviderDescriptor {
 pub fn descriptors() -> Vec<ProviderDescriptor> {
     vec![
         descriptor(
-            "anthropic",
-            "Anthropic",
-            "https://api.anthropic.com",
-            "ANTHROPIC_API_KEY",
-            false,
-        ),
-        descriptor(
             "openai",
             "OpenAI",
             "https://api.openai.com/v1",
             "OPENAI_API_KEY",
             true,
         ),
+        descriptor(
+            "anthropic",
+            "Claude (Anthropic)",
+            "https://api.anthropic.com",
+            "ANTHROPIC_API_KEY",
+            false,
+        ),
+        unavailable_descriptor(
+            "gemini",
+            "Gemini (Google)",
+            "GEMINI_API_KEY",
+            Some("gemini-3.6-flash"),
+        ),
         ProviderDescriptor {
             name: "bedrock".into(),
-            title: "Amazon Bedrock（环境凭据）".into(),
+            title: "AWS Bedrock".into(),
+            available: true,
             needs_key: false,
             default_base_url: None,
             fields: vec![
@@ -67,16 +76,47 @@ pub fn descriptors() -> Vec<ProviderDescriptor> {
             ],
             recommended_model: matrix::models_for_provider("bedrock")
                 .first()
-                .map(|entry| entry.id.to_string()),
+                .map(|entry| matrix::canonical_model_id("bedrock", entry.id)),
             env_key: None,
             openai_compatible: false,
         },
         descriptor(
             "deepseek",
             "DeepSeek",
-            "https://api.deepseek.com/v1",
+            "https://api.deepseek.com",
             "DEEPSEEK_API_KEY",
             true,
+        ),
+        unavailable_descriptor(
+            "kimi",
+            "Kimi (Moonshot AI)",
+            "MOONSHOT_API_KEY",
+            Some("kimi-k2.6"),
+        ),
+        unavailable_descriptor(
+            "minimax",
+            "MiniMax",
+            "MINIMAX_API_KEY",
+            Some("MiniMax-M2.5"),
+        ),
+        unavailable_descriptor(
+            "qwen",
+            "Qwen (Alibaba)",
+            "DASHSCOPE_API_KEY",
+            Some("qwen3-max"),
+        ),
+        unavailable_descriptor("xai", "xAI (Grok)", "XAI_API_KEY", Some("grok-4.3")),
+        unavailable_descriptor(
+            "mistral",
+            "Mistral",
+            "MISTRAL_API_KEY",
+            Some("mistral-large-latest"),
+        ),
+        unavailable_descriptor(
+            "meta",
+            "Meta (Muse Spark)",
+            "META_API_KEY",
+            Some("muse-spark-1.1"),
         ),
         descriptor(
             "together",
@@ -85,9 +125,22 @@ pub fn descriptors() -> Vec<ProviderDescriptor> {
             "TOGETHER_API_KEY",
             true,
         ),
+        unavailable_descriptor(
+            "fireworks",
+            "Fireworks AI",
+            "FIREWORKS_API_KEY",
+            Some("accounts/fireworks/models/glm-5p2"),
+        ),
+        unavailable_descriptor(
+            "openrouter",
+            "OpenRouter",
+            "OPENROUTER_API_KEY",
+            Some("z-ai/glm-5.2"),
+        ),
         ProviderDescriptor {
             name: "vertex".into(),
-            title: "Google Vertex AI（未接入）".into(),
+            title: "Vertex AI (Google Cloud)".into(),
+            available: false,
             needs_key: true,
             default_base_url: None,
             fields: vec![
@@ -95,7 +148,20 @@ pub fn descriptors() -> Vec<ProviderDescriptor> {
                 field("location", "Location", false, true),
                 field("service_account_json", "Service account JSON", true, false),
             ],
-            recommended_model: Some("gemini-2.5-flash".into()),
+            recommended_model: matrix::models_for_provider("vertex")
+                .first()
+                .map(|entry| matrix::canonical_model_id("vertex", entry.id)),
+            env_key: None,
+            openai_compatible: false,
+        },
+        ProviderDescriptor {
+            name: "ollama".into(),
+            title: "Ollama (local models)".into(),
+            available: false,
+            needs_key: false,
+            default_base_url: Some("http://localhost:11434".into()),
+            fields: vec![field("base_url", "Ollama server URL", false, false)],
+            recommended_model: Some("qwen3-coder:30b".into()),
             env_key: None,
             openai_compatible: false,
         },
@@ -123,14 +189,34 @@ fn descriptor(
     ProviderDescriptor {
         name: name.into(),
         title: title.into(),
+        available: true,
         needs_key: !env.is_empty(),
         default_base_url: Some(url.into()),
         fields: vec![field("api_key", "API key", true, !env.is_empty())],
         recommended_model: matrix::models_for_provider(name)
             .first()
-            .map(|entry| entry.id.to_string()),
+            .map(|entry| matrix::canonical_model_id(name, entry.id)),
         env_key: (!env.is_empty()).then_some(env.into()),
         openai_compatible: compatible,
+    }
+}
+
+fn unavailable_descriptor(
+    name: &str,
+    title: &str,
+    env: &str,
+    recommended_model: Option<&str>,
+) -> ProviderDescriptor {
+    ProviderDescriptor {
+        name: name.into(),
+        title: title.into(),
+        available: false,
+        needs_key: !env.is_empty(),
+        default_base_url: None,
+        fields: vec![field("api_key", "API key", true, !env.is_empty())],
+        recommended_model: recommended_model.map(str::to_owned),
+        env_key: (!env.is_empty()).then_some(env.into()),
+        openai_compatible: false,
     }
 }
 

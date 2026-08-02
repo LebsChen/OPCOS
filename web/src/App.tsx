@@ -51,6 +51,7 @@ type UiEvent = {
 type ProviderDescriptor = {
   name: string;
   title: string;
+  available?: boolean;
   needs_key?: boolean;
   default_base_url?: string | null;
   recommended_model?: string | null;
@@ -66,6 +67,10 @@ type Asset = {
   enabled: boolean;
 };
 type SecretMetadata = { name: string; scope: string; purpose: string };
+type ConnectorCatalogEntry = {
+  name: string;
+  description: string;
+};
 type InboxRecord = {
   session_id: string;
   call_id: string;
@@ -76,6 +81,170 @@ type InboxRecord = {
   created_at: string;
   resolution?: string | null;
 };
+
+const OPENWORKER_CONNECTORS: ConnectorCatalogEntry[] = [
+  { name: "Telegram", description: "Two-way messaging with a Telegram bot." },
+  {
+    name: "Slack",
+    description:
+      "Two-way messaging through a Slack app or managed workspace connection.",
+  },
+  {
+    name: "Email (IMAP)",
+    description: "Read, search, and send mail from an IMAP account.",
+  },
+  { name: "Gmail", description: "Search, summarize, draft, and send email." },
+  {
+    name: "Google Calendar",
+    description: "Read availability, summarize schedules, and create events.",
+  },
+  {
+    name: "Browser",
+    description: "Navigate, read, and act on websites with approval.",
+  },
+  {
+    name: "GitHub",
+    description: "Work with issues, pull requests, files, and CI status.",
+  },
+  {
+    name: "Outlook",
+    description: "Manage Microsoft 365 mail and calendar.",
+  },
+  {
+    name: "Jira",
+    description: "Search, summarize, create, and update issues.",
+  },
+  {
+    name: "monday.com",
+    description: "Read boards and items, track work, and post updates.",
+  },
+  {
+    name: "Confluence",
+    description: "Search spaces, read pages, and draft documentation.",
+  },
+  {
+    name: "Zendesk",
+    description:
+      "Search tickets, summarize customer context, and draft replies.",
+  },
+  {
+    name: "Linear",
+    description: "Search, read, and create Linear issues.",
+  },
+  {
+    name: "GitLab",
+    description: "Work with issues and merge requests.",
+  },
+  {
+    name: "Discord",
+    description: "Read channels and send messages through a Discord bot.",
+  },
+  {
+    name: "Stripe",
+    description: "Read customers, charges, and invoices.",
+  },
+  {
+    name: "Asana",
+    description: "Search, read, create, update, and comment on tasks.",
+  },
+  {
+    name: "HubSpot",
+    description: "Search CRM records and update notes and tasks.",
+  },
+  {
+    name: "Dropbox",
+    description: "Search, browse, and read files in Dropbox.",
+  },
+  {
+    name: "Box",
+    description: "Search, browse, and read files in Box.",
+  },
+  {
+    name: "WhatsApp",
+    description: "Send WhatsApp messages through the official Cloud API.",
+  },
+  {
+    name: "QuickBooks",
+    description: "Read customers, invoices, and financial reports.",
+  },
+  {
+    name: "Datadog",
+    description: "Pull firing alerts, monitors, and incident timelines.",
+  },
+  {
+    name: "Salesforce",
+    description: "Read and update cases, accounts, and opportunities.",
+  },
+  {
+    name: "Docusign",
+    description: "Track agreements and send documents for signature.",
+  },
+  {
+    name: "ClickUp",
+    description: "Search tasks and docs; create and update items.",
+  },
+  {
+    name: "Google Drive",
+    description: "Search, browse, and read files in Google Drive.",
+  },
+  {
+    name: "Canva",
+    description: "Browse, create, and export designs.",
+  },
+  {
+    name: "Figma",
+    description: "Read design files and comments; export assets.",
+  },
+  {
+    name: "Descript",
+    description: "Read and edit audio and video projects through transcripts.",
+  },
+  {
+    name: "Clay",
+    description: "Enrich people and companies for research workflows.",
+  },
+  {
+    name: "Close",
+    description: "Read and update leads, contacts, and opportunities.",
+  },
+  {
+    name: "Notion",
+    description:
+      "Search pages, read content, query databases, and create pages.",
+  },
+  {
+    name: "Attio",
+    description: "Read CRM objects, records, and notes.",
+  },
+  {
+    name: "PostHog",
+    description: "Query product analytics, events, funnels, and insights.",
+  },
+  {
+    name: "Mixpanel",
+    description: "Query events and segmentation data.",
+  },
+  {
+    name: "Amplitude",
+    description: "Query product analytics and chart data.",
+  },
+  {
+    name: "Apollo.io",
+    description: "Enrich people and companies and search the B2B database.",
+  },
+  {
+    name: "Hunter",
+    description: "Find and verify professional email addresses.",
+  },
+  {
+    name: "PagerDuty",
+    description: "See on-call schedules and review active incidents.",
+  },
+  {
+    name: "Devin",
+    description: "Import Devin Knowledge and Playbooks and connect Devin MCP.",
+  },
+];
 
 function relativeTime(value: string): string {
   const elapsed = Date.now() - new Date(value).getTime();
@@ -1221,8 +1390,12 @@ function ManageSections({
                 return (
                   <button
                     key={descriptor.name}
-                    className="flex items-center gap-2.5 rounded-xl border border-line bg-panel px-3 py-2.5 text-left hover:border-lineStrong transition-colors"
-                    onClick={() => setSelectedProvider(descriptor.name)}
+                    className="flex items-center gap-2.5 rounded-xl border border-line bg-panel px-3 py-2.5 text-left hover:border-lineStrong transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+                    disabled={descriptor.available === false}
+                    onClick={() =>
+                      descriptor.available !== false &&
+                      setSelectedProvider(descriptor.name)
+                    }
                   >
                     <span className="rounded-lg border border-line grid place-items-center shrink-0 w-8 h-8 bg-paper">
                       <span className="text-[13px] font-semibold text-muted">
@@ -1234,11 +1407,13 @@ function ManageSections({
                         {descriptor.title}
                       </span>
                       <span className="block text-[11.5px] text-faint truncate">
-                        {config?.configured
-                          ? "✓ Configured securely."
-                          : config?.base_url
-                            ? config.base_url
-                            : "Not configured yet."}
+                        {descriptor.available === false
+                          ? "Not integrated."
+                          : config?.configured
+                            ? "✓ Configured securely."
+                            : config?.base_url
+                              ? config.base_url
+                              : "Not configured yet."}
                       </span>
                     </span>
                     <span className="text-faint text-[14px]">›</span>
@@ -1451,10 +1626,12 @@ function ManageSections({
               <SelectMenu
                 value={provider}
                 onChange={setProvider}
-                options={providers.map((item) => ({
-                  value: item.name,
-                  label: item.title,
-                }))}
+                options={providers
+                  .filter((item) => item.available !== false)
+                  .map((item) => ({
+                    value: item.name,
+                    label: item.title,
+                  }))}
               />
             </div>
             <div className="settings-row">
@@ -2329,6 +2506,47 @@ function ManageSections({
           <div className="space-y-5">
             <div className="rounded-xl2 border border-line bg-panel p-5">
               <h2 className="text-[15px] font-semibold text-ink">
+                OpenWorker connector directory
+              </h2>
+              <p className="muted mt-1">
+                Default connector catalog from OpenWorker. OPCOS only enables
+                integrations that are implemented locally.
+              </p>
+              <div className="manage-list mt-4">
+                {OPENWORKER_CONNECTORS.map((connector) => {
+                  const integrated =
+                    connector.name === "Linear" || connector.name === "Devin";
+                  const status =
+                    connector.name === "Devin"
+                      ? devinKeyConfigured
+                        ? "Connected"
+                        : "Configurable"
+                      : connector.name === "Linear"
+                        ? linearStatus.includes("Connected")
+                          ? "Connected"
+                          : "Configurable"
+                        : "Not integrated";
+                  return (
+                    <div className="manage-row px-4" key={connector.name}>
+                      <span>
+                        <strong>{connector.name}</strong>
+                        <small>{connector.description}</small>
+                      </span>
+                      <span className="flex items-center gap-2">
+                        <span className="muted">{status}</span>
+                        {!integrated && (
+                          <Button className="bordered" disabled>
+                            Unavailable
+                          </Button>
+                        )}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+            <div className="rounded-xl2 border border-line bg-panel p-5">
+              <h2 className="text-[15px] font-semibold text-ink">
                 Devin integrations
               </h2>
               <p className="muted mt-1">
@@ -2501,15 +2719,6 @@ function ManageSections({
                 </div>
               )}
             </div>
-            {["Slack", "Jira", "Sentry"].map((name) => (
-              <div className="manage-row px-4" key={name}>
-                <span>
-                  <strong>{name}</strong>
-                  <small>Not integrated</small>
-                </span>
-                <span className="muted">Unavailable</span>
-              </div>
-            ))}
           </div>
         )}
         {tab === "index" && (
@@ -4170,8 +4379,13 @@ function SessionRightPanel({
                     >
                       <option value="">Global default</option>
                       {providers.map((item) => (
-                        <option key={item.name} value={item.name}>
+                        <option
+                          key={item.name}
+                          value={item.name}
+                          disabled={item.available === false}
+                        >
                           {item.title}
+                          {item.available === false ? " (unavailable)" : ""}
                         </option>
                       ))}
                     </select>
@@ -5304,8 +5518,13 @@ function AppContent() {
                     >
                       <option value="">默认</option>
                       {providers.map((provider) => (
-                        <option key={provider.name} value={provider.name}>
+                        <option
+                          key={provider.name}
+                          value={provider.name}
+                          disabled={provider.available === false}
+                        >
                           {provider.title}
+                          {provider.available === false ? " (unavailable)" : ""}
                         </option>
                       ))}
                     </select>
