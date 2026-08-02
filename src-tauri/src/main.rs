@@ -35,7 +35,10 @@ use opcos_rvm::{
     ExecRequest, HttpRvmClient, IdeBootstrap, PersistentShell, RvmClient, RvmClientConfig, WsKind,
     WsParams, join_remote_path,
 };
-use opcos_store::{KeyringSecretStore, SecretStore, SessionRecord, SessionStore, SqliteStore};
+use opcos_store::{
+    ArtifactRecord, KeyringSecretStore, SecretStore, SessionRecord, SessionStore, SqliteStore,
+    ToolCallRecord,
+};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1789,6 +1792,347 @@ async fn read_transcript(
         })
 }
 
+fn artifact_kind(path: &str) -> (&'static str, Option<&'static str>) {
+    match path
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "md" | "markdown" => ("markdown", Some("text/markdown")),
+        "html" | "htm" => ("html", Some("text/html")),
+        "json" => ("code", Some("application/json")),
+        "csv" => ("csv", Some("text/csv")),
+        "png" => ("image", Some("image/png")),
+        "jpg" | "jpeg" => ("image", Some("image/jpeg")),
+        "gif" => ("image", Some("image/gif")),
+        "svg" => ("image", Some("image/svg+xml")),
+        "pdf" => ("pdf", Some("application/pdf")),
+        "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "sh" | "css" => ("code", Some("text/plain")),
+        _ => ("text", Some("text/plain")),
+    }
+}
+
+fn shell_tokens(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    let mut characters = command.chars().peekable();
+    while let Some(character) = characters.next() {
+        if let Some(active_quote) = quote {
+            if character == active_quote {
+                quote = None;
+            } else {
+                token.push(character);
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '>' => {
+                if !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                }
+                if characters.peek() == Some(&'>') {
+                    characters.next();
+                    tokens.push(">>".into());
+                } else {
+                    tokens.push(">".into());
+                }
+            }
+            character if character.is_whitespace() => {
+                if !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                }
+            }
+            character => token.push(character),
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    tokens
+}
+
+fn shell_artifact_paths(command: &str) -> Vec<String> {
+    let tokens = shell_tokens(command);
+    let mut paths = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        match tokens[index].as_str() {
+            ">" | ">>" => {
+                if let Some(path) = tokens.get(index + 1)
+                    && !path.is_empty()
+                    && path != "/dev/null"
+                    && path != "NUL"
+                    && !path.starts_with('&')
+                {
+                    paths.push(path.clone());
+                }
+                index += 2;
+            }
+            "tee" => {
+                index += 1;
+                while let Some(token) = tokens.get(index) {
+                    if token.starts_with('-') {
+                        index += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if let Some(path) = tokens.get(index)
+                    && !path.is_empty()
+                    && path != "/dev/null"
+                    && path != "NUL"
+                    && !path.starts_with('&')
+                {
+                    paths.push(path.clone());
+                }
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    paths
+}
+
+const ARTIFACT_HASH_LIMIT: i64 = 8 * 1024 * 1024;
+
+fn artifact_hash_command(path: &str) -> String {
+    let escaped = path.replace('\'', "'\\''");
+    format!("sha256sum -- '{escaped}' 2>/dev/null || shasum -a 256 -- '{escaped}'")
+}
+
+async fn artifact_hash(host: &dyn Host, path: &str, size_bytes: Option<i64>) -> Option<String> {
+    if size_bytes.is_none_or(|size| size > ARTIFACT_HASH_LIMIT) {
+        return None;
+    }
+    let path = host.join(path).ok()?;
+    let command = artifact_hash_command(&path);
+    let result = host
+        .exec(ExecRequest {
+            command,
+            cwd: None,
+            timeout_seconds: DEFAULT_EXEC_TIMEOUT_SECONDS,
+            session: None,
+            env: None,
+        })
+        .await
+        .ok()?;
+    if result.result.exit_code != 0 {
+        return None;
+    }
+    result
+        .result
+        .stdout
+        .split_whitespace()
+        .next()
+        .map(str::to_owned)
+}
+
+async fn record_artifacts(
+    state: &DesktopState,
+    session_id: &str,
+    host_id: &str,
+    calls: Vec<ToolCallRecord>,
+) -> Result<(), String> {
+    let (host, resolved_host_id) = artifact_host(state, session_id).await?;
+    if resolved_host_id != host_id {
+        return Err("artifact host binding changed during collection".into());
+    }
+    for call in calls {
+        let Some(result) = call.result.as_ref() else {
+            continue;
+        };
+        if result.get("error").is_some() {
+            continue;
+        }
+        if matches!(call.name.as_str(), "run_shell" | "exec")
+            && result
+                .get("result")
+                .and_then(|value| value.get("exit_code"))
+                .and_then(Value::as_i64)
+                .is_some_and(|exit_code| exit_code != 0)
+        {
+            continue;
+        }
+        let paths = match call.name.as_str() {
+            "write_file" => call
+                .arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .into_iter()
+                .collect(),
+            "run_shell" | "exec" => call
+                .arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .map(shell_artifact_paths)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        if paths.is_empty() {
+            continue;
+        }
+        for path in paths {
+            let (kind, mime) = artifact_kind(&path);
+            let size_bytes = if call.name == "write_file" {
+                result.get("size").and_then(Value::as_i64).or_else(|| {
+                    call.arguments
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map(|content| content.len() as i64)
+                })
+            } else {
+                result.get("size").and_then(Value::as_i64)
+            };
+            let sha256 = artifact_hash(host.as_ref(), &path, size_bytes).await;
+            state
+                .store
+                .upsert_artifact(&ArtifactRecord {
+                    id: format!("{session_id}:{host_id}:{path}"),
+                    session_id: session_id.to_owned(),
+                    turn_id: call.message_sequence,
+                    call_id: call.call_id.clone(),
+                    host_id: host_id.to_owned(),
+                    path,
+                    size_bytes,
+                    sha256,
+                    mime: mime.map(str::to_owned),
+                    kind: kind.to_owned(),
+                    created_at: Utc::now(),
+                })
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+async fn record_artifacts_best_effort(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    session_id: &str,
+    host_id: &str,
+    calls: Vec<ToolCallRecord>,
+) {
+    if let Err(error) = record_artifacts(state, session_id, host_id, calls).await {
+        emit(
+            app,
+            "notice",
+            Some(session_id),
+            json!({"kind":"artifact_registration_failed","text":error}),
+        );
+    }
+}
+
+fn approval_artifact_calls(
+    state: &DesktopState,
+    session_id: &str,
+    call_id: &str,
+    sequence_before: i64,
+) -> Result<Vec<ToolCallRecord>, String> {
+    let mut calls = state
+        .store
+        .load_tool_calls_after(session_id, sequence_before)
+        .map_err(|error| error.to_string())?;
+    if let Some(call) = state
+        .store
+        .load_tool_call(session_id, call_id)
+        .map_err(|error| error.to_string())?
+        && !calls.iter().any(|item| item.call_id == call.call_id)
+    {
+        calls.push(call);
+    }
+    Ok(calls)
+}
+
+async fn artifact_host(
+    state: &DesktopState,
+    session_id: &str,
+) -> Result<(Box<dyn Host>, String), String> {
+    let session = session_for(state, session_id)?;
+    let host_id = session.host_id;
+    if host_id == "local" {
+        let workspace = if session.workspace.is_empty() {
+            std::env::current_dir()
+                .map_err(|error| format!("local workspace unavailable: {error}"))?
+        } else {
+            PathBuf::from(session.workspace)
+        };
+        let host = LocalHost::new(workspace).map_err(|error| error.to_string())?;
+        host.health().await.map_err(|error| error.to_string())?;
+        return Ok((Box::new(host), host_id));
+    }
+    let client = client_for(state, &host_id)?;
+    let health = client
+        .health()
+        .await
+        .map_err(|error| format!("remote host unavailable: {error}"))?;
+    let workspace = if session.workspace.is_empty() {
+        health
+            .workspace
+            .ok_or_else(|| "remote host did not provide a workspace".to_owned())?
+    } else {
+        session.workspace
+    };
+    let client = client.with_workspace(workspace.clone());
+    Ok((
+        Box::new(RvmHost::new(host_id.clone(), workspace, client)),
+        host_id,
+    ))
+}
+
+#[tauri::command]
+async fn list_artifacts(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Vec<ArtifactRecord>, String> {
+    let (_host, _host_id) = artifact_host(&state, &session_id).await?;
+    state
+        .store
+        .load_artifacts(&session_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn read_artifact(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    artifact_id: String,
+) -> Result<Value, String> {
+    let (host, host_id) = artifact_host(&state, &session_id).await?;
+    let artifact = state
+        .store
+        .load_artifacts(&session_id)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|item| item.id == artifact_id)
+        .ok_or_else(|| "artifact reference not found".to_owned())?;
+    if artifact.host_id != host_id {
+        return Err("artifact belongs to an unavailable host binding".to_owned());
+    }
+    let path = host
+        .join(&artifact.path)
+        .map_err(|error| format!("artifact path rejected: {error}"))?;
+    if !host.contains(&path) {
+        return Err("artifact path is outside the bound workspace".into());
+    }
+    let content = host
+        .read(&path)
+        .await
+        .map_err(|error| format!("artifact host read failed: {error}"))?;
+    Ok(json!({
+        "id": artifact.id,
+        "path": content.path,
+        "content": content.content,
+        "size": content.size,
+        "kind": artifact.kind,
+        "mime": artifact.mime,
+    }))
+}
+
 #[tauri::command]
 async fn submit_turn(
     app: tauri::AppHandle,
@@ -1818,6 +2162,10 @@ async fn submit_turn(
             return Err(format!("remote host unavailable: {error}"));
         }
     }
+    let sequence_before = state
+        .store
+        .max_message_sequence(&request.session_id)
+        .map_err(|error| error.to_string())?;
     let engine = engine_for(&app, &state, &request.session_id).await?;
     emit(
         &app,
@@ -1827,6 +2175,11 @@ async fn submit_turn(
     );
     match engine.submit_text(request.text).await {
         Ok(_) => {
+            let calls = state
+                .store
+                .load_tool_calls_after(&request.session_id, sequence_before)
+                .map_err(|error| error.to_string())?;
+            record_artifacts_best_effort(&app, &state, &request.session_id, &host_id, calls).await;
             emit(
                 &app,
                 "turn_done",
@@ -1836,6 +2189,11 @@ async fn submit_turn(
             Ok(())
         }
         Err(EngineError::ApprovalPending(call_id)) => {
+            let calls = state
+                .store
+                .load_tool_calls_after(&request.session_id, sequence_before)
+                .map_err(|error| error.to_string())?;
+            record_artifacts_best_effort(&app, &state, &request.session_id, &host_id, calls).await;
             if let Ok(Some(pending)) = state
                 .store
                 .load_pending(&request.session_id)
@@ -1870,6 +2228,11 @@ async fn submit_turn(
             Err(message)
         }
         Err(error) => {
+            let calls = state
+                .store
+                .load_tool_calls_after(&request.session_id, sequence_before)
+                .map_err(|error| error.to_string())?;
+            record_artifacts_best_effort(&app, &state, &request.session_id, &host_id, calls).await;
             let message = engine_error_message(error);
             if message.contains("denied") || message.contains("policy") {
                 audit(
@@ -2010,6 +2373,11 @@ async fn resolve_approval(
     call_id: String,
     approve: bool,
 ) -> Result<(), String> {
+    let host_id = session_host_id(&state, &session_id)?;
+    let sequence_before = state
+        .store
+        .max_message_sequence(&session_id)
+        .map_err(|error| error.to_string())?;
     let engine = engine_for(&app, &state, &session_id).await?;
     let result = engine
         .resolve_approval(
@@ -2025,6 +2393,8 @@ async fn resolve_approval(
     match result {
         Ok(()) => {
             emit_approval_decision(&app, &state, &session_id, &call_id, approve);
+            let calls = approval_artifact_calls(&state, &session_id, &call_id, sequence_before)?;
+            record_artifacts_best_effort(&app, &state, &session_id, &host_id, calls).await;
             let _ = emit_pending_approval(&app, &state, &session_id)?;
             emit(
                 &app,
@@ -2037,6 +2407,8 @@ async fn resolve_approval(
         Err(opcos_engine::EngineError::ApprovalPending(next_call_id)) => {
             let _ = next_call_id;
             emit_approval_decision(&app, &state, &session_id, &call_id, approve);
+            let calls = approval_artifact_calls(&state, &session_id, &call_id, sequence_before)?;
+            record_artifacts_best_effort(&app, &state, &session_id, &host_id, calls).await;
             emit_pending_approval(&app, &state, &session_id)?;
             emit(
                 &app,
@@ -2052,7 +2424,8 @@ async fn resolve_approval(
             Ok(())
         }
         Err(error) => {
-            emit_approval_decision(&app, &state, &session_id, &call_id, approve);
+            let calls = approval_artifact_calls(&state, &session_id, &call_id, sequence_before)?;
+            record_artifacts_best_effort(&app, &state, &session_id, &host_id, calls).await;
             Err(engine_error_message(error))
         }
     }
@@ -3029,7 +3402,17 @@ async fn run_schedule_for(
         )
         .map_err(|error| error.to_string())?;
     let engine = engine_for(app, state, &session_id).await?;
+    let sequence_before = state
+        .store
+        .max_message_sequence(&session_id)
+        .map_err(|error| error.to_string())?;
     let result = engine.submit_text(prompt).await;
+    let host_id = session_host_id(state, &session_id)?;
+    let calls = state
+        .store
+        .load_tool_calls_after(&session_id, sequence_before)
+        .map_err(|error| error.to_string())?;
+    record_artifacts_best_effort(app, state, &session_id, &host_id, calls).await;
     let result_label = if result.is_ok() { "ok" } else { "error" };
     state
         .database
@@ -3435,6 +3818,8 @@ fn main() {
             list_sessions,
             read_transcript,
             submit_turn,
+            list_artifacts,
+            read_artifact,
             upload_text_attachment,
             interrupt,
             steering,
@@ -3515,6 +3900,25 @@ mod m7_tests {
             assert!(reject_dangerous_git(command).is_err(), "{command}");
         }
         assert!(reject_dangerous_git("git add -- src/lib.rs").is_ok());
+    }
+
+    #[test]
+    fn shell_artifact_paths_cover_attached_quoted_and_repeated_redirects() {
+        assert_eq!(
+            shell_artifact_paths(r#"printf x >out.txt >> "reports/final output.txt""#),
+            vec!["out.txt", "reports/final output.txt"]
+        );
+        assert_eq!(
+            shell_artifact_paths("generate | tee -a reports/out.log"),
+            vec!["reports/out.log"]
+        );
+    }
+
+    #[test]
+    fn artifact_hash_command_quotes_shell_metacharacters() {
+        let command = artifact_hash_command("reports/O'Brien; $(touch hacked) final.txt");
+        assert!(command.contains("'reports/O'\\''Brien; $(touch hacked) final.txt'"));
+        assert_eq!(command.matches('\'').count() % 2, 0);
     }
 
     #[test]

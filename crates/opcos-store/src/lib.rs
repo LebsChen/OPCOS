@@ -128,6 +128,21 @@ pub struct AuditEvent {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ArtifactRecord {
+    pub id: String,
+    pub session_id: String,
+    pub turn_id: i64,
+    pub call_id: String,
+    pub host_id: String,
+    pub path: String,
+    pub size_bytes: Option<i64>,
+    pub sha256: Option<String>,
+    pub mime: Option<String>,
+    pub kind: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct TranscriptRecord {
     pub kind: String,
     pub payload: serde_json::Value,
@@ -146,6 +161,80 @@ fn table_columns(connection: &Connection, table: &str) -> Result<Vec<String>, St
     let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(StoreError::from)
+}
+
+fn ensure_artifact_schema(connection: &Connection) -> Result<(), StoreError> {
+    if !table_exists(connection, "artifacts")? {
+        connection.execute_batch(
+            "CREATE TABLE artifacts (
+               id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL,
+               turn_id INTEGER NOT NULL,
+               call_id TEXT NOT NULL,
+               host_id TEXT NOT NULL,
+               path TEXT NOT NULL,
+               size_bytes INTEGER,
+               sha256 TEXT,
+               mime TEXT,
+               kind TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               UNIQUE(session_id, host_id, path)
+             );",
+        )?;
+        return Ok(());
+    }
+    let mut indexes = connection.prepare("PRAGMA index_list(artifacts)")?;
+    let mut rows = indexes.query([])?;
+    let mut has_scoped_unique = false;
+    while let Some(row) = rows.next()? {
+        let index_name: String = row.get(1)?;
+        let unique: i64 = row.get(2)?;
+        if unique == 0 {
+            continue;
+        }
+        let mut columns = connection.prepare(&format!(
+            "PRAGMA index_info({})",
+            quote_sqlite_identifier(&index_name)
+        ))?;
+        let names = columns
+            .query_map([], |index_row| index_row.get::<_, String>(2))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if names == ["session_id", "host_id", "path"] {
+            has_scoped_unique = true;
+            break;
+        }
+    }
+    drop(rows);
+    drop(indexes);
+    if has_scoped_unique {
+        return Ok(());
+    }
+    connection.execute_batch(
+        "ALTER TABLE artifacts RENAME TO artifacts_legacy_p0_4;
+         CREATE TABLE artifacts (
+           id TEXT PRIMARY KEY,
+           session_id TEXT NOT NULL,
+           turn_id INTEGER NOT NULL,
+           call_id TEXT NOT NULL,
+           host_id TEXT NOT NULL,
+           path TEXT NOT NULL,
+           size_bytes INTEGER,
+           sha256 TEXT,
+           mime TEXT,
+           kind TEXT NOT NULL,
+           created_at TEXT NOT NULL,
+           UNIQUE(session_id, host_id, path)
+         );
+         INSERT OR REPLACE INTO artifacts
+           SELECT id,session_id,turn_id,call_id,host_id,path,size_bytes,sha256,mime,kind,created_at
+           FROM artifacts_legacy_p0_4;
+         DROP TABLE artifacts_legacy_p0_4;",
+    )?;
+    Ok(())
+}
+
+fn quote_sqlite_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 fn parse_timestamp(value: String) -> Result<DateTime<Utc>, rusqlite::Error> {
@@ -382,6 +471,8 @@ pub trait SessionStore {
     fn load_grants(&self, session_id: &str) -> Result<Vec<GrantRecord>, StoreError>;
     fn append_usage(&self, usage: &UsageRecord) -> Result<(), StoreError>;
     fn load_usage(&self, session_id: &str) -> Result<Vec<UsageRecord>, StoreError>;
+    fn upsert_artifact(&self, artifact: &ArtifactRecord) -> Result<(), StoreError>;
+    fn load_artifacts(&self, session_id: &str) -> Result<Vec<ArtifactRecord>, StoreError>;
     fn update_session_status(
         &self,
         session_id: &str,
@@ -684,11 +775,25 @@ impl SqliteStore {
     }
 
     pub fn load_tool_calls(&self, session_id: &str) -> Result<Vec<ToolCallRecord>, StoreError> {
+        self.load_tool_calls_filtered(session_id, None, None)
+    }
+
+    fn load_tool_calls_filtered(
+        &self,
+        session_id: &str,
+        after_sequence: Option<i64>,
+        call_id: Option<&str>,
+    ) -> Result<Vec<ToolCallRecord>, StoreError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT session_id,message_sequence,call_id,name,arguments,result FROM tool_calls WHERE session_id=?1 ORDER BY message_sequence,call_id",
+            "SELECT session_id,message_sequence,call_id,name,arguments,result
+             FROM tool_calls
+             WHERE session_id=?1
+               AND (?2 IS NULL OR message_sequence > ?2)
+               AND (?3 IS NULL OR call_id = ?3)
+             ORDER BY message_sequence,call_id",
         )?;
-        let rows = statement.query_map([session_id], |row| {
+        let rows = statement.query_map(params![session_id, after_sequence, call_id], |row| {
             let arguments: String = row.get(4)?;
             let result: Option<String> = row.get(5)?;
             Ok(ToolCallRecord {
@@ -716,6 +821,47 @@ impl SqliteStore {
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn max_message_notice_sequence(&self, session_id: &str) -> Result<i64, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        Ok(connection.query_row(
+            "SELECT COALESCE(MAX(sequence), 0) FROM (
+               SELECT sequence FROM messages WHERE session_id=?1
+               UNION ALL
+               SELECT sequence FROM notices WHERE session_id=?1
+             )",
+            [session_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn max_message_sequence(&self, session_id: &str) -> Result<i64, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        Ok(connection.query_row(
+            "SELECT COALESCE(MAX(sequence), 0) FROM messages WHERE session_id=?1",
+            [session_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn load_tool_calls_after(
+        &self,
+        session_id: &str,
+        message_sequence: i64,
+    ) -> Result<Vec<ToolCallRecord>, StoreError> {
+        self.load_tool_calls_filtered(session_id, Some(message_sequence), None)
+    }
+
+    pub fn load_tool_call(
+        &self,
+        session_id: &str,
+        call_id: &str,
+    ) -> Result<Option<ToolCallRecord>, StoreError> {
+        Ok(self
+            .load_tool_calls_filtered(session_id, None, Some(call_id))?
+            .into_iter()
+            .next())
     }
 
     pub fn load_transcript(&self, session_id: &str) -> Result<Vec<TranscriptRecord>, StoreError> {
@@ -890,8 +1036,10 @@ impl SqliteStore {
                output_tokens INTEGER NOT NULL,
                duration_ms INTEGER NOT NULL,
                recorded_at TEXT NOT NULL
-             );",
+             );
+             ;",
             )?;
+            ensure_artifact_schema(&connection)?;
             let session_columns = table_columns(&connection, "sessions")?;
             let legacy_sessions = !session_columns.is_empty()
                 && !session_columns.iter().any(|column| column == "session_id");
@@ -1347,6 +1495,67 @@ impl SessionStore for SqliteStore {
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
+
+    fn upsert_artifact(&self, artifact: &ArtifactRecord) -> Result<(), StoreError> {
+        self.connection.lock().expect("sqlite mutex poisoned").execute(
+            "INSERT INTO artifacts(id,session_id,turn_id,call_id,host_id,path,size_bytes,sha256,mime,kind,created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+             ON CONFLICT(session_id,host_id,path) DO UPDATE SET
+               id=excluded.id,
+               session_id=excluded.session_id,
+               turn_id=excluded.turn_id,
+               call_id=excluded.call_id,
+               size_bytes=excluded.size_bytes,
+               sha256=excluded.sha256,
+               mime=excluded.mime,
+               kind=excluded.kind,
+               created_at=excluded.created_at",
+            params![
+                artifact.id,
+                artifact.session_id,
+                artifact.turn_id,
+                artifact.call_id,
+                artifact.host_id,
+                artifact.path,
+                artifact.size_bytes,
+                artifact.sha256,
+                artifact.mime,
+                artifact.kind,
+                artifact.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn load_artifacts(&self, session_id: &str) -> Result<Vec<ArtifactRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT id,session_id,turn_id,call_id,host_id,path,size_bytes,sha256,mime,kind,created_at
+             FROM artifacts WHERE session_id=?1 ORDER BY created_at DESC",
+        )?;
+        let rows = statement.query_map([session_id], |row| {
+            Ok(ArtifactRecord {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                turn_id: row.get(2)?,
+                call_id: row.get(3)?,
+                host_id: row.get(4)?,
+                path: row.get(5)?,
+                size_bytes: row.get(6)?,
+                sha256: row.get(7)?,
+                mime: row.get(8)?,
+                kind: row.get(9)?,
+                created_at: row.get::<_, String>(10)?.parse().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        10,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
 }
 
 #[cfg(test)]
@@ -1782,6 +1991,40 @@ mod tests {
                 .unwrap(),
             300
         );
+    }
+
+    #[test]
+    fn artifacts_store_references_and_upserts_by_host_path() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let first = ArtifactRecord {
+            id: "artifact-1".into(),
+            session_id: "session-artifact".into(),
+            turn_id: 1,
+            call_id: "call-1".into(),
+            host_id: "remote".into(),
+            path: "reports/out.txt".into(),
+            size_bytes: Some(4),
+            sha256: None,
+            mime: Some("text/plain".into()),
+            kind: "text".into(),
+            created_at: Utc::now(),
+        };
+        store.upsert_artifact(&first).unwrap();
+        let mut second = first.clone();
+        second.id = "artifact-2".into();
+        second.call_id = "call-2".into();
+        second.size_bytes = Some(8);
+        store.upsert_artifact(&second).unwrap();
+        let artifacts = store.load_artifacts("session-artifact").unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].id, "artifact-2");
+        assert_eq!(artifacts[0].size_bytes, Some(8));
+        let mut other_session = second.clone();
+        other_session.id = "artifact-3".into();
+        other_session.session_id = "other-session".into();
+        store.upsert_artifact(&other_session).unwrap();
+        assert_eq!(store.load_artifacts("session-artifact").unwrap().len(), 1);
+        assert_eq!(store.load_artifacts("other-session").unwrap().len(), 1);
     }
 
     #[test]

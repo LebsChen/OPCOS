@@ -36,7 +36,7 @@
 ### P0-4 产物模型
 
 - 改：`opcos-store`、右栏
-- 做：`artifact` 表只存引用（host、路径、大小、hash、turn），不复制内容；工具执行结果落产物记录；右栏加 Artifacts pane（照 Cloud-Dev 现有 pane 结构，不自造）。
+- 做：`artifact` 表只存引用（host、路径、大小、hash、turn），不复制内容；工具执行结果落产物记录；右栏加 Artifacts pane（照 OpenWorker `surfaces/gui/src/components/RightRail.tsx` 的 Artifacts section/viewer 结构，沿用 OPCOS 现有 rail 样式）。
 - 验收：一次真实 turn 后产物列表出现远端文件，点击能读回内容；远端不可读时显式报错。
 
 ---
