@@ -1135,6 +1135,11 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                key TEXT PRIMARY KEY,
                value TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS devin_settings (
+               scope TEXT PRIMARY KEY,
+               value TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS desktop_schema_migrations (
                version TEXT PRIMARY KEY,
                applied_at TEXT NOT NULL
@@ -1231,6 +1236,72 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
     migrate_config_objects(&mut connection)?;
     migrate_coordination(&connection)?;
     Ok(connection)
+}
+
+fn default_devin_settings() -> Value {
+    json!({
+        "computer_use": true,
+        "default_agent": "Fusion",
+        "api_default_agent": "Fusion",
+        "default_platform": "Ubuntu",
+        "batch_limit": 50,
+        "message_usage_limit": 0,
+        "share_prompts_in_prs": true,
+        "require_devin_mention": false,
+        "auto_add_reviewer": false,
+        "reviewer": "",
+        "open_prs_as": "ready",
+        "responding_to_bots": "ignore"
+    })
+}
+
+fn merge_settings(base: &mut Value, override_value: &Value) {
+    if let (Some(base), Some(overrides)) = (base.as_object_mut(), override_value.as_object()) {
+        for (key, value) in overrides {
+            base.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+fn load_devin_settings(connection: &Connection, project_id: Option<&str>) -> Result<Value, String> {
+    let mut result = default_devin_settings();
+    let global = connection
+        .query_row(
+            "SELECT value FROM devin_settings WHERE scope='global'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|value| serde_json::from_str::<Value>(&value).ok());
+    if let Some(global) = global.as_ref() {
+        merge_settings(&mut result, global);
+    }
+    if let Some(project_id) = project_id {
+        let scope = format!("project:{project_id}");
+        let project = connection
+            .query_row(
+                "SELECT value FROM devin_settings WHERE scope=?1",
+                [&scope],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|value| serde_json::from_str::<Value>(&value).ok());
+        if let Some(project) = project.as_ref() {
+            merge_settings(&mut result, project);
+        }
+    }
+    Ok(result)
+}
+
+fn computer_use_enabled(state: &DesktopState, project_id: Option<&str>) -> Result<bool, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    Ok(load_devin_settings(&connection, project_id)?
+        .get("computer_use")
+        .and_then(Value::as_bool)
+        .unwrap_or(true))
 }
 
 fn migrate_coordination(connection: &Connection) -> Result<(), String> {
@@ -2092,6 +2163,12 @@ fn clear_project_configuration(state: &DesktopState, project_id: &str) -> Result
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?;
+    connection
+        .execute(
+            "DELETE FROM devin_settings WHERE scope=?1",
+            [format!("project:{project_id}")],
+        )
+        .map_err(|error| error.to_string())?;
     let object_ids = {
         let mut statement = connection
             .prepare("SELECT id FROM config_object WHERE scope_kind='project' AND scope_key=?1")
@@ -2924,6 +3001,13 @@ async fn engine_for(
         &host_id,
         session.project_id.as_deref(),
     )?;
+    let settings = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        load_devin_settings(&connection, session.project_id.as_deref())?
+    };
     let (provider_id, configured_base_url) = {
         let connection = state
             .database
@@ -3191,6 +3275,12 @@ async fn engine_for(
         model,
     ));
     engine.set_linear_tools_enabled(linear_tools_enabled);
+    engine.set_message_usage_limit(
+        settings
+            .get("message_usage_limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    );
     for kind in [
         "github", "telegram", "discord", "slack", "notion", "gitlab", "jira", "stripe",
     ] {
@@ -3705,6 +3795,7 @@ async fn start_surface(
     cols: Option<u16>,
     rows: Option<u16>,
     cwd: Option<String>,
+    project_id: Option<String>,
 ) -> Result<u16, String> {
     let kind = match surface.as_str() {
         "pty" => WsKind::Pty,
@@ -3712,6 +3803,11 @@ async fn start_surface(
         "cdp" => WsKind::Cdp,
         _ => return Err("unknown surface".into()),
     };
+    if matches!(kind, WsKind::Vnc | WsKind::Cdp)
+        && !computer_use_enabled(&state, project_id.as_deref())?
+    {
+        return Err("Computer use is disabled in Devin settings".into());
+    }
     if host_id == "local" {
         return Err(match kind {
             WsKind::Pty => "本机 host 暂不支持远程 PTY，请使用本机内置终端能力".into(),
@@ -3837,7 +3933,7 @@ fn create_session(
     if project_id.is_some() != agent_id.is_some() {
         return Err("project_id and agent_id must be supplied together".to_owned());
     }
-    let (host_id, agent) =
+    let (mut host_id, agent) =
         if let (Some(project_id), Some(agent_id)) = (project_id.clone(), agent_id.clone()) {
             let project = state
                 .store
@@ -3859,6 +3955,61 @@ fn create_session(
         } else {
             (host_id.clone(), None)
         };
+    let settings = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        load_devin_settings(&connection, project_id.as_deref())?
+    };
+    if host_id.trim().is_empty() {
+        let platform = settings
+            .get("default_platform")
+            .and_then(Value::as_str)
+            .unwrap_or("Ubuntu")
+            .to_ascii_lowercase();
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        host_id = connection
+            .query_row(
+                "SELECT id FROM hosts WHERE lower(name) LIKE ?1 ORDER BY id LIMIT 1",
+                [format!("%{platform}%")],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap_or_else(|_| "local".into());
+    }
+    let default_agent = settings
+        .get("default_agent")
+        .and_then(Value::as_str)
+        .unwrap_or("Fusion")
+        .to_owned();
+    let batch_limit = settings
+        .get("batch_limit")
+        .and_then(Value::as_i64)
+        .unwrap_or(50);
+    {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let recent_sessions: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE created_at >= ?1",
+                [Utc::now()
+                    .checked_sub_signed(chrono::Duration::minutes(1))
+                    .unwrap_or_else(Utc::now)
+                    .to_rfc3339()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if recent_sessions >= batch_limit {
+            return Err(format!(
+                "batch session limit reached ({batch_limit}); wait before creating another session"
+            ));
+        }
+    }
     let workspace = if let Some(agent) = agent.as_ref() {
         Some(agent.worktree_path.clone())
     } else if host_id == "local" && workspace.as_deref().is_none_or(str::is_empty) {
@@ -3889,7 +4040,7 @@ fn create_session(
             pinned: false,
             archived: false,
             origin: None,
-            origin_label: None,
+            origin_label: Some(default_agent),
             compaction: json!({}),
             host_id: host_id.clone(),
             provider: provider.clone(),
@@ -8426,8 +8577,27 @@ async fn github_pull_request(
     body: String,
     token_secret: String,
 ) -> Result<Value, String> {
-    if let Some(session_id) = session_id {
-        run_configured_lifecycle_stage(&state, &session_id, LifecycleStage::PrePush, None).await?;
+    let project_id = session_id
+        .as_deref()
+        .and_then(|id| state.store.load_session(id).ok().flatten())
+        .and_then(|session| session.project_id);
+    let settings = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        load_devin_settings(&connection, project_id.as_deref())?
+    };
+    if settings
+        .get("require_devin_mention")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && !body.contains("@Devin")
+    {
+        return Err("Pull request policy requires @Devin to respond".into());
+    }
+    if let Some(session_id) = session_id.as_deref() {
+        run_configured_lifecycle_stage(&state, session_id, LifecycleStage::PrePush, None).await?;
     }
     let token = state
         .secrets
@@ -8459,11 +8629,37 @@ async fn github_pull_request(
     } else {
         String::new()
     };
-    let body = if template_text.is_empty() {
+    let mut body = if template_text.is_empty() {
         body
     } else {
         format!("{template_text}\n\n{body}")
     };
+    if settings
+        .get("share_prompts_in_prs")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+        && let Some(session_id) = session_id.as_deref()
+        && let Ok(messages) = state.store.load_messages(session_id)
+    {
+        let prompts = messages
+            .into_iter()
+            .filter(|message| message.role == "user")
+            .filter_map(|message| {
+                message
+                    .content
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .and_then(|items| items.first())
+                    .and_then(|item| item.get("text"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        if !prompts.is_empty() {
+            body.push_str("\n\n## OPCOS prompts\n\n");
+            body.push_str(&prompts.join("\n\n"));
+        }
+    }
     if body.contains(&token)
         || title.contains(&token)
         || head.contains(&token)
@@ -8471,16 +8667,44 @@ async fn github_pull_request(
     {
         return Err("GitHub credential must not appear in PR fields".into());
     }
-    http.post(format!("https://api.github.com/repos/{repo}/pulls"))
+    let response: Value = http
+        .post(format!("https://api.github.com/repos/{repo}/pulls"))
         .header("User-Agent", "OPCOS/0.1")
-        .bearer_auth(token)
-        .json(&json!({"title":title,"head":head,"base":base,"body":body}))
+        .bearer_auth(&token)
+        .json(&json!({
+            "title":title,
+            "head":head,
+            "base":base,
+            "body":body,
+            "draft": settings.get("open_prs_as").and_then(Value::as_str) == Some("draft")
+        }))
         .send()
         .await
         .map_err(|error| error.to_string())?
         .json()
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    if settings
+        .get("auto_add_reviewer")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && let Some(reviewer) = settings
+            .get("reviewer")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        && let Some(number) = response.get("number").and_then(Value::as_u64)
+    {
+        let _ = http
+            .post(format!(
+                "https://api.github.com/repos/{repo}/pulls/{number}/requested_reviewers"
+            ))
+            .header("User-Agent", "OPCOS/0.1")
+            .bearer_auth(token)
+            .json(&json!({"reviewers": [reviewer]}))
+            .send()
+            .await;
+    }
+    Ok(response)
 }
 
 fn local_git_command(cwd: &str, args: &[&str]) -> Result<std::process::Output, String> {
@@ -10595,6 +10819,68 @@ fn provider_settings(state: State<'_, DesktopState>) -> Result<Value, String> {
 }
 
 #[tauri::command]
+fn devin_settings(
+    state: State<'_, DesktopState>,
+    project_id: Option<String>,
+) -> Result<Value, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    load_devin_settings(&connection, project_id.as_deref())
+}
+
+#[tauri::command]
+fn save_devin_settings(
+    state: State<'_, DesktopState>,
+    project_id: Option<String>,
+    value: Value,
+) -> Result<Value, String> {
+    let mut settings = default_devin_settings();
+    merge_settings(&mut settings, &value);
+    let object = settings
+        .as_object_mut()
+        .ok_or_else(|| "Devin settings must be an object".to_owned())?;
+    let batch_limit = object
+        .get("batch_limit")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "batch_limit must be an integer".to_owned())?;
+    if !(1..=500).contains(&batch_limit) {
+        return Err("batch_limit must be between 1 and 500".into());
+    }
+    let usage_limit = object
+        .get("message_usage_limit")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "message_usage_limit must be an integer".to_owned())?;
+    if usage_limit < 0 {
+        return Err("message_usage_limit cannot be negative".into());
+    }
+    let open_prs_as = object
+        .get("open_prs_as")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "open_prs_as must be draft or ready".to_owned())?;
+    if !matches!(open_prs_as, "draft" | "ready") {
+        return Err("open_prs_as must be draft or ready".into());
+    }
+    let scope = project_id
+        .as_deref()
+        .map(|id| format!("project:{id}"))
+        .unwrap_or_else(|| "global".into());
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    connection
+        .execute(
+            "INSERT INTO devin_settings(scope,value,updated_at) VALUES (?1,?2,?3)
+             ON CONFLICT(scope) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+            params![scope, settings.to_string(), Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(settings)
+}
+
+#[tauri::command]
 fn provider_configurations(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
     let connection = state
         .database
@@ -10966,6 +11252,8 @@ fn main() {
             list_secret_metadata,
             delete_secret_metadata,
             provider_settings,
+            devin_settings,
+            save_devin_settings,
             provider_configurations,
             save_provider_settings,
             save_provider_key,
@@ -11494,5 +11782,56 @@ mod m7_tests {
         });
         overlay_running_tool_status("tool", &mut interrupted, &active);
         assert_eq!(interrupted["status"], "interrupted");
+    }
+
+    #[test]
+    fn devin_settings_project_override_changes_effective_behavior() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE devin_settings (
+                    scope TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO devin_settings(scope,value,updated_at)
+                 VALUES ('global',?1,'now'),('project:p1',?2,'now')",
+                params![
+                    json!({"computer_use":true,"batch_limit":50}).to_string(),
+                    json!({"computer_use":false,"batch_limit":2}).to_string()
+                ],
+            )
+            .unwrap();
+        let global = load_devin_settings(&connection, None).unwrap();
+        let project = load_devin_settings(&connection, Some("p1")).unwrap();
+        assert_eq!(global["computer_use"], true);
+        assert_eq!(global["batch_limit"], 50);
+        assert_eq!(project["computer_use"], false);
+        assert_eq!(project["batch_limit"], 2);
+    }
+
+    #[test]
+    fn devin_settings_defaults_are_real_runtime_limits() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE devin_settings (
+                    scope TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )",
+                [],
+            )
+            .unwrap();
+        let settings = load_devin_settings(&connection, None).unwrap();
+        assert_eq!(settings["batch_limit"], 50);
+        assert_eq!(settings["message_usage_limit"], 0);
+        assert_eq!(settings["open_prs_as"], "ready");
+        assert_eq!(settings["computer_use"], true);
     }
 }

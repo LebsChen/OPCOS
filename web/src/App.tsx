@@ -89,6 +89,20 @@ type ConnectorField = {
   type?: "text" | "password" | "url";
   placeholder?: string;
 };
+type DevinSettings = {
+  computer_use: boolean;
+  default_agent: string;
+  api_default_agent: string;
+  default_platform: string;
+  batch_limit: number;
+  message_usage_limit: number;
+  share_prompts_in_prs: boolean;
+  require_devin_mention: boolean;
+  auto_add_reviewer: boolean;
+  reviewer: string;
+  open_prs_as: "draft" | "ready";
+  responding_to_bots: "ignore" | "respond";
+};
 const TOKEN_CONNECTOR_KINDS = [
   "github",
   "telegram",
@@ -1852,6 +1866,7 @@ function SurfaceView({
           cols: 100,
           rows: 30,
           cwd: selected.workspace || null,
+          projectId: selected.project_id || null,
         }),
       );
     } catch (error) {
@@ -2423,6 +2438,7 @@ function ManageSections({
   assets,
   providers,
   secrets,
+  projects,
   selected,
   onRefresh,
   onError,
@@ -2444,6 +2460,7 @@ function ManageSections({
   assets: Asset[];
   providers: ProviderDescriptor[];
   secrets: SecretMetadata[];
+  projects: Project[];
   selected: Session | null;
   onRefresh: () => void;
   onError: (error: unknown) => void;
@@ -2474,6 +2491,11 @@ function ManageSections({
   const [providerStatuses, setProviderStatuses] = useState<
     Record<string, string>
   >({});
+  const [devinSettings, setDevinSettings] = useState<DevinSettings | null>(
+    null,
+  );
+  const [devinProjectId, setDevinProjectId] = useState<string | null>(null);
+  const [devinSettingsStatus, setDevinSettingsStatus] = useState("");
   const [providerModelOptions, setProviderModelOptions] = useState<
     Record<string, Array<{ id: string; label: string }>>
   >({});
@@ -2660,6 +2682,10 @@ function ManageSections({
     ],
     blueprint: ["Blueprint", "Read and manage the selected host blueprint."],
     appearance: [translate("general"), translate("appearanceDescription")],
+    devin: [
+      "Devin",
+      "控制会话默认值、Computer use、用量上限和 Pull request 策略。",
+    ],
   };
   const assetKinds = [
     "agents",
@@ -2721,6 +2747,12 @@ function ManageSections({
       .catch(onError);
   }, []);
   useEffect(() => {
+    if (tab !== "devin") return;
+    void command<DevinSettings>("devin_settings", { projectId: devinProjectId })
+      .then(setDevinSettings)
+      .catch(onError);
+  }, [tab, devinProjectId, onError]);
+  useEffect(() => {
     void command<
       Array<{ provider: string; base_url?: string; configured: boolean }>
     >("provider_configurations")
@@ -2754,7 +2786,10 @@ function ManageSections({
       </header>
       <div
         className={
-          tab === "appearance" || tab === "provider" || tab === "blueprint"
+          tab === "appearance" ||
+          tab === "provider" ||
+          tab === "blueprint" ||
+          tab === "devin"
             ? "rounded-xl2 border border-line bg-panel p-5"
             : ""
         }
@@ -2792,6 +2827,194 @@ function ManageSections({
                   { value: "zh", label: translate("chinese") },
                 ]}
               />
+            </div>
+          </div>
+        )}
+        {tab === "devin" && devinSettings && (
+          <div className="divide-y divide-line">
+            <label className="settings-row">
+              <div>
+                <strong>配置作用域</strong>
+                <small>项目设置覆盖全局设置；未选择项目时编辑全局设置。</small>
+              </div>
+              <SelectMenu
+                value={devinProjectId || ""}
+                onChange={(value) => setDevinProjectId(value || null)}
+                options={[
+                  { value: "", label: "全局" },
+                  ...projects.map((project) => ({
+                    value: project.id,
+                    label: project.name,
+                  })),
+                ]}
+              />
+            </label>
+            <div className="settings-row">
+              <div>
+                <strong>Computer use</strong>
+                <small>关闭后不允许打开远程桌面和浏览器控制面。</small>
+              </div>
+              <input
+                type="checkbox"
+                checked={devinSettings.computer_use}
+                onChange={(event) =>
+                  setDevinSettings({
+                    ...devinSettings,
+                    computer_use: event.target.checked,
+                  })
+                }
+              />
+            </div>
+            {(
+              [
+                ["default_agent", "Default agent"],
+                ["api_default_agent", "API default agent"],
+                ["default_platform", "Default platform"],
+              ] as const
+            ).map(([keyName, label]) => (
+              <label className="settings-row" key={keyName}>
+                <div>
+                  <strong>{label}</strong>
+                  <small>用于没有显式覆盖的新建会话。</small>
+                </div>
+                <input
+                  value={devinSettings[keyName]}
+                  onChange={(event) =>
+                    setDevinSettings({
+                      ...devinSettings,
+                      [keyName]: event.target.value,
+                    })
+                  }
+                />
+              </label>
+            ))}
+            <label className="settings-row">
+              <div>
+                <strong>Batch limit</strong>
+                <small>一分钟内最多创建的会话数（1–500）。</small>
+              </div>
+              <input
+                type="number"
+                min={1}
+                max={500}
+                value={devinSettings.batch_limit}
+                onChange={(event) =>
+                  setDevinSettings({
+                    ...devinSettings,
+                    batch_limit: Number(event.target.value),
+                  })
+                }
+              />
+            </label>
+            <label className="settings-row">
+              <div>
+                <strong>Message usage limit</strong>
+                <small>单条消息允许消耗的 token 数，0 表示不限制。</small>
+              </div>
+              <input
+                type="number"
+                min={0}
+                value={devinSettings.message_usage_limit}
+                onChange={(event) =>
+                  setDevinSettings({
+                    ...devinSettings,
+                    message_usage_limit: Number(event.target.value),
+                  })
+                }
+              />
+            </label>
+            {(
+              [
+                ["share_prompts_in_prs", "Share prompts in PRs"],
+                ["require_devin_mention", "Require @Devin to respond"],
+                ["auto_add_reviewer", "Auto-add reviewer"],
+              ] as const
+            ).map(([keyName, label]) => (
+              <label className="settings-row" key={keyName}>
+                <div>
+                  <strong>{label}</strong>
+                  <small>应用于后续 Pull request 工作流。</small>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={devinSettings[keyName]}
+                  onChange={(event) =>
+                    setDevinSettings({
+                      ...devinSettings,
+                      [keyName]: event.target.checked,
+                    })
+                  }
+                />
+              </label>
+            ))}
+            <label className="settings-row">
+              <div>
+                <strong>Reviewer</strong>
+                <small>自动添加 reviewer 时使用的 GitHub 用户名。</small>
+              </div>
+              <input
+                value={devinSettings.reviewer}
+                onChange={(event) =>
+                  setDevinSettings({
+                    ...devinSettings,
+                    reviewer: event.target.value,
+                  })
+                }
+              />
+            </label>
+            <label className="settings-row">
+              <div>
+                <strong>Open PRs as</strong>
+                <small>创建 Pull request 时的初始状态。</small>
+              </div>
+              <SelectMenu
+                value={devinSettings.open_prs_as}
+                onChange={(value) =>
+                  setDevinSettings({
+                    ...devinSettings,
+                    open_prs_as: value as "draft" | "ready",
+                  })
+                }
+                options={[
+                  { value: "ready", label: "Ready" },
+                  { value: "draft", label: "Draft" },
+                ]}
+              />
+            </label>
+            <label className="settings-row">
+              <div>
+                <strong>Responding to bots</strong>
+                <small>是否响应机器人触发的消息。</small>
+              </div>
+              <SelectMenu
+                value={devinSettings.responding_to_bots}
+                onChange={(value) =>
+                  setDevinSettings({
+                    ...devinSettings,
+                    responding_to_bots: value as "ignore" | "respond",
+                  })
+                }
+                options={[
+                  { value: "ignore", label: "Ignore" },
+                  { value: "respond", label: "Respond" },
+                ]}
+              />
+            </label>
+            <div className="settings-row justify-end gap-3">
+              {devinSettingsStatus && <small>{devinSettingsStatus}</small>}
+              <Button
+                className="primary"
+                onClick={() =>
+                  command("save_devin_settings", {
+                    projectId: devinProjectId,
+                    value: devinSettings,
+                  })
+                    .then(() => setDevinSettingsStatus("已保存"))
+                    .catch(onError)
+                }
+              >
+                保存 Devin 设置
+              </Button>
             </div>
           </div>
         )}
@@ -7182,6 +7405,7 @@ function AppContent() {
               assets={assets}
               providers={providers}
               secrets={secrets}
+              projects={projects}
               selected={selected}
               onRefresh={() => refresh().catch(onError)}
               onError={onError}
