@@ -188,7 +188,7 @@ async fn ensure_browser_stopped(host: &dyn Host) -> Result<(), LoginStateError> 
 
 fn powershell_archive_command(profile_path: &str, backup_path: &str) -> String {
     powershell_path_command(
-        "Add-Type -AssemblyName System.IO.Compression.FileSystem; $bytes=(Get-ChildItem -LiteralPath $profilePath -Force -Recurse -File | Measure-Object -Property Length -Sum).Sum; if ($bytes -gt 1900000000) { exit 42 }; New-Item -ItemType Directory -Force -Path (Split-Path -Parent $backupPath) | Out-Null; Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue; $archive=[IO.Compression.ZipFile]::Open($backupPath,[IO.Compression.ZipArchiveMode]::Create); try { $profile=Get-Item -LiteralPath $profilePath -Force; $root=$profile.FullName.TrimEnd('\\')+'\\'; $archive.CreateEntry($profile.Name+'/') | Out-Null; Get-ChildItem -LiteralPath $profilePath -Force -Recurse | ForEach-Object { $relative=$_.FullName.Substring($root.Length).Replace('\\','/'); if ($_.PSIsContainer) { $archive.CreateEntry($profile.Name+'/'+$relative+'/') | Out-Null } else { $entry=$archive.CreateEntry($profile.Name+'/'+$relative); $input=[IO.File]::OpenRead($_.FullName); $output=$entry.Open(); try { $input.CopyTo($output) } finally { $output.Dispose(); $input.Dispose() } } } } finally { $archive.Dispose() }",
+        "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.IO.Compression; Add-Type -AssemblyName System.IO.Compression.FileSystem; $bytes=(Get-ChildItem -LiteralPath $profilePath -Force -Recurse -File | Measure-Object -Property Length -Sum).Sum; if ($bytes -gt 1900000000) { exit 42 }; New-Item -ItemType Directory -Force -Path (Split-Path -Parent $backupPath) | Out-Null; Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue; $archive=[IO.Compression.ZipFile]::Open($backupPath,[IO.Compression.ZipArchiveMode]::Create); try { $profile=Get-Item -LiteralPath $profilePath -Force; $root=$profile.FullName.TrimEnd('\\')+'\\'; $archive.CreateEntry($profile.Name+'/') | Out-Null; Get-ChildItem -LiteralPath $profilePath -Force -Recurse | ForEach-Object { $relative=$_.FullName.Substring($root.Length).Replace('\\','/'); if ($_.PSIsContainer) { $archive.CreateEntry($profile.Name+'/'+$relative+'/') | Out-Null } else { $entry=$archive.CreateEntry($profile.Name+'/'+$relative); $inputStream=[IO.File]::OpenRead($_.FullName); $outputStream=$entry.Open(); try { $inputStream.CopyTo($outputStream) } finally { $outputStream.Dispose(); $inputStream.Dispose() } } } } finally { $archive.Dispose() }",
         profile_path,
         backup_path,
     )
@@ -197,16 +197,27 @@ fn powershell_archive_command(profile_path: &str, backup_path: &str) -> String {
 fn powershell_extract_archive_command(backup_path: &str, profile_path: &str) -> String {
     let backup_path = BASE64.encode(backup_path.as_bytes());
     let profile_path = BASE64.encode(profile_path.as_bytes());
-    format!(
-        "powershell -NoProfile -NonInteractive -Command \"$profilePath=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{profile_path}')); $backupPath=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{backup_path}')); $restorePath=\\\"$($profilePath).__opcos_restore_$([Guid]::NewGuid().ToString('N'))\\\"; $previousPath=\\\"$($profilePath).__opcos_previous_$([Guid]::NewGuid().ToString('N'))\\\"; try {{ if (Test-Path -LiteralPath $profilePath) {{ Move-Item -LiteralPath $profilePath -Destination $previousPath -ErrorAction Stop }}; Expand-Archive -LiteralPath $backupPath -DestinationPath $restorePath -Force -ErrorAction Stop; $archiveRoot=@(Get-ChildItem -LiteralPath $restorePath -Force); if (($archiveRoot.Count -ne 1) -or -not $archiveRoot[0].PSIsContainer) {{ throw 'archive root is invalid' }}; New-Item -ItemType Directory -Force -Path $profilePath | Out-Null; Get-ChildItem -LiteralPath $archiveRoot[0].FullName -Force | Move-Item -Destination $profilePath -Force -ErrorAction Stop; Remove-Item -LiteralPath $restorePath -Recurse -Force -ErrorAction Stop; if (Test-Path -LiteralPath $previousPath) {{ Remove-Item -LiteralPath $previousPath -Recurse -Force -ErrorAction SilentlyContinue }} }} catch {{ if (Test-Path -LiteralPath $restorePath) {{ Remove-Item -LiteralPath $restorePath -Recurse -Force -ErrorAction SilentlyContinue }}; if (Test-Path -LiteralPath $previousPath) {{ if (Test-Path -LiteralPath $profilePath) {{ Remove-Item -LiteralPath $profilePath -Recurse -Force -ErrorAction SilentlyContinue }}; Move-Item -LiteralPath $previousPath -Destination $profilePath -ErrorAction SilentlyContinue }}; exit 1 }}\""
-    )
+    powershell_encoded_command(&format!(
+        "$ErrorActionPreference='Stop'; $profilePath=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{profile_path}')); $backupPath=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{backup_path}')); $restorePath=\"$($profilePath).__opcos_restore_$([Guid]::NewGuid().ToString('N'))\"; $previousPath=\"$($profilePath).__opcos_previous_$([Guid]::NewGuid().ToString('N'))\"; try {{ if (Test-Path -LiteralPath $profilePath) {{ Move-Item -LiteralPath $profilePath -Destination $previousPath -ErrorAction Stop }}; Expand-Archive -LiteralPath $backupPath -DestinationPath $restorePath -Force -ErrorAction Stop; $archiveRoot=@(Get-ChildItem -LiteralPath $restorePath -Force); if (($archiveRoot.Count -ne 1) -or -not $archiveRoot[0].PSIsContainer) {{ throw 'archive root is invalid' }}; New-Item -ItemType Directory -Force -Path $profilePath | Out-Null; Get-ChildItem -LiteralPath $archiveRoot[0].FullName -Force | Move-Item -Destination $profilePath -Force -ErrorAction Stop; Remove-Item -LiteralPath $restorePath -Recurse -Force -ErrorAction Stop; if (Test-Path -LiteralPath $previousPath) {{ Remove-Item -LiteralPath $previousPath -Recurse -Force -ErrorAction SilentlyContinue }} }} catch {{ if (Test-Path -LiteralPath $restorePath) {{ Remove-Item -LiteralPath $restorePath -Recurse -Force -ErrorAction SilentlyContinue }}; if (Test-Path -LiteralPath $previousPath) {{ if (Test-Path -LiteralPath $profilePath) {{ Remove-Item -LiteralPath $profilePath -Recurse -Force -ErrorAction SilentlyContinue }}; Move-Item -LiteralPath $previousPath -Destination $profilePath -ErrorAction SilentlyContinue }}; exit 1 }}",
+    ))
 }
 
 fn powershell_path_command(body: &str, first: &str, second: &str) -> String {
     let first = BASE64.encode(first.as_bytes());
     let second = BASE64.encode(second.as_bytes());
+    powershell_encoded_command(&format!(
+        "$profilePath=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{first}')); $backupPath=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{second}')); {body}"
+    ))
+}
+
+fn powershell_encoded_command(script: &str) -> String {
+    let encoded = script
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
     format!(
-        "powershell -NoProfile -NonInteractive -Command \"$profilePath=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{first}')); $backupPath=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{second}')); {body}\""
+        "powershell -NoProfile -NonInteractive -EncodedCommand {}",
+        BASE64.encode(encoded)
     )
 }
 
@@ -247,13 +258,14 @@ mod tests {
         let profile = r"C:\Users\Agent\Profile With Spaces";
         let backup = r"C:\Users\Agent\OPCOS\backup.zip";
         let command = powershell_archive_command(profile, backup);
-        assert!(!command.contains(profile));
-        assert!(!command.contains(backup));
-        assert!(command.contains("ZipFile]::Open"));
-        assert!(command.contains("-Force -Recurse -File"));
-        assert!(command.contains("Get-ChildItem -LiteralPath $profilePath -Force -Recurse"));
-        assert!(command.contains("CreateEntry($profile.Name+'/')"));
-        assert!(command.contains("exit 42"));
+        let script = decode_powershell_command(&command);
+        assert!(!script.contains(profile));
+        assert!(!script.contains(backup));
+        assert!(script.contains("ZipFile]::Open"));
+        assert!(script.contains("-Force -Recurse -File"));
+        assert!(script.contains("Get-ChildItem -LiteralPath $profilePath -Force -Recurse"));
+        assert!(script.contains("CreateEntry($profile.Name+'/')"));
+        assert!(script.contains("exit 42"));
     }
 
     #[test]
@@ -261,14 +273,15 @@ mod tests {
         let profile = r"C:\Users\Agent\Profile";
         let backup = r"C:\Users\Agent\OPCOS\backup.zip";
         let command = powershell_extract_archive_command(backup, profile);
-        assert!(command.contains("Expand-Archive -LiteralPath $backupPath"));
-        assert!(command.contains("-DestinationPath $restorePath"));
-        assert!(command.contains("Move-Item -LiteralPath $profilePath"));
-        assert!(command.contains("$previousPath"));
-        assert!(command.contains("@(Get-ChildItem -LiteralPath $restorePath -Force)"));
-        assert!(command.contains("Get-ChildItem -LiteralPath $archiveRoot[0].FullName -Force"));
-        assert!(command.contains("Move-Item -LiteralPath $previousPath -Destination $profilePath"));
-        assert!(!command.contains("Expand-Archive -LiteralPath $profilePath"));
+        let script = decode_powershell_command(&command);
+        assert!(script.contains("Expand-Archive -LiteralPath $backupPath"));
+        assert!(script.contains("-DestinationPath $restorePath"));
+        assert!(script.contains("Move-Item -LiteralPath $profilePath"));
+        assert!(script.contains("$previousPath"));
+        assert!(script.contains("@(Get-ChildItem -LiteralPath $restorePath -Force)"));
+        assert!(script.contains("Get-ChildItem -LiteralPath $archiveRoot[0].FullName -Force"));
+        assert!(script.contains("Move-Item -LiteralPath $previousPath -Destination $profilePath"));
+        assert!(!script.contains("Expand-Archive -LiteralPath $profilePath"));
     }
 
     #[test]
@@ -292,5 +305,20 @@ mod tests {
                 "EmptyDirectory/",
             ]
         );
+    }
+
+    fn decode_powershell_command(command: &str) -> String {
+        let encoded = command
+            .split_once("-EncodedCommand ")
+            .expect("encoded PowerShell command")
+            .1;
+        let bytes = BASE64.decode(encoded).expect("valid command encoding");
+        String::from_utf16(
+            &bytes
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect::<Vec<_>>(),
+        )
+        .expect("valid UTF-16LE command")
     }
 }
