@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use opcos_hosts::{ComputerUseAction, Host, HostError, ScreenBounds, Screenshot};
+use opcos_hosts::{
+    ComputerUseAction, ComputerUseResponse, Host, HostError, ScreenBounds, Screenshot,
+};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -64,6 +66,7 @@ pub trait ComputerUseVerifier: Send + Sync {
         step: &ComputerUseStep,
         before: &Screenshot,
         after: &Screenshot,
+        response: &ComputerUseResponse,
     ) -> Result<bool, String>;
 }
 
@@ -74,11 +77,16 @@ pub struct ScreenshotChangedVerifier;
 impl ComputerUseVerifier for ScreenshotChangedVerifier {
     async fn verify(
         &self,
-        _step: &ComputerUseStep,
+        step: &ComputerUseStep,
         before: &Screenshot,
         after: &Screenshot,
+        response: &ComputerUseResponse,
     ) -> Result<bool, String> {
-        Ok(before.image != after.image)
+        Ok(match &step.action {
+            ComputerUseAction::CursorPosition => response.coordinate.is_some(),
+            ComputerUseAction::Screenshot | ComputerUseAction::Wait => response.ok,
+            _ => before.image != after.image,
+        })
     }
 }
 
@@ -113,10 +121,11 @@ pub async fn run_computer_use_loop(
             if started.elapsed() >= config.total_timeout {
                 return Err(ComputerUseLoopError::TimeLimit);
             }
-            host.computer_use(step.action.clone(), config.screen_bounds)
+            let response = host
+                .computer_use(step.action.clone(), config.screen_bounds)
                 .await?;
             let after = host.screenshot().await?;
-            match verifier.verify(step, &before, &after).await {
+            match verifier.verify(step, &before, &after, &response).await {
                 Ok(true) => {
                     results.push(ComputerUseStepResult {
                         step_index,
