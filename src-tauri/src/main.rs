@@ -17,8 +17,8 @@ use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use notify::Watcher;
 use opcos_assets::{
-    AssetBundle, InstructionSource, KnowledgeEntry, Playbook, SkillEntry,
-    discover as discover_assets, parse_blueprint,
+    AssetBundle, CommandArgument, CommandEntry, InstructionSource, KnowledgeEntry, Playbook,
+    SkillEntry, discover as discover_assets, expand_command, parse_blueprint, parse_command,
 };
 use opcos_engine::{
     AcpHarness, AcpHarnessConfig, AgentEngine, EngineError, Harness, OpenCodeHarness,
@@ -4385,6 +4385,71 @@ fn seed_builtin_templates(connection: &Connection) -> Result<(), String> {
             &json!(content),
         )?;
     }
+    let opc_knowledge = [
+        (
+            "template-knowledge-opcos-hosts",
+            "OPCOS Host 使用边界",
+            "LocalHost 与 RVM 的能力边界、路径和失败语义。",
+            r#"# OPCOS Host 使用边界
+
+- LocalHost 负责本机 workspace 的文件、命令、结构化 stdio 和本地进程生命周期。
+- RVM 只通过 Host 抽象访问远端；远端不可用时必须报告明确错误，不能静默改跑本机。
+- 远端路径使用 Host 的路径代数和 containment 检查，不用本机路径规范化猜测远端位置。
+- 凭据只通过 Authorization Bearer header 或 SecretStore 的受控引用传递，不写入 URL、日志、提示词或仓库。
+- MCP server 的仓库声明只表示“已发现”，默认 disabled；启用必须由用户明确选择。
+"#,
+        ),
+        (
+            "template-knowledge-opcos-windows-ime",
+            "Windows 中文输入法空格排查",
+            "Computer Use 在 Windows 中文输入法下输入空格可能被吞掉时的排查办法。",
+            r#"# Windows 中文输入法空格排查
+
+在 Windows 中文输入法处于中文模式时，Computer Use 的空格输入可能被输入法吞掉、转换为候选操作，或没有进入目标控件。
+
+1. 先确认焦点确实在目标编辑控件。
+2. 检查当前输入法中英文状态；需要稳定输入时切换到英文模式再发送文本。
+3. 对包含空格的内容，分段输入并在界面中读取结果确认空格实际存在。
+4. 不要仅凭“按键事件已发送”声称文本正确；应通过读取控件或截图核对。
+5. 若仍失败，明确报告输入法状态和复现步骤，不要静默改写用户文本。
+"#,
+        ),
+        (
+            "template-knowledge-opcos-local-gates",
+            "OPCOS 本地验证优先",
+            "不依赖远端 CI 结论的本地构建、测试和交付原则。",
+            r#"# OPCOS 本地验证优先
+
+- 修改后优先在绑定 Host 上运行仓库规定的格式化、lint、类型检查、构建和测试。
+- 每条门禁都记录实际命令、退出结果和环境限制；未运行不等于通过。
+- GitHub API 可用于读取 PR、分支和 CI 状态，但外部状态不能替代本地可复现验证。
+- 失败应保留证据并修复根因；不要通过跳过门禁、吞掉错误或修改测试来制造绿色结果。
+"#,
+        ),
+        (
+            "template-knowledge-opcos-coordination",
+            "OPCOS 本地协同协议",
+            "OPCOS Leader/Worker 星型协同、消息协议和真实交付判据。",
+            r#"# OPCOS 本地协同协议
+
+- `sort_order == 0` 的角色是 Leader，其余是 Worker；只允许 Leader→Worker 派发、Worker→Leader 回传。
+- 协同消息使用 `[[COORD]]` 结构化信封，Worker 之间不得直接通信。
+- 模型工具只能让当前 builtin Leader 派发给已存在的 builtin Worker，不创建 session，也不递归派生。
+- Worker 自述结果只能是 `worker_reported` 或 `awaiting_verification`，不是完成证据。
+- 真实交付必须由分支、push、PR repository/head 和 GitHub API 核实；验收后才能进入 Done。
+"#,
+        ),
+    ];
+    for (id, name, description, content) in opc_knowledge {
+        seed_builtin_template(
+            connection,
+            id,
+            "knowledge",
+            name,
+            description,
+            &json!(content),
+        )?;
+    }
     let runbooks = [
         (
             "template-runbook-new-feature",
@@ -4416,6 +4481,57 @@ fn seed_builtin_templates(connection: &Connection) -> Result<(), String> {
         ),
     ];
     for (id, name, description, content) in runbooks {
+        seed_builtin_template(
+            connection,
+            id,
+            "runbook",
+            name,
+            description,
+            &json!(content),
+        )?;
+    }
+    let opc_runbooks = [
+        (
+            "template-runbook-opcos-rvm",
+            "在 OPCOS Host 上执行任务",
+            "选择 LocalHost 或 RVM 并以显式失败语义执行开发任务。",
+            r#"# 在 OPCOS Host 上执行任务
+
+1. 确认 session 绑定的 Host、workspace 和仓库边界。
+2. LocalHost 任务使用本机 Host；RVM 任务使用远端 Host 的路径和能力。
+3. 执行前检查所需 capability；缺失时返回明确错误，不切换到另一台 Host。
+4. 对文件变更、命令结果和进程退出状态保留有界证据。
+5. 完成后运行仓库门禁，并报告实际结果和未解决限制。
+"#,
+        ),
+        (
+            "template-runbook-opcos-coordination",
+            "派发并验收 OPCOS 协同任务",
+            "使用本地 Leader/Worker 协同并保留 Worker 自述与客观验证的区别。",
+            r#"# 派发并验收 OPCOS 协同任务
+
+1. 由当前 builtin Leader 选择已存在的 Worker role；Worker 不得派发子任务。
+2. 使用 `coordination_dispatch` 后立即记录 task id 和 pending 状态，不阻塞等待。
+3. 使用 `coordination_status` 查看有界回报，并尊重建议的下次查询时间。
+4. Worker 回报只作为线索；检查真实 branch、push、PR API、head 和 repository。
+5. 只有验证通过并完成必要验收后，才将协同任务视为 Done。
+"#,
+        ),
+        (
+            "template-runbook-opcos-local-release",
+            "OPCOS 本地构建与交付",
+            "从本地门禁到可审查 GitHub 交付的重复流程。",
+            r#"# OPCOS 本地构建与交付
+
+1. 从最新目标分支创建任务分支，检查状态和完整 diff。
+2. 在本地 Host 运行 Rust 和前端格式化、lint、类型检查、构建和测试。
+3. 修复失败根因，确认没有凭据、临时文件或无关改动。
+4. 显式暂存相关文件并创建单一目的提交。
+5. 推送分支后核对远端 commit、PR repository/head 和实际 diff。
+"#,
+        ),
+    ];
+    for (id, name, description, content) in opc_runbooks {
         seed_builtin_template(
             connection,
             id,
@@ -4465,6 +4581,25 @@ description: 为新行为和缺陷修复设计覆盖正常、失败及边界条�
     ];
     for (id, name, description, content) in skills {
         seed_builtin_template(connection, id, "skill", name, description, &json!(content))?;
+    }
+    let commands = [
+        (
+            "template-command-verify",
+            "/verify",
+            "展开为一份明确的本地验证请求；命令本身不执行任何动作。",
+            "请按 {{scope}} 范围检查当前仓库：先确认变更范围，再运行项目已有的格式化、静态检查、类型检查、构建和测试门禁。只报告实际执行结果，不把未运行的检查写成通过。",
+            json!([{"name":"scope","type":"string","required":true}]),
+        ),
+        (
+            "template-command-review",
+            "/review-change",
+            "展开为一份聚焦风险和证据的代码审查请求；命令本身不执行任何动作。",
+            "请审查当前变更，重点检查 {{focus}}、错误路径、边界条件、凭据安全和测试覆盖。按文件位置给出可复现证据；没有问题时说明检查过的风险面。",
+            json!([{"name":"focus","type":"string","required":true}]),
+        ),
+    ];
+    for (id, name, description, body, arguments) in commands {
+        seed_builtin_command(connection, id, name, description, body, &arguments)?;
     }
     let mcp_servers = [
         (
@@ -4595,6 +4730,31 @@ fn seed_builtin_template(
                 now,
                 metadata
             ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn seed_builtin_command(
+    connection: &Connection,
+    id: &str,
+    name: &str,
+    description: &str,
+    body: &str,
+    arguments: &Value,
+) -> Result<(), String> {
+    seed_builtin_template(connection, id, "command", name, description, &json!(body))?;
+    let metadata = serde_json::to_string(&json!({
+        "description": description,
+        "arguments": arguments
+    }))
+    .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "UPDATE config_object_version
+             SET metadata_json=?1
+             WHERE id=?2 AND object_id=?3",
+            params![metadata, format!("{id}:v1"), id],
         )
         .map_err(|error| error.to_string())?;
     Ok(())
@@ -4744,6 +4904,7 @@ fn builtin_slash_commands() -> Vec<(&'static str, &'static str)> {
 fn effective_slash_commands(
     connection: &Connection,
     project_id: Option<&str>,
+    repo_scope: Option<&str>,
 ) -> Result<Vec<Value>, String> {
     let mut commands = builtin_slash_commands()
         .into_iter()
@@ -4763,6 +4924,9 @@ fn effective_slash_commands(
     let mut scopes = vec!["global".to_owned()];
     if let Some(project_id) = project_id {
         scopes.push(format!("project:{project_id}"));
+    }
+    if let Some(repo_scope) = repo_scope {
+        scopes.push(repo_scope.to_owned());
     }
     for scope in scopes {
         let mut statement = connection
@@ -4795,6 +4959,58 @@ fn effective_slash_commands(
             );
         }
     }
+    let has_config_objects: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='config_object')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if has_config_objects {
+        let mut statement = connection
+            .prepare(
+                "SELECT o.name,v.content,v.metadata_json,o.scope_kind,COALESCE(o.scope_key,'')
+                 FROM config_object o
+                 JOIN config_object_version v ON v.id=o.current_version_id
+                 WHERE o.kind='command' AND o.status IN ('active','builtin')
+                   AND (o.scope_kind='global'
+                        OR (o.scope_kind='project' AND o.scope_key=?1)
+                        OR (o.scope_kind='repo' AND o.scope_key=?2)
+                        OR (o.scope_kind='global' AND o.scope_key=?2))
+                 ORDER BY CASE
+                    WHEN o.scope_kind='global' AND o.scope_key IS NULL THEN 0
+                    WHEN o.scope_kind='project' THEN 1
+                    ELSE 2
+                 END, o.id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                params![project_id.unwrap_or_default(), repo_scope.unwrap_or_default()],
+                |row| {
+                    let name: String = row.get(0)?;
+                    let content: String = row.get(1)?;
+                    let metadata = serde_json::from_str::<Value>(&row.get::<_, String>(2)?)
+                        .unwrap_or_else(|_| json!({}));
+                    Ok((
+                        name,
+                        json!({
+                            "name": row.get::<_, String>(0)?,
+                            "kind": "command",
+                            "body": content,
+                            "scope": format!("{}:{}", row.get::<_, String>(3)?, row.get::<_, String>(4)?),
+                            "description": metadata.get("description").and_then(Value::as_str).unwrap_or(""),
+                            "arguments": metadata.get("arguments").cloned().unwrap_or_else(|| json!([]))
+                        }),
+                    ))
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            let (name, command) = row.map_err(|error| error.to_string())?;
+            commands.insert(name, command);
+        }
+    }
     let mut result = commands.into_values().collect::<Vec<_>>();
     result.sort_by(|a, b| {
         a.get("name")
@@ -4807,6 +5023,7 @@ fn effective_slash_commands(
 fn expand_slash_command(
     connection: &Connection,
     project_id: Option<&str>,
+    repo_scope: Option<&str>,
     text: &str,
 ) -> Result<String, String> {
     let trimmed = text.trim_start();
@@ -4816,7 +5033,7 @@ fn expand_slash_command(
     if !command_name.starts_with('/') {
         return Ok(text.to_owned());
     }
-    let Some(command) = effective_slash_commands(connection, project_id)?
+    let Some(command) = effective_slash_commands(connection, project_id, repo_scope)?
         .into_iter()
         .find(|command| command.get("name").and_then(Value::as_str) == Some(command_name))
     else {
@@ -4827,6 +5044,35 @@ fn expand_slash_command(
         .and_then(Value::as_str)
         .ok_or_else(|| "slash command body is invalid".to_owned())?;
     let remainder = trimmed[command_name.len()..].trim();
+    if command.get("kind").and_then(Value::as_str) == Some("command") {
+        let arguments = command
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        let arguments = serde_json::from_value::<Vec<CommandArgument>>(arguments)
+            .map_err(|error| format!("command arguments are invalid: {error}"))?;
+        let mut values = HashMap::new();
+        for token in remainder.split_whitespace() {
+            let Some((name, value)) = token.split_once('=') else {
+                return Err(format!(
+                    "command argument must use name=value syntax: {token}"
+                ));
+            };
+            values.insert(name.to_owned(), value.to_owned());
+        }
+        let command = CommandEntry {
+            name: command_name.to_owned(),
+            description: command
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            arguments,
+            body: body.to_owned(),
+            path: command_name.to_owned(),
+        };
+        return expand_command(&command, &values).map_err(|error| error.to_string());
+    }
     if remainder.is_empty() {
         Ok(body.to_owned())
     } else {
@@ -5136,6 +5382,7 @@ fn migrate_config_objects(connection: &mut Connection) -> Result<(), String> {
             "knowledge" => "knowledge",
             "playbook" => "runbook",
             "skill" => "skill",
+            "command" => "command",
             other => {
                 return Err(format!(
                     "config object migration encountered unknown asset kind '{other}' for asset '{legacy_id}'"
@@ -9638,12 +9885,22 @@ async fn submit_turn(
     mut request: SubmitRequest,
 ) -> Result<(), String> {
     let session = session_for(&state, &request.session_id)?;
+    let repo_scope = session
+        .project_id
+        .as_deref()
+        .and_then(|project_id| state.store.load_project(project_id).ok().flatten())
+        .map(|project| format!("repo:{}", project.repo_root));
     request.text = {
         let connection = state
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?;
-        expand_slash_command(&connection, session.project_id.as_deref(), &request.text)?
+        expand_slash_command(
+            &connection,
+            session.project_id.as_deref(),
+            repo_scope.as_deref(),
+            &request.text,
+        )?
     };
     if session.harness == "opencode" {
         return submit_opencode_turn(app, state, request).await;
@@ -10726,6 +10983,7 @@ fn list_assets(
     let kind = kind.map(|kind| match kind.as_str() {
         "agents" => "rules".to_owned(),
         "playbook" => "runbook".to_owned(),
+        "command" => "command".to_owned(),
         other => other.to_owned(),
     });
     let connection = state
@@ -10836,6 +11094,7 @@ fn save_template(
             | "rules"
             | "knowledge"
             | "runbook"
+            | "command"
             | "mcp"
             | "connector"
             | "acp-agent"
@@ -10846,6 +11105,23 @@ fn save_template(
     if name.trim().is_empty() {
         return Err("template name cannot be empty".into());
     }
+    let mut content = content;
+    let command_metadata = if kind == "command" {
+        let command = parse_command(&name, &content).map_err(|error| error.to_string())?;
+        if command.name != name {
+            return Err(format!(
+                "command frontmatter name '{}' does not match template name '{}'",
+                command.name, name
+            ));
+        }
+        content = command.body;
+        Some(json!({
+            "arguments": command.arguments,
+            "description": command.description
+        }))
+    } else {
+        None
+    };
     if matches!(kind.as_str(), "agent-template" | "team-template") {
         serde_json::from_str::<Value>(&content)
             .map_err(|error| format!("template content must be valid JSON: {error}"))?;
@@ -10872,8 +11148,16 @@ fn save_template(
         return Err("builtin templates are read-only; save a copy with a new name".into());
     }
     let now = Utc::now().to_rfc3339();
-    let metadata = serde_json::to_string(&json!({"description":description}))
-        .map_err(|error| error.to_string())?;
+    let mut metadata_value = json!({"description":description});
+    if let Some(command_metadata) = command_metadata
+        && let (Some(target), Some(source)) =
+            (metadata_value.as_object_mut(), command_metadata.as_object())
+    {
+        for (key, value) in source {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    let metadata = serde_json::to_string(&metadata_value).map_err(|error| error.to_string())?;
     let version: i64 = connection
         .query_row(
             "SELECT COALESCE(MAX(version),0)+1 FROM config_object_version WHERE object_id=?1",
@@ -11200,6 +11484,7 @@ fn repository_template_paths(
         "rules" => (".".to_owned(), "AGENTS.md".to_owned()),
         "knowledge" => (".agents/knowledge".to_owned(), format!("{slug}.md")),
         "runbook" => (".agents/playbooks".to_owned(), format!("{slug}.md")),
+        "command" => (".agents/commands".to_owned(), format!("{slug}.md")),
         "skill" => (format!(".agents/skills/{slug}"), "SKILL.md".to_owned()),
         "blueprint" => (".devin".to_owned(), "blueprint.yaml".to_owned()),
         other => {
@@ -11399,6 +11684,89 @@ async fn import_repository_templates(
             conflicts.push(json!({"name":name,"reason":"同名内置或用户自定义模板已存在"}));
         } else {
             imported.push(json!({"name":name,"kind":"runbook","status":status}));
+        }
+    }
+    for command in bundle.commands {
+        let name = command.name.clone();
+        let metadata = serde_json::json!({
+            "description": command.description,
+            "arguments": command.arguments,
+            "path": command.path
+        })
+        .to_string();
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let status = import_repository_record(
+            &connection,
+            "command",
+            &name,
+            &command.description,
+            &command.body,
+            &repo_scope,
+            &command.path,
+        )?;
+        if status != "conflict" {
+            let object_id: Option<String> = connection
+                .query_row(
+                    "SELECT id FROM config_object
+                     WHERE kind='command' AND name=?1 AND scope_kind='global' AND scope_key=?2",
+                    params![name, repo_scope],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if let Some(object_id) = object_id {
+                let version_id: String = connection
+                    .query_row(
+                        "SELECT current_version_id FROM config_object WHERE id=?1",
+                        [&object_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                connection
+                    .execute(
+                        "UPDATE config_object_version SET metadata_json=?1 WHERE id=?2",
+                        params![metadata, version_id],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        if status == "conflict" {
+            conflicts.push(json!({"name":name,"reason":"同名内置或用户自定义模板已存在"}));
+        } else {
+            imported.push(json!({"name":name,"kind":"command","status":status}));
+        }
+    }
+    for server in bundle.mcp_servers {
+        let name = format!("{repository_prefix}: {}", server.name);
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let status = import_repository_record(
+            &connection,
+            "mcp",
+            &name,
+            &json!({"enabled":false,"path":server.path}).to_string(),
+            &server.content,
+            &repo_scope,
+            &server.path,
+        )?;
+        if status != "conflict" {
+            connection
+                .execute(
+                    "UPDATE config_object SET status='disabled'
+                     WHERE kind='mcp' AND name=?1 AND scope_kind='global' AND scope_key=?2",
+                    params![name, repo_scope],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        if status == "conflict" {
+            conflicts.push(json!({"name":name,"reason":"同名内置或用户自定义模板已存在"}));
+        } else {
+            imported.push(json!({"name":name,"kind":"mcp","status":status,"enabled":false}));
         }
     }
     Ok(json!({"imported":imported,"rejected":rejected,"conflicts":conflicts}))
@@ -11755,6 +12123,7 @@ fn save_asset(
             | "knowledge"
             | "playbook"
             | "skill"
+            | "command"
             | "agents"
             | "mcp"
             | "acp-agent"
@@ -11766,6 +12135,23 @@ fn save_asset(
     if kind == "mcp" {
         validate_mcp_content(&body)?;
     }
+    let mut body = body;
+    let command_metadata = if kind == "command" {
+        let command = parse_command(&id, &body).map_err(|error| error.to_string())?;
+        if command.name != title {
+            return Err(format!(
+                "command frontmatter name '{}' does not match title '{}'",
+                command.name, title
+            ));
+        }
+        body = command.body;
+        Some(json!({
+            "description": command.description,
+            "arguments": command.arguments
+        }))
+    } else {
+        None
+    };
     let id = if kind == "instructions" {
         "global-instructions".to_owned()
     } else {
@@ -11827,11 +12213,19 @@ fn save_asset(
             ],
         )
         .map_err(|error| error.to_string())?;
-    let metadata = serde_json::to_string(&json!({
+    let mut metadata_value = json!({
         "trigger": trigger.unwrap_or_default(),
         "scope": scope_key.clone().unwrap_or_default()
-    }))
-    .map_err(|error| error.to_string())?;
+    });
+    if let Some(command_metadata) = command_metadata
+        && let (Some(target), Some(source)) =
+            (metadata_value.as_object_mut(), command_metadata.as_object())
+    {
+        for (key, value) in source {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    let metadata = serde_json::to_string(&metadata_value).map_err(|error| error.to_string())?;
     let hash = content_hash(&body);
     let existing: Option<String> = transaction
         .query_row(
@@ -12131,16 +12525,36 @@ async fn export_assets(
                 format!(".agents/skills/{}", repository_template_slug(&title)),
                 "SKILL.md".to_owned(),
             ),
+            "command" => (
+                ".agents/commands".to_owned(),
+                format!("{}.md", repository_template_slug(&title)),
+            ),
             _ => continue,
         };
         let metadata = serde_json::from_str::<Value>(&metadata_json).unwrap_or_else(|_| json!({}));
-        let trigger = metadata
-            .get("trigger")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let content = format!(
-            "---\nid: {id}\nname: {title}\ntrigger: {trigger}\nscope: {scope}\n---\n{body}\n"
-        );
+        let content = if kind == "command" {
+            let frontmatter = serde_yaml::to_string(&json!({
+                "name": title,
+                "description": metadata
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                "arguments": metadata
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!([]))
+            }))
+            .map_err(|error| format!("command export failed: {error}"))?;
+            format!("---\n{frontmatter}---\n{body}\n")
+        } else {
+            let trigger = metadata
+                .get("trigger")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            format!(
+                "---\nid: {id}\nname: {title}\ntrigger: {trigger}\nscope: {scope}\n---\n{body}\n"
+            )
+        };
         client
             .write(&format!("{workspace}/{directory}/{filename}"), &content)
             .await
@@ -12260,6 +12674,81 @@ async fn import_assets(
                     item.body,
                     content_hash(&item.body),
                     Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    for item in &bundle.commands {
+        let object_id = format!("config:command:{}", item.name);
+        let version_id = format!("{object_id}:v1");
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO config_object
+                 (id,kind,name,scope_kind,scope_key,status,created_at,current_version_id)
+                 VALUES (?1,'command',?2,'repo',?3,'active',?4,?5)",
+                params![
+                    object_id,
+                    item.name,
+                    workspace,
+                    Utc::now().to_rfc3339(),
+                    version_id
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO config_object_version
+                 (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+                 VALUES (?1,?2,1,?3,?4,?5,'imported',?6)",
+                params![
+                    version_id,
+                    object_id,
+                    item.body,
+                    content_hash(&item.body),
+                    Utc::now().to_rfc3339(),
+                    serde_json::to_string(&json!({
+                        "description": item.description,
+                        "arguments": item.arguments,
+                        "path": item.path
+                    }))
+                    .map_err(|error| error.to_string())?
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    for item in &bundle.mcp_servers {
+        let object_id = format!("config:mcp:{}", item.name);
+        let version_id = format!("{object_id}:v1");
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO config_object
+                 (id,kind,name,scope_kind,scope_key,status,created_at,current_version_id)
+                 VALUES (?1,'mcp',?2,'repo',?3,'disabled',?4,?5)",
+                params![
+                    object_id,
+                    item.name,
+                    workspace,
+                    Utc::now().to_rfc3339(),
+                    version_id
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO config_object_version
+                 (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+                 VALUES (?1,?2,1,?3,?4,?5,'discovered-disabled',?6)",
+                params![
+                    version_id,
+                    object_id,
+                    item.content,
+                    content_hash(&item.content),
+                    Utc::now().to_rfc3339(),
+                    serde_json::to_string(&json!({
+                        "path": item.path,
+                        "enabled": false
+                    }))
+                    .map_err(|error| error.to_string())?
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -18117,7 +18606,7 @@ fn list_slash_commands(
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?;
-    effective_slash_commands(&connection, project_id.as_deref())
+    effective_slash_commands(&connection, project_id.as_deref(), None)
 }
 
 #[tauri::command]
@@ -19038,12 +19527,13 @@ mod m7_tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(builtin_count, 20);
+        assert_eq!(builtin_count, 29);
         for kind in [
             "rules",
             "knowledge",
             "runbook",
             "skill",
+            "command",
             "mcp",
             "connector",
             "acp-agent",
@@ -19058,6 +19548,61 @@ mod m7_tests {
                 )
                 .unwrap();
             assert!(count > 0, "expected builtin preset for {kind}");
+        }
+    }
+
+    #[test]
+    fn seeded_opcos_assets_exclude_external_credentials_and_product_endpoints() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE config_object (
+                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+                   server_key TEXT, scope_kind TEXT NOT NULL, scope_key TEXT,
+                   status TEXT NOT NULL, created_at TEXT NOT NULL,
+                   current_version_id TEXT
+                 );
+                 CREATE TABLE config_object_version (
+                   id TEXT PRIMARY KEY, object_id TEXT NOT NULL, version INTEGER NOT NULL,
+                   content TEXT NOT NULL, content_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+                   note TEXT NOT NULL, metadata_json TEXT NOT NULL,
+                   UNIQUE(object_id,version)
+                 );",
+            )
+            .unwrap();
+        seed_builtin_templates(&connection).unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT v.content,v.metadata_json
+                 FROM config_object o
+                 JOIN config_object_version v ON v.id=o.current_version_id
+                 WHERE o.status='builtin'",
+            )
+            .unwrap();
+        let values = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for (content, metadata) in values {
+            let combined = format!("{content}\n{metadata}").to_ascii_lowercase();
+            for marker in [
+                "devin.ai",
+                "api.devin",
+                "cog_",
+                "cloud-dev",
+                "token=",
+                "password=",
+                "secret=",
+                "user:pass@",
+            ] {
+                assert!(
+                    !combined.contains(marker),
+                    "seed contains forbidden marker {marker}"
+                );
+            }
         }
     }
 
@@ -20423,17 +20968,50 @@ agents:
             )
             .unwrap();
         assert_eq!(
-            expand_slash_command(&connection, Some("p1"), "/review 查登录流程").unwrap(),
+            expand_slash_command(&connection, Some("p1"), None, "/review 查登录流程").unwrap(),
             "项目审查模板\n\n查登录流程"
         );
         assert_eq!(
-            expand_slash_command(&connection, Some("p1"), "/custom").unwrap(),
+            expand_slash_command(&connection, Some("p1"), None, "/custom").unwrap(),
             "自定义模板"
         );
         assert_eq!(
-            expand_slash_command(&connection, Some("p1"), "普通消息").unwrap(),
+            expand_slash_command(&connection, Some("p1"), None, "普通消息").unwrap(),
             "普通消息"
         );
+    }
+
+    #[test]
+    fn builtin_parameterized_commands_expand_only_after_explicit_user_invocation() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE config_object (
+                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+                   server_key TEXT, scope_kind TEXT NOT NULL, scope_key TEXT,
+                   status TEXT NOT NULL, created_at TEXT NOT NULL,
+                   current_version_id TEXT
+                 );
+                 CREATE TABLE config_object_version (
+                   id TEXT PRIMARY KEY, object_id TEXT NOT NULL, version INTEGER NOT NULL,
+                   content TEXT NOT NULL, content_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+                   note TEXT NOT NULL, metadata_json TEXT NOT NULL,
+                   UNIQUE(object_id,version)
+                 );
+                 CREATE TABLE slash_commands (
+                   scope TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL,
+                   body TEXT NOT NULL, updated_at TEXT NOT NULL,
+                   PRIMARY KEY(scope,name)
+                 );",
+            )
+            .unwrap();
+        seed_builtin_templates(&connection).unwrap();
+        let expanded =
+            expand_slash_command(&connection, None, None, "/verify scope=backend").unwrap();
+        assert!(expanded.contains("backend"));
+        assert!(expand_slash_command(&connection, None, None, "/verify").is_err());
+        assert!(expand_slash_command(&connection, None, None, "/verify typo=x").is_err());
+        assert!(!expanded.contains("run_shell"));
     }
 
     #[test]
@@ -20452,7 +21030,7 @@ agents:
                 [],
             )
             .unwrap();
-        let commands = effective_slash_commands(&connection, None).unwrap();
+        let commands = effective_slash_commands(&connection, None, None).unwrap();
         for name in [
             "/implement",
             "/plan",

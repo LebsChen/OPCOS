@@ -18,6 +18,8 @@ pub struct AssetBundle {
     pub knowledge: Vec<KnowledgeEntry>,
     pub playbook: Option<Playbook>,
     pub skills: Vec<SkillEntry>,
+    pub commands: Vec<CommandEntry>,
+    pub mcp_servers: Vec<McpServerEntry>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -47,6 +49,38 @@ pub struct SkillEntry {
     pub path: String,
     pub content: String,
     pub active: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CommandArgument {
+    pub name: String,
+    #[serde(rename = "type", default = "default_argument_type")]
+    pub argument_type: String,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub default: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CommandEntry {
+    pub name: String,
+    pub description: String,
+    pub arguments: Vec<CommandArgument>,
+    pub body: String,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct McpServerEntry {
+    pub name: String,
+    pub path: String,
+    pub content: String,
+    pub enabled: bool,
+}
+
+fn default_argument_type() -> String {
+    "string".to_owned()
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -160,6 +194,102 @@ pub fn parse_skill(path: &str, markdown: &str) -> SkillEntry {
     }
 }
 
+pub fn parse_command(path: &str, markdown: &str) -> Result<CommandEntry, AssetError> {
+    let Some(rest) = markdown.strip_prefix("---\n") else {
+        return Err(AssetError::Invalid(format!(
+            "command {path} is missing YAML frontmatter"
+        )));
+    };
+    let Some(end) = rest.find("\n---") else {
+        return Err(AssetError::Invalid(format!(
+            "command {path} has unterminated YAML frontmatter"
+        )));
+    };
+    #[derive(Deserialize)]
+    struct Frontmatter {
+        name: String,
+        #[serde(default)]
+        description: String,
+        #[serde(default)]
+        arguments: Vec<CommandArgument>,
+    }
+    let frontmatter: Frontmatter = serde_yaml::from_str(&rest[..end])
+        .map_err(|error| AssetError::Invalid(format!("command {path}: {error}")))?;
+    if frontmatter.name.trim().is_empty() {
+        return Err(AssetError::Invalid(format!(
+            "command {path} has an empty name"
+        )));
+    }
+    let body = rest[end + 4..].trim_start_matches('\n').to_owned();
+    let declared = frontmatter
+        .arguments
+        .iter()
+        .map(|argument| argument.name.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut cursor = body.as_str();
+    while let Some(start) = cursor.find("{{") {
+        let after = &cursor[start + 2..];
+        let Some(end) = after.find("}}") else {
+            return Err(AssetError::Invalid(format!(
+                "command {} has an unterminated template variable",
+                frontmatter.name
+            )));
+        };
+        let variable = after[..end].trim();
+        if variable.is_empty() || !declared.contains(variable) {
+            return Err(AssetError::Invalid(format!(
+                "command {} references undeclared variable '{variable}'",
+                frontmatter.name
+            )));
+        }
+        cursor = &after[end + 2..];
+    }
+    Ok(CommandEntry {
+        name: frontmatter.name,
+        description: frontmatter.description,
+        arguments: frontmatter.arguments,
+        body,
+        path: path.to_owned(),
+    })
+}
+
+pub fn expand_command(
+    command: &CommandEntry,
+    values: &std::collections::HashMap<String, String>,
+) -> Result<String, AssetError> {
+    let declared = command
+        .arguments
+        .iter()
+        .map(|argument| (argument.name.as_str(), argument))
+        .collect::<std::collections::HashMap<_, _>>();
+    if let Some(unknown) = values
+        .keys()
+        .find(|name| !declared.contains_key(name.as_str()))
+    {
+        return Err(AssetError::Invalid(format!(
+            "command argument is unknown: {unknown}"
+        )));
+    }
+    let mut rendered = command.body.clone();
+    for argument in &command.arguments {
+        let value = values
+            .get(&argument.name)
+            .cloned()
+            .or_else(|| argument.default.clone());
+        let Some(value) = value else {
+            if argument.required {
+                return Err(AssetError::Invalid(format!(
+                    "command argument missing: {}",
+                    argument.name
+                )));
+            }
+            continue;
+        };
+        rendered = rendered.replace(&format!("{{{{{}}}}}", argument.name), &value);
+    }
+    Ok(rendered)
+}
+
 fn split_frontmatter(markdown: &str) -> (std::collections::HashMap<String, String>, &str) {
     let mut values = std::collections::HashMap::new();
     let Some(rest) = markdown.strip_prefix("---\n") else {
@@ -214,6 +344,8 @@ pub async fn discover<R: RemoteAssetReader>(
         ".agents/skills",
         ".agents/knowledge",
         ".agents/playbooks",
+        ".agents/commands",
+        ".agents/mcp",
     ] {
         let root = join_remote_path(workspace, path);
         let _ = discover_tree(reader, &root, &mut bundle).await;
@@ -251,6 +383,25 @@ async fn discover_tree<R: RemoteAssetReader>(
                 if let Ok(content) = reader.read(&child).await {
                     bundle.playbook = Some(parse_playbook(&child, &content));
                 }
+            } else if child.replace('\\', "/").contains("/.agents/commands/")
+                && name.ends_with(".md")
+            {
+                let content = reader.read(&child).await?;
+                bundle.commands.push(parse_command(&child, &content)?);
+            } else if child.replace('\\', "/").contains("/.agents/mcp/")
+                && (name.ends_with(".json") || name.ends_with(".yaml") || name.ends_with(".yml"))
+            {
+                let content = reader.read(&child).await?;
+                bundle.mcp_servers.push(McpServerEntry {
+                    name: name
+                        .trim_end_matches(".json")
+                        .trim_end_matches(".yaml")
+                        .trim_end_matches(".yml")
+                        .to_owned(),
+                    path: child,
+                    content,
+                    enabled: false,
+                });
             } else if (child.replace('\\', "/").contains("/.cursor/rules/")
                 || name.ends_with(".md"))
                 && let Ok(content) = reader.read(&child).await
@@ -297,6 +448,8 @@ mod tests {
                 content: "skill".into(),
                 active: true,
             }],
+            commands: Vec::new(),
+            mcp_servers: Vec::new(),
         };
         let rendered = bundle.system_instructions();
         assert!(rendered.find("global").unwrap() < rendered.find("agents").unwrap());
@@ -321,6 +474,62 @@ mod tests {
         );
         assert_eq!(skill.name, "review");
         assert!(skill.content.contains("Check the diff."));
+    }
+
+    #[test]
+    fn commands_require_declared_arguments_and_expand_without_execution() {
+        let command = parse_command(
+            ".agents/commands/verify.md",
+            "---\nname: verify\ndescription: Verify\narguments:\n  - name: scope\n    required: true\n---\nRun {{scope}} checks.",
+        )
+        .unwrap();
+        let values = [("scope".to_owned(), "backend".to_owned())]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            expand_command(&command, &values).unwrap(),
+            "Run backend checks."
+        );
+        assert!(expand_command(&command, &std::collections::HashMap::new()).is_err());
+        assert!(
+            expand_command(
+                &command,
+                &[("typo".to_owned(), "x".to_owned())].into_iter().collect()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn command_parser_rejects_undeclared_template_variables() {
+        let error = parse_command(
+            ".agents/commands/bad.md",
+            "---\nname: bad\n---\nRun {{missing}}.",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("undeclared variable"));
+    }
+
+    #[test]
+    fn commands_and_mcp_discovery_are_not_active_system_instructions() {
+        let bundle = AssetBundle {
+            commands: vec![CommandEntry {
+                name: "verify".into(),
+                description: "verify".into(),
+                arguments: Vec::new(),
+                body: "run checks".into(),
+                path: ".agents/commands/verify.md".into(),
+            }],
+            mcp_servers: vec![McpServerEntry {
+                name: "remote".into(),
+                path: ".agents/mcp/remote.json".into(),
+                content: "{}".into(),
+                enabled: false,
+            }],
+            ..AssetBundle::default()
+        };
+        assert!(!bundle.system_instructions().contains("run checks"));
+        assert!(!bundle.mcp_servers[0].enabled);
     }
 
     #[test]
