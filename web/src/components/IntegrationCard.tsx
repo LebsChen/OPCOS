@@ -25,7 +25,7 @@ export function IntegrationCard({
   const clickable = Boolean(onClick) && !disabled;
   return (
     <div
-      className={`rounded-xl border border-line bg-panel px-3.5 py-3 transition-colors ${
+      className={`w-full max-w-[440px] rounded-xl border border-line bg-panel px-3.5 py-3 transition-colors ${
         clickable ? "cursor-pointer hover:border-lineStrong" : ""
       } ${disabled ? "opacity-60" : ""}`}
       onClick={clickable ? onClick : undefined}
