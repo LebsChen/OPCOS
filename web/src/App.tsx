@@ -150,6 +150,12 @@ type MarketTemplate = {
   version: number;
   readonly: boolean;
 };
+type ProjectConfigurationTemplate = MarketTemplate & {
+  template_id: string;
+  source: string;
+  applied: boolean;
+  modified: boolean;
+};
 const TOKEN_CONNECTOR_KINDS = [
   "github",
   "telegram",
@@ -1162,6 +1168,9 @@ function ProjectConfigPanel({
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [configurationTemplates, setConfigurationTemplates] = useState<
+    ProjectConfigurationTemplate[]
+  >([]);
   const [secretName, setSecretName] = useState("");
   const [secretPurpose, setSecretPurpose] = useState("");
   const [secretValue, setSecretValue] = useState("");
@@ -1181,6 +1190,11 @@ function ProjectConfigPanel({
     ]);
     setAssets(nextAssets);
     setSecrets(nextSecrets);
+    const nextTemplates = await command<ProjectConfigurationTemplate[]>(
+      "list_project_configuration_templates",
+      { projectId: project.id },
+    );
+    setConfigurationTemplates(nextTemplates);
   };
   useEffect(() => {
     void load().catch(onError);
@@ -1206,6 +1220,30 @@ function ProjectConfigPanel({
       .then(onRefresh)
       .then(reset)
       .catch(onError);
+  };
+  const toggleConfigurationTemplate = async (
+    template: ProjectConfigurationTemplate,
+    enabled: boolean,
+  ) => {
+    if (
+      !enabled &&
+      !window.confirm(
+        `将删除项目作用域配置「${template.name}」，已本地修改的内容也会被删除。确定继续吗？`,
+      )
+    ) {
+      return;
+    }
+    try {
+      await command("set_project_configuration_template", {
+        projectId: project.id,
+        templateId: template.template_id,
+        enabled,
+      });
+      await load();
+      await onRefresh();
+    } catch (reason) {
+      onError(reason);
+    }
   };
   return (
     <section className="mt-8 rounded-xl border border-line bg-panel p-5">
@@ -1239,6 +1277,37 @@ function ProjectConfigPanel({
         </div>
       </div>
       <div className="mt-5 grid gap-3">
+        <fieldset className="rounded-lg border border-line p-3">
+          <legend className="px-1 text-sm font-medium">
+            配置模板（项目作用域）
+          </legend>
+          <div className="grid gap-2">
+            {configurationTemplates.map((template) => (
+              <label
+                key={template.template_id}
+                className="flex items-center gap-2 text-sm"
+              >
+                <input
+                  type="checkbox"
+                  checked={template.applied}
+                  onChange={(event) =>
+                    void toggleConfigurationTemplate(
+                      template,
+                      event.target.checked,
+                    )
+                  }
+                />
+                <span>
+                  {template.name} · {template.source}
+                  {template.modified ? " · 已本地修改" : ""}
+                </span>
+              </label>
+            ))}
+            {!configurationTemplates.length && (
+              <span className="text-xs text-faint">暂无可用配置模板</span>
+            )}
+          </div>
+        </fieldset>
         {assets
           .filter((asset) => asset.kind === kind)
           .map((asset) => (
@@ -8026,6 +8095,12 @@ function AppContent() {
   const [homeModel, setHomeModel] = useState("auto");
   const [homeMode, setHomeMode] = useState("Interactive");
   const [homeHarness, setHomeHarness] = useState("builtin");
+  const [homeRole, setHomeRole] = useState("");
+  const [homeSystemPrompt, setHomeSystemPrompt] = useState("");
+  const [homeAgentTemplateId, setHomeAgentTemplateId] = useState("");
+  const [homeAgentTemplates, setHomeAgentTemplates] = useState<
+    MarketTemplate[]
+  >([]);
   const [harnessOptions, setHarnessOptions] = useState<
     Array<{ id: string; label: string; available: boolean; reason?: string }>
   >([]);
@@ -8139,6 +8214,13 @@ function AppContent() {
   useEffect(() => {
     if (!homeProvider && providers[0]) setHomeProvider(providers[0].name);
   }, [providers, homeProvider]);
+  useEffect(() => {
+    void command<MarketTemplate[]>("list_template_market", {
+      kind: "agent-template",
+    })
+      .then(setHomeAgentTemplates)
+      .catch(() => setHomeAgentTemplates([]));
+  }, []);
   useEffect(() => {
     void command<Array<{ id: string; label: string }>>("provider_models", {
       provider: "openai",
@@ -8346,6 +8428,10 @@ function AppContent() {
         mode: homeMode,
         harness: homeHarness,
         workspace: homeWorkspace || null,
+        systemPrompt:
+          [homeRole ? `你的角色是：${homeRole}` : "", homeSystemPrompt]
+            .filter(Boolean)
+            .join("\n\n") || null,
       });
       setSelected(next);
       setSurface("session");
@@ -8802,6 +8888,55 @@ function AppContent() {
                         setHomeAttachment(file);
                         setHomePlusOpen(false);
                       }}
+                    />
+                    <select
+                      className="chip"
+                      title="Agent 模板"
+                      value={homeAgentTemplateId}
+                      onChange={(event) => {
+                        const id = event.target.value;
+                        setHomeAgentTemplateId(id);
+                        const template = homeAgentTemplates.find(
+                          (item) => item.id === id,
+                        );
+                        if (!template) {
+                          setHomeRole("");
+                          setHomeSystemPrompt("");
+                          return;
+                        }
+                        try {
+                          const content = JSON.parse(template.content) as {
+                            role?: string;
+                            provider?: string;
+                            model?: string;
+                            harness?: string;
+                            mode?: string;
+                            system_prompt?: string;
+                          };
+                          setHomeRole(content.role || "");
+                          setHomeProvider(content.provider || "");
+                          setHomeModel(content.model || "auto");
+                          setHomeHarness(content.harness || "builtin");
+                          setHomeMode(content.mode || "Interactive");
+                          setHomeSystemPrompt(content.system_prompt || "");
+                        } catch {
+                          onError("Agent 模板内容不是有效 JSON");
+                        }
+                      }}
+                    >
+                      <option value="">Agent 模板</option>
+                      {homeAgentTemplates.map((template) => (
+                        <option key={template.id} value={template.id}>
+                          {template.name}
+                        </option>
+                      ))}
+                    </select>
+                    <input
+                      className="chip"
+                      title="角色"
+                      value={homeRole}
+                      onChange={(event) => setHomeRole(event.target.value)}
+                      placeholder="Role"
                     />
                     <select
                       className="chip"

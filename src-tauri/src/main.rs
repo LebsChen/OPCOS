@@ -2537,8 +2537,105 @@ fn copy_config_templates(
             ],
         )
         .map_err(|error| error.to_string())?;
+        let metadata = serde_json::from_str::<Value>(&metadata).unwrap_or_else(|_| json!({}));
+        let metadata = serde_json::to_string(&json!({
+            "description": metadata.get("description").and_then(Value::as_str).unwrap_or(""),
+            "source_template_id": template_id,
+            "source_content_hash": content_hash(&content)
+        }))
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "UPDATE config_object_version SET metadata_json=?1 WHERE id=?2",
+            params![metadata, version_id],
+        )
+        .map_err(|error| error.to_string())?;
     }
     tx.commit().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn list_project_configuration_templates(
+    state: State<'_, DesktopState>,
+    project_id: String,
+) -> Result<Vec<Value>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let mut statement = connection
+        .prepare(
+            "SELECT t.id,t.kind,t.name,t.status,t.scope_key,tv.content,tv.content_hash,
+                    p.id,pv.content,pv.content_hash,pv.metadata_json
+             FROM config_object t
+             JOIN config_object_version tv ON tv.id=t.current_version_id
+             LEFT JOIN config_object p
+               ON p.id=('project-' || ?1 || '-' || t.id)
+              AND p.scope_kind='project'
+             LEFT JOIN config_object_version pv ON pv.id=p.current_version_id
+             WHERE t.scope_kind='template' AND t.status <> 'deleted'
+               AND t.kind NOT IN ('agent-template','team-template')
+             ORDER BY t.name",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([project_id], |row| {
+            let project_status: Option<String> = row.get(7)?;
+            let metadata = row
+                .get::<_, Option<String>>(10)?
+                .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+                .unwrap_or_else(|| json!({}));
+            let project_hash = row.get::<_, Option<String>>(8)?;
+            let source_hash = metadata
+                .get("source_content_hash")
+                .and_then(Value::as_str)
+                .or(project_hash.as_deref());
+            Ok(json!({
+                "template_id": row.get::<_, String>(0)?,
+                "kind": row.get::<_, String>(1)?,
+                "name": row.get::<_, String>(2)?,
+                "status": row.get::<_, String>(3)?,
+                "source": if row.get::<_, String>(4)? == "builtin" {
+                    "内置"
+                } else if row.get::<_, String>(4)?.starts_with("repo:") {
+                    "仓库"
+                } else {
+                    "自定义"
+                },
+                "content": row.get::<_, String>(5)?,
+                "applied": project_status.as_deref() == Some("active"),
+                "modified": project_status.as_deref() == Some("active")
+                    && source_hash != Some(row.get::<_, String>(6)?.as_str()),
+                "project_object_id": row.get::<_, Option<String>>(7)?,
+            }))
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn set_project_configuration_template(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    template_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    if enabled {
+        return copy_config_templates_to_project(&state, &project_id, &[template_id]);
+    }
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let object_id = format!("project-{project_id}-{template_id}");
+    connection
+        .execute(
+            "UPDATE config_object SET status='deleted'
+             WHERE id=?1 AND scope_kind='project' AND scope_key=?2",
+            params![object_id, project_id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -3545,24 +3642,28 @@ fn bind_session_config_versions(
              FROM config_object o
              LEFT JOIN asset_session_selection selection
                ON selection.session_id=?4 AND selection.asset_id=o.id
-            WHERE o.status='active' AND o.current_version_id IS NOT NULL
+             WHERE o.status='active' AND o.current_version_id IS NOT NULL
                AND (o.scope_kind='global'
                  OR (o.scope_kind='project' AND o.scope_key=?3)
                  OR (o.scope_kind='repo' AND o.scope_key=?1)
-                 OR (o.scope_kind='host' AND o.scope_key=?2))
+                 OR (o.scope_kind='host' AND o.scope_key=?2)
+                 OR (o.scope_kind='session' AND o.scope_key=?5))
              ORDER BY CASE o.scope_kind
                WHEN 'global' THEN 0 WHEN 'project' THEN 1
-               WHEN 'repo' THEN 2 WHEN 'host' THEN 3 ELSE 4 END, o.id",
+               WHEN 'repo' THEN 2 WHEN 'host' THEN 3 WHEN 'session' THEN 4 ELSE 5 END, o.id",
         )
         .map_err(|error| error.to_string())?;
     let objects = statement
-        .query_map(params![workspace, host_id, project_id, session_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, bool>(2)?,
-            ))
-        })
+        .query_map(
+            params![workspace, host_id, project_id, session_id, session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
+        )
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
@@ -4719,6 +4820,7 @@ fn create_session(
     workspace: Option<String>,
     project_id: Option<String>,
     agent_id: Option<String>,
+    system_prompt: Option<String>,
 ) -> Result<SessionView, String> {
     let id = format!(
         "session-{}",
@@ -4845,6 +4947,43 @@ fn create_session(
         },
         false,
     )?;
+    if let Some(system_prompt) = system_prompt.filter(|value| !value.trim().is_empty()) {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let object_id = format!("session-{id}-agent-template");
+        let version_id = format!("{object_id}:v1");
+        let now = Utc::now().to_rfc3339();
+        connection
+            .execute(
+                "INSERT INTO config_object
+                 (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
+                 VALUES (?1,'instructions','Agent template system prompt',?2,'session',?3,'active',?4,?5)",
+                params![
+                    object_id,
+                    stable_server_key(&object_id),
+                    id,
+                    now,
+                    version_id
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute(
+                "INSERT INTO config_object_version
+                 (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+                 VALUES (?1,?2,1,?3,?4,?5,'agent template system prompt','{}')",
+                params![
+                    version_id,
+                    object_id,
+                    system_prompt,
+                    content_hash(&system_prompt),
+                    now
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
     if let Some(agent) = agent {
         state
             .store
@@ -6606,21 +6745,9 @@ fn insert_repository_template(
     repo_scope: &str,
     repo_path: &str,
 ) -> Result<String, String> {
-    let conflict: Option<(String, String)> = connection
-        .query_row(
-            "SELECT id,status FROM config_object
-             WHERE scope_kind='template' AND status='active' AND name=?1",
-            [name],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?;
-    if let Some((id, _)) = conflict {
-        return Ok(id);
-    }
     let id = format!(
         "template-repo-{}",
-        content_hash(&format!("{kind}:{repo_path}:{content}"))
+        content_hash(&format!("{kind}:{repo_scope}:{repo_path}:{content}"))
     );
     let version_id = format!("{id}:v1");
     let now = Utc::now().to_rfc3339();
@@ -6661,6 +6788,118 @@ fn insert_repository_template(
         )
         .map_err(|error| error.to_string())?;
     Ok(id)
+}
+
+fn repository_display_prefix(repository_root: &str) -> String {
+    repository_root
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("repository")
+        .to_owned()
+}
+
+fn upsert_repository_template_version(
+    connection: &Connection,
+    id: &str,
+    content: &str,
+    metadata: &str,
+) -> Result<bool, String> {
+    let (current_version, current_content): (i64, String) = connection
+        .query_row(
+            "SELECT v.version,v.content FROM config_object o
+             JOIN config_object_version v ON v.id=o.current_version_id
+             WHERE o.id=?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    if current_content == content {
+        return Ok(false);
+    }
+    let version = current_version + 1;
+    let version_id = format!("{id}:v{version}");
+    let now = Utc::now().to_rfc3339();
+    connection
+        .execute(
+            "INSERT INTO config_object_version
+             (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+             VALUES (?1,?2,?3,?4,?5,?6,'repository update',?7)",
+            params![
+                version_id,
+                id,
+                version,
+                content,
+                content_hash(content),
+                now,
+                metadata
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "UPDATE config_object SET current_version_id=?1 WHERE id=?2",
+            params![version_id, id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+fn import_repository_record(
+    connection: &Connection,
+    kind: &str,
+    name: &str,
+    description: &str,
+    content: &str,
+    repo_scope: &str,
+    repo_path: &str,
+) -> Result<&'static str, String> {
+    let same_source: Option<(String, String)> = connection
+        .query_row(
+            "SELECT id,status FROM config_object
+             WHERE scope_kind='template' AND scope_key=?1 AND kind=?2 AND name=?3
+               AND status <> 'deleted'",
+            params![repo_scope, kind, name],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let metadata = serde_json::to_string(&json!({
+        "description": description,
+        "repository_path": repo_path
+    }))
+    .map_err(|error| error.to_string())?;
+    if let Some((id, _)) = same_source {
+        return if upsert_repository_template_version(connection, &id, content, &metadata)? {
+            Ok("updated")
+        } else {
+            Ok("unchanged")
+        };
+    }
+    let protected: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM config_object
+             WHERE scope_kind='template' AND status IN ('active','builtin')
+               AND scope_key IN ('global','custom','builtin') AND kind=?1 AND name=?2)",
+            params![kind, name],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if protected {
+        return Ok("conflict");
+    }
+    insert_repository_template(
+        connection,
+        kind,
+        name,
+        description,
+        content,
+        repo_scope,
+        repo_path,
+    )?;
+    Ok("imported")
 }
 
 async fn ensure_repository_directory(
@@ -6776,27 +7015,11 @@ async fn import_repository_templates(
                 }
             };
             let normalized = serde_json::to_string(&yaml).map_err(|error| error.to_string())?;
-            let existing: Option<String> = state
-                .database
-                .lock()
-                .map_err(|_| "database lock poisoned")?
-                .query_row(
-                    "SELECT status FROM config_object
-                     WHERE scope_kind='template' AND status='active' AND name=?1",
-                    [&name],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|error| error.to_string())?;
-            if existing.is_some() {
-                conflicts.push(json!({"path":path,"name":name,"reason":"同名自定义模板已存在"}));
-                continue;
-            }
             let connection = state
                 .database
                 .lock()
                 .map_err(|_| "database lock poisoned")?;
-            insert_repository_template(
+            let status = import_repository_record(
                 &connection,
                 kind,
                 &name,
@@ -6807,110 +7030,93 @@ async fn import_repository_templates(
                 &repo_scope,
                 &path,
             )?;
-            imported.push(json!({"path":path,"name":name,"kind":kind}));
+            match status {
+                "conflict" => conflicts.push(json!({
+                    "path":path,"name":name,"reason":"同名内置或用户自定义模板已存在"
+                })),
+                other => imported.push(json!({
+                    "path":path,"name":name,"kind":kind,"status":other
+                })),
+            }
         }
     }
     let bundle = discover_assets(&HostAssetReader { host }, &project.repo_root)
         .await
         .map_err(|error| error.to_string())?;
+    let repository_prefix = repository_display_prefix(&project.repo_root);
     for source in bundle.agents {
-        let name = source
-            .path
-            .replace('\\', "/")
-            .rsplit('/')
-            .next()
-            .unwrap_or("AGENTS.md")
-            .to_owned();
+        let name = format!(
+            "{}: {}",
+            repository_prefix,
+            source
+                .path
+                .replace('\\', "/")
+                .rsplit('/')
+                .next()
+                .unwrap_or("AGENTS.md")
+        );
         let connection = state
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?;
-        if connection
-            .query_row::<String, _, _>(
-                "SELECT name FROM config_object WHERE scope_kind='template'
-                 AND status='active' AND name=?1",
-                [&name],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?
-            .is_some()
-        {
-            conflicts.push(json!({"path":source.path,"name":name,"reason":"同名自定义模板已存在"}));
+        let status = import_repository_record(
+            &connection,
+            "rules",
+            &name,
+            "",
+            &source.content,
+            &repo_scope,
+            &source.path,
+        )?;
+        if status == "conflict" {
+            conflicts.push(
+                json!({"path":source.path,"name":name,"reason":"同名内置或用户自定义模板已存在"}),
+            );
         } else {
-            insert_repository_template(
-                &connection,
-                "rules",
-                &name,
-                "",
-                &source.content,
-                &repo_scope,
-                &source.path,
-            )?;
-            imported.push(json!({"path":source.path,"name":name,"kind":"rules"}));
+            imported.push(json!({"path":source.path,"name":name,"kind":"rules","status":status}));
         }
     }
     for knowledge in bundle.knowledge {
-        let name = knowledge.title;
+        let name = format!("{repository_prefix}: {}", knowledge.title);
         let content = knowledge.body;
         let connection = state
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?;
-        if connection
-            .query_row::<String, _, _>(
-                "SELECT name FROM config_object WHERE scope_kind='template'
-                 AND status='active' AND name=?1",
-                [&name],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?
-            .is_some()
-        {
-            conflicts.push(json!({"name":name,"reason":"同名自定义模板已存在"}));
+        let status = import_repository_record(
+            &connection,
+            "knowledge",
+            &name,
+            "",
+            &content,
+            &repo_scope,
+            "",
+        )?;
+        if status == "conflict" {
+            conflicts.push(json!({"name":name,"reason":"同名内置或用户自定义模板已存在"}));
         } else {
-            insert_repository_template(
-                &connection,
-                "knowledge",
-                &name,
-                "",
-                &content,
-                &repo_scope,
-                "",
-            )?;
-            imported.push(json!({"name":name,"kind":"knowledge"}));
+            imported.push(json!({"name":name,"kind":"knowledge","status":status}));
         }
     }
     if let Some(playbook) = bundle.playbook {
-        let name = playbook.title;
+        let name = format!("{repository_prefix}: {}", playbook.title);
         let connection = state
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?;
-        if connection
-            .query_row::<String, _, _>(
-                "SELECT name FROM config_object WHERE scope_kind='template'
-                 AND status='active' AND name=?1",
-                [&name],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?
-            .is_some()
-        {
-            conflicts.push(json!({"name":name,"reason":"同名自定义模板已存在"}));
+        let status = import_repository_record(
+            &connection,
+            "runbook",
+            &name,
+            "",
+            &playbook.body,
+            &repo_scope,
+            "",
+        )?;
+        if status == "conflict" {
+            conflicts.push(json!({"name":name,"reason":"同名内置或用户自定义模板已存在"}));
         } else {
-            insert_repository_template(
-                &connection,
-                "runbook",
-                &name,
-                "",
-                &playbook.body,
-                &repo_scope,
-                "",
-            )?;
-            imported.push(json!({"name":name,"kind":"runbook"}));
+            imported.push(json!({"name":name,"kind":"runbook","status":status}));
         }
     }
     Ok(json!({"imported":imported,"rejected":rejected,"conflicts":conflicts}))
@@ -7114,6 +7320,21 @@ fn save_project_as_team_template(
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?;
+    let template_name = name
+        .clone()
+        .unwrap_or_else(|| format!("{} Team", project.name));
+    let duplicate: Option<String> = connection
+        .query_row(
+            "SELECT id FROM config_object
+             WHERE scope_kind='template' AND status='active' AND name=?1",
+            [&template_name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if duplicate.is_some() {
+        return Err(format!("同名自定义模板已存在: {template_name}"));
+    }
     let transaction = connection
         .unchecked_transaction()
         .map_err(|error| error.to_string())?;
@@ -7200,7 +7421,6 @@ fn save_project_as_team_template(
         "config_template_ids": config_ids
     }))
     .map_err(|error| error.to_string())?;
-    let template_name = name.unwrap_or_else(|| format!("{} Team", project.name));
     transaction.commit().map_err(|error| error.to_string())?;
     let id = insert_custom_template(
         &connection,
@@ -13439,6 +13659,8 @@ fn main() {
             export_template_to_repository,
             save_project_agent_as_template,
             save_project_as_team_template,
+            list_project_configuration_templates,
+            set_project_configuration_template,
             save_asset,
             delete_asset,
             set_asset_enabled,
@@ -13695,7 +13917,7 @@ agents:
                     'hash','now','custom','{}');",
             )
             .unwrap();
-        let result = insert_repository_template(
+        let result = import_repository_record(
             &connection,
             "agent-template",
             "Demo",
@@ -13705,7 +13927,7 @@ agents:
             ".agents/templates/agents/demo.yaml",
         )
         .unwrap();
-        assert_eq!(result, "custom-agent");
+        assert_eq!(result, "conflict");
         let content: String = connection
             .query_row(
                 "SELECT content FROM config_object_version WHERE id='custom-agent:v1'",
@@ -13714,6 +13936,86 @@ agents:
             )
             .unwrap();
         assert_eq!(content, r#"{"role":"Custom"}"#);
+    }
+
+    #[test]
+    fn repository_import_is_idempotent_and_versions_source_updates() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE config_object (
+                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+                   server_key TEXT, scope_kind TEXT NOT NULL, scope_key TEXT,
+                   status TEXT NOT NULL, created_at TEXT NOT NULL,
+                   current_version_id TEXT
+                 );
+                 CREATE TABLE config_object_version (
+                   id TEXT PRIMARY KEY, object_id TEXT NOT NULL, version INTEGER NOT NULL,
+                   content TEXT NOT NULL, content_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+                   note TEXT NOT NULL, metadata_json TEXT NOT NULL,
+                   UNIQUE(object_id,version)
+                 );",
+            )
+            .unwrap();
+        let scope = "repo:/workspace/demo";
+        assert_eq!(
+            import_repository_record(
+                &connection,
+                "agent-template",
+                "Demo",
+                "",
+                r#"{"role":"Code"}"#,
+                scope,
+                "agents/demo.yaml",
+            )
+            .unwrap(),
+            "imported"
+        );
+        assert_eq!(
+            import_repository_record(
+                &connection,
+                "agent-template",
+                "Demo",
+                "",
+                r#"{"role":"Code"}"#,
+                scope,
+                "agents/demo.yaml",
+            )
+            .unwrap(),
+            "unchanged"
+        );
+        assert_eq!(
+            import_repository_record(
+                &connection,
+                "agent-template",
+                "Demo",
+                "",
+                r#"{"role":"Review"}"#,
+                scope,
+                "agents/demo.yaml",
+            )
+            .unwrap(),
+            "updated"
+        );
+        assert_eq!(
+            import_repository_record(
+                &connection,
+                "agent-template",
+                "Demo",
+                "",
+                r#"{"role":"Code"}"#,
+                "repo:/workspace/other",
+                "agents/demo.yaml",
+            )
+            .unwrap(),
+            "imported"
+        );
+        let versions: i64 = connection
+            .query_row("SELECT COUNT(*) FROM config_object_version", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(versions, 3);
     }
 
     #[test]
