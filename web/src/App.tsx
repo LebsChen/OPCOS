@@ -6538,6 +6538,10 @@ function Activity({
   const [planningHistory, setPlanningHistory] = useState<
     Record<string, unknown>[]
   >([]);
+  const [currentPlan, setCurrentPlan] = useState<Record<
+    string,
+    unknown
+  > | null>(null);
   const [goalDescription, setGoalDescription] = useState("");
   const [accountId, setAccountId] = useState("");
   const [accountHostId, setAccountHostId] = useState("");
@@ -6645,6 +6649,16 @@ function Activity({
                   })
                     .then(setPlanningHistory)
                     .catch(onError);
+                  if (selected?.id) {
+                    void command<Record<string, unknown> | null>(
+                      "current_plan",
+                      {
+                        sessionId: selected.id,
+                      },
+                    )
+                      .then(setCurrentPlan)
+                      .catch(onError);
+                  }
                   void command<Record<string, unknown>[]>(
                     "account_host_bindings",
                     {},
@@ -6938,6 +6952,48 @@ function Activity({
             )}
             {activityTab === "goals" && (
               <div className="space-y-5">
+                <div className="rounded-xl2 border border-line bg-panel p-5 space-y-3">
+                  <h2 className="text-[15px] font-semibold">Current plan</h2>
+                  {currentPlan ? (
+                    <>
+                      <div className="text-[13px]">
+                        <strong>{String(currentPlan.title)}</strong>{" "}
+                        <span className="text-muted">
+                          revision {String(currentPlan.revision)}
+                        </span>
+                      </div>
+                      <p className="text-[12px] text-muted">
+                        {String(currentPlan.summary ?? "")}
+                      </p>
+                      <div className="space-y-1">
+                        {(Array.isArray(currentPlan.steps)
+                          ? currentPlan.steps
+                          : []
+                        ).map((step) => {
+                          const item = step as Record<string, unknown>;
+                          return (
+                            <div
+                              className="flex items-start justify-between gap-3 text-[12px]"
+                              key={String(item.step_id)}
+                            >
+                              <span>
+                                {Number(item.position ?? 0) + 1}.{" "}
+                                {String(item.description)}
+                              </span>
+                              <span className="text-muted">
+                                {String(item.status)}
+                              </span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </>
+                  ) : (
+                    <p className="text-[12px] text-muted">
+                      No tracked plan for the selected session.
+                    </p>
+                  )}
+                </div>
                 <div className="rounded-xl2 border border-line bg-panel p-5 space-y-3">
                   <h2 className="text-[15px] font-semibold">
                     Account host bindings

@@ -1346,7 +1346,24 @@ where
                 json!({"role":"system","content":[{"type":"text","text":instructions}]}),
             );
         }
+        if let Some(plan) = self
+            .store
+            .load_plan(&self.session_id)
+            .map_err(|error| EngineError::Store(error.to_string()))?
+        {
+            messages.insert(
+                0,
+                json!({"role":"system","content":[{"type":"text","text":format_plan_context(&plan)}]}),
+            );
+        }
         Ok(messages)
+    }
+
+    fn plan_context_message(&self) -> Result<Option<Value>, EngineError> {
+        self.store
+            .load_plan(&self.session_id)
+            .map_err(|error| EngineError::Store(error.to_string()))
+            .map(|plan| plan.map(|plan| json!({"role":"system","content":[{"type":"text","text":format_plan_context(&plan)}]})))
     }
 
     async fn compact_context(&self, messages: Vec<Value>) -> Result<Vec<Value>, EngineError> {
@@ -1384,6 +1401,9 @@ where
         }
         let summary = json!({"role":"user","content":[{"type":"text","text":"[Compacted history: earlier messages were summarized and remain durable in the session store.]"}]});
         valid.insert(0, summary);
+        if let Some(plan) = self.plan_context_message()? {
+            valid.insert(0, plan);
+        }
         self.store
             .save_compaction(&CompactionRecord {
                 session_id: self.session_id.clone(),
@@ -1446,6 +1466,8 @@ fn tool_risk(name: &str) -> ToolRisk {
         | "repo_index_find_symbol"
         | "repo_index_glob"
         | "repo_index_search" => ToolRisk::Read,
+        "plan_get" => ToolRisk::Read,
+        "plan_update" | "plan_revise" => ToolRisk::Write,
         "action_ledger_list" => ToolRisk::Read,
         "action_ledger_begin" | "action_ledger_finish" => ToolRisk::Write,
         "work_queue_list" => ToolRisk::Read,
@@ -1878,7 +1900,10 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"github_get_pull_request","description":"Read a GitHub pull request, including issue comments and review comments.","parameters":{"type":"object","properties":{"repo":{"type":"string"},"number":{"type":"integer"},"token_secret":{"type":"string"}},"required":["repo","number","token_secret"]}}}),
         json!({"type":"function","function":{"name":"github_ci_status","description":"Read GitHub Actions checks for the bound project repository by pull request number or commit SHA. Classifies code failures separately from billing, runner, cancellation, timeout, and indeterminate states; this is observational and not a delivery gate.","parameters":{"type":"object","properties":{"repo":{"type":"string"},"pull_request":{"type":"integer"},"commit":{"type":"string"}},"required":["repo"]}}}),
         json!({"type":"function","function":{"name":"github_ci_failure_log","description":"Read a bounded tail or offset segment of a failed GitHub Actions job log. Optionally request a step; if it cannot be located, the result explicitly says the returned text is the bounded job tail.","parameters":{"type":"object","properties":{"repo":{"type":"string"},"run_id":{"type":"integer"},"job_id":{"type":"integer"},"step":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"},"tail":{"type":"boolean"}},"required":["repo","run_id"]}}}),
-        json!({"type":"function","function":{"name":"propose_plan","description":"Propose a plan and wait for approval.","parameters":{"type":"object","properties":{"plan":{"type":"string"}},"required":["plan"]}}}),
+        json!({"type":"function","function":{"name":"propose_plan","description":"Propose a structured ordered plan and wait for approval. Each step is persisted and can be tracked after approval.","parameters":{"type":"object","properties":{"title":{"type":"string"},"summary":{"type":"string"},"steps":{"type":"array","items":{"type":"string"}}},"required":["title","steps"]}}}),
+        json!({"type":"function","function":{"name":"plan_get","description":"Read the current persisted plan, ordered steps, statuses, failure or abandonment reasons, and revision number.","parameters":{"type":"object","properties":{}}}}),
+        json!({"type":"function","function":{"name":"plan_update","description":"Update one plan step. Valid statuses are not_started, in_progress, done, failed, and abandoned. Abandoned steps require a reason and failed steps cannot silently become done.","parameters":{"type":"object","properties":{"step_id":{"type":"string"},"status":{"type":"string","enum":["not_started","in_progress","done","failed","abandoned"]},"description":{"type":"string"},"reason":{"type":"string"}},"required":["step_id"]}}}),
+        json!({"type":"function","function":{"name":"plan_revise","description":"Revise the current plan with an explicit summary and optional additional ordered steps. Revisions are retained in plan history; steps are never physically deleted.","parameters":{"type":"object","properties":{"summary":{"type":"string"},"add_steps":{"type":"array","items":{"type":"string"}}},"required":["summary"]}}}),
         json!({"type":"function","function":{"name":"ask_user","description":"Ask the user a question and wait for an answer.","parameters":{"type":"object","properties":{"question":{"type":"string"}},"required":["question"]}}}),
         json!({"type":"function","function":{"name":"linear_get_issue","description":"Read a Linear issue by identifier. Read-only.","parameters":{"type":"object","properties":{"identifier":{"type":"string"}},"required":["identifier"]}}}),
         json!({"type":"function","function":{"name":"linear_list_my_issues","description":"List Linear issues assigned to the current user. Read-only.","parameters":{"type":"object","properties":{"limit":{"type":"integer"}}}}}),
@@ -1903,6 +1928,38 @@ fn tool_definitions() -> Vec<Value> {
     tools.extend(action_ledger_tool_definitions());
     tools.extend(work_queue_tool_definitions());
     tools
+}
+
+fn format_plan_context(plan: &opcos_store::PlanRecord) -> String {
+    let mut text = format!(
+        "Persisted execution plan (authoritative; update it with plan_update, do not announce status in prose): {} (revision {}, status {})\n{}\n",
+        plan.title, plan.revision, plan.status, plan.summary
+    );
+    for step in &plan.steps {
+        let reason = step
+            .failure_reason
+            .as_deref()
+            .or(step.abandoned_reason.as_deref())
+            .unwrap_or("");
+        let line = format!(
+            "{}. [{}] {}{}",
+            step.position + 1,
+            step.status,
+            step.description,
+            if reason.is_empty() {
+                String::new()
+            } else {
+                format!(" — reason: {reason}")
+            }
+        );
+        if text.len() + line.len() < 12_000
+            || matches!(step.status.as_str(), "failed" | "abandoned")
+        {
+            text.push_str(&line);
+            text.push('\n');
+        }
+    }
+    text
 }
 
 pub fn action_ledger_tool_definitions() -> Vec<Value> {
@@ -2881,6 +2938,57 @@ mod tests {
                 cache_write: 0
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn compaction_reinjects_authoritative_plan_state() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let plan = store
+            .create_plan(
+                "s",
+                None,
+                "Tracked work",
+                "Keep the execution state durable",
+                &["Implement".into(), "Verify".into()],
+            )
+            .unwrap();
+        store
+            .update_plan_step(
+                "s",
+                &plan.steps[0].step_id,
+                Some("failed"),
+                None,
+                Some("tests failed"),
+            )
+            .unwrap();
+        store
+            .update_plan_step(
+                "s",
+                &plan.steps[1].step_id,
+                Some("abandoned"),
+                None,
+                Some("requirement removed"),
+            )
+            .unwrap();
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let compacted = engine
+            .compact_context(vec![json!({"role":"user","content":"old"})])
+            .await
+            .unwrap();
+        let context = compacted
+            .iter()
+            .find_map(|message| message.pointer("/content/0/text").and_then(Value::as_str))
+            .unwrap();
+        assert!(context.contains("tests failed"));
+        assert!(context.contains("requirement removed"));
     }
 
     #[tokio::test]

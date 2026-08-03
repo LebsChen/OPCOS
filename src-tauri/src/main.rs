@@ -2102,6 +2102,96 @@ fn execute_work_queue_tool(
     }
 }
 
+fn execute_plan_tool(
+    store: &SqliteStore,
+    session_id: &str,
+    project_id: Option<&str>,
+    name: &str,
+    arguments: Value,
+) -> Result<Value, String> {
+    match name {
+        "plan_get" => {
+            let plan = store
+                .load_plan(session_id)
+                .map_err(|error| error.to_string())?;
+            let revisions = match &plan {
+                Some(plan) => store
+                    .load_plan_revisions(&plan.plan_id)
+                    .map_err(|error| error.to_string())?,
+                None => Vec::new(),
+            };
+            Ok(json!({"plan": plan, "revisions": revisions}))
+        }
+        "plan_update" => {
+            let step_id = arguments
+                .get("step_id")
+                .and_then(Value::as_str)
+                .ok_or("missing string argument: step_id")?;
+            store
+                .update_plan_step(
+                    session_id,
+                    step_id,
+                    arguments.get("status").and_then(Value::as_str),
+                    arguments.get("description").and_then(Value::as_str),
+                    arguments.get("reason").and_then(Value::as_str),
+                )
+                .map(|plan| json!(plan))
+                .map_err(|error| error.to_string())
+        }
+        "plan_revise" => {
+            let summary = arguments
+                .get("summary")
+                .and_then(Value::as_str)
+                .ok_or("missing string argument: summary")?;
+            let add_steps = arguments
+                .get("add_steps")
+                .and_then(Value::as_array)
+                .map(|steps| {
+                    steps
+                        .iter()
+                        .map(|step| {
+                            step.as_str()
+                                .map(str::to_owned)
+                                .ok_or("add_steps must contain only strings")
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            store
+                .revise_plan(session_id, summary, &add_steps)
+                .map(|plan| json!(plan))
+                .map_err(|error| error.to_string())
+        }
+        "propose_plan" => {
+            let title = arguments
+                .get("title")
+                .and_then(Value::as_str)
+                .ok_or("missing string argument: title")?;
+            let summary = arguments
+                .get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let steps = arguments
+                .get("steps")
+                .and_then(Value::as_array)
+                .ok_or("missing array argument: steps")?
+                .iter()
+                .map(|step| {
+                    step.as_str()
+                        .map(str::to_owned)
+                        .ok_or("steps must contain only strings")
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            store
+                .create_plan(session_id, project_id, title, summary, &steps)
+                .map(|plan| json!(plan))
+                .map_err(|error| error.to_string())
+        }
+        _ => Err(format!("unknown plan tool: {name}")),
+    }
+}
+
 async fn run_goal_planner(
     app: &tauri::AppHandle,
     state: &DesktopState,
@@ -2484,6 +2574,18 @@ impl ToolExecutor for RemoteExecutor {
                 arguments,
             );
         }
+        if matches!(
+            name,
+            "plan_get" | "plan_update" | "plan_revise" | "propose_plan"
+        ) {
+            return execute_plan_tool(
+                &self.store,
+                &self.session_id,
+                self.project_id.as_deref(),
+                name,
+                arguments,
+            );
+        }
         let argument = |key: &str| {
             arguments
                 .get(key)
@@ -2716,6 +2818,18 @@ impl ToolExecutor for DesktopExecutor {
                 }
                 if name.starts_with("work_queue_") {
                     return execute_work_queue_tool(
+                        &executor.store,
+                        &executor.session_id,
+                        executor.project_id.as_deref(),
+                        name,
+                        arguments,
+                    );
+                }
+                if matches!(
+                    name,
+                    "plan_get" | "plan_update" | "plan_revise" | "propose_plan"
+                ) {
+                    return execute_plan_tool(
                         &executor.store,
                         &executor.session_id,
                         executor.project_id.as_deref(),
@@ -6902,7 +7016,13 @@ async fn engine_for(
             })
             .collect::<Vec<_>>();
         let mut allowed_tools = allowed_tools;
-        allowed_tools.extend(["propose_plan".to_owned(), "ask_user".to_owned()]);
+        allowed_tools.extend([
+            "propose_plan".to_owned(),
+            "plan_get".to_owned(),
+            "plan_update".to_owned(),
+            "plan_revise".to_owned(),
+            "ask_user".to_owned(),
+        ]);
         allowed_tools.extend([
             "repo_index_find_symbol".to_owned(),
             "repo_index_glob".to_owned(),
@@ -16953,6 +17073,18 @@ fn planning_history(
 }
 
 #[tauri::command]
+fn current_plan(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Option<Value>, String> {
+    state
+        .store
+        .load_plan(&session_id)
+        .map(|plan| plan.map(|value| serde_json::to_value(value).unwrap_or(Value::Null)))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn approve_work_queue_item(
     state: State<'_, DesktopState>,
     queue_id: String,
@@ -17773,6 +17905,7 @@ fn main() {
             set_autonomous_goal_status,
             run_autonomous_goal,
             planning_history,
+            current_plan,
             approve_work_queue_item,
             save_login_profile,
             login_profile,
