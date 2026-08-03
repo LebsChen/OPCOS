@@ -1297,6 +1297,7 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
     migrate_secret_records(&mut connection)?;
     migrate_mcp_session_tools(&connection)?;
     migrate_config_objects(&mut connection)?;
+    seed_builtin_templates(&connection)?;
     migrate_coordination(&connection)?;
     Ok(connection)
 }
@@ -1316,6 +1317,150 @@ fn default_devin_settings() -> Value {
         "open_prs_as": "ready",
         "responding_to_bots": "ignore"
     })
+}
+
+fn seed_builtin_templates(connection: &Connection) -> Result<(), String> {
+    let agents = [
+        (
+            "template-agent-lead",
+            "Lead",
+            "负责计划、拆解任务、协调成员和验收交付。",
+            json!({"role":"Lead","provider":"openai","model":"auto","harness":"builtin","mode":"Interactive","system_prompt":"你是项目 Lead。负责理解目标、拆解任务、协调 Worker，并在验收前检查交付质量。"}),
+        ),
+        (
+            "template-agent-code",
+            "Code",
+            "负责实现功能、维护代码和提交可审查变更。",
+            json!({"role":"Code","provider":"openai","model":"auto","harness":"builtin","mode":"Interactive","system_prompt":"你是 Code Worker。负责以最小、可验证的改动实现任务，并报告测试证据。"}),
+        ),
+        (
+            "template-agent-review",
+            "Review",
+            "负责审查实现、发现回归和提出可执行修正。",
+            json!({"role":"Review","provider":"openai","model":"auto","harness":"builtin","mode":"Interactive","system_prompt":"你是 Review Worker。重点检查正确性、安全性、边界条件和测试覆盖，不要只给泛泛建议。"}),
+        ),
+        (
+            "template-agent-test",
+            "Test",
+            "负责设计和运行测试，确认行为符合验收标准。",
+            json!({"role":"Test","provider":"openai","model":"auto","harness":"builtin","mode":"Interactive","system_prompt":"你是 Test Worker。负责补充有意义的测试，运行完整验证并准确报告失败原因。"}),
+        ),
+        (
+            "template-agent-devops",
+            "DevOps",
+            "负责构建、环境、发布和持续集成相关工作。",
+            json!({"role":"DevOps","provider":"openai","model":"auto","harness":"builtin","mode":"Interactive","system_prompt":"你是 DevOps Worker。负责构建、环境和发布链路，优先保证可重复和可回滚。"}),
+        ),
+    ];
+    for (id, name, description, content) in agents {
+        seed_builtin_template(
+            connection,
+            id,
+            "agent-template",
+            name,
+            description,
+            &content,
+        )?;
+    }
+    let teams = [
+        (
+            "template-team-core",
+            "Lead + Code + Review",
+            "适合常规功能开发，包含计划、实现、审查和验收。",
+            json!({
+                "workflow":{"workflow":[
+                    {"stage":"plan","roles":["Lead"],"gate":"none"},
+                    {"stage":"code","roles":["Code"],"gate":"build+test"},
+                    {"stage":"review","roles":["Review"],"gate":"accept"}
+                ],"serial":true},
+                "agents":[
+                    {"template_id":"template-agent-lead","name":"Lead","role":"Lead"},
+                    {"template_id":"template-agent-code","name":"Code","role":"Code"},
+                    {"template_id":"template-agent-review","name":"Review","role":"Review"}
+                ],
+                "config_template_ids":[]
+            }),
+        ),
+        (
+            "template-team-full",
+            "Lead + Code + Review + Test + DevOps",
+            "完整交付团队，覆盖实现、审查、测试、构建和发布。",
+            json!({
+                "workflow":{"workflow":[
+                    {"stage":"plan","roles":["Lead"],"gate":"none"},
+                    {"stage":"code","roles":["Code"],"gate":"build+test"},
+                    {"stage":"review","roles":["Review"],"gate":"pass"},
+                    {"stage":"test","roles":["Test"],"gate":"build+test"},
+                    {"stage":"release","roles":["DevOps"],"gate":"accept"}
+                ],"serial":true},
+                "agents":[
+                    {"template_id":"template-agent-lead","name":"Lead","role":"Lead"},
+                    {"template_id":"template-agent-code","name":"Code","role":"Code"},
+                    {"template_id":"template-agent-review","name":"Review","role":"Review"},
+                    {"template_id":"template-agent-test","name":"Test","role":"Test"},
+                    {"template_id":"template-agent-devops","name":"DevOps","role":"DevOps"}
+                ],
+                "config_template_ids":[]
+            }),
+        ),
+    ];
+    for (id, name, description, content) in teams {
+        seed_builtin_template(connection, id, "team-template", name, description, &content)?;
+    }
+    seed_builtin_template(
+        connection,
+        "template-blueprint-standard",
+        "blueprint",
+        "标准 Rust/TypeScript Blueprint",
+        "默认执行格式化、测试和构建检查。",
+        &json!({"initialize":["git status"],"dependencies":["cargo check"],"build":["cargo test","npm run build"]}),
+    )?;
+    Ok(())
+}
+
+fn seed_builtin_template(
+    connection: &Connection,
+    id: &str,
+    kind: &str,
+    name: &str,
+    description: &str,
+    content: &Value,
+) -> Result<(), String> {
+    let now = Utc::now().to_rfc3339();
+    let metadata = serde_json::to_string(&json!({"description":description}))
+        .map_err(|error| error.to_string())?;
+    let body = serde_json::to_string(content).map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO config_object
+             (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
+             VALUES (?1,?2,?3,?4,'template','builtin','builtin',?5,?6)",
+            params![
+                id,
+                kind,
+                name,
+                stable_server_key(id),
+                now,
+                format!("{id}:v1")
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO config_object_version
+             (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+             VALUES (?1,?2,1,?3,?4,?5,'builtin seed',?6)",
+            params![
+                format!("{id}:v1"),
+                id,
+                body,
+                content_hash(&body),
+                now,
+                metadata
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn merge_settings(base: &mut Value, override_value: &Value) {
@@ -2298,6 +2443,121 @@ async fn list_projects(state: State<'_, DesktopState>) -> Result<Vec<ProjectView
     Ok(views)
 }
 
+fn load_template_content(
+    state: &DesktopState,
+    template_id: &str,
+) -> Result<(String, String, String), String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    connection
+        .query_row(
+            "SELECT o.kind,o.name,v.content FROM config_object o
+             JOIN config_object_version v ON v.id=o.current_version_id
+             WHERE o.id=?1 AND o.scope_kind='template' AND o.status <> 'deleted'",
+            [template_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| format!("template not found: {error}"))
+}
+
+fn copy_config_templates_to_project(
+    state: &DesktopState,
+    project_id: &str,
+    template_ids: &[String],
+) -> Result<(), String> {
+    if template_ids.is_empty() {
+        return Ok(());
+    }
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    copy_config_templates(&connection, project_id, template_ids)
+}
+
+fn copy_config_templates(
+    connection: &Connection,
+    project_id: &str,
+    template_ids: &[String],
+) -> Result<(), String> {
+    if template_ids.is_empty() {
+        return Ok(());
+    }
+    let tx = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    for template_id in template_ids {
+        let (kind, name, content, metadata): (String, String, String, String) = tx
+            .query_row(
+                "SELECT o.kind,o.name,v.content,v.metadata_json FROM config_object o
+                 JOIN config_object_version v ON v.id=o.current_version_id
+                 WHERE o.id=?1 AND o.scope_kind='template'
+                   AND o.status <> 'deleted'
+                   AND o.kind NOT IN ('agent-template','team-template')",
+                [template_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(|error| format!("configuration template not found: {error}"))?;
+        let object_id = format!("project-{project_id}-{template_id}");
+        let version_id = format!("{object_id}:v1");
+        tx.execute(
+            "INSERT INTO config_object
+             (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
+             VALUES (?1,?2,?3,?4,'project',?5,'active',?6,?7)
+             ON CONFLICT(id) DO NOTHING",
+            params![
+                object_id,
+                kind,
+                name,
+                stable_server_key(&object_id),
+                project_id,
+                Utc::now().to_rfc3339(),
+                version_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT OR IGNORE INTO config_object_version
+             (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+             VALUES (?1,?2,1,?3,?4,?5,'copied from template',?6)",
+            params![
+                version_id,
+                object_id,
+                content,
+                content_hash(&content),
+                Utc::now().to_rfc3339(),
+                metadata
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    tx.commit().map_err(|error| error.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamTemplateAgent {
+    template_id: Option<String>,
+    name: Option<String>,
+    role: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    harness: Option<String>,
+    mode: Option<String>,
+    system_prompt: Option<String>,
+    branch: Option<String>,
+}
+
+fn validate_team_template_members(members: &[TeamTemplateAgent]) -> Result<(), String> {
+    if members.is_empty()
+        || members.first().and_then(|member| member.role.as_deref()) != Some("Lead")
+    {
+        return Err("team template must define Lead as its first member".into());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn create_project(
     state: State<'_, DesktopState>,
@@ -2398,6 +2658,125 @@ async fn create_project(
         online: Some(true),
         project,
     })
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn create_project_from_team_template(
+    state: State<'_, DesktopState>,
+    team_template_id: String,
+    name: String,
+    host_id: String,
+    repo_url: Option<String>,
+    repo_root: Option<String>,
+    default_branch: Option<String>,
+    config_template_ids: Option<Vec<String>>,
+) -> Result<ProjectView, String> {
+    let (kind, _name, content) = load_template_content(&state, &team_template_id)?;
+    if kind != "team-template" {
+        return Err("selected template is not a team template".into());
+    }
+    let team: Value = serde_json::from_str(&content)
+        .map_err(|error| format!("invalid team template: {error}"))?;
+    let members: Vec<TeamTemplateAgent> = serde_json::from_value(
+        team.get("agents")
+            .cloned()
+            .ok_or_else(|| "team template has no members".to_owned())?,
+    )
+    .map_err(|error| format!("invalid team members: {error}"))?;
+    validate_team_template_members(&members)?;
+    let workflow = team
+        .get("workflow")
+        .cloned()
+        .ok_or_else(|| "team template has no workflow".to_owned())?;
+    parse_workflow(&serde_json::to_string(&workflow).map_err(|error| error.to_string())?)?;
+    let project = create_project(
+        state.clone(),
+        name,
+        host_id,
+        repo_url,
+        repo_root,
+        default_branch,
+    )
+    .await?;
+    let project_id = project.project.id.clone();
+    let mut project_record = project.project.clone();
+    project_record.workflow_json =
+        serde_json::to_string(&workflow).map_err(|error| error.to_string())?;
+    if let Err(error) = state.store.save_project(&project_record) {
+        let _ = delete_project(state.clone(), project_id.clone(), Some(true)).await;
+        return Err(error.to_string());
+    }
+    let mut config_ids = team
+        .get("config_template_ids")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    config_ids.extend(config_template_ids.unwrap_or_default());
+    config_ids.sort();
+    config_ids.dedup();
+    if let Err(error) = copy_config_templates_to_project(&state, &project_id, &config_ids) {
+        let _ = delete_project(state.clone(), project_id.clone(), Some(true)).await;
+        return Err(error);
+    }
+    for (sort_order, member) in members.into_iter().enumerate() {
+        let mut values = member;
+        if let Some(template_id) = values.template_id.as_deref() {
+            let (agent_kind, _agent_name, agent_content) =
+                match load_template_content(&state, template_id) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = delete_project(state.clone(), project_id.clone(), Some(true)).await;
+                        return Err(error);
+                    }
+                };
+            if agent_kind != "agent-template" {
+                let _ = delete_project(state.clone(), project_id.clone(), Some(true)).await;
+                return Err(format!("{template_id} is not an agent template"));
+            }
+            let template: TeamTemplateAgent = serde_json::from_str(&agent_content)
+                .map_err(|error| format!("invalid agent template: {error}"))?;
+            values = TeamTemplateAgent {
+                name: values.name.or(template.name),
+                role: values.role.or(template.role),
+                provider: values.provider.or(template.provider),
+                model: values.model.or(template.model),
+                harness: values.harness.or(template.harness),
+                mode: values.mode.or(template.mode),
+                system_prompt: values.system_prompt.or(template.system_prompt),
+                branch: values.branch.or(template.branch),
+                template_id: Some(template_id.to_owned()),
+            };
+        }
+        if let Err(error) = create_project_agent(
+            state.clone(),
+            project_id.clone(),
+            values
+                .name
+                .unwrap_or_else(|| format!("成员 {}", sort_order + 1)),
+            values.role.unwrap_or_default(),
+            Some(sort_order as u32),
+            values.provider,
+            values.model,
+            values.harness,
+            values.mode,
+            values.system_prompt,
+            values.branch,
+        )
+        .await
+        {
+            let _ = delete_project(state.clone(), project_id.clone(), Some(true)).await;
+            return Err(error);
+        }
+    }
+    list_projects(state)
+        .await?
+        .into_iter()
+        .find(|item| item.project.id == project_id)
+        .ok_or_else(|| "created project could not be reloaded".to_owned())
 }
 
 #[tauri::command]
@@ -6011,6 +6390,167 @@ fn list_assets(
         .map_err(|error| error.to_string())?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn list_template_market(
+    state: State<'_, DesktopState>,
+    kind: Option<String>,
+) -> Result<Vec<Value>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let mut statement = connection
+        .prepare(
+            "SELECT o.id,o.kind,o.name,o.status,v.content,v.metadata_json,v.version
+             FROM config_object o
+             JOIN config_object_version v ON v.id=o.current_version_id
+             WHERE o.scope_kind='template' AND o.status <> 'deleted'
+               AND (?1 IS NULL OR o.kind=?1)
+             ORDER BY CASE o.status WHEN 'builtin' THEN 0 ELSE 1 END,o.name",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([kind], |row| {
+            let metadata = serde_json::from_str::<Value>(&row.get::<_, String>(5)?)
+                .unwrap_or_else(|_| json!({}));
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "kind": row.get::<_, String>(1)?,
+                "name": row.get::<_, String>(2)?,
+                "status": row.get::<_, String>(3)?,
+                "content": row.get::<_, String>(4)?,
+                "description": metadata.get("description").and_then(Value::as_str).unwrap_or(""),
+                "version": row.get::<_, i64>(6)?,
+                "readonly": row.get::<_, String>(3)? == "builtin"
+            }))
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn save_template(
+    state: State<'_, DesktopState>,
+    id: Option<String>,
+    kind: String,
+    name: String,
+    description: String,
+    content: String,
+) -> Result<Value, String> {
+    if !matches!(
+        kind.as_str(),
+        "agent-template"
+            | "team-template"
+            | "rules"
+            | "knowledge"
+            | "runbook"
+            | "mcp"
+            | "connector"
+            | "blueprint"
+    ) {
+        return Err("unsupported template kind".into());
+    }
+    if name.trim().is_empty() {
+        return Err("template name cannot be empty".into());
+    }
+    if matches!(kind.as_str(), "agent-template" | "team-template") {
+        serde_json::from_str::<Value>(&content)
+            .map_err(|error| format!("template content must be valid JSON: {error}"))?;
+    }
+    let id = id.unwrap_or_else(|| {
+        format!(
+            "template-custom-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        )
+    });
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let existing_status: Option<String> = connection
+        .query_row(
+            "SELECT status FROM config_object WHERE id=?1 AND scope_kind='template'",
+            [&id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if existing_status.as_deref() == Some("builtin") {
+        return Err("builtin templates are read-only; save a copy with a new name".into());
+    }
+    let now = Utc::now().to_rfc3339();
+    let metadata = serde_json::to_string(&json!({"description":description}))
+        .map_err(|error| error.to_string())?;
+    let version: i64 = connection
+        .query_row(
+            "SELECT COALESCE(MAX(version),0)+1 FROM config_object_version WHERE object_id=?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let version_id = format!("{id}:v{version}");
+    let tx = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    tx.execute(
+        "INSERT INTO config_object
+         (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
+         VALUES (?1,?2,?3,?4,'template','custom','active',?5,NULL)
+         ON CONFLICT(id) DO UPDATE SET name=excluded.name,kind=excluded.kind,status='active'",
+        params![id, kind, name, stable_server_key(&id), now],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "INSERT INTO config_object_version
+         (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![
+            version_id,
+            id,
+            version,
+            content,
+            content_hash(&content),
+            now,
+            if version == 1 { "created" } else { "edited" },
+            metadata
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "UPDATE config_object SET current_version_id=?1 WHERE id=?2",
+        params![version_id, id],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(json!({"id":id,"kind":kind,"name":name,"status":"active"}))
+}
+
+#[tauri::command]
+fn delete_template(state: State<'_, DesktopState>, id: String) -> Result<(), String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let status: String = connection
+        .query_row(
+            "SELECT status FROM config_object WHERE id=?1 AND scope_kind='template'",
+            [&id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if status == "builtin" {
+        return Err("builtin templates are read-only".into());
+    }
+    connection
+        .execute(
+            "UPDATE config_object SET status='deleted' WHERE id=?1 AND scope_kind='template'",
+            [&id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -12202,6 +12742,7 @@ fn main() {
             create_session,
             list_projects,
             create_project,
+            create_project_from_team_template,
             update_project,
             delete_project,
             list_project_agents,
@@ -12231,6 +12772,9 @@ fn main() {
             provider_descriptors,
             provider_models,
             list_assets,
+            list_template_market,
+            save_template,
+            delete_template,
             save_asset,
             delete_asset,
             set_asset_enabled,
@@ -12330,6 +12874,112 @@ fn main() {
 #[cfg(test)]
 mod m7_tests {
     use super::*;
+
+    #[test]
+    fn builtin_template_seed_is_idempotent_and_never_overwrites_custom_content() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE config_object (
+                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+                   server_key TEXT, scope_kind TEXT NOT NULL, scope_key TEXT,
+                   status TEXT NOT NULL, created_at TEXT NOT NULL,
+                   current_version_id TEXT
+                 );
+                 CREATE TABLE config_object_version (
+                   id TEXT PRIMARY KEY, object_id TEXT NOT NULL, version INTEGER NOT NULL,
+                   content TEXT NOT NULL, content_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+                   note TEXT NOT NULL, metadata_json TEXT NOT NULL,
+                   UNIQUE(object_id,version)
+                 );
+                 INSERT INTO config_object VALUES
+                   ('template-agent-lead','agent-template','My Lead','my-lead',
+                    'template','custom','active','now','template-agent-lead:v1');
+                 INSERT INTO config_object_version VALUES
+                   ('template-agent-lead:v1','template-agent-lead',1,
+                    '{\"role\":\"Custom\"}','hash','now','custom','{}');",
+            )
+            .unwrap();
+        seed_builtin_templates(&connection).unwrap();
+        seed_builtin_templates(&connection).unwrap();
+        let custom: String = connection
+            .query_row(
+                "SELECT content FROM config_object_version
+                 WHERE id='template-agent-lead:v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(custom, r#"{"role":"Custom"}"#);
+        let builtin_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM config_object WHERE status='builtin'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(builtin_count, 7);
+    }
+
+    #[test]
+    fn copying_a_template_creates_an_independent_project_scoped_object() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE config_object (
+                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+                   server_key TEXT, scope_kind TEXT NOT NULL, scope_key TEXT,
+                   status TEXT NOT NULL, created_at TEXT NOT NULL,
+                   current_version_id TEXT
+                 );
+                 CREATE TABLE config_object_version (
+                   id TEXT PRIMARY KEY, object_id TEXT NOT NULL, version INTEGER NOT NULL,
+                   content TEXT NOT NULL, content_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+                   note TEXT NOT NULL, metadata_json TEXT NOT NULL,
+                   UNIQUE(object_id,version)
+                 );
+                 INSERT INTO config_object VALUES
+                   ('template-rules','rules','Rules','rules','template','custom',
+                    'active','now','template-rules:v1');
+                 INSERT INTO config_object_version VALUES
+                   ('template-rules:v1','template-rules',1,'before','hash','now','created','{}');",
+            )
+            .unwrap();
+        copy_config_templates(&connection, "project-1", &["template-rules".to_owned()]).unwrap();
+        connection
+            .execute(
+                "UPDATE config_object_version SET content='after'
+                 WHERE object_id='template-rules'",
+                [],
+            )
+            .unwrap();
+        let copied: String = connection
+            .query_row(
+                "SELECT v.content FROM config_object o
+                 JOIN config_object_version v ON v.id=o.current_version_id
+                 WHERE o.scope_kind='project' AND o.scope_key='project-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(copied, "before");
+    }
+
+    #[test]
+    fn team_template_requires_lead_at_sort_order_zero() {
+        let members = vec![TeamTemplateAgent {
+            template_id: None,
+            name: Some("Code".into()),
+            role: Some("Code".into()),
+            provider: None,
+            model: None,
+            harness: None,
+            mode: None,
+            system_prompt: None,
+            branch: None,
+        }];
+        assert!(validate_team_template_members(&members).is_err());
+    }
 
     #[test]
     fn global_secret_listing_excludes_project_names() {

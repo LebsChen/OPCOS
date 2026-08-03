@@ -140,6 +140,16 @@ type BlueprintStatus = {
   content: string;
   value: Record<string, unknown>;
 };
+type MarketTemplate = {
+  id: string;
+  kind: string;
+  name: string;
+  status: "builtin" | "active";
+  content: string;
+  description: string;
+  version: number;
+  readonly: boolean;
+};
 const TOKEN_CONNECTOR_KINDS = [
   "github",
   "telegram",
@@ -720,6 +730,8 @@ function ProjectDialog({
     repoUrl: string;
     repoRoot: string;
     defaultBranch: string;
+    teamTemplateId: string;
+    configTemplateIds: string[];
   }) => Promise<void>;
 }) {
   const [name, setName] = useState("");
@@ -729,6 +741,39 @@ function ProjectDialog({
   const [defaultBranch, setDefaultBranch] = useState("main");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [teamTemplates, setTeamTemplates] = useState<MarketTemplate[]>([]);
+  const [configTemplates, setConfigTemplates] = useState<MarketTemplate[]>([]);
+  const [teamTemplateId, setTeamTemplateId] = useState("");
+  const [configTemplateIds, setConfigTemplateIds] = useState<string[]>([]);
+  useEffect(() => {
+    void Promise.all([
+      command<MarketTemplate[]>("list_template_market", {
+        kind: "team-template",
+      }),
+      command<MarketTemplate[]>("list_template_market"),
+    ]).then(([teams, templates]) => {
+      setTeamTemplates(teams);
+      setConfigTemplates(
+        templates.filter(
+          (template) =>
+            !["agent-template", "team-template"].includes(template.kind),
+        ),
+      );
+    });
+  }, []);
+  const selectedTeam = teamTemplates.find((item) => item.id === teamTemplateId);
+  const selectedTeamContent = selectedTeam
+    ? (() => {
+        try {
+          return JSON.parse(selectedTeam.content) as {
+            agents?: Array<{ name?: string; role?: string }>;
+            workflow?: unknown;
+          };
+        } catch {
+          return null;
+        }
+      })()
+    : null;
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!name.trim() || !hostId) {
@@ -744,6 +789,8 @@ function ProjectDialog({
         repoUrl: repoUrl.trim(),
         repoRoot: repoRoot.trim(),
         defaultBranch: defaultBranch.trim() || "main",
+        teamTemplateId,
+        configTemplateIds,
       });
     } catch (reason) {
       setError(errorMessage(reason));
@@ -813,6 +860,64 @@ function ProjectDialog({
               onChange={(event) => setDefaultBranch(event.target.value)}
             />
           </label>
+          <label className="field-label">
+            从 Team 模板创建（可选）
+            <select
+              className="input"
+              value={teamTemplateId}
+              onChange={(event) => setTeamTemplateId(event.target.value)}
+            >
+              <option value="">不使用 Team 模板</option>
+              {teamTemplates.map((template) => (
+                <option key={template.id} value={template.id}>
+                  {template.name} ·{" "}
+                  {template.status === "builtin" ? "内置" : "自定义"}
+                </option>
+              ))}
+            </select>
+          </label>
+          {selectedTeamContent && (
+            <div className="rounded-lg border border-line p-3 text-sm">
+              <strong>将创建的成员</strong>
+              <div className="mt-1">
+                {(selectedTeamContent.agents || [])
+                  .map(
+                    (agent) =>
+                      `${agent.name || "成员"}（${agent.role || "Worker"}）`,
+                  )
+                  .join("、")}
+              </div>
+              <small className="text-muted">
+                Workflow：{JSON.stringify(selectedTeamContent.workflow)}
+              </small>
+            </div>
+          )}
+          {configTemplates.length > 0 && (
+            <fieldset className="rounded-lg border border-line p-3">
+              <legend className="px-1 text-sm font-medium">
+                配置模板（可勾选）
+              </legend>
+              {configTemplates.map((template) => (
+                <label
+                  key={template.id}
+                  className="flex items-center gap-2 text-sm"
+                >
+                  <input
+                    type="checkbox"
+                    checked={configTemplateIds.includes(template.id)}
+                    onChange={(event) =>
+                      setConfigTemplateIds((ids) =>
+                        event.target.checked
+                          ? [...ids, template.id]
+                          : ids.filter((id) => id !== template.id),
+                      )
+                    }
+                  />
+                  {template.name} · {template.kind}
+                </label>
+              ))}
+            </fieldset>
+          )}
         </div>
         {error && <p className="mt-3 text-sm text-danger">{error}</p>}
         <div className="mt-6 flex justify-end gap-2">
@@ -2779,6 +2884,14 @@ function ManageSections({
     null,
   );
   const [skillBrowse, setSkillBrowse] = useState<SkillRulesBrowse | null>(null);
+  const [marketTemplates, setMarketTemplates] = useState<MarketTemplate[]>([]);
+  const [marketKind, setMarketKind] = useState<
+    "agent-template" | "team-template" | "config"
+  >("agent-template");
+  const [templateDraftName, setTemplateDraftName] = useState("");
+  const [templateDraftDescription, setTemplateDraftDescription] = useState("");
+  const [templateDraftContent, setTemplateDraftContent] = useState("{}");
+  const [templateDraftStatus, setTemplateDraftStatus] = useState("");
   const [environmentTab, setEnvironmentTab] = useState<
     "blueprints" | "snapshots" | "advanced" | "outposts"
   >("blueprints");
@@ -2983,6 +3096,7 @@ function ManageSections({
       "Environment",
       "管理 Blueprint、固定环境说明、有序仓库 setup 和长期主机。",
     ],
+    market: ["市场", "浏览和管理 Agent、Team 与配置模板。"],
   };
   const assetKinds = [
     "agents",
@@ -3069,6 +3183,12 @@ function ManageSections({
       .catch(onError);
   }, [tab, devinProjectId, selected, onError]);
   useEffect(() => {
+    if (tab !== "market") return;
+    void command<MarketTemplate[]>("list_template_market")
+      .then(setMarketTemplates)
+      .catch(onError);
+  }, [tab, onError]);
+  useEffect(() => {
     if (tab !== "environment") return;
     void command<EnvironmentRepository[]>("list_environment_repositories", {
       projectId: devinProjectId,
@@ -3133,7 +3253,8 @@ function ManageSections({
           tab === "appearance" ||
           tab === "provider" ||
           tab === "blueprint" ||
-          tab === "devin"
+          tab === "devin" ||
+          tab === "market"
             ? "rounded-xl2 border border-line bg-panel p-5"
             : ""
         }
@@ -4367,6 +4488,150 @@ function ManageSections({
                 </>
               );
             })()}
+          </div>
+        )}
+        {tab === "market" && (
+          <div className="space-y-4">
+            <div className="flex gap-2 border-b border-line pb-2">
+              {(
+                [
+                  ["agent-template", "Agent 市场"],
+                  ["team-template", "Team 市场"],
+                  ["config", "配置模板"],
+                ] as const
+              ).map(([value, label]) => (
+                <button
+                  key={value}
+                  type="button"
+                  className={`px-3 py-1.5 rounded-md text-sm ${
+                    marketKind === value
+                      ? "bg-paper text-accent font-medium"
+                      : "text-muted"
+                  }`}
+                  onClick={() => setMarketKind(value)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            <section className="rounded-lg border border-line p-4 space-y-3">
+              <strong>创建自定义模板</strong>
+              <div className="grid gap-2 md:grid-cols-2">
+                <input
+                  className="input"
+                  value={templateDraftName}
+                  onChange={(event) => setTemplateDraftName(event.target.value)}
+                  placeholder="模板名称"
+                />
+                <input
+                  className="input"
+                  value={templateDraftDescription}
+                  onChange={(event) =>
+                    setTemplateDraftDescription(event.target.value)
+                  }
+                  placeholder="描述"
+                />
+              </div>
+              <textarea
+                className="input min-h-28 font-mono text-xs"
+                value={templateDraftContent}
+                onChange={(event) =>
+                  setTemplateDraftContent(event.target.value)
+                }
+                placeholder={
+                  marketKind === "agent-template"
+                    ? '{"role":"Code","model":"auto"}'
+                    : marketKind === "team-template"
+                      ? '{"workflow":{"workflow":[]},"agents":[]}'
+                      : "模板内容"
+                }
+              />
+              <div className="flex items-center justify-between">
+                <small className="text-muted">{templateDraftStatus}</small>
+                <button
+                  type="button"
+                  className="btn approval-primary"
+                  disabled={!templateDraftName.trim()}
+                  onClick={() => {
+                    const kind =
+                      marketKind === "config" ? "blueprint" : marketKind;
+                    void command("save_template", {
+                      kind,
+                      name: templateDraftName.trim(),
+                      description: templateDraftDescription.trim(),
+                      content: templateDraftContent,
+                    })
+                      .then(() => {
+                        setTemplateDraftStatus("已保存");
+                        setTemplateDraftName("");
+                        return command<MarketTemplate[]>(
+                          "list_template_market",
+                        );
+                      })
+                      .then(setMarketTemplates)
+                      .catch(onError);
+                  }}
+                >
+                  保存模板
+                </button>
+              </div>
+            </section>
+            <div className="grid gap-3 md:grid-cols-2">
+              {marketTemplates
+                .filter((template) =>
+                  marketKind === "config"
+                    ? !["agent-template", "team-template"].includes(
+                        template.kind,
+                      )
+                    : template.kind === marketKind,
+                )
+                .map((template) => (
+                  <article
+                    className="rounded-lg border border-line p-4"
+                    key={template.id}
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div>
+                        <strong>{template.name}</strong>
+                        <small className="block text-muted">
+                          {template.status === "builtin" ? "内置" : "自定义"} ·
+                          v{template.version}
+                        </small>
+                      </div>
+                      <span className="text-xs text-muted">
+                        {template.kind}
+                      </span>
+                    </div>
+                    <p className="mt-2 text-sm text-muted">
+                      {template.description || "无描述"}
+                    </p>
+                    <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap text-xs text-muted">
+                      {template.content}
+                    </pre>
+                    {template.readonly && (
+                      <div className="mt-2 flex items-center justify-between">
+                        <small className="text-muted">内置模板只读。</small>
+                        <button
+                          type="button"
+                          className="btn"
+                          onClick={() => {
+                            setTemplateDraftName(`${template.name} 副本`);
+                            setTemplateDraftDescription(template.description);
+                            setTemplateDraftContent(template.content);
+                          }}
+                        >
+                          另存为
+                        </button>
+                      </div>
+                    )}
+                  </article>
+                ))}
+            </div>
+            {!marketTemplates.some((template) =>
+              marketKind === "config"
+                ? !["agent-template", "team-template"].includes(template.kind)
+                : template.kind === marketKind,
+            ) && <div className="py-8 text-sm text-muted">暂无模板</div>}
           </div>
         )}
         {tab === "skill" && (
@@ -8555,14 +8820,24 @@ function AppContent() {
           hosts={hosts}
           onClose={() => setProjectDialogOpen(false)}
           onSubmit={async (values) => {
-            const project = await command<Project>("create_project", {
-              name: values.name,
-              hostId: values.hostId,
-              repoUrl: values.repoUrl || null,
-              repoRoot: values.repoRoot || null,
-              defaultBranch: values.defaultBranch,
-            });
-            setProjects((items) => [...items, project]);
+            const project = values.teamTemplateId
+              ? await command<Project>("create_project_from_team_template", {
+                  teamTemplateId: values.teamTemplateId,
+                  name: values.name,
+                  hostId: values.hostId,
+                  repoUrl: values.repoUrl || null,
+                  repoRoot: values.repoRoot || null,
+                  defaultBranch: values.defaultBranch,
+                  configTemplateIds: values.configTemplateIds,
+                })
+              : await command<Project>("create_project", {
+                  name: values.name,
+                  hostId: values.hostId,
+                  repoUrl: values.repoUrl || null,
+                  repoRoot: values.repoRoot || null,
+                  defaultBranch: values.defaultBranch,
+                });
+            await refresh();
             setSelectedProject(project);
             setProjectDialogOpen(false);
             setSurface("project");
