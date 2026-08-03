@@ -1226,6 +1226,15 @@ function ProjectConfigPanel({
     enabled: boolean,
   ) => {
     if (
+      enabled &&
+      template.modified &&
+      !window.confirm(
+        `该项目配置「${template.name}」已本地修改。重新勾选将用模板当前内容覆盖本地修改，确定继续吗？`,
+      )
+    ) {
+      return;
+    }
+    if (
       !enabled &&
       !window.confirm(
         `将删除项目作用域配置「${template.name}」，已本地修改的内容也会被删除。确定继续吗？`,

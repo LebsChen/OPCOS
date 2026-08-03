@@ -2506,32 +2506,74 @@ fn copy_config_templates(
             )
             .map_err(|error| format!("configuration template not found: {error}"))?;
         let object_id = format!("project-{project_id}-{template_id}");
-        let version_id = format!("{object_id}:v1");
-        tx.execute(
-            "INSERT INTO config_object
-             (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
-             VALUES (?1,?2,?3,?4,'project',?5,'active',?6,?7)
-             ON CONFLICT(id) DO NOTHING",
-            params![
-                object_id,
-                kind,
-                name,
-                stable_server_key(&object_id),
-                project_id,
-                Utc::now().to_rfc3339(),
-                version_id
-            ],
-        )
-        .map_err(|error| error.to_string())?;
+        let template_hash = content_hash(&content);
+        let existing_version: Option<i64> = tx
+            .query_row(
+                "SELECT v.version FROM config_object o
+                 JOIN config_object_version v ON v.id=o.current_version_id
+                 WHERE o.id=?1 AND o.scope_kind='project'",
+                [&object_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let version = if let Some(version) = existing_version {
+            let matching_version: Option<i64> = tx
+                .query_row(
+                    "SELECT version FROM config_object_version
+                     WHERE object_id=?1 AND content_hash=?2
+                     ORDER BY version DESC LIMIT 1",
+                    params![object_id, template_hash],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let version = matching_version.unwrap_or(version + 1);
+            tx.execute(
+                "UPDATE config_object
+                 SET kind=?1,name=?2,status='active',current_version_id=?3
+                 WHERE id=?4 AND scope_kind='project' AND scope_key=?5",
+                params![
+                    kind,
+                    name,
+                    format!("{object_id}:v{version}"),
+                    object_id,
+                    project_id
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+            version
+        } else {
+            let version = 1;
+            let version_id = format!("{object_id}:v{version}");
+            tx.execute(
+                "INSERT INTO config_object
+                 (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
+                 VALUES (?1,?2,?3,?4,'project',?5,'active',?6,?7)",
+                params![
+                    object_id,
+                    kind,
+                    name,
+                    stable_server_key(&object_id),
+                    project_id,
+                    Utc::now().to_rfc3339(),
+                    version_id
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+            version
+        };
+        let version_id = format!("{object_id}:v{version}");
         tx.execute(
             "INSERT OR IGNORE INTO config_object_version
              (id,object_id,version,content,content_hash,created_at,note,metadata_json)
-             VALUES (?1,?2,1,?3,?4,?5,'copied from template',?6)",
+             VALUES (?1,?2,?3,?4,?5,?6,'copied from template',?7)",
             params![
                 version_id,
                 object_id,
+                version,
                 content,
-                content_hash(&content),
+                template_hash,
                 Utc::now().to_rfc3339(),
                 metadata
             ],
@@ -2541,7 +2583,7 @@ fn copy_config_templates(
         let metadata = serde_json::to_string(&json!({
             "description": metadata.get("description").and_then(Value::as_str).unwrap_or(""),
             "source_template_id": template_id,
-            "source_content_hash": content_hash(&content)
+            "source_content_hash": template_hash
         }))
         .map_err(|error| error.to_string())?;
         tx.execute(
@@ -2603,7 +2645,7 @@ fn list_project_configuration_templates(
                 },
                 "content": row.get::<_, String>(5)?,
                 "applied": project_status.as_deref() == Some("active"),
-                "modified": project_status.as_deref() == Some("active")
+                "modified": project_status.is_some()
                     && source_hash != Some(row.get::<_, String>(6)?.as_str()),
                 "project_object_id": row.get::<_, Option<String>>(7)?,
             }))
@@ -13849,6 +13891,89 @@ mod m7_tests {
             )
             .unwrap();
         assert_eq!(copied, "before");
+    }
+
+    #[test]
+    fn copying_a_template_can_restore_deleted_objects_and_tracks_new_versions() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE config_object (
+                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+                   server_key TEXT, scope_kind TEXT NOT NULL, scope_key TEXT,
+                   status TEXT NOT NULL, created_at TEXT NOT NULL,
+                   current_version_id TEXT
+                 );
+                 CREATE TABLE config_object_version (
+                   id TEXT PRIMARY KEY, object_id TEXT NOT NULL, version INTEGER NOT NULL,
+                   content TEXT NOT NULL, content_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+                   note TEXT NOT NULL, metadata_json TEXT NOT NULL,
+                   UNIQUE(object_id,version)
+                 );
+                 INSERT INTO config_object VALUES
+                   ('template-rules','rules','Rules','rules','template','custom',
+                    'active','now','template-rules:v1');
+                 INSERT INTO config_object_version VALUES
+                   ('template-rules:v1','template-rules',1,'before',
+                    'hash-before','now','created','{}');",
+            )
+            .unwrap();
+        copy_config_templates(&connection, "project-1", &["template-rules".to_owned()]).unwrap();
+        connection
+            .execute(
+                "UPDATE config_object SET status='deleted'
+                 WHERE id='project-project-1-template-rules'",
+                [],
+            )
+            .unwrap();
+        copy_config_templates(&connection, "project-1", &["template-rules".to_owned()]).unwrap();
+        let status_and_content: (String, String) = connection
+            .query_row(
+                "SELECT o.status,v.content FROM config_object o
+                 JOIN config_object_version v ON v.id=o.current_version_id
+                 WHERE o.id='project-project-1-template-rules'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status_and_content, ("active".into(), "before".into()));
+
+        connection
+            .execute_batch(
+                "INSERT INTO config_object_version
+                 VALUES ('template-rules:v2','template-rules',2,'after',
+                         'hash-after','now','edited','{}');
+                 UPDATE config_object SET current_version_id='template-rules:v2'
+                 WHERE id='template-rules'",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE config_object SET status='deleted'
+                 WHERE id='project-project-1-template-rules'",
+                [],
+            )
+            .unwrap();
+        copy_config_templates(&connection, "project-1", &["template-rules".to_owned()]).unwrap();
+        let content: String = connection
+            .query_row(
+                "SELECT v.content FROM config_object o
+                 JOIN config_object_version v ON v.id=o.current_version_id
+                 WHERE o.id='project-project-1-template-rules'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "after");
+        let versions: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM config_object_version
+                 WHERE object_id='project-project-1-template-rules'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(versions, 2);
     }
 
     #[test]
