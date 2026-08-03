@@ -215,6 +215,44 @@ pub struct CompactionRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PlanRecord {
+    pub plan_id: String,
+    pub session_id: String,
+    pub project_id: Option<String>,
+    pub title: String,
+    pub summary: String,
+    pub status: String,
+    pub revision: u64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub steps: Vec<PlanStepRecord>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PlanStepRecord {
+    pub step_id: String,
+    pub plan_id: String,
+    pub position: u32,
+    pub description: String,
+    pub status: String,
+    pub failure_reason: Option<String>,
+    pub abandoned_reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PlanRevisionRecord {
+    pub revision_id: String,
+    pub plan_id: String,
+    pub revision: u64,
+    pub change_type: String,
+    pub summary: String,
+    pub snapshot: serde_json::Value,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GrantRecord {
     pub session_id: String,
     pub key: String,
@@ -625,6 +663,70 @@ fn planning_round_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Planning
         started_at: row.get(7)?,
         finished_at: row.get(8)?,
     })
+}
+
+fn plan_step_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlanStepRecord> {
+    Ok(PlanStepRecord {
+        step_id: row.get(0)?,
+        plan_id: row.get(1)?,
+        position: row.get::<_, i64>(2)?.try_into().unwrap_or_default(),
+        description: row.get(3)?,
+        status: row.get(4)?,
+        failure_reason: row.get(5)?,
+        abandoned_reason: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+fn load_plan_with_connection(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Option<PlanRecord>, StoreError> {
+    let Some((plan_id, project_id, title, summary, status, revision, created_at, updated_at)) =
+        connection
+            .query_row(
+                "SELECT plan_id,project_id,title,summary,status,revision,created_at,updated_at
+                 FROM plans WHERE session_id=?1 AND status='active'
+                 ORDER BY updated_at DESC LIMIT 1",
+                [session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get::<_, i64>(5)?.try_into().unwrap_or_default(),
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .optional()?
+    else {
+        return Ok(None);
+    };
+    let mut statement = connection.prepare(
+        "SELECT step_id,plan_id,position,description,status,failure_reason,abandoned_reason,
+                created_at,updated_at
+         FROM plan_steps WHERE plan_id=?1 ORDER BY position,created_at",
+    )?;
+    let steps = statement
+        .query_map([&plan_id], plan_step_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(PlanRecord {
+        plan_id,
+        session_id: session_id.into(),
+        project_id,
+        title,
+        summary,
+        status,
+        revision,
+        created_at,
+        updated_at,
+        steps,
+    }))
 }
 
 const WORK_QUEUE_COLUMNS: &str = "queue_id,task_type,payload,dedup_key,idempotency_key,
@@ -1047,6 +1149,30 @@ pub trait SessionStore {
     ) -> Result<bool, StoreError>;
     fn save_compaction(&self, state: &CompactionRecord) -> Result<(), StoreError>;
     fn load_compaction(&self, session_id: &str) -> Result<Option<CompactionRecord>, StoreError>;
+    fn create_plan(
+        &self,
+        session_id: &str,
+        project_id: Option<&str>,
+        title: &str,
+        summary: &str,
+        steps: &[String],
+    ) -> Result<PlanRecord, StoreError>;
+    fn load_plan(&self, session_id: &str) -> Result<Option<PlanRecord>, StoreError>;
+    fn load_plan_revisions(&self, plan_id: &str) -> Result<Vec<PlanRevisionRecord>, StoreError>;
+    fn update_plan_step(
+        &self,
+        session_id: &str,
+        step_id: &str,
+        status: Option<&str>,
+        description: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<PlanRecord, StoreError>;
+    fn revise_plan(
+        &self,
+        session_id: &str,
+        summary: &str,
+        add_steps: &[String],
+    ) -> Result<PlanRecord, StoreError>;
     fn save_grant(&self, grant: &GrantRecord) -> Result<(), StoreError>;
     fn load_grants(&self, session_id: &str) -> Result<Vec<GrantRecord>, StoreError>;
     fn append_usage(&self, usage: &UsageRecord) -> Result<(), StoreError>;
@@ -3437,6 +3563,43 @@ impl SqliteStore {
              );
              CREATE INDEX IF NOT EXISTS idx_planning_rounds_goal_time
                ON planning_rounds(goal_id, started_at DESC);
+             CREATE TABLE IF NOT EXISTS plans (
+               plan_id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL,
+               project_id TEXT,
+               title TEXT NOT NULL,
+               summary TEXT NOT NULL,
+               status TEXT NOT NULL,
+               revision INTEGER NOT NULL,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_plans_session_status
+               ON plans(session_id, status, updated_at DESC);
+             CREATE TABLE IF NOT EXISTS plan_steps (
+               step_id TEXT PRIMARY KEY,
+               plan_id TEXT NOT NULL,
+               position INTEGER NOT NULL,
+               description TEXT NOT NULL,
+               status TEXT NOT NULL,
+               failure_reason TEXT,
+               abandoned_reason TEXT,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_plan_steps_plan_position
+               ON plan_steps(plan_id, position);
+             CREATE TABLE IF NOT EXISTS plan_revisions (
+               revision_id TEXT PRIMARY KEY,
+               plan_id TEXT NOT NULL,
+               revision INTEGER NOT NULL,
+               change_type TEXT NOT NULL,
+               summary TEXT NOT NULL,
+               snapshot TEXT NOT NULL,
+               created_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_plan_revisions_plan_revision
+               ON plan_revisions(plan_id, revision DESC);
              CREATE TABLE IF NOT EXISTS events (
                event_id TEXT PRIMARY KEY,
                kind TEXT NOT NULL,
@@ -4358,6 +4521,171 @@ impl SessionStore for SqliteStore {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn create_plan(
+        &self,
+        session_id: &str,
+        project_id: Option<&str>,
+        title: &str,
+        summary: &str,
+        steps: &[String],
+    ) -> Result<PlanRecord, StoreError> {
+        if title.trim().is_empty()
+            || steps.is_empty()
+            || steps.iter().any(|step| step.trim().is_empty())
+        {
+            return Err(StoreError::Validation(
+                "plan title and non-empty steps are required".into(),
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
+        let plan_id = format!("plan-{}", uuid::Uuid::new_v4());
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        if connection
+            .query_row(
+                "SELECT 1 FROM plans WHERE session_id=?1 AND status='active' LIMIT 1",
+                [session_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Err(StoreError::Validation(
+                "session already has an active plan; revise it instead".into(),
+            ));
+        }
+        connection.execute("INSERT INTO plans (plan_id,session_id,project_id,title,summary,status,revision,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,'active',1,?6,?6)", params![plan_id, session_id, project_id, title, summary, now])?;
+        for (position, description) in steps.iter().enumerate() {
+            connection.execute("INSERT INTO plan_steps (step_id,plan_id,position,description,status,created_at,updated_at) VALUES (?1,?2,?3,?4,'not_started',?5,?5)", params![format!("step-{}", uuid::Uuid::new_v4()), plan_id, position as i64, description, now])?;
+        }
+        let plan = load_plan_with_connection(&connection, session_id)?
+            .ok_or_else(|| StoreError::Validation("created plan could not be loaded".into()))?;
+        connection.execute("INSERT INTO plan_revisions (revision_id,plan_id,revision,change_type,summary,snapshot,created_at) VALUES (?1,?2,1,'created',?3,?4,?5)", params![format!("revision-{}", uuid::Uuid::new_v4()), plan.plan_id, "created plan", serde_json::to_string(&plan)?, now])?;
+        Ok(plan)
+    }
+
+    fn load_plan(&self, session_id: &str) -> Result<Option<PlanRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        load_plan_with_connection(&connection, session_id)
+    }
+
+    fn load_plan_revisions(&self, plan_id: &str) -> Result<Vec<PlanRevisionRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare("SELECT revision_id,plan_id,revision,change_type,summary,snapshot,created_at FROM plan_revisions WHERE plan_id=?1 ORDER BY revision")?;
+        statement
+            .query_map([plan_id], |row| {
+                let snapshot: String = row.get(5)?;
+                Ok(PlanRevisionRecord {
+                    revision_id: row.get(0)?,
+                    plan_id: row.get(1)?,
+                    revision: row.get::<_, i64>(2)?.try_into().unwrap_or_default(),
+                    change_type: row.get(3)?,
+                    summary: row.get(4)?,
+                    snapshot: serde_json::from_str(&snapshot).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            5,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    created_at: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    fn update_plan_step(
+        &self,
+        session_id: &str,
+        step_id: &str,
+        status: Option<&str>,
+        description: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<PlanRecord, StoreError> {
+        const STATUSES: [&str; 5] = ["not_started", "in_progress", "done", "failed", "abandoned"];
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let plan = load_plan_with_connection(&connection, session_id)?
+            .ok_or_else(|| StoreError::Validation("no active plan".into()))?;
+        let (current_status, current_description): (String, String) = connection
+            .query_row(
+                "SELECT status,description FROM plan_steps WHERE step_id=?1 AND plan_id=?2",
+                params![step_id, plan.plan_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| StoreError::Validation("plan step not found".into()))?;
+        let next_status = status.unwrap_or(&current_status);
+        if !STATUSES.contains(&next_status) {
+            return Err(StoreError::Validation("invalid plan step status".into()));
+        }
+        if current_status == "abandoned" && next_status != "abandoned" {
+            return Err(StoreError::Validation(
+                "abandoned steps cannot be reopened".into(),
+            ));
+        }
+        if current_status == "failed" && next_status == "done" {
+            return Err(StoreError::Validation(
+                "failed steps cannot silently become done; revise the plan or explain the recovery"
+                    .into(),
+            ));
+        }
+        if next_status == "failed" && reason.is_none_or(|value| value.trim().is_empty()) {
+            return Err(StoreError::Validation(
+                "failing a step requires a reason".into(),
+            ));
+        }
+        if next_status == "abandoned" && reason.is_none_or(|value| value.trim().is_empty()) {
+            return Err(StoreError::Validation(
+                "abandoning a step requires a reason".into(),
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
+        connection.execute("UPDATE plan_steps SET status=?1,description=?2,failure_reason=?3,abandoned_reason=?4,updated_at=?5 WHERE step_id=?6 AND plan_id=?7", params![next_status, description.unwrap_or(&current_description), (next_status == "failed").then(|| reason.unwrap_or("")), (next_status == "abandoned").then(|| reason.unwrap_or("")), now, step_id, plan.plan_id])?;
+        let revision = plan.revision + 1;
+        connection.execute(
+            "UPDATE plans SET revision=?1,updated_at=?2 WHERE plan_id=?3",
+            params![revision as i64, now, plan.plan_id],
+        )?;
+        let updated = load_plan_with_connection(&connection, session_id)?
+            .ok_or_else(|| StoreError::Validation("updated plan could not be loaded".into()))?;
+        connection.execute("INSERT INTO plan_revisions (revision_id,plan_id,revision,change_type,summary,snapshot,created_at) VALUES (?1,?2,?3,'step_update',?4,?5,?6)", params![format!("revision-{}", uuid::Uuid::new_v4()), updated.plan_id, revision as i64, format!("updated step {step_id} to {next_status}"), serde_json::to_string(&updated)?, now])?;
+        Ok(updated)
+    }
+
+    fn revise_plan(
+        &self,
+        session_id: &str,
+        summary: &str,
+        add_steps: &[String],
+    ) -> Result<PlanRecord, StoreError> {
+        if summary.trim().is_empty() || add_steps.iter().any(|step| step.trim().is_empty()) {
+            return Err(StoreError::Validation(
+                "revision summary and step descriptions are required".into(),
+            ));
+        }
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let plan = load_plan_with_connection(&connection, session_id)?
+            .ok_or_else(|| StoreError::Validation("no active plan".into()))?;
+        let now = Utc::now().to_rfc3339();
+        let position = plan
+            .steps
+            .iter()
+            .map(|step| step.position)
+            .max()
+            .map_or(0, |value| value + 1);
+        for (offset, description) in add_steps.iter().enumerate() {
+            connection.execute("INSERT INTO plan_steps (step_id,plan_id,position,description,status,created_at,updated_at) VALUES (?1,?2,?3,?4,'not_started',?5,?5)", params![format!("step-{}", uuid::Uuid::new_v4()), plan.plan_id, (position + offset as u32) as i64, description, now])?;
+        }
+        let revision = plan.revision + 1;
+        connection.execute(
+            "UPDATE plans SET revision=?1,summary=?2,updated_at=?3 WHERE plan_id=?4",
+            params![revision as i64, summary, now, plan.plan_id],
+        )?;
+        let updated = load_plan_with_connection(&connection, session_id)?
+            .ok_or_else(|| StoreError::Validation("revised plan could not be loaded".into()))?;
+        connection.execute("INSERT INTO plan_revisions (revision_id,plan_id,revision,change_type,summary,snapshot,created_at) VALUES (?1,?2,?3,'revised',?4,?5,?6)", params![format!("revision-{}", uuid::Uuid::new_v4()), updated.plan_id, revision as i64, summary, serde_json::to_string(&updated)?, now])?;
+        Ok(updated)
     }
 
     fn save_grant(&self, grant: &GrantRecord) -> Result<(), StoreError> {
@@ -5732,6 +6060,75 @@ mod tests {
             store.load_planning_rounds(Some(&goal.goal_id), 10).unwrap(),
             vec![round]
         );
+    }
+
+    #[test]
+    fn tracked_plan_preserves_revisions_and_rejects_silent_recovery() {
+        let path = std::env::temp_dir().join(format!("opcos-plan-{}.db", uuid::Uuid::new_v4()));
+        let store = SqliteStore::open(&path).unwrap();
+        let plan = store
+            .create_plan(
+                "session-plan",
+                None,
+                "Ship feature",
+                "Implement and verify",
+                &["Implement".into(), "Test".into()],
+            )
+            .unwrap();
+        assert_eq!(plan.steps[0].status, "not_started");
+        let failed = store
+            .update_plan_step(
+                "session-plan",
+                &plan.steps[0].step_id,
+                Some("failed"),
+                None,
+                Some("compiler error"),
+            )
+            .unwrap();
+        assert_eq!(
+            failed.steps[0].failure_reason.as_deref(),
+            Some("compiler error")
+        );
+        let error = store
+            .update_plan_step(
+                "session-plan",
+                &plan.steps[0].step_id,
+                Some("done"),
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot silently become done"));
+        let abandoned = store
+            .update_plan_step(
+                "session-plan",
+                &plan.steps[1].step_id,
+                Some("abandoned"),
+                None,
+                Some("requirement removed"),
+            )
+            .unwrap();
+        assert_eq!(
+            abandoned.steps[1].abandoned_reason.as_deref(),
+            Some("requirement removed")
+        );
+        let revised = store
+            .revise_plan("session-plan", "Added follow-up", &["Document".into()])
+            .unwrap();
+        assert_eq!(revised.revision, 4);
+        assert_eq!(store.load_plan_revisions(&plan.plan_id).unwrap().len(), 4);
+        drop(store);
+        let restored = SqliteStore::open(&path).unwrap();
+        assert_eq!(
+            restored
+                .load_plan("session-plan")
+                .unwrap()
+                .unwrap()
+                .revision,
+            4
+        );
+        drop(restored);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
