@@ -1586,12 +1586,15 @@ input.workspace-chip {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: 14px;
-  min-height: 500px;
+  min-height: 0;
 }
-@media (min-width: 900px) {
+@container (min-width: 900px) {
   .review-grid {
     grid-template-columns: minmax(200px, 260px) minmax(0, 1fr);
   }
+}
+.review-panel {
+  container-type: inline-size;
 }
 .file-row {
   display: flex;
@@ -1622,7 +1625,8 @@ input.workspace-chip {
   background: var(--panel);
 }
 .diff-view {
-  min-height: 420px;
+  min-height: 240px;
+  max-height: 420px;
   overflow: auto;
   margin: 0;
   padding: 13px;
