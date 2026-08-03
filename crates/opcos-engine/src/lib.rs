@@ -1469,6 +1469,8 @@ fn tool_risk(name: &str) -> ToolRisk {
         "plan_get" => ToolRisk::Read,
         "plan_update" | "plan_revise" => ToolRisk::Write,
         "lsp_definition" | "lsp_references" | "lsp_diagnostics" => ToolRisk::Read,
+        "skill_search_learned" | "skill_get_learned" => ToolRisk::Read,
+        "skill_save_learned" => ToolRisk::Write,
         "action_ledger_list" => ToolRisk::Read,
         "action_ledger_begin" | "action_ledger_finish" => ToolRisk::Write,
         "work_queue_list" => ToolRisk::Read,
@@ -1908,6 +1910,9 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"lsp_definition","description":"Use the local language server to find definitions. Only LocalHost supports structured LSP; remote RVM hosts return an explicit unsupported error. Results may be incomplete while indexing, and incomplete results must not be treated as a complete answer.","parameters":{"type":"object","properties":{"language":{"type":"string"},"path":{"type":"string"},"line":{"type":"integer"},"character":{"type":"integer"}},"required":["path","line","character"]}}}),
         json!({"type":"function","function":{"name":"lsp_references","description":"Use the local language server to find references. Results are bounded with honest truncation metadata and may be explicitly incomplete while indexing; an incomplete result is not proof that no references exist.","parameters":{"type":"object","properties":{"language":{"type":"string"},"path":{"type":"string"},"line":{"type":"integer"},"character":{"type":"integer"}},"required":["path","line","character"]}}}),
         json!({"type":"function","function":{"name":"lsp_diagnostics","description":"Read diagnostics from the local language server. Diagnostics are synchronized after edits and stale document versions are rejected. Missing servers and remote structured-stdio hosts are explicit errors, not empty results.","parameters":{"type":"object","properties":{"language":{"type":"string"},"path":{"type":"string"}},"required":["path"]}}}),
+        json!({"type":"function","function":{"name":"skill_save_learned","description":"Persist a reusable workflow explicitly described by the model. Nothing is auto-captured. The verification field is only a model assertion, never an OPCOS verification; credentials or secret-like values are rejected. Learned skills never modify user-authored skills.","parameters":{"type":"object","properties":{"title":{"type":"string"},"summary":{"type":"string"},"applies_when":{"type":"string"},"steps":{"type":"array","items":{"type":"string"}},"verification":{"type":"string"},"caveats":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}},"source_commit":{"type":"string"},"model_asserted_status":{"type":"string","enum":["model_asserted_validated","model_asserted_observed","model_asserted_partial"]},"supersedes_id":{"type":"string"}},"required":["title","summary","applies_when","steps","verification","source_commit","model_asserted_status"]}}}),
+        json!({"type":"function","function":{"name":"skill_search_learned","description":"Search explicitly saved learned workflows for the current repository. Results are bounded to at most five and prominently mark source-commit mismatches as STALE CANDIDATE; model-asserted verification is not an objective fact.","parameters":{"type":"object","properties":{"query":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}}}}}}),
+        json!({"type":"function","function":{"name":"skill_get_learned","description":"Read one explicitly saved learned workflow. The result includes its source commit, model-asserted verification status, version links, and stale/conflict warnings.","parameters":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}}),
         json!({"type":"function","function":{"name":"ask_user","description":"Ask the user a question and wait for an answer.","parameters":{"type":"object","properties":{"question":{"type":"string"}},"required":["question"]}}}),
         json!({"type":"function","function":{"name":"linear_get_issue","description":"Read a Linear issue by identifier. Read-only.","parameters":{"type":"object","properties":{"identifier":{"type":"string"}},"required":["identifier"]}}}),
         json!({"type":"function","function":{"name":"linear_list_my_issues","description":"List Linear issues assigned to the current user. Read-only.","parameters":{"type":"object","properties":{"limit":{"type":"integer"}}}}}),
@@ -2163,6 +2168,25 @@ mod tests {
         assert!(names.contains("lsp_definition"));
         assert!(names.contains("lsp_references"));
         assert!(names.contains("lsp_diagnostics"));
+    }
+
+    #[test]
+    fn learned_skill_tools_are_explicitly_scoped_and_not_prompt_assets() {
+        assert_eq!(tool_risk("skill_save_learned"), ToolRisk::Write);
+        assert_eq!(tool_risk("skill_search_learned"), ToolRisk::Read);
+        assert_eq!(tool_risk("skill_get_learned"), ToolRisk::Read);
+        let names = tool_definitions()
+            .into_iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<HashSet<_>>();
+        assert!(names.contains("skill_save_learned"));
+        assert!(names.contains("skill_search_learned"));
+        assert!(names.contains("skill_get_learned"));
     }
     #[derive(Clone)]
     struct FakeProvider;

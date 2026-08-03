@@ -251,6 +251,262 @@ enum DesktopExecutor {
     Local(Box<LocalExecutor>),
 }
 
+fn reject_learned_secret(text: &str, known: &[String]) -> Result<(), String> {
+    if known
+        .iter()
+        .any(|secret| !secret.is_empty() && text.contains(secret))
+    {
+        return Err("learned skill rejected: content contains a configured secret".into());
+    }
+    let lower = text.to_ascii_lowercase();
+    for marker in ["bearer ", "token=", "key=", "password=", "secret="] {
+        if lower.contains(marker) {
+            return Err(format!(
+                "learned skill rejected: credential-like pattern {marker}"
+            ));
+        }
+    }
+    if text.split_whitespace().any(|word| {
+        let Some(at) = word.find('@') else {
+            return false;
+        };
+        let prefix = &word[..at];
+        prefix.contains(':') && (prefix.contains("://") || prefix.matches(':').count() == 1)
+    }) {
+        return Err("learned skill rejected: credential-bearing URL syntax".into());
+    }
+    Ok(())
+}
+
+async fn learned_current_commit(host: &dyn Host, workspace: &str) -> String {
+    host.exec(ExecRequest {
+        command: "git rev-parse HEAD".into(),
+        cwd: Some(workspace.into()),
+        timeout_seconds: 15,
+        session: None,
+        env: None,
+    })
+    .await
+    .ok()
+    .filter(|result| result.result.exit_code == 0)
+    .map(|result| result.result.stdout.trim().to_owned())
+    .filter(|value| !value.is_empty())
+    .unwrap_or_else(|| "unknown".into())
+}
+
+fn learned_skill_json(record: &opcos_store::LearnedSkillRecord, current_commit: &str) -> Value {
+    let stale = current_commit != "unknown" && record.source_commit != current_commit;
+    json!({
+        "id": record.id,
+        "title": record.title,
+        "summary": record.summary,
+        "applies_when": record.applies_when,
+        "steps": record.steps,
+        "verification": record.verification,
+        "verification_semantics": "model_asserted_only_not_system_verified",
+        "model_asserted_status": record.model_asserted_status,
+        "caveats": record.caveats,
+        "tags": record.tags,
+        "repository_identity": record.repository_identity,
+        "source_commit": record.source_commit,
+        "current_commit": current_commit,
+        "freshness": if stale { "stale_candidate" } else { "current" },
+        "freshness_warning": if stale {
+            format!("STALE CANDIDATE: saved at {}, current commit is {}", record.source_commit, current_commit)
+        } else {
+            "Current commit matches saved commit".to_owned()
+        },
+        "status": record.status,
+        "supersedes_id": record.supersedes_id,
+        "superseded_by_id": record.superseded_by_id,
+        "conflict_group": record.conflict_group,
+        "conflict_warning": "Learned skills never override human-authored skills; conflicts require model review",
+    })
+}
+
+async fn execute_learned_skill_tool(
+    store: &SqliteStore,
+    secrets: &KeyringSecretStore,
+    project_id: Option<&str>,
+    host: &dyn Host,
+    workspace: &str,
+    name: &str,
+    arguments: &Value,
+) -> Result<Value, String> {
+    let repository_identity = project_id
+        .map(|id| format!("project:{id}"))
+        .unwrap_or_else(|| format!("workspace:{workspace}"));
+    let current_commit = learned_current_commit(host, workspace).await;
+    match name {
+        "skill_save_learned" => {
+            let string = |key| {
+                arguments
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            let steps = arguments
+                .get("steps")
+                .and_then(Value::as_array)
+                .ok_or("steps must be a non-empty array")?
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(str::to_owned)
+                        .ok_or("steps must be strings")
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if steps.is_empty() {
+                return Err("steps must be a non-empty array".into());
+            }
+            let tags = arguments
+                .get("tags")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|item| {
+                            item.as_str()
+                                .map(str::to_owned)
+                                .ok_or("tags must be strings")
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let title = string("title");
+            let summary = string("summary");
+            let applies_when = string("applies_when");
+            let verification = string("verification");
+            let caveats = string("caveats");
+            let source_commit = string("source_commit");
+            let model_asserted_status = string("model_asserted_status");
+            if current_commit != "unknown" && source_commit != current_commit {
+                return Err(format!(
+                    "source_commit does not match current repository commit; expected {current_commit}"
+                ));
+            }
+            let content = format!(
+                "{title}\n{summary}\n{applies_when}\n{verification}\n{caveats}\n{source_commit}\n{}\n{}",
+                steps.join("\n"),
+                tags.join("\n")
+            );
+            let known_names = [
+                "github",
+                "gitlab",
+                "linear-pat",
+                "telegram",
+                "discord",
+                "slack",
+                "rvm-token",
+            ];
+            let mut known = known_names
+                .iter()
+                .flat_map(|name| {
+                    [
+                        scoped_secret_get_from_store(secrets, project_id, "connector-token", name),
+                        scoped_secret_get_from_store(secrets, project_id, "asset-secret", name),
+                        scoped_secret_get_from_store(secrets, project_id, "mcp-credential", name),
+                    ]
+                })
+                .filter_map(Result::ok)
+                .flatten()
+                .collect::<Vec<_>>();
+            for provider in registry::descriptors() {
+                for prefix in ["provider-key", "asset-secret"] {
+                    if let Ok(Some(value)) =
+                        scoped_secret_get_from_store(secrets, project_id, prefix, &provider.name)
+                    {
+                        known.push(value);
+                    }
+                }
+            }
+            reject_learned_secret(&content, &known)?;
+            let record = store
+                .save_learned_skill(opcos_store::LearnedSkillRecord {
+                    id: String::new(),
+                    repository_identity,
+                    project_id: project_id.map(str::to_owned),
+                    title,
+                    summary,
+                    applies_when,
+                    steps,
+                    verification,
+                    caveats,
+                    tags,
+                    source_commit,
+                    model_asserted_status,
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                    status: "active".into(),
+                    supersedes_id: arguments
+                        .get("supersedes_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    superseded_by_id: None,
+                    conflict_group: String::new(),
+                })
+                .map_err(|error| error.to_string())?;
+            Ok(
+                json!({"saved": learned_skill_json(&record, &current_commit),
+                "warning": "model_asserted_status is not independently verified by OPCOS"}),
+            )
+        }
+        "skill_search_learned" => {
+            let mut query = arguments
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            if let Some(tags) = arguments.get("tags").and_then(Value::as_array) {
+                for tag in tags.iter().filter_map(Value::as_str) {
+                    if !query.is_empty() {
+                        query.push(' ');
+                    }
+                    query.push_str(tag);
+                }
+            }
+            let records = store
+                .search_learned_skills(&repository_identity, &query, &current_commit, 5)
+                .map_err(|error| error.to_string())?;
+            let mut results = records
+                .iter()
+                .map(|record| learned_skill_json(record, &current_commit))
+                .collect::<Vec<_>>();
+            for result in &mut results {
+                let group = result
+                    .get("conflict_group")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let conflict = records
+                    .iter()
+                    .filter(|record| record.conflict_group == group)
+                    .count()
+                    > 1;
+                if let Some(object) = result.as_object_mut() {
+                    object.insert("conflict_detected".into(), Value::Bool(conflict));
+                }
+            }
+            Ok(json!({"results": results,
+                "returned_items": records.len(), "limit": 5,
+                "warning": "model assertions are not system verification"}))
+        }
+        "skill_get_learned" => {
+            let id = arguments
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or("missing learned skill id")?;
+            let record = store
+                .get_learned_skill(id)
+                .map_err(|error| error.to_string())?
+                .ok_or("learned skill not found")?;
+            Ok(learned_skill_json(&record, &current_commit))
+        }
+        _ => Err(format!("unsupported learned skill tool: {name}")),
+    }
+}
+
 fn git_string_argument(arguments: &Value, key: &str) -> Result<String, String> {
     arguments
         .get(key)
@@ -2650,6 +2906,26 @@ impl ToolExecutor for RemoteExecutor {
         }
         if matches!(
             name,
+            "skill_save_learned" | "skill_search_learned" | "skill_get_learned"
+        ) {
+            let host = RvmHost::new(
+                self.host_id.clone(),
+                self.workspace.clone(),
+                self.client.clone(),
+            );
+            return execute_learned_skill_tool(
+                &self.store,
+                &self.secrets,
+                self.project_id.as_deref(),
+                &host,
+                &self.workspace,
+                name,
+                &arguments,
+            )
+            .await;
+        }
+        if matches!(
+            name,
             "plan_get" | "plan_update" | "plan_revise" | "propose_plan"
         ) {
             return execute_plan_tool(
@@ -2907,6 +3183,21 @@ impl ToolExecutor for DesktopExecutor {
                         name,
                         arguments,
                     );
+                }
+                if matches!(
+                    name,
+                    "skill_save_learned" | "skill_search_learned" | "skill_get_learned"
+                ) {
+                    return execute_learned_skill_tool(
+                        &executor.store,
+                        &executor.secrets,
+                        executor.project_id.as_deref(),
+                        &executor.host,
+                        &executor.workspace,
+                        name,
+                        &arguments,
+                    )
+                    .await;
                 }
                 if matches!(
                     name,
@@ -7117,6 +7408,9 @@ async fn engine_for(
             "plan_get".to_owned(),
             "plan_update".to_owned(),
             "plan_revise".to_owned(),
+            "skill_save_learned".to_owned(),
+            "skill_search_learned".to_owned(),
+            "skill_get_learned".to_owned(),
             "ask_user".to_owned(),
         ]);
         if host_id == "local" {
@@ -18081,6 +18375,63 @@ fn main() {
 #[cfg(test)]
 mod m7_tests {
     use super::*;
+
+    #[test]
+    fn learned_skill_secret_patterns_are_rejected_without_sanitizing() {
+        for value in [
+            "Authorization: Bearer xxx",
+            "TOKEN=xxx",
+            "KEY=xxx",
+            "PASSWORD=xxx",
+            "https://user:pass@example.com",
+        ] {
+            assert!(reject_learned_secret(value, &[]).is_err(), "{value}");
+        }
+        assert!(reject_learned_secret("use known-secret here", &["known-secret".into()]).is_err());
+        assert!(reject_learned_secret("safe workflow", &[]).is_ok());
+    }
+
+    #[test]
+    fn learned_skill_results_make_model_assertion_and_staleness_explicit() {
+        let record = opcos_store::LearnedSkillRecord {
+            id: "learned-1".into(),
+            repository_identity: "project:test".into(),
+            project_id: Some("test".into()),
+            title: "Test workflow".into(),
+            summary: "Run tests".into(),
+            applies_when: "Rust changes".into(),
+            steps: vec!["cargo test".into()],
+            verification: "The model reported success".into(),
+            caveats: String::new(),
+            tags: vec!["rust".into(), "test".into()],
+            source_commit: "old-commit".into(),
+            model_asserted_status: "model_asserted_validated".into(),
+            created_at: "now".into(),
+            updated_at: "now".into(),
+            status: "active".into(),
+            supersedes_id: None,
+            superseded_by_id: None,
+            conflict_group: "project:test:test workflow".into(),
+        };
+        let result = learned_skill_json(&record, "new-commit");
+        assert_eq!(result["freshness"], "stale_candidate");
+        assert!(
+            result["freshness_warning"]
+                .as_str()
+                .unwrap()
+                .contains("STALE CANDIDATE")
+        );
+        assert_eq!(
+            result["verification_semantics"],
+            "model_asserted_only_not_system_verified"
+        );
+        assert!(
+            result["conflict_warning"]
+                .as_str()
+                .unwrap()
+                .contains("human-authored")
+        );
+    }
 
     fn edit_test_host() -> (PathBuf, LocalHost) {
         let root = std::env::temp_dir().join(format!("opcos-edit-{}", Uuid::new_v4()));
