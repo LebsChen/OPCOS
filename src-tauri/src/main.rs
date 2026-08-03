@@ -38,8 +38,9 @@ use opcos_engine::{
     planner::{parse_planner_output, planner_dedup_key, planning_prompt},
 };
 use opcos_hosts::{
-    ComputerUseAction, DEFAULT_EXEC_TIMEOUT_SECONDS, Host, LIFECYCLE_EXEC_TIMEOUT_SECONDS,
-    LifecycleStage, LocalHost, RvmHost, ScreenBounds, execute_lifecycle_stage,
+    BackgroundJobManager, ComputerUseAction, DEFAULT_EXEC_TIMEOUT_SECONDS, Host,
+    LIFECYCLE_EXEC_TIMEOUT_SECONDS, LifecycleStage, LocalHost, RvmHost, ScreenBounds, SpawnRequest,
+    execute_lifecycle_stage,
 };
 use opcos_mcp::{
     McpCredentialStore, McpManager, McpServerConfig, qualified_tool_name, stable_server_key,
@@ -177,6 +178,7 @@ struct DesktopState {
     coordination: AsyncMutex<HashMap<String, CoordinationRuntime>>,
     index_root: PathBuf,
     mcp: Arc<McpManager<McpCredentialAdapter>>,
+    jobs: Arc<BackgroundJobManager>,
 }
 
 #[derive(Clone)]
@@ -227,6 +229,7 @@ struct RemoteExecutor {
     project_id: Option<String>,
     session_id: String,
     store: Arc<SqliteStore>,
+    jobs: Arc<BackgroundJobManager>,
 }
 
 struct LocalExecutor {
@@ -238,11 +241,12 @@ struct LocalExecutor {
     workspace: String,
     project_id: Option<String>,
     store: Arc<SqliteStore>,
+    jobs: Arc<BackgroundJobManager>,
 }
 
 enum DesktopExecutor {
     Remote(Box<RemoteExecutor>),
-    Local(LocalExecutor),
+    Local(Box<LocalExecutor>),
 }
 
 fn git_string_argument(arguments: &Value, key: &str) -> Result<String, String> {
@@ -1061,6 +1065,135 @@ async fn execute_index_tool(
     }
 }
 
+async fn execute_background_job_tool(
+    jobs: &BackgroundJobManager,
+    host: &dyn Host,
+    name: &str,
+    arguments: Value,
+) -> Result<Value, String> {
+    match name {
+        "background_job_start" => {
+            let command = arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .ok_or("missing string argument: command")?;
+            let request = SpawnRequest {
+                command: command.to_owned(),
+                cwd: arguments
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                env: None,
+                cols: 120,
+                rows: 40,
+            };
+            let snapshot = jobs
+                .start(
+                    host,
+                    request,
+                    arguments.get("timeout_seconds").and_then(Value::as_u64),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            serde_json::to_value(snapshot).map_err(|error| error.to_string())
+        }
+        "background_job_status" => jobs
+            .status(
+                arguments
+                    .get("job_id")
+                    .and_then(Value::as_str)
+                    .ok_or("missing string argument: job_id")?,
+            )
+            .await
+            .map(|snapshot| serde_json::to_value(snapshot).unwrap_or(Value::Null))
+            .map_err(|error| error.to_string()),
+        "background_job_output" => jobs
+            .output(
+                arguments
+                    .get("job_id")
+                    .and_then(Value::as_str)
+                    .ok_or("missing string argument: job_id")?,
+                arguments.get("offset").and_then(Value::as_u64),
+                arguments.get("limit").and_then(Value::as_u64),
+                arguments
+                    .get("tail")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+            )
+            .await
+            .map(|output| serde_json::to_value(output).unwrap_or(Value::Null))
+            .map_err(|error| error.to_string()),
+        "background_job_kill" => jobs
+            .kill(
+                arguments
+                    .get("job_id")
+                    .and_then(Value::as_str)
+                    .ok_or("missing string argument: job_id")?,
+            )
+            .await
+            .map(|snapshot| serde_json::to_value(snapshot).unwrap_or(Value::Null))
+            .map_err(|error| error.to_string()),
+        _ => Err(format!("background job tool is unavailable: {name}")),
+    }
+}
+
+const INLINE_SHELL_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
+
+fn bounded_output_text(value: &str) -> (String, Value) {
+    let total_bytes = value.len() as u64;
+    let lines = value.lines().collect::<Vec<_>>();
+    let total_lines = lines.len() as u64;
+    let mut start = lines.len();
+    let mut bytes = 0;
+    while start > 0 {
+        let next = lines[start - 1].len() + usize::from(start < lines.len());
+        if bytes + next > INLINE_SHELL_OUTPUT_LIMIT_BYTES && start < lines.len() {
+            break;
+        }
+        bytes += next;
+        start -= 1;
+    }
+    let end = lines.len();
+    let text = lines[start..end].join("\n");
+    (
+        text,
+        json!({
+            "total_bytes": total_bytes,
+            "total_lines": total_lines,
+            "start_line": start as u64,
+            "end_line": end as u64,
+            "omitted_before": start as u64,
+            "omitted_after": 0,
+            "truncated": start > 0,
+        }),
+    )
+}
+
+fn bound_shell_output(value: &mut Value) {
+    let object = if value.get("result").is_some() {
+        value.get_mut("result").and_then(Value::as_object_mut)
+    } else {
+        value.as_object_mut()
+    };
+    let Some(object) = object else {
+        return;
+    };
+    for stream in ["stdout", "stderr"] {
+        let Some(text) = object.get(stream).and_then(Value::as_str) else {
+            continue;
+        };
+        let (bounded, metadata) = bounded_output_text(text);
+        object.insert(stream.to_owned(), Value::String(bounded));
+        object.insert(format!("{stream}_metadata"), metadata);
+    }
+}
+
+fn remote_background_supported(capabilities: &[String]) -> bool {
+    capabilities
+        .iter()
+        .any(|item| item == "process_stream" || item == "pty")
+}
+
 fn action_ledger_argument<'a>(arguments: &'a Value, key: &str) -> Result<&'a str, String> {
     arguments
         .get(key)
@@ -1668,6 +1801,26 @@ struct IdeProxyState {
 #[async_trait]
 impl ToolExecutor for RemoteExecutor {
     async fn execute(&self, name: &str, arguments: Value) -> Result<Value, String> {
+        if name.starts_with("background_job_") {
+            if name == "background_job_start" {
+                let capabilities = self
+                    .client
+                    .capabilities()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if !remote_background_supported(&capabilities.available) {
+                    return Err(
+                        "remote host does not advertise background process streaming".into(),
+                    );
+                }
+            }
+            let host = RvmHost::new(
+                self.host_id.clone(),
+                self.workspace.clone(),
+                self.client.clone(),
+            );
+            return execute_background_job_tool(&self.jobs, &host, name, arguments).await;
+        }
         if matches!(
             name,
             "action_ledger_begin" | "action_ledger_finish" | "action_ledger_list"
@@ -1742,6 +1895,7 @@ impl ToolExecutor for RemoteExecutor {
                     .await
                     .map_err(|error| error.to_string())?;
                 let mut output = serde_json::to_value(result).unwrap_or(Value::Null);
+                bound_shell_output(&mut output);
                 for value in values {
                     redact_json_strings(&mut output, &value);
                 }
@@ -1871,6 +2025,15 @@ impl ToolExecutor for DesktopExecutor {
         match self {
             Self::Remote(executor) => executor.execute(name, arguments).await,
             Self::Local(executor) => {
+                if name.starts_with("background_job_") {
+                    return execute_background_job_tool(
+                        &executor.jobs,
+                        &executor.host,
+                        name,
+                        arguments,
+                    )
+                    .await;
+                }
                 if matches!(
                     name,
                     "action_ledger_begin" | "action_ledger_finish" | "action_ledger_list"
@@ -1954,6 +2117,7 @@ impl ToolExecutor for DesktopExecutor {
                             .await
                             .map_err(|error| error.to_string())?;
                         let mut output = serde_json::to_value(result).unwrap_or(Value::Null);
+                        bound_shell_output(&mut output);
                         for value in values {
                             redact_json_strings(&mut output, &value);
                         }
@@ -6056,6 +6220,10 @@ async fn engine_for(
             "repo_index_find_symbol".to_owned(),
             "repo_index_glob".to_owned(),
             "repo_index_search".to_owned(),
+            "background_job_start".to_owned(),
+            "background_job_status".to_owned(),
+            "background_job_output".to_owned(),
+            "background_job_kill".to_owned(),
             "action_ledger_begin".to_owned(),
             "action_ledger_finish".to_owned(),
             "action_ledger_list".to_owned(),
@@ -6111,7 +6279,7 @@ async fn engine_for(
         }
         (
             workspace.display().to_string(),
-            Arc::new(DesktopExecutor::Local(LocalExecutor {
+            Arc::new(DesktopExecutor::Local(Box::new(LocalExecutor {
                 host,
                 secrets: state.secrets.clone(),
                 session_id: session_id.to_owned(),
@@ -6120,7 +6288,8 @@ async fn engine_for(
                 workspace: workspace.display().to_string(),
                 project_id: session.project_id.clone(),
                 store: Arc::clone(&state.store),
-            })),
+                jobs: Arc::clone(&state.jobs),
+            }))),
             None,
             Some(allowed_tools),
         )
@@ -6155,6 +6324,7 @@ async fn engine_for(
                 project_id: session.project_id.clone(),
                 session_id: session_id.to_owned(),
                 store: Arc::clone(&state.store),
+                jobs: Arc::clone(&state.jobs),
             }))),
             Some(executor_client),
             None,
@@ -16678,6 +16848,9 @@ fn main() {
                 store: secrets.clone(),
                 project_id: None,
             })));
+            let mut jobs_path = path.clone();
+            jobs_path.set_file_name("background-jobs");
+            let jobs = Arc::new(BackgroundJobManager::new(jobs_path));
             let mut trigger_token_bytes = [0_u8; 32];
             getrandom::fill(&mut trigger_token_bytes).map_err(|error| {
                 tauri::Error::from(std::io::Error::other(format!(
@@ -16724,6 +16897,7 @@ fn main() {
                 trigger_watcher_reload: Mutex::new(None),
                 trigger_watcher_stop: Mutex::new(None),
                 mcp: Arc::clone(&mcp),
+                jobs,
             });
             let handle = app.handle().clone();
             let trigger_handle = handle.clone();
@@ -16981,6 +17155,29 @@ fn main() {
 #[cfg(test)]
 mod m7_tests {
     use super::*;
+
+    #[test]
+    fn inline_shell_output_is_tail_bounded_with_honest_metadata() {
+        let input = (0..20_000)
+            .map(|index| format!("line-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (output, metadata) = bounded_output_text(&input);
+        assert!(output.ends_with("line-19999"));
+        assert!(metadata["truncated"].as_bool().unwrap());
+        assert_eq!(metadata["total_lines"], 20_000);
+        assert_eq!(metadata["omitted_before"], metadata["start_line"]);
+        assert_eq!(metadata["omitted_after"], 0);
+        assert!(output.len() <= INLINE_SHELL_OUTPUT_LIMIT_BYTES);
+    }
+
+    #[test]
+    fn remote_background_jobs_require_advertised_stream_capability() {
+        assert!(!remote_background_supported(&[]));
+        assert!(!remote_background_supported(&["exec".into()]));
+        assert!(remote_background_supported(&["pty".into()]));
+        assert!(remote_background_supported(&["process_stream".into()]));
+    }
 
     #[test]
     fn acp_agent_selection_preserves_scope_and_name_order() {

@@ -1460,6 +1460,8 @@ fn tool_risk(name: &str) -> ToolRisk {
         "git_push" | "github_create_pull_request" => ToolRisk::External,
         "github_get_pull_request" => ToolRisk::Read,
         "run_shell" => ToolRisk::Execute,
+        "background_job_start" | "background_job_kill" => ToolRisk::Execute,
+        "background_job_status" | "background_job_output" => ToolRisk::Read,
         _ => ToolRisk::External,
     }
 }
@@ -1859,6 +1861,10 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"read_file","description":"Read a remote file.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}),
         json!({"type":"function","function":{"name":"write_file","description":"Write a remote file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
         json!({"type":"function","function":{"name":"run_shell","description":"Run a remote shell command.","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}),
+        json!({"type":"function","function":{"name":"background_job_start","description":"Start a long-running shell command in the background and return a job id. Output is retained with bounded storage.","parameters":{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"},"timeout_seconds":{"type":"integer"}},"required":["command"]}}}),
+        json!({"type":"function","function":{"name":"background_job_status","description":"Read a background job status, exit code, and output counters.","parameters":{"type":"object","properties":{"job_id":{"type":"string"}},"required":["job_id"]}}}),
+        json!({"type":"function","function":{"name":"background_job_output","description":"Read bounded background job output. Defaults to the tail; use offset for historical lines. The result reports omitted lines and total counters.","parameters":{"type":"object","properties":{"job_id":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"},"tail":{"type":"boolean"}},"required":["job_id"]}}}),
+        json!({"type":"function","function":{"name":"background_job_kill","description":"Stop a running background job and return its terminal status.","parameters":{"type":"object","properties":{"job_id":{"type":"string"}},"required":["job_id"]}}}),
         json!({"type":"function","function":{"name":"list_dir","description":"List a remote directory.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}),
         json!({"type":"function","function":{"name":"git_status","description":"Read structured Git working-tree status.","parameters":{"type":"object","properties":{"cwd":{"type":"string"}},"required":["cwd"]}}}),
         json!({"type":"function","function":{"name":"git_diff","description":"Read structured Git diff summary.","parameters":{"type":"object","properties":{"cwd":{"type":"string"},"reference":{"type":"string"}},"required":["cwd"]}}}),
@@ -2022,6 +2028,26 @@ mod tests {
         assert_eq!(tool_risk("github_create_pull_request"), ToolRisk::External);
     }
 
+    #[test]
+    fn background_job_tools_have_explicit_risk_boundaries() {
+        assert_eq!(tool_risk("background_job_status"), ToolRisk::Read);
+        assert_eq!(tool_risk("background_job_output"), ToolRisk::Read);
+        assert_eq!(tool_risk("background_job_start"), ToolRisk::Execute);
+        assert_eq!(tool_risk("background_job_kill"), ToolRisk::Execute);
+        let names = tool_definitions()
+            .into_iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<HashSet<_>>();
+        assert!(names.contains("background_job_start"));
+        assert!(names.contains("background_job_status"));
+        assert!(names.contains("background_job_output"));
+        assert!(names.contains("background_job_kill"));
+    }
     #[derive(Clone)]
     struct FakeProvider;
 
