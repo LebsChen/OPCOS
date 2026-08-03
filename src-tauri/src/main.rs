@@ -23,6 +23,7 @@ use opcos_assets::{
 use opcos_engine::{
     AcpHarness, AcpHarnessConfig, AgentEngine, EngineError, Harness, OpenCodeHarness,
     OpenCodeHarnessConfig, SessionRecorder, ToolExecutor, TurnEngine,
+    event_bus::{EventEffect, dispatch_event},
     orchestration::{BoardPhase, BoardTask},
     orchestration::{CoordinationRuntime, Envelope, Role},
     planner::{parse_planner_output, planner_dedup_key, planning_prompt},
@@ -449,6 +450,26 @@ fn execute_action_ledger_tool(
                     .map_err(|error| error.to_string())?,
                 _ => return Err("status must be succeeded or failed".into()),
             };
+            if status == "failed" {
+                let _ = store.publish_event(
+                    "action.failed",
+                    "action_ledger",
+                    &json!({
+                        "platform": record.platform,
+                        "account_id": record.account_id,
+                        "project_id": record.project_id,
+                    }),
+                    &json!({
+                        "action_id": record.action_id,
+                        "attempts": record.attempts,
+                    }),
+                    Some(&format!(
+                        "action.failed:{}:{}",
+                        record.action_id, record.attempts
+                    )),
+                    None,
+                );
+            }
             serde_json::to_value(record).map_err(|error| error.to_string())
         }
         "action_ledger_list" => {
@@ -480,6 +501,24 @@ fn execute_work_queue_tool(
     name: &str,
     arguments: Value,
 ) -> Result<Value, String> {
+    fn publish_dead_letters(store: &SqliteStore) {
+        if let Ok(items) = store.load_work_queue(Some("dead_letter"), 500) {
+            for item in items {
+                let _ = store.publish_event(
+                    "queue.dead_letter",
+                    "work_queue",
+                    &json!({"project_id": item.project_id}),
+                    &json!({
+                        "queue_id": item.queue_id,
+                        "task_type": item.task_type,
+                        "attempts": item.attempts,
+                    }),
+                    Some(&format!("queue.dead_letter:{}", item.queue_id)),
+                    None,
+                );
+            }
+        }
+    }
     match name {
         "work_queue_enqueue" => {
             let task_type = action_ledger_argument(&arguments, "task_type")?;
@@ -513,6 +552,7 @@ fn execute_work_queue_tool(
                         .unwrap_or(300) as u32,
                 )
                 .map_err(|error| error.to_string())?;
+            publish_dead_letters(store);
             serde_json::to_value(item).map_err(|error| error.to_string())
         }
         "work_queue_renew" => {
@@ -545,6 +585,21 @@ fn execute_work_queue_tool(
                     arguments.get("error_summary").and_then(Value::as_str),
                 )
                 .map_err(|error| error.to_string())?;
+            if item.status == "dead_letter" {
+                let _ = store.publish_event(
+                    "queue.dead_letter",
+                    "work_queue",
+                    &json!({"project_id": item.project_id}),
+                    &json!({
+                        "queue_id": item.queue_id,
+                        "task_type": item.task_type,
+                        "attempts": item.attempts,
+                    }),
+                    Some(&format!("queue.dead_letter:{}", item.queue_id)),
+                    None,
+                );
+            }
+            publish_dead_letters(store);
             serde_json::to_value(item).map_err(|error| error.to_string())
         }
         "work_queue_cancel" => {
@@ -595,6 +650,17 @@ async fn run_goal_planner(
     result
 }
 
+fn publish_goal_paused(store: &SqliteStore, goal_id: &str, reason: &str) {
+    let _ = store.publish_event(
+        "goal.paused",
+        "planner",
+        &json!({"goal_id": goal_id}),
+        &json!({"reason": reason}),
+        Some(&format!("goal.paused:{goal_id}:{reason}")),
+        None,
+    );
+}
+
 async fn run_goal_planner_inner(
     app: &tauri::AppHandle,
     state: &DesktopState,
@@ -619,6 +685,7 @@ async fn run_goal_planner_inner(
             .store
             .update_goal_status(goal_id, "paused")
             .map_err(|error| error.to_string())?;
+        publish_goal_paused(&state.store, goal_id, "dead_letter_limit");
         return Err(format!(
             "goal paused after dead letters: {}",
             paused.goal_id
@@ -713,7 +780,11 @@ async fn run_goal_planner_inner(
                 &started_at,
                 Some(&Utc::now().to_rfc3339()),
             );
-            let _ = state.store.record_goal_failure(goal_id);
+            if let Ok(updated) = state.store.record_goal_failure(goal_id)
+                && updated.status == "paused"
+            {
+                publish_goal_paused(&state.store, goal_id, "planner_failure_limit");
+            }
             let _ = state.store.append_audit(
                 &session_id,
                 "planner.round",
@@ -740,6 +811,9 @@ async fn run_goal_planner_inner(
                 .store
                 .record_goal_failure(goal_id)
                 .map_err(|store_error| store_error.to_string())?;
+            if updated.status == "paused" {
+                publish_goal_paused(&state.store, goal_id, "planner_failure_limit");
+            }
             let _ = state.store.append_audit(
                 &session_id,
                 "planner.round",
@@ -760,7 +834,11 @@ async fn run_goal_planner_inner(
             &started_at,
             Some(&Utc::now().to_rfc3339()),
         );
-        let _ = state.store.record_goal_failure(goal_id);
+        if let Ok(updated) = state.store.record_goal_failure(goal_id)
+            && updated.status == "paused"
+        {
+            publish_goal_paused(&state.store, goal_id, "planner_failure_limit");
+        }
         return Err(reason);
     }
     let mut produced = Vec::new();
@@ -826,6 +904,58 @@ async fn run_goal_planner_inner(
         )
         .map_err(|error| error.to_string())?;
     Ok(json!({"goal_id":goal_id,"queue_ids":produced}))
+}
+
+async fn run_event_bus_pump(app: &tauri::AppHandle, state: &DesktopState) {
+    let consumer_id = "planner-event-pump";
+    let events = match state.store.load_events_after(consumer_id, 100) {
+        Ok(events) => events,
+        Err(_) => return,
+    };
+    for event in events {
+        let rules = match state.store.load_event_rules(true) {
+            Ok(rules) => rules,
+            Err(_) => continue,
+        };
+        let matching = rules
+            .iter()
+            .filter(|rule| opcos_engine::event_bus::kind_matches(&rule.kind_pattern, &event.kind))
+            .cloned()
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            let _ = state.store.ack_event(consumer_id, event.sequence);
+            continue;
+        }
+        let mut event_handled = true;
+        for rule in matching {
+            match dispatch_event(&state.store, &event, &rule) {
+                Ok(dispatch) => match dispatch.effect {
+                    EventEffect::Enqueue(_) => {
+                        let _ = state.store.record_event_rule_success(&rule.rule_id);
+                    }
+                    EventEffect::PlanGoal { goal_id } => {
+                        if run_goal_planner(app, state, &goal_id).await.is_err() {
+                            event_handled = false;
+                            let _ = state.store.record_event_rule_failure(&rule.rule_id);
+                        } else {
+                            let _ = state.store.record_event_rule_success(&rule.rule_id);
+                        }
+                    }
+                },
+                Err(_) => {
+                    event_handled = false;
+                    if let Ok(updated) = state.store.record_event_rule_failure(&rule.rule_id)
+                        && !updated.enabled
+                    {
+                        event_handled = true;
+                    }
+                }
+            }
+        }
+        if event_handled {
+            let _ = state.store.ack_event(consumer_id, event.sequence);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -14382,6 +14512,119 @@ fn work_queue_events(
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct EventInput {
+    kind: String,
+    source: String,
+    subject: Option<Value>,
+    payload: Value,
+    dedup_key: Option<String>,
+    caused_by: Option<String>,
+}
+
+#[tauri::command]
+fn event_stream(
+    state: State<'_, DesktopState>,
+    consumer_id: String,
+    limit: Option<u32>,
+) -> Result<Vec<Value>, String> {
+    state
+        .store
+        .load_events_after(&consumer_id, limit.unwrap_or(200))
+        .and_then(|events| {
+            events
+                .into_iter()
+                .map(|event| serde_json::to_value(event).map_err(opcos_store::StoreError::from))
+                .collect()
+        })
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn acknowledge_event(
+    state: State<'_, DesktopState>,
+    consumer_id: String,
+    sequence: i64,
+) -> Result<Value, String> {
+    state
+        .store
+        .ack_event(&consumer_id, sequence)
+        .and_then(|cursor| serde_json::to_value(cursor).map_err(opcos_store::StoreError::from))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn publish_event(state: State<'_, DesktopState>, input: EventInput) -> Result<Value, String> {
+    state
+        .store
+        .publish_event(
+            &input.kind,
+            &input.source,
+            &input.subject.unwrap_or_else(|| json!({})),
+            &input.payload,
+            input.dedup_key.as_deref(),
+            input.caused_by.as_deref(),
+        )
+        .and_then(|event| serde_json::to_value(event).map_err(opcos_store::StoreError::from))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn event_rules(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
+    state
+        .store
+        .load_event_rules(false)
+        .and_then(|rules| {
+            rules
+                .into_iter()
+                .map(|rule| serde_json::to_value(rule).map_err(opcos_store::StoreError::from))
+                .collect()
+        })
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct EventRuleInput {
+    kind_pattern: String,
+    effect_kind: String,
+    effect: Value,
+    max_triggers: u32,
+    window_seconds: u32,
+    failure_limit: u32,
+}
+
+#[tauri::command]
+fn create_event_rule(
+    state: State<'_, DesktopState>,
+    input: EventRuleInput,
+) -> Result<Value, String> {
+    state
+        .store
+        .create_event_rule(
+            &input.kind_pattern,
+            &input.effect_kind,
+            &input.effect,
+            input.max_triggers,
+            input.window_seconds,
+            input.failure_limit,
+        )
+        .and_then(|rule| serde_json::to_value(rule).map_err(opcos_store::StoreError::from))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn set_event_rule_enabled(
+    state: State<'_, DesktopState>,
+    rule_id: String,
+    enabled: bool,
+) -> Result<Value, String> {
+    state
+        .store
+        .set_event_rule_enabled(&rule_id, enabled)
+        .and_then(|rule| serde_json::to_value(rule).map_err(opcos_store::StoreError::from))
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct GoalInput {
     goal_id: Option<String>,
     description: String,
@@ -14442,11 +14685,14 @@ fn set_autonomous_goal_status(
     goal_id: String,
     status: String,
 ) -> Result<Value, String> {
-    state
+    let goal = state
         .store
         .update_goal_status(&goal_id, &status)
-        .and_then(|goal| serde_json::to_value(goal).map_err(opcos_store::StoreError::from))
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    if status == "paused" {
+        publish_goal_paused(&state.store, &goal_id, "manual");
+    }
+    serde_json::to_value(goal).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -15156,6 +15402,15 @@ fn main() {
                     }
                 }
             });
+            let event_bus_handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                loop {
+                    interval.tick().await;
+                    let state = event_bus_handle.state::<DesktopState>();
+                    run_event_bus_pump(&event_bus_handle, &state).await;
+                }
+            });
             tauri::async_runtime::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
                 loop {
@@ -15287,6 +15542,12 @@ fn main() {
             audit_events,
             action_ledger_events,
             work_queue_events,
+            event_stream,
+            acknowledge_event,
+            publish_event,
+            event_rules,
+            create_event_rule,
+            set_event_rule_enabled,
             autonomous_goals,
             save_autonomous_goal,
             set_autonomous_goal_status,

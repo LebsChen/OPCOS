@@ -182,6 +182,41 @@ pub struct AuditEvent {
     pub payload: serde_json::Value,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct EventRecord {
+    pub event_id: String,
+    pub kind: String,
+    pub source: String,
+    pub subject: serde_json::Value,
+    pub payload: serde_json::Value,
+    pub occurred_at: String,
+    pub sequence: i64,
+    pub dedup_key: Option<String>,
+    pub caused_by: Option<String>,
+    pub cause_depth: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct EventCursor {
+    pub consumer_id: String,
+    pub sequence: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct EventRule {
+    pub rule_id: String,
+    pub kind_pattern: String,
+    pub effect_kind: String,
+    pub effect: serde_json::Value,
+    pub enabled: bool,
+    pub max_triggers: u32,
+    pub window_seconds: u32,
+    pub failure_limit: u32,
+    pub consecutive_failures: u32,
+    pub window_started_at: Option<String>,
+    pub trigger_count: u32,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ActionLedgerRecord {
     pub action_id: String,
@@ -391,6 +426,67 @@ fn autonomous_goal_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Autonom
         created_at: row.get(14)?,
         updated_at: row.get(15)?,
     })
+}
+
+fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRecord> {
+    let subject: String = row.get(3)?;
+    let payload: String = row.get(4)?;
+    Ok(EventRecord {
+        event_id: row.get(0)?,
+        kind: row.get(1)?,
+        source: row.get(2)?,
+        subject: serde_json::from_str(&subject).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        payload: serde_json::from_str(&payload).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        occurred_at: row.get(5)?,
+        sequence: row.get(6)?,
+        dedup_key: row.get(7)?,
+        caused_by: row.get(8)?,
+        cause_depth: row.get::<_, i64>(9)?.try_into().map_err(|_| {
+            rusqlite::Error::IntegralValueOutOfRange(9, row.get::<_, i64>(9).unwrap_or_default())
+        })?,
+    })
+}
+
+fn event_rule_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRule> {
+    let effect: String = row.get(3)?;
+    Ok(EventRule {
+        rule_id: row.get(0)?,
+        kind_pattern: row.get(1)?,
+        effect_kind: row.get(2)?,
+        effect: serde_json::from_str(&effect).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        enabled: row.get::<_, i64>(4)? != 0,
+        max_triggers: row.get(5)?,
+        window_seconds: row.get(6)?,
+        failure_limit: row.get(7)?,
+        consecutive_failures: row.get(8)?,
+        window_started_at: row.get(9)?,
+        trigger_count: row.get(10)?,
+    })
+}
+
+fn depth_to_i64(depth: i64) -> Result<i64, StoreError> {
+    if depth < 0 {
+        return Err(StoreError::Validation("cause depth out of range".into()));
+    }
+    Ok(depth)
 }
 
 fn planning_round_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlanningRound> {
@@ -1459,6 +1555,368 @@ impl SqliteStore {
             .map_err(StoreError::from)
     }
 
+    pub fn publish_event(
+        &self,
+        kind: &str,
+        source: &str,
+        subject: &serde_json::Value,
+        payload: &serde_json::Value,
+        dedup_key: Option<&str>,
+        caused_by: Option<&str>,
+    ) -> Result<EventRecord, StoreError> {
+        if kind.trim().is_empty() || !kind.contains('.') || kind.chars().any(char::is_whitespace) {
+            return Err(StoreError::Validation(
+                "event kind must be a non-empty namespaced value".into(),
+            ));
+        }
+        if source.trim().is_empty() {
+            return Err(StoreError::Validation(
+                "event source cannot be empty".into(),
+            ));
+        }
+        if let Some(key) = dedup_key
+            && key.trim().is_empty()
+        {
+            return Err(StoreError::Validation("dedup_key cannot be empty".into()));
+        }
+        let occurred_at = Utc::now().to_rfc3339();
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            if let Some(key) = dedup_key
+                && let Some(existing) = connection
+                    .query_row(
+                        "SELECT event_id,kind,source,subject,payload,occurred_at,sequence,
+                                dedup_key,caused_by,cause_depth
+                         FROM events WHERE dedup_key=?1",
+                        [key],
+                        event_from_row,
+                    )
+                    .optional()?
+            {
+                return Ok(existing);
+            }
+            let cause_depth = if let Some(parent_id) = caused_by {
+                let parent_depth: i64 = connection
+                    .query_row(
+                        "SELECT cause_depth FROM events WHERE event_id=?1",
+                        [parent_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        StoreError::Validation("caused_by event does not exist".into())
+                    })?;
+                let depth = parent_depth
+                    .checked_add(1)
+                    .ok_or_else(|| StoreError::Validation("event cause depth overflow".into()))?;
+                if depth > 8 {
+                    let rejected_id = uuid::Uuid::new_v4().to_string();
+                    let sequence: i64 = connection.query_row(
+                        "SELECT COALESCE(MAX(sequence),0)+1 FROM events",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    connection.execute(
+                        "INSERT INTO events
+                         (event_id,kind,source,subject,payload,occurred_at,sequence,dedup_key,caused_by,cause_depth)
+                         VALUES (?1,'event.rejected','event_bus',?2,?3,?4,?5,NULL,?6,0)",
+                        params![
+                            rejected_id,
+                            serde_json::json!({"kind":kind}).to_string(),
+                            serde_json::json!({
+                                "reason":"cause_depth_limit",
+                                "caused_by":parent_id,
+                                "max_depth":8
+                            }).to_string(),
+                            occurred_at,
+                            sequence,
+                            parent_id
+                        ],
+                    )?;
+                    return Err(StoreError::Validation(
+                        "event cause depth limit reached; rejection recorded".into(),
+                    ));
+                }
+                depth
+            } else {
+                0
+            };
+            let event_id = uuid::Uuid::new_v4().to_string();
+            let sequence: i64 = connection.query_row(
+                "SELECT COALESCE(MAX(sequence),0)+1 FROM events",
+                [],
+                |row| row.get(0),
+            )?;
+            connection.execute(
+                "INSERT INTO events
+                 (event_id,kind,source,subject,payload,occurred_at,sequence,dedup_key,caused_by,cause_depth)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![
+                    event_id,
+                    kind,
+                    source,
+                    subject.to_string(),
+                    payload.to_string(),
+                    occurred_at,
+                    sequence,
+                    dedup_key,
+                    caused_by,
+                    depth_to_i64(cause_depth)?
+                ],
+            )?;
+            connection
+                .query_row(
+                    "SELECT event_id,kind,source,subject,payload,occurred_at,sequence,
+                        dedup_key,caused_by,cause_depth
+                 FROM events WHERE event_id=?1",
+                    [event_id],
+                    event_from_row,
+                )
+                .map_err(StoreError::from)
+        })();
+        match result {
+            Ok(event) => {
+                connection.execute_batch("COMMIT")?;
+                Ok(event)
+            }
+            Err(error) if error.to_string().contains("rejection recorded") => {
+                connection.execute_batch("COMMIT")?;
+                Err(error)
+            }
+            Err(error) => {
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    pub fn load_events_after(
+        &self,
+        consumer_id: &str,
+        limit: u32,
+    ) -> Result<Vec<EventRecord>, StoreError> {
+        if consumer_id.trim().is_empty() || limit == 0 {
+            return Err(StoreError::Validation(
+                "consumer_id and positive limit are required".into(),
+            ));
+        }
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let cursor: i64 = connection
+            .query_row(
+                "SELECT sequence FROM event_cursors WHERE consumer_id=?1",
+                [consumer_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let mut statement = connection.prepare(
+            "SELECT event_id,kind,source,subject,payload,occurred_at,sequence,
+                    dedup_key,caused_by,cause_depth
+             FROM events WHERE sequence>?1 ORDER BY sequence LIMIT ?2",
+        )?;
+        statement
+            .query_map(params![cursor, i64::from(limit)], event_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn ack_event(&self, consumer_id: &str, sequence: i64) -> Result<EventCursor, StoreError> {
+        if consumer_id.trim().is_empty() || sequence < 0 {
+            return Err(StoreError::Validation(
+                "consumer_id and non-negative sequence are required".into(),
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "INSERT INTO event_cursors(consumer_id,sequence,updated_at) VALUES (?1,?2,?3)
+             ON CONFLICT(consumer_id) DO UPDATE SET
+               sequence=MAX(sequence,excluded.sequence),updated_at=excluded.updated_at",
+            params![consumer_id, sequence, now],
+        )?;
+        connection
+            .query_row(
+                "SELECT consumer_id,sequence FROM event_cursors WHERE consumer_id=?1",
+                [consumer_id],
+                |row| {
+                    Ok(EventCursor {
+                        consumer_id: row.get(0)?,
+                        sequence: row.get(1)?,
+                    })
+                },
+            )
+            .map_err(StoreError::from)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_event_rule(
+        &self,
+        kind_pattern: &str,
+        effect_kind: &str,
+        effect: &serde_json::Value,
+        max_triggers: u32,
+        window_seconds: u32,
+        failure_limit: u32,
+    ) -> Result<EventRule, StoreError> {
+        if kind_pattern.trim().is_empty()
+            || !matches!(effect_kind, "enqueue_work" | "plan_goal")
+            || max_triggers == 0
+            || window_seconds == 0
+            || failure_limit == 0
+        {
+            return Err(StoreError::Validation("invalid event rule".into()));
+        }
+        let rule_id = uuid::Uuid::new_v4().to_string();
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "INSERT INTO event_rules
+             (rule_id,kind_pattern,effect_kind,effect,enabled,max_triggers,window_seconds,failure_limit)
+             VALUES (?1,?2,?3,?4,1,?5,?6,?7)",
+            params![
+                rule_id,
+                kind_pattern,
+                effect_kind,
+                effect.to_string(),
+                max_triggers,
+                window_seconds,
+                failure_limit
+            ],
+        )?;
+        connection
+            .query_row(
+                "SELECT rule_id,kind_pattern,effect_kind,effect,enabled,max_triggers,
+                        window_seconds,failure_limit,consecutive_failures,window_started_at,trigger_count
+                 FROM event_rules WHERE rule_id=?1",
+                [rule_id],
+                event_rule_from_row,
+            )
+            .map_err(StoreError::from)
+    }
+
+    pub fn load_event_rules(&self, enabled_only: bool) -> Result<Vec<EventRule>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let filter = if enabled_only { " WHERE enabled=1" } else { "" };
+        let mut statement = connection.prepare(&format!(
+            "SELECT rule_id,kind_pattern,effect_kind,effect,enabled,max_triggers,
+                    window_seconds,failure_limit,consecutive_failures,window_started_at,trigger_count
+             FROM event_rules{filter} ORDER BY rule_id"
+        ))?;
+        statement
+            .query_map([], event_rule_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn set_event_rule_enabled(
+        &self,
+        rule_id: &str,
+        enabled: bool,
+    ) -> Result<EventRule, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let changed = connection.execute(
+            "UPDATE event_rules SET enabled=?1 WHERE rule_id=?2",
+            params![enabled as i64, rule_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::Validation("event rule not found".into()));
+        }
+        connection
+            .query_row(
+                "SELECT rule_id,kind_pattern,effect_kind,effect,enabled,max_triggers,
+                        window_seconds,failure_limit,consecutive_failures,window_started_at,trigger_count
+                 FROM event_rules WHERE rule_id=?1",
+                [rule_id],
+                event_rule_from_row,
+            )
+            .map_err(StoreError::from)
+    }
+
+    pub fn reserve_event_rule_trigger(
+        &self,
+        rule_id: &str,
+        occurred_at: &str,
+    ) -> Result<EventRule, StoreError> {
+        let now = DateTime::parse_from_rfc3339(occurred_at)
+            .map_err(|_| StoreError::Validation("invalid event timestamp".into()))?
+            .with_timezone(&Utc);
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let rule = connection
+            .query_row(
+                "SELECT rule_id,kind_pattern,effect_kind,effect,enabled,max_triggers,
+                        window_seconds,failure_limit,consecutive_failures,window_started_at,trigger_count
+                 FROM event_rules WHERE rule_id=?1",
+                [rule_id],
+                event_rule_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::Validation("event rule not found".into()))?;
+        if !rule.enabled {
+            return Err(StoreError::Validation("event rule is disabled".into()));
+        }
+        let (count, started) = match rule.window_started_at.as_deref() {
+            Some(started) => {
+                let start = DateTime::parse_from_rfc3339(started)
+                    .map_err(|_| StoreError::Validation("invalid rule timestamp".into()))?;
+                if now.signed_duration_since(start).num_seconds() >= i64::from(rule.window_seconds)
+                {
+                    (0, occurred_at.to_owned())
+                } else {
+                    (rule.trigger_count, started.to_owned())
+                }
+            }
+            None => (0, occurred_at.to_owned()),
+        };
+        if count >= rule.max_triggers {
+            return Err(StoreError::Validation(
+                "event rule frequency limit reached".into(),
+            ));
+        }
+        connection.execute(
+            "UPDATE event_rules SET trigger_count=?1,window_started_at=?2 WHERE rule_id=?3",
+            params![count + 1, started, rule_id],
+        )?;
+        connection
+            .query_row(
+                "SELECT rule_id,kind_pattern,effect_kind,effect,enabled,max_triggers,
+                        window_seconds,failure_limit,consecutive_failures,window_started_at,trigger_count
+                 FROM event_rules WHERE rule_id=?1",
+                [rule_id],
+                event_rule_from_row,
+            )
+            .map_err(StoreError::from)
+    }
+
+    pub fn record_event_rule_failure(&self, rule_id: &str) -> Result<EventRule, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "UPDATE event_rules SET consecutive_failures=consecutive_failures+1,
+             enabled=CASE WHEN consecutive_failures+1>=failure_limit THEN 0 ELSE enabled END
+             WHERE rule_id=?1",
+            [rule_id],
+        )?;
+        connection
+            .query_row(
+                "SELECT rule_id,kind_pattern,effect_kind,effect,enabled,max_triggers,
+                        window_seconds,failure_limit,consecutive_failures,window_started_at,trigger_count
+                 FROM event_rules WHERE rule_id=?1",
+                [rule_id],
+                event_rule_from_row,
+            )
+            .map_err(StoreError::from)
+    }
+
+    pub fn record_event_rule_success(&self, rule_id: &str) -> Result<(), StoreError> {
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "UPDATE event_rules SET consecutive_failures=0 WHERE rule_id=?1",
+                [rule_id],
+            )?;
+        Ok(())
+    }
+
     pub fn load_goal(&self, goal_id: &str) -> Result<AutonomousGoal, StoreError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         connection
@@ -2421,6 +2879,40 @@ impl SqliteStore {
              );
              CREATE INDEX IF NOT EXISTS idx_planning_rounds_goal_time
                ON planning_rounds(goal_id, started_at DESC);
+             CREATE TABLE IF NOT EXISTS events (
+               event_id TEXT PRIMARY KEY,
+               kind TEXT NOT NULL,
+               source TEXT NOT NULL,
+               subject TEXT NOT NULL,
+               payload TEXT NOT NULL,
+               occurred_at TEXT NOT NULL,
+               sequence INTEGER NOT NULL UNIQUE,
+               dedup_key TEXT UNIQUE,
+               caused_by TEXT,
+               cause_depth INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE INDEX IF NOT EXISTS idx_events_sequence ON events(sequence);
+             CREATE INDEX IF NOT EXISTS idx_events_kind_sequence ON events(kind, sequence);
+             CREATE TABLE IF NOT EXISTS event_cursors (
+               consumer_id TEXT PRIMARY KEY,
+               sequence INTEGER NOT NULL DEFAULT 0,
+               updated_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS event_rules (
+               rule_id TEXT PRIMARY KEY,
+               kind_pattern TEXT NOT NULL,
+               effect_kind TEXT NOT NULL,
+               effect TEXT NOT NULL,
+               enabled INTEGER NOT NULL DEFAULT 1,
+               max_triggers INTEGER NOT NULL,
+               window_seconds INTEGER NOT NULL,
+               failure_limit INTEGER NOT NULL,
+               consecutive_failures INTEGER NOT NULL DEFAULT 0,
+               window_started_at TEXT,
+               trigger_count INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE INDEX IF NOT EXISTS idx_event_rules_enabled
+               ON event_rules(enabled, kind_pattern);
              ;",
             )?;
             ensure_artifact_schema(&connection)?;
@@ -2612,6 +3104,12 @@ impl SqliteStore {
             if version < 5 {
                 connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (5, ?1)",
+                    [Utc::now().to_rfc3339()],
+                )?;
+            }
+            if version < 6 {
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (6, ?1)",
                     [Utc::now().to_rfc3339()],
                 )?;
             }
@@ -4660,6 +5158,89 @@ mod tests {
         assert_eq!(
             store.load_planning_rounds(Some(&goal.goal_id), 10).unwrap(),
             vec![round]
+        );
+    }
+
+    #[test]
+    fn durable_events_deduplicate_and_resume_from_consumer_cursor() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let first = store
+            .publish_event(
+                "external.order.created",
+                "webhook",
+                &serde_json::json!({"platform":"shop"}),
+                &serde_json::json!({"external_id":"order-1"}),
+                Some("webhook:order-1"),
+                None,
+            )
+            .unwrap();
+        let duplicate = store
+            .publish_event(
+                "external.order.created",
+                "webhook",
+                &serde_json::json!({}),
+                &serde_json::json!({"different":true}),
+                Some("webhook:order-1"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(first, duplicate);
+        let pending = store.load_events_after("worker-a", 10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].sequence, first.sequence);
+        store.ack_event("worker-a", first.sequence).unwrap();
+        assert!(store.load_events_after("worker-a", 10).unwrap().is_empty());
+        assert_eq!(store.load_events_after("worker-b", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn event_rule_frequency_uses_rfc3339_boundary_and_disables_after_failures() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let rule = store
+            .create_event_rule(
+                "external.*",
+                "plan_goal",
+                &serde_json::json!({"goal_id":"goal-1"}),
+                1,
+                3600,
+                2,
+            )
+            .unwrap();
+        let old = store
+            .publish_event(
+                "external.old",
+                "test",
+                &serde_json::json!({}),
+                &serde_json::json!({}),
+                Some("old-event"),
+                None,
+            )
+            .unwrap();
+        let mut rule = store
+            .reserve_event_rule_trigger(&rule.rule_id, "2026-08-03T01:00:00+00:00")
+            .unwrap();
+        assert_eq!(rule.trigger_count, 1);
+        assert!(
+            store
+                .reserve_event_rule_trigger(&rule.rule_id, "2026-08-03T01:30:00+00:00")
+                .is_err()
+        );
+        rule = store
+            .reserve_event_rule_trigger(&rule.rule_id, "2026-08-03T02:00:00+00:00")
+            .unwrap();
+        assert_eq!(rule.trigger_count, 1);
+        assert_eq!(old.kind, "external.old");
+        assert!(
+            store
+                .record_event_rule_failure(&rule.rule_id)
+                .unwrap()
+                .enabled
+        );
+        assert!(
+            !store
+                .record_event_rule_failure(&rule.rule_id)
+                .unwrap()
+                .enabled
         );
     }
 }

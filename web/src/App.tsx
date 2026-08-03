@@ -6443,6 +6443,7 @@ function Activity({
     | "audit"
     | "actions"
     | "queue"
+    | "events"
     | "goals"
     | "board"
     | "roles"
@@ -6460,6 +6461,8 @@ function Activity({
     [],
   );
   const [workQueue, setWorkQueue] = useState<Record<string, unknown>[]>([]);
+  const [events, setEvents] = useState<Record<string, unknown>[]>([]);
+  const [eventRules, setEventRules] = useState<Record<string, unknown>[]>([]);
   const [goals, setGoals] = useState<Record<string, unknown>[]>([]);
   const [planningHistory, setPlanningHistory] = useState<
     Record<string, unknown>[]
@@ -6481,6 +6484,7 @@ function Activity({
               "audit",
               "actions",
               "queue",
+              "events",
               "goals",
               "board",
               "roles",
@@ -6530,6 +6534,17 @@ function Activity({
                   })
                     .then(setWorkQueue)
                     .catch(onError);
+                if (item === "events") {
+                  void command<Record<string, unknown>[]>("event_stream", {
+                    consumerId: "ui",
+                    limit: 200,
+                  })
+                    .then(setEvents)
+                    .catch(onError);
+                  void command<Record<string, unknown>[]>("event_rules", {})
+                    .then(setEventRules)
+                    .catch(onError);
+                }
                 if (item === "goals") {
                   void command<Record<string, unknown>[]>(
                     "autonomous_goals",
@@ -6552,6 +6567,7 @@ function Activity({
                       audit: "audit",
                       actions: "audit",
                       queue: "audit",
+                      events: "audit",
                       goals: "sparkle",
                       board: "audit",
                       roles: "gear",
@@ -6584,6 +6600,8 @@ function Activity({
                         "Review cross-session records of OPCOS external actions.",
                       queue:
                         "Review durable work items, retries, and dead-letter records.",
+                      events:
+                        "Review durable events, causal chains, and bounded effect rules.",
                       goals:
                         "Define bounded autonomous goals and review planning rounds.",
                       board: "Start or observe the active coordination board.",
@@ -6725,6 +6743,90 @@ function Activity({
                 }
                 empty="No durable work queue records yet."
               />
+            )}
+            {activityTab === "events" && (
+              <div className="space-y-5">
+                <CollectionPage
+                  search=""
+                  onSearch={() => undefined}
+                  searchPlaceholder="Filter event stream"
+                  rows={
+                    events.length ? (
+                      <>
+                        {events.map((event) => (
+                          <div
+                            className="manage-row px-4"
+                            key={String(event.event_id)}
+                          >
+                            <span>
+                              <strong>
+                                {String(event.kind)} · seq{" "}
+                                {String(event.sequence)}
+                              </strong>
+                              <small>
+                                {String(event.source)} · caused by{" "}
+                                {String(event.caused_by ?? "none")} ·{" "}
+                                {JSON.stringify(event.payload)}
+                              </small>
+                            </span>
+                          </div>
+                        ))}
+                      </>
+                    ) : null
+                  }
+                  empty="No durable events yet."
+                />
+                <CollectionPage
+                  search=""
+                  onSearch={() => undefined}
+                  searchPlaceholder="Filter event rules"
+                  rows={
+                    eventRules.length ? (
+                      <>
+                        {eventRules.map((rule) => (
+                          <div
+                            className="manage-row px-4"
+                            key={String(rule.rule_id)}
+                          >
+                            <span>
+                              <strong>
+                                {String(rule.kind_pattern)} →{" "}
+                                {String(rule.effect_kind)}
+                              </strong>
+                              <small>
+                                {rule.enabled ? "enabled" : "disabled"} ·{" "}
+                                {String(rule.trigger_count)}/
+                                {String(rule.max_triggers)} per{" "}
+                                {String(rule.window_seconds)}s
+                                <button
+                                  className="ml-2 text-accent underline"
+                                  onClick={() =>
+                                    void command("set_event_rule_enabled", {
+                                      ruleId: String(rule.rule_id),
+                                      enabled: !rule.enabled,
+                                    })
+                                      .then(() =>
+                                        command<Record<string, unknown>[]>(
+                                          "event_rules",
+                                          {},
+                                        ),
+                                      )
+                                      .then(setEventRules)
+                                      .catch(onError)
+                                  }
+                                >
+                                  {rule.enabled ? "disable" : "enable"}
+                                </button>
+                              </small>
+                            </span>
+                          </div>
+                        ))}
+                      </>
+                    ) : null
+                  }
+                  empty="No event rules configured."
+                />
+              </div>
             )}
             {activityTab === "goals" && (
               <div className="space-y-5">
