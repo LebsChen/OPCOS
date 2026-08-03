@@ -25,6 +25,7 @@ use opcos_engine::{
     OpenCodeHarnessConfig, SessionRecorder, ToolExecutor, TurnEngine,
     orchestration::{BoardPhase, BoardTask},
     orchestration::{CoordinationRuntime, Envelope, Role},
+    planner::{parse_planner_output, planner_dedup_key, planning_prompt},
 };
 use opcos_hosts::{
     DEFAULT_EXEC_TIMEOUT_SECONDS, Host, LIFECYCLE_EXEC_TIMEOUT_SECONDS, LifecycleStage, LocalHost,
@@ -575,6 +576,256 @@ fn execute_work_queue_tool(
         }
         _ => Err(format!("work queue tool is unavailable: {name}")),
     }
+}
+
+async fn run_goal_planner(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    goal_id: &str,
+) -> Result<Value, String> {
+    let run_key = format!("planner:{goal_id}");
+    {
+        let mut runs = state.trigger_runs.lock().await;
+        if !runs.insert(run_key.clone()) {
+            return Err("planner already running for this goal".into());
+        }
+    }
+    let result = run_goal_planner_inner(app, state, goal_id).await;
+    state.trigger_runs.lock().await.remove(&run_key);
+    result
+}
+
+async fn run_goal_planner_inner(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    goal_id: &str,
+) -> Result<Value, String> {
+    let goal = state
+        .store
+        .load_goal(goal_id)
+        .map_err(|error| error.to_string())?;
+    let session_id = goal
+        .session_id
+        .clone()
+        .ok_or_else(|| "goal has no planner session".to_owned())?;
+    let now = Utc::now().to_rfc3339();
+    if state
+        .store
+        .goal_dead_letter_count(goal_id)
+        .map_err(|error| error.to_string())?
+        >= goal.failure_limit
+    {
+        let paused = state
+            .store
+            .update_goal_status(goal_id, "paused")
+            .map_err(|error| error.to_string())?;
+        return Err(format!(
+            "goal paused after dead letters: {}",
+            paused.goal_id
+        ));
+    }
+    let goal = state
+        .store
+        .goal_planning_allowed(goal_id, &now)
+        .map_err(|error| error.to_string())?;
+    let in_flight = state
+        .store
+        .goal_in_flight_count(goal_id)
+        .map_err(|error| error.to_string())?;
+    if in_flight >= goal.max_in_flight {
+        return Err("goal max_in_flight reached".into());
+    }
+    state
+        .store
+        .mark_goal_planned(goal_id, &now)
+        .map_err(|error| error.to_string())?;
+    let actions = state
+        .store
+        .load_actions(None, None, None, 50)
+        .map_err(|error| error.to_string())?;
+    let queue = state
+        .store
+        .load_work_queue(None, 200)
+        .map_err(|error| error.to_string())?;
+    let events = state
+        .store
+        .load_audit(Some(&session_id))
+        .map_err(|error| error.to_string())?;
+    let action_summary = json!({
+        "count": actions.len(),
+        "recent": actions.iter().map(|action| json!({
+            "action_type": action.action_type,
+            "platform": action.platform,
+            "account_id": action.account_id,
+            "idempotency_key": action.idempotency_key,
+            "external_id": action.external_id,
+            "status": action.status,
+        })).collect::<Vec<_>>()
+    });
+    let queue_summary = json!({
+        "count": queue.len(),
+        "statuses": queue.iter().fold(HashMap::<String, u32>::new(), |mut counts, item| {
+            *counts.entry(item.status.clone()).or_default() += 1;
+            counts
+        }),
+        "recent": queue.iter().take(50).map(|item| json!({
+            "queue_id": item.queue_id,
+            "task_type": item.task_type,
+            "status": item.status,
+            "attempts": item.attempts,
+            "last_error": item.last_error,
+            "dedup_key": item.dedup_key,
+        })).collect::<Vec<_>>()
+    });
+    let event_summary = json!({
+        "count": events.len(),
+        "recent": events.iter().take(50).map(|event| json!({
+            "kind": event.kind,
+            "payload": event.payload,
+        })).collect::<Vec<_>>()
+    });
+    let input_summary = json!({
+        "goal_id": goal.goal_id,
+        "goal_description": goal.description,
+        "action_ledger": action_summary,
+        "work_queue": queue_summary,
+        "events": event_summary,
+    });
+    let prompt = planning_prompt(
+        &goal.description,
+        &input_summary["action_ledger"],
+        &input_summary["work_queue"],
+        &input_summary["events"],
+    );
+    let engine = engine_for(app, state, &session_id).await?;
+    let started_at = now.clone();
+    let turn = match engine.submit_text(prompt).await {
+        Ok(turn) => turn,
+        Err(error) => {
+            let reason = error.to_string();
+            let _ = state.store.record_planning_round(
+                goal_id,
+                "failed",
+                &input_summary,
+                &json!({}),
+                Some(&reason),
+                0,
+                &started_at,
+                Some(&Utc::now().to_rfc3339()),
+            );
+            let _ = state.store.record_goal_failure(goal_id);
+            let _ = state.store.append_audit(
+                &session_id,
+                "planner.round",
+                &json!({"goal_id":goal_id,"status":"failed","reason":reason}),
+            );
+            return Err(reason);
+        }
+    };
+    let output = match parse_planner_output(&turn) {
+        Ok(output) => output,
+        Err(error) => {
+            let reason = error.to_string();
+            let _ = state.store.record_planning_round(
+                goal_id,
+                "failed",
+                &input_summary,
+                &json!({}),
+                Some(&reason),
+                0,
+                &started_at,
+                Some(&Utc::now().to_rfc3339()),
+            );
+            let updated = state
+                .store
+                .record_goal_failure(goal_id)
+                .map_err(|store_error| store_error.to_string())?;
+            let _ = state.store.append_audit(
+                &session_id,
+                "planner.round",
+                &json!({"goal_id":goal_id,"status":"failed","reason":reason}),
+            );
+            return Err(format!("{error}; goal_status={}", updated.status));
+        }
+    };
+    if output.steps.len() as u32 > goal.max_in_flight.saturating_sub(in_flight) {
+        let reason = "planner output exceeds goal max_in_flight".to_owned();
+        let _ = state.store.record_planning_round(
+            goal_id,
+            "failed",
+            &input_summary,
+            &serde_json::to_value(&output).unwrap_or_else(|_| json!({})),
+            Some(&reason),
+            0,
+            &started_at,
+            Some(&Utc::now().to_rfc3339()),
+        );
+        let _ = state.store.record_goal_failure(goal_id);
+        return Err(reason);
+    }
+    let mut produced = Vec::new();
+    for step in &output.steps {
+        let mut payload = step.payload.clone();
+        let Some(payload_object) = payload.as_object_mut() else {
+            return Err("planner payload was not an object".into());
+        };
+        payload_object.insert("goal_id".into(), Value::String(goal_id.into()));
+        let item = state
+            .store
+            .enqueue_work_item(
+                &step.task_type,
+                &payload,
+                Some(&planner_dedup_key(goal_id, &step.key)),
+                step.idempotency_key.as_deref(),
+                step.max_attempts.unwrap_or(3),
+                step.compensates_for.as_deref(),
+                Some(&session_id),
+                goal.project_id.as_deref(),
+            )
+            .map_err(|error| error.to_string())?;
+        if goal.autonomy_level == "propose" && item.status == "ready" {
+            state
+                .store
+                .hold_work_item_for_approval(&item.queue_id)
+                .map_err(|error| error.to_string())?;
+        }
+        produced.push(item.queue_id);
+    }
+    let output_summary = json!({
+        "rationale": output.rationale,
+        "queue_ids": produced,
+    });
+    state
+        .store
+        .record_planning_round(
+            goal_id,
+            "succeeded",
+            &input_summary,
+            &output_summary,
+            None,
+            produced.len() as u32,
+            &started_at,
+            Some(&Utc::now().to_rfc3339()),
+        )
+        .map_err(|error| error.to_string())?;
+    state
+        .store
+        .record_goal_success(goal_id)
+        .map_err(|error| error.to_string())?;
+    state
+        .store
+        .append_audit(
+            &session_id,
+            "planner.round",
+            &json!({
+                "goal_id": goal_id,
+                "status": "succeeded",
+                "input_summary": input_summary,
+                "output_summary": output_summary,
+            }),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(json!({"goal_id":goal_id,"queue_ids":produced}))
 }
 
 #[derive(Clone)]
@@ -14130,6 +14381,113 @@ fn work_queue_events(
         .map_err(|error| error.to_string())
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct GoalInput {
+    goal_id: Option<String>,
+    description: String,
+    session_id: Option<String>,
+    project_id: Option<String>,
+    platform: Option<String>,
+    account_id: Option<String>,
+    cadence_seconds: Option<u64>,
+    max_in_flight: Option<u32>,
+    max_rounds_per_hour: Option<u32>,
+    autonomy_level: Option<String>,
+    failure_limit: Option<u32>,
+}
+
+#[tauri::command]
+fn autonomous_goals(
+    state: State<'_, DesktopState>,
+    status: Option<String>,
+) -> Result<Vec<Value>, String> {
+    state
+        .store
+        .load_goals(status.as_deref())
+        .and_then(|goals| {
+            goals
+                .into_iter()
+                .map(|goal| serde_json::to_value(goal).map_err(opcos_store::StoreError::from))
+                .collect()
+        })
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn save_autonomous_goal(state: State<'_, DesktopState>, input: GoalInput) -> Result<Value, String> {
+    if input.goal_id.is_some() {
+        return Err("editing goals is not supported by this command".into());
+    }
+    let goal = state
+        .store
+        .create_goal(
+            &input.description,
+            input.session_id.as_deref(),
+            input.project_id.as_deref(),
+            input.platform.as_deref(),
+            input.account_id.as_deref(),
+            input.cadence_seconds.unwrap_or(3600),
+            input.max_in_flight.unwrap_or(5),
+            input.max_rounds_per_hour.unwrap_or(1),
+            input.autonomy_level.as_deref().unwrap_or("propose"),
+            input.failure_limit.unwrap_or(3),
+        )
+        .map_err(|error| error.to_string())?;
+    serde_json::to_value(goal).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn set_autonomous_goal_status(
+    state: State<'_, DesktopState>,
+    goal_id: String,
+    status: String,
+) -> Result<Value, String> {
+    state
+        .store
+        .update_goal_status(&goal_id, &status)
+        .and_then(|goal| serde_json::to_value(goal).map_err(opcos_store::StoreError::from))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn run_autonomous_goal(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    goal_id: String,
+) -> Result<Value, String> {
+    run_goal_planner(&app, &state, &goal_id).await
+}
+
+#[tauri::command]
+fn planning_history(
+    state: State<'_, DesktopState>,
+    goal_id: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<Value>, String> {
+    state
+        .store
+        .load_planning_rounds(goal_id.as_deref(), limit.unwrap_or(100))
+        .and_then(|rounds| {
+            rounds
+                .into_iter()
+                .map(|round| serde_json::to_value(round).map_err(opcos_store::StoreError::from))
+                .collect()
+        })
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn approve_work_queue_item(
+    state: State<'_, DesktopState>,
+    queue_id: String,
+) -> Result<Value, String> {
+    state
+        .store
+        .approve_work_item(&queue_id)
+        .and_then(|item| serde_json::to_value(item).map_err(opcos_store::StoreError::from))
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 fn save_secret_metadata(
     state: State<'_, DesktopState>,
@@ -14784,6 +15142,20 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 initialize_mcp(&mcp_handle).await;
             });
+            let planner_handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+                    let state = planner_handle.state::<DesktopState>();
+                    let goals = state.store.load_goals(Some("active")).unwrap_or_default();
+                    for goal in goals {
+                        if goal.session_id.is_some() {
+                            let _ = run_goal_planner(&planner_handle, &state, &goal.goal_id).await;
+                        }
+                    }
+                }
+            });
             tauri::async_runtime::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
                 loop {
@@ -14915,6 +15287,12 @@ fn main() {
             audit_events,
             action_ledger_events,
             work_queue_events,
+            autonomous_goals,
+            save_autonomous_goal,
+            set_autonomous_goal_status,
+            run_autonomous_goal,
+            planning_history,
+            approve_work_queue_item,
             save_schedule,
             list_schedules,
             run_schedule,

@@ -23,6 +23,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 mod acp;
 mod opencode;
 pub mod orchestration;
+pub mod planner;
 
 pub use acp::{AcpHarness, AcpHarnessConfig};
 pub use opencode::{OpenCodeHarness, OpenCodeHarnessConfig};

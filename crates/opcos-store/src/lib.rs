@@ -246,6 +246,39 @@ pub struct WorkQueueItem {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AutonomousGoal {
+    pub goal_id: String,
+    pub description: String,
+    pub session_id: Option<String>,
+    pub project_id: Option<String>,
+    pub platform: Option<String>,
+    pub account_id: Option<String>,
+    pub status: String,
+    pub cadence_seconds: u64,
+    pub max_in_flight: u32,
+    pub max_rounds_per_hour: u32,
+    pub autonomy_level: String,
+    pub failure_limit: u32,
+    pub consecutive_failures: u32,
+    pub last_planned_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct PlanningRound {
+    pub round_id: String,
+    pub goal_id: String,
+    pub status: String,
+    pub input_summary: serde_json::Value,
+    pub output_summary: serde_json::Value,
+    pub reason: Option<String>,
+    pub produced_count: u32,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ArtifactRecord {
     pub id: String,
     pub session_id: String,
@@ -333,6 +366,58 @@ fn work_queue_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkQueueIte
         completed_at: row.get(16)?,
         session_id: row.get(17)?,
         project_id: row.get(18)?,
+    })
+}
+
+fn autonomous_goal_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutonomousGoal> {
+    let cadence_seconds = row.get::<_, i64>(7)?;
+    let cadence_seconds = u64::try_from(cadence_seconds)
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(7, cadence_seconds))?;
+    Ok(AutonomousGoal {
+        goal_id: row.get(0)?,
+        description: row.get(1)?,
+        session_id: row.get(2)?,
+        project_id: row.get(3)?,
+        platform: row.get(4)?,
+        account_id: row.get(5)?,
+        status: row.get(6)?,
+        cadence_seconds,
+        max_in_flight: row.get(8)?,
+        max_rounds_per_hour: row.get(9)?,
+        autonomy_level: row.get(10)?,
+        failure_limit: row.get(11)?,
+        consecutive_failures: row.get(12)?,
+        last_planned_at: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
+    })
+}
+
+fn planning_round_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlanningRound> {
+    let input: String = row.get(3)?;
+    let output: String = row.get(4)?;
+    Ok(PlanningRound {
+        round_id: row.get(0)?,
+        goal_id: row.get(1)?,
+        status: row.get(2)?,
+        input_summary: serde_json::from_str(&input).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        output_summary: serde_json::from_str(&output).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        reason: row.get(5)?,
+        produced_count: row.get(6)?,
+        started_at: row.get(7)?,
+        finished_at: row.get(8)?,
     })
 }
 
@@ -1293,6 +1378,288 @@ impl SqliteStore {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn create_goal(
+        &self,
+        description: &str,
+        session_id: Option<&str>,
+        project_id: Option<&str>,
+        platform: Option<&str>,
+        account_id: Option<&str>,
+        cadence_seconds: u64,
+        max_in_flight: u32,
+        max_rounds_per_hour: u32,
+        autonomy_level: &str,
+        failure_limit: u32,
+    ) -> Result<AutonomousGoal, StoreError> {
+        if description.trim().is_empty() {
+            return Err(StoreError::Validation(
+                "goal description cannot be empty".into(),
+            ));
+        }
+        if cadence_seconds == 0
+            || cadence_seconds > i64::MAX as u64
+            || max_in_flight == 0
+            || max_rounds_per_hour == 0
+            || failure_limit == 0
+            || !matches!(autonomy_level, "propose" | "execute")
+        {
+            return Err(StoreError::Validation(
+                "invalid goal cadence, bounds, or autonomy level".into(),
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
+        let goal_id = format!("goal-{}", uuid::Uuid::new_v4());
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "INSERT INTO autonomous_goals
+             (goal_id,description,session_id,project_id,platform,account_id,status,cadence_seconds,
+              max_in_flight,max_rounds_per_hour,autonomy_level,failure_limit,
+              consecutive_failures,last_planned_at,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,'active',?7,?8,?9,?10,?11,0,NULL,?12,?12)",
+            params![
+                goal_id,
+                description,
+                session_id,
+                project_id,
+                platform,
+                account_id,
+                cadence_seconds as i64,
+                max_in_flight,
+                max_rounds_per_hour,
+                autonomy_level,
+                failure_limit,
+                now
+            ],
+        )?;
+        connection
+            .query_row(
+                "SELECT goal_id,description,session_id,project_id,platform,account_id,status,
+                        cadence_seconds,max_in_flight,max_rounds_per_hour,autonomy_level,
+                        failure_limit,consecutive_failures,last_planned_at,created_at,updated_at
+                 FROM autonomous_goals WHERE goal_id=?1",
+                [goal_id],
+                autonomous_goal_from_row,
+            )
+            .map_err(StoreError::from)
+    }
+
+    pub fn load_goals(&self, status: Option<&str>) -> Result<Vec<AutonomousGoal>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT goal_id,description,session_id,project_id,platform,account_id,status,
+                    cadence_seconds,max_in_flight,max_rounds_per_hour,autonomy_level,
+                    failure_limit,consecutive_failures,last_planned_at,created_at,updated_at
+             FROM autonomous_goals
+             WHERE (?1 IS NULL OR status=?1)
+             ORDER BY created_at DESC",
+        )?;
+        statement
+            .query_map([status], autonomous_goal_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn load_goal(&self, goal_id: &str) -> Result<AutonomousGoal, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .query_row(
+                "SELECT goal_id,description,session_id,project_id,platform,account_id,status,
+                        cadence_seconds,max_in_flight,max_rounds_per_hour,autonomy_level,
+                        failure_limit,consecutive_failures,last_planned_at,created_at,updated_at
+                 FROM autonomous_goals WHERE goal_id=?1",
+                [goal_id],
+                autonomous_goal_from_row,
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    StoreError::Validation("goal not found".into())
+                }
+                error => StoreError::from(error),
+            })
+    }
+
+    pub fn update_goal_status(
+        &self,
+        goal_id: &str,
+        status: &str,
+    ) -> Result<AutonomousGoal, StoreError> {
+        if !matches!(status, "active" | "paused" | "done") {
+            return Err(StoreError::Validation("invalid goal status".into()));
+        }
+        let now = Utc::now().to_rfc3339();
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let changed = connection.execute(
+            "UPDATE autonomous_goals SET status=?1,updated_at=?2 WHERE goal_id=?3",
+            params![status, now, goal_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::Validation("goal not found".into()));
+        }
+        connection
+            .query_row(
+                "SELECT goal_id,description,session_id,project_id,platform,account_id,status,
+                        cadence_seconds,max_in_flight,max_rounds_per_hour,autonomy_level,
+                        failure_limit,consecutive_failures,last_planned_at,created_at,updated_at
+                 FROM autonomous_goals WHERE goal_id=?1",
+                [goal_id],
+                autonomous_goal_from_row,
+            )
+            .map_err(StoreError::from)
+    }
+
+    pub fn goal_planning_allowed(
+        &self,
+        goal_id: &str,
+        now: &str,
+    ) -> Result<AutonomousGoal, StoreError> {
+        let goal = self.load_goal(goal_id)?;
+        if goal.status != "active" {
+            return Err(StoreError::Validation("goal is not active".into()));
+        }
+        let planning_now = DateTime::parse_from_rfc3339(now)
+            .map_err(|_| StoreError::Validation("invalid planning timestamp".into()))?;
+        if let Some(last) = &goal.last_planned_at {
+            let last = DateTime::parse_from_rfc3339(last)
+                .map_err(|_| StoreError::Validation("invalid goal timestamp".into()))?;
+            if planning_now.signed_duration_since(last).num_seconds() < goal.cadence_seconds as i64
+            {
+                return Err(StoreError::Validation(
+                    "goal cadence has not elapsed".into(),
+                ));
+            }
+        }
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let threshold =
+            (planning_now.with_timezone(&Utc) - chrono::Duration::hours(1)).to_rfc3339();
+        let rounds: u32 = connection.query_row(
+            "SELECT COUNT(*) FROM planning_rounds
+             WHERE goal_id=?1 AND started_at>=?2",
+            params![goal_id, threshold],
+            |row| row.get(0),
+        )?;
+        if rounds >= goal.max_rounds_per_hour {
+            return Err(StoreError::Validation(
+                "goal planning frequency limit reached".into(),
+            ));
+        }
+        Ok(goal)
+    }
+
+    pub fn goal_in_flight_count(&self, goal_id: &str) -> Result<u32, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        Ok(connection.query_row(
+            "SELECT COUNT(*) FROM work_queue
+             WHERE status IN ('ready','running','pending_approval')
+               AND json_extract(payload,'$.goal_id')=?1",
+            [goal_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn mark_goal_planned(&self, goal_id: &str, at: &str) -> Result<(), StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "UPDATE autonomous_goals SET last_planned_at=?1,updated_at=?1 WHERE goal_id=?2",
+            params![at, goal_id],
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_planning_round(
+        &self,
+        goal_id: &str,
+        status: &str,
+        input_summary: &serde_json::Value,
+        output_summary: &serde_json::Value,
+        reason: Option<&str>,
+        produced_count: u32,
+        started_at: &str,
+        finished_at: Option<&str>,
+    ) -> Result<PlanningRound, StoreError> {
+        let round_id = format!("round-{}", uuid::Uuid::new_v4());
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "INSERT INTO planning_rounds
+             (round_id,goal_id,status,input_summary,output_summary,reason,produced_count,
+              started_at,finished_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                round_id,
+                goal_id,
+                status,
+                serde_json::to_string(input_summary)?,
+                serde_json::to_string(output_summary)?,
+                reason,
+                produced_count,
+                started_at,
+                finished_at
+            ],
+        )?;
+        connection
+            .query_row(
+                "SELECT round_id,goal_id,status,input_summary,output_summary,reason,
+                        produced_count,started_at,finished_at
+                 FROM planning_rounds WHERE round_id=?1",
+                [round_id],
+                planning_round_from_row,
+            )
+            .map_err(StoreError::from)
+    }
+
+    pub fn load_planning_rounds(
+        &self,
+        goal_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<PlanningRound>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT round_id,goal_id,status,input_summary,output_summary,reason,
+                    produced_count,started_at,finished_at
+             FROM planning_rounds
+             WHERE (?1 IS NULL OR goal_id=?1)
+             ORDER BY started_at DESC LIMIT ?2",
+        )?;
+        statement
+            .query_map(
+                params![goal_id, limit.clamp(1, 500)],
+                planning_round_from_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn record_goal_failure(&self, goal_id: &str) -> Result<AutonomousGoal, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "UPDATE autonomous_goals
+             SET consecutive_failures=consecutive_failures+1,
+                 status=CASE WHEN consecutive_failures+1>=failure_limit THEN 'paused' ELSE status END,
+                 updated_at=?1 WHERE goal_id=?2",
+            params![Utc::now().to_rfc3339(), goal_id],
+        )?;
+        connection
+            .query_row(
+                "SELECT goal_id,description,session_id,project_id,platform,account_id,status,
+                        cadence_seconds,max_in_flight,max_rounds_per_hour,autonomy_level,
+                        failure_limit,consecutive_failures,last_planned_at,created_at,updated_at
+                 FROM autonomous_goals WHERE goal_id=?1",
+                [goal_id],
+                autonomous_goal_from_row,
+            )
+            .map_err(StoreError::from)
+    }
+
+    pub fn record_goal_success(&self, goal_id: &str) -> Result<(), StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "UPDATE autonomous_goals SET consecutive_failures=0,updated_at=?1 WHERE goal_id=?2",
+            params![Utc::now().to_rfc3339(), goal_id],
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn enqueue_work_item(
         &self,
         task_type: &str,
@@ -1637,6 +2004,59 @@ impl SqliteStore {
             .map_err(StoreError::from)
     }
 
+    pub fn approve_work_item(&self, queue_id: &str) -> Result<WorkQueueItem, StoreError> {
+        let now = Utc::now().to_rfc3339();
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let changed = connection.execute(
+            "UPDATE work_queue SET status='ready',updated_at=?1 WHERE queue_id=?2 AND status='pending_approval'",
+            params![now, queue_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::Validation(
+                "queue item is missing or not awaiting approval".into(),
+            ));
+        }
+        connection
+            .query_row(
+                &format!("SELECT {WORK_QUEUE_COLUMNS} FROM work_queue WHERE queue_id=?1"),
+                [queue_id],
+                work_queue_from_row,
+            )
+            .map_err(StoreError::from)
+    }
+
+    pub fn hold_work_item_for_approval(&self, queue_id: &str) -> Result<WorkQueueItem, StoreError> {
+        let now = Utc::now().to_rfc3339();
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let changed = connection.execute(
+            "UPDATE work_queue SET status='pending_approval',updated_at=?1
+             WHERE queue_id=?2 AND status='ready'",
+            params![now, queue_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::Validation(
+                "queue item is missing or not ready".into(),
+            ));
+        }
+        connection
+            .query_row(
+                &format!("SELECT {WORK_QUEUE_COLUMNS} FROM work_queue WHERE queue_id=?1"),
+                [queue_id],
+                work_queue_from_row,
+            )
+            .map_err(StoreError::from)
+    }
+
+    pub fn goal_dead_letter_count(&self, goal_id: &str) -> Result<u32, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        Ok(connection.query_row(
+            "SELECT COUNT(*) FROM work_queue
+             WHERE status='dead_letter' AND json_extract(payload,'$.goal_id')=?1",
+            [goal_id],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn load_work_queue(
         &self,
         status: Option<&str>,
@@ -1970,6 +2390,37 @@ impl SqliteStore {
                ON work_queue(status, run_after, created_at);
              CREATE INDEX IF NOT EXISTS idx_work_queue_dedup
                ON work_queue(dedup_key);
+             CREATE TABLE IF NOT EXISTS autonomous_goals (
+               goal_id TEXT PRIMARY KEY,
+               description TEXT NOT NULL,
+               session_id TEXT,
+               project_id TEXT,
+               platform TEXT,
+               account_id TEXT,
+               status TEXT NOT NULL,
+               cadence_seconds INTEGER NOT NULL,
+               max_in_flight INTEGER NOT NULL,
+               max_rounds_per_hour INTEGER NOT NULL,
+               autonomy_level TEXT NOT NULL DEFAULT 'propose',
+               failure_limit INTEGER NOT NULL,
+               consecutive_failures INTEGER NOT NULL DEFAULT 0,
+               last_planned_at TEXT,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS planning_rounds (
+               round_id TEXT PRIMARY KEY,
+               goal_id TEXT NOT NULL,
+               status TEXT NOT NULL,
+               input_summary TEXT NOT NULL,
+               output_summary TEXT NOT NULL,
+               reason TEXT,
+               produced_count INTEGER NOT NULL,
+               started_at TEXT NOT NULL,
+               finished_at TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_planning_rounds_goal_time
+               ON planning_rounds(goal_id, started_at DESC);
              ;",
             )?;
             ensure_artifact_schema(&connection)?;
@@ -2155,6 +2606,12 @@ impl SqliteStore {
             if version < 4 {
                 connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (4, ?1)",
+                    [Utc::now().to_rfc3339()],
+                )?;
+            }
+            if version < 5 {
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (5, ?1)",
                     [Utc::now().to_rfc3339()],
                 )?;
             }
@@ -4055,5 +4512,154 @@ mod tests {
         let replayed = store.requeue_work_item(&item.queue_id).unwrap();
         assert_eq!(replayed.status, "ready");
         assert_eq!(replayed.attempts, 0);
+    }
+
+    #[test]
+    fn autonomous_goals_default_to_bounded_propose_planning() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let goal = store
+            .create_goal(
+                "Keep the store catalog current",
+                Some("planner-session"),
+                Some("project-1"),
+                Some("shop"),
+                Some("account-1"),
+                3600,
+                1,
+                1,
+                "propose",
+                2,
+            )
+            .unwrap();
+        assert_eq!(goal.autonomy_level, "propose");
+        assert_eq!(goal.status, "active");
+        let now = Utc::now().to_rfc3339();
+        assert!(store.goal_planning_allowed(&goal.goal_id, &now).is_ok());
+        store.mark_goal_planned(&goal.goal_id, &now).unwrap();
+        assert!(store.goal_planning_allowed(&goal.goal_id, &now).is_err());
+        let queued = store
+            .enqueue_work_item(
+                "catalog",
+                &serde_json::json!({"goal_id": goal.goal_id}),
+                Some("planner:g1:catalog"),
+                None,
+                3,
+                None,
+                Some("planner-session"),
+                Some("project-1"),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .hold_work_item_for_approval(&queued.queue_id)
+                .unwrap()
+                .status,
+            "pending_approval"
+        );
+        assert_eq!(
+            store.approve_work_item(&queued.queue_id).unwrap().status,
+            "ready"
+        );
+        assert_eq!(store.goal_in_flight_count(&goal.goal_id).unwrap(), 1);
+        store
+            .record_planning_round(
+                &goal.goal_id,
+                "succeeded",
+                &serde_json::json!({}),
+                &serde_json::json!({}),
+                None,
+                0,
+                &now,
+                Some(&now),
+            )
+            .unwrap();
+        let frequency_limited = store
+            .create_goal(
+                "Frequency-limited goal",
+                None,
+                None,
+                None,
+                None,
+                1,
+                1,
+                1,
+                "propose",
+                2,
+            )
+            .unwrap();
+        store
+            .record_planning_round(
+                &frequency_limited.goal_id,
+                "succeeded",
+                &serde_json::json!({}),
+                &serde_json::json!({}),
+                None,
+                0,
+                "2026-08-03T01:00:00+00:00",
+                Some("2026-08-03T01:00:01+00:00"),
+            )
+            .unwrap();
+        assert!(
+            store
+                .goal_planning_allowed(&frequency_limited.goal_id, "2026-08-03T23:00:00+00:00")
+                .is_ok()
+        );
+        store
+            .record_planning_round(
+                &frequency_limited.goal_id,
+                "succeeded",
+                &serde_json::json!({}),
+                &serde_json::json!({}),
+                None,
+                0,
+                "2026-08-03T22:30:00+00:00",
+                Some("2026-08-03T22:30:01+00:00"),
+            )
+            .unwrap();
+        assert!(
+            store
+                .goal_planning_allowed(&frequency_limited.goal_id, "2026-08-03T23:00:00+00:00")
+                .is_err()
+        );
+        let failed = store.record_goal_failure(&goal.goal_id).unwrap();
+        assert_eq!(failed.status, "active");
+        let paused = store.record_goal_failure(&goal.goal_id).unwrap();
+        assert_eq!(paused.status, "paused");
+    }
+
+    #[test]
+    fn planning_rounds_are_auditable_and_persisted_across_goal_queries() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let goal = store
+            .create_goal(
+                "Review customer messages",
+                None,
+                None,
+                Some("market"),
+                Some("account"),
+                60,
+                2,
+                2,
+                "execute",
+                3,
+            )
+            .unwrap();
+        let round = store
+            .record_planning_round(
+                &goal.goal_id,
+                "failed",
+                &serde_json::json!({"queue":{"count":1}}),
+                &serde_json::json!({}),
+                Some("invalid planner JSON"),
+                0,
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-01T00:00:01Z"),
+            )
+            .unwrap();
+        assert_eq!(round.status, "failed");
+        assert_eq!(
+            store.load_planning_rounds(Some(&goal.goal_id), 10).unwrap(),
+            vec![round]
+        );
     }
 }
