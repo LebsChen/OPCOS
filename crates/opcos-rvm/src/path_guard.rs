@@ -65,7 +65,12 @@ pub fn join_remote_path(workspace: &str, child: &str) -> String {
     let windows = workspace.as_bytes().get(1) == Some(&b':') || workspace.contains('\\');
     let separator = if windows { '\\' } else { '/' };
     let root = workspace.trim_end_matches(['/', '\\']);
-    let child = child.trim_start_matches(['/', '\\']).replace('/', "\\");
+    let child = child.trim_start_matches(['/', '\\']);
+    let child = if windows {
+        child.replace('/', "\\")
+    } else {
+        child.replace('\\', "/")
+    };
     format!("{root}{separator}{child}")
 }
 
@@ -174,6 +179,18 @@ mod tests {
         assert_eq!(
             join_remote_path("c:\\users\\TEAM", "\\AGENTS.md").to_ascii_lowercase(),
             "c:\\users\\team\\agents.md"
+        );
+    }
+
+    #[test]
+    fn joins_posix_paths_with_forward_slashes() {
+        assert_eq!(
+            join_remote_path("/workspace/", ".agents/skills"),
+            "/workspace/.agents/skills"
+        );
+        assert_eq!(
+            join_remote_path("/workspace", "\\AGENTS.md"),
+            "/workspace/AGENTS.md"
         );
     }
 

@@ -9,6 +9,9 @@ import { translate } from "../i18n";
 
 export type SettingsSection =
   | "appearance"
+  | "devin"
+  | "environment"
+  | "market"
   | "provider"
   | "hosts"
   | "agents"
@@ -24,6 +27,9 @@ export type SettingsSection =
 
 const tabs: Array<{ key: SettingsSection; label: string; icon: IconName }> = [
   { key: "appearance", label: "general", icon: "sliders" },
+  { key: "devin", label: "Devin", icon: "sparkle" },
+  { key: "environment", label: "Environment", icon: "folder" },
+  { key: "market", label: "市场", icon: "sparkle" },
   { key: "provider", label: "provider", icon: "sparkle" },
   { key: "hosts", label: "hosts", icon: "folder" },
   { key: "agents", label: "agents", icon: "fileCode" },

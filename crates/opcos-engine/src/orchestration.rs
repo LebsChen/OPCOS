@@ -9,6 +9,8 @@ const SUFFIX: &str = "[[/COORD]]";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Role {
+    #[serde(default)]
+    pub project_id: String,
     pub id: String,
     pub sort_order: u32,
     pub session_id: String,
@@ -99,6 +101,8 @@ pub enum BoardPhase {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BoardTask {
+    #[serde(default)]
+    pub project_id: String,
     pub id: String,
     pub title: String,
     pub phase: BoardPhase,
@@ -292,6 +296,16 @@ impl CoordinationRuntime {
         Ok(())
     }
 
+    pub fn restore_messages(
+        &mut self,
+        messages: impl IntoIterator<Item = (Envelope, DateTime<Utc>)>,
+    ) -> Result<(), CoordinationError> {
+        for (envelope, created_at) in messages {
+            self.validate_and_record(&envelope, created_at)?;
+        }
+        Ok(())
+    }
+
     pub fn set_role_state(
         &mut self,
         role_id: &str,
@@ -342,18 +356,21 @@ mod tests {
     fn runtime() -> CoordinationRuntime {
         CoordinationRuntime::new(vec![
             Role {
+                project_id: "project".into(),
                 id: "leader".into(),
                 sort_order: 0,
                 session_id: "s0".into(),
                 state: RoleState::Active,
             },
             Role {
+                project_id: "project".into(),
                 id: "worker-a".into(),
                 sort_order: 1,
                 session_id: "s1".into(),
                 state: RoleState::Active,
             },
             Role {
+                project_id: "project".into(),
                 id: "worker-b".into(),
                 sort_order: 2,
                 session_id: "s2".into(),
@@ -431,9 +448,76 @@ mod tests {
     }
 
     #[test]
+    fn malformed_envelope_is_rejected_for_human_intervention() {
+        let mut runtime = runtime();
+        let mut value = envelope("leader", "worker-a", EnvelopeKind::Request, "bad-version");
+        value.v = 2;
+        assert_eq!(
+            runtime.validate_and_record(&value, Utc::now()),
+            Err(CoordinationError::Malformed)
+        );
+        assert_eq!(
+            Envelope::decode("human text without a coordination envelope"),
+            Err(CoordinationError::Malformed)
+        );
+    }
+
+    #[test]
+    fn task_limit_is_two_hundred_across_minutes() {
+        let mut runtime = runtime();
+        let start = Utc::now();
+        for index in 0..200 {
+            runtime
+                .validate_and_record(
+                    &envelope(
+                        "leader",
+                        "worker-a",
+                        EnvelopeKind::Request,
+                        &format!("task-limit-{index}"),
+                    ),
+                    start + Duration::minutes(index as i64 + 1),
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            runtime.validate_and_record(
+                &envelope("leader", "worker-a", EnvelopeKind::Request, "task-limit-overflow"),
+                start + Duration::minutes(202),
+            ),
+            Err(CoordinationError::CircuitBreaker(message)) if message == "task limit 200"
+        ));
+    }
+
+    #[test]
+    fn lease_renewal_requires_current_generation() {
+        let now = Utc::now();
+        let mut task = BoardTask {
+            project_id: "project".into(),
+            id: "renew".into(),
+            title: "renew".into(),
+            phase: BoardPhase::Open,
+            assignee: None,
+            lease_generation: 0,
+            lease_until: None,
+            require_acceptance: false,
+            verified_pr_url: None,
+            branch: None,
+            pr: None,
+        };
+        task.claim("worker-a", now).unwrap();
+        assert_eq!(
+            task.renew("worker-a", 0, now),
+            Err(CoordinationError::LeaseExpired)
+        );
+        task.renew("worker-a", 1, now).unwrap();
+        assert!(task.lease_until.is_some_and(|until| until > now));
+    }
+
+    #[test]
     fn lease_expiry_reclaim_and_acceptance_need_real_pr() {
         let now = Utc::now();
         let mut task = BoardTask {
+            project_id: "project".into(),
             id: "t".into(),
             title: "work".into(),
             phase: BoardPhase::Open,
@@ -463,6 +547,69 @@ mod tests {
     }
 
     #[test]
+    fn workflow_gate_failure_does_not_mark_task_done() {
+        let now = Utc::now();
+        let mut task = BoardTask {
+            project_id: "project".into(),
+            id: "gate".into(),
+            title: "gate".into(),
+            phase: BoardPhase::Open,
+            assignee: None,
+            lease_generation: 0,
+            lease_until: None,
+            require_acceptance: true,
+            verified_pr_url: None,
+            branch: Some("feature/gate".into()),
+            pr: None,
+        };
+        task.claim("worker-a", now).unwrap();
+        task.complete("worker-a", now, None).unwrap();
+        assert_eq!(task.phase, BoardPhase::AwaitingAcceptance);
+        assert_eq!(
+            task.accept(),
+            Err(CoordinationError::AcceptanceRequiresPullRequest)
+        );
+    }
+
+    #[test]
+    fn coordination_history_replays_after_restart() {
+        let now = Utc::now();
+        let message = envelope("leader", "worker-a", EnvelopeKind::Request, "restart-1");
+        let mut first = runtime();
+        first.validate_and_record(&message, now).unwrap();
+        let mut restarted = runtime();
+        restarted
+            .restore_messages(vec![(message.clone(), now)])
+            .unwrap();
+        assert_eq!(
+            restarted.validate_and_record(&message, now),
+            Err(CoordinationError::DuplicateMessage)
+        );
+        let history = (0..200)
+            .map(|index| {
+                (
+                    envelope(
+                        "leader",
+                        "worker-a",
+                        EnvelopeKind::Request,
+                        &format!("restart-limit-{index}"),
+                    ),
+                    now + Duration::minutes(index as i64 + 1),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut limited = runtime();
+        limited.restore_messages(history.clone()).unwrap();
+        assert!(matches!(
+            limited.validate_and_record(
+                &envelope("leader", "worker-a", EnvelopeKind::Request, "restart-overflow"),
+                now + Duration::minutes(202),
+            ),
+            Err(CoordinationError::CircuitBreaker(message)) if message == "task limit 200"
+        ));
+    }
+
+    #[test]
     fn sleeping_worker_state_is_preserved() {
         let mut runtime = runtime();
         runtime
@@ -475,6 +622,7 @@ mod tests {
     fn shared_branch_is_serial_but_independent_branches_parallel() {
         let mut board = Board::new();
         board.insert(BoardTask {
+            project_id: "project".into(),
             id: "a".into(),
             title: "a".into(),
             phase: BoardPhase::Claimed,
@@ -487,6 +635,7 @@ mod tests {
             pr: Some("pr-1".into()),
         });
         board.insert(BoardTask {
+            project_id: "project".into(),
             id: "b".into(),
             title: "b".into(),
             phase: BoardPhase::Open,

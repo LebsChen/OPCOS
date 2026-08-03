@@ -90,8 +90,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rvm = client()?;
         rvm.clone().with_workspace(r"C:\Users\Team").write(&format!("{root}\\task.txt"), "leader seed").await?;
         let roles = vec![
-            Role { id: "leader".into(), sort_order: 0, session_id: "m8-leader".into(), state: RoleState::Active },
-            Role { id: "worker".into(), sort_order: 1, session_id: "m8-worker".into(), state: RoleState::Active },
+            Role { project_id: "m8-project".into(), id: "leader".into(), sort_order: 0, session_id: "m8-leader".into(), state: RoleState::Active },
+            Role { project_id: "m8-project".into(), id: "worker".into(), sort_order: 1, session_id: "m8-worker".into(), state: RoleState::Active },
         ];
         let mut coordination = CoordinationRuntime::new(roles)?;
         let request = Envelope { v: 1, task_id: "m8-task".into(), from: "leader".into(), to: "worker".into(), kind: EnvelopeKind::Request, msg_id: "m8-request-1".into(), reply_to: None, payload: json!({"instruction":"modify task.txt to exactly worker complete and run node --version"}) };

@@ -129,6 +129,7 @@ interface Props {
   onInterrupt: () => void;
   assets?: Array<{ kind: string; title: string }>;
   secrets?: Array<{ name: string }>;
+  slashCommands?: Array<{ name: string; body: string; kind: string }>;
   onUploadFile?: (file: File) => Promise<string>;
   onModeChange?: (mode: string) => void;
   onHarnessChange?: (harness: string) => void;
@@ -165,6 +166,7 @@ export function Composer(props: Props) {
   const [dictationError, setDictationError] = useState<string | null>(null);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [attachNotice, setAttachNotice] = useState<string | null>(null);
+  const [slashQuery, setSlashQuery] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const noticeTimer = useRef<number | null>(null);
@@ -344,6 +346,16 @@ export function Composer(props: Props) {
     textareaRef.current?.focus();
   };
 
+  const expandSlashCommand = (value: string) => {
+    const match = value.trimStart().match(/^(\/\S+)(?:\s+([\s\S]*))?$/);
+    if (!match) return value;
+    const command = props.slashCommands?.find((item) => item.name === match[1]);
+    if (!command) return value;
+    return match[2]?.trim()
+      ? `${command.body}\n\n${match[2].trim()}`
+      : command.body;
+  };
+
   const uploadFile = async (file: File) => {
     if (!props.onUploadFile) return;
     if (file.size > 256 * 1024) {
@@ -390,7 +402,7 @@ export function Composer(props: Props) {
       props.onConnectModel?.();
       return;
     }
-    props.onSend(t, attachments);
+    props.onSend(expandSlashCommand(t), attachments);
     setText("");
     setAttachments([]);
   };
@@ -509,10 +521,38 @@ export function Composer(props: Props) {
           className="w-full block px-3.5 pt-3.5 pb-1.5 text-[14.5px]"
           placeholder={props.placeholder || "Ask OPCOS…"}
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => {
+            const value = e.target.value;
+            setText(value);
+            const match = value.match(/^\/([^\s]*)$/);
+            setSlashQuery(match ? match[1].toLowerCase() : null);
+          }}
           onKeyDown={onKey}
           rows={1}
         />
+        {slashQuery !== null && props.slashCommands && (
+          <div className="px-3 pb-2 flex flex-wrap gap-1.5">
+            {props.slashCommands
+              .filter((command) =>
+                command.name.slice(1).toLowerCase().startsWith(slashQuery),
+              )
+              .slice(0, 8)
+              .map((command) => (
+                <button
+                  className="pill"
+                  key={command.name}
+                  type="button"
+                  onClick={() => {
+                    setText(`${command.name} `);
+                    setSlashQuery(null);
+                    textareaRef.current?.focus();
+                  }}
+                >
+                  {command.name}
+                </button>
+              ))}
+          </div>
+        )}
 
         <div className="pending-files">
           {attachments.map((attachment, index) => (

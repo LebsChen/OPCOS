@@ -1584,12 +1584,22 @@ input.workspace-chip {
 }
 .review-grid {
   display: grid;
-  grid-template-columns: 260px 1fr;
+  grid-template-columns: minmax(0, 1fr);
   gap: 14px;
-  min-height: 500px;
+  min-height: 0;
+}
+@container (min-width: 900px) {
+  .review-grid {
+    grid-template-columns: minmax(200px, 260px) minmax(0, 1fr);
+  }
+}
+.review-panel {
+  container-type: inline-size;
 }
 .file-row {
-  display: block;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
   width: 100%;
   padding: 8px;
   border: 0;
@@ -1598,15 +1608,25 @@ input.workspace-chip {
   color: var(--color-muted);
   text-align: left;
   overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
+}
+.file-row-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.file-row-meta {
+  flex: 0 0 auto;
+  color: var(--color-faint);
+  font-size: 0.78rem;
 }
 .file-row:hover {
   color: var(--color-ink);
   background: var(--panel);
 }
 .diff-view {
-  min-height: 420px;
+  min-height: 240px;
+  max-height: 420px;
   overflow: auto;
   margin: 0;
   padding: 13px;

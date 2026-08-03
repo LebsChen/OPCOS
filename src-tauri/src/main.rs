@@ -13,7 +13,7 @@ use axum::{
     routing::any,
 };
 use base64::Engine;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use notify::Watcher;
 use opcos_assets::{
@@ -44,8 +44,8 @@ use opcos_rvm::{
     WsParams, join_remote_path,
 };
 use opcos_store::{
-    ArtifactRecord, KeyringSecretStore, SecretStore, SessionRecord, SessionStore, SqliteStore,
-    ToolCallRecord,
+    ArtifactRecord, KeyringSecretStore, ProjectAgentRecord, ProjectRecord, SecretStore,
+    SessionRecord, SessionStore, SqliteStore, ToolCallRecord,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -58,6 +58,38 @@ use std::process::Command as ProcessCommand;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+struct HostAssetReader {
+    host: Arc<dyn Host>,
+}
+
+#[async_trait]
+impl opcos_assets::RemoteAssetReader for HostAssetReader {
+    async fn read(&self, path: &str) -> Result<String, opcos_assets::AssetError> {
+        self.host
+            .read(path)
+            .await
+            .map(|content| content.content)
+            .map_err(|error| opcos_assets::AssetError::Invalid(error.to_string()))
+    }
+
+    async fn list(
+        &self,
+        path: Option<&str>,
+    ) -> Result<Vec<(String, bool)>, opcos_assets::AssetError> {
+        self.host
+            .ls(path)
+            .await
+            .map(|listing| {
+                listing
+                    .items
+                    .into_iter()
+                    .map(|item| (item.name, item.dir))
+                    .collect()
+            })
+            .map_err(|error| opcos_assets::AssetError::Invalid(error.to_string()))
+    }
+}
 use tauri::{Emitter, Manager, RunEvent, State};
 use tauri_plugin_opener::OpenerExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -138,6 +170,7 @@ struct DesktopState {
 #[derive(Clone)]
 struct McpCredentialAdapter {
     store: KeyringSecretStore,
+    project_id: Option<String>,
 }
 
 #[async_trait]
@@ -146,10 +179,13 @@ impl McpCredentialStore for McpCredentialAdapter {
         &self,
         server_id: &str,
     ) -> Result<Option<HashMap<String, String>>, opcos_mcp::McpClientError> {
-        let value = self
-            .store
-            .get(&secret_key("mcp-credential", server_id))
-            .map_err(|_| opcos_mcp::McpClientError::Transport)?;
+        let value = scoped_secret_get_from_store(
+            &self.store,
+            self.project_id.as_deref(),
+            "mcp-credential",
+            server_id,
+        )
+        .map_err(|_| opcos_mcp::McpClientError::Transport)?;
         value
             .map(|value| {
                 serde_json::from_str(&value).map_err(|_| opcos_mcp::McpClientError::Transport)
@@ -176,6 +212,7 @@ struct RemoteExecutor {
     index_root: PathBuf,
     host_id: String,
     workspace: String,
+    project_id: Option<String>,
 }
 
 struct LocalExecutor {
@@ -185,6 +222,7 @@ struct LocalExecutor {
     mcp: Arc<McpManager<McpCredentialAdapter>>,
     index_root: PathBuf,
     workspace: String,
+    project_id: Option<String>,
 }
 
 enum DesktopExecutor {
@@ -369,11 +407,13 @@ impl ToolExecutor for RemoteExecutor {
                 let mut env = serde_json::Map::new();
                 let mut values = Vec::new();
                 for name in names {
-                    let value = self
-                        .secrets
-                        .get(&secret_key("asset-secret", name))
-                        .map_err(|error| error.to_string())?
-                        .ok_or_else(|| format!("secret is not configured: {name}"))?;
+                    let value = scoped_secret_get_from_store(
+                        &self.secrets,
+                        self.project_id.as_deref(),
+                        "asset-secret",
+                        name,
+                    )?
+                    .ok_or_else(|| format!("secret is not configured: {name}"))?;
                     env.insert(name.to_owned(), Value::String(value.clone()));
                     values.push(value);
                 }
@@ -409,14 +449,16 @@ impl ToolExecutor for RemoteExecutor {
             | "linear_list_my_issues"
             | "linear_comment_issue"
             | "linear_update_issue_status" => {
-                execute_linear_tool(&self.secrets, name, arguments).await
+                execute_linear_tool(&self.secrets, self.project_id.as_deref(), name, arguments)
+                    .await
             }
             name if name.starts_with("github_")
                 || name.starts_with("telegram_")
                 || name.starts_with("discord_")
                 || name.starts_with("slack_") =>
             {
-                execute_connector_tool(&self.secrets, name, arguments).await
+                execute_connector_tool(&self.secrets, self.project_id.as_deref(), name, arguments)
+                    .await
             }
             "repo_index_find_symbol" | "repo_index_glob" | "repo_index_search" => {
                 let host = RvmHost::new(
@@ -500,10 +542,12 @@ impl ToolExecutor for DesktopExecutor {
                         let mut env = serde_json::Map::new();
                         let mut values = Vec::new();
                         for name in names {
-                            let value = executor
-                                .secrets
-                                .get(&secret_key("asset-secret", name))
-                                .map_err(|error| error.to_string())?
+                            let value = scoped_secret_get_from_store(
+                                    &executor.secrets,
+                                    executor.project_id.as_deref(),
+                                    "asset-secret",
+                                    name,
+                        )?
                                 .ok_or_else(|| format!("secret is not configured: {name}"))?;
                             env.insert(name.to_owned(), Value::String(value.clone()));
                             values.push(value);
@@ -530,14 +574,26 @@ impl ToolExecutor for DesktopExecutor {
                     }
                     "linear_get_issue" | "linear_list_my_issues" | "linear_comment_issue"
                     | "linear_update_issue_status" => {
-                        execute_linear_tool(&executor.secrets, name, arguments).await
+                        execute_linear_tool(
+                            &executor.secrets,
+                            executor.project_id.as_deref(),
+                            name,
+                            arguments,
+                        )
+                        .await
                     }
                     name if name.starts_with("github_")
                         || name.starts_with("telegram_")
                         || name.starts_with("discord_")
                         || name.starts_with("slack_") =>
                     {
-                        execute_connector_tool(&executor.secrets, name, arguments).await
+                        execute_connector_tool(
+                            &executor.secrets,
+                            executor.project_id.as_deref(),
+                            name,
+                            arguments,
+                        )
+                        .await
                     }
                     "repo_index_find_symbol" | "repo_index_glob" | "repo_index_search" => {
                         execute_index_tool(
@@ -707,6 +763,17 @@ struct SessionView {
     workspace: String,
     run_state: String,
     stop_reason: String,
+    project_id: Option<String>,
+    agent_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ProjectView {
+    #[serde(flatten)]
+    project: ProjectRecord,
+    agents: Vec<ProjectAgentRecord>,
+    host_name: String,
+    online: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -775,6 +842,37 @@ fn emit_pending_approval(
 
 fn secret_key(prefix: &str, id: &str) -> String {
     format!("{prefix}:{id}")
+}
+
+fn project_secret_key(project_id: &str, prefix: &str, id: &str) -> String {
+    format!("project:{project_id}/{}", secret_key(prefix, id))
+}
+
+fn scoped_secret_get_from_store(
+    store: &KeyringSecretStore,
+    project_id: Option<&str>,
+    prefix: &str,
+    id: &str,
+) -> Result<Option<String>, String> {
+    if let Some(project_id) = project_id
+        && let Some(value) = store
+            .get(&project_secret_key(project_id, prefix, id))
+            .map_err(|error| error.to_string())?
+    {
+        return Ok(Some(value));
+    }
+    store
+        .get(&secret_key(prefix, id))
+        .map_err(|error| error.to_string())
+}
+
+fn scoped_secret_get(
+    state: &DesktopState,
+    project_id: Option<&str>,
+    prefix: &str,
+    id: &str,
+) -> Result<Option<String>, String> {
+    scoped_secret_get_from_store(&state.secrets, project_id, prefix, id)
 }
 
 async fn devin_api_request(state: &DesktopState, path: &str) -> Result<Value, String> {
@@ -1069,6 +1167,19 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                key TEXT PRIMARY KEY,
                value TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS devin_settings (
+               scope TEXT PRIMARY KEY,
+               value TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS slash_commands (
+               scope TEXT NOT NULL,
+               name TEXT NOT NULL,
+               kind TEXT NOT NULL,
+               body TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               PRIMARY KEY(scope,name)
+             );
              CREATE TABLE IF NOT EXISTS desktop_schema_migrations (
                version TEXT PRIMARY KEY,
                applied_at TEXT NOT NULL
@@ -1085,7 +1196,8 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
              CREATE TABLE IF NOT EXISTS secret_records (
                name TEXT PRIMARY KEY,
                scope TEXT NOT NULL,
-               purpose TEXT NOT NULL
+               purpose TEXT NOT NULL,
+               project_id TEXT NOT NULL DEFAULT ''
              );
              CREATE TABLE IF NOT EXISTS mcp_session_tools (
                session_id TEXT NOT NULL,
@@ -1120,6 +1232,7 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
              );
              CREATE TABLE IF NOT EXISTS coord_tasks (
                id TEXT PRIMARY KEY,
+               project_id TEXT NOT NULL DEFAULT '',
                title TEXT NOT NULL,
                phase TEXT NOT NULL,
                assignee TEXT,
@@ -1129,12 +1242,648 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                verified_pr_url TEXT,
                branch TEXT,
                pr TEXT
+             );
+             CREATE TABLE IF NOT EXISTS coord_messages (
+               project_id TEXT NOT NULL,
+               task_id TEXT NOT NULL,
+               msg_id TEXT PRIMARY KEY,
+               from_role TEXT NOT NULL,
+               to_role TEXT NOT NULL,
+               kind TEXT NOT NULL,
+               reply_to TEXT,
+               payload TEXT NOT NULL,
+               created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS project_workflow_state (
+               project_id TEXT PRIMARY KEY,
+               stage_index INTEGER NOT NULL DEFAULT 0,
+               status TEXT NOT NULL DEFAULT 'open',
+               updated_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS coord_task_dependencies (
+               task_id TEXT NOT NULL,
+               depends_on TEXT NOT NULL,
+               PRIMARY KEY(task_id,depends_on)
+             );
+             CREATE TABLE IF NOT EXISTS coordination_ingest_cursor (
+               session_id TEXT PRIMARY KEY,
+               sequence INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS skill_usage (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               session_id TEXT NOT NULL,
+               project_id TEXT,
+               skill_name TEXT NOT NULL,
+               skill_path TEXT NOT NULL,
+               source TEXT NOT NULL,
+               used_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS environment_repositories (
+               scope TEXT NOT NULL,
+               position INTEGER NOT NULL,
+               repository TEXT NOT NULL,
+               setup_command TEXT NOT NULL DEFAULT '',
+               PRIMARY KEY(scope,position)
              );",
         )
         .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS skill_usage_session_skill
+             ON skill_usage(session_id,skill_path)",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    migrate_secret_records(&mut connection)?;
     migrate_mcp_session_tools(&connection)?;
     migrate_config_objects(&mut connection)?;
+    migrate_config_scope_model(&connection)?;
+    seed_builtin_templates(&connection)?;
+    migrate_coordination(&connection)?;
     Ok(connection)
+}
+
+fn migrate_config_scope_model(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS project_config_selection (
+               project_id TEXT NOT NULL,
+               object_id TEXT NOT NULL,
+               enabled INTEGER NOT NULL,
+               PRIMARY KEY(project_id,object_id)
+             );",
+        )
+        .map_err(|error| error.to_string())?;
+    let migrated: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM desktop_schema_migrations
+               WHERE version='p1-2-config-scope-model'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if migrated {
+        return Ok(());
+    }
+    let tx = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    tx.execute(
+        "UPDATE config_object
+         SET scope_kind='global'
+         WHERE scope_kind='template'",
+        [],
+    )
+    .map_err(|error| error.to_string())?;
+    let mut projects = tx
+        .prepare(
+            "SELECT p.id,p.status,p.current_version_id,pv.content,pv.metadata_json
+             FROM config_object p
+             JOIN config_object_version pv ON pv.id=p.current_version_id
+             WHERE p.scope_kind='project'",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = projects
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(projects);
+    for (project_object_id, status, _version_id, content, metadata_json) in rows {
+        let metadata = serde_json::from_str::<Value>(&metadata_json).unwrap_or_else(|_| json!({}));
+        let Some(source_id) = metadata.get("source_template_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let project_id: Option<String> = tx
+            .query_row(
+                "SELECT scope_key FROM config_object WHERE id=?1",
+                [&project_object_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let Some(project_id) = project_id else {
+            continue;
+        };
+        if status == "deleted" {
+            tx.execute(
+                "INSERT OR REPLACE INTO project_config_selection(project_id,object_id,enabled)
+                 VALUES (?1,?2,0)",
+                params![project_id, source_id],
+            )
+            .map_err(|error| error.to_string())?;
+            continue;
+        }
+        let source_content: Option<String> = tx
+            .query_row(
+                "SELECT v.content FROM config_object o
+                 JOIN config_object_version v ON v.id=o.current_version_id
+                 WHERE o.id=?1 AND o.scope_kind='global' AND o.status <> 'deleted'",
+                [source_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if source_content.as_deref() == Some(content.as_str()) {
+            tx.execute(
+                "UPDATE config_object SET status='deleted' WHERE id=?1",
+                [&project_object_id],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
+    tx.execute(
+        "INSERT INTO desktop_schema_migrations(version,applied_at)
+         VALUES ('p1-2-config-scope-model',?1)",
+        [Utc::now().to_rfc3339()],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())
+}
+
+fn default_devin_settings() -> Value {
+    json!({
+        "computer_use": true,
+        "default_agent": "Fusion",
+        "api_default_agent": "Fusion",
+        "default_platform": "Ubuntu",
+        "batch_limit": 50,
+        "message_usage_limit": 0,
+        "share_prompts_in_prs": true,
+        "require_devin_mention": false,
+        "auto_add_reviewer": false,
+        "reviewer": "",
+        "open_prs_as": "ready",
+        "responding_to_bots": "ignore"
+    })
+}
+
+fn seed_builtin_templates(connection: &Connection) -> Result<(), String> {
+    let agents = [
+        (
+            "template-agent-lead",
+            "Lead",
+            "负责计划、拆解任务、协调成员和验收交付。",
+            json!({"role":"Lead","model":"auto","harness":"builtin","mode":"Interactive","system_prompt":"你是项目 Lead。负责理解目标、拆解任务、协调 Worker，并在验收前检查交付质量。"}),
+        ),
+        (
+            "template-agent-code",
+            "Code",
+            "负责实现功能、维护代码和提交可审查变更。",
+            json!({"role":"Code","model":"auto","harness":"builtin","mode":"Interactive","system_prompt":"你是 Code Worker。负责以最小、可验证的改动实现任务，并报告测试证据。"}),
+        ),
+        (
+            "template-agent-review",
+            "Review",
+            "负责审查实现、发现回归和提出可执行修正。",
+            json!({"role":"Review","model":"auto","harness":"builtin","mode":"Interactive","system_prompt":"你是 Review Worker。重点检查正确性、安全性、边界条件和测试覆盖，不要只给泛泛建议。"}),
+        ),
+        (
+            "template-agent-test",
+            "Test",
+            "负责设计和运行测试，确认行为符合验收标准。",
+            json!({"role":"Test","model":"auto","harness":"builtin","mode":"Interactive","system_prompt":"你是 Test Worker。负责补充有意义的测试，运行完整验证并准确报告失败原因。"}),
+        ),
+        (
+            "template-agent-devops",
+            "DevOps",
+            "负责构建、环境、发布和持续集成相关工作。",
+            json!({"role":"DevOps","model":"auto","harness":"builtin","mode":"Interactive","system_prompt":"你是 DevOps Worker。负责构建、环境和发布链路，优先保证可重复和可回滚。"}),
+        ),
+    ];
+    for (id, name, description, content) in agents {
+        seed_builtin_template(
+            connection,
+            id,
+            "agent-template",
+            name,
+            description,
+            &content,
+        )?;
+    }
+    let teams = [
+        (
+            "template-team-core",
+            "Lead + Code + Review",
+            "适合常规功能开发，包含计划、实现、审查和验收。",
+            json!({
+                "workflow":{"workflow":[
+                    {"stage":"plan","roles":["Lead"],"gate":"none"},
+                    {"stage":"code","roles":["Code"],"gate":"build+test"},
+                    {"stage":"review","roles":["Review"],"gate":"accept"}
+                ],"serial":true},
+                "agents":[
+                    {"template_id":"template-agent-lead","name":"Lead","role":"Lead"},
+                    {"template_id":"template-agent-code","name":"Code","role":"Code"},
+                    {"template_id":"template-agent-review","name":"Review","role":"Review"}
+                ],
+                "config_template_ids":[]
+            }),
+        ),
+        (
+            "template-team-full",
+            "Lead + Code + Review + Test + DevOps",
+            "完整交付团队，覆盖实现、审查、测试、构建和发布。",
+            json!({
+                "workflow":{"workflow":[
+                    {"stage":"plan","roles":["Lead"],"gate":"none"},
+                    {"stage":"code","roles":["Code"],"gate":"build+test"},
+                    {"stage":"review","roles":["Review"],"gate":"pass"},
+                    {"stage":"test","roles":["Test"],"gate":"build+test"},
+                    {"stage":"release","roles":["DevOps"],"gate":"accept"}
+                ],"serial":true},
+                "agents":[
+                    {"template_id":"template-agent-lead","name":"Lead","role":"Lead"},
+                    {"template_id":"template-agent-code","name":"Code","role":"Code"},
+                    {"template_id":"template-agent-review","name":"Review","role":"Review"},
+                    {"template_id":"template-agent-test","name":"Test","role":"Test"},
+                    {"template_id":"template-agent-devops","name":"DevOps","role":"DevOps"}
+                ],
+                "config_template_ids":[]
+            }),
+        ),
+    ];
+    for (id, name, description, content) in teams {
+        seed_builtin_template(connection, id, "team-template", name, description, &content)?;
+    }
+    seed_builtin_template(
+        connection,
+        "template-blueprint-standard",
+        "blueprint",
+        "标准 Rust/TypeScript Blueprint",
+        "拉取依赖后构建，并在推送前跑格式化、静态检查和测试。",
+        &json!(
+            "dependencies:\n  - cargo fetch\n  - (cd web && npm install)\nbuild:\n  - cargo build\n  - (cd web && npm run build)\npre-push:\n  - cargo fmt --check\n  - cargo clippy --workspace --all-targets -- -D warnings\n  - cargo test\n  - (cd web && npx tsc --noEmit)\n"
+        ),
+    )?;
+    Ok(())
+}
+
+fn seed_builtin_template(
+    connection: &Connection,
+    id: &str,
+    kind: &str,
+    name: &str,
+    description: &str,
+    content: &Value,
+) -> Result<(), String> {
+    let now = Utc::now().to_rfc3339();
+    let metadata = serde_json::to_string(&json!({"description":description}))
+        .map_err(|error| error.to_string())?;
+    let body = content
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or(serde_json::to_string(content).map_err(|error| error.to_string())?);
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO config_object
+             (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
+             VALUES (?1,?2,?3,?4,'global',NULL,'builtin',?5,?6)",
+            params![
+                id,
+                kind,
+                name,
+                stable_server_key(id),
+                now,
+                format!("{id}:v1")
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO config_object_version
+             (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+             VALUES (?1,?2,1,?3,?4,?5,'builtin seed',?6)",
+            params![
+                format!("{id}:v1"),
+                id,
+                body,
+                content_hash(&body),
+                now,
+                metadata
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn merge_settings(base: &mut Value, override_value: &Value) {
+    if let (Some(base), Some(overrides)) = (base.as_object_mut(), override_value.as_object()) {
+        for (key, value) in overrides {
+            base.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+fn load_devin_settings(connection: &Connection, project_id: Option<&str>) -> Result<Value, String> {
+    let mut result = default_devin_settings();
+    let global = connection
+        .query_row(
+            "SELECT value FROM devin_settings WHERE scope='global'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|value| serde_json::from_str::<Value>(&value).ok());
+    if let Some(global) = global.as_ref() {
+        merge_settings(&mut result, global);
+    }
+    if let Some(project_id) = project_id {
+        let scope = format!("project:{project_id}");
+        let project = connection
+            .query_row(
+                "SELECT value FROM devin_settings WHERE scope=?1",
+                [&scope],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|value| serde_json::from_str::<Value>(&value).ok());
+        if let Some(project) = project.as_ref() {
+            merge_settings(&mut result, project);
+        }
+    }
+    Ok(result)
+}
+
+fn save_session_via_factory(
+    state: &DesktopState,
+    mut session: SessionRecord,
+    automated: bool,
+) -> Result<(), String> {
+    let settings = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        load_devin_settings(&connection, session.project_id.as_deref())?
+    };
+    let agent = default_agent_for_creation(&settings, automated);
+    session.origin_label = Some(agent);
+    state
+        .store
+        .save_session(&session)
+        .map_err(|error| error.to_string())
+}
+
+fn default_agent_for_creation(settings: &Value, automated: bool) -> String {
+    let setting_name = if automated {
+        "api_default_agent"
+    } else {
+        "default_agent"
+    };
+    settings
+        .get(setting_name)
+        .and_then(Value::as_str)
+        .unwrap_or("Fusion")
+        .to_owned()
+}
+
+fn project_session_target(
+    project: &ProjectRecord,
+    agent: &ProjectAgentRecord,
+) -> Result<(String, String), String> {
+    if agent.project_id != project.id {
+        return Err("project member does not belong to project".to_owned());
+    }
+    if agent.session_id.is_some() {
+        return Err("project member already has a session".to_owned());
+    }
+    Ok((project.host_id.clone(), agent.worktree_path.clone()))
+}
+
+fn validate_git_repository_result(
+    exit_code: i32,
+    stdout: &str,
+    repo_root: &str,
+) -> Result<(), String> {
+    if exit_code != 0 || stdout.trim() != "true" {
+        return Err(format!(
+            "repository path is not a git repository: {repo_root}"
+        ));
+    }
+    Ok(())
+}
+
+fn computer_use_enabled(state: &DesktopState, project_id: Option<&str>) -> Result<bool, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    Ok(load_devin_settings(&connection, project_id)?
+        .get("computer_use")
+        .and_then(Value::as_bool)
+        .unwrap_or(true))
+}
+
+fn builtin_slash_commands() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "/implement",
+            "请把当前任务落实为可运行的实现：先检查相关代码和约束，再做最小完整修改，并运行针对性测试。",
+        ),
+        (
+            "/plan",
+            "请先分析目标、现状、依赖和风险，给出分步骤执行计划；未经确认不要修改文件。",
+        ),
+        (
+            "/review",
+            "请以严格代码审查方式检查当前变更，优先找功能缺陷、回归、边界条件和安全问题，并给出证据。",
+        ),
+        (
+            "/test",
+            "请围绕当前任务补充或运行有意义的测试，覆盖成功、失败和边界行为，不要只验证数据存取。",
+        ),
+        (
+            "/think-hard",
+            "请深入推演问题的隐含约束、替代方案和失败模式，再提出经过验证的实现路径。",
+        ),
+        (
+            "/deploy",
+            "请检查发布前置条件、构建产物和部署步骤；只执行仓库允许且明确授权的部署动作。",
+        ),
+        (
+            "/pull-project",
+            "请同步当前项目的仓库状态，核对分支和未提交改动，再继续处理项目任务。",
+        ),
+    ]
+}
+
+fn effective_slash_commands(
+    connection: &Connection,
+    project_id: Option<&str>,
+) -> Result<Vec<Value>, String> {
+    let mut commands = builtin_slash_commands()
+        .into_iter()
+        .map(|(name, body)| {
+            (
+                name.to_owned(),
+                json!({
+                    "name": name,
+                    "kind": "system",
+                    "body": body,
+                    "scope": "global",
+                    "default_body": body
+                }),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut scopes = vec!["global".to_owned()];
+    if let Some(project_id) = project_id {
+        scopes.push(format!("project:{project_id}"));
+    }
+    for scope in scopes {
+        let mut statement = connection
+            .prepare("SELECT name,kind,body FROM slash_commands WHERE scope=?1")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([scope.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            let (name, kind, body) = row.map_err(|error| error.to_string())?;
+            let default_body = builtin_slash_commands()
+                .into_iter()
+                .find(|(builtin, _)| *builtin == name)
+                .map(|(_, body)| body);
+            commands.insert(
+                name.clone(),
+                json!({
+                    "name": name,
+                    "kind": kind,
+                    "body": body,
+                    "scope": scope,
+                    "default_body": default_body
+                }),
+            );
+        }
+    }
+    let mut result = commands.into_values().collect::<Vec<_>>();
+    result.sort_by(|a, b| {
+        a.get("name")
+            .and_then(Value::as_str)
+            .cmp(&b.get("name").and_then(Value::as_str))
+    });
+    Ok(result)
+}
+
+fn expand_slash_command(
+    connection: &Connection,
+    project_id: Option<&str>,
+    text: &str,
+) -> Result<String, String> {
+    let trimmed = text.trim_start();
+    let Some(command_name) = trimmed.split_whitespace().next() else {
+        return Ok(text.to_owned());
+    };
+    if !command_name.starts_with('/') {
+        return Ok(text.to_owned());
+    }
+    let Some(command) = effective_slash_commands(connection, project_id)?
+        .into_iter()
+        .find(|command| command.get("name").and_then(Value::as_str) == Some(command_name))
+    else {
+        return Ok(text.to_owned());
+    };
+    let body = command
+        .get("body")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "slash command body is invalid".to_owned())?;
+    let remainder = trimmed[command_name.len()..].trim();
+    if remainder.is_empty() {
+        Ok(body.to_owned())
+    } else {
+        Ok(format!("{body}\n\n{remainder}"))
+    }
+}
+
+fn migrate_coordination(connection: &Connection) -> Result<(), String> {
+    let columns = connection
+        .prepare("PRAGMA table_info(coord_tasks)")
+        .map_err(|error| error.to_string())?
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    if !columns.iter().any(|column| column == "project_id") {
+        connection
+            .execute(
+                "ALTER TABLE coord_tasks ADD COLUMN project_id TEXT NOT NULL DEFAULT ''",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS coord_messages (
+               project_id TEXT NOT NULL,
+               task_id TEXT NOT NULL,
+               msg_id TEXT PRIMARY KEY,
+               from_role TEXT NOT NULL,
+               to_role TEXT NOT NULL,
+               kind TEXT NOT NULL,
+               reply_to TEXT,
+               payload TEXT NOT NULL,
+               created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS coord_task_dependencies (
+               task_id TEXT NOT NULL,
+               depends_on TEXT NOT NULL,
+               PRIMARY KEY(task_id,depends_on)
+             );
+             CREATE TABLE IF NOT EXISTS coordination_ingest_cursor (
+               session_id TEXT PRIMARY KEY,
+               sequence INTEGER NOT NULL DEFAULT 0
+             );",
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn migrate_secret_records(connection: &mut Connection) -> Result<(), String> {
+    let has_project_id = connection
+        .prepare("PRAGMA table_info(secret_records)")
+        .map_err(|error| error.to_string())?
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?
+        .iter()
+        .any(|name| name == "project_id");
+    if has_project_id {
+        return Ok(());
+    }
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute_batch(
+            "CREATE TABLE secret_records_v2 (
+               name TEXT NOT NULL,
+               scope TEXT NOT NULL,
+               purpose TEXT NOT NULL,
+               project_id TEXT NOT NULL DEFAULT '',
+               PRIMARY KEY(name, project_id)
+             );
+             INSERT INTO secret_records_v2(name,scope,purpose,project_id)
+               SELECT name,scope,purpose,'' FROM secret_records;
+             DROP TABLE secret_records;
+             ALTER TABLE secret_records_v2 RENAME TO secret_records;",
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 fn migrate_mcp_session_tools(connection: &Connection) -> Result<(), String> {
@@ -1534,6 +2283,1233 @@ fn session_for(state: &DesktopState, session_id: &str) -> Result<SessionRecord, 
         .ok_or_else(|| "session not found".to_owned())
 }
 
+async fn project_host(
+    state: &State<'_, DesktopState>,
+    project: &ProjectRecord,
+) -> Result<Arc<dyn Host>, String> {
+    if project.host_id == "local" {
+        let root = dirs::home_dir().ok_or_else(|| "home directory is unavailable".to_owned())?;
+        return Ok(Arc::new(
+            LocalHost::new(root).map_err(|error| format!("project host unavailable: {error}"))?,
+        ));
+    }
+    let client = client_for(state, &project.host_id)?;
+    let health = client
+        .health()
+        .await
+        .map_err(|error| format!("remote host unavailable: {error}"))?;
+    let workspace = health
+        .workspace
+        .ok_or_else(|| "remote host did not provide a workspace".to_owned())?;
+    Ok(Arc::new(RvmHost::new(
+        project.host_id.clone(),
+        workspace.clone(),
+        client.with_workspace(workspace),
+    )))
+}
+
+fn quote_for(platform: Option<&str>, value: &str) -> String {
+    if platform.is_some_and(|value| value.eq_ignore_ascii_case("windows")) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn project_host_contains(host: &Arc<dyn Host>, candidate: &str) -> bool {
+    if host.id() == "local" {
+        return dirs::home_dir()
+            .and_then(|root| std::fs::canonicalize(root).ok())
+            .is_some_and(|root| FsPath::new(candidate).starts_with(root));
+    }
+    host.contains(candidate)
+}
+
+fn git_worktree_add_command(
+    platform: Option<&str>,
+    repo_root: &str,
+    worktree_path: &str,
+    branch: &str,
+    existing_branch: bool,
+) -> String {
+    let quote = |value: &str| quote_for(platform, value);
+    if existing_branch {
+        format!(
+            "git -C {} worktree add {} {}",
+            quote(repo_root),
+            quote(worktree_path),
+            quote(branch)
+        )
+    } else {
+        format!(
+            "git -C {} worktree add {} -b {}",
+            quote(repo_root),
+            quote(worktree_path),
+            quote(branch)
+        )
+    }
+}
+
+fn filter_managed_worktree_status(status: &str) -> String {
+    status
+        .lines()
+        .filter(|line| {
+            let path = line.get(3..).unwrap_or("").trim().replace('\\', "/");
+            let path = path
+                .split(" -> ")
+                .last()
+                .unwrap_or(path.as_str())
+                .trim_matches('"');
+            !(path == "worktrees" || path.starts_with("worktrees/"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn remove_empty_worktree_container(
+    host: &Arc<dyn Host>,
+    project: &ProjectRecord,
+    platform: Option<&str>,
+) -> Option<String> {
+    let container = format!(
+        "{}/worktrees",
+        project.repo_root.trim_end_matches(['/', '\\'])
+    );
+    let command = if platform.is_some_and(|value| value.eq_ignore_ascii_case("windows")) {
+        format!("rmdir {}", quote_for(platform, &container))
+    } else {
+        format!("rmdir -- {}", quote_for(platform, &container))
+    };
+    let result = host
+        .exec(ExecRequest {
+            command,
+            cwd: None,
+            timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+            session: None,
+            env: None,
+        })
+        .await
+        .ok()?;
+    if result.result.exit_code != 0 {
+        let stderr = result.result.stderr.trim();
+        if !stderr.is_empty() && !stderr.contains("No such file") {
+            return Some(format!(
+                "managed worktree directory could not be removed: {stderr}"
+            ));
+        }
+    }
+    None
+}
+
+async fn remove_project_agent_worktree(
+    host: &Arc<dyn Host>,
+    project: &ProjectRecord,
+    agent: &ProjectAgentRecord,
+    force: bool,
+    platform: Option<&str>,
+) -> Result<Vec<String>, String> {
+    if agent.sort_order == 0 {
+        let result = host
+            .exec(ExecRequest {
+                command: format!(
+                    "git -C {} status --porcelain",
+                    quote_for(platform, &project.repo_root)
+                ),
+                cwd: None,
+                timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+                session: None,
+                env: None,
+            })
+            .await
+            .map_err(|error| format!("worktree status check failed: {error}"))?;
+        if result.result.exit_code != 0 {
+            return Err(format!(
+                "worktree status check failed: {}",
+                result.result.stderr
+            ));
+        }
+        let user_changes = filter_managed_worktree_status(&result.result.stdout);
+        if !force && !user_changes.trim().is_empty() {
+            return Err("worktree has uncommitted changes; use force to remove it".to_owned());
+        }
+        return Ok(vec![]);
+    }
+    let quote = |value: &str| quote_for(platform, value);
+    let command = if force {
+        format!(
+            "git -C {} worktree remove --force {}",
+            quote(&project.repo_root),
+            quote(&agent.worktree_path)
+        )
+    } else {
+        format!(
+            "git -C {} worktree remove {}",
+            quote(&project.repo_root),
+            quote(&agent.worktree_path)
+        )
+    };
+    let result = host
+        .exec(ExecRequest {
+            command,
+            cwd: None,
+            timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+            session: None,
+            env: None,
+        })
+        .await
+        .map_err(|error| format!("worktree removal failed: {error}"))?;
+    if result.result.exit_code != 0 {
+        return Err(if force {
+            format!("worktree removal failed: {}", result.result.stderr)
+        } else {
+            format!(
+                "worktree has uncommitted changes or could not be removed: {}",
+                result.result.stderr
+            )
+        });
+    }
+    let branch_result = match host
+        .exec(ExecRequest {
+            command: format!(
+                "git -C {} branch -D {}",
+                quote(&project.repo_root),
+                quote(&agent.branch)
+            ),
+            cwd: None,
+            timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+            session: None,
+            env: None,
+        })
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return Ok(vec![format!(
+                "worktree removed but branch '{}' cleanup failed: {error}",
+                agent.branch
+            )]);
+        }
+    };
+    if branch_result.result.exit_code != 0 {
+        return Ok(vec![format!(
+            "worktree removed but branch '{}' could not be deleted: {}",
+            agent.branch,
+            branch_result.result.stderr.trim()
+        )]);
+    }
+    Ok(vec![])
+}
+
+fn project_root(project_id: &str) -> Result<String, String> {
+    let home = dirs::home_dir().ok_or_else(|| "home directory is unavailable".to_owned())?;
+    home.join("OPCOS")
+        .join("projects")
+        .join(project_id)
+        .join("repo")
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "project path is not valid UTF-8".to_owned())
+}
+
+fn worktree_branch(role: &str, sequence: u32) -> String {
+    let role = role.trim().to_ascii_lowercase().replace(' ', "-");
+    format!("agent/{role}-{sequence}")
+}
+
+#[tauri::command]
+async fn list_projects(state: State<'_, DesktopState>) -> Result<Vec<ProjectView>, String> {
+    let projects = state
+        .store
+        .load_projects()
+        .map_err(|error| error.to_string())?;
+    let host_names = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        projects
+            .iter()
+            .map(|project| {
+                host_name(&connection, &project.host_id)?
+                    .ok_or_else(|| "project host not found".to_owned())
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    };
+    let mut views = Vec::with_capacity(projects.len());
+    for (project, host_name) in projects.into_iter().zip(host_names) {
+        let agents = state
+            .store
+            .load_project_agents(&project.id)
+            .map_err(|error| error.to_string())?;
+        let online = tokio::time::timeout(Duration::from_secs(2), project_host(&state, &project))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .is_some();
+        views.push(ProjectView {
+            project,
+            agents,
+            host_name,
+            online: Some(online),
+        });
+    }
+    Ok(views)
+}
+
+fn load_template_content(
+    state: &DesktopState,
+    template_id: &str,
+) -> Result<(String, String, String), String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    connection
+        .query_row(
+            "SELECT o.kind,o.name,v.content FROM config_object o
+             JOIN config_object_version v ON v.id=o.current_version_id
+             WHERE o.id=?1 AND o.scope_kind='global' AND o.status <> 'deleted'",
+            [template_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| format!("template not found: {error}"))
+}
+
+fn copy_config_templates_to_project(
+    state: &DesktopState,
+    project_id: &str,
+    template_ids: &[String],
+) -> Result<(), String> {
+    if template_ids.is_empty() {
+        return Ok(());
+    }
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    copy_config_templates(&connection, project_id, template_ids)
+}
+
+fn copy_config_templates(
+    connection: &Connection,
+    project_id: &str,
+    template_ids: &[String],
+) -> Result<(), String> {
+    if template_ids.is_empty() {
+        return Ok(());
+    }
+    let tx = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS project_config_selection (
+           project_id TEXT NOT NULL,
+           object_id TEXT NOT NULL,
+           enabled INTEGER NOT NULL,
+           PRIMARY KEY(project_id,object_id)
+         );",
+    )
+    .map_err(|error| error.to_string())?;
+    for template_id in template_ids {
+        tx.query_row(
+            "SELECT id FROM config_object
+                 WHERE id=?1 AND scope_kind='global'
+                   AND status <> 'deleted'
+                   AND kind NOT IN ('agent-template','team-template')",
+            [template_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| format!("configuration template not found: {error}"))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO project_config_selection(project_id,object_id,enabled)
+             VALUES (?1,?2,1)",
+            params![project_id, template_id],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    tx.commit().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn list_project_configuration_templates(
+    state: State<'_, DesktopState>,
+    project_id: String,
+) -> Result<Vec<Value>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let mut statement = connection
+        .prepare(
+            "SELECT t.id,t.kind,t.name,t.status,t.scope_key,tv.content,tv.content_hash,
+                    p.id,p.status,pv.content,pv.content_hash,pv.metadata_json,
+                    COALESCE(selection.enabled,1)
+             FROM config_object t
+             JOIN config_object_version tv ON tv.id=t.current_version_id
+             LEFT JOIN config_object p
+               ON p.kind=t.kind AND p.name=t.name
+              AND p.scope_kind='project' AND p.scope_key=?1
+             LEFT JOIN config_object_version pv ON pv.id=p.current_version_id
+             LEFT JOIN project_config_selection selection
+               ON selection.project_id=?1 AND selection.object_id=t.id
+             WHERE t.scope_kind='global' AND t.status <> 'deleted'
+               AND t.kind NOT IN ('agent-template','team-template')
+             ORDER BY t.name",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([&project_id], |row| {
+            let project_status: Option<String> = row.get(8)?;
+            let global_hash: String = row.get(6)?;
+            let project_hash: Option<String> = row.get(10)?;
+            Ok(json!({
+                "template_id": row.get::<_, String>(0)?,
+                "kind": row.get::<_, String>(1)?,
+                "name": row.get::<_, String>(2)?,
+                "status": row.get::<_, String>(3)?,
+                "source": if row.get::<_, String>(3)? == "builtin" {
+                    "内置"
+                } else if row
+                    .get::<_, Option<String>>(4)?
+                    .is_some_and(|scope| scope.starts_with("repo:"))
+                {
+                    "仓库"
+                } else {
+                    "自定义"
+                },
+                "content": row.get::<_, String>(5)?,
+                "applied": row.get::<_, bool>(12)?,
+                "overridden": project_status.as_deref() == Some("active"),
+                "modified": project_status.as_deref() == Some("active")
+                    && project_hash.as_deref() != Some(global_hash.as_str()),
+                "project_object_id": row.get::<_, Option<String>>(7)?,
+            }))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut result = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut additions = connection
+        .prepare(
+            "SELECT p.id,p.kind,p.name,p.status,pv.content
+             FROM config_object p
+             JOIN config_object_version pv ON pv.id=p.current_version_id
+             WHERE p.scope_kind='project' AND p.scope_key=?1 AND p.status='active'
+               AND NOT EXISTS (
+                 SELECT 1 FROM config_object g
+                 WHERE g.scope_kind='global' AND g.status <> 'deleted'
+                   AND g.kind=p.kind AND g.name=p.name
+               )",
+        )
+        .map_err(|error| error.to_string())?;
+    let additions = additions
+        .query_map([project_id], |row| {
+            Ok(json!({
+                "template_id": row.get::<_, String>(0)?,
+                "kind": row.get::<_, String>(1)?,
+                "name": row.get::<_, String>(2)?,
+                "status": row.get::<_, String>(3)?,
+                "source": "项目",
+                "content": row.get::<_, String>(4)?,
+                "applied": true,
+                "overridden": true,
+                "modified": true,
+                "project_object_id": row.get::<_, String>(0)?,
+            }))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    result.extend(additions);
+    Ok(result)
+}
+
+#[tauri::command]
+fn set_project_configuration_template(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    template_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    if enabled {
+        return copy_config_templates_to_project(&state, &project_id, &[template_id]);
+    }
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO project_config_selection(project_id,object_id,enabled)
+             VALUES (?1,?2,0)",
+            params![project_id, template_id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn restore_project_configuration(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    template_id: String,
+) -> Result<(), String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    connection
+        .execute(
+            "UPDATE config_object SET status='deleted'
+             WHERE scope_kind='project' AND scope_key=?1
+               AND kind=(SELECT kind FROM config_object WHERE id=?2)
+               AND name=(SELECT name FROM config_object WHERE id=?2)",
+            params![project_id, template_id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn override_project_configuration(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    template_id: String,
+) -> Result<(), String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let (kind, name, content, metadata): (String, String, String, String) = connection
+        .query_row(
+            "SELECT o.kind,o.name,v.content,v.metadata_json
+             FROM config_object o
+             JOIN config_object_version v ON v.id=o.current_version_id
+             WHERE o.id=?1 AND o.scope_kind='global' AND o.status <> 'deleted'",
+            [&template_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(|error| format!("global preset not found: {error}"))?;
+    let object_id = format!("project-config-{project_id}-{template_id}");
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    let version: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(version),0)+1 FROM config_object_version WHERE object_id=?1",
+            [&object_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let version_id = format!("{object_id}:v{version}");
+    transaction
+        .execute(
+            "INSERT INTO config_object
+             (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
+             VALUES (?1,?2,?3,?4,'project',?5,'active',?6,?7)
+             ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,name=excluded.name,
+               status='active',current_version_id=excluded.current_version_id",
+            params![
+                object_id,
+                kind,
+                name,
+                stable_server_key(&object_id),
+                project_id,
+                Utc::now().to_rfc3339(),
+                version_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "INSERT INTO config_object_version
+             (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+             VALUES (?1,?2,?3,?4,?5,?6,'project override',?7)",
+            params![
+                version_id,
+                object_id,
+                version,
+                content,
+                content_hash(&content),
+                Utc::now().to_rfc3339(),
+                serde_json::to_string(&json!({
+                    "source_global_id": template_id,
+                    "source_metadata": serde_json::from_str::<Value>(&metadata)
+                        .unwrap_or_else(|_| json!({}))
+                }))
+                .map_err(|error| error.to_string())?
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "INSERT OR REPLACE INTO project_config_selection(project_id,object_id,enabled)
+             SELECT ?1,id,1 FROM config_object
+             WHERE id=?2 AND scope_kind='global'",
+            params![project_id, template_id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamTemplateAgent {
+    template_id: Option<String>,
+    name: Option<String>,
+    role: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    harness: Option<String>,
+    mode: Option<String>,
+    system_prompt: Option<String>,
+    branch: Option<String>,
+}
+
+fn validate_team_template_members(members: &[TeamTemplateAgent]) -> Result<(), String> {
+    if members.is_empty()
+        || members.first().and_then(|member| member.role.as_deref()) != Some("Lead")
+    {
+        return Err("team template must define Lead as its first member".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn create_project(
+    state: State<'_, DesktopState>,
+    name: String,
+    host_id: String,
+    repo_url: Option<String>,
+    repo_root: Option<String>,
+    default_branch: Option<String>,
+) -> Result<ProjectView, String> {
+    let id = format!(
+        "project-{}",
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let repo_root = if let Some(repo_root) = repo_root.filter(|value| !value.trim().is_empty()) {
+        repo_root
+    } else if host_id == "local" {
+        project_root(&id)?
+    } else {
+        let client = client_for(&state, &host_id)?;
+        let health = client
+            .health()
+            .await
+            .map_err(|error| format!("remote host unavailable: {error}"))?;
+        let workspace = health
+            .workspace
+            .ok_or_else(|| "remote host did not provide a workspace".to_owned())?;
+        format!("{workspace}/OPCOS/projects/{id}/repo")
+    };
+    let project = ProjectRecord {
+        id: id.clone(),
+        name,
+        host_id,
+        repo_url: repo_url.unwrap_or_default(),
+        repo_root,
+        default_branch: default_branch.unwrap_or_else(|| "main".into()),
+        workflow_json: "{}".into(),
+        board_id: format!("board-{id}"),
+        archived: false,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let host = project_host(&state, &project).await?;
+    if !project_host_contains(&host, &project.repo_root) {
+        return Err("project repository path is outside the bound host workspace".to_owned());
+    }
+    let platform = host.health().await.ok().and_then(|health| health.platform);
+    if !project.repo_url.is_empty() {
+        let result = host
+            .exec(ExecRequest {
+                command: format!(
+                    "git clone {} {}",
+                    quote_for(platform.as_deref(), &project.repo_url),
+                    quote_for(platform.as_deref(), &project.repo_root)
+                ),
+                cwd: None,
+                timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+                session: None,
+                env: None,
+            })
+            .await
+            .map_err(|error| format!("repository clone failed: {error}"))?;
+        if result.result.exit_code != 0 {
+            return Err(format!("repository clone failed: {}", result.result.stderr));
+        }
+    } else if host.ls(Some(&project.repo_root)).await.is_err() {
+        return Err("repository path does not exist on the project host".to_owned());
+    }
+    let git_check = host
+        .exec(ExecRequest {
+            command: format!(
+                "git -C {} rev-parse --is-inside-work-tree",
+                quote_for(platform.as_deref(), &project.repo_root)
+            ),
+            cwd: None,
+            timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+            session: None,
+            env: None,
+        })
+        .await
+        .map_err(|error| format!("repository validation failed: {error}"))?;
+    validate_git_repository_result(
+        git_check.result.exit_code,
+        &git_check.result.stdout,
+        &project.repo_root,
+    )?;
+    state
+        .store
+        .save_project(&project)
+        .map_err(|error| error.to_string())?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    Ok(ProjectView {
+        host_name: host_name(&connection, &project.host_id)?
+            .unwrap_or_else(|| project.host_id.clone()),
+        agents: vec![],
+        online: Some(true),
+        project,
+    })
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn create_project_from_team_template(
+    state: State<'_, DesktopState>,
+    team_template_id: String,
+    name: String,
+    host_id: String,
+    repo_url: Option<String>,
+    repo_root: Option<String>,
+    default_branch: Option<String>,
+    config_template_ids: Option<Vec<String>>,
+) -> Result<ProjectView, String> {
+    let (kind, _name, content) = load_template_content(&state, &team_template_id)?;
+    if kind != "team-template" {
+        return Err("selected template is not a team template".into());
+    }
+    let team: Value = serde_json::from_str(&content)
+        .map_err(|error| format!("invalid team template: {error}"))?;
+    let members: Vec<TeamTemplateAgent> = serde_json::from_value(
+        team.get("agents")
+            .cloned()
+            .ok_or_else(|| "team template has no members".to_owned())?,
+    )
+    .map_err(|error| format!("invalid team members: {error}"))?;
+    validate_team_template_members(&members)?;
+    let workflow = team
+        .get("workflow")
+        .cloned()
+        .ok_or_else(|| "team template has no workflow".to_owned())?;
+    parse_workflow(&serde_json::to_string(&workflow).map_err(|error| error.to_string())?)?;
+    let project = create_project(
+        state.clone(),
+        name,
+        host_id,
+        repo_url,
+        repo_root,
+        default_branch,
+    )
+    .await?;
+    let project_id = project.project.id.clone();
+    let mut project_record = project.project.clone();
+    project_record.workflow_json =
+        serde_json::to_string(&workflow).map_err(|error| error.to_string())?;
+    if let Err(error) = state.store.save_project(&project_record) {
+        let _ = delete_project(state.clone(), project_id.clone(), Some(true)).await;
+        return Err(error.to_string());
+    }
+    let mut config_ids = team
+        .get("config_template_ids")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    config_ids.extend(config_template_ids.unwrap_or_default());
+    config_ids.sort();
+    config_ids.dedup();
+    if let Err(error) = copy_config_templates_to_project(&state, &project_id, &config_ids) {
+        let _ = delete_project(state.clone(), project_id.clone(), Some(true)).await;
+        return Err(error);
+    }
+    for (sort_order, member) in members.into_iter().enumerate() {
+        let mut values = member;
+        if let Some(template_id) = values.template_id.as_deref() {
+            let (agent_kind, _agent_name, agent_content) =
+                match load_template_content(&state, template_id) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = delete_project(state.clone(), project_id.clone(), Some(true)).await;
+                        return Err(error);
+                    }
+                };
+            if agent_kind != "agent-template" {
+                let _ = delete_project(state.clone(), project_id.clone(), Some(true)).await;
+                return Err(format!("{template_id} is not an agent template"));
+            }
+            let template: TeamTemplateAgent = serde_json::from_str(&agent_content)
+                .map_err(|error| format!("invalid agent template: {error}"))?;
+            values = TeamTemplateAgent {
+                name: values.name.or(template.name),
+                role: values.role.or(template.role),
+                provider: values.provider.or(template.provider),
+                model: values.model.or(template.model),
+                harness: values.harness.or(template.harness),
+                mode: values.mode.or(template.mode),
+                system_prompt: values.system_prompt.or(template.system_prompt),
+                branch: values.branch.or(template.branch),
+                template_id: Some(template_id.to_owned()),
+            };
+        }
+        if let Err(error) = create_project_agent(
+            state.clone(),
+            project_id.clone(),
+            values
+                .name
+                .unwrap_or_else(|| format!("成员 {}", sort_order + 1)),
+            values.role.unwrap_or_default(),
+            Some(sort_order as u32),
+            values.provider,
+            values.model,
+            values.harness,
+            values.mode,
+            values.system_prompt,
+            values.branch,
+        )
+        .await
+        {
+            let _ = delete_project(state.clone(), project_id.clone(), Some(true)).await;
+            return Err(error);
+        }
+    }
+    list_projects(state)
+        .await?
+        .into_iter()
+        .find(|item| item.project.id == project_id)
+        .ok_or_else(|| "created project could not be reloaded".to_owned())
+}
+
+#[tauri::command]
+fn update_project(
+    state: State<'_, DesktopState>,
+    id: String,
+    name: Option<String>,
+    default_branch: Option<String>,
+    archived: Option<bool>,
+) -> Result<ProjectRecord, String> {
+    let mut project = state
+        .store
+        .load_project(&id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    if let Some(name) = name.filter(|value| !value.trim().is_empty()) {
+        project.name = name;
+    }
+    if let Some(branch) = default_branch.filter(|value| !value.trim().is_empty()) {
+        project.default_branch = branch;
+    }
+    if let Some(archived) = archived {
+        project.archived = archived;
+    }
+    project.updated_at = Utc::now();
+    state
+        .store
+        .save_project(&project)
+        .map_err(|error| error.to_string())?;
+    Ok(project)
+}
+
+#[tauri::command]
+async fn delete_project(
+    state: State<'_, DesktopState>,
+    id: String,
+    force: Option<bool>,
+) -> Result<Value, String> {
+    let project = state
+        .store
+        .load_project(&id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    let agents = state
+        .store
+        .load_project_agents(&id)
+        .map_err(|error| error.to_string())?;
+    let host = project_host(&state, &project).await?;
+    let mut warnings = Vec::new();
+    let platform = host.health().await.ok().and_then(|health| health.platform);
+    if !agents.is_empty() {
+        if !project_host_contains(&host, &project.repo_root) {
+            return Err("project repository path is outside the bound host workspace".to_owned());
+        }
+        for agent in &agents {
+            if !project_host_contains(&host, &agent.worktree_path) {
+                return Err("project worktree path is outside the bound host workspace".to_owned());
+            }
+            warnings.extend(
+                remove_project_agent_worktree(
+                    &host,
+                    &project,
+                    agent,
+                    force.unwrap_or(false),
+                    platform.as_deref(),
+                )
+                .await?,
+            );
+        }
+    }
+    if let Some(warning) =
+        remove_empty_worktree_container(&host, &project, platform.as_deref()).await
+    {
+        warnings.push(warning);
+    }
+    state
+        .store
+        .clear_project_session_ownership(&id)
+        .map_err(|error| error.to_string())?;
+    state
+        .coordination
+        .lock()
+        .await
+        .remove(&format!("project-board:{id}"));
+    {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        connection
+            .execute("DELETE FROM coord_messages WHERE project_id=?1", [&id])
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute("DELETE FROM coord_tasks WHERE project_id=?1", [&id])
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute(
+                "DELETE FROM project_workflow_state WHERE project_id=?1",
+                [&id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    for agent in agents {
+        state
+            .store
+            .delete_project_agent(&agent.id)
+            .map_err(|error| error.to_string())?;
+    }
+    clear_project_configuration(&state, &id)?;
+    state
+        .store
+        .delete_project(&id)
+        .map_err(|error| error.to_string())?;
+    Ok(json!({"deleted": true, "warnings": warnings}))
+}
+
+fn clear_project_configuration(state: &DesktopState, project_id: &str) -> Result<(), String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    connection
+        .execute(
+            "DELETE FROM devin_settings WHERE scope=?1",
+            [format!("project:{project_id}")],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "DELETE FROM slash_commands WHERE scope=?1",
+            [format!("project:{project_id}")],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "DELETE FROM environment_repositories WHERE scope=?1",
+            [format!("project:{project_id}")],
+        )
+        .map_err(|error| error.to_string())?;
+    let object_ids = {
+        let mut statement = connection
+            .prepare("SELECT id FROM config_object WHERE scope_kind='project' AND scope_key=?1")
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map([project_id], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+    for object_id in object_ids {
+        connection
+            .execute(
+                "DELETE FROM session_config_versions WHERE object_id=?1",
+                [&object_id],
+            )
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute(
+                "DELETE FROM session_config_bindings WHERE object_id=?1",
+                [&object_id],
+            )
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute(
+                "DELETE FROM config_object_version WHERE object_id=?1",
+                [&object_id],
+            )
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute("DELETE FROM config_object WHERE id=?1", [&object_id])
+            .map_err(|error| error.to_string())?;
+    }
+    let secret_names = {
+        let mut statement = connection
+            .prepare("SELECT name FROM secret_records WHERE project_id=?1")
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map([project_id], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+    clear_project_secret_values(&state.secrets, project_id, &secret_names)?;
+    connection
+        .execute(
+            "DELETE FROM secret_records WHERE project_id=?1",
+            [project_id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn clear_project_secret_values(
+    store: &KeyringSecretStore,
+    project_id: &str,
+    names: &[String],
+) -> Result<(), String> {
+    for name in names {
+        let (prefix, id) = project_secret_descriptor(name);
+        store
+            .delete(&project_secret_key(project_id, prefix, id))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn project_secret_descriptor(name: &str) -> (&str, &str) {
+    name.split_once(':')
+        .filter(|(prefix, _)| {
+            matches!(
+                *prefix,
+                "provider-key" | "mcp-credential" | "connector-token"
+            )
+        })
+        .unwrap_or(("asset-secret", name))
+}
+
+#[tauri::command]
+fn list_project_agents(
+    state: State<'_, DesktopState>,
+    project_id: String,
+) -> Result<Vec<ProjectAgentRecord>, String> {
+    state
+        .store
+        .load_project_agents(&project_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn create_project_agent(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    name: String,
+    role: String,
+    sort_order: Option<u32>,
+    provider: Option<String>,
+    model: Option<String>,
+    harness: Option<String>,
+    mode: Option<String>,
+    system_prompt: Option<String>,
+    branch: Option<String>,
+) -> Result<ProjectAgentRecord, String> {
+    let project = state
+        .store
+        .load_project(&project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    let agents = state
+        .store
+        .load_project_agents(&project_id)
+        .map_err(|error| error.to_string())?;
+    let sort_order = sort_order.unwrap_or(agents.len() as u32);
+    let id = format!(
+        "agent-{}",
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let worktree_path = if sort_order == 0 {
+        project.repo_root.clone()
+    } else {
+        format!("{}/worktrees/{id}", project.repo_root.trim_end_matches('/'))
+    };
+    let branch = if sort_order == 0 {
+        project.default_branch.clone()
+    } else {
+        branch.unwrap_or_else(|| worktree_branch(&role, sort_order))
+    };
+    let host = project_host(&state, &project).await?;
+    if !project_host_contains(&host, &project.repo_root)
+        || !project_host_contains(&host, &worktree_path)
+    {
+        return Err("project worktree path is outside the bound host workspace".to_owned());
+    }
+    if sort_order != 0 {
+        let platform = host.health().await.ok().and_then(|health| health.platform);
+        let probe = host
+            .exec(ExecRequest {
+                command: format!(
+                    "git -C {} rev-parse --verify --quiet refs/heads/{}",
+                    quote_for(platform.as_deref(), &project.repo_root),
+                    quote_for(platform.as_deref(), &branch)
+                ),
+                cwd: None,
+                timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+                session: None,
+                env: None,
+            })
+            .await
+            .map_err(|error| format!("branch check failed: {error}"))?;
+        let result = host
+            .exec(ExecRequest {
+                command: git_worktree_add_command(
+                    platform.as_deref(),
+                    &project.repo_root,
+                    &worktree_path,
+                    &branch,
+                    probe.result.exit_code == 0,
+                ),
+                cwd: None,
+                timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+                session: None,
+                env: None,
+            })
+            .await
+            .map_err(|error| format!("worktree creation failed: {error}"))?;
+        if result.result.exit_code != 0 {
+            return Err(format!(
+                "worktree creation failed: {}",
+                result.result.stderr
+            ));
+        }
+    }
+    let agent = ProjectAgentRecord {
+        id,
+        project_id,
+        sort_order,
+        name,
+        role,
+        session_id: None,
+        provider,
+        model: model.unwrap_or_else(|| "auto".into()),
+        harness: harness.unwrap_or_else(|| "builtin".into()),
+        mode: mode.unwrap_or_else(|| "Interactive".into()),
+        system_prompt: system_prompt.unwrap_or_default(),
+        worktree_path,
+        branch,
+        state: "Active".into(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    state
+        .store
+        .save_project_agent(&agent)
+        .map_err(|error| error.to_string())?;
+    Ok(agent)
+}
+
+#[tauri::command]
+async fn delete_project_agent(
+    state: State<'_, DesktopState>,
+    agent_id: String,
+    force: Option<bool>,
+) -> Result<Value, String> {
+    let agent = state
+        .store
+        .load_project_agent(&agent_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project member not found".to_owned())?;
+    let project = state
+        .store
+        .load_project(&agent.project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    if agent.sort_order == 0 {
+        return Err("the Lead member cannot be deleted".to_owned());
+    }
+    let host = project_host(&state, &project).await?;
+    if !project_host_contains(&host, &project.repo_root)
+        || !project_host_contains(&host, &agent.worktree_path)
+    {
+        return Err("project worktree path is outside the bound host workspace".to_owned());
+    }
+    let platform = host.health().await.ok().and_then(|health| health.platform);
+    let warnings = remove_project_agent_worktree(
+        &host,
+        &project,
+        &agent,
+        force.unwrap_or(false),
+        platform.as_deref(),
+    )
+    .await?;
+    let mut warnings = warnings;
+    if let Some(warning) =
+        remove_empty_worktree_container(&host, &project, platform.as_deref()).await
+    {
+        warnings.push(warning);
+    }
+    state
+        .store
+        .delete_project_agent(&agent_id)
+        .map_err(|error| error.to_string())?;
+    Ok(json!({"deleted": true, "warnings": warnings}))
+}
+
+#[tauri::command]
+fn update_project_agent(
+    state: State<'_, DesktopState>,
+    id: String,
+    name: Option<String>,
+    role: Option<String>,
+    state_name: Option<String>,
+) -> Result<ProjectAgentRecord, String> {
+    let mut agent = state
+        .store
+        .load_project_agent(&id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project member not found".to_owned())?;
+    if let Some(name) = name.filter(|value| !value.trim().is_empty()) {
+        agent.name = name;
+    }
+    if let Some(role) = role.filter(|value| !value.trim().is_empty()) {
+        if agent.sort_order == 0 && !role.eq_ignore_ascii_case("lead") {
+            return Err("sort_order 0 project member must have Lead role".to_owned());
+        }
+        agent.role = role;
+    }
+    if let Some(state_name) = state_name.filter(|value| !value.trim().is_empty()) {
+        agent.state = state_name;
+    }
+    agent.updated_at = Utc::now();
+    state
+        .store
+        .save_project_agent(&agent)
+        .map_err(|error| error.to_string())?;
+    Ok(agent)
+}
+
 fn parse_permission_mode(value: &str) -> Result<PermissionMode, String> {
     match value.to_ascii_lowercase().as_str() {
         "discuss" => Ok(PermissionMode::Discuss),
@@ -1854,11 +3830,98 @@ async fn serve_ide_proxy(listener: TcpListener, state: IdeProxyState) {
     let _ = axum::serve(listener, router).await;
 }
 
+fn effective_config_objects(
+    connection: &Connection,
+    workspace: &str,
+    host_id: &str,
+    project_id: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<Vec<(String, String)>, String> {
+    let project_key = project_id.unwrap_or_default();
+    let session_key = session_id.unwrap_or_default();
+    let mut statement = connection
+        .prepare(
+            "SELECT o.id,o.kind,o.name,o.current_version_id,
+                    CASE o.scope_kind
+                      WHEN 'global' THEN 0
+                      WHEN 'project' THEN 1
+                      WHEN 'repo' THEN 2
+                      WHEN 'host' THEN 3
+                      WHEN 'session' THEN 4 ELSE 5 END AS precedence,
+                    COALESCE(selection.enabled,1),
+                    COALESCE(session_selection.enabled,1)
+             FROM config_object o
+             LEFT JOIN project_config_selection selection
+               ON selection.project_id=?3 AND selection.object_id=o.id
+             LEFT JOIN asset_session_selection session_selection
+               ON session_selection.session_id=?4
+              AND session_selection.asset_id=o.id
+             WHERE o.status='active' AND o.current_version_id IS NOT NULL
+               AND (o.scope_kind='global'
+                 OR (o.scope_kind='project' AND o.scope_key=?3)
+                 OR (o.scope_kind='repo' AND o.scope_key=?1)
+                 OR (o.scope_kind='host' AND o.scope_key=?2)
+                 OR (o.scope_kind='session' AND o.scope_key=?4))
+               AND (o.scope_kind <> 'global' OR COALESCE(selection.enabled,1)=1)
+               AND NOT (
+                 o.scope_kind='project' AND EXISTS (
+                   SELECT 1
+                   FROM project_config_selection excluded
+                   JOIN config_object global_object
+                     ON global_object.id=excluded.object_id
+                    AND global_object.scope_kind='global'
+                    AND global_object.kind=o.kind
+                    AND global_object.name=o.name
+                   WHERE excluded.project_id=?3 AND excluded.enabled=0
+                 )
+               )
+               AND (o.scope_kind <> 'session' OR COALESCE(session_selection.enabled,1)=1)
+             ORDER BY precedence,o.kind,o.name,o.id",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(
+            params![workspace, host_id, project_key, session_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut selected: HashMap<(String, String), (i64, String, String)> = HashMap::new();
+    for (id, kind, name, version_id, precedence) in rows {
+        let key = (kind, name);
+        let replace = selected
+            .get(&key)
+            .is_none_or(|(current_precedence, current_id, _)| {
+                precedence > *current_precedence
+                    || (precedence == *current_precedence && id < *current_id)
+            });
+        if replace {
+            selected.insert(key, (precedence, id, version_id));
+        }
+    }
+    let mut values = selected
+        .into_values()
+        .map(|(_, id, version_id)| (id, version_id))
+        .collect::<Vec<_>>();
+    values.sort();
+    Ok(values)
+}
+
 fn bind_session_config_versions(
     state: &DesktopState,
     session_id: &str,
     workspace: &str,
     host_id: &str,
+    project_id: Option<&str>,
 ) -> Result<(), String> {
     let connection = state
         .database
@@ -1877,31 +3940,14 @@ fn bind_session_config_versions(
     let transaction = connection
         .unchecked_transaction()
         .map_err(|error| error.to_string())?;
-    let mut statement = transaction
-        .prepare(
-            "SELECT o.id,o.current_version_id,COALESCE(selection.enabled,1)
-             FROM config_object o
-             LEFT JOIN asset_session_selection selection
-               ON selection.session_id=?3 AND selection.asset_id=o.id
-             WHERE o.status='active' AND o.current_version_id IS NOT NULL
-               AND (o.scope_kind='global'
-                 OR (o.scope_kind='repo' AND o.scope_key=?1)
-                 OR (o.scope_kind='host' AND o.scope_key=?2))",
-        )
-        .map_err(|error| error.to_string())?;
-    let objects = statement
-        .query_map(params![workspace, host_id, session_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, bool>(2)?,
-            ))
-        })
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    drop(statement);
-    for (object_id, version_id, enabled) in objects {
+    let objects = effective_config_objects(
+        &transaction,
+        workspace,
+        host_id,
+        project_id,
+        Some(session_id),
+    )?;
+    for (object_id, version_id) in objects {
         transaction
             .execute(
                 "INSERT OR IGNORE INTO session_config_bindings(session_id,object_id)
@@ -1909,15 +3955,13 @@ fn bind_session_config_versions(
                 params![session_id, object_id],
             )
             .map_err(|error| error.to_string())?;
-        if enabled {
-            transaction
-                .execute(
-                    "INSERT INTO session_config_versions(session_id,object_id,version_id)
-                     VALUES (?1,?2,?3)",
-                    params![session_id, object_id, version_id],
-                )
-                .map_err(|error| error.to_string())?;
-        }
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO session_config_versions(session_id,object_id,version_id)
+                 VALUES (?1,?2,?3)",
+                params![session_id, object_id, version_id],
+            )
+            .map_err(|error| error.to_string())?;
     }
     transaction.commit().map_err(|error| error.to_string())
 }
@@ -1997,6 +4041,36 @@ fn append_session_config_assets(bundle: &mut AssetBundle, assets: Vec<SessionCon
             _ => {}
         }
     }
+}
+
+fn record_skill_usage(
+    connection: &Connection,
+    session_id: &str,
+    project_id: Option<&str>,
+    bundle: &AssetBundle,
+) -> Result<(), String> {
+    for skill in bundle.skills.iter().filter(|skill| skill.active) {
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO skill_usage
+                 (session_id,project_id,skill_name,skill_path,source,used_at)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                params![
+                    session_id,
+                    project_id,
+                    skill.name,
+                    skill.path,
+                    if skill.path.starts_with(".agents/") {
+                        "repository"
+                    } else {
+                        "configured"
+                    },
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 async fn opencode_for(
@@ -2087,7 +4161,20 @@ async fn engine_for(
             .workspace
             .ok_or_else(|| "remote host did not provide a workspace".to_owned())?
     };
-    bind_session_config_versions(state, session_id, &resolved_workspace, &host_id)?;
+    bind_session_config_versions(
+        state,
+        session_id,
+        &resolved_workspace,
+        &host_id,
+        session.project_id.as_deref(),
+    )?;
+    let settings = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        load_devin_settings(&connection, session.project_id.as_deref())?
+    };
     let (provider_id, configured_base_url) = {
         let connection = state
             .database
@@ -2132,24 +4219,38 @@ async fn engine_for(
         .or(configured_base_url)
         .or(descriptor.default_base_url)
         .unwrap_or_default();
-    let linear_tools_enabled = state
-        .secrets
-        .get(&secret_key("asset-secret", "linear-pat"))
-        .map_err(|error| error.to_string())?
-        .is_some();
+    let linear_tools_enabled = scoped_secret_get(
+        state,
+        session.project_id.as_deref(),
+        "asset-secret",
+        "linear-pat",
+    )?
+    .is_some();
     let connector_tools_enabled = [
         "github", "telegram", "discord", "slack", "notion", "gitlab", "jira", "stripe",
     ]
     .into_iter()
     .map(|kind| {
-        state
-            .secrets
-            .get(&secret_key("connector-token", kind))
-            .map(|value| (kind, value.is_some()))
-            .map_err(|error| error.to_string())
+        scoped_secret_get(
+            state,
+            session.project_id.as_deref(),
+            "connector-token",
+            kind,
+        )
+        .map(|value| (kind, value.is_some()))
+        .map_err(|error| error.to_string())
     })
     .collect::<Result<HashMap<_, _>, _>>()?;
-    let mcp_runtime = Arc::clone(&state.mcp);
+    let mcp_runtime = session
+        .project_id
+        .as_ref()
+        .map(|project_id| {
+            Arc::new(McpManager::new(Arc::new(McpCredentialAdapter {
+                store: state.secrets.clone(),
+                project_id: Some(project_id.clone()),
+            })))
+        })
+        .unwrap_or_else(|| Arc::clone(&state.mcp));
     let (workspace, executor, remote_client, allowed_tools) = if host_id == "local" {
         let workspace = PathBuf::from(resolved_workspace.clone());
         let host = LocalHost::new(&workspace).map_err(|error| error.to_string())?;
@@ -2228,6 +4329,7 @@ async fn engine_for(
                 mcp: Arc::clone(&mcp_runtime),
                 index_root: state.index_root.clone(),
                 workspace: workspace.display().to_string(),
+                project_id: session.project_id.clone(),
             })),
             None,
             Some(allowed_tools),
@@ -2243,7 +4345,7 @@ async fn engine_for(
         let workspace = if session_workspace.is_empty() {
             health.workspace.unwrap_or_else(|| "/workspace".into())
         } else {
-            session_workspace
+            session_workspace.clone()
         };
         let executor_client = client.clone().with_workspace(workspace.clone());
         (
@@ -2260,6 +4362,7 @@ async fn engine_for(
                 index_root: state.index_root.clone(),
                 host_id: host_id.clone(),
                 workspace: workspace.clone(),
+                project_id: session.project_id.clone(),
             }))),
             Some(executor_client),
             None,
@@ -2297,20 +4400,24 @@ async fn engine_for(
             );
         }
         "anthropic" => {
-            let key = state
-                .secrets
-                .get(&secret_key("provider-key", &provider_id))
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| {
-                    "provider key is not configured; open Provider settings first".to_owned()
-                })?;
+            let key = scoped_secret_get(
+                state,
+                session.project_id.as_deref(),
+                "provider-key",
+                &provider_id,
+            )?
+            .ok_or_else(|| {
+                "provider key is not configured; open Provider settings first".to_owned()
+            })?;
             Box::new(AnthropicProvider::new(ProviderConfig::new(base_url, key)))
         }
         _name if descriptor.openai_compatible => {
-            let stored_key = state
-                .secrets
-                .get(&secret_key("provider-key", &provider_id))
-                .map_err(|error| error.to_string())?;
+            let stored_key = scoped_secret_get(
+                state,
+                session.project_id.as_deref(),
+                "provider-key",
+                &provider_id,
+            )?;
             let key = match stored_key {
                 Some(key) => key,
                 None if descriptor.needs_key => {
@@ -2335,6 +4442,12 @@ async fn engine_for(
         model,
     ));
     engine.set_linear_tools_enabled(linear_tools_enabled);
+    engine.set_message_usage_limit(
+        settings
+            .get("message_usage_limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    );
     for kind in [
         "github", "telegram", "discord", "slack", "notion", "gitlab", "jira", "stripe",
     ] {
@@ -2386,28 +4499,37 @@ async fn engine_for(
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?;
-        let mut statement = connection
-            .prepare(
-                "SELECT o.id,o.name,COALESCE(o.server_key,''),o.current_version_id,v.content
-                 FROM config_object o
-                 JOIN config_object_version v ON v.id=o.current_version_id
-                 WHERE o.kind='mcp' AND o.status='active'",
-            )
-            .map_err(|error| error.to_string())?;
-        statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    serde_json::from_str::<Value>(&row.get::<_, String>(4)?)
-                        .unwrap_or_else(|_| json!({})),
-                ))
-            })
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?
+        effective_config_objects(
+            &connection,
+            &session_workspace,
+            &host_id,
+            session.project_id.as_deref(),
+            Some(session_id),
+        )?
+        .into_iter()
+        .filter_map(|(object_id, version_id)| {
+            connection
+                .query_row(
+                    "SELECT o.name,COALESCE(o.server_key,''),v.content
+                     FROM config_object o
+                     JOIN config_object_version v ON v.id=?2
+                     WHERE o.id=?1 AND o.kind='mcp'",
+                    params![object_id, version_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            serde_json::from_str::<Value>(&row.get::<_, String>(2)?)
+                                .unwrap_or_else(|_| json!({})),
+                        ))
+                    },
+                )
+                .ok()
+                .map(|(name, server_key, content)| {
+                    (object_id, name, server_key, version_id, content)
+                })
+        })
+        .collect::<Vec<_>>()
     };
     let mut independent_tools = Vec::new();
     for (object_id, name, server_key, version_id, mut content) in mcp_configs {
@@ -2497,6 +4619,18 @@ async fn engine_for(
         &mut bundle,
         load_session_config_assets(state, session_id).unwrap_or_default(),
     );
+    {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        record_skill_usage(
+            &connection,
+            session_id,
+            session.project_id.as_deref(),
+            &bundle,
+        )?;
+    }
     engine
         .set_system_instructions(Some(bundle.system_instructions()))
         .await;
@@ -2842,6 +4976,7 @@ async fn start_surface(
     cols: Option<u16>,
     rows: Option<u16>,
     cwd: Option<String>,
+    project_id: Option<String>,
 ) -> Result<u16, String> {
     let kind = match surface.as_str() {
         "pty" => WsKind::Pty,
@@ -2849,6 +4984,11 @@ async fn start_surface(
         "cdp" => WsKind::Cdp,
         _ => return Err("unknown surface".into()),
     };
+    if matches!(kind, WsKind::Vnc | WsKind::Cdp)
+        && !computer_use_enabled(&state, project_id.as_deref())?
+    {
+        return Err("Computer use is disabled in Devin settings".into());
+    }
     if host_id == "local" {
         return Err(match kind {
             WsKind::Pty => "本机 host 暂不支持远程 PTY，请使用本机内置终端能力".into(),
@@ -2951,12 +5091,15 @@ async fn start_ide_proxy(
 fn create_session(
     state: State<'_, DesktopState>,
     title: String,
-    host_id: String,
+    host_id: Option<String>,
     model: Option<String>,
     provider: Option<String>,
     mode: Option<String>,
     harness: Option<String>,
     workspace: Option<String>,
+    project_id: Option<String>,
+    agent_id: Option<String>,
+    system_prompt: Option<String>,
 ) -> Result<SessionView, String> {
     let id = format!(
         "session-{}",
@@ -2969,7 +5112,79 @@ fn create_session(
     if !matches!(harness.as_str(), "builtin" | "opencode") {
         return Err(format!("unsupported harness: {harness}"));
     }
-    let workspace = if host_id == "local" && workspace.as_deref().is_none_or(str::is_empty) {
+    if project_id.is_some() != agent_id.is_some() {
+        return Err("project_id and agent_id must be supplied together".to_owned());
+    }
+    let (mut host_id, agent) =
+        if let (Some(project_id), Some(agent_id)) = (project_id.clone(), agent_id.clone()) {
+            let project = state
+                .store
+                .load_project(&project_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "project not found".to_owned())?;
+            let agent = state
+                .store
+                .load_project_agent(&agent_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "project member not found".to_owned())?;
+            let (host_id, _) = project_session_target(&project, &agent)?;
+            (host_id, Some(agent))
+        } else {
+            (host_id.unwrap_or_default(), None)
+        };
+    let settings = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        load_devin_settings(&connection, project_id.as_deref())?
+    };
+    if host_id.trim().is_empty() {
+        let platform = settings
+            .get("default_platform")
+            .and_then(Value::as_str)
+            .unwrap_or("Ubuntu")
+            .to_ascii_lowercase();
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        host_id = connection
+            .query_row(
+                "SELECT id FROM hosts WHERE lower(name) LIKE ?1 ORDER BY id LIMIT 1",
+                [format!("%{platform}%")],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap_or_else(|_| "local".into());
+    }
+    let batch_limit = settings
+        .get("batch_limit")
+        .and_then(Value::as_i64)
+        .unwrap_or(50);
+    {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let recent_sessions: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE created_at >= ?1",
+                [Utc::now()
+                    .checked_sub_signed(chrono::Duration::minutes(1))
+                    .unwrap_or_else(Utc::now)
+                    .to_rfc3339()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if recent_sessions >= batch_limit {
+            return Err(format!(
+                "batch session limit reached ({batch_limit}); wait before creating another session"
+            ));
+        }
+    }
+    let workspace = if let Some(agent) = agent.as_ref() {
+        Some(agent.worktree_path.clone())
+    } else if host_id == "local" && workspace.as_deref().is_none_or(str::is_empty) {
         Some(local_workspace_path(&id)?)
     } else {
         workspace.filter(|value| !value.is_empty())
@@ -2983,9 +5198,9 @@ fn create_session(
         .ok_or_else(|| "remote host not found; session was not created".to_owned())?;
     drop(connection);
     let now = Utc::now();
-    state
-        .store
-        .save_session(&SessionRecord {
+    save_session_via_factory(
+        &state,
+        SessionRecord {
             session_id: id.clone(),
             workspace: workspace.clone().unwrap_or_default(),
             model: model.clone(),
@@ -3006,8 +5221,54 @@ fn create_session(
             stop_reason: "none".into(),
             created_at: now,
             updated_at: now,
-        })
-        .map_err(|error| error.to_string())?;
+            project_id: project_id.clone(),
+            agent_id: agent_id.clone(),
+        },
+        false,
+    )?;
+    if let Some(system_prompt) = system_prompt.filter(|value| !value.trim().is_empty()) {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let object_id = format!("session-{id}-agent-template");
+        let version_id = format!("{object_id}:v1");
+        let now = Utc::now().to_rfc3339();
+        connection
+            .execute(
+                "INSERT INTO config_object
+                 (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
+                 VALUES (?1,'instructions','Agent template system prompt',?2,'session',?3,'active',?4,?5)",
+                params![
+                    object_id,
+                    stable_server_key(&object_id),
+                    id,
+                    now,
+                    version_id
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute(
+                "INSERT INTO config_object_version
+                 (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+                 VALUES (?1,?2,1,?3,?4,?5,'agent template system prompt','{}')",
+                params![
+                    version_id,
+                    object_id,
+                    system_prompt,
+                    content_hash(&system_prompt),
+                    now
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    if let Some(agent) = agent {
+        state
+            .store
+            .update_project_agent_session(&agent.id, Some(&id))
+            .map_err(|error| error.to_string())?;
+    }
     audit(
         &state,
         &id,
@@ -3026,6 +5287,8 @@ fn create_session(
         workspace: workspace.unwrap_or_default(),
         run_state: "idle".into(),
         stop_reason: "none".into(),
+        project_id: project_id.clone(),
+        agent_id: agent_id.clone(),
     })
 }
 
@@ -3209,6 +5472,8 @@ fn session_view_for_host(
         workspace: session.workspace,
         run_state: session.run_state,
         stop_reason: session.stop_reason,
+        project_id: session.project_id,
+        agent_id: session.agent_id,
     }))
 }
 
@@ -3720,8 +5985,16 @@ async fn repo_index_refresh(
 async fn submit_turn(
     app: tauri::AppHandle,
     state: State<'_, DesktopState>,
-    request: SubmitRequest,
+    mut request: SubmitRequest,
 ) -> Result<(), String> {
+    let session = session_for(&state, &request.session_id)?;
+    request.text = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        expand_slash_command(&connection, session.project_id.as_deref(), &request.text)?
+    };
     if session_for(&state, &request.session_id)?.harness == "opencode" {
         return submit_opencode_turn(app, state, request).await;
     }
@@ -3761,6 +6034,7 @@ async fn submit_turn(
     );
     match engine.submit_text(request.text).await {
         Ok(_) => {
+            let _ = coordination_ingest_session_inner(&state, &request.session_id, false).await;
             let calls = state
                 .store
                 .load_tool_calls_after(&request.session_id, sequence_before)
@@ -4024,6 +6298,11 @@ async fn submit_opencode_turn(
                             object.insert("turn".into(), json!(turn));
                         }
                         emit(&event_app, "turn_done", Some(&event_session), payload);
+                        if let Some(state) = event_app.try_state::<DesktopState>() {
+                            let _ =
+                                coordination_ingest_session_inner(&state, &event_session, false)
+                                    .await;
+                        }
                     }
                 }
             }
@@ -4484,7 +6763,11 @@ fn provider_models(provider: String) -> Vec<ModelDescriptor> {
 }
 
 #[tauri::command]
-fn list_assets(state: State<'_, DesktopState>, kind: Option<String>) -> Result<Vec<Value>, String> {
+fn list_assets(
+    state: State<'_, DesktopState>,
+    kind: Option<String>,
+    project_id: Option<String>,
+) -> Result<Vec<Value>, String> {
     let kind = kind.map(|kind| match kind.as_str() {
         "agents" => "rules".to_owned(),
         "playbook" => "runbook".to_owned(),
@@ -4501,11 +6784,12 @@ fn list_assets(state: State<'_, DesktopState>, kind: Option<String>) -> Result<V
              FROM config_object o
              JOIN config_object_version v ON v.id=o.current_version_id
              WHERE (?1 IS NULL OR o.kind=?1) AND o.status <> 'deleted'
+               AND (?2 IS NULL OR (o.scope_kind='project' AND o.scope_key=?2))
              ORDER BY o.name",
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
-        .query_map([kind], |row| {
+        .query_map(params![kind, project_id], |row| {
             let metadata: Value = serde_json::from_str::<Value>(&row.get::<_, String>(4)?)
                 .unwrap_or_else(|_| json!({}));
             Ok(json!({
@@ -4532,6 +6816,966 @@ fn list_assets(state: State<'_, DesktopState>, kind: Option<String>) -> Result<V
 }
 
 #[tauri::command]
+fn list_template_market(
+    state: State<'_, DesktopState>,
+    kind: Option<String>,
+) -> Result<Vec<Value>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let mut statement = connection
+        .prepare(
+            "SELECT o.id,o.kind,o.name,o.status,v.content,v.metadata_json,v.version,
+                    o.scope_key
+             FROM config_object o
+             JOIN config_object_version v ON v.id=o.current_version_id
+             WHERE o.scope_kind='global' AND o.status <> 'deleted'
+               AND (?1 IS NULL OR o.kind=?1)
+             ORDER BY CASE o.status WHEN 'builtin' THEN 0 ELSE 1 END,o.name",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([kind], |row| {
+            let metadata = serde_json::from_str::<Value>(&row.get::<_, String>(5)?)
+                .unwrap_or_else(|_| json!({}));
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "kind": row.get::<_, String>(1)?,
+                "name": row.get::<_, String>(2)?,
+                "status": row.get::<_, String>(3)?,
+                "content": row.get::<_, String>(4)?,
+                "description": metadata.get("description").and_then(Value::as_str).unwrap_or(""),
+                "version": row.get::<_, i64>(6)?,
+                "readonly": row.get::<_, String>(3)? == "builtin",
+                "source": if row
+                    .get::<_, Option<String>>(7)?
+                    .is_some_and(|scope| scope.starts_with("repo:"))
+                {
+                    "仓库"
+                } else if row.get::<_, String>(3)? == "builtin" {
+                    "内置"
+                } else {
+                    "自定义"
+                }
+            }))
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn save_template(
+    state: State<'_, DesktopState>,
+    id: Option<String>,
+    kind: String,
+    name: String,
+    description: String,
+    content: String,
+) -> Result<Value, String> {
+    if !matches!(
+        kind.as_str(),
+        "agent-template"
+            | "team-template"
+            | "rules"
+            | "knowledge"
+            | "runbook"
+            | "mcp"
+            | "connector"
+            | "blueprint"
+    ) {
+        return Err("unsupported template kind".into());
+    }
+    if name.trim().is_empty() {
+        return Err("template name cannot be empty".into());
+    }
+    if matches!(kind.as_str(), "agent-template" | "team-template") {
+        serde_json::from_str::<Value>(&content)
+            .map_err(|error| format!("template content must be valid JSON: {error}"))?;
+    }
+    let id = id.unwrap_or_else(|| {
+        format!(
+            "template-custom-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        )
+    });
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let existing_status: Option<String> = connection
+        .query_row(
+            "SELECT status FROM config_object WHERE id=?1 AND scope_kind='global'",
+            [&id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if existing_status.as_deref() == Some("builtin") {
+        return Err("builtin templates are read-only; save a copy with a new name".into());
+    }
+    let now = Utc::now().to_rfc3339();
+    let metadata = serde_json::to_string(&json!({"description":description}))
+        .map_err(|error| error.to_string())?;
+    let version: i64 = connection
+        .query_row(
+            "SELECT COALESCE(MAX(version),0)+1 FROM config_object_version WHERE object_id=?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let version_id = format!("{id}:v{version}");
+    let tx = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    tx.execute(
+        "INSERT INTO config_object
+         (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
+         VALUES (?1,?2,?3,?4,'global',NULL,'active',?5,NULL)
+         ON CONFLICT(id) DO UPDATE SET name=excluded.name,kind=excluded.kind,status='active'",
+        params![id, kind, name, stable_server_key(&id), now],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "INSERT INTO config_object_version
+         (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![
+            version_id,
+            id,
+            version,
+            content,
+            content_hash(&content),
+            now,
+            if version == 1 { "created" } else { "edited" },
+            metadata
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "UPDATE config_object SET current_version_id=?1 WHERE id=?2",
+        params![version_id, id],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(json!({"id":id,"kind":kind,"name":name,"status":"active"}))
+}
+
+#[tauri::command]
+fn delete_template(state: State<'_, DesktopState>, id: String) -> Result<(), String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let status: String = connection
+        .query_row(
+            "SELECT status FROM config_object WHERE id=?1 AND scope_kind='global'",
+            [&id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if status == "builtin" {
+        return Err("builtin templates are read-only".into());
+    }
+    connection
+        .execute(
+            "UPDATE config_object SET status='deleted' WHERE id=?1 AND scope_kind='global'",
+            [&id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn repository_template_name(value: &Value, fallback: &str) -> Result<String, String> {
+    value
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{fallback}: missing non-empty name"))
+}
+
+fn parse_repository_template(content: &str, path: &str) -> Result<(Value, String), String> {
+    let value = serde_yaml::from_str::<Value>(content)
+        .map_err(|error| format!("{path}: invalid YAML: {error}"))?;
+    let name = repository_template_name(&value, path)?;
+    Ok((value, name))
+}
+
+fn repository_template_yaml(content: &str) -> Result<String, String> {
+    let value: Value = serde_json::from_str(content)
+        .map_err(|error| format!("template content is not valid JSON: {error}"))?;
+    serde_yaml::to_string(&value).map_err(|error| error.to_string())
+}
+
+fn repository_template_slug(name: &str) -> String {
+    let mut slug = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while slug.contains("--") {
+        slug = slug.replace("--", "-");
+    }
+    slug.trim_matches('-').to_owned()
+}
+
+fn insert_repository_template(
+    connection: &Connection,
+    kind: &str,
+    name: &str,
+    description: &str,
+    content: &str,
+    repo_scope: &str,
+    repo_path: &str,
+) -> Result<String, String> {
+    let id = format!(
+        "template-repo-{}",
+        content_hash(&format!("{kind}:{repo_scope}:{repo_path}:{content}"))
+    );
+    let version_id = format!("{id}:v1");
+    let now = Utc::now().to_rfc3339();
+    let metadata = serde_json::to_string(&json!({
+        "description": description,
+        "repository_path": repo_path
+    }))
+    .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO config_object
+             (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
+             VALUES (?1,?2,?3,?4,'global',?5,'active',?6,?7)",
+            params![
+                id,
+                kind,
+                name,
+                stable_server_key(&id),
+                repo_scope,
+                now,
+                version_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO config_object_version
+             (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+             VALUES (?1,?2,1,?3,?4,?5,'imported from repository',?6)",
+            params![
+                version_id,
+                id,
+                content,
+                content_hash(content),
+                now,
+                metadata
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(id)
+}
+
+fn repository_display_prefix(repository_root: &str) -> String {
+    repository_root
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("repository")
+        .to_owned()
+}
+
+fn upsert_repository_template_version(
+    connection: &Connection,
+    id: &str,
+    content: &str,
+    metadata: &str,
+) -> Result<bool, String> {
+    let (current_version, current_content): (i64, String) = connection
+        .query_row(
+            "SELECT v.version,v.content FROM config_object o
+             JOIN config_object_version v ON v.id=o.current_version_id
+             WHERE o.id=?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    if current_content == content {
+        return Ok(false);
+    }
+    let version = current_version + 1;
+    let version_id = format!("{id}:v{version}");
+    let now = Utc::now().to_rfc3339();
+    connection
+        .execute(
+            "INSERT INTO config_object_version
+             (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+             VALUES (?1,?2,?3,?4,?5,?6,'repository update',?7)",
+            params![
+                version_id,
+                id,
+                version,
+                content,
+                content_hash(content),
+                now,
+                metadata
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "UPDATE config_object SET current_version_id=?1 WHERE id=?2",
+            params![version_id, id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+fn import_repository_record(
+    connection: &Connection,
+    kind: &str,
+    name: &str,
+    description: &str,
+    content: &str,
+    repo_scope: &str,
+    repo_path: &str,
+) -> Result<&'static str, String> {
+    let same_source: Option<(String, String)> = connection
+        .query_row(
+            "SELECT id,status FROM config_object
+             WHERE scope_kind='global' AND scope_key=?1 AND kind=?2 AND name=?3
+               AND status <> 'deleted'",
+            params![repo_scope, kind, name],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let metadata = serde_json::to_string(&json!({
+        "description": description,
+        "repository_path": repo_path
+    }))
+    .map_err(|error| error.to_string())?;
+    if let Some((id, _)) = same_source {
+        return if upsert_repository_template_version(connection, &id, content, &metadata)? {
+            Ok("updated")
+        } else {
+            Ok("unchanged")
+        };
+    }
+    let protected: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM config_object
+             WHERE scope_kind='global' AND status IN ('active','builtin')
+               AND (scope_key IN ('global','custom','builtin') OR scope_key IS NULL)
+               AND kind=?1 AND name=?2)",
+            params![kind, name],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if protected {
+        return Ok("conflict");
+    }
+    insert_repository_template(
+        connection,
+        kind,
+        name,
+        description,
+        content,
+        repo_scope,
+        repo_path,
+    )?;
+    Ok("imported")
+}
+
+async fn ensure_repository_directory(
+    host: &dyn Host,
+    platform: Option<&str>,
+    path: &str,
+) -> Result<(), String> {
+    let command = if platform.is_some_and(|value| value.eq_ignore_ascii_case("windows")) {
+        format!(
+            "New-Item -ItemType Directory -Force -Path {} | Out-Null",
+            quote_for(platform, path)
+        )
+    } else {
+        format!("mkdir -p {}", quote_for(platform, path))
+    };
+    let result = host
+        .exec(ExecRequest {
+            command,
+            cwd: None,
+            timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+            session: None,
+            env: None,
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    if result.result.exit_code != 0 {
+        return Err(format!(
+            "cannot create repository template directory: {}",
+            result.result.stderr
+        ));
+    }
+    Ok(())
+}
+
+fn repository_template_paths(
+    kind: &str,
+    name: &str,
+    host: &dyn Host,
+    repository_root: &str,
+) -> Result<(String, String), String> {
+    let slug = repository_template_slug(name);
+    if slug.is_empty() {
+        return Err("template name cannot produce a repository filename".into());
+    }
+    let (directory, filename) = match kind {
+        "agent-template" => (".agents/templates/agents", format!("{slug}.yaml")),
+        "team-template" => (".agents/templates/teams", format!("{slug}.yaml")),
+        "rules" => (".", "AGENTS.md".to_owned()),
+        "knowledge" => (".agents/knowledge", format!("{slug}.md")),
+        "runbook" => (".agents/playbooks", format!("{slug}.md")),
+        "blueprint" => (".devin", "blueprint.yaml".to_owned()),
+        other => {
+            return Err(format!(
+                "repository export is unsupported for template kind '{other}'"
+            ));
+        }
+    };
+    let directory_path = repository_path(host, repository_root, directory)?;
+    let relative_file = if directory == "." {
+        filename.clone()
+    } else {
+        format!("{directory}/{filename}")
+    };
+    let path = repository_path(host, repository_root, &relative_file)?;
+    Ok((directory_path, path))
+}
+
+fn repository_path(
+    host: &dyn Host,
+    repository_root: &str,
+    relative: &str,
+) -> Result<String, String> {
+    if host.id() == "local" {
+        let path = format!(
+            "{}/{}",
+            repository_root.trim_end_matches(['/', '\\']),
+            relative.trim_start_matches(['/', '\\'])
+        );
+        if !host.contains(repository_root) {
+            return Err("repository path is outside the bound host workspace".into());
+        }
+        return Ok(path);
+    }
+    let workspace = host.join(".").map_err(|error| error.to_string())?;
+    let root = repository_root.trim_end_matches(['/', '\\']);
+    let relative_root = root
+        .strip_prefix(workspace.trim_end_matches(['/', '\\']))
+        .map(|value| value.trim_start_matches(['/', '\\']))
+        .ok_or_else(|| "repository path is outside the bound host workspace".to_owned())?;
+    let child = if relative_root.is_empty() {
+        relative.to_owned()
+    } else {
+        format!("{relative_root}/{relative}")
+    };
+    host.join(&child).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn import_repository_templates(
+    state: State<'_, DesktopState>,
+    project_id: String,
+) -> Result<Value, String> {
+    let project = state
+        .store
+        .load_project(&project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    let host = project_host(&state, &project).await?;
+    let repo_scope = format!("repo:{}", project.repo_root);
+    let mut imported = Vec::new();
+    let mut rejected = Vec::new();
+    let mut conflicts = Vec::new();
+    let template_roots = [
+        ("agent-template", ".agents/templates/agents"),
+        ("team-template", ".agents/templates/teams"),
+    ];
+    for (kind, relative_root) in template_roots {
+        let root = repository_path(host.as_ref(), &project.repo_root, relative_root)?;
+        let listing = match host.ls(Some(&root)).await {
+            Ok(listing) => listing,
+            Err(_) => continue,
+        };
+        for item in listing.items.into_iter().filter(|item| !item.dir) {
+            if !item.name.ends_with(".yaml") && !item.name.ends_with(".yml") {
+                continue;
+            }
+            let path = repository_path(
+                host.as_ref(),
+                &project.repo_root,
+                &format!("{relative_root}/{}", item.name),
+            )?;
+            let content = match host.read(&path).await {
+                Ok(content) => content.content,
+                Err(error) => {
+                    rejected.push(json!({"path":path,"reason":error.to_string()}));
+                    continue;
+                }
+            };
+            let (yaml, name) = match parse_repository_template(&content, &path) {
+                Ok(value) => value,
+                Err(error) => {
+                    rejected.push(json!({"path":path,"reason":error}));
+                    continue;
+                }
+            };
+            let normalized = serde_json::to_string(&yaml).map_err(|error| error.to_string())?;
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            let status = import_repository_record(
+                &connection,
+                kind,
+                &name,
+                yaml.get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                &normalized,
+                &repo_scope,
+                &path,
+            )?;
+            match status {
+                "conflict" => conflicts.push(json!({
+                    "path":path,"name":name,"reason":"同名内置或用户自定义模板已存在"
+                })),
+                other => imported.push(json!({
+                    "path":path,"name":name,"kind":kind,"status":other
+                })),
+            }
+        }
+    }
+    let bundle = discover_assets(&HostAssetReader { host }, &project.repo_root)
+        .await
+        .map_err(|error| error.to_string())?;
+    let repository_prefix = repository_display_prefix(&project.repo_root);
+    for source in bundle.agents {
+        let name = format!(
+            "{}: {}",
+            repository_prefix,
+            source
+                .path
+                .replace('\\', "/")
+                .rsplit('/')
+                .next()
+                .unwrap_or("AGENTS.md")
+        );
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let status = import_repository_record(
+            &connection,
+            "rules",
+            &name,
+            "",
+            &source.content,
+            &repo_scope,
+            &source.path,
+        )?;
+        if status == "conflict" {
+            conflicts.push(
+                json!({"path":source.path,"name":name,"reason":"同名内置或用户自定义模板已存在"}),
+            );
+        } else {
+            imported.push(json!({"path":source.path,"name":name,"kind":"rules","status":status}));
+        }
+    }
+    for knowledge in bundle.knowledge {
+        let name = format!("{repository_prefix}: {}", knowledge.title);
+        let content = knowledge.body;
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let status = import_repository_record(
+            &connection,
+            "knowledge",
+            &name,
+            "",
+            &content,
+            &repo_scope,
+            "",
+        )?;
+        if status == "conflict" {
+            conflicts.push(json!({"name":name,"reason":"同名内置或用户自定义模板已存在"}));
+        } else {
+            imported.push(json!({"name":name,"kind":"knowledge","status":status}));
+        }
+    }
+    if let Some(playbook) = bundle.playbook {
+        let name = format!("{repository_prefix}: {}", playbook.title);
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let status = import_repository_record(
+            &connection,
+            "runbook",
+            &name,
+            "",
+            &playbook.body,
+            &repo_scope,
+            "",
+        )?;
+        if status == "conflict" {
+            conflicts.push(json!({"name":name,"reason":"同名内置或用户自定义模板已存在"}));
+        } else {
+            imported.push(json!({"name":name,"kind":"runbook","status":status}));
+        }
+    }
+    Ok(json!({"imported":imported,"rejected":rejected,"conflicts":conflicts}))
+}
+
+fn template_record_content(
+    connection: &Connection,
+    template_id: &str,
+) -> Result<(String, String, String), String> {
+    connection
+        .query_row(
+            "SELECT o.kind,o.name,v.content FROM config_object o
+             JOIN config_object_version v ON v.id=o.current_version_id
+             WHERE o.id=?1 AND o.scope_kind='global' AND o.status <> 'deleted'",
+            [template_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| format!("template not found: {error}"))
+}
+
+#[tauri::command]
+async fn export_template_to_repository(
+    state: State<'_, DesktopState>,
+    template_id: String,
+    project_id: String,
+    overwrite: Option<bool>,
+) -> Result<Value, String> {
+    let project = state
+        .store
+        .load_project(&project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    let (kind, name, content) = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        template_record_content(&connection, &template_id)?
+    };
+    let host = project_host(&state, &project).await?;
+    let (directory, path) =
+        repository_template_paths(&kind, &name, host.as_ref(), &project.repo_root)?;
+    let output = if matches!(kind.as_str(), "agent-template" | "team-template") {
+        repository_template_yaml(&content)?
+    } else {
+        content
+    };
+    if let Ok(existing) = host.read(&path).await {
+        if existing.content == output {
+            return Ok(json!({"path":path,"written":false,"unchanged":true}));
+        }
+        if !overwrite.unwrap_or(false) {
+            return Err(format!(
+                "repository template already exists with different content: {path}; confirm overwrite"
+            ));
+        }
+    }
+    if directory != repository_path(host.as_ref(), &project.repo_root, ".")? {
+        let platform = host.health().await.ok().and_then(|health| health.platform);
+        ensure_repository_directory(host.as_ref(), platform.as_deref(), &directory).await?;
+    }
+    host.write(&path, &output)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(json!({"path":path,"written":true,"unchanged":false}))
+}
+
+fn insert_custom_template(
+    connection: &Connection,
+    kind: &str,
+    name: &str,
+    description: &str,
+    content: &str,
+    scope_key: &str,
+) -> Result<String, String> {
+    let existing: Option<String> = connection
+        .query_row(
+            "SELECT id FROM config_object WHERE scope_kind='global'
+             AND status='active' AND name=?1",
+            [name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if existing.is_some() {
+        return Err(format!("同名自定义模板已存在: {name}"));
+    }
+    let id = format!(
+        "template-custom-{}",
+        content_hash(&format!("{kind}:{name}:{content}"))
+    );
+    let version_id = format!("{id}:v1");
+    let now = Utc::now().to_rfc3339();
+    let metadata = serde_json::to_string(&json!({"description":description}))
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "INSERT INTO config_object
+             (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
+             VALUES (?1,?2,?3,?4,'global',?5,'active',?6,?7)",
+            params![
+                id,
+                kind,
+                name,
+                stable_server_key(&id),
+                scope_key,
+                now,
+                version_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "INSERT INTO config_object_version
+             (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+             VALUES (?1,?2,1,?3,?4,?5,'saved as template',?6)",
+            params![
+                version_id,
+                id,
+                content,
+                content_hash(content),
+                now,
+                metadata
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(id)
+}
+
+#[tauri::command]
+fn save_project_agent_as_template(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    agent_id: String,
+    name: Option<String>,
+) -> Result<Value, String> {
+    let agent = state
+        .store
+        .load_project_agents(&project_id)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|agent| agent.id == agent_id)
+        .ok_or_else(|| "project agent not found".to_owned())?;
+    let template_name = name.unwrap_or_else(|| format!("{} Agent", agent.name));
+    let content = serde_json::to_string(&json!({
+        "name": agent.name,
+        "role": agent.role,
+        "provider": agent.provider,
+        "model": agent.model,
+        "harness": agent.harness,
+        "mode": agent.mode,
+        "system_prompt": agent.system_prompt
+    }))
+    .map_err(|error| error.to_string())?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let id = insert_custom_template(
+        &connection,
+        "agent-template",
+        &template_name,
+        &format!("从项目成员 {} 另存", agent.name),
+        &content,
+        "global",
+    )?;
+    Ok(json!({"id":id,"name":template_name,"kind":"agent-template"}))
+}
+
+#[tauri::command]
+fn save_project_as_team_template(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    name: Option<String>,
+) -> Result<Value, String> {
+    let project = state
+        .store
+        .load_project(&project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    let agents = state
+        .store
+        .load_project_agents(&project_id)
+        .map_err(|error| error.to_string())?;
+    validate_team_template_members(
+        &agents
+            .iter()
+            .map(|agent| TeamTemplateAgent {
+                template_id: None,
+                name: Some(agent.name.clone()),
+                role: Some(agent.role.clone()),
+                provider: agent.provider.clone(),
+                model: Some(agent.model.clone()),
+                harness: Some(agent.harness.clone()),
+                mode: Some(agent.mode.clone()),
+                system_prompt: Some(agent.system_prompt.clone()),
+                branch: None,
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let template_name = name
+        .clone()
+        .unwrap_or_else(|| format!("{} Team", project.name));
+    let duplicate: Option<String> = connection
+        .query_row(
+            "SELECT id FROM config_object
+             WHERE scope_kind='global' AND status='active' AND name=?1",
+            [&template_name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if duplicate.is_some() {
+        return Err(format!("同名自定义模板已存在: {template_name}"));
+    }
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    let mut config_ids = Vec::new();
+    let mut statement = transaction
+        .prepare(
+            "SELECT o.id,o.kind,o.name,v.content,v.metadata_json
+             FROM config_object o
+             JOIN config_object_version v ON v.id=o.current_version_id
+             WHERE o.scope_kind='project' AND o.scope_key=?1 AND o.status <> 'deleted'",
+        )
+        .map_err(|error| error.to_string())?;
+    let configs = statement
+        .query_map([&project_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(statement);
+    for (_source_id, kind, config_name, content, metadata) in configs {
+        let content_hash_value = content_hash(&content);
+        let existing_id: Option<String> = transaction
+            .query_row(
+                "SELECT o.id FROM config_object o
+                 JOIN config_object_version v ON v.id=o.current_version_id
+                 WHERE o.scope_kind='global' AND o.status <> 'deleted'
+                   AND o.kind=?1 AND v.content_hash=?2
+                 ORDER BY CASE o.status WHEN 'builtin' THEN 0 ELSE 1 END,o.id
+                 LIMIT 1",
+                params![kind, content_hash_value],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let id = if let Some(id) = existing_id {
+            config_ids.push(id);
+            continue;
+        } else {
+            format!(
+                "template-custom-{}",
+                content_hash(&format!("{kind}:{config_name}:{content}"))
+            )
+        };
+        let version_id = format!("{id}:v1");
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO config_object
+                 (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
+                 VALUES (?1,?2,?3,?4,'global',NULL,'active',?5,?6)",
+                params![
+                    id,
+                    kind,
+                    config_name,
+                    stable_server_key(&id),
+                    Utc::now().to_rfc3339(),
+                    version_id
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO config_object_version
+                 (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+                 VALUES (?1,?2,1,?3,?4,?5,'saved from project',?6)",
+                params![
+                    version_id,
+                    id,
+                    content,
+                    content_hash_value,
+                    Utc::now().to_rfc3339(),
+                    metadata
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        config_ids.push(id);
+    }
+    let member_values = agents
+        .iter()
+        .map(|agent| {
+            json!({
+                "name": agent.name,
+                "role": agent.role,
+                "provider": agent.provider,
+                "model": agent.model,
+                "harness": agent.harness,
+                "mode": agent.mode,
+                "system_prompt": agent.system_prompt
+            })
+        })
+        .collect::<Vec<_>>();
+    let content = serde_json::to_string(&json!({
+        "name": name.clone().unwrap_or_else(|| project.name.clone()),
+        "description": format!("从项目 {} 另存", project.name),
+        "workflow": serde_json::from_str::<Value>(&project.workflow_json).unwrap_or_else(|_| json!({})),
+        "agents": member_values,
+        "config_template_ids": config_ids
+    }))
+    .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    let id = insert_custom_template(
+        &connection,
+        "team-template",
+        &template_name,
+        &format!("从项目 {} 另存", project.name),
+        &content,
+        "global",
+    )?;
+    Ok(json!({"id":id,"name":template_name,"kind":"team-template"}))
+}
+
+#[tauri::command]
 #[allow(clippy::too_many_arguments)]
 fn save_asset(
     state: State<'_, DesktopState>,
@@ -4543,10 +7787,18 @@ fn save_asset(
     scope: Option<String>,
     scope_kind: Option<String>,
     enabled: Option<bool>,
+    project_id: Option<String>,
 ) -> Result<(), String> {
     if !matches!(
         kind.as_str(),
-        "instructions" | "knowledge" | "playbook" | "skill" | "agents" | "mcp"
+        "instructions"
+            | "knowledge"
+            | "playbook"
+            | "skill"
+            | "agents"
+            | "mcp"
+            | "connectors"
+            | "blueprint"
     ) {
         return Err("unsupported asset kind".into());
     }
@@ -4575,6 +7827,7 @@ fn save_asset(
         Some("global") => "global",
         Some("repo") if scope_key.is_some() => "repo",
         Some("host") if scope_key.is_some() => "host",
+        Some("project") if project_id.as_deref().is_some_and(|id| !id.is_empty()) => "project",
         _ if scope_key.is_some() => "repo",
         _ => "global",
     };
@@ -4583,6 +7836,8 @@ fn save_asset(
     }
     let scope_key = if scope_kind == "global" {
         None
+    } else if scope_kind == "project" {
+        project_id
     } else {
         scope_key
     };
@@ -5074,6 +8329,121 @@ async fn discover_remote_assets(
 }
 
 #[tauri::command]
+async fn browse_skill_rules(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Value, String> {
+    let session = session_for(&state, &session_id)?;
+    let (host, workspace) = if session.host_id == "local" {
+        let workspace = if session.workspace.is_empty() {
+            default_local_workspace(&state, &session_id)?
+        } else {
+            session.workspace.clone()
+        };
+        let host = LocalHost::new(PathBuf::from(&workspace))
+            .map_err(|error| format!("本机 workspace 不可用: {error}"))?;
+        (Box::new(host) as Box<dyn Host>, workspace)
+    } else {
+        let client = client_for(&state, &session.host_id)?;
+        let health = client
+            .health()
+            .await
+            .map_err(|error| format!("remote host unavailable: {error}"))?;
+        let workspace = if session.workspace.is_empty() {
+            health
+                .workspace
+                .ok_or_else(|| "remote host did not provide a workspace".to_owned())?
+        } else {
+            session.workspace
+        };
+        (
+            Box::new(RvmHost::new(
+                session.host_id.clone(),
+                workspace.clone(),
+                client.with_workspace(workspace.clone()),
+            )) as Box<dyn Host>,
+            workspace,
+        )
+    };
+    let bundle = discover_assets(&HostAssetReader { host: host.into() }, &workspace)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(json!({
+        "skills": bundle.skills.into_iter().map(|item| json!({
+            "name": item.name,
+            "path": item.path,
+            "content": item.content,
+            "source": "repository"
+        })).collect::<Vec<_>>(),
+        "rules": bundle.agents.into_iter().map(|item| json!({
+            "path": item.path,
+            "content": item.content,
+            "source": if item.path.replace('\\', "/").contains("/.cursor/rules/") {
+                ".cursor/rules"
+            } else {
+                "repository"
+            }
+        })).collect::<Vec<_>>()
+    }))
+}
+
+#[tauri::command]
+fn skill_usage_dashboard(
+    state: State<'_, DesktopState>,
+    project_id: Option<String>,
+) -> Result<Value, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let project_filter = project_id
+        .as_deref()
+        .map(|_| " AND project_id=?1")
+        .unwrap_or("");
+    let params = project_id
+        .as_deref()
+        .map(|id| vec![id.to_owned()])
+        .unwrap_or_default();
+    let mut by_skill = connection
+        .prepare(&format!(
+            "SELECT skill_name,skill_path,source,COUNT(*),COUNT(DISTINCT session_id),MAX(used_at)
+             FROM skill_usage WHERE 1=1{project_filter}
+             GROUP BY skill_name,skill_path,source ORDER BY COUNT(*) DESC,skill_name"
+        ))
+        .map_err(|error| error.to_string())?;
+    let rows = by_skill
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok(json!({
+                "name": row.get::<_, String>(0)?,
+                "path": row.get::<_, String>(1)?,
+                "source": row.get::<_, String>(2)?,
+                "calls": row.get::<_, i64>(3)?,
+                "sessions": row.get::<_, i64>(4)?,
+                "last_used": row.get::<_, String>(5)?,
+            }))
+        })
+        .map_err(|error| error.to_string())?;
+    let skills = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut timeline = connection
+        .prepare(&format!(
+            "SELECT substr(used_at,1,10),COUNT(*) FROM skill_usage
+             WHERE 1=1{project_filter} GROUP BY substr(used_at,1,10) ORDER BY substr(used_at,1,10)"
+        ))
+        .map_err(|error| error.to_string())?;
+    let rows = timeline
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok(json!({"date": row.get::<_, String>(0)?, "calls": row.get::<_, i64>(1)?}))
+        })
+        .map_err(|error| error.to_string())?;
+    let timeline = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(json!({"skills": skills, "timeline": timeline}))
+}
+
+#[tauri::command]
 async fn mcp_tools(
     state: State<'_, DesktopState>,
     session_id: String,
@@ -5156,11 +8526,11 @@ async fn linear_graphql_token(token: &str, query: &str, variables: Value) -> Res
 
 async fn execute_linear_tool(
     secrets: &KeyringSecretStore,
+    project_id: Option<&str>,
     name: &str,
     arguments: Value,
 ) -> Result<Value, String> {
-    let token = secrets
-        .get(&secret_key("asset-secret", "linear-pat"))
+    let token = scoped_secret_get_from_store(secrets, project_id, "asset-secret", "linear-pat")
         .map_err(|error| format!("Linear PAT unavailable: {error}"))?
         .ok_or_else(|| "Linear PAT is not configured".to_owned())?;
     match name {
@@ -6553,8 +9923,148 @@ async fn github_json(
     connector_json(request, "GitHub").await
 }
 
+fn github_comment_is_bot(comment: &Value) -> bool {
+    comment
+        .get("user")
+        .and_then(|user| user.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("bot"))
+        || comment
+            .get("user")
+            .and_then(|user| user.get("login"))
+            .and_then(Value::as_str)
+            .is_some_and(|login| login.ends_with("[bot]"))
+}
+
+fn github_comment_allowed(comment: &Value, settings: &Value) -> Result<(), String> {
+    if github_comment_is_bot(comment)
+        && settings
+            .get("responding_to_bots")
+            .and_then(Value::as_str)
+            .unwrap_or("ignore")
+            != "respond"
+    {
+        return Err("bot comment ignored by Responding to bots".into());
+    }
+    if settings
+        .get("require_devin_mention")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let body = comment
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !body.contains("@devin") {
+            return Err("comment does not mention @Devin".into());
+        }
+    }
+    Ok(())
+}
+
+fn github_pr_coordinates(pr_url: &str) -> Result<(String, u64), String> {
+    if !pr_url.starts_with("https://github.com/") || !pr_url.contains("/pull/") {
+        return Err("expected a GitHub pull request URL".into());
+    }
+    let path = pr_url
+        .trim_start_matches("https://github.com/")
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    let parts = path.split('/').collect::<Vec<_>>();
+    if parts.len() < 4 || parts[2] != "pull" {
+        return Err("expected a valid GitHub pull request URL".into());
+    }
+    let repo = format!("{}/{}", parts[0], parts[1]);
+    let number = parts[3]
+        .parse::<u64>()
+        .map_err(|_| "expected a valid pull request number".to_owned())?;
+    Ok((repo, number))
+}
+
+#[tauri::command]
+async fn github_process_pull_request_comments(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    session_id: String,
+    pr_url: String,
+    token_secret: String,
+) -> Result<Value, String> {
+    let session = session_for(&state, &session_id)?;
+    let (repo, number) = github_pr_coordinates(&pr_url)?;
+    let settings = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        load_devin_settings(&connection, session.project_id.as_deref())?
+    };
+    let configured = scoped_secret_get(
+        &state,
+        session.project_id.as_deref(),
+        "asset-secret",
+        &token_secret,
+    )?
+    .or(scoped_secret_get(
+        &state,
+        session.project_id.as_deref(),
+        "connector-token",
+        "github",
+    )?)
+    .ok_or_else(|| "GitHub token is not configured".to_owned())?;
+    let issue_comments = github_json(
+        &configured,
+        reqwest::Method::GET,
+        &format!("https://api.github.com/repos/{repo}/issues/{number}/comments"),
+        None,
+    )
+    .await?;
+    let review_comments = github_json(
+        &configured,
+        reqwest::Method::GET,
+        &format!("https://api.github.com/repos/{repo}/pulls/{number}/comments"),
+        None,
+    )
+    .await?;
+    let mut comments = issue_comments.as_array().cloned().unwrap_or_default();
+    comments.extend(review_comments.as_array().cloned().unwrap_or_default());
+    let mut processed = Vec::new();
+    let mut skipped = Vec::new();
+    for comment in comments {
+        let id = comment.get("id").cloned().unwrap_or(Value::Null);
+        if let Err(reason) = github_comment_allowed(&comment, &settings) {
+            skipped.push(json!({"id": id, "reason": reason}));
+            continue;
+        }
+        let body = comment
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if body.is_empty() {
+            skipped.push(json!({"id": id, "reason": "empty comment"}));
+            continue;
+        }
+        let login = comment
+            .get("user")
+            .and_then(|user| user.get("login"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let prompt = format!("请处理 GitHub PR {pr_url} 上来自 @{login} 的评论：\n\n{body}");
+        let engine = engine_for(&app, &state, &session_id).await?;
+        engine
+            .submit_text(prompt)
+            .await
+            .map_err(engine_error_message)?;
+        processed.push(json!({"id": id, "login": login}));
+    }
+    Ok(json!({"processed": processed, "skipped": skipped}))
+}
+
 async fn execute_connector_tool(
     secrets: &KeyringSecretStore,
+    project_id: Option<&str>,
     name: &str,
     arguments: Value,
 ) -> Result<Value, String> {
@@ -6565,12 +10075,10 @@ async fn execute_connector_tool(
     } else {
         name.split('_').next().unwrap_or_default()
     };
-    let config = secrets
-        .get(&secret_key("connector-config", kind))
+    let config = scoped_secret_get_from_store(secrets, project_id, "connector-config", kind)
         .map_err(|error| format!("{kind} credentials unavailable: {error}"))?
         .or_else(|| {
-            secrets
-                .get(&secret_key("connector-token", kind))
+            scoped_secret_get_from_store(secrets, project_id, "connector-token", kind)
                 .ok()
                 .flatten()
                 .map(|token| json!({"token": token}).to_string())
@@ -6845,9 +10353,9 @@ async fn linear_create_session_from_issue(
     let mode = mode.unwrap_or_else(|| "Interactive".into());
     let mode = permission_mode_name(parse_permission_mode(&mode)?).to_owned();
     let now = Utc::now();
-    state
-        .store
-        .save_session(&SessionRecord {
+    save_session_via_factory(
+        &state,
+        SessionRecord {
             session_id: session_id.clone(),
             workspace,
             model: model.unwrap_or_else(|| "auto".into()),
@@ -6871,7 +10379,7 @@ async fn linear_create_session_from_issue(
             pinned: false,
             archived: false,
             origin: Some("linear".into()),
-            origin_label: Some(identifier.clone()),
+            origin_label: None,
             compaction: json!({}),
             host_id,
             provider,
@@ -6880,8 +10388,11 @@ async fn linear_create_session_from_issue(
             stop_reason: "none".into(),
             created_at: now,
             updated_at: now,
-        })
-        .map_err(|error| error.to_string())?;
+            project_id: None,
+            agent_id: None,
+        },
+        true,
+    )?;
     audit(
         &state,
         &session_id,
@@ -7072,14 +10583,260 @@ async fn read_blueprint(
     session_id: String,
 ) -> Result<Value, String> {
     let (host, _, _) = lifecycle_host(&state, &session_id).await?;
-    let content = host
-        .read(".devin/blueprint.yaml")
-        .await
-        .map_err(|error| error.to_string())?
-        .content;
+    let session = session_for(&state, &session_id)?;
+    let content = match project_blueprint_content(&state, session.project_id.as_deref())? {
+        Some(content) => content,
+        None => {
+            host.read(".devin/blueprint.yaml")
+                .await
+                .map_err(|error| error.to_string())?
+                .content
+        }
+    };
     let value: serde_yaml::Value =
         serde_yaml::from_str(&content).map_err(|error| format!("invalid blueprint: {error}"))?;
     serde_json::to_value(value).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn blueprint_status(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Value, String> {
+    let (host, _, _) = lifecycle_host(&state, &session_id).await?;
+    let session = session_for(&state, &session_id)?;
+    let (source, content) = match project_blueprint_content(&state, session.project_id.as_deref())?
+    {
+        Some(content) => (
+            configured_blueprint_scope(&state, session.project_id.as_deref())?
+                .unwrap_or_else(|| "global".into()),
+            content,
+        ),
+        None => (
+            "repository".to_owned(),
+            host.read(".devin/blueprint.yaml")
+                .await
+                .map_err(|error| error.to_string())?
+                .content,
+        ),
+    };
+    let parsed: Value = serde_yaml::from_str::<serde_yaml::Value>(&content)
+        .map_err(|error| format!("invalid blueprint: {error}"))
+        .and_then(|value| serde_json::to_value(value).map_err(|error| error.to_string()))?;
+    Ok(json!({"source": source, "content": content, "value": parsed}))
+}
+
+#[tauri::command]
+fn list_environment_repositories(
+    state: State<'_, DesktopState>,
+    project_id: Option<String>,
+) -> Result<Vec<Value>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let repositories = load_environment_repositories(&connection, project_id.as_deref())?;
+    Ok(repositories
+        .into_iter()
+        .enumerate()
+        .map(|(position, (repository, setup_command))| {
+            json!({
+                "position": position,
+                "repository": repository,
+                "setup_command": setup_command
+            })
+        })
+        .collect())
+}
+
+#[tauri::command]
+fn save_environment_repositories(
+    state: State<'_, DesktopState>,
+    project_id: Option<String>,
+    repositories: Vec<Value>,
+) -> Result<(), String> {
+    let scope = project_id
+        .as_deref()
+        .map(|id| format!("project:{id}"))
+        .unwrap_or_else(|| "global".to_owned());
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM environment_repositories WHERE scope=?1",
+            [&scope],
+        )
+        .map_err(|error| error.to_string())?;
+    for (position, item) in repositories.iter().enumerate() {
+        let repository = item
+            .get("repository")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if repository.is_empty() {
+            return Err("repository URL cannot be empty".into());
+        }
+        let setup = item
+            .get("setup_command")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        transaction
+            .execute(
+                "INSERT INTO environment_repositories(scope,position,repository,setup_command)
+                 VALUES (?1,?2,?3,?4)",
+                params![scope, position as i64, repository, setup],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn project_blueprint_content(
+    state: &DesktopState,
+    project_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let project_content = project_id
+        .map(|id| {
+            connection
+                .query_row(
+                    "SELECT v.content
+                     FROM config_object o
+                     JOIN config_object_version v ON v.id=o.current_version_id
+                     WHERE o.kind='blueprint' AND o.scope_kind='project'
+                       AND o.scope_key=?1 AND o.status='active'
+                     LIMIT 1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()
+        })
+        .transpose()
+        .map_err(|error| error.to_string())?
+        .flatten();
+    if project_content.is_some() {
+        return Ok(project_content);
+    }
+    connection
+        .query_row(
+            "SELECT v.content
+             FROM config_object o
+             JOIN config_object_version v ON v.id=o.current_version_id
+             LEFT JOIN project_config_selection selection
+               ON selection.project_id=?1 AND selection.object_id=o.id
+             WHERE o.kind='blueprint' AND o.scope_kind='global'
+               AND o.status='active' AND COALESCE(selection.enabled,1)=1
+             LIMIT 1",
+            [project_id.unwrap_or_default()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())
+}
+
+fn configured_blueprint_scope(
+    state: &DesktopState,
+    project_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    if let Some(project_id) = project_id {
+        let project_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM config_object
+                   WHERE kind='blueprint' AND scope_kind='project'
+                     AND scope_key=?1 AND status='active'
+                 )",
+                [project_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if project_exists {
+            return Ok(Some("project".into()));
+        }
+    }
+    let global_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM config_object o
+               LEFT JOIN project_config_selection selection
+                 ON selection.project_id=?1 AND selection.object_id=o.id
+               WHERE o.kind='blueprint' AND o.scope_kind='global'
+                 AND o.status='active' AND COALESCE(selection.enabled,1)=1
+             )",
+            [project_id.unwrap_or_default()],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(global_exists.then_some("global".into()))
+}
+
+fn load_environment_repositories(
+    connection: &Connection,
+    project_id: Option<&str>,
+) -> Result<Vec<(String, String)>, String> {
+    let project_scope = project_id.map(|id| format!("project:{id}"));
+    let scope = if let Some(scope) = project_scope.as_deref() {
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM environment_repositories WHERE scope=?1",
+                [scope],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if count > 0 {
+            scope.to_owned()
+        } else {
+            "global".to_owned()
+        }
+    } else {
+        "global".to_owned()
+    };
+    let mut statement = connection
+        .prepare(
+            "SELECT repository,setup_command FROM environment_repositories
+             WHERE scope=?1 ORDER BY position",
+        )
+        .map_err(|error| error.to_string())?;
+    statement
+        .query_map([scope], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+fn environment_repository_commands(
+    repositories: &[(String, String)],
+    platform: Option<&str>,
+) -> Vec<String> {
+    repositories
+        .iter()
+        .enumerate()
+        .flat_map(|(index, (repository, setup))| {
+            let target = format!("repository-{index}");
+            let mut commands = vec![format!(
+                "git clone {} {}",
+                quote_for(platform, repository),
+                quote_for(platform, &target)
+            )];
+            if !setup.trim().is_empty() {
+                commands.push(setup.trim().to_owned());
+            }
+            commands
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -7246,16 +11003,30 @@ async fn run_configured_lifecycle_stage(
     cwd: Option<String>,
 ) -> Result<Value, String> {
     let (host, _, workspace) = lifecycle_host(state, session_id).await?;
-    let blueprint = parse_blueprint(
-        &host
-            .read(".devin/blueprint.yaml")
-            .await
-            .map_err(|error| error.to_string())?
-            .content,
-    )
-    .map_err(|error| error.to_string())?;
+    let session = session_for(state, session_id)?;
+    let blueprint_content = match project_blueprint_content(state, session.project_id.as_deref())? {
+        Some(content) => content,
+        None => {
+            host.read(".devin/blueprint.yaml")
+                .await
+                .map_err(|error| error.to_string())?
+                .content
+        }
+    };
+    let blueprint = parse_blueprint(&blueprint_content).map_err(|error| error.to_string())?;
     let commands = match stage {
-        LifecycleStage::Clone => blueprint.clone,
+        LifecycleStage::Clone => {
+            let repositories = {
+                let connection = state
+                    .database
+                    .lock()
+                    .map_err(|_| "database lock poisoned")?;
+                load_environment_repositories(&connection, session.project_id.as_deref())?
+            };
+            let mut commands = environment_repository_commands(&repositories, None);
+            commands.extend(blueprint.clone);
+            commands
+        }
         LifecycleStage::Initialize => {
             let mut commands = blueprint.dependencies;
             commands.extend(blueprint.initialize);
@@ -7365,6 +11136,12 @@ async fn git_workflow(
         }));
     }
     let client = client_for(&state, &host_id)?.with_workspace(cwd.clone());
+    let platform = client
+        .health()
+        .await
+        .ok()
+        .and_then(|health| health.platform);
+    let quote = |value: &str| quote_for(platform.as_deref(), value);
     let command = match operation.as_str() {
         "branch" => git_branch_name(
             slug.as_deref().ok_or("branch slug is required")?,
@@ -7376,15 +11153,18 @@ async fn git_workflow(
             if files.is_empty() || files.iter().any(|path| path.trim().is_empty()) {
                 return Err("explicit files are required".into());
             }
-            files
-                .iter()
-                .map(|path| format!("git add -- {}", shell_quote(path)))
-                .collect::<Vec<_>>()
-                .join(" && ")
+            format!(
+                "git add -- {}",
+                files
+                    .iter()
+                    .map(|path| quote(path))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
         }
         "commit" => format!(
             "git commit -m {}",
-            shell_quote(message.as_deref().ok_or("commit message is required")?)
+            quote(message.as_deref().ok_or("commit message is required")?)
         ),
         "push" => "git push".into(),
         _ => return Err("unsupported git operation".into()),
@@ -7444,10 +11224,6 @@ async fn git_workflow(
     result.map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
 }
 
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn github_pull_request(
@@ -7460,8 +11236,27 @@ async fn github_pull_request(
     body: String,
     token_secret: String,
 ) -> Result<Value, String> {
-    if let Some(session_id) = session_id {
-        run_configured_lifecycle_stage(&state, &session_id, LifecycleStage::PrePush, None).await?;
+    let project_id = session_id
+        .as_deref()
+        .and_then(|id| state.store.load_session(id).ok().flatten())
+        .and_then(|session| session.project_id);
+    let settings = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        load_devin_settings(&connection, project_id.as_deref())?
+    };
+    if settings
+        .get("require_devin_mention")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && !body.contains("@Devin")
+    {
+        return Err("Pull request policy requires @Devin to respond".into());
+    }
+    if let Some(session_id) = session_id.as_deref() {
+        run_configured_lifecycle_stage(&state, session_id, LifecycleStage::PrePush, None).await?;
     }
     let token = state
         .secrets
@@ -7493,11 +11288,37 @@ async fn github_pull_request(
     } else {
         String::new()
     };
-    let body = if template_text.is_empty() {
+    let mut body = if template_text.is_empty() {
         body
     } else {
         format!("{template_text}\n\n{body}")
     };
+    if settings
+        .get("share_prompts_in_prs")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+        && let Some(session_id) = session_id.as_deref()
+        && let Ok(messages) = state.store.load_messages(session_id)
+    {
+        let prompts = messages
+            .into_iter()
+            .filter(|message| message.role == "user")
+            .filter_map(|message| {
+                message
+                    .content
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .and_then(|items| items.first())
+                    .and_then(|item| item.get("text"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        if !prompts.is_empty() {
+            body.push_str("\n\n## OPCOS prompts\n\n");
+            body.push_str(&prompts.join("\n\n"));
+        }
+    }
     if body.contains(&token)
         || title.contains(&token)
         || head.contains(&token)
@@ -7505,16 +11326,44 @@ async fn github_pull_request(
     {
         return Err("GitHub credential must not appear in PR fields".into());
     }
-    http.post(format!("https://api.github.com/repos/{repo}/pulls"))
+    let response: Value = http
+        .post(format!("https://api.github.com/repos/{repo}/pulls"))
         .header("User-Agent", "OPCOS/0.1")
-        .bearer_auth(token)
-        .json(&json!({"title":title,"head":head,"base":base,"body":body}))
+        .bearer_auth(&token)
+        .json(&json!({
+            "title":title,
+            "head":head,
+            "base":base,
+            "body":body,
+            "draft": settings.get("open_prs_as").and_then(Value::as_str) == Some("draft")
+        }))
         .send()
         .await
         .map_err(|error| error.to_string())?
         .json()
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    if settings
+        .get("auto_add_reviewer")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && let Some(reviewer) = settings
+            .get("reviewer")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        && let Some(number) = response.get("number").and_then(Value::as_u64)
+    {
+        let _ = http
+            .post(format!(
+                "https://api.github.com/repos/{repo}/pulls/{number}/requested_reviewers"
+            ))
+            .header("User-Agent", "OPCOS/0.1")
+            .bearer_auth(token)
+            .json(&json!({"reviewers": [reviewer]}))
+            .send()
+            .await;
+    }
+    Ok(response)
 }
 
 fn local_git_command(cwd: &str, args: &[&str]) -> Result<std::process::Output, String> {
@@ -7571,25 +11420,49 @@ fn local_git_status(cwd: &str) -> Result<Value, String> {
     }))
 }
 
+fn git_change_type(status: &str) -> &'static str {
+    match status.chars().next() {
+        Some('A') => "added",
+        Some('D') => "deleted",
+        Some('R') => "renamed",
+        _ => "modified",
+    }
+}
+
 fn local_git_changes(cwd: &str, base: &str) -> Result<Value, String> {
     let output = local_git_command(cwd, &["diff", "--numstat", base, "--"])?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
     }
+    let status_output = local_git_command(
+        cwd,
+        &["diff", "--name-status", "--find-renames", base, "--"],
+    )?;
+    if !status_output.status.success() {
+        return Err(String::from_utf8_lossy(&status_output.stderr)
+            .trim()
+            .to_owned());
+    }
+    let change_types = String::from_utf8_lossy(&status_output.stdout)
+        .lines()
+        .map(|line| git_change_type(line.split('\t').next().unwrap_or_default()))
+        .collect::<Vec<_>>();
     let branch_output = local_git_command(cwd, &["branch", "--show-current"])?;
     let branch = String::from_utf8_lossy(&branch_output.stdout)
         .trim()
         .to_owned();
     let files = String::from_utf8_lossy(&output.stdout)
         .lines()
+        .enumerate()
         .filter_map(|line| {
+            let (index, line) = line;
             let mut fields = line.splitn(3, '\t');
             let additions = fields.next()?.parse::<i64>().ok()?;
             let deletions = fields.next()?.parse::<i64>().ok()?;
             let path = fields.next()?.to_owned();
             Some(json!({
                 "path": path,
-                "changeType": "modified",
+                "changeType": change_types.get(index).copied().unwrap_or("modified"),
                 "additions": additions,
                 "deletions": deletions,
             }))
@@ -7694,8 +11567,84 @@ struct ScheduleInput {
     prompt: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum WorkflowGate {
+    #[serde(rename = "none")]
+    None,
+    #[serde(rename = "build+test")]
+    BuildTest,
+    #[serde(rename = "accept")]
+    Accept,
+    #[serde(rename = "pass")]
+    Pass,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct WorkflowStage {
+    stage: String,
+    roles: Vec<String>,
+    gate: WorkflowGate,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct WorkflowDefinition {
+    #[serde(default = "default_workflow_stages")]
+    workflow: Vec<WorkflowStage>,
+    #[serde(default = "default_workflow_serial")]
+    serial: bool,
+}
+
+fn default_workflow_serial() -> bool {
+    true
+}
+
+fn default_workflow_stages() -> Vec<WorkflowStage> {
+    vec![WorkflowStage {
+        stage: "plan".into(),
+        roles: vec!["Lead".into()],
+        gate: WorkflowGate::None,
+    }]
+}
+
+fn parse_workflow(value: &str) -> Result<WorkflowDefinition, String> {
+    let definition: WorkflowDefinition =
+        serde_json::from_str(value).map_err(|error| format!("invalid workflow_json: {error}"))?;
+    if definition.workflow.is_empty()
+        || definition
+            .workflow
+            .iter()
+            .any(|stage| stage.stage.trim().is_empty() || stage.roles.is_empty())
+    {
+        return Err("workflow must contain named stages with roles".into());
+    }
+    Ok(definition)
+}
+
+#[tauri::command]
+fn save_project_workflow(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    workflow_json: String,
+) -> Result<Value, String> {
+    let mut project = state
+        .store
+        .load_project(&project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    parse_workflow(&workflow_json)?;
+    project.workflow_json = workflow_json;
+    project.updated_at = Utc::now();
+    state
+        .store
+        .save_project(&project)
+        .map_err(|error| error.to_string())?;
+    Ok(json!({"project_id":project_id,"saved":true}))
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct CoordinationStartInput {
+    project_id: Option<String>,
     task_id: String,
     roles: Vec<Role>,
 }
@@ -7705,13 +11654,87 @@ async fn coordination_start(
     state: State<'_, DesktopState>,
     input: CoordinationStartInput,
 ) -> Result<Value, String> {
-    let runtime = CoordinationRuntime::new(input.roles).map_err(|error| error.to_string())?;
+    let project_id = input
+        .project_id
+        .clone()
+        .or_else(|| input.roles.first().map(|role| role.project_id.clone()))
+        .unwrap_or_default();
+    let mut runtime = CoordinationRuntime::new(input.roles).map_err(|error| error.to_string())?;
+    let persisted = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        load_persisted_coord_messages(&connection, &input.task_id)?
+    };
+    runtime
+        .restore_messages(persisted)
+        .map_err(|error| format!("stored coordination history is invalid: {error}"))?;
     state
         .coordination
         .lock()
         .await
         .insert(input.task_id.clone(), runtime);
-    Ok(json!({"task_id":input.task_id,"started":true}))
+    Ok(json!({"project_id":project_id,"task_id":input.task_id,"started":true}))
+}
+
+#[tauri::command]
+async fn coordination_start_project(
+    state: State<'_, DesktopState>,
+    project_id: String,
+) -> Result<Value, String> {
+    let agents = state
+        .store
+        .load_project_agents(&project_id)
+        .map_err(|error| error.to_string())?;
+    let roles = agents
+        .into_iter()
+        .map(|agent| {
+            Ok(Role {
+                project_id: project_id.clone(),
+                id: agent.id,
+                sort_order: agent.sort_order,
+                session_id: agent
+                    .session_id
+                    .ok_or_else(|| "all project members must have started sessions".to_owned())?,
+                state: match agent.state.as_str() {
+                    "Paused" | "paused" => opcos_engine::orchestration::RoleState::Paused,
+                    "Sleep" | "sleep" => opcos_engine::orchestration::RoleState::Sleep,
+                    _ => opcos_engine::orchestration::RoleState::Active,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let project = state
+        .store
+        .load_project(&project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    let workflow = parse_workflow(&project.workflow_json)?;
+    let task_id = format!("project-board:{project_id}");
+    let mut runtime = CoordinationRuntime::new(roles).map_err(|error| error.to_string())?;
+    let persisted = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        load_persisted_coord_messages(&connection, &task_id)?
+    };
+    runtime
+        .restore_messages(persisted)
+        .map_err(|error| format!("stored coordination history is invalid: {error}"))?;
+    state
+        .coordination
+        .lock()
+        .await
+        .insert(task_id.clone(), runtime);
+    Ok(json!({
+        "project_id": project_id,
+        "board_id": project.board_id,
+        "task_id": task_id,
+        "stage": workflow.workflow.first().map(|stage| &stage.stage),
+        "started": true
+    }))
 }
 
 #[tauri::command]
@@ -7722,14 +11745,495 @@ async fn coordination_message(
 ) -> Result<Value, String> {
     let envelope: Envelope = serde_json::from_value(envelope)
         .map_err(|_| "malformed coordination envelope".to_owned())?;
-    let mut runtimes = state.coordination.lock().await;
-    let runtime = runtimes
-        .get_mut(&task_id)
-        .ok_or_else(|| "coordination task is not started".to_owned())?;
-    runtime
-        .validate_and_record(&envelope, Utc::now())
-        .map_err(|error| error.to_string())?;
+    let worker_session = {
+        let mut runtimes = state.coordination.lock().await;
+        let runtime = runtimes
+            .get_mut(&task_id)
+            .ok_or_else(|| "coordination task is not started".to_owned())?;
+        runtime
+            .validate_and_record(&envelope, Utc::now())
+            .map_err(|error| error.to_string())?;
+        if envelope.kind == opcos_engine::orchestration::EnvelopeKind::Request {
+            Some(
+                runtime
+                    .role(&envelope.to)
+                    .ok_or_else(|| "coordination target role is unavailable".to_owned())?
+                    .session_id
+                    .clone(),
+            )
+        } else {
+            None
+        }
+    };
+    let project_id = connection_project_for_task(&state, &task_id)?;
+    persist_coord_message(&state, &project_id, &task_id, &envelope)?;
+    if let Some(worker_session) = worker_session {
+        let engine = state
+            .engines
+            .lock()
+            .await
+            .get(&worker_session)
+            .cloned()
+            .ok_or_else(|| "coordination target session is not started".to_owned())?;
+        engine
+            .queue_steering(envelope.encode(None).map_err(|error| error.to_string())?)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
     Ok(json!({"accepted":true,"msg_id":envelope.msg_id}))
+}
+
+fn connection_project_for_task(state: &DesktopState, task_id: &str) -> Result<String, String> {
+    state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .query_row(
+            "SELECT project_id FROM coord_tasks WHERE id=?1",
+            [task_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn persist_coord_message(
+    state: &DesktopState,
+    project_id: &str,
+    task_id: &str,
+    envelope: &Envelope,
+) -> Result<(), String> {
+    state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .execute(
+            "INSERT INTO coord_messages
+             (project_id,task_id,msg_id,from_role,to_role,kind,reply_to,payload,created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                project_id,
+                task_id,
+                envelope.msg_id,
+                envelope.from,
+                envelope.to,
+                serde_json::to_string(&envelope.kind).map_err(|error| error.to_string())?,
+                envelope.reply_to,
+                envelope.payload.to_string(),
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn load_persisted_coord_messages(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<Vec<(Envelope, DateTime<Utc>)>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT task_id,from_role,to_role,kind,msg_id,reply_to,payload,created_at
+             FROM coord_messages WHERE task_id=?1 ORDER BY created_at,msg_id",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([task_id], |row| {
+            let kind: String = row.get(3)?;
+            let payload: String = row.get(6)?;
+            let created_at: String = row.get(7)?;
+            Ok((
+                Envelope {
+                    v: 1,
+                    task_id: row.get(0)?,
+                    from: row.get(1)?,
+                    to: row.get(2)?,
+                    kind: serde_json::from_str(&format!("\"{kind}\"")).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    msg_id: row.get(4)?,
+                    reply_to: row.get(5)?,
+                    payload: serde_json::from_str(&payload).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            6,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                },
+                created_at.parse::<DateTime<Utc>>().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        7,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn project_workflow_snapshot(
+    state: State<'_, DesktopState>,
+    project_id: String,
+) -> Result<Value, String> {
+    let project = state
+        .store
+        .load_project(&project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    let workflow = parse_workflow(&project.workflow_json)?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let (stage_index, status): (i64, String) = connection
+        .query_row(
+            "SELECT stage_index,status FROM project_workflow_state WHERE project_id=?1",
+            [&project_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .unwrap_or((0, "open".to_owned()));
+    let tasks = load_project_tasks(&connection, &project_id)?;
+    let messages = load_project_messages(&connection, &project_id)?;
+    Ok(json!({
+        "project_id": project_id,
+        "workflow": workflow,
+        "stage_index": stage_index,
+        "status": status,
+        "tasks": tasks,
+        "messages": messages
+    }))
+}
+
+#[tauri::command]
+fn project_workflow_advance(
+    state: State<'_, DesktopState>,
+    project_id: String,
+) -> Result<Value, String> {
+    let project = state
+        .store
+        .load_project(&project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    let workflow = parse_workflow(&project.workflow_json)?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let (stage_index, _): (i64, String) = connection
+        .query_row(
+            "SELECT stage_index,status FROM project_workflow_state WHERE project_id=?1",
+            [&project_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .unwrap_or((0, "open".to_owned()));
+    let index = usize::try_from(stage_index).map_err(|_| "invalid workflow stage".to_owned())?;
+    let Some(stage) = workflow.workflow.get(index) else {
+        return Ok(json!({"project_id":project_id,"done":true,"stage_index":stage_index}));
+    };
+    let tasks = load_project_tasks(&connection, &project_id)?;
+    let relevant = tasks.iter().filter(|task| {
+        task.get("assignee")
+            .and_then(Value::as_str)
+            .is_some_and(|assignee| stage.roles.iter().any(|role| role == assignee))
+    });
+    let blocked = match stage.gate {
+        WorkflowGate::None => false,
+        WorkflowGate::BuildTest | WorkflowGate::Pass => {
+            relevant.clone().any(|task| task["phase"] != "Done")
+        }
+        WorkflowGate::Accept => relevant.clone().any(|task| {
+            task["phase"] != "Done"
+                || task
+                    .get("verified_pr_url")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+        }),
+    };
+    if blocked {
+        return Err(format!(
+            "workflow stage '{}' gate has not passed",
+            stage.stage
+        ));
+    }
+    let next = stage_index + 1;
+    connection
+        .execute(
+            "INSERT INTO project_workflow_state(project_id,stage_index,status,updated_at)
+             VALUES (?1,?2,?3,?4)
+             ON CONFLICT(project_id) DO UPDATE SET stage_index=excluded.stage_index,
+               status=excluded.status,updated_at=excluded.updated_at",
+            params![
+                project_id,
+                next,
+                if usize::try_from(next).unwrap_or(usize::MAX) >= workflow.workflow.len() {
+                    "done"
+                } else {
+                    "open"
+                },
+                Utc::now().to_rfc3339()
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(
+        json!({"project_id":project_id,"stage_index":next,"stage":workflow.workflow.get(next as usize)}),
+    )
+}
+
+fn load_project_tasks(connection: &Connection, project_id: &str) -> Result<Vec<Value>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id,title,phase,assignee,lease_generation,lease_until,require_acceptance,
+                    verified_pr_url,branch,pr
+             FROM coord_tasks WHERE project_id=?1 ORDER BY id",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([project_id], |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "title": row.get::<_, String>(1)?,
+                "phase": row.get::<_, String>(2)?,
+                "assignee": row.get::<_, Option<String>>(3)?,
+                "lease_generation": row.get::<_, i64>(4)?,
+                "lease_until": row.get::<_, Option<String>>(5)?,
+                "require_acceptance": row.get::<_, i64>(6)? != 0,
+                "verified_pr_url": row.get::<_, Option<String>>(7)?,
+                "branch": row.get::<_, Option<String>>(8)?,
+                "pr": row.get::<_, Option<String>>(9)?
+            }))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut tasks = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    for task in &mut tasks {
+        let id = task
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "coordination task has no id".to_owned())?;
+        let mut dependencies = connection
+            .prepare(
+                "SELECT depends_on FROM coord_task_dependencies
+                 WHERE task_id=?1 ORDER BY depends_on",
+            )
+            .map_err(|error| error.to_string())?;
+        let values = dependencies
+            .query_map([id], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        if let Some(object) = task.as_object_mut() {
+            object.insert("dependencies".into(), json!(values));
+        }
+    }
+    Ok(tasks)
+}
+
+fn load_project_messages(connection: &Connection, project_id: &str) -> Result<Vec<Value>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT task_id,msg_id,from_role,to_role,kind,reply_to,payload,created_at
+             FROM coord_messages WHERE project_id=?1 ORDER BY created_at",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([project_id], |row| {
+            Ok(json!({
+                "task_id": row.get::<_, String>(0)?,
+                "msg_id": row.get::<_, String>(1)?,
+                "from": row.get::<_, String>(2)?,
+                "to": row.get::<_, String>(3)?,
+                "kind": row.get::<_, String>(4)?,
+                "reply_to": row.get::<_, Option<String>>(5)?,
+                "payload": serde_json::from_str::<Value>(&row.get::<_, String>(6)?).unwrap_or(Value::Null),
+                "created_at": row.get::<_, String>(7)?
+            }))
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn coordination_ingest_session(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    full: Option<bool>,
+) -> Result<Value, String> {
+    coordination_ingest_session_inner(&state, &session_id, full.unwrap_or(true)).await
+}
+
+async fn coordination_ingest_session_inner(
+    state: &DesktopState,
+    session_id: &str,
+    full: bool,
+) -> Result<Value, String> {
+    let cursor = if full {
+        0
+    } else {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        connection
+            .query_row(
+                "SELECT sequence FROM coordination_ingest_cursor WHERE session_id=?1",
+                [session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .unwrap_or(0)
+    };
+    let messages = state
+        .store
+        .load_messages(session_id)
+        .map_err(|error| error.to_string())?;
+    let mut accepted = 0usize;
+    let mut skipped = 0usize;
+    let mut rejected = Vec::new();
+    let mut max_sequence = cursor;
+    for record in messages
+        .into_iter()
+        .filter(|record| record.sequence > cursor)
+    {
+        max_sequence = max_sequence.max(record.sequence);
+        if record.role != "assistant" {
+            continue;
+        }
+        let Some(text) = coordination_text(&record.content) else {
+            continue;
+        };
+        if !text.contains("[[COORD]]") {
+            continue;
+        }
+        let envelope = match Envelope::decode(&text) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                rejected.push(json!({
+                    "reason": format!("coordination circuit breaker tripped: {error}")
+                }));
+                continue;
+            }
+        };
+        let already_recorded = {
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            connection
+                .query_row(
+                    "SELECT 1 FROM coord_messages WHERE msg_id=?1",
+                    [&envelope.msg_id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .is_some()
+        };
+        if already_recorded {
+            skipped += 1;
+            continue;
+        }
+        let project_id = match connection_project_for_task(state, &envelope.task_id) {
+            Ok(project_id) => project_id,
+            Err(error) => {
+                rejected.push(json!({
+                    "msgId": envelope.msg_id,
+                    "reason": error
+                }));
+                continue;
+            }
+        };
+        let result = {
+            let mut runtimes = state.coordination.lock().await;
+            if let Some(runtime) = runtimes.get_mut(&envelope.task_id) {
+                let source_matches_session = runtime
+                    .role(&envelope.from)
+                    .is_some_and(|role| role.session_id == session_id);
+                if !source_matches_session {
+                    Err("coordination envelope source session does not match role".to_owned())
+                } else {
+                    runtime
+                        .validate_and_record(&envelope, Utc::now())
+                        .map_err(|error| error.to_string())
+                }
+            } else {
+                Err("coordination task is not started".to_owned())
+            }
+        };
+        if let Err(reason) = result {
+            rejected.push(json!({
+                "msgId": envelope.msg_id,
+                "reason": format!("coordination circuit breaker tripped: {reason}")
+            }));
+            continue;
+        }
+        if let Err(error) = persist_coord_message(state, &project_id, &envelope.task_id, &envelope)
+        {
+            rejected.push(json!({"msgId": envelope.msg_id, "reason": error}));
+        } else {
+            accepted += 1;
+        }
+    }
+    if !full {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        connection
+            .execute(
+                "INSERT INTO coordination_ingest_cursor(session_id,sequence) VALUES (?1,?2)
+                 ON CONFLICT(session_id) DO UPDATE SET sequence=excluded.sequence",
+                params![session_id, max_sequence],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(json!({
+        "session_id": session_id,
+        "accepted": accepted,
+        "skipped": skipped,
+        "rejected": rejected
+    }))
+}
+
+fn coordination_text(content: &Value) -> Option<String> {
+    if let Some(text) = content.as_str() {
+        return Some(text.to_owned());
+    }
+    if let Some(text) = content.get("text").and_then(Value::as_str) {
+        return Some(text.to_owned());
+    }
+    if let Some(text) = content.get("content").and_then(Value::as_str) {
+        return Some(text.to_owned());
+    }
+    content
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    item.get("text")
+                        .and_then(Value::as_str)
+                        .or_else(|| item.as_str())
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .filter(|text| !text.is_empty())
 }
 
 #[tauri::command]
@@ -7752,6 +12256,24 @@ async fn coordination_set_role_state(
     runtime
         .set_role_state(&role_id, role_state)
         .map_err(|error| error.to_string())?;
+    let project_id = runtime
+        .role(&role_id)
+        .map(|role| role.project_id.clone())
+        .ok_or_else(|| "coordination role is not available".to_owned())?;
+    drop(runtimes);
+    if let Some(mut agent) = state
+        .store
+        .load_project_agent(&role_id)
+        .map_err(|error| error.to_string())?
+    {
+        agent.state = state_name.clone();
+        state
+            .store
+            .save_project_agent(&agent)
+            .map_err(|error| error.to_string())?;
+    } else {
+        return Err(format!("project role not found: {project_id}/{role_id}"));
+    }
     Ok(json!({"task_id":task_id,"role_id":role_id,"state":state_name}))
 }
 
@@ -7759,6 +12281,7 @@ async fn coordination_set_role_state(
 async fn coordination_snapshot(
     state: State<'_, DesktopState>,
     task_id: String,
+    project_id: Option<String>,
 ) -> Result<Value, String> {
     let runtimes = state.coordination.lock().await;
     let runtime = runtimes
@@ -7772,10 +12295,13 @@ async fn coordination_snapshot(
             .lock()
             .map_err(|_| "database lock poisoned")?;
         let mut statement = connection
-            .prepare("SELECT id FROM coord_tasks ORDER BY id")
+            .prepare(
+                "SELECT id FROM coord_tasks
+                 WHERE (?1 IS NULL OR project_id=?1) ORDER BY id",
+            )
             .map_err(|error| error.to_string())?;
         let ids = statement
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([project_id], |row| row.get::<_, String>(0))
             .map_err(|error| error.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
@@ -7789,23 +12315,24 @@ async fn coordination_snapshot(
 fn load_coord_task(connection: &Connection, id: &str) -> Result<BoardTask, String> {
     connection
         .query_row(
-            "SELECT id,title,phase,assignee,lease_generation,lease_until,require_acceptance,verified_pr_url,branch,pr FROM coord_tasks WHERE id=?1",
+            "SELECT project_id,id,title,phase,assignee,lease_generation,lease_until,require_acceptance,verified_pr_url,branch,pr FROM coord_tasks WHERE id=?1",
             [id],
             |row| {
-                let phase: String = row.get(2)?;
-                let lease_until: Option<String> = row.get(5)?;
+                let phase: String = row.get(3)?;
+                let lease_until: Option<String> = row.get(6)?;
                 Ok(BoardTask {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
+                    project_id: row.get(0)?,
+                    id: row.get(1)?,
+                    title: row.get(2)?,
                     phase: serde_json::from_str(&format!("\"{phase}\""))
                         .unwrap_or(BoardPhase::Open),
-                    assignee: row.get(3)?,
-                    lease_generation: row.get::<_, i64>(4)? as u64,
+                    assignee: row.get(4)?,
+                    lease_generation: row.get::<_, i64>(5)? as u64,
                     lease_until: lease_until.and_then(|value| value.parse().ok()),
-                    require_acceptance: row.get::<_, i64>(6)? != 0,
-                    verified_pr_url: row.get(7)?,
-                    branch: row.get(8)?,
-                    pr: row.get(9)?,
+                    require_acceptance: row.get::<_, i64>(7)? != 0,
+                    verified_pr_url: row.get(8)?,
+                    branch: row.get(9)?,
+                    pr: row.get(10)?,
                 })
             },
         )
@@ -7819,8 +12346,9 @@ fn save_coord_task(connection: &Connection, task: &BoardTask) -> Result<(), Stri
         .to_owned();
     connection
         .execute(
-            "INSERT OR REPLACE INTO coord_tasks(id,title,phase,assignee,lease_generation,lease_until,require_acceptance,verified_pr_url,branch,pr) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            "INSERT OR REPLACE INTO coord_tasks(project_id,id,title,phase,assignee,lease_generation,lease_until,require_acceptance,verified_pr_url,branch,pr) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![
+                task.project_id,
                 task.id,
                 task.title,
                 phase,
@@ -7838,15 +12366,19 @@ fn save_coord_task(connection: &Connection, task: &BoardTask) -> Result<(), Stri
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn coordination_create_task(
     state: State<'_, DesktopState>,
     id: String,
+    project_id: Option<String>,
     title: String,
     require_acceptance: bool,
     branch: Option<String>,
     pr: Option<String>,
+    dependencies: Option<Vec<String>>,
 ) -> Result<Value, String> {
     let task = BoardTask {
+        project_id: project_id.unwrap_or_default(),
         id,
         title,
         phase: BoardPhase::Open,
@@ -7863,6 +12395,14 @@ fn coordination_create_task(
         .lock()
         .map_err(|_| "database lock poisoned")?;
     save_coord_task(&connection, &task)?;
+    for dependency in dependencies.unwrap_or_default() {
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO coord_task_dependencies(task_id,depends_on) VALUES (?1,?2)",
+                params![task.id, dependency],
+            )
+            .map_err(|error| error.to_string())?;
+    }
     serde_json::to_value(task).map_err(|error| error.to_string())
 }
 
@@ -7902,12 +12442,34 @@ fn coordination_renew_task(
 }
 
 #[tauri::command]
-fn coordination_complete_task(
+async fn coordination_complete_task(
     state: State<'_, DesktopState>,
     id: String,
     worker: String,
     verified_pr_url: Option<String>,
 ) -> Result<Value, String> {
+    let (initial_task, project) = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let task = load_coord_task(&connection, &id)?;
+        let project = if task.project_id.is_empty() {
+            None
+        } else {
+            Some(
+                state
+                    .store
+                    .load_project(&task.project_id)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "project not found for coordination task".to_owned())?,
+            )
+        };
+        (task, project)
+    };
+    if let Some(project) = project.as_ref() {
+        verify_task_delivery(&state, project, &initial_task, verified_pr_url.as_deref()).await?;
+    }
     let connection = state
         .database
         .lock()
@@ -7917,6 +12479,119 @@ fn coordination_complete_task(
         .map_err(|error| error.to_string())?;
     save_coord_task(&connection, &task)?;
     serde_json::to_value(task).map_err(|error| error.to_string())
+}
+
+async fn verify_task_delivery(
+    state: &State<'_, DesktopState>,
+    project: &ProjectRecord,
+    task: &BoardTask,
+    verified_pr_url: Option<&str>,
+) -> Result<(), String> {
+    let branch = task
+        .branch
+        .as_deref()
+        .ok_or_else(|| "completion requires a branch".to_owned())?;
+    let pr_url = verified_pr_url
+        .or(task.verified_pr_url.as_deref())
+        .or(task.pr.as_deref())
+        .ok_or_else(|| "completion requires a pull request URL".to_owned())?;
+    if !pr_url.starts_with("https://github.com/") || !pr_url.contains("/pull/") {
+        return Err("completion requires a GitHub pull request URL".into());
+    }
+    let path = pr_url
+        .trim_start_matches("https://github.com/")
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    let parts = path.split('/').collect::<Vec<_>>();
+    if parts.len() < 4 || parts[2] != "pull" {
+        return Err("completion requires a valid GitHub pull request URL".into());
+    }
+    let pr_repo = format!("{}/{}", parts[0], parts[1]);
+    let pr_number = parts[3]
+        .parse::<u64>()
+        .map_err(|_| "completion requires a valid pull request number".to_owned())?;
+    let repo = project
+        .repo_url
+        .trim_end_matches(".git")
+        .trim_start_matches("https://github.com/")
+        .trim_start_matches("http://github.com/")
+        .trim_start_matches("git@github.com:")
+        .trim_end_matches('/');
+    if !repo.is_empty() && repo != pr_repo {
+        return Err("pull request repository does not match the project repository".into());
+    }
+    let host = project_host(state, project).await?;
+    let platform = host.health().await.ok().and_then(|health| health.platform);
+    for command in [
+        format!(
+            "git -C {} rev-parse --verify refs/heads/{}",
+            quote_for(platform.as_deref(), &project.repo_root),
+            quote_for(platform.as_deref(), branch)
+        ),
+        format!(
+            "git -C {} ls-remote --exit-code origin refs/heads/{}",
+            quote_for(platform.as_deref(), &project.repo_root),
+            quote_for(platform.as_deref(), branch)
+        ),
+    ] {
+        let result = host
+            .exec(ExecRequest {
+                command,
+                cwd: None,
+                timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+                session: None,
+                env: None,
+            })
+            .await
+            .map_err(|error| format!("completion verification failed: {error}"))?;
+        if result.result.exit_code != 0 {
+            return Err(
+                "completion verification failed: branch is not committed and pushed".into(),
+            );
+        }
+    }
+    let configured = scoped_secret_get(state, Some(&project.id), "connector-config", "github")?
+        .or(scoped_secret_get(
+            state,
+            Some(&project.id),
+            "connector-token",
+            "github",
+        )?)
+        .or(scoped_secret_get(
+            state,
+            Some(&project.id),
+            "asset-secret",
+            "github-token",
+        )?)
+        .ok_or_else(|| "GitHub token is not configured for completion verification".to_owned())?;
+    let token = serde_json::from_str::<Value>(&configured)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("token")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or(configured);
+    let api_url = format!("https://api.github.com/repos/{pr_repo}/pulls/{pr_number}");
+    let response = github_json(&token, reqwest::Method::GET, &api_url, None).await?;
+    if response
+        .get("head")
+        .and_then(|head| head.get("ref"))
+        .and_then(Value::as_str)
+        != Some(branch)
+    {
+        return Err(
+            "completion verification failed: pull request branch does not match task branch".into(),
+        );
+    }
+    if response.get("state").and_then(Value::as_str) == Some("closed")
+        && response.get("merged").and_then(Value::as_bool) != Some(true)
+    {
+        return Err("completion verification failed: pull request is closed without merge".into());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -8204,10 +12879,7 @@ async fn run_schedule_for_inner(
     triggered.external_session_id = None;
     triggered.run_state = "idle".into();
     triggered.stop_reason = "none".into();
-    state
-        .store
-        .save_session(&triggered)
-        .map_err(|e| e.to_string())?;
+    save_session_via_factory(state, triggered, true)?;
     state
         .store
         .set_unattended(&session_id, true)
@@ -8608,41 +13280,56 @@ fn save_secret_metadata(
     scope: String,
     purpose: String,
     value: String,
+    project_id: Option<String>,
 ) -> Result<(), String> {
     if value.is_empty() {
         return Err("secret value cannot be empty".into());
     }
+    let key = project_id
+        .as_deref()
+        .map(|id| project_secret_key(id, "asset-secret", &name))
+        .unwrap_or_else(|| secret_key("asset-secret", &name));
     state
         .secrets
-        .set(&secret_key("asset-secret", &name), &value)
+        .set(&key, &value)
         .map_err(|error| error.to_string())?;
     state
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?
         .execute(
-            "INSERT OR REPLACE INTO secret_records(name,scope,purpose) VALUES (?1,?2,?3)",
-            params![name, scope, purpose],
+            "INSERT OR REPLACE INTO secret_records(name,scope,purpose,project_id) VALUES (?1,?2,?3,?4)",
+            params![name, scope, purpose, project_id.unwrap_or_default()],
         )
         .map_err(|error| error.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
-fn list_secret_metadata(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
+fn list_secret_metadata(
+    state: State<'_, DesktopState>,
+    project_id: Option<String>,
+) -> Result<Vec<Value>, String> {
     let connection = state
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?;
     let mut statement = connection
-        .prepare("SELECT name,scope,purpose FROM secret_records ORDER BY name")
+        .prepare(
+            "SELECT name,scope,purpose,project_id FROM secret_records
+             WHERE (?1 IS NULL AND project_id='')
+                OR (?1 IS NOT NULL AND (project_id=?1 OR project_id=''))
+             ORDER BY name",
+        )
         .map_err(|error| error.to_string())?;
     let rows = statement
-        .query_map([], |row| {
+        .query_map([project_id], |row| {
+            let project_id = row.get::<_, String>(3)?;
             Ok(json!({
                 "name": row.get::<_, String>(0)?,
                 "scope": row.get::<_, String>(1)?,
                 "purpose": row.get::<_, String>(2)?,
+                "project_id": if project_id.is_empty() { Value::Null } else { Value::String(project_id) },
             }))
         })
         .map_err(|error| error.to_string())?;
@@ -8651,16 +13338,27 @@ fn list_secret_metadata(state: State<'_, DesktopState>) -> Result<Vec<Value>, St
 }
 
 #[tauri::command]
-fn delete_secret_metadata(state: State<'_, DesktopState>, name: String) -> Result<(), String> {
+fn delete_secret_metadata(
+    state: State<'_, DesktopState>,
+    name: String,
+    project_id: Option<String>,
+) -> Result<(), String> {
+    let key = project_id
+        .as_deref()
+        .map(|id| project_secret_key(id, "asset-secret", &name))
+        .unwrap_or_else(|| secret_key("asset-secret", &name));
     state
         .secrets
-        .delete(&secret_key("asset-secret", &name))
+        .delete(&key)
         .map_err(|error| error.to_string())?;
     state
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?
-        .execute("DELETE FROM secret_records WHERE name=?1", [name])
+        .execute(
+            "DELETE FROM secret_records WHERE name=?1 AND project_id=?2",
+            params![name, project_id.unwrap_or_default()],
+        )
         .map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -8670,20 +13368,95 @@ fn save_provider_key(
     state: State<'_, DesktopState>,
     provider: String,
     key: String,
+    project_id: Option<String>,
 ) -> Result<(), String> {
     if key.trim().is_empty() {
         return Err("provider key cannot be empty".into());
     }
+    let secret_key_value = project_id
+        .as_deref()
+        .map(|id| project_secret_key(id, "provider-key", &provider))
+        .unwrap_or_else(|| secret_key("provider-key", &provider));
     state
         .secrets
-        .set(&secret_key("provider-key", &provider), &key)
+        .set(&secret_key_value, &key)
         .map_err(|error| error.to_string())?;
+    if let Some(project_id) = project_id {
+        record_project_secret(&state, &format!("provider-key:{provider}"), &project_id)?;
+    }
     audit(
         &state,
         "",
         "provider_key_saved",
         json!({"provider": provider}),
     );
+    Ok(())
+}
+
+#[tauri::command]
+fn save_mcp_credential(
+    state: State<'_, DesktopState>,
+    server_id: String,
+    value: String,
+    project_id: Option<String>,
+) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err("MCP credential cannot be empty".into());
+    }
+    let key = project_id
+        .as_deref()
+        .map(|id| project_secret_key(id, "mcp-credential", &server_id))
+        .unwrap_or_else(|| secret_key("mcp-credential", &server_id));
+    state
+        .secrets
+        .set(&key, &value)
+        .map_err(|error| error.to_string())?;
+    if let Some(project_id) = project_id {
+        record_project_secret(&state, &format!("mcp-credential:{server_id}"), &project_id)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn save_connector_token(
+    state: State<'_, DesktopState>,
+    kind: String,
+    value: String,
+    project_id: Option<String>,
+) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err("connector token cannot be empty".into());
+    }
+    let key = project_id
+        .as_deref()
+        .map(|id| project_secret_key(id, "connector-token", &kind))
+        .unwrap_or_else(|| secret_key("connector-token", &kind));
+    state
+        .secrets
+        .set(&key, &value)
+        .map_err(|error| error.to_string())?;
+    if let Some(project_id) = project_id {
+        record_project_secret(&state, &format!("connector-token:{kind}"), &project_id)?;
+    }
+    Ok(())
+}
+
+fn record_project_secret(state: &DesktopState, name: &str, project_id: &str) -> Result<(), String> {
+    state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .execute(
+            "INSERT OR REPLACE INTO secret_records(name,scope,purpose,project_id)
+             VALUES (?1,?2,?3,?4)",
+            params![
+                name,
+                format!("project:{project_id}"),
+                "project secret",
+                project_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -8723,6 +13496,189 @@ fn provider_settings(state: State<'_, DesktopState>) -> Result<Value, String> {
         )
         .ok();
     Ok(json!({"provider":provider,"base_url":base_url}))
+}
+
+#[tauri::command]
+fn devin_settings(
+    state: State<'_, DesktopState>,
+    project_id: Option<String>,
+) -> Result<Value, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    load_devin_settings(&connection, project_id.as_deref())
+}
+
+#[tauri::command]
+fn save_devin_settings(
+    state: State<'_, DesktopState>,
+    project_id: Option<String>,
+    value: Value,
+) -> Result<Value, String> {
+    let mut settings = default_devin_settings();
+    merge_settings(&mut settings, &value);
+    let object = settings
+        .as_object_mut()
+        .ok_or_else(|| "Devin settings must be an object".to_owned())?;
+    let batch_limit = object
+        .get("batch_limit")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "batch_limit must be an integer".to_owned())?;
+    if !(1..=500).contains(&batch_limit) {
+        return Err("batch_limit must be between 1 and 500".into());
+    }
+    let usage_limit = object
+        .get("message_usage_limit")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "message_usage_limit must be an integer".to_owned())?;
+    if usage_limit < 0 {
+        return Err("message_usage_limit cannot be negative".into());
+    }
+    let open_prs_as = object
+        .get("open_prs_as")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "open_prs_as must be draft or ready".to_owned())?;
+    if !matches!(open_prs_as, "draft" | "ready") {
+        return Err("open_prs_as must be draft or ready".into());
+    }
+    let scope = project_id
+        .as_deref()
+        .map(|id| format!("project:{id}"))
+        .unwrap_or_else(|| "global".into());
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    connection
+        .execute(
+            "INSERT INTO devin_settings(scope,value,updated_at) VALUES (?1,?2,?3)
+             ON CONFLICT(scope) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+            params![scope, settings.to_string(), Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(settings)
+}
+
+#[tauri::command]
+fn list_slash_commands(
+    state: State<'_, DesktopState>,
+    project_id: Option<String>,
+) -> Result<Vec<Value>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    effective_slash_commands(&connection, project_id.as_deref())
+}
+
+#[tauri::command]
+fn save_slash_command(
+    state: State<'_, DesktopState>,
+    project_id: Option<String>,
+    name: String,
+    body: String,
+    kind: String,
+) -> Result<(), String> {
+    let name = name.trim().to_owned();
+    if !name.starts_with('/') || name.contains(char::is_whitespace) {
+        return Err("command name must start with / and contain no spaces".into());
+    }
+    if body.trim().is_empty() {
+        return Err("command body cannot be empty".into());
+    }
+    if !matches!(kind.as_str(), "system" | "custom") {
+        return Err("command kind must be system or custom".into());
+    }
+    if kind == "system"
+        && !builtin_slash_commands()
+            .iter()
+            .any(|(builtin, _)| *builtin == name)
+    {
+        return Err("only built-in commands can use system kind".into());
+    }
+    let scope = project_id
+        .as_deref()
+        .map(|id| format!("project:{id}"))
+        .unwrap_or_else(|| "global".into());
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    connection
+        .execute(
+            "INSERT INTO slash_commands(scope,name,kind,body,updated_at)
+             VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT(scope,name) DO UPDATE SET kind=excluded.kind,body=excluded.body,updated_at=excluded.updated_at",
+            params![scope, name, kind, body, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_slash_command(
+    state: State<'_, DesktopState>,
+    project_id: Option<String>,
+    name: String,
+) -> Result<(), String> {
+    let scope = project_id
+        .as_deref()
+        .map(|id| format!("project:{id}"))
+        .unwrap_or_else(|| "global".into());
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let kind = connection
+        .query_row(
+            "SELECT kind FROM slash_commands WHERE scope=?1 AND name=?2",
+            params![scope, name],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| "command not found".to_owned())?;
+    if kind != "custom" {
+        return Err("system commands can be reset but not deleted".into());
+    }
+    connection
+        .execute(
+            "DELETE FROM slash_commands WHERE scope=?1 AND name=?2",
+            params![scope, name],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn reset_slash_commands(
+    state: State<'_, DesktopState>,
+    project_id: Option<String>,
+    name: Option<String>,
+) -> Result<(), String> {
+    let scope = project_id
+        .as_deref()
+        .map(|id| format!("project:{id}"))
+        .unwrap_or_else(|| "global".into());
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    if let Some(name) = name {
+        connection
+            .execute(
+                "DELETE FROM slash_commands WHERE scope=?1 AND name=?2 AND kind='system'",
+                params![scope, name],
+            )
+            .map_err(|error| error.to_string())?;
+    } else {
+        connection
+            .execute(
+                "DELETE FROM slash_commands WHERE scope=?1 AND kind='system'",
+                [scope],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -8891,6 +13847,7 @@ fn main() {
             eprintln!("secret_backend={secret_backend}");
             let mcp = Arc::new(McpManager::new(Arc::new(McpCredentialAdapter {
                 store: secrets.clone(),
+                project_id: None,
             })));
             let mut trigger_token_bytes = [0_u8; 32];
             getrandom::fill(&mut trigger_token_bytes).map_err(|error| {
@@ -9010,6 +13967,15 @@ fn main() {
             test_host,
             delete_host,
             create_session,
+            list_projects,
+            create_project,
+            create_project_from_team_template,
+            update_project,
+            delete_project,
+            list_project_agents,
+            create_project_agent,
+            update_project_agent,
+            delete_project_agent,
             harness_options,
             change_harness,
             list_sessions,
@@ -9033,6 +13999,17 @@ fn main() {
             provider_descriptors,
             provider_models,
             list_assets,
+            list_template_market,
+            save_template,
+            delete_template,
+            import_repository_templates,
+            export_template_to_repository,
+            save_project_agent_as_template,
+            save_project_as_team_template,
+            list_project_configuration_templates,
+            set_project_configuration_template,
+            restore_project_configuration,
+            override_project_configuration,
             save_asset,
             delete_asset,
             set_asset_enabled,
@@ -9061,6 +14038,7 @@ fn main() {
             git_branch_name_command,
             git_workflow,
             github_pull_request,
+            github_process_pull_request_comments,
             review_snapshot,
             review_file_diff,
             session_worklog,
@@ -9071,7 +14049,9 @@ fn main() {
             list_schedules,
             run_schedule,
             coordination_start,
+            coordination_start_project,
             coordination_message,
+            coordination_ingest_session,
             coordination_set_role_state,
             coordination_snapshot,
             coordination_create_task,
@@ -9079,13 +14059,29 @@ fn main() {
             coordination_renew_task,
             coordination_complete_task,
             coordination_accept_task,
+            project_workflow_snapshot,
+            project_workflow_advance,
+            save_project_workflow,
             save_secret_metadata,
             list_secret_metadata,
             delete_secret_metadata,
             provider_settings,
+            devin_settings,
+            save_devin_settings,
+            list_slash_commands,
+            save_slash_command,
+            delete_slash_command,
+            reset_slash_commands,
+            browse_skill_rules,
+            skill_usage_dashboard,
+            blueprint_status,
+            list_environment_repositories,
+            save_environment_repositories,
             provider_configurations,
             save_provider_settings,
             save_provider_key,
+            save_mcp_credential,
+            save_connector_token,
             delete_provider_key,
             validate_provider_key,
             start_surface,
@@ -9115,10 +14111,715 @@ mod m7_tests {
     use super::*;
 
     #[test]
+    fn builtin_template_seed_is_idempotent_and_never_overwrites_custom_content() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE config_object (
+                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+                   server_key TEXT, scope_kind TEXT NOT NULL, scope_key TEXT,
+                   status TEXT NOT NULL, created_at TEXT NOT NULL,
+                   current_version_id TEXT
+                 );
+                 CREATE TABLE config_object_version (
+                   id TEXT PRIMARY KEY, object_id TEXT NOT NULL, version INTEGER NOT NULL,
+                   content TEXT NOT NULL, content_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+                   note TEXT NOT NULL, metadata_json TEXT NOT NULL,
+                   UNIQUE(object_id,version)
+                 );
+                 INSERT INTO config_object VALUES
+                   ('template-agent-lead','agent-template','My Lead','my-lead',
+                    'template','custom','active','now','template-agent-lead:v1');
+                 INSERT INTO config_object_version VALUES
+                   ('template-agent-lead:v1','template-agent-lead',1,
+                    '{\"role\":\"Custom\"}','hash','now','custom','{}');",
+            )
+            .unwrap();
+        seed_builtin_templates(&connection).unwrap();
+        seed_builtin_templates(&connection).unwrap();
+        let custom: String = connection
+            .query_row(
+                "SELECT content FROM config_object_version
+                 WHERE id='template-agent-lead:v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(custom, r#"{"role":"Custom"}"#);
+        let builtin_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM config_object WHERE status='builtin'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(builtin_count, 7);
+    }
+
+    #[test]
+    fn selecting_a_global_preset_does_not_copy_its_content() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE config_object (
+                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+                   server_key TEXT, scope_kind TEXT NOT NULL, scope_key TEXT,
+                   status TEXT NOT NULL, created_at TEXT NOT NULL,
+                   current_version_id TEXT
+                 );
+                 CREATE TABLE config_object_version (
+                   id TEXT PRIMARY KEY, object_id TEXT NOT NULL, version INTEGER NOT NULL,
+                   content TEXT NOT NULL, content_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+                   note TEXT NOT NULL, metadata_json TEXT NOT NULL,
+                   UNIQUE(object_id,version)
+                 );
+                 INSERT INTO config_object VALUES
+                   ('template-rules','rules','Rules','rules','global',NULL,
+                    'active','now','template-rules:v1');
+                 INSERT INTO config_object_version VALUES
+                   ('template-rules:v1','template-rules',1,'before','hash','now','created','{}');",
+            )
+            .unwrap();
+        copy_config_templates(&connection, "project-1", &["template-rules".to_owned()]).unwrap();
+        let selected: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM project_config_selection
+                 WHERE project_id='project-1' AND object_id='template-rules' AND enabled=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(selected, 1);
+    }
+
+    #[test]
+    fn selecting_and_excluding_a_global_preset_is_reversible() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE config_object (
+                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+                   server_key TEXT, scope_kind TEXT NOT NULL, scope_key TEXT,
+                   status TEXT NOT NULL, created_at TEXT NOT NULL,
+                   current_version_id TEXT
+                 );
+                 CREATE TABLE config_object_version (
+                   id TEXT PRIMARY KEY, object_id TEXT NOT NULL, version INTEGER NOT NULL,
+                   content TEXT NOT NULL, content_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+                   note TEXT NOT NULL, metadata_json TEXT NOT NULL,
+                   UNIQUE(object_id,version)
+                 );
+                 INSERT INTO config_object VALUES
+                   ('template-rules','rules','Rules','rules','global',NULL,
+                    'active','now','template-rules:v1');
+                 INSERT INTO config_object_version VALUES
+                   ('template-rules:v1','template-rules',1,'before',
+                    'hash-before','now','created','{}');",
+            )
+            .unwrap();
+        copy_config_templates(&connection, "project-1", &["template-rules".to_owned()]).unwrap();
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO project_config_selection(project_id,object_id,enabled)
+                 VALUES ('project-1','template-rules',0)",
+                [],
+            )
+            .unwrap();
+        copy_config_templates(&connection, "project-1", &["template-rules".to_owned()]).unwrap();
+        let enabled: i64 = connection
+            .query_row(
+                "SELECT enabled FROM project_config_selection
+                 WHERE project_id='project-1' AND object_id='template-rules'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(enabled, 1);
+    }
+
+    #[test]
+    fn effective_configuration_combines_inheritance_overrides_exclusions_and_restore() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE config_object (
+                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+                   server_key TEXT, scope_kind TEXT NOT NULL, scope_key TEXT,
+                   status TEXT NOT NULL, created_at TEXT NOT NULL,
+                   current_version_id TEXT
+                 );
+                 CREATE TABLE config_object_version (
+                   id TEXT PRIMARY KEY, object_id TEXT NOT NULL, version INTEGER NOT NULL,
+                   content TEXT NOT NULL, content_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+                   note TEXT NOT NULL, metadata_json TEXT NOT NULL,
+                   UNIQUE(object_id,version)
+                 );
+                 CREATE TABLE project_config_selection (
+                   project_id TEXT NOT NULL, object_id TEXT NOT NULL,
+                   enabled INTEGER NOT NULL, PRIMARY KEY(project_id,object_id)
+                 );
+                 CREATE TABLE asset_session_selection (
+                   session_id TEXT NOT NULL, asset_id TEXT NOT NULL,
+                   enabled INTEGER NOT NULL, PRIMARY KEY(session_id,asset_id)
+                 );
+                 INSERT INTO config_object VALUES
+                   ('global-rules','rules','Rules','global-rules','global',NULL,
+                    'active','now','global-rules:v1'),
+                   ('project-rules','rules','Rules','project-rules','project','project-1',
+                    'active','now','project-rules:v1');
+                 INSERT INTO config_object_version VALUES
+                   ('global-rules:v1','global-rules',1,'global-value','h1','now','created','{}'),
+                   ('project-rules:v1','project-rules',1,'project-value','h2','now','created','{}');",
+            )
+            .unwrap();
+
+        let inherited =
+            effective_config_objects(&connection, "/workspace", "local", Some("project-1"), None)
+                .unwrap();
+        assert_eq!(
+            inherited,
+            vec![("project-rules".into(), "project-rules:v1".into())]
+        );
+
+        connection
+            .execute(
+                "UPDATE config_object SET status='deleted' WHERE id='project-rules'",
+                [],
+            )
+            .unwrap();
+        let global =
+            effective_config_objects(&connection, "/workspace", "local", Some("project-1"), None)
+                .unwrap();
+        assert_eq!(
+            global,
+            vec![("global-rules".into(), "global-rules:v1".into())]
+        );
+
+        connection
+            .execute(
+                "INSERT INTO project_config_selection(project_id,object_id,enabled)
+                 VALUES ('project-1','global-rules',0)",
+                [],
+            )
+            .unwrap();
+        assert!(
+            effective_config_objects(&connection, "/workspace", "local", Some("project-1"), None,)
+                .unwrap()
+                .is_empty()
+        );
+
+        connection
+            .execute(
+                "DELETE FROM project_config_selection
+                 WHERE project_id='project-1' AND object_id='global-rules'",
+                [],
+            )
+            .unwrap();
+        let restored =
+            effective_config_objects(&connection, "/workspace", "local", Some("project-1"), None)
+                .unwrap();
+        assert_eq!(
+            restored,
+            vec![("global-rules".into(), "global-rules:v1".into())]
+        );
+    }
+
+    #[test]
+    fn config_scope_migration_promotes_presets_and_preserves_project_selection() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE desktop_schema_migrations(
+                   version TEXT PRIMARY KEY, applied_at TEXT NOT NULL
+                 );
+                 CREATE TABLE config_object (
+                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+                   server_key TEXT, scope_kind TEXT NOT NULL, scope_key TEXT,
+                   status TEXT NOT NULL, created_at TEXT NOT NULL,
+                   current_version_id TEXT
+                 );
+                 CREATE TABLE config_object_version (
+                   id TEXT PRIMARY KEY, object_id TEXT NOT NULL, version INTEGER NOT NULL,
+                   content TEXT NOT NULL, content_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+                   note TEXT NOT NULL, metadata_json TEXT NOT NULL,
+                   UNIQUE(object_id,version)
+                 );
+                 INSERT INTO config_object VALUES
+                   ('template-rules','rules','Rules','rules','template','repo:/repo',
+                    'active','now','template-rules:v1'),
+                   ('project-same','rules','Rules','rules','project','project-1',
+                    'active','now','project-same:v1'),
+                   ('project-excluded','rules','Other','rules','project','project-1',
+                    'deleted','now','project-excluded:v1');
+                 INSERT INTO config_object_version VALUES
+                   ('template-rules:v1','template-rules',1,'same','h','now','created','{}'),
+                   ('project-same:v1','project-same',1,'same','h','now','copied',
+                    '{\"source_template_id\":\"template-rules\"}'),
+                   ('project-excluded:v1','project-excluded',1,'other','h2','now','copied',
+                    '{\"source_template_id\":\"template-rules\"}');",
+            )
+            .unwrap();
+        migrate_config_scope_model(&connection).unwrap();
+        let scope: (String, Option<String>) = connection
+            .query_row(
+                "SELECT scope_kind,scope_key FROM config_object WHERE id='template-rules'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(scope, ("global".into(), Some("repo:/repo".into())));
+        let same_status: String = connection
+            .query_row(
+                "SELECT status FROM config_object WHERE id='project-same'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(same_status, "deleted");
+        let excluded: i64 = connection
+            .query_row(
+                "SELECT enabled FROM project_config_selection
+                 WHERE project_id='project-1' AND object_id='template-rules'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(excluded, 0);
+    }
+
+    #[test]
+    fn repository_paths_are_resolved_from_project_root() {
+        let root = std::env::temp_dir().join(format!(
+            "opcos-repository-path-test-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let host = LocalHost::new(&root).unwrap();
+        let path = repository_path(
+            &host,
+            &root.display().to_string(),
+            ".agents/templates/agents",
+        )
+        .unwrap();
+        assert_eq!(path, format!("{}/.agents/templates/agents", root.display()));
+        let missing = repository_path(
+            &host,
+            &root.display().to_string(),
+            ".agents/templates/teams",
+        )
+        .unwrap();
+        assert_eq!(
+            missing,
+            format!("{}/.agents/templates/teams", root.display())
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn team_template_requires_lead_at_sort_order_zero() {
+        let members = vec![TeamTemplateAgent {
+            template_id: None,
+            name: Some("Code".into()),
+            role: Some("Code".into()),
+            provider: None,
+            model: None,
+            harness: None,
+            mode: None,
+            system_prompt: None,
+            branch: None,
+        }];
+        assert!(validate_team_template_members(&members).is_err());
+    }
+
+    #[test]
+    fn repository_template_yaml_round_trip_and_invalid_files_are_reported_individually() {
+        let source = r#"
+name: Demo Team
+description: A repository team
+workflow:
+  workflow:
+    - stage: plan
+      roles: [Lead]
+      gate: none
+agents:
+  - name: Lead
+    role: Lead
+"#;
+        let (value, name) = parse_repository_template(source, "teams/demo.yaml").unwrap();
+        assert_eq!(name, "Demo Team");
+        let json_content = serde_json::to_string(&value).unwrap();
+        let exported = repository_template_yaml(&json_content).unwrap();
+        let (_, round_trip_name) = parse_repository_template(&exported, "teams/demo.yaml").unwrap();
+        assert_eq!(round_trip_name, name);
+        let invalid = parse_repository_template("name: [", "teams/bad.yaml").unwrap_err();
+        assert!(invalid.contains("teams/bad.yaml"));
+        assert!(parse_repository_template("description: missing", "teams/missing.yaml").is_err());
+    }
+
+    #[test]
+    fn repository_import_does_not_overwrite_existing_custom_template() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE config_object (
+                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+                   server_key TEXT, scope_kind TEXT NOT NULL, scope_key TEXT,
+                   status TEXT NOT NULL, created_at TEXT NOT NULL,
+                   current_version_id TEXT
+                 );
+                 CREATE TABLE config_object_version (
+                   id TEXT PRIMARY KEY, object_id TEXT NOT NULL, version INTEGER NOT NULL,
+                   content TEXT NOT NULL, content_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+                   note TEXT NOT NULL, metadata_json TEXT NOT NULL,
+                   UNIQUE(object_id,version)
+                 );
+                 INSERT INTO config_object VALUES
+                   ('custom-agent','agent-template','Demo','custom-agent',
+                    'global','custom','active','now','custom-agent:v1');
+                 INSERT INTO config_object_version VALUES
+                   ('custom-agent:v1','custom-agent',1,'{\"role\":\"Custom\"}',
+                    'hash','now','custom','{}');",
+            )
+            .unwrap();
+        let result = import_repository_record(
+            &connection,
+            "agent-template",
+            "Demo",
+            "",
+            r#"{"role":"Repository"}"#,
+            "repo:/workspace",
+            ".agents/templates/agents/demo.yaml",
+        )
+        .unwrap();
+        assert_eq!(result, "conflict");
+        let content: String = connection
+            .query_row(
+                "SELECT content FROM config_object_version WHERE id='custom-agent:v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, r#"{"role":"Custom"}"#);
+    }
+
+    #[test]
+    fn repository_import_is_idempotent_and_versions_source_updates() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE config_object (
+                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+                   server_key TEXT, scope_kind TEXT NOT NULL, scope_key TEXT,
+                   status TEXT NOT NULL, created_at TEXT NOT NULL,
+                   current_version_id TEXT
+                 );
+                 CREATE TABLE config_object_version (
+                   id TEXT PRIMARY KEY, object_id TEXT NOT NULL, version INTEGER NOT NULL,
+                   content TEXT NOT NULL, content_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+                   note TEXT NOT NULL, metadata_json TEXT NOT NULL,
+                   UNIQUE(object_id,version)
+                 );",
+            )
+            .unwrap();
+        let scope = "repo:/workspace/demo";
+        assert_eq!(
+            import_repository_record(
+                &connection,
+                "agent-template",
+                "Demo",
+                "",
+                r#"{"role":"Code"}"#,
+                scope,
+                "agents/demo.yaml",
+            )
+            .unwrap(),
+            "imported"
+        );
+        assert_eq!(
+            import_repository_record(
+                &connection,
+                "agent-template",
+                "Demo",
+                "",
+                r#"{"role":"Code"}"#,
+                scope,
+                "agents/demo.yaml",
+            )
+            .unwrap(),
+            "unchanged"
+        );
+        assert_eq!(
+            import_repository_record(
+                &connection,
+                "agent-template",
+                "Demo",
+                "",
+                r#"{"role":"Review"}"#,
+                scope,
+                "agents/demo.yaml",
+            )
+            .unwrap(),
+            "updated"
+        );
+        assert_eq!(
+            import_repository_record(
+                &connection,
+                "agent-template",
+                "Demo",
+                "",
+                r#"{"role":"Code"}"#,
+                "repo:/workspace/other",
+                "agents/demo.yaml",
+            )
+            .unwrap(),
+            "imported"
+        );
+        let versions: i64 = connection
+            .query_row("SELECT COUNT(*) FROM config_object_version", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(versions, 3);
+    }
+
+    #[test]
+    fn global_secret_listing_excludes_project_names() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE secret_records (
+                   name TEXT NOT NULL, scope TEXT NOT NULL, purpose TEXT NOT NULL,
+                   project_id TEXT NOT NULL DEFAULT '', PRIMARY KEY(name, project_id)
+                 );
+                 INSERT INTO secret_records VALUES
+                   ('global-token','global','test',''),
+                   ('project-token','project:project-1','test','project-1');",
+            )
+            .unwrap();
+        let names = connection
+            .prepare(
+                "SELECT name FROM secret_records
+                 WHERE (?1 IS NULL AND project_id='')
+                    OR (?1 IS NOT NULL AND (project_id=?1 OR project_id=''))",
+            )
+            .unwrap()
+            .query_map([Option::<String>::None], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(names, vec!["global-token"]);
+    }
+
+    #[test]
+    fn project_secret_cleanup_covers_all_scoped_prefixes() {
+        assert_eq!(
+            project_secret_descriptor("provider-key:anthropic"),
+            ("provider-key", "anthropic")
+        );
+        assert_eq!(
+            project_secret_descriptor("mcp-credential:server-1"),
+            ("mcp-credential", "server-1")
+        );
+        assert_eq!(
+            project_secret_descriptor("connector-token:github"),
+            ("connector-token", "github")
+        );
+        assert_eq!(
+            project_secret_descriptor("asset-name"),
+            ("asset-secret", "asset-name")
+        );
+    }
+
+    #[test]
+    fn project_secret_cleanup_removes_all_scoped_values() {
+        let path = std::env::temp_dir().join(format!(
+            "opcos-secret-test-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let store = KeyringSecretStore::with_fallback("opcos-test", path.clone());
+        let project_id = "project-cleanup";
+        let names = vec![
+            "asset-name".to_owned(),
+            "provider-key:anthropic".to_owned(),
+            "mcp-credential:server".to_owned(),
+            "connector-token:github".to_owned(),
+        ];
+        for name in &names {
+            let (prefix, id) = project_secret_descriptor(name);
+            store
+                .set(&project_secret_key(project_id, prefix, id), "test")
+                .unwrap();
+        }
+        clear_project_secret_values(&store, project_id, &names).unwrap();
+        for name in &names {
+            let (prefix, id) = project_secret_descriptor(name);
+            assert!(
+                store
+                    .get(&project_secret_key(project_id, prefix, id))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn project_secret_key_isolated_from_legacy_global_key() {
+        assert_eq!(secret_key("asset-secret", "token"), "asset-secret:token");
+        assert_eq!(
+            project_secret_key("project-1", "asset-secret", "token"),
+            "project:project-1/asset-secret:token"
+        );
+        assert_ne!(
+            project_secret_key("project-1", "asset-secret", "token"),
+            secret_key("asset-secret", "token")
+        );
+    }
+
+    #[test]
+    fn skill_usage_records_only_active_injected_skills_with_project_scope() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE skill_usage (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   session_id TEXT NOT NULL,
+                   project_id TEXT,
+                   skill_name TEXT NOT NULL,
+                   skill_path TEXT NOT NULL,
+                   source TEXT NOT NULL,
+                   used_at TEXT NOT NULL
+                 );
+                 CREATE UNIQUE INDEX skill_usage_session_skill
+                   ON skill_usage(session_id,skill_path)",
+            )
+            .unwrap();
+        let bundle = AssetBundle {
+            skills: vec![
+                SkillEntry {
+                    name: "active".into(),
+                    path: ".agents/skills/active/SKILL.md".into(),
+                    content: "active".into(),
+                    active: true,
+                },
+                SkillEntry {
+                    name: "inactive".into(),
+                    path: ".agents/skills/inactive/SKILL.md".into(),
+                    content: "inactive".into(),
+                    active: false,
+                },
+            ],
+            ..AssetBundle::default()
+        };
+        record_skill_usage(&connection, "session-1", Some("project-1"), &bundle).unwrap();
+        record_skill_usage(&connection, "session-1", Some("project-1"), &bundle).unwrap();
+        let row: (String, String, String, String) = connection
+            .query_row(
+                "SELECT session_id,project_id,skill_name,source FROM skill_usage",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "session-1".into(),
+                "project-1".into(),
+                "active".into(),
+                "repository".into()
+            )
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM skill_usage", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn environment_repository_commands_preserve_saved_order() {
+        let repositories = vec![
+            (
+                "https://example.test/first.git".into(),
+                "setup-first".into(),
+            ),
+            (
+                "https://example.test/second.git".into(),
+                "setup-second".into(),
+            ),
+        ];
+        let commands = environment_repository_commands(&repositories, Some("linux"));
+        assert_eq!(
+            commands,
+            vec![
+                "git clone 'https://example.test/first.git' 'repository-0'",
+                "setup-first",
+                "git clone 'https://example.test/second.git' 'repository-1'",
+                "setup-second",
+            ]
+        );
+    }
+
+    #[test]
+    fn environment_repository_scope_prefers_project_order_over_global() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE environment_repositories (
+                   scope TEXT NOT NULL,
+                   position INTEGER NOT NULL,
+                   repository TEXT NOT NULL,
+                   setup_command TEXT NOT NULL DEFAULT '',
+                   PRIMARY KEY(scope,position)
+                 );
+                 INSERT INTO environment_repositories VALUES
+                   ('global',0,'global-first','global-setup'),
+                   ('project:p1',0,'project-first','project-setup');",
+            )
+            .unwrap();
+        assert_eq!(
+            load_environment_repositories(&connection, Some("p1")).unwrap(),
+            vec![("project-first".into(), "project-setup".into())]
+        );
+        assert_eq!(
+            load_environment_repositories(&connection, Some("p2")).unwrap(),
+            vec![("global-first".into(), "global-setup".into())]
+        );
+    }
+
+    #[test]
     fn branch_names_follow_devin_convention() {
         assert_eq!(
             git_branch_name("GitHub Workflow", 123).unwrap(),
             "devin/123-github-workflow"
+        );
+    }
+
+    #[test]
+    fn project_git_commands_quote_posix_and_windows_paths() {
+        let posix = git_worktree_add_command(
+            Some("linux"),
+            "/workspace/my repo",
+            "/workspace/my repo/worktrees/agent one",
+            "agent/code/review-1",
+            false,
+        );
+        assert_eq!(
+            posix,
+            "git -C '/workspace/my repo' worktree add '/workspace/my repo/worktrees/agent one' -b 'agent/code/review-1'"
+        );
+        let windows = git_worktree_add_command(
+            Some("windows"),
+            r"C:\workspace\my repo",
+            r"C:\workspace\my repo\worktrees\agent one",
+            "agent/code/review-1",
+            true,
+        );
+        assert_eq!(
+            windows,
+            r#"git -C "C:\workspace\my repo" worktree add "C:\workspace\my repo\worktrees\agent one" "agent/code/review-1""#
         );
     }
 
@@ -9363,6 +15064,8 @@ mod m7_tests {
             stop_reason: "none".into(),
             created_at: now,
             updated_at: now,
+            project_id: None,
+            agent_id: None,
         };
         assert!(
             session_view_for_host(&connection, session)
@@ -9487,5 +15190,241 @@ mod m7_tests {
         });
         overlay_running_tool_status("tool", &mut interrupted, &active);
         assert_eq!(interrupted["status"], "interrupted");
+    }
+
+    #[test]
+    fn devin_settings_project_override_changes_effective_behavior() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE devin_settings (
+                    scope TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO devin_settings(scope,value,updated_at)
+                 VALUES ('global',?1,'now'),('project:p1',?2,'now')",
+                params![
+                    json!({"computer_use":true,"batch_limit":50}).to_string(),
+                    json!({"computer_use":false,"batch_limit":2}).to_string()
+                ],
+            )
+            .unwrap();
+        let global = load_devin_settings(&connection, None).unwrap();
+        let project = load_devin_settings(&connection, Some("p1")).unwrap();
+        assert_eq!(global["computer_use"], true);
+        assert_eq!(global["batch_limit"], 50);
+        assert_eq!(project["computer_use"], false);
+        assert_eq!(project["batch_limit"], 2);
+    }
+
+    #[test]
+    fn devin_settings_defaults_are_real_runtime_limits() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE devin_settings (
+                    scope TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )",
+                [],
+            )
+            .unwrap();
+        let settings = load_devin_settings(&connection, None).unwrap();
+        assert_eq!(settings["batch_limit"], 50);
+        assert_eq!(settings["message_usage_limit"], 0);
+        assert_eq!(settings["open_prs_as"], "ready");
+        assert_eq!(settings["computer_use"], true);
+    }
+
+    #[test]
+    fn session_factory_separates_interactive_and_api_default_agents() {
+        let settings = json!({
+            "default_agent": "InteractiveAgent",
+            "api_default_agent": "AutomationAgent"
+        });
+        assert_eq!(
+            default_agent_for_creation(&settings, false),
+            "InteractiveAgent"
+        );
+        assert_eq!(
+            default_agent_for_creation(&settings, true),
+            "AutomationAgent"
+        );
+    }
+
+    #[test]
+    fn project_session_without_explicit_host_uses_member_worktree() {
+        let now = Utc::now();
+        let project = ProjectRecord {
+            id: "project-1".into(),
+            name: "Project".into(),
+            host_id: "rvm-1".into(),
+            repo_url: String::new(),
+            repo_root: "/workspace/repo".into(),
+            default_branch: "main".into(),
+            workflow_json: "{}".into(),
+            board_id: "board-1".into(),
+            archived: false,
+            created_at: now,
+            updated_at: now,
+        };
+        let agent = ProjectAgentRecord {
+            id: "agent-1".into(),
+            project_id: project.id.clone(),
+            sort_order: 1,
+            name: "Code".into(),
+            role: "Code".into(),
+            session_id: None,
+            provider: None,
+            model: "auto".into(),
+            harness: "builtin".into(),
+            mode: "Interactive".into(),
+            system_prompt: String::new(),
+            worktree_path: "/workspace/repo/.worktrees/code".into(),
+            branch: "code".into(),
+            state: "Active".into(),
+            created_at: now,
+            updated_at: now,
+        };
+        assert_eq!(
+            project_session_target(&project, &agent).unwrap(),
+            (
+                "rvm-1".to_owned(),
+                "/workspace/repo/.worktrees/code".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn project_creation_rejects_non_git_repository() {
+        let error = validate_git_repository_result(128, "", "/tmp/not-a-repository").unwrap_err();
+        assert!(error.contains("not a git repository"));
+        assert!(validate_git_repository_result(0, "true\n", "/tmp/repository").is_ok());
+    }
+
+    #[test]
+    fn project_worktree_container_is_ignored_but_user_changes_block_cleanup() {
+        assert_eq!(
+            filter_managed_worktree_status("?? worktrees/\n M README.md\n"),
+            " M README.md"
+        );
+        assert!(filter_managed_worktree_status("?? worktrees/agent-code-1/\n").is_empty());
+        assert_eq!(
+            filter_managed_worktree_status(" M worktrees-not-managed/file\n"),
+            " M worktrees-not-managed/file"
+        );
+    }
+
+    #[test]
+    fn git_change_types_map_name_status_codes() {
+        assert_eq!(git_change_type("A"), "added");
+        assert_eq!(git_change_type("M"), "modified");
+        assert_eq!(git_change_type("D"), "deleted");
+        assert_eq!(git_change_type("R100"), "renamed");
+    }
+
+    #[test]
+    fn github_comment_policy_handles_bot_and_mention_combinations() {
+        let human =
+            json!({"id":1,"body":"@Devin please inspect","user":{"type":"User","login":"alice"}});
+        let human_without_mention =
+            json!({"id":2,"body":"please inspect","user":{"type":"User","login":"alice"}});
+        let bot =
+            json!({"id":3,"body":"@Devin generated report","user":{"type":"Bot","login":"ci"}});
+        let bot_suffix = json!({"id":4,"body":"@Devin generated report","user":{"type":"User","login":"renovate[bot]"}});
+        let comments = [&human, &human_without_mention, &bot, &bot_suffix];
+        let cases = [
+            (false, false, vec![1, 2]),
+            (false, true, vec![1, 2, 3, 4]),
+            (true, false, vec![1]),
+            (true, true, vec![1, 3, 4]),
+        ];
+        for (require_mention, respond_to_bots, expected) in cases {
+            let settings = json!({
+                "require_devin_mention": require_mention,
+                "responding_to_bots": if respond_to_bots { "respond" } else { "ignore" }
+            });
+            let accepted = comments
+                .iter()
+                .filter(|comment| github_comment_allowed(comment, &settings).is_ok())
+                .map(|comment| comment["id"].as_i64().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(accepted, expected);
+        }
+    }
+
+    #[test]
+    fn slash_command_expansion_uses_project_override_and_arguments() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE slash_commands (
+                    scope TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(scope,name)
+                )",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO slash_commands(scope,name,kind,body,updated_at)
+                 VALUES ('project:p1','/review','system','项目审查模板','now'),
+                        ('global','/custom','custom','自定义模板','now')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            expand_slash_command(&connection, Some("p1"), "/review 查登录流程").unwrap(),
+            "项目审查模板\n\n查登录流程"
+        );
+        assert_eq!(
+            expand_slash_command(&connection, Some("p1"), "/custom").unwrap(),
+            "自定义模板"
+        );
+        assert_eq!(
+            expand_slash_command(&connection, Some("p1"), "普通消息").unwrap(),
+            "普通消息"
+        );
+    }
+
+    #[test]
+    fn builtin_slash_commands_are_available_without_storage_rows() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE slash_commands (
+                    scope TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(scope,name)
+                )",
+                [],
+            )
+            .unwrap();
+        let commands = effective_slash_commands(&connection, None).unwrap();
+        for name in [
+            "/implement",
+            "/plan",
+            "/review",
+            "/test",
+            "/think-hard",
+            "/deploy",
+            "/pull-project",
+        ] {
+            assert!(commands.iter().any(|item| item["name"] == name));
+        }
     }
 }

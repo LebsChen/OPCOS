@@ -37,6 +37,8 @@ pub enum EngineError {
     Interrupted,
     #[error("maximum iterations reached")]
     MaxIterations,
+    #[error("message usage limit reached")]
+    MessageUsageLimitReached,
     #[error("approval pending for tool call {0}")]
     ApprovalPending(String),
     #[error("approval already processed: {0}")]
@@ -373,6 +375,7 @@ pub struct TurnEngine<P, S, E> {
     gitlab_tools_enabled: AtomicBool,
     jira_tools_enabled: AtomicBool,
     stripe_tools_enabled: AtomicBool,
+    message_usage_limit: AtomicU64,
     active_tool_calls: StdMutex<HashSet<String>>,
     policy_denied: AtomicBool,
 }
@@ -455,6 +458,7 @@ where
             gitlab_tools_enabled: AtomicBool::new(false),
             jira_tools_enabled: AtomicBool::new(false),
             stripe_tools_enabled: AtomicBool::new(false),
+            message_usage_limit: AtomicU64::new(0),
             active_tool_calls: StdMutex::new(HashSet::new()),
             policy_denied: AtomicBool::new(false),
         }
@@ -493,6 +497,10 @@ where
             _ => return,
         };
         target.store(enabled, Ordering::SeqCst);
+    }
+
+    pub fn set_message_usage_limit(&self, limit: u64) {
+        self.message_usage_limit.store(limit, Ordering::SeqCst);
     }
 
     pub async fn submit_text(&self, text: impl Into<String>) -> Result<AssistantTurn, EngineError> {
@@ -625,6 +633,7 @@ where
             Err(EngineError::ContextExhausted(_)) => ("error", "context_exhausted"),
             Err(EngineError::Store(_)) => ("error", "internal_error"),
             Err(EngineError::MaxIterations) => ("error", "max_iterations"),
+            Err(EngineError::MessageUsageLimitReached) => ("error", "usage_limit"),
             Err(EngineError::ApprovalAlreadyProcessed(_)) => ("idle", "waiting_for_approval"),
         };
         if result.is_ok() && self.policy_denied.load(Ordering::SeqCst) {
@@ -965,6 +974,15 @@ where
                 Ok(turn) => {
                     usage = turn.usage.clone();
                     if let Some(value) = &turn.usage {
+                        let limit = self.message_usage_limit.load(Ordering::SeqCst);
+                        if limit > 0 && value.input.saturating_add(value.output) > limit {
+                            self.notice(
+                                "usage_limit",
+                                format!("Message usage limit reached ({limit} tokens)"),
+                            )
+                            .await?;
+                            return Err(EngineError::MessageUsageLimitReached);
+                        }
                         self.store
                             .append_usage(&UsageRecord {
                                 session_id: self.session_id.clone(),
@@ -2235,6 +2253,8 @@ mod tests {
                 stop_reason: "none".into(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
+                project_id: None,
+                agent_id: None,
             })
             .unwrap();
         let engine = Arc::new(TurnEngine::new(
@@ -2483,6 +2503,8 @@ mod tests {
                 stop_reason: "none".into(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
+                project_id: None,
+                agent_id: None,
             })
             .unwrap();
         store

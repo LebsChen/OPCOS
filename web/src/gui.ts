@@ -18,6 +18,40 @@ export type Session = {
   workspace?: string;
   run_state?: string;
   stop_reason?: string;
+  project_id?: string | null;
+  agent_id?: string | null;
+};
+
+export type ProjectAgent = {
+  id: string;
+  project_id: string;
+  sort_order: number;
+  name: string;
+  role: string;
+  session_id?: string | null;
+  provider?: string | null;
+  model: string;
+  harness: string;
+  mode: string;
+  system_prompt: string;
+  worktree_path: string;
+  branch: string;
+  state: string;
+};
+
+export type Project = {
+  id: string;
+  name: string;
+  host_id: string;
+  host_name: string;
+  repo_url: string;
+  repo_root: string;
+  default_branch: string;
+  workflow_json: string;
+  board_id: string;
+  archived: boolean;
+  online?: boolean | null;
+  agents: ProjectAgent[];
 };
 
 export type TranscriptItem = {
