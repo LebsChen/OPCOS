@@ -8024,6 +8024,7 @@ function AppContent() {
     >("harness_options", {
       hostId: homeHostId,
       workspace: homeWorkspace || null,
+      projectId: null,
     })
       .then((options) => {
         setHarnessOptions(options);
@@ -8035,7 +8036,7 @@ function AppContent() {
           setHomeHarness("builtin");
       })
       .catch(() => setHarnessOptions([]));
-  }, [homeHostId]);
+  }, [homeHostId, homeWorkspace]);
   useEffect(() => {
     if (!selected) return;
     void command<
@@ -8043,10 +8044,16 @@ function AppContent() {
     >("harness_options", {
       hostId: selected.host_id,
       workspace: selected.workspace || null,
+      projectId: selected.project_id || null,
     })
       .then(setSelectedHarnessOptions)
       .catch(() => setSelectedHarnessOptions([]));
-  }, [selected?.id, selected?.host_id]);
+  }, [
+    selected?.id,
+    selected?.host_id,
+    selected?.workspace,
+    selected?.project_id,
+  ]);
   useEffect(() => {
     if (!homeProvider && providers[0]) setHomeProvider(providers[0].name);
   }, [providers, homeProvider]);

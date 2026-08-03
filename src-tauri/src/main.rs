@@ -4351,6 +4351,20 @@ async fn opencode_for(
     Ok(harness)
 }
 
+fn select_acp_agent_content<I>(rows: I) -> Option<String>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut selected = Vec::<(String, String)>::new();
+    let mut seen_names = HashSet::new();
+    for (name, content) in rows {
+        if seen_names.insert(name.clone()) {
+            selected.push((name, content));
+        }
+    }
+    selected.into_iter().next().map(|(_, content)| content)
+}
+
 fn acp_agent_config(
     state: &DesktopState,
     project_id: Option<&str>,
@@ -4377,14 +4391,12 @@ fn acp_agent_config(
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
         .map_err(|error| error.to_string())?;
-    let mut selected = HashMap::<String, String>::new();
+    let mut candidates = Vec::new();
     for row in rows {
         let (name, content) = row.map_err(|error| error.to_string())?;
-        selected.entry(name).or_insert(content);
+        candidates.push((name, content));
     }
-    let (_name, content) = selected
-        .into_iter()
-        .next()
+    let content = select_acp_agent_content(candidates)
         .ok_or_else(|| "ACP unavailable: no ACP agent command is configured".to_owned())?;
     let value: Value = serde_json::from_str(&content)
         .map_err(|error| format!("invalid ACP agent config: {error}"))?;
@@ -5618,6 +5630,7 @@ async fn change_harness(
             state.clone(),
             session.host_id.clone(),
             (!session.workspace.is_empty()).then_some(session.workspace.clone()),
+            session.project_id.clone(),
         )
         .await?;
         let option = options
@@ -5654,6 +5667,7 @@ async fn harness_options(
     state: State<'_, DesktopState>,
     host_id: String,
     workspace: Option<String>,
+    project_id: Option<String>,
 ) -> Result<Vec<HarnessAvailability>, String> {
     let mut options = vec![HarnessAvailability {
         id: "builtin".into(),
@@ -5679,9 +5693,8 @@ async fn harness_options(
     };
     let capabilities = host.capabilities().await.map_err(|e| e.to_string())?;
     let stdio = capabilities.items.iter().find(|item| item.name == "stdio");
-    let acp_option = if let Some(stdio) = stdio.filter(|item| item.available) {
-        let _ = stdio;
-        match acp_agent_config(&state, None) {
+    let acp_option = if stdio.is_some_and(|item| item.available) {
+        match acp_agent_config(&state, project_id.as_deref()) {
             Ok(config) => {
                 let executable = config.command.split_whitespace().next().unwrap_or_default();
                 let probe = host
@@ -6663,7 +6676,18 @@ async fn submit_acp_turn(
     state: State<'_, DesktopState>,
     request: SubmitRequest,
 ) -> Result<(), String> {
-    let harness = acp_for(&state, &request.session_id).await?;
+    let harness = match acp_for(&state, &request.session_id).await {
+        Ok(harness) => harness,
+        Err(error) => {
+            emit(
+                &app,
+                "notice",
+                Some(&request.session_id),
+                json!({"kind":"error","text":error}),
+            );
+            return Err(error);
+        }
+    };
     let start_events = {
         let mut sessions = state.acp_event_sessions.lock().await;
         sessions.insert(request.session_id.clone())
@@ -14640,6 +14664,24 @@ fn main() {
 #[cfg(test)]
 mod m7_tests {
     use super::*;
+
+    #[test]
+    fn acp_agent_selection_preserves_scope_and_name_order() {
+        assert_eq!(
+            select_acp_agent_content(vec![
+                ("claude".into(), r#"{"command":"global"}"#.into()),
+                ("other".into(), r#"{"command":"other"}"#.into()),
+            ]),
+            Some(r#"{"command":"global"}"#.into())
+        );
+        assert_eq!(
+            select_acp_agent_content(vec![
+                ("claude".into(), r#"{"command":"project"}"#.into()),
+                ("claude".into(), r#"{"command":"global"}"#.into()),
+            ]),
+            Some(r#"{"command":"project"}"#.into())
+        );
+    }
 
     #[test]
     fn builtin_template_seed_is_idempotent_and_never_overwrites_custom_content() {
