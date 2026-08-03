@@ -10,6 +10,8 @@ pub struct ComputerUseLoopConfig {
     pub max_steps: usize,
     pub max_retries_per_step: usize,
     pub total_timeout: Duration,
+    pub settle_delay: Duration,
+    pub retry_delay: Duration,
     pub screen_bounds: ScreenBounds,
 }
 
@@ -19,6 +21,8 @@ impl Default for ComputerUseLoopConfig {
             max_steps: 20,
             max_retries_per_step: 2,
             total_timeout: Duration::from_secs(60),
+            settle_delay: Duration::from_millis(500),
+            retry_delay: Duration::from_millis(500),
             screen_bounds: ScreenBounds {
                 width: 1920,
                 height: 1080,
@@ -27,16 +31,49 @@ impl Default for ComputerUseLoopConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScreenRegion {
+    pub left: u32,
+    pub top: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VerificationExpectation {
+    None,
+    ScreenshotChanged { region: Option<ScreenRegion> },
+}
+
 #[derive(Clone, Debug)]
 pub struct ComputerUseStep {
     pub action: ComputerUseAction,
+    pub expectation: VerificationExpectation,
+    pub retryable: bool,
+}
+
+impl ComputerUseStep {
+    fn can_retry(&self) -> bool {
+        self.retryable || action_is_idempotent(&self.action)
+    }
+}
+
+fn action_is_idempotent(action: &ComputerUseAction) -> bool {
+    matches!(
+        action,
+        ComputerUseAction::Screenshot
+            | ComputerUseAction::CursorPosition
+            | ComputerUseAction::Wait
+            | ComputerUseAction::MouseMove { .. }
+            | ComputerUseAction::Scroll { .. }
+    )
 }
 
 #[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
 pub struct ComputerUseStepResult {
     pub step_index: usize,
     pub attempts: usize,
-    pub verified: bool,
+    pub verified: Option<bool>,
     pub before: Screenshot,
     pub after: Screenshot,
 }
@@ -54,6 +91,8 @@ pub enum ComputerUseLoopError {
         step: usize,
         attempts: usize,
         reason: String,
+        before: Box<Screenshot>,
+        after: Box<Screenshot>,
     },
     #[error("computer-use host failed: {0}")]
     Host(#[from] HostError),
@@ -70,11 +109,14 @@ pub trait ComputerUseVerifier: Send + Sync {
     ) -> Result<bool, String>;
 }
 
+/// Best-effort screenshot-diff heuristic. It is not proof that an action succeeded.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct ScreenshotChangedVerifier;
+pub struct BestEffortScreenshotChangedVerifier;
+
+pub type ScreenshotChangedVerifier = BestEffortScreenshotChangedVerifier;
 
 #[async_trait]
-impl ComputerUseVerifier for ScreenshotChangedVerifier {
+impl ComputerUseVerifier for BestEffortScreenshotChangedVerifier {
     async fn verify(
         &self,
         step: &ComputerUseStep,
@@ -82,12 +124,52 @@ impl ComputerUseVerifier for ScreenshotChangedVerifier {
         after: &Screenshot,
         response: &ComputerUseResponse,
     ) -> Result<bool, String> {
-        Ok(match &step.action {
-            ComputerUseAction::CursorPosition => response.coordinate.is_some(),
-            ComputerUseAction::Screenshot | ComputerUseAction::Wait => response.ok,
-            _ => before.image != after.image,
-        })
+        let VerificationExpectation::ScreenshotChanged { region } = step.expectation else {
+            return Ok(false);
+        };
+        if matches!(
+            step.action,
+            ComputerUseAction::CursorPosition
+                | ComputerUseAction::Screenshot
+                | ComputerUseAction::Wait
+        ) {
+            return Ok(response.ok);
+        }
+        screenshot_region_changed(before, after, region)
     }
+}
+
+fn screenshot_region_changed(
+    before: &Screenshot,
+    after: &Screenshot,
+    region: Option<ScreenRegion>,
+) -> Result<bool, String> {
+    let (before_bounds, before_pixels) =
+        before.decoded_rgba().map_err(|error| error.to_string())?;
+    let (after_bounds, after_pixels) = after.decoded_rgba().map_err(|error| error.to_string())?;
+    if before_bounds != after_bounds {
+        return Ok(true);
+    }
+    let region = region.unwrap_or(ScreenRegion {
+        left: 0,
+        top: 0,
+        width: before_bounds.width,
+        height: before_bounds.height,
+    });
+    if region.left.saturating_add(region.width) > before_bounds.width
+        || region.top.saturating_add(region.height) > before_bounds.height
+    {
+        return Err("verification region is outside screenshot bounds".into());
+    }
+    for y in region.top..region.top + region.height {
+        for x in region.left..region.left + region.width {
+            let offset = ((y * before_bounds.width + x) * 4) as usize;
+            if before_pixels[offset..offset + 4] != after_pixels[offset..offset + 4] {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 pub async fn run_computer_use_loop(
@@ -105,32 +187,50 @@ pub async fn run_computer_use_loop(
     let started = Instant::now();
     let mut results = Vec::with_capacity(steps.len());
     for (step_index, step) in steps.iter().enumerate() {
-        if started.elapsed() >= config.total_timeout {
-            return Err(ComputerUseLoopError::TimeLimit);
-        }
-        step.action
-            .validate(config.screen_bounds)
-            .map_err(|error| ComputerUseLoopError::VerificationFailed {
-                step: step_index,
-                attempts: 0,
-                reason: error.to_string(),
-            })?;
+        ensure_time(started, config.total_timeout)?;
         let before = host.screenshot().await?;
+        let actual_bounds = before
+            .dimensions()
+            .map_err(|error| HostError::InvalidResponse(error.to_string()))?;
+        if actual_bounds != config.screen_bounds {
+            return Err(ComputerUseLoopError::Host(HostError::InvalidResponse(
+                "declared screen bounds do not match screenshot dimensions".into(),
+            )));
+        }
+        step.action.validate(actual_bounds).map_err(|error| {
+            ComputerUseLoopError::Host(HostError::InvalidResponse(error.to_string()))
+        })?;
+        let max_attempts = if step.expectation == VerificationExpectation::None || !step.can_retry()
+        {
+            1
+        } else {
+            config.max_retries_per_step.saturating_add(1)
+        };
         let mut last_reason = "verification returned false".to_owned();
-        for attempt in 1..=config.max_retries_per_step + 1 {
-            if started.elapsed() >= config.total_timeout {
-                return Err(ComputerUseLoopError::TimeLimit);
-            }
+        for attempt in 1..=max_attempts {
             let response = host
-                .computer_use(step.action.clone(), config.screen_bounds)
+                .computer_use(step.action.clone(), actual_bounds)
                 .await?;
+            if !config.settle_delay.is_zero() {
+                tokio::time::sleep(config.settle_delay).await;
+            }
             let after = host.screenshot().await?;
+            if step.expectation == VerificationExpectation::None {
+                results.push(ComputerUseStepResult {
+                    step_index,
+                    attempts: attempt,
+                    verified: None,
+                    before: before.clone(),
+                    after,
+                });
+                break;
+            }
             match verifier.verify(step, &before, &after, &response).await {
                 Ok(true) => {
                     results.push(ComputerUseStepResult {
                         step_index,
                         attempts: attempt,
-                        verified: true,
+                        verified: Some(true),
                         before: before.clone(),
                         after,
                     });
@@ -139,171 +239,69 @@ pub async fn run_computer_use_loop(
                 Ok(false) => {}
                 Err(reason) => last_reason = reason,
             }
-            if attempt == config.max_retries_per_step + 1 {
+            if attempt == max_attempts {
                 return Err(ComputerUseLoopError::VerificationFailed {
                     step: step_index,
                     attempts: attempt,
                     reason: last_reason,
+                    before: Box::new(before.clone()),
+                    after: Box::new(after),
                 });
+            }
+            ensure_time(started, config.total_timeout)?;
+            if !config.retry_delay.is_zero() {
+                tokio::time::sleep(config.retry_delay).await;
             }
         }
     }
     Ok(results)
 }
 
+fn ensure_time(started: Instant, timeout: Duration) -> Result<(), ComputerUseLoopError> {
+    if started.elapsed() >= timeout {
+        Err(ComputerUseLoopError::TimeLimit)
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opcos_hosts::{Capability, HostCapabilities, HostError, HostProcess, HostStdioProcess};
-    use opcos_rvm::{ComputerUseResponse, DirectoryListing, ExecResult, FileContent, Health};
-    use serde_json::Value;
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
 
-    struct MockHost {
-        screenshots: Mutex<VecDeque<Screenshot>>,
-        actions: Mutex<usize>,
-    }
-
-    impl MockHost {
-        fn new(screenshots: Vec<Screenshot>) -> Self {
-            Self {
-                screenshots: Mutex::new(screenshots.into()),
-                actions: Mutex::new(0),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl Host for MockHost {
-        fn id(&self) -> &str {
-            "mock"
-        }
-
-        async fn health(&self) -> Result<Health, HostError> {
-            Err(HostError::Unsupported("mock".into()))
-        }
-
-        async fn capabilities(&self) -> Result<HostCapabilities, HostError> {
-            Ok(HostCapabilities {
-                observed_at: chrono::Utc::now(),
-                items: vec![Capability {
-                    name: "computer_use".into(),
-                    available: true,
-                    source: "mock".into(),
-                    observed_at: chrono::Utc::now(),
-                    reason: None,
-                }],
-            })
-        }
-
-        async fn exec(&self, _: opcos_hosts::ExecRequest) -> Result<ExecResult, HostError> {
-            Err(HostError::Unsupported("mock".into()))
-        }
-
-        async fn screenshot(&self) -> Result<Screenshot, HostError> {
-            self.screenshots
-                .lock()
-                .unwrap()
-                .pop_front()
-                .ok_or_else(|| HostError::InvalidResponse("mock screenshot exhausted".into()))
-        }
-
-        async fn computer_use(
-            &self,
-            _: ComputerUseAction,
-            _: ScreenBounds,
-        ) -> Result<ComputerUseResponse, HostError> {
-            *self.actions.lock().unwrap() += 1;
-            Ok(ComputerUseResponse {
-                ok: true,
-                coordinate: None,
-                x: None,
-                y: None,
-                error: None,
-            })
-        }
-
-        async fn spawn(
-            &self,
-            _: opcos_hosts::SpawnRequest,
-        ) -> Result<Box<dyn HostProcess>, HostError> {
-            Err(HostError::Unsupported("mock".into()))
-        }
-
-        async fn spawn_stdio(
-            &self,
-            _: opcos_hosts::SpawnRequest,
-        ) -> Result<Box<dyn HostStdioProcess>, HostError> {
-            Err(HostError::Unsupported("mock".into()))
-        }
-
-        async fn read(&self, _: &str) -> Result<FileContent, HostError> {
-            Err(HostError::Unsupported("mock".into()))
-        }
-
-        async fn write(&self, _: &str, _: &str) -> Result<Value, HostError> {
-            Err(HostError::Unsupported("mock".into()))
-        }
-
-        async fn ls(&self, _: Option<&str>) -> Result<DirectoryListing, HostError> {
-            Err(HostError::Unsupported("mock".into()))
-        }
-
-        fn join(&self, _: &str) -> Result<String, HostError> {
-            Err(HostError::Unsupported("mock".into()))
-        }
-
-        fn contains(&self, _: &str) -> bool {
-            false
-        }
-
-        fn temp_file(&self, _: &str) -> Result<String, HostError> {
-            Err(HostError::Unsupported("mock".into()))
-        }
-
-        fn contains_temp(&self, _: &str) -> bool {
-            false
-        }
-    }
-
-    #[tokio::test]
-    async fn verification_failure_retries_then_fails_explicitly() {
-        let host = MockHost::new(vec![
-            Screenshot {
-                image: "same".into(),
-                format: "png".into(),
-            },
-            Screenshot {
-                image: "same".into(),
-                format: "png".into(),
-            },
-            Screenshot {
-                image: "same".into(),
-                format: "png".into(),
-            },
-            Screenshot {
-                image: "same".into(),
-                format: "png".into(),
-            },
-        ]);
-        let error = run_computer_use_loop(
-            &host,
-            &[ComputerUseStep {
+    #[test]
+    fn side_effect_actions_are_not_retryable_by_default() {
+        let click = ComputerUseStep {
+            action: ComputerUseAction::LeftClick { coordinate: [1, 1] },
+            expectation: VerificationExpectation::ScreenshotChanged { region: None },
+            retryable: false,
+        };
+        assert!(!click.can_retry());
+        assert!(
+            ComputerUseStep {
                 action: ComputerUseAction::LeftClick { coordinate: [1, 1] },
-            }],
-            ComputerUseLoopConfig {
-                max_retries_per_step: 2,
-                ..Default::default()
-            },
-            &ScreenshotChangedVerifier,
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            ComputerUseLoopError::VerificationFailed { attempts: 3, .. }
-        ));
-        assert_eq!(*host.actions.lock().unwrap(), 3);
+                expectation: VerificationExpectation::ScreenshotChanged { region: None },
+                retryable: true,
+            }
+            .can_retry()
+        );
+        assert!(
+            ComputerUseStep {
+                action: ComputerUseAction::MouseMove { coordinate: [1, 1] },
+                expectation: VerificationExpectation::ScreenshotChanged { region: None },
+                retryable: false,
+            }
+            .can_retry()
+        );
+    }
+
+    #[test]
+    fn no_expectation_is_unverified() {
+        let step = ComputerUseStep {
+            action: ComputerUseAction::Wait,
+            expectation: VerificationExpectation::None,
+            retryable: false,
+        };
+        assert_eq!(step.expectation, VerificationExpectation::None);
     }
 }

@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::Bytes;
 use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -281,6 +282,53 @@ pub struct Screenshot {
     pub image: String,
     #[serde(default = "default_png_format")]
     pub format: String,
+}
+
+impl Screenshot {
+    pub fn decoded_rgba(&self) -> Result<(ScreenBounds, Vec<u8>), RvmError> {
+        let bytes = BASE64.decode(&self.image).map_err(|error| {
+            RvmError::InvalidResponse(format!("screenshot base64 is invalid: {error}"))
+        })?;
+        let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+        let mut reader = decoder.read_info().map_err(|error| {
+            RvmError::InvalidResponse(format!("screenshot PNG is invalid: {error}"))
+        })?;
+        let mut buffer = vec![0; reader.output_buffer_size()];
+        let output = reader.next_frame(&mut buffer).map_err(|error| {
+            RvmError::InvalidResponse(format!("screenshot PNG frame is invalid: {error}"))
+        })?;
+        let pixels = match output.color_type {
+            png::ColorType::Rgba => buffer[..output.buffer_size()].to_vec(),
+            png::ColorType::Rgb => buffer[..output.buffer_size()]
+                .chunks_exact(3)
+                .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], 255])
+                .collect(),
+            png::ColorType::Grayscale => buffer[..output.buffer_size()]
+                .iter()
+                .flat_map(|value| [*value, *value, *value, 255])
+                .collect(),
+            png::ColorType::GrayscaleAlpha => buffer[..output.buffer_size()]
+                .chunks_exact(2)
+                .flat_map(|pixel| [pixel[0], pixel[0], pixel[0], pixel[1]])
+                .collect(),
+            png::ColorType::Indexed => {
+                return Err(RvmError::InvalidResponse(
+                    "indexed screenshots are unsupported".into(),
+                ));
+            }
+        };
+        Ok((
+            ScreenBounds {
+                width: output.width,
+                height: output.height,
+            },
+            pixels,
+        ))
+    }
+
+    pub fn dimensions(&self) -> Result<ScreenBounds, RvmError> {
+        self.decoded_rgba().map(|(bounds, _)| bounds)
+    }
 }
 
 fn default_png_format() -> String {
@@ -1544,6 +1592,21 @@ mod tests {
         assert_eq!(
             serde_json::to_value(action).unwrap(),
             serde_json::json!({"action":"left_click","coordinate":[4,5]})
+        );
+    }
+
+    #[test]
+    fn screenshot_dimensions_are_read_from_png_header() {
+        let screenshot = Screenshot {
+            image: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".into(),
+            format: "png".into(),
+        };
+        assert_eq!(
+            screenshot.dimensions().unwrap(),
+            ScreenBounds {
+                width: 1,
+                height: 1
+            }
         );
     }
 

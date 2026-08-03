@@ -24,7 +24,8 @@ use opcos_engine::{
     AcpHarness, AcpHarnessConfig, AgentEngine, EngineError, Harness, OpenCodeHarness,
     OpenCodeHarnessConfig, SessionRecorder, ToolExecutor, TurnEngine,
     computer_use::{
-        ComputerUseLoopConfig, ComputerUseStep, ScreenshotChangedVerifier, run_computer_use_loop,
+        BestEffortScreenshotChangedVerifier, ComputerUseLoopConfig, ComputerUseStep,
+        run_computer_use_loop,
     },
     event_bus::{EventEffect, dispatch_event},
     orchestration::{BoardPhase, BoardTask},
@@ -5880,6 +5881,10 @@ struct ComputerUseRequest {
     max_retries_per_step: usize,
     #[serde(default = "default_computer_use_timeout")]
     timeout_seconds: u64,
+    #[serde(default = "default_computer_use_settle")]
+    settle_milliseconds: u64,
+    #[serde(default = "default_computer_use_retry_delay")]
+    retry_delay_milliseconds: u64,
 }
 
 fn default_computer_use_steps() -> usize {
@@ -5892,6 +5897,14 @@ fn default_computer_use_retries() -> usize {
 
 fn default_computer_use_timeout() -> u64 {
     60
+}
+
+fn default_computer_use_settle() -> u64 {
+    500
+}
+
+fn default_computer_use_retry_delay() -> u64 {
+    500
 }
 
 #[tauri::command]
@@ -5937,6 +5950,8 @@ async fn run_computer_use(
         max_steps: request.max_steps,
         max_retries_per_step: request.max_retries_per_step,
         total_timeout: std::time::Duration::from_secs(request.timeout_seconds),
+        settle_delay: std::time::Duration::from_millis(request.settle_milliseconds),
+        retry_delay: std::time::Duration::from_millis(request.retry_delay_milliseconds),
         screen_bounds: ScreenBounds {
             width: request.screen_width,
             height: request.screen_height,
@@ -5945,9 +5960,13 @@ async fn run_computer_use(
     let steps = request
         .actions
         .into_iter()
-        .map(|action| ComputerUseStep { action })
+        .map(|action| ComputerUseStep {
+            action,
+            expectation: opcos_engine::computer_use::VerificationExpectation::None,
+            retryable: false,
+        })
         .collect::<Vec<_>>();
-    match run_computer_use_loop(&host, &steps, config, &ScreenshotChangedVerifier).await {
+    match run_computer_use_loop(&host, &steps, config, &BestEffortScreenshotChangedVerifier).await {
         Ok(results) => {
             let summary = format!("completed {} computer-use steps", results.len());
             state
