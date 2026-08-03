@@ -1,3 +1,4 @@
+use chrono::Utc;
 use opcos_store::{EventRecord, EventRule, SqliteStore, StoreError, WorkQueueItem};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -17,6 +18,7 @@ pub enum EventDispatchError {
 pub enum EventEffect {
     Enqueue(Box<WorkQueueItem>),
     PlanGoal { goal_id: String },
+    AlreadyHandled,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -43,7 +45,7 @@ pub fn dispatch_event(
             "event rule does not match event".into(),
         )));
     }
-    store.reserve_event_rule_trigger(&rule.rule_id, &event.occurred_at)?;
+    let reserved_at = Utc::now().to_rfc3339();
     let effect = match rule.effect_kind.as_str() {
         "plan_goal" => {
             let goal_id = rule
@@ -55,6 +57,21 @@ pub fn dispatch_event(
                     rule_id: rule.rule_id.clone(),
                     field: "goal_id",
                 })?;
+            if !store.reserve_event_rule_dispatch(
+                &rule.rule_id,
+                &event.event_id,
+                &rule.effect_kind,
+            )? {
+                return Ok(EventDispatch {
+                    event: event.clone(),
+                    rule: rule.clone(),
+                    effect: EventEffect::AlreadyHandled,
+                });
+            }
+            if let Err(error) = store.reserve_event_rule_trigger(&rule.rule_id, &reserved_at) {
+                let _ = store.clear_event_rule_dispatch(&rule.rule_id, &event.event_id);
+                return Err(error.into());
+            }
             EventEffect::PlanGoal {
                 goal_id: goal_id.to_owned(),
             }
@@ -81,14 +98,20 @@ pub fn dispatch_event(
                         rule_id: rule.rule_id.clone(),
                         field: "payload",
                     })?;
+            store.reserve_event_rule_trigger(&rule.rule_id, &reserved_at)?;
             payload_object.insert("event_id".into(), Value::String(event.event_id.clone()));
             if let Some(caused_by) = &event.caused_by {
                 payload_object.insert("caused_by".into(), Value::String(caused_by.clone()));
             }
+            let dedup_key = event_rule_dedup_key(
+                &rule.rule_id,
+                &event.event_id,
+                rule.effect.get("dedup_key").and_then(Value::as_str),
+            );
             let item = store.enqueue_work_item(
                 task_type,
                 &payload,
-                rule.effect.get("dedup_key").and_then(Value::as_str),
+                Some(&dedup_key),
                 rule.effect.get("idempotency_key").and_then(Value::as_str),
                 rule.effect
                     .get("max_attempts")
@@ -117,6 +140,13 @@ pub fn dispatch_event(
         rule: rule.clone(),
         effect,
     })
+}
+
+fn event_rule_dedup_key(rule_id: &str, event_id: &str, extra: Option<&str>) -> String {
+    match extra {
+        Some(extra) => format!("event-rule:{rule_id}:{event_id}:{extra}"),
+        None => format!("event-rule:{rule_id}:{event_id}"),
+    }
 }
 
 #[cfg(test)]
@@ -161,7 +191,113 @@ mod tests {
                 assert_eq!(item.payload["event_id"], event.event_id);
             }
             EventEffect::PlanGoal { .. } => panic!("unexpected planner effect"),
+            EventEffect::AlreadyHandled => panic!("unexpected duplicate effect"),
         }
+    }
+
+    #[test]
+    fn redelivering_one_event_reuses_the_same_work_item() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let rule = store
+            .create_event_rule(
+                "queue.dead_letter",
+                "enqueue_work",
+                &json!({"task_type":"reconcile","payload":{}}),
+                3,
+                3600,
+                2,
+            )
+            .unwrap();
+        let event = store
+            .publish_event(
+                "queue.dead_letter",
+                "work_queue",
+                &json!({}),
+                &json!({"queue_id":"q"}),
+                Some("event-redelivery"),
+                None,
+            )
+            .unwrap();
+        let first = dispatch_event(&store, &event, &rule).unwrap();
+        let second = dispatch_event(&store, &event, &rule).unwrap();
+        let (EventEffect::Enqueue(first), EventEffect::Enqueue(second)) =
+            (first.effect, second.effect)
+        else {
+            panic!("expected enqueue effects");
+        };
+        assert_eq!(first.queue_id, second.queue_id);
+        assert_eq!(first.dedup_key, second.dedup_key);
+        assert_eq!(store.load_work_queue(None, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn replayed_old_event_still_consumes_the_current_frequency_window() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let rule = store
+            .create_event_rule(
+                "external.replayed",
+                "enqueue_work",
+                &json!({"task_type":"reconcile","payload":{}}),
+                1,
+                3600,
+                2,
+            )
+            .unwrap();
+        let first = store
+            .publish_event(
+                "external.replayed",
+                "test",
+                &json!({}),
+                &json!({}),
+                Some("replayed-1"),
+                None,
+            )
+            .unwrap();
+        let second = store
+            .publish_event(
+                "external.replayed",
+                "test",
+                &json!({}),
+                &json!({}),
+                Some("replayed-2"),
+                None,
+            )
+            .unwrap();
+        let mut first = first;
+        let mut second = second;
+        first.occurred_at = "2020-01-01T00:00:00+00:00".into();
+        second.occurred_at = "2020-01-01T00:01:00+00:00".into();
+        dispatch_event(&store, &first, &rule).unwrap();
+        assert!(dispatch_event(&store, &second, &rule).is_err());
+    }
+
+    #[test]
+    fn redelivering_one_planner_event_is_already_handled() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let rule = store
+            .create_event_rule(
+                "goal.paused",
+                "plan_goal",
+                &json!({"goal_id":"goal-1"}),
+                3,
+                3600,
+                2,
+            )
+            .unwrap();
+        let event = store
+            .publish_event(
+                "goal.paused",
+                "planner",
+                &json!({"goal_id":"goal-1"}),
+                &json!({"reason":"failure"}),
+                Some("goal-paused-1"),
+                None,
+            )
+            .unwrap();
+        let first = dispatch_event(&store, &event, &rule).unwrap();
+        assert!(matches!(first.effect, EventEffect::PlanGoal { .. }));
+        let second = dispatch_event(&store, &event, &rule).unwrap();
+        assert!(matches!(second.effect, EventEffect::AlreadyHandled));
     }
 
     #[test]
@@ -212,6 +348,7 @@ mod tests {
                 Some(&parent.event_id),
             )
             .unwrap_err();
+        assert!(matches!(&error, StoreError::EventRejectionRecorded(_)));
         assert!(error.to_string().contains("cause depth limit"));
         assert_eq!(
             store

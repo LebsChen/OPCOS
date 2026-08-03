@@ -29,6 +29,8 @@ pub enum StoreError {
     Migration(String),
     #[error("store validation error: {0}")]
     Validation(String),
+    #[error("event rejection recorded and persisted: {0}")]
+    EventRejectionRecorded(String),
     #[error("session not found: {0}")]
     SessionNotFound(String),
 }
@@ -1634,8 +1636,8 @@ impl SqliteStore {
                             parent_id
                         ],
                     )?;
-                    return Err(StoreError::Validation(
-                        "event cause depth limit reached; rejection recorded".into(),
+                    return Err(StoreError::EventRejectionRecorded(
+                        "event cause depth limit reached".into(),
                     ));
                 }
                 depth
@@ -1680,7 +1682,7 @@ impl SqliteStore {
                 connection.execute_batch("COMMIT")?;
                 Ok(event)
             }
-            Err(error) if error.to_string().contains("rejection recorded") => {
+            Err(error @ StoreError::EventRejectionRecorded(_)) => {
                 connection.execute_batch("COMMIT")?;
                 Err(error)
             }
@@ -1710,6 +1712,40 @@ impl SqliteStore {
             )
             .optional()?
             .unwrap_or(0);
+        let mut statement = connection.prepare(
+            "SELECT event_id,kind,source,subject,payload,occurred_at,sequence,
+                    dedup_key,caused_by,cause_depth
+             FROM events WHERE sequence>?1 ORDER BY sequence LIMIT ?2",
+        )?;
+        statement
+            .query_map(params![cursor, i64::from(limit)], event_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn load_events_after_from_tail(
+        &self,
+        consumer_id: &str,
+        limit: u32,
+    ) -> Result<Vec<EventRecord>, StoreError> {
+        if consumer_id.trim().is_empty() || limit == 0 {
+            return Err(StoreError::Validation(
+                "consumer_id and positive limit are required".into(),
+            ));
+        }
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let cursor: i64 = connection
+            .query_row(
+                "SELECT sequence FROM event_cursors WHERE consumer_id=?1",
+                [consumer_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(connection.query_row(
+                "SELECT COALESCE(MAX(sequence),0) FROM events",
+                [],
+                |row| row.get(0),
+            )?);
         let mut statement = connection.prepare(
             "SELECT event_id,kind,source,subject,payload,occurred_at,sequence,
                     dedup_key,caused_by,cause_depth
@@ -1832,13 +1868,65 @@ impl SqliteStore {
             .map_err(StoreError::from)
     }
 
+    pub fn reserve_event_rule_dispatch(
+        &self,
+        rule_id: &str,
+        event_id: &str,
+        effect_kind: &str,
+    ) -> Result<bool, StoreError> {
+        let changed = self
+            .connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "INSERT INTO event_dispatches
+                 (rule_id,event_id,effect_kind,status,created_at,updated_at)
+                 VALUES (?1,?2,?3,'reserved',?4,?4)
+                 ON CONFLICT(rule_id,event_id) DO NOTHING",
+                params![rule_id, event_id, effect_kind, Utc::now().to_rfc3339()],
+            )?;
+        Ok(changed == 1)
+    }
+
+    pub fn complete_event_rule_dispatch(
+        &self,
+        rule_id: &str,
+        event_id: &str,
+    ) -> Result<(), StoreError> {
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "UPDATE event_dispatches
+                 SET status='completed',updated_at=?1
+                 WHERE rule_id=?2 AND event_id=?3",
+                params![Utc::now().to_rfc3339(), rule_id, event_id],
+            )?;
+        Ok(())
+    }
+
+    pub fn clear_event_rule_dispatch(
+        &self,
+        rule_id: &str,
+        event_id: &str,
+    ) -> Result<(), StoreError> {
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "DELETE FROM event_dispatches WHERE rule_id=?1 AND event_id=?2",
+                params![rule_id, event_id],
+            )?;
+        Ok(())
+    }
+
     pub fn reserve_event_rule_trigger(
         &self,
         rule_id: &str,
-        occurred_at: &str,
+        reserved_at: &str,
     ) -> Result<EventRule, StoreError> {
-        let now = DateTime::parse_from_rfc3339(occurred_at)
-            .map_err(|_| StoreError::Validation("invalid event timestamp".into()))?
+        let now = DateTime::parse_from_rfc3339(reserved_at)
+            .map_err(|_| StoreError::Validation("invalid reservation timestamp".into()))?
             .with_timezone(&Utc);
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let rule = connection
@@ -1860,12 +1948,12 @@ impl SqliteStore {
                     .map_err(|_| StoreError::Validation("invalid rule timestamp".into()))?;
                 if now.signed_duration_since(start).num_seconds() >= i64::from(rule.window_seconds)
                 {
-                    (0, occurred_at.to_owned())
+                    (0, reserved_at.to_owned())
                 } else {
                     (rule.trigger_count, started.to_owned())
                 }
             }
-            None => (0, occurred_at.to_owned()),
+            None => (0, reserved_at.to_owned()),
         };
         if count >= rule.max_triggers {
             return Err(StoreError::Validation(
@@ -2913,6 +3001,15 @@ impl SqliteStore {
              );
              CREATE INDEX IF NOT EXISTS idx_event_rules_enabled
                ON event_rules(enabled, kind_pattern);
+             CREATE TABLE IF NOT EXISTS event_dispatches (
+               rule_id TEXT NOT NULL,
+               event_id TEXT NOT NULL,
+               effect_kind TEXT NOT NULL,
+               status TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               PRIMARY KEY(rule_id, event_id)
+             );
              ;",
             )?;
             ensure_artifact_schema(&connection)?;
@@ -5191,6 +5288,46 @@ mod tests {
         store.ack_event("worker-a", first.sequence).unwrap();
         assert!(store.load_events_after("worker-a", 10).unwrap().is_empty());
         assert_eq!(store.load_events_after("worker-b", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn internal_event_consumer_starts_at_tail_without_a_cursor() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .publish_event(
+                "external.old",
+                "test",
+                &serde_json::json!({}),
+                &serde_json::json!({}),
+                Some("old"),
+                None,
+            )
+            .unwrap();
+        assert!(
+            store
+                .load_events_after_from_tail("planner-event-pump", 10)
+                .unwrap()
+                .is_empty()
+        );
+        let newest = store
+            .publish_event(
+                "external.new",
+                "test",
+                &serde_json::json!({}),
+                &serde_json::json!({}),
+                Some("new"),
+                None,
+            )
+            .unwrap();
+        store
+            .ack_event("planner-event-pump", newest.sequence)
+            .unwrap();
+        assert!(
+            store
+                .load_events_after_from_tail("planner-event-pump", 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

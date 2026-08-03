@@ -908,7 +908,7 @@ async fn run_goal_planner_inner(
 
 async fn run_event_bus_pump(app: &tauri::AppHandle, state: &DesktopState) {
     let consumer_id = "planner-event-pump";
-    let events = match state.store.load_events_after(consumer_id, 100) {
+    let events = match state.store.load_events_after_from_tail(consumer_id, 100) {
         Ok(events) => events,
         Err(_) => return,
     };
@@ -933,11 +933,18 @@ async fn run_event_bus_pump(app: &tauri::AppHandle, state: &DesktopState) {
                     EventEffect::Enqueue(_) => {
                         let _ = state.store.record_event_rule_success(&rule.rule_id);
                     }
+                    EventEffect::AlreadyHandled => {}
                     EventEffect::PlanGoal { goal_id } => {
                         if run_goal_planner(app, state, &goal_id).await.is_err() {
                             event_handled = false;
+                            let _ = state
+                                .store
+                                .clear_event_rule_dispatch(&rule.rule_id, &event.event_id);
                             let _ = state.store.record_event_rule_failure(&rule.rule_id);
                         } else {
+                            let _ = state
+                                .store
+                                .complete_event_rule_dispatch(&rule.rule_id, &event.event_id);
                             let _ = state.store.record_event_rule_success(&rule.rule_id);
                         }
                     }
