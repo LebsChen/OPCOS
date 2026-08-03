@@ -149,11 +149,13 @@ type MarketTemplate = {
   description: string;
   version: number;
   readonly: boolean;
+  source?: string;
 };
 type ProjectConfigurationTemplate = MarketTemplate & {
   template_id: string;
   source: string;
   applied: boolean;
+  overridden: boolean;
   modified: boolean;
 };
 const TOKEN_CONNECTOR_KINDS = [
@@ -1237,7 +1239,7 @@ function ProjectConfigPanel({
     if (
       !enabled &&
       !window.confirm(
-        `将删除项目作用域配置「${template.name}」，已本地修改的内容也会被删除。确定继续吗？`,
+        `将排除全局预设「${template.name}」在该项目中的生效，不会删除全局预设。确定继续吗？`,
       )
     ) {
       return;
@@ -1288,29 +1290,75 @@ function ProjectConfigPanel({
       <div className="mt-5 grid gap-3">
         <fieldset className="rounded-lg border border-line p-3">
           <legend className="px-1 text-sm font-medium">
-            配置模板（项目作用域）
+            全局预设（项目选择）
           </legend>
           <div className="grid gap-2">
             {configurationTemplates.map((template) => (
-              <label
+              <div
                 key={template.template_id}
                 className="flex items-center gap-2 text-sm"
               >
-                <input
-                  type="checkbox"
-                  checked={template.applied}
-                  onChange={(event) =>
-                    void toggleConfigurationTemplate(
-                      template,
-                      event.target.checked,
-                    )
-                  }
-                />
-                <span>
-                  {template.name} · {template.source}
-                  {template.modified ? " · 已本地修改" : ""}
-                </span>
-              </label>
+                <label className="flex min-w-0 flex-1 items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={template.applied}
+                    onChange={(event) =>
+                      void toggleConfigurationTemplate(
+                        template,
+                        event.target.checked,
+                      )
+                    }
+                  />
+                  <span>
+                    {template.name} · {template.source} ·{" "}
+                    {template.overridden ? "项目已覆盖" : "继承自全局预设"}
+                    {template.modified ? " · 已本地修改" : ""}
+                    {template.overridden ? " · 可在下方编辑" : ""}
+                  </span>
+                </label>
+                <div className="flex shrink-0 gap-2">
+                  {template.overridden && (
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={() => {
+                        if (
+                          window.confirm(
+                            `将删除项目覆盖「${template.name}」，恢复继承全局预设。确定继续吗？`,
+                          )
+                        ) {
+                          void command("restore_project_configuration", {
+                            projectId: project.id,
+                            templateId: template.template_id,
+                          })
+                            .then(load)
+                            .then(onRefresh)
+                            .catch(onError);
+                        }
+                      }}
+                    >
+                      恢复继承
+                    </button>
+                  )}
+                  {!template.overridden && (
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={() => {
+                        void command("override_project_configuration", {
+                          projectId: project.id,
+                          templateId: template.template_id,
+                        })
+                          .then(load)
+                          .then(onRefresh)
+                          .catch(onError);
+                      }}
+                    >
+                      创建项目覆盖
+                    </button>
+                  )}
+                </div>
+              </div>
             ))}
             {!configurationTemplates.length && (
               <span className="text-xs text-faint">暂无可用配置模板</span>
@@ -4742,8 +4790,11 @@ function ManageSections({
                       <div>
                         <strong>{template.name}</strong>
                         <small className="block text-muted">
-                          {template.status === "builtin" ? "内置" : "自定义"} ·
-                          v{template.version}
+                          {template.source ||
+                            (template.status === "builtin"
+                              ? "内置"
+                              : "自定义")}{" "}
+                          · v{template.version}
                         </small>
                       </div>
                       <span className="text-xs text-muted">

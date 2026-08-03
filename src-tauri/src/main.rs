@@ -1297,9 +1297,117 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
     migrate_secret_records(&mut connection)?;
     migrate_mcp_session_tools(&connection)?;
     migrate_config_objects(&mut connection)?;
+    migrate_config_scope_model(&connection)?;
     seed_builtin_templates(&connection)?;
     migrate_coordination(&connection)?;
     Ok(connection)
+}
+
+fn migrate_config_scope_model(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS project_config_selection (
+               project_id TEXT NOT NULL,
+               object_id TEXT NOT NULL,
+               enabled INTEGER NOT NULL,
+               PRIMARY KEY(project_id,object_id)
+             );",
+        )
+        .map_err(|error| error.to_string())?;
+    let migrated: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM desktop_schema_migrations
+               WHERE version='p1-2-config-scope-model'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if migrated {
+        return Ok(());
+    }
+    let tx = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    tx.execute(
+        "UPDATE config_object
+         SET scope_kind='global'
+         WHERE scope_kind='template'",
+        [],
+    )
+    .map_err(|error| error.to_string())?;
+    let mut projects = tx
+        .prepare(
+            "SELECT p.id,p.status,p.current_version_id,pv.content,pv.metadata_json
+             FROM config_object p
+             JOIN config_object_version pv ON pv.id=p.current_version_id
+             WHERE p.scope_kind='project'",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = projects
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(projects);
+    for (project_object_id, status, _version_id, content, metadata_json) in rows {
+        let metadata = serde_json::from_str::<Value>(&metadata_json).unwrap_or_else(|_| json!({}));
+        let Some(source_id) = metadata.get("source_template_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let project_id: Option<String> = tx
+            .query_row(
+                "SELECT scope_key FROM config_object WHERE id=?1",
+                [&project_object_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let Some(project_id) = project_id else {
+            continue;
+        };
+        if status == "deleted" {
+            tx.execute(
+                "INSERT OR REPLACE INTO project_config_selection(project_id,object_id,enabled)
+                 VALUES (?1,?2,0)",
+                params![project_id, source_id],
+            )
+            .map_err(|error| error.to_string())?;
+            continue;
+        }
+        let source_content: Option<String> = tx
+            .query_row(
+                "SELECT v.content FROM config_object o
+                 JOIN config_object_version v ON v.id=o.current_version_id
+                 WHERE o.id=?1 AND o.scope_kind='global' AND o.status <> 'deleted'",
+                [source_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if source_content.as_deref() == Some(content.as_str()) {
+            tx.execute(
+                "UPDATE config_object SET status='deleted' WHERE id=?1",
+                [&project_object_id],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
+    tx.execute(
+        "INSERT INTO desktop_schema_migrations(version,applied_at)
+         VALUES ('p1-2-config-scope-model',?1)",
+        [Utc::now().to_rfc3339()],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())
 }
 
 fn default_devin_settings() -> Value {
@@ -1439,7 +1547,7 @@ fn seed_builtin_template(
         .execute(
             "INSERT OR IGNORE INTO config_object
              (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
-             VALUES (?1,?2,?3,?4,'template','builtin','builtin',?5,?6)",
+             VALUES (?1,?2,?3,?4,'global',NULL,'builtin',?5,?6)",
             params![
                 id,
                 kind,
@@ -2460,7 +2568,7 @@ fn load_template_content(
         .query_row(
             "SELECT o.kind,o.name,v.content FROM config_object o
              JOIN config_object_version v ON v.id=o.current_version_id
-             WHERE o.id=?1 AND o.scope_kind='template' AND o.status <> 'deleted'",
+             WHERE o.id=?1 AND o.scope_kind='global' AND o.status <> 'deleted'",
             [template_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -2493,102 +2601,29 @@ fn copy_config_templates(
     let tx = connection
         .unchecked_transaction()
         .map_err(|error| error.to_string())?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS project_config_selection (
+           project_id TEXT NOT NULL,
+           object_id TEXT NOT NULL,
+           enabled INTEGER NOT NULL,
+           PRIMARY KEY(project_id,object_id)
+         );",
+    )
+    .map_err(|error| error.to_string())?;
     for template_id in template_ids {
-        let (kind, name, content, metadata): (String, String, String, String) = tx
-            .query_row(
-                "SELECT o.kind,o.name,v.content,v.metadata_json FROM config_object o
-                 JOIN config_object_version v ON v.id=o.current_version_id
-                 WHERE o.id=?1 AND o.scope_kind='template'
-                   AND o.status <> 'deleted'
-                   AND o.kind NOT IN ('agent-template','team-template')",
-                [template_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .map_err(|error| format!("configuration template not found: {error}"))?;
-        let object_id = format!("project-{project_id}-{template_id}");
-        let template_hash = content_hash(&content);
-        let existing_version: Option<i64> = tx
-            .query_row(
-                "SELECT v.version FROM config_object o
-                 JOIN config_object_version v ON v.id=o.current_version_id
-                 WHERE o.id=?1 AND o.scope_kind='project'",
-                [&object_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        let version = if let Some(version) = existing_version {
-            let matching_version: Option<i64> = tx
-                .query_row(
-                    "SELECT version FROM config_object_version
-                     WHERE object_id=?1 AND content_hash=?2
-                     ORDER BY version DESC LIMIT 1",
-                    params![object_id, template_hash],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|error| error.to_string())?;
-            let version = matching_version.unwrap_or(version + 1);
-            tx.execute(
-                "UPDATE config_object
-                 SET kind=?1,name=?2,status='active',current_version_id=?3
-                 WHERE id=?4 AND scope_kind='project' AND scope_key=?5",
-                params![
-                    kind,
-                    name,
-                    format!("{object_id}:v{version}"),
-                    object_id,
-                    project_id
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-            version
-        } else {
-            let version = 1;
-            let version_id = format!("{object_id}:v{version}");
-            tx.execute(
-                "INSERT INTO config_object
-                 (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
-                 VALUES (?1,?2,?3,?4,'project',?5,'active',?6,?7)",
-                params![
-                    object_id,
-                    kind,
-                    name,
-                    stable_server_key(&object_id),
-                    project_id,
-                    Utc::now().to_rfc3339(),
-                    version_id
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-            version
-        };
-        let version_id = format!("{object_id}:v{version}");
-        tx.execute(
-            "INSERT OR IGNORE INTO config_object_version
-             (id,object_id,version,content,content_hash,created_at,note,metadata_json)
-             VALUES (?1,?2,?3,?4,?5,?6,'copied from template',?7)",
-            params![
-                version_id,
-                object_id,
-                version,
-                content,
-                template_hash,
-                Utc::now().to_rfc3339(),
-                metadata
-            ],
+        tx.query_row(
+            "SELECT id FROM config_object
+                 WHERE id=?1 AND scope_kind='global'
+                   AND status <> 'deleted'
+                   AND kind NOT IN ('agent-template','team-template')",
+            [template_id],
+            |row| row.get::<_, String>(0),
         )
-        .map_err(|error| error.to_string())?;
-        let metadata = serde_json::from_str::<Value>(&metadata).unwrap_or_else(|_| json!({}));
-        let metadata = serde_json::to_string(&json!({
-            "description": metadata.get("description").and_then(Value::as_str).unwrap_or(""),
-            "source_template_id": template_id,
-            "source_content_hash": template_hash
-        }))
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("configuration template not found: {error}"))?;
         tx.execute(
-            "UPDATE config_object_version SET metadata_json=?1 WHERE id=?2",
-            params![metadata, version_id],
+            "INSERT OR REPLACE INTO project_config_selection(project_id,object_id,enabled)
+             VALUES (?1,?2,1)",
+            params![project_id, template_id],
         )
         .map_err(|error| error.to_string())?;
     }
@@ -2607,52 +2642,86 @@ fn list_project_configuration_templates(
     let mut statement = connection
         .prepare(
             "SELECT t.id,t.kind,t.name,t.status,t.scope_key,tv.content,tv.content_hash,
-                    p.id,p.status,pv.content,pv.content_hash,pv.metadata_json
+                    p.id,p.status,pv.content,pv.content_hash,pv.metadata_json,
+                    COALESCE(selection.enabled,1)
              FROM config_object t
              JOIN config_object_version tv ON tv.id=t.current_version_id
              LEFT JOIN config_object p
-               ON p.id=('project-' || ?1 || '-' || t.id)
-              AND p.scope_kind='project'
+               ON p.kind=t.kind AND p.name=t.name
+              AND p.scope_kind='project' AND p.scope_key=?1
              LEFT JOIN config_object_version pv ON pv.id=p.current_version_id
-             WHERE t.scope_kind='template' AND t.status <> 'deleted'
+             LEFT JOIN project_config_selection selection
+               ON selection.project_id=?1 AND selection.object_id=t.id
+             WHERE t.scope_kind='global' AND t.status <> 'deleted'
                AND t.kind NOT IN ('agent-template','team-template')
              ORDER BY t.name",
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
-        .query_map([project_id], |row| {
+        .query_map([&project_id], |row| {
             let project_status: Option<String> = row.get(8)?;
-            let metadata = row
-                .get::<_, Option<String>>(11)?
-                .and_then(|value| serde_json::from_str::<Value>(&value).ok())
-                .unwrap_or_else(|| json!({}));
-            let project_hash = row.get::<_, Option<String>>(9)?;
-            let source_hash = metadata
-                .get("source_content_hash")
-                .and_then(Value::as_str)
-                .or(project_hash.as_deref());
+            let global_hash: String = row.get(6)?;
+            let project_hash: Option<String> = row.get(10)?;
             Ok(json!({
                 "template_id": row.get::<_, String>(0)?,
                 "kind": row.get::<_, String>(1)?,
                 "name": row.get::<_, String>(2)?,
                 "status": row.get::<_, String>(3)?,
-                "source": if row.get::<_, String>(4)? == "builtin" {
+                "source": if row.get::<_, String>(3)? == "builtin" {
                     "内置"
-                } else if row.get::<_, String>(4)?.starts_with("repo:") {
+                } else if row
+                    .get::<_, Option<String>>(4)?
+                    .is_some_and(|scope| scope.starts_with("repo:"))
+                {
                     "仓库"
                 } else {
                     "自定义"
                 },
                 "content": row.get::<_, String>(5)?,
-                "applied": project_status.as_deref() == Some("active"),
-                "modified": project_status.is_some()
-                    && source_hash != Some(row.get::<_, String>(6)?.as_str()),
+                "applied": row.get::<_, bool>(12)?,
+                "overridden": project_status.as_deref() == Some("active"),
+                "modified": project_status.as_deref() == Some("active")
+                    && project_hash.as_deref() != Some(global_hash.as_str()),
                 "project_object_id": row.get::<_, Option<String>>(7)?,
             }))
         })
         .map_err(|error| error.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())
+    let mut result = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut additions = connection
+        .prepare(
+            "SELECT p.id,p.kind,p.name,p.status,pv.content
+             FROM config_object p
+             JOIN config_object_version pv ON pv.id=p.current_version_id
+             WHERE p.scope_kind='project' AND p.scope_key=?1 AND p.status='active'
+               AND NOT EXISTS (
+                 SELECT 1 FROM config_object g
+                 WHERE g.scope_kind='global' AND g.status <> 'deleted'
+                   AND g.kind=p.kind AND g.name=p.name
+               )",
+        )
+        .map_err(|error| error.to_string())?;
+    let additions = additions
+        .query_map([project_id], |row| {
+            Ok(json!({
+                "template_id": row.get::<_, String>(0)?,
+                "kind": row.get::<_, String>(1)?,
+                "name": row.get::<_, String>(2)?,
+                "status": row.get::<_, String>(3)?,
+                "source": "项目",
+                "content": row.get::<_, String>(4)?,
+                "applied": true,
+                "overridden": true,
+                "modified": true,
+                "project_object_id": row.get::<_, String>(0)?,
+            }))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    result.extend(additions);
+    Ok(result)
 }
 
 #[tauri::command]
@@ -2669,15 +2738,118 @@ fn set_project_configuration_template(
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?;
-    let object_id = format!("project-{project_id}-{template_id}");
     connection
         .execute(
-            "UPDATE config_object SET status='deleted'
-             WHERE id=?1 AND scope_kind='project' AND scope_key=?2",
-            params![object_id, project_id],
+            "INSERT OR REPLACE INTO project_config_selection(project_id,object_id,enabled)
+             VALUES (?1,?2,0)",
+            params![project_id, template_id],
         )
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+#[tauri::command]
+fn restore_project_configuration(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    template_id: String,
+) -> Result<(), String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    connection
+        .execute(
+            "UPDATE config_object SET status='deleted'
+             WHERE scope_kind='project' AND scope_key=?1
+               AND kind=(SELECT kind FROM config_object WHERE id=?2)
+               AND name=(SELECT name FROM config_object WHERE id=?2)",
+            params![project_id, template_id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn override_project_configuration(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    template_id: String,
+) -> Result<(), String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let (kind, name, content, metadata): (String, String, String, String) = connection
+        .query_row(
+            "SELECT o.kind,o.name,v.content,v.metadata_json
+             FROM config_object o
+             JOIN config_object_version v ON v.id=o.current_version_id
+             WHERE o.id=?1 AND o.scope_kind='global' AND o.status <> 'deleted'",
+            [&template_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(|error| format!("global preset not found: {error}"))?;
+    let object_id = format!("project-config-{project_id}-{template_id}");
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    let version: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(version),0)+1 FROM config_object_version WHERE object_id=?1",
+            [&object_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let version_id = format!("{object_id}:v{version}");
+    transaction
+        .execute(
+            "INSERT INTO config_object
+             (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
+             VALUES (?1,?2,?3,?4,'project',?5,'active',?6,?7)
+             ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,name=excluded.name,
+               status='active',current_version_id=excluded.current_version_id",
+            params![
+                object_id,
+                kind,
+                name,
+                stable_server_key(&object_id),
+                project_id,
+                Utc::now().to_rfc3339(),
+                version_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "INSERT INTO config_object_version
+             (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+             VALUES (?1,?2,?3,?4,?5,?6,'project override',?7)",
+            params![
+                version_id,
+                object_id,
+                version,
+                content,
+                content_hash(&content),
+                Utc::now().to_rfc3339(),
+                serde_json::to_string(&json!({
+                    "source_global_id": template_id,
+                    "source_metadata": serde_json::from_str::<Value>(&metadata)
+                        .unwrap_or_else(|_| json!({}))
+                }))
+                .map_err(|error| error.to_string())?
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "INSERT OR REPLACE INTO project_config_selection(project_id,object_id,enabled)
+             SELECT ?1,id,1 FROM config_object
+             WHERE id=?2 AND scope_kind='global'",
+            params![project_id, template_id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -3658,6 +3830,92 @@ async fn serve_ide_proxy(listener: TcpListener, state: IdeProxyState) {
     let _ = axum::serve(listener, router).await;
 }
 
+fn effective_config_objects(
+    connection: &Connection,
+    workspace: &str,
+    host_id: &str,
+    project_id: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<Vec<(String, String)>, String> {
+    let project_key = project_id.unwrap_or_default();
+    let session_key = session_id.unwrap_or_default();
+    let mut statement = connection
+        .prepare(
+            "SELECT o.id,o.kind,o.name,o.current_version_id,
+                    CASE o.scope_kind
+                      WHEN 'global' THEN 0
+                      WHEN 'project' THEN 1
+                      WHEN 'repo' THEN 2
+                      WHEN 'host' THEN 3
+                      WHEN 'session' THEN 4 ELSE 5 END AS precedence,
+                    COALESCE(selection.enabled,1),
+                    COALESCE(session_selection.enabled,1)
+             FROM config_object o
+             LEFT JOIN project_config_selection selection
+               ON selection.project_id=?3 AND selection.object_id=o.id
+             LEFT JOIN asset_session_selection session_selection
+               ON session_selection.session_id=?4
+              AND session_selection.asset_id=o.id
+             WHERE o.status='active' AND o.current_version_id IS NOT NULL
+               AND (o.scope_kind='global'
+                 OR (o.scope_kind='project' AND o.scope_key=?3)
+                 OR (o.scope_kind='repo' AND o.scope_key=?1)
+                 OR (o.scope_kind='host' AND o.scope_key=?2)
+                 OR (o.scope_kind='session' AND o.scope_key=?4))
+               AND (o.scope_kind <> 'global' OR COALESCE(selection.enabled,1)=1)
+               AND NOT (
+                 o.scope_kind='project' AND EXISTS (
+                   SELECT 1
+                   FROM project_config_selection excluded
+                   JOIN config_object global_object
+                     ON global_object.id=excluded.object_id
+                    AND global_object.scope_kind='global'
+                    AND global_object.kind=o.kind
+                    AND global_object.name=o.name
+                   WHERE excluded.project_id=?3 AND excluded.enabled=0
+                 )
+               )
+               AND (o.scope_kind <> 'session' OR COALESCE(session_selection.enabled,1)=1)
+             ORDER BY precedence,o.kind,o.name,o.id",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(
+            params![workspace, host_id, project_key, session_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut selected: HashMap<(String, String), (i64, String, String)> = HashMap::new();
+    for (id, kind, name, version_id, precedence) in rows {
+        let key = (kind, name);
+        let replace = selected
+            .get(&key)
+            .is_none_or(|(current_precedence, current_id, _)| {
+                precedence > *current_precedence
+                    || (precedence == *current_precedence && id < *current_id)
+            });
+        if replace {
+            selected.insert(key, (precedence, id, version_id));
+        }
+    }
+    let mut values = selected
+        .into_values()
+        .map(|(_, id, version_id)| (id, version_id))
+        .collect::<Vec<_>>();
+    values.sort();
+    Ok(values)
+}
+
 fn bind_session_config_versions(
     state: &DesktopState,
     session_id: &str,
@@ -3682,39 +3940,14 @@ fn bind_session_config_versions(
     let transaction = connection
         .unchecked_transaction()
         .map_err(|error| error.to_string())?;
-    let mut statement = transaction
-        .prepare(
-            "SELECT o.id,o.current_version_id,COALESCE(selection.enabled,1)
-             FROM config_object o
-             LEFT JOIN asset_session_selection selection
-               ON selection.session_id=?4 AND selection.asset_id=o.id
-             WHERE o.status='active' AND o.current_version_id IS NOT NULL
-               AND (o.scope_kind='global'
-                 OR (o.scope_kind='project' AND o.scope_key=?3)
-                 OR (o.scope_kind='repo' AND o.scope_key=?1)
-                 OR (o.scope_kind='host' AND o.scope_key=?2)
-                 OR (o.scope_kind='session' AND o.scope_key=?5))
-             ORDER BY CASE o.scope_kind
-               WHEN 'global' THEN 0 WHEN 'project' THEN 1
-               WHEN 'repo' THEN 2 WHEN 'host' THEN 3 WHEN 'session' THEN 4 ELSE 5 END, o.id",
-        )
-        .map_err(|error| error.to_string())?;
-    let objects = statement
-        .query_map(
-            params![workspace, host_id, project_id, session_id, session_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, bool>(2)?,
-                ))
-            },
-        )
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    drop(statement);
-    for (object_id, version_id, enabled) in objects {
+    let objects = effective_config_objects(
+        &transaction,
+        workspace,
+        host_id,
+        project_id,
+        Some(session_id),
+    )?;
+    for (object_id, version_id) in objects {
         transaction
             .execute(
                 "INSERT OR IGNORE INTO session_config_bindings(session_id,object_id)
@@ -3722,15 +3955,13 @@ fn bind_session_config_versions(
                 params![session_id, object_id],
             )
             .map_err(|error| error.to_string())?;
-        if enabled {
-            transaction
-                .execute(
-                    "INSERT INTO session_config_versions(session_id,object_id,version_id)
-                     VALUES (?1,?2,?3)",
-                    params![session_id, object_id, version_id],
-                )
-                .map_err(|error| error.to_string())?;
-        }
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO session_config_versions(session_id,object_id,version_id)
+                 VALUES (?1,?2,?3)",
+                params![session_id, object_id, version_id],
+            )
+            .map_err(|error| error.to_string())?;
     }
     transaction.commit().map_err(|error| error.to_string())
 }
@@ -4268,35 +4499,37 @@ async fn engine_for(
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?;
-        let mut statement = connection
-            .prepare(
-                "SELECT o.id,o.name,COALESCE(o.server_key,''),o.current_version_id,v.content
-                 FROM config_object o
-                 JOIN config_object_version v ON v.id=o.current_version_id
-                 WHERE o.kind='mcp' AND o.status='active'
-                   AND (o.scope_kind='global'
-                     OR (o.scope_kind='project' AND o.scope_key=?1)
-                     OR (o.scope_kind='repo' AND o.scope_key=?2)
-                     OR (o.scope_kind='host' AND o.scope_key=?3))",
-            )
-            .map_err(|error| error.to_string())?;
-        statement
-            .query_map(
-                params![session.project_id, session_workspace, host_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        serde_json::from_str::<Value>(&row.get::<_, String>(4)?)
-                            .unwrap_or_else(|_| json!({})),
-                    ))
-                },
-            )
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?
+        effective_config_objects(
+            &connection,
+            &session_workspace,
+            &host_id,
+            session.project_id.as_deref(),
+            Some(session_id),
+        )?
+        .into_iter()
+        .filter_map(|(object_id, version_id)| {
+            connection
+                .query_row(
+                    "SELECT o.name,COALESCE(o.server_key,''),v.content
+                     FROM config_object o
+                     JOIN config_object_version v ON v.id=?2
+                     WHERE o.id=?1 AND o.kind='mcp'",
+                    params![object_id, version_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            serde_json::from_str::<Value>(&row.get::<_, String>(2)?)
+                                .unwrap_or_else(|_| json!({})),
+                        ))
+                    },
+                )
+                .ok()
+                .map(|(name, server_key, content)| {
+                    (object_id, name, server_key, version_id, content)
+                })
+        })
+        .collect::<Vec<_>>()
     };
     let mut independent_tools = Vec::new();
     for (object_id, name, server_key, version_id, mut content) in mcp_configs {
@@ -6593,10 +6826,11 @@ fn list_template_market(
         .map_err(|_| "database lock poisoned")?;
     let mut statement = connection
         .prepare(
-            "SELECT o.id,o.kind,o.name,o.status,v.content,v.metadata_json,v.version
+            "SELECT o.id,o.kind,o.name,o.status,v.content,v.metadata_json,v.version,
+                    o.scope_key
              FROM config_object o
              JOIN config_object_version v ON v.id=o.current_version_id
-             WHERE o.scope_kind='template' AND o.status <> 'deleted'
+             WHERE o.scope_kind='global' AND o.status <> 'deleted'
                AND (?1 IS NULL OR o.kind=?1)
              ORDER BY CASE o.status WHEN 'builtin' THEN 0 ELSE 1 END,o.name",
         )
@@ -6613,7 +6847,17 @@ fn list_template_market(
                 "content": row.get::<_, String>(4)?,
                 "description": metadata.get("description").and_then(Value::as_str).unwrap_or(""),
                 "version": row.get::<_, i64>(6)?,
-                "readonly": row.get::<_, String>(3)? == "builtin"
+                "readonly": row.get::<_, String>(3)? == "builtin",
+                "source": if row
+                    .get::<_, Option<String>>(7)?
+                    .is_some_and(|scope| scope.starts_with("repo:"))
+                {
+                    "仓库"
+                } else if row.get::<_, String>(3)? == "builtin" {
+                    "内置"
+                } else {
+                    "自定义"
+                }
             }))
         })
         .map_err(|error| error.to_string())?;
@@ -6662,7 +6906,7 @@ fn save_template(
         .map_err(|_| "database lock poisoned")?;
     let existing_status: Option<String> = connection
         .query_row(
-            "SELECT status FROM config_object WHERE id=?1 AND scope_kind='template'",
+            "SELECT status FROM config_object WHERE id=?1 AND scope_kind='global'",
             [&id],
             |row| row.get(0),
         )
@@ -6688,7 +6932,7 @@ fn save_template(
     tx.execute(
         "INSERT INTO config_object
          (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
-         VALUES (?1,?2,?3,?4,'template','custom','active',?5,NULL)
+         VALUES (?1,?2,?3,?4,'global',NULL,'active',?5,NULL)
          ON CONFLICT(id) DO UPDATE SET name=excluded.name,kind=excluded.kind,status='active'",
         params![id, kind, name, stable_server_key(&id), now],
     )
@@ -6726,7 +6970,7 @@ fn delete_template(state: State<'_, DesktopState>, id: String) -> Result<(), Str
         .map_err(|_| "database lock poisoned")?;
     let status: String = connection
         .query_row(
-            "SELECT status FROM config_object WHERE id=?1 AND scope_kind='template'",
+            "SELECT status FROM config_object WHERE id=?1 AND scope_kind='global'",
             [&id],
             |row| row.get(0),
         )
@@ -6736,7 +6980,7 @@ fn delete_template(state: State<'_, DesktopState>, id: String) -> Result<(), Str
     }
     connection
         .execute(
-            "UPDATE config_object SET status='deleted' WHERE id=?1 AND scope_kind='template'",
+            "UPDATE config_object SET status='deleted' WHERE id=?1 AND scope_kind='global'",
             [&id],
         )
         .map_err(|error| error.to_string())?;
@@ -6806,7 +7050,7 @@ fn insert_repository_template(
         .execute(
             "INSERT OR IGNORE INTO config_object
              (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
-             VALUES (?1,?2,?3,?4,'template',?5,'active',?6,?7)",
+             VALUES (?1,?2,?3,?4,'global',?5,'active',?6,?7)",
             params![
                 id,
                 kind,
@@ -6905,7 +7149,7 @@ fn import_repository_record(
     let same_source: Option<(String, String)> = connection
         .query_row(
             "SELECT id,status FROM config_object
-             WHERE scope_kind='template' AND scope_key=?1 AND kind=?2 AND name=?3
+             WHERE scope_kind='global' AND scope_key=?1 AND kind=?2 AND name=?3
                AND status <> 'deleted'",
             params![repo_scope, kind, name],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -6927,8 +7171,9 @@ fn import_repository_record(
     let protected: bool = connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM config_object
-             WHERE scope_kind='template' AND status IN ('active','builtin')
-               AND scope_key IN ('global','custom','builtin') AND kind=?1 AND name=?2)",
+             WHERE scope_kind='global' AND status IN ('active','builtin')
+               AND (scope_key IN ('global','custom','builtin') OR scope_key IS NULL)
+               AND kind=?1 AND name=?2)",
             params![kind, name],
             |row| row.get(0),
         )
@@ -7207,7 +7452,7 @@ fn template_record_content(
         .query_row(
             "SELECT o.kind,o.name,v.content FROM config_object o
              JOIN config_object_version v ON v.id=o.current_version_id
-             WHERE o.id=?1 AND o.scope_kind='template' AND o.status <> 'deleted'",
+             WHERE o.id=?1 AND o.scope_kind='global' AND o.status <> 'deleted'",
             [template_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -7271,7 +7516,7 @@ fn insert_custom_template(
 ) -> Result<String, String> {
     let existing: Option<String> = connection
         .query_row(
-            "SELECT id FROM config_object WHERE scope_kind='template'
+            "SELECT id FROM config_object WHERE scope_kind='global'
              AND status='active' AND name=?1",
             [name],
             |row| row.get(0),
@@ -7293,7 +7538,7 @@ fn insert_custom_template(
         .execute(
             "INSERT INTO config_object
              (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
-             VALUES (?1,?2,?3,?4,'template',?5,'active',?6,?7)",
+             VALUES (?1,?2,?3,?4,'global',?5,'active',?6,?7)",
             params![
                 id,
                 kind,
@@ -7404,7 +7649,7 @@ fn save_project_as_team_template(
     let duplicate: Option<String> = connection
         .query_row(
             "SELECT id FROM config_object
-             WHERE scope_kind='template' AND status='active' AND name=?1",
+             WHERE scope_kind='global' AND status='active' AND name=?1",
             [&template_name],
             |row| row.get(0),
         )
@@ -7445,7 +7690,7 @@ fn save_project_as_team_template(
             .query_row(
                 "SELECT o.id FROM config_object o
                  JOIN config_object_version v ON v.id=o.current_version_id
-                 WHERE o.scope_kind='template' AND o.status <> 'deleted'
+                 WHERE o.scope_kind='global' AND o.status <> 'deleted'
                    AND o.kind=?1 AND v.content_hash=?2
                  ORDER BY CASE o.status WHEN 'builtin' THEN 0 ELSE 1 END,o.id
                  LIMIT 1",
@@ -7468,7 +7713,7 @@ fn save_project_as_team_template(
             .execute(
                 "INSERT OR IGNORE INTO config_object
                  (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
-                 VALUES (?1,?2,?3,?4,'template','global','active',?5,?6)",
+                 VALUES (?1,?2,?3,?4,'global',NULL,'active',?5,?6)",
                 params![
                     id,
                     kind,
@@ -10486,10 +10731,12 @@ fn project_blueprint_content(
             "SELECT v.content
              FROM config_object o
              JOIN config_object_version v ON v.id=o.current_version_id
+             LEFT JOIN project_config_selection selection
+               ON selection.project_id=?1 AND selection.object_id=o.id
              WHERE o.kind='blueprint' AND o.scope_kind='global'
-               AND o.status='active'
+               AND o.status='active' AND COALESCE(selection.enabled,1)=1
              LIMIT 1",
-            [],
+            [project_id.unwrap_or_default()],
             |row| row.get(0),
         )
         .optional()
@@ -10523,10 +10770,13 @@ fn configured_blueprint_scope(
     let global_exists: bool = connection
         .query_row(
             "SELECT EXISTS(
-               SELECT 1 FROM config_object
-               WHERE kind='blueprint' AND scope_kind='global' AND status='active'
+               SELECT 1 FROM config_object o
+               LEFT JOIN project_config_selection selection
+                 ON selection.project_id=?1 AND selection.object_id=o.id
+               WHERE o.kind='blueprint' AND o.scope_kind='global'
+                 AND o.status='active' AND COALESCE(selection.enabled,1)=1
              )",
-            [],
+            [project_id.unwrap_or_default()],
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
@@ -13758,6 +14008,8 @@ fn main() {
             save_project_as_team_template,
             list_project_configuration_templates,
             set_project_configuration_template,
+            restore_project_configuration,
+            override_project_configuration,
             save_asset,
             delete_asset,
             set_asset_enabled,
@@ -13905,7 +14157,7 @@ mod m7_tests {
     }
 
     #[test]
-    fn copying_a_template_creates_an_independent_project_scoped_object() {
+    fn selecting_a_global_preset_does_not_copy_its_content() {
         let connection = Connection::open_in_memory().unwrap();
         connection
             .execute_batch(
@@ -13922,34 +14174,26 @@ mod m7_tests {
                    UNIQUE(object_id,version)
                  );
                  INSERT INTO config_object VALUES
-                   ('template-rules','rules','Rules','rules','template','custom',
+                   ('template-rules','rules','Rules','rules','global',NULL,
                     'active','now','template-rules:v1');
                  INSERT INTO config_object_version VALUES
                    ('template-rules:v1','template-rules',1,'before','hash','now','created','{}');",
             )
             .unwrap();
         copy_config_templates(&connection, "project-1", &["template-rules".to_owned()]).unwrap();
-        connection
-            .execute(
-                "UPDATE config_object_version SET content='after'
-                 WHERE object_id='template-rules'",
-                [],
-            )
-            .unwrap();
-        let copied: String = connection
+        let selected: i64 = connection
             .query_row(
-                "SELECT v.content FROM config_object o
-                 JOIN config_object_version v ON v.id=o.current_version_id
-                 WHERE o.scope_kind='project' AND o.scope_key='project-1'",
+                "SELECT COUNT(*) FROM project_config_selection
+                 WHERE project_id='project-1' AND object_id='template-rules' AND enabled=1",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(copied, "before");
+        assert_eq!(selected, 1);
     }
 
     #[test]
-    fn copying_a_template_can_restore_deleted_objects_and_tracks_new_versions() {
+    fn selecting_and_excluding_a_global_preset_is_reversible() {
         let connection = Connection::open_in_memory().unwrap();
         connection
             .execute_batch(
@@ -13966,7 +14210,7 @@ mod m7_tests {
                    UNIQUE(object_id,version)
                  );
                  INSERT INTO config_object VALUES
-                   ('template-rules','rules','Rules','rules','template','custom',
+                   ('template-rules','rules','Rules','rules','global',NULL,
                     'active','now','template-rules:v1');
                  INSERT INTO config_object_version VALUES
                    ('template-rules:v1','template-rules',1,'before',
@@ -13976,59 +14220,171 @@ mod m7_tests {
         copy_config_templates(&connection, "project-1", &["template-rules".to_owned()]).unwrap();
         connection
             .execute(
-                "UPDATE config_object SET status='deleted'
-                 WHERE id='project-project-1-template-rules'",
+                "INSERT OR REPLACE INTO project_config_selection(project_id,object_id,enabled)
+                 VALUES ('project-1','template-rules',0)",
                 [],
             )
             .unwrap();
         copy_config_templates(&connection, "project-1", &["template-rules".to_owned()]).unwrap();
-        let status_and_content: (String, String) = connection
+        let enabled: i64 = connection
             .query_row(
-                "SELECT o.status,v.content FROM config_object o
-                 JOIN config_object_version v ON v.id=o.current_version_id
-                 WHERE o.id='project-project-1-template-rules'",
+                "SELECT enabled FROM project_config_selection
+                 WHERE project_id='project-1' AND object_id='template-rules'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(enabled, 1);
+    }
+
+    #[test]
+    fn effective_configuration_combines_inheritance_overrides_exclusions_and_restore() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE config_object (
+                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+                   server_key TEXT, scope_kind TEXT NOT NULL, scope_key TEXT,
+                   status TEXT NOT NULL, created_at TEXT NOT NULL,
+                   current_version_id TEXT
+                 );
+                 CREATE TABLE config_object_version (
+                   id TEXT PRIMARY KEY, object_id TEXT NOT NULL, version INTEGER NOT NULL,
+                   content TEXT NOT NULL, content_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+                   note TEXT NOT NULL, metadata_json TEXT NOT NULL,
+                   UNIQUE(object_id,version)
+                 );
+                 CREATE TABLE project_config_selection (
+                   project_id TEXT NOT NULL, object_id TEXT NOT NULL,
+                   enabled INTEGER NOT NULL, PRIMARY KEY(project_id,object_id)
+                 );
+                 CREATE TABLE asset_session_selection (
+                   session_id TEXT NOT NULL, asset_id TEXT NOT NULL,
+                   enabled INTEGER NOT NULL, PRIMARY KEY(session_id,asset_id)
+                 );
+                 INSERT INTO config_object VALUES
+                   ('global-rules','rules','Rules','global-rules','global',NULL,
+                    'active','now','global-rules:v1'),
+                   ('project-rules','rules','Rules','project-rules','project','project-1',
+                    'active','now','project-rules:v1');
+                 INSERT INTO config_object_version VALUES
+                   ('global-rules:v1','global-rules',1,'global-value','h1','now','created','{}'),
+                   ('project-rules:v1','project-rules',1,'project-value','h2','now','created','{}');",
+            )
+            .unwrap();
+
+        let inherited =
+            effective_config_objects(&connection, "/workspace", "local", Some("project-1"), None)
+                .unwrap();
+        assert_eq!(
+            inherited,
+            vec![("project-rules".into(), "project-rules:v1".into())]
+        );
+
+        connection
+            .execute(
+                "UPDATE config_object SET status='deleted' WHERE id='project-rules'",
+                [],
+            )
+            .unwrap();
+        let global =
+            effective_config_objects(&connection, "/workspace", "local", Some("project-1"), None)
+                .unwrap();
+        assert_eq!(
+            global,
+            vec![("global-rules".into(), "global-rules:v1".into())]
+        );
+
+        connection
+            .execute(
+                "INSERT INTO project_config_selection(project_id,object_id,enabled)
+                 VALUES ('project-1','global-rules',0)",
+                [],
+            )
+            .unwrap();
+        assert!(
+            effective_config_objects(&connection, "/workspace", "local", Some("project-1"), None,)
+                .unwrap()
+                .is_empty()
+        );
+
+        connection
+            .execute(
+                "DELETE FROM project_config_selection
+                 WHERE project_id='project-1' AND object_id='global-rules'",
+                [],
+            )
+            .unwrap();
+        let restored =
+            effective_config_objects(&connection, "/workspace", "local", Some("project-1"), None)
+                .unwrap();
+        assert_eq!(
+            restored,
+            vec![("global-rules".into(), "global-rules:v1".into())]
+        );
+    }
+
+    #[test]
+    fn config_scope_migration_promotes_presets_and_preserves_project_selection() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE desktop_schema_migrations(
+                   version TEXT PRIMARY KEY, applied_at TEXT NOT NULL
+                 );
+                 CREATE TABLE config_object (
+                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+                   server_key TEXT, scope_kind TEXT NOT NULL, scope_key TEXT,
+                   status TEXT NOT NULL, created_at TEXT NOT NULL,
+                   current_version_id TEXT
+                 );
+                 CREATE TABLE config_object_version (
+                   id TEXT PRIMARY KEY, object_id TEXT NOT NULL, version INTEGER NOT NULL,
+                   content TEXT NOT NULL, content_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+                   note TEXT NOT NULL, metadata_json TEXT NOT NULL,
+                   UNIQUE(object_id,version)
+                 );
+                 INSERT INTO config_object VALUES
+                   ('template-rules','rules','Rules','rules','template','repo:/repo',
+                    'active','now','template-rules:v1'),
+                   ('project-same','rules','Rules','rules','project','project-1',
+                    'active','now','project-same:v1'),
+                   ('project-excluded','rules','Other','rules','project','project-1',
+                    'deleted','now','project-excluded:v1');
+                 INSERT INTO config_object_version VALUES
+                   ('template-rules:v1','template-rules',1,'same','h','now','created','{}'),
+                   ('project-same:v1','project-same',1,'same','h','now','copied',
+                    '{\"source_template_id\":\"template-rules\"}'),
+                   ('project-excluded:v1','project-excluded',1,'other','h2','now','copied',
+                    '{\"source_template_id\":\"template-rules\"}');",
+            )
+            .unwrap();
+        migrate_config_scope_model(&connection).unwrap();
+        let scope: (String, Option<String>) = connection
+            .query_row(
+                "SELECT scope_kind,scope_key FROM config_object WHERE id='template-rules'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(status_and_content, ("active".into(), "before".into()));
-
-        connection
-            .execute_batch(
-                "INSERT INTO config_object_version
-                 VALUES ('template-rules:v2','template-rules',2,'after',
-                         'hash-after','now','edited','{}');
-                 UPDATE config_object SET current_version_id='template-rules:v2'
-                 WHERE id='template-rules'",
-            )
-            .unwrap();
-        connection
-            .execute(
-                "UPDATE config_object SET status='deleted'
-                 WHERE id='project-project-1-template-rules'",
-                [],
-            )
-            .unwrap();
-        copy_config_templates(&connection, "project-1", &["template-rules".to_owned()]).unwrap();
-        let content: String = connection
+        assert_eq!(scope, ("global".into(), Some("repo:/repo".into())));
+        let same_status: String = connection
             .query_row(
-                "SELECT v.content FROM config_object o
-                 JOIN config_object_version v ON v.id=o.current_version_id
-                 WHERE o.id='project-project-1-template-rules'",
+                "SELECT status FROM config_object WHERE id='project-same'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(content, "after");
-        let versions: i64 = connection
+        assert_eq!(same_status, "deleted");
+        let excluded: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM config_object_version
-                 WHERE object_id='project-project-1-template-rules'",
+                "SELECT enabled FROM project_config_selection
+                 WHERE project_id='project-1' AND object_id='template-rules'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(versions, 2);
+        assert_eq!(excluded, 0);
     }
 
     #[test]
@@ -14119,7 +14475,7 @@ agents:
                  );
                  INSERT INTO config_object VALUES
                    ('custom-agent','agent-template','Demo','custom-agent',
-                    'template','custom','active','now','custom-agent:v1');
+                    'global','custom','active','now','custom-agent:v1');
                  INSERT INTO config_object_version VALUES
                    ('custom-agent:v1','custom-agent',1,'{\"role\":\"Custom\"}',
                     'hash','now','custom','{}');",

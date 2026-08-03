@@ -106,18 +106,65 @@ workflow:
 
 ---
 
-## 5. 配置作用域
+## 5. 配置作用域与全局预设
 
-`config_object.scope_kind` 增加 `project`（`scope_key = project_id`）。解析顺序，后者覆盖前者：
+设置页里的全局配置本身就是可复用的系统预设，不再为 Rules、Knowledge、Playbook、Skills、MCP、Connectors、Blueprint 等配置维护平行的 `template` 存储层。市场页只是这些全局预设以及仓库导入预设的浏览入口；Agent/Team 预设也存放在全局作用域，但创建会话或成员时仍然实例化为具体实体。
+
+### 5.1 作用域模型
+
+`config_object.scope_kind` 使用以下作用域：
+
+| 作用域 | 含义 |
+| --- | --- |
+| `global` | 设置页中的通用预设，默认对所有项目和会话继承 |
+| `project` | 项目的新增配置或对全局预设的覆盖，`scope_key = project_id` |
+| `repo` | 仓库/主机绑定的配置 |
+| `host` | 执行主机绑定的配置 |
+| `session` | 会话专属配置 |
+
+项目选择不复制全局对象，而是记录在 `project_config_selection`：
+
+- 没有记录：默认继承该全局预设；
+- `enabled = 1`：项目显式启用该全局预设；
+- `enabled = 0`：项目显式排除该全局预设；
+- 新增全局预设自动对已有项目生效，除非该项目存在显式排除记录。
+
+项目需要修改某条全局预设时，才创建同 `kind/name` 的 `project` 对象。项目页显示：
+
+- `继承自全局预设`：没有有效项目覆盖；
+- `项目已覆盖`：存在 active 的项目对象；
+- `已本地修改`：项目覆盖的当前版本 `content_hash` 与全局预设当前版本的 `content_hash` 不同。
+
+恢复继承会停用项目覆盖对象；它不会删除全局对象或历史版本。项目覆盖在项目配置页下方的既有资产编辑器中编辑，不另建一套编辑器。
+
+### 5.2 运行时解析
+
+运行时按以下顺序收集对象，后者覆盖前者：
 
 ```
 global → project → repo → host → session binding（冻结版本）
 ```
 
-- **Rules / Knowledge / Playbook / Skills**：项目级条目并入 `AssetBundle`，注入顺序为 Instructions → 项目 Rules → 仓库 AGENTS/rules → Knowledge（global 后 project）→ Playbook → Skills → 成员角色提示。
-- **MCP / Connectors**：配置对象走 project scope；成员会话的工具启用状态仍存 `mcp_session_tools`。
-- **Secrets**：key 加项目前缀 `project:<id>/<key>`，读取时先项目后全局，写入默认落项目。SecretStore 接口增加显式 scope 参数，不靠 UI 约束。
-- **Blueprint**：项目持有一份 blueprint，成员 worktree 建立后按其 `clone/initialize/dependencies/build/post_build` 阶段执行；`pre_push` 作为门禁在 Lead 验收前跑。
+对象按 `(kind, name)` 去重；同一名称在更高优先级作用域出现时，使用更高作用域的当前版本。全局对象先应用项目选择表的显式排除，项目覆盖和新增配置再参与解析；会话级 `asset_session_selection` 最后控制会话对象是否启用。绑定会话时保存所选对象及版本，保证运行中的会话使用冻结版本。
+
+- **Rules / Knowledge / Playbook / Skills**：有效配置并入 `AssetBundle`，注入顺序为 Instructions → Rules → 仓库 AGENTS/rules → Knowledge → Playbook → Skills → 成员角色提示。
+- **MCP / Connectors**：配置对象遵循同一作用域解析；成员会话的工具启用状态仍存 `mcp_session_tools`。
+- **Secrets**：独立使用 `secret_records` 的显式全局/项目隔离 API；项目 Secret 优先于全局同名 Secret，值不进入配置对象或日志。
+- **Blueprint**：优先使用有效项目覆盖，其次使用未被项目排除的全局 Blueprint，最后才读取仓库 `.devin/blueprint.yaml`；`pre-push` 作为 Lead 验收前门禁。
+
+### 5.3 旧数据迁移
+
+启动迁移 `p1-2-config-scope-model` 会：
+
+1. 创建 `project_config_selection`；
+2. 将已有 `scope_kind = 'template'` 的配置对象提升为 `global`，保留 `scope_key`、内容、版本和元数据，不覆盖用户数据；
+3. 对旧的项目配置副本：
+   - 副本内容仍等于来源预设时，停用副本并恢复全局继承；
+   - 已删除的副本转换为 `enabled = 0` 的项目显式排除；
+   - 内容已经被项目修改的副本保留为 `project` 覆盖；
+4. 记录迁移版本，重复启动不会重复迁移。
+
+配置对象的版本历史始终保留在 `config_object_version`；导入仓库模板也写入全局配置对象并保留仓库来源 scope，重复导入相同内容时保持不变，内容变化时追加新版本。
 
 ---
 
