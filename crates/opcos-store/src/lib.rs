@@ -2225,6 +2225,13 @@ mod tests {
     #[test]
     fn projects_agents_and_session_ownership_round_trip() {
         let store = SqliteStore::open_in_memory().unwrap();
+        let foreign_keys: i64 = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1);
         let now = Utc::now();
         store
             .save_project(&ProjectRecord {
