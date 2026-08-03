@@ -23,6 +23,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 mod acp;
 pub mod computer_use;
 pub mod event_bus;
+pub mod git;
 pub mod login_state;
 mod opencode;
 pub mod orchestration;
@@ -1431,6 +1432,7 @@ fn tool_risk(name: &str) -> ToolRisk {
         | "git_status"
         | "git_diff"
         | "git_log"
+        | "git_rev_parse"
         | "linear_get_issue"
         | "linear_list_my_issues"
         | "github_list_repositories"
@@ -1454,6 +1456,9 @@ fn tool_risk(name: &str) -> ToolRisk {
         | "work_queue_cancel"
         | "work_queue_requeue" => ToolRisk::Write,
         "write_file" | "edit" => ToolRisk::Write,
+        "git_create_branch" | "git_stage_commit" => ToolRisk::Write,
+        "git_push" | "github_create_pull_request" => ToolRisk::External,
+        "github_get_pull_request" => ToolRisk::Read,
         "run_shell" => ToolRisk::Execute,
         _ => ToolRisk::External,
     }
@@ -1855,6 +1860,15 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"write_file","description":"Write a remote file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
         json!({"type":"function","function":{"name":"run_shell","description":"Run a remote shell command.","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}),
         json!({"type":"function","function":{"name":"list_dir","description":"List a remote directory.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}),
+        json!({"type":"function","function":{"name":"git_status","description":"Read structured Git working-tree status.","parameters":{"type":"object","properties":{"cwd":{"type":"string"}},"required":["cwd"]}}}),
+        json!({"type":"function","function":{"name":"git_diff","description":"Read structured Git diff summary.","parameters":{"type":"object","properties":{"cwd":{"type":"string"},"reference":{"type":"string"}},"required":["cwd"]}}}),
+        json!({"type":"function","function":{"name":"git_log","description":"Read recent Git commits.","parameters":{"type":"object","properties":{"cwd":{"type":"string"},"count":{"type":"integer"}},"required":["cwd"]}}}),
+        json!({"type":"function","function":{"name":"git_rev_parse","description":"Resolve a Git reference to a commit SHA.","parameters":{"type":"object","properties":{"cwd":{"type":"string"},"reference":{"type":"string"}},"required":["cwd","reference"]}}}),
+        json!({"type":"function","function":{"name":"git_create_branch","description":"Create and switch to a named Git branch. Requires approval.","parameters":{"type":"object","properties":{"cwd":{"type":"string"},"branch":{"type":"string"}},"required":["cwd","branch"]}}}),
+        json!({"type":"function","function":{"name":"git_stage_commit","description":"Stage an explicit file list and create a Git commit. Requires approval.","parameters":{"type":"object","properties":{"cwd":{"type":"string"},"files":{"type":"array","items":{"type":"string"}},"message":{"type":"string"}},"required":["cwd","files","message"]}}}),
+        json!({"type":"function","function":{"name":"git_push","description":"Push the current Git branch using configured credential secrets. Requires approval and an external action record.","parameters":{"type":"object","properties":{"cwd":{"type":"string"},"remote":{"type":"string"},"branch":{"type":"string"},"credential_secret":{"type":"string"},"username_secret":{"type":"string"}},"required":["cwd","credential_secret"]}}}),
+        json!({"type":"function","function":{"name":"github_create_pull_request","description":"Create or reconcile a GitHub pull request for an existing pushed branch. Requires approval and is idempotent.","parameters":{"type":"object","properties":{"repo":{"type":"string"},"title":{"type":"string"},"head":{"type":"string"},"base":{"type":"string"},"body":{"type":"string"},"token_secret":{"type":"string"}},"required":["repo","title","head","base","body","token_secret"]}}}),
+        json!({"type":"function","function":{"name":"github_get_pull_request","description":"Read a GitHub pull request, including issue comments and review comments.","parameters":{"type":"object","properties":{"repo":{"type":"string"},"number":{"type":"integer"},"token_secret":{"type":"string"}},"required":["repo","number","token_secret"]}}}),
         json!({"type":"function","function":{"name":"propose_plan","description":"Propose a plan and wait for approval.","parameters":{"type":"object","properties":{"plan":{"type":"string"}},"required":["plan"]}}}),
         json!({"type":"function","function":{"name":"ask_user","description":"Ask the user a question and wait for an answer.","parameters":{"type":"object","properties":{"question":{"type":"string"}},"required":["question"]}}}),
         json!({"type":"function","function":{"name":"linear_get_issue","description":"Read a Linear issue by identifier. Read-only.","parameters":{"type":"object","properties":{"identifier":{"type":"string"}},"required":["identifier"]}}}),
@@ -1994,6 +2008,18 @@ mod tests {
         assert_eq!(tool_risk("linear_list_my_issues"), ToolRisk::Read);
         assert_eq!(tool_risk("linear_comment_issue"), ToolRisk::External);
         assert_eq!(tool_risk("linear_update_issue_status"), ToolRisk::External);
+    }
+
+    #[test]
+    fn structured_git_tools_have_separate_risk_boundaries() {
+        assert_eq!(tool_risk("git_status"), ToolRisk::Read);
+        assert_eq!(tool_risk("git_diff"), ToolRisk::Read);
+        assert_eq!(tool_risk("git_log"), ToolRisk::Read);
+        assert_eq!(tool_risk("github_get_pull_request"), ToolRisk::Read);
+        assert_eq!(tool_risk("git_create_branch"), ToolRisk::Write);
+        assert_eq!(tool_risk("git_stage_commit"), ToolRisk::Write);
+        assert_eq!(tool_risk("git_push"), ToolRisk::External);
+        assert_eq!(tool_risk("github_create_pull_request"), ToolRisk::External);
     }
 
     #[derive(Clone)]
