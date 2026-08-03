@@ -1440,6 +1440,8 @@ fn tool_risk(name: &str) -> ToolRisk {
         | "repo_index_find_symbol"
         | "repo_index_glob"
         | "repo_index_search" => ToolRisk::Read,
+        "action_ledger_list" => ToolRisk::Read,
+        "action_ledger_begin" | "action_ledger_finish" => ToolRisk::Write,
         "write_file" | "edit" => ToolRisk::Write,
         "run_shell" => ToolRisk::Execute,
         _ => ToolRisk::External,
@@ -1837,7 +1839,7 @@ where
 }
 
 fn tool_definitions() -> Vec<Value> {
-    vec![
+    let mut tools = vec![
         json!({"type":"function","function":{"name":"read_file","description":"Read a remote file.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}),
         json!({"type":"function","function":{"name":"write_file","description":"Write a remote file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
         json!({"type":"function","function":{"name":"run_shell","description":"Run a remote shell command.","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}),
@@ -1863,6 +1865,16 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"repo_index_find_symbol","description":"Find definitions and symbols in the repository index. Read-only.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}),
         json!({"type":"function","function":{"name":"repo_index_glob","description":"Find repository paths matching a glob. Read-only.","parameters":{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}}}),
         json!({"type":"function","function":{"name":"repo_index_search","description":"Search indexed symbol/content lines without loading whole files. Read-only.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}),
+    ];
+    tools.extend(action_ledger_tool_definitions());
+    tools
+}
+
+pub fn action_ledger_tool_definitions() -> Vec<Value> {
+    vec![
+        json!({"type":"function","function":{"name":"action_ledger_begin","description":"Claim an idempotent external action before performing it. An in-flight result is unsafe to retry without reconciliation.","parameters":{"type":"object","properties":{"action_type":{"type":"string"},"platform":{"type":"string"},"account_id":{"type":"string"},"idempotency_key":{"type":"string"}},"required":["action_type","platform","account_id","idempotency_key"]}}}),
+        json!({"type":"function","function":{"name":"action_ledger_finish","description":"Record the result of a previously begun external action.","parameters":{"type":"object","properties":{"action_id":{"type":"string"},"status":{"type":"string","enum":["succeeded","failed"]},"external_id":{"type":"string"},"result_summary":{"type":"string"},"error_summary":{"type":"string"}},"required":["action_id","status"]}}}),
+        json!({"type":"function","function":{"name":"action_ledger_list","description":"List OPCOS action history across sessions. Platform entities remain authoritative in their APIs or MCP servers.","parameters":{"type":"object","properties":{"platform":{"type":"string"},"account_id":{"type":"string"},"status":{"type":"string"},"limit":{"type":"integer"}}}}}),
     ]
 }
 

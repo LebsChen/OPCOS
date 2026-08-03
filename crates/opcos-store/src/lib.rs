@@ -182,6 +182,45 @@ pub struct AuditEvent {
     pub payload: serde_json::Value,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ActionLedgerRecord {
+    pub action_id: String,
+    pub action_type: String,
+    pub platform: String,
+    pub account_id: String,
+    pub idempotency_key: String,
+    pub external_id: Option<String>,
+    pub status: String,
+    pub result_summary: Option<String>,
+    pub error_summary: Option<String>,
+    pub attempts: u32,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub session_id: Option<String>,
+    pub project_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActionBeginResult {
+    Fresh(Box<ActionLedgerRecord>),
+    AlreadySucceeded {
+        action_id: String,
+        external_id: Option<String>,
+        result_summary: Option<String>,
+    },
+    InFlight {
+        action_id: String,
+        started_at: String,
+        attempts: u32,
+    },
+    PreviouslyFailed {
+        action_id: String,
+        attempts: u32,
+    },
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ArtifactRecord {
     pub id: String,
@@ -216,6 +255,82 @@ fn table_columns(connection: &Connection, table: &str) -> Result<Vec<String>, St
     let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(StoreError::from)
+}
+
+fn action_ledger_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActionLedgerRecord> {
+    Ok(ActionLedgerRecord {
+        action_id: row.get(0)?,
+        action_type: row.get(1)?,
+        platform: row.get(2)?,
+        account_id: row.get(3)?,
+        idempotency_key: row.get(4)?,
+        external_id: row.get(5)?,
+        status: row.get(6)?,
+        result_summary: row.get(7)?,
+        error_summary: row.get(8)?,
+        attempts: row.get(9)?,
+        started_at: row.get(10)?,
+        finished_at: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+        session_id: row.get(14)?,
+        project_id: row.get(15)?,
+    })
+}
+
+// This is only best-effort cleanup. Callers must provide a non-sensitive summary;
+// marker matching is not a security boundary and cannot detect arbitrary bare secrets.
+fn safe_action_summary(summary: &str) -> Result<String, StoreError> {
+    if summary.len() > 4096 {
+        return Err(StoreError::Validation("action summary is too long".into()));
+    }
+    let markers = [
+        "authorization:",
+        "authorization=",
+        "bearer ",
+        "api_key=",
+        "api-key=",
+        "apikey=",
+        "password=",
+        "password:",
+        "secret=",
+        "secret:",
+        "token=",
+        "token:",
+    ];
+    let lower = summary.to_ascii_lowercase();
+    let mut output = String::with_capacity(summary.len());
+    let mut cursor = 0;
+    let mut search_from = 0;
+    while search_from < lower.len() {
+        let Some((start, marker)) = markers
+            .iter()
+            .filter_map(|marker| {
+                lower[search_from..]
+                    .find(marker)
+                    .map(|offset| (search_from + offset, *marker))
+            })
+            .min_by_key(|(start, _)| *start)
+        else {
+            break;
+        };
+        let value_start = start + marker.len();
+        let end = summary[value_start..]
+            .char_indices()
+            .find(|(_, character)| character.is_whitespace() || matches!(character, ',' | ';'))
+            .map(|(index, _)| value_start + index)
+            .unwrap_or(summary.len());
+        output.push_str(&summary[cursor..value_start]);
+        output.push_str("[REDACTED]");
+        cursor = end;
+        search_from = end;
+    }
+    if cursor == 0 {
+        Ok(summary.to_owned())
+    } else {
+        output.push_str(&summary[cursor..]);
+        Ok(output)
+    }
 }
 
 fn ensure_artifact_schema(connection: &Connection) -> Result<(), StoreError> {
@@ -900,6 +1015,222 @@ impl SqliteStore {
         Ok(store)
     }
 
+    pub fn begin_action(
+        &self,
+        action_type: &str,
+        platform: &str,
+        account_id: &str,
+        idempotency_key: &str,
+        session_id: Option<&str>,
+        project_id: Option<&str>,
+    ) -> Result<ActionBeginResult, StoreError> {
+        for (name, value) in [
+            ("action_type", action_type),
+            ("platform", platform),
+            ("account_id", account_id),
+            ("idempotency_key", idempotency_key),
+        ] {
+            if value.trim().is_empty() {
+                return Err(StoreError::Validation(format!("{name} cannot be empty")));
+            }
+            if value.len() > 512 {
+                return Err(StoreError::Validation(format!("{name} is too long")));
+            }
+        }
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute_batch("BEGIN IMMEDIATE")?;
+        let now = Utc::now().to_rfc3339();
+        let result = (|| -> Result<ActionBeginResult, StoreError> {
+            let action_id = uuid::Uuid::new_v4().to_string();
+            let inserted = connection.execute(
+                "INSERT OR IGNORE INTO action_ledger
+                 (action_id,action_type,platform,account_id,idempotency_key,status,attempts,
+                  started_at,created_at,updated_at,session_id,project_id)
+                 VALUES (?1,?2,?3,?4,?5,'in_flight',1,?6,?6,?6,?7,?8)",
+                params![
+                    action_id,
+                    action_type,
+                    platform,
+                    account_id,
+                    idempotency_key,
+                    now,
+                    session_id,
+                    project_id
+                ],
+            )?;
+            if inserted == 1 {
+                return Ok(ActionBeginResult::Fresh(Box::new(ActionLedgerRecord {
+                    action_id,
+                    action_type: action_type.to_owned(),
+                    platform: platform.to_owned(),
+                    account_id: account_id.to_owned(),
+                    idempotency_key: idempotency_key.to_owned(),
+                    external_id: None,
+                    status: "in_flight".into(),
+                    result_summary: None,
+                    error_summary: None,
+                    attempts: 1,
+                    started_at: now.clone(),
+                    finished_at: None,
+                    created_at: now.clone(),
+                    updated_at: now,
+                    session_id: session_id.map(str::to_owned),
+                    project_id: project_id.map(str::to_owned),
+                })));
+            }
+            let existing = {
+                let mut statement = connection.prepare(
+                    "SELECT action_id,action_type,platform,account_id,idempotency_key,external_id,
+                            status,result_summary,error_summary,attempts,started_at,finished_at,
+                            created_at,updated_at,session_id,project_id
+                     FROM action_ledger WHERE idempotency_key=?1",
+                )?;
+                statement.query_row([idempotency_key], action_ledger_from_row)?
+            };
+            let was_failed = existing.status == "failed";
+            connection.execute(
+                "UPDATE action_ledger SET status='in_flight', attempts=attempts+1,
+                 started_at=?1, updated_at=?1, finished_at=NULL
+                 WHERE idempotency_key=?2 AND status='failed'",
+                params![now, idempotency_key],
+            )?;
+            let mut statement = connection.prepare(
+                "SELECT action_id,action_type,platform,account_id,idempotency_key,external_id,
+                        status,result_summary,error_summary,attempts,started_at,finished_at,
+                        created_at,updated_at,session_id,project_id
+                 FROM action_ledger WHERE idempotency_key=?1",
+            )?;
+            let record = statement.query_row([idempotency_key], action_ledger_from_row)?;
+            Ok(if was_failed {
+                ActionBeginResult::PreviouslyFailed {
+                    action_id: record.action_id,
+                    attempts: record.attempts,
+                }
+            } else {
+                match record.status.as_str() {
+                    "succeeded" => ActionBeginResult::AlreadySucceeded {
+                        action_id: record.action_id,
+                        external_id: record.external_id,
+                        result_summary: record.result_summary,
+                    },
+                    "in_flight" => ActionBeginResult::InFlight {
+                        action_id: record.action_id,
+                        started_at: record.started_at,
+                        attempts: record.attempts,
+                    },
+                    "failed" => ActionBeginResult::PreviouslyFailed {
+                        action_id: record.action_id,
+                        attempts: record.attempts,
+                    },
+                    status => {
+                        return Err(StoreError::Validation(format!(
+                            "unknown action ledger status: {status}"
+                        )));
+                    }
+                }
+            })
+        })();
+        match result {
+            Ok(value) => {
+                connection.execute_batch("COMMIT")?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    pub fn finish_action_succeeded(
+        &self,
+        action_id: &str,
+        external_id: Option<&str>,
+        result_summary: Option<&str>,
+    ) -> Result<ActionLedgerRecord, StoreError> {
+        self.finish_action(action_id, "succeeded", external_id, result_summary, None)
+    }
+
+    pub fn finish_action_failed(
+        &self,
+        action_id: &str,
+        error_summary: &str,
+    ) -> Result<ActionLedgerRecord, StoreError> {
+        self.finish_action(action_id, "failed", None, None, Some(error_summary))
+    }
+
+    fn finish_action(
+        &self,
+        action_id: &str,
+        status: &str,
+        external_id: Option<&str>,
+        result_summary: Option<&str>,
+        error_summary: Option<&str>,
+    ) -> Result<ActionLedgerRecord, StoreError> {
+        if action_id.trim().is_empty() {
+            return Err(StoreError::Validation("action_id cannot be empty".into()));
+        }
+        let result_summary = result_summary.map(safe_action_summary).transpose()?;
+        let error_summary = error_summary.map(safe_action_summary).transpose()?;
+        let now = Utc::now().to_rfc3339();
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let changed = connection.execute(
+            "UPDATE action_ledger SET status=?1, external_id=?2, result_summary=?3,
+             error_summary=?4, finished_at=?5, updated_at=?5
+             WHERE action_id=?6 AND status='in_flight'",
+            params![
+                status,
+                external_id,
+                result_summary,
+                error_summary,
+                now,
+                action_id
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::Validation(
+                "action is missing or is not in flight".into(),
+            ));
+        }
+        connection
+            .query_row(
+                "SELECT action_id,action_type,platform,account_id,idempotency_key,external_id,
+                        status,result_summary,error_summary,attempts,started_at,finished_at,
+                        created_at,updated_at,session_id,project_id
+                 FROM action_ledger WHERE action_id=?1",
+                [action_id],
+                action_ledger_from_row,
+            )
+            .map_err(StoreError::from)
+    }
+
+    pub fn load_actions(
+        &self,
+        platform: Option<&str>,
+        account_id: Option<&str>,
+        status: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<ActionLedgerRecord>, StoreError> {
+        let limit = limit.clamp(1, 500);
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT action_id,action_type,platform,account_id,idempotency_key,external_id,
+                    status,result_summary,error_summary,attempts,started_at,finished_at,
+                    created_at,updated_at,session_id,project_id
+             FROM action_ledger
+             WHERE (?1 IS NULL OR platform=?1)
+               AND (?2 IS NULL OR account_id=?2)
+               AND (?3 IS NULL OR status=?3)
+             ORDER BY created_at DESC LIMIT ?4",
+        )?;
+        let rows = statement.query_map(
+            params![platform, account_id, status, limit],
+            action_ledger_from_row,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     pub fn load_tool_calls(&self, session_id: &str) -> Result<Vec<ToolCallRecord>, StoreError> {
         self.load_tool_calls_filtered(session_id, None, None)
     }
@@ -1169,6 +1500,28 @@ impl SqliteStore {
                duration_ms INTEGER NOT NULL,
                recorded_at TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS action_ledger (
+               action_id TEXT PRIMARY KEY,
+               action_type TEXT NOT NULL,
+               platform TEXT NOT NULL,
+               account_id TEXT NOT NULL,
+               idempotency_key TEXT NOT NULL UNIQUE,
+               external_id TEXT,
+               status TEXT NOT NULL,
+               result_summary TEXT,
+               error_summary TEXT,
+               attempts INTEGER NOT NULL,
+               started_at TEXT NOT NULL,
+               finished_at TEXT,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               session_id TEXT,
+               project_id TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_action_ledger_created_at
+               ON action_ledger(created_at DESC);
+             CREATE INDEX IF NOT EXISTS idx_action_ledger_target
+               ON action_ledger(platform, account_id, status);
              ;",
             )?;
             ensure_artifact_schema(&connection)?;
@@ -1342,6 +1695,12 @@ impl SqliteStore {
             if version < 2 {
                 connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (2, ?1)",
+                    [Utc::now().to_rfc3339()],
+                )?;
+            }
+            if version < 3 {
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (3, ?1)",
                     [Utc::now().to_rfc3339()],
                 )?;
             }
@@ -2832,5 +3191,160 @@ mod tests {
         println!("secret_backend={}", store.backend());
         assert!(matches!(store.backend(), "keyring" | "encrypted-file"));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn action_ledger_begin_finish_and_retry_preserve_semantics() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let first = store
+            .begin_action(
+                "publish_product",
+                "shop",
+                "account-1",
+                "idem-1",
+                Some("session-1"),
+                Some("project-1"),
+            )
+            .unwrap();
+        let action_id = match first {
+            ActionBeginResult::Fresh(record) => {
+                assert_eq!(record.attempts, 1);
+                record.action_id
+            }
+            other => panic!("expected fresh, got {other:?}"),
+        };
+        store
+            .finish_action_succeeded(&action_id, Some("external-1"), Some("created"))
+            .unwrap();
+        assert!(matches!(
+            store
+                .begin_action("publish_product", "shop", "account-1", "idem-1", None, None)
+                .unwrap(),
+            ActionBeginResult::AlreadySucceeded {
+                external_id: Some(_),
+                ..
+            }
+        ));
+
+        let failed = store
+            .begin_action("reply", "market", "account-2", "idem-2", None, None)
+            .unwrap();
+        let failed_id = match failed {
+            ActionBeginResult::Fresh(record) => record.action_id,
+            other => panic!("expected fresh, got {other:?}"),
+        };
+        store
+            .finish_action_failed(&failed_id, "temporary network failure")
+            .unwrap();
+        assert!(matches!(
+            store
+                .begin_action("reply", "market", "account-2", "idem-2", None, None)
+                .unwrap(),
+            ActionBeginResult::PreviouslyFailed { attempts: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn action_ledger_keeps_in_flight_explicit_and_best_effort_redacts_summaries() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let action_id = match store
+            .begin_action("ship", "market", "account-1", "idem-in-flight", None, None)
+            .unwrap()
+        {
+            ActionBeginResult::Fresh(record) => record.action_id,
+            other => panic!("expected fresh, got {other:?}"),
+        };
+        let in_flight = store
+            .begin_action("ship", "market", "account-1", "idem-in-flight", None, None)
+            .unwrap();
+        assert!(matches!(in_flight, ActionBeginResult::InFlight { .. }));
+        store
+            .finish_action_succeeded(
+                &action_id,
+                Some("external-1"),
+                Some("password=do-not-store result=accepted"),
+            )
+            .unwrap();
+        let records = store.load_actions(None, None, None, 10).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(
+            !records[0]
+                .result_summary
+                .as_deref()
+                .unwrap()
+                .contains("do-not-store")
+        );
+        assert!(
+            records[0]
+                .result_summary
+                .as_deref()
+                .unwrap()
+                .contains("[REDACTED]")
+        );
+    }
+
+    #[test]
+    fn action_summary_redaction_handles_repeated_markers_and_utf8() {
+        let cases = [
+            ("token=abc", "token=[REDACTED]"),
+            ("token=aaaa token=b", "token=[REDACTED] token=[REDACTED]"),
+            (
+                "token=a token=bbbbbbbbbbbbbbbb",
+                "token=[REDACTED] token=[REDACTED]",
+            ),
+            (
+                "secret=x secret=y secret=z",
+                "secret=[REDACTED] secret=[REDACTED] secret=[REDACTED]",
+            ),
+            (
+                "token=привет token=мир",
+                "token=[REDACTED] token=[REDACTED]",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(safe_action_summary(input).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn action_ledger_competing_connections_have_one_fresh_result() {
+        let path = std::env::temp_dir().join(format!(
+            "opcos-action-ledger-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let setup = SqliteStore::open(&path).unwrap();
+        drop(setup);
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let path = path.clone();
+            threads.push(std::thread::spawn(move || {
+                SqliteStore::open(path)
+                    .unwrap()
+                    .begin_action("create", "shop", "account-1", "same-key", None, None)
+                    .unwrap()
+            }));
+        }
+        let results = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, ActionBeginResult::Fresh(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, ActionBeginResult::InFlight { .. }))
+                .count(),
+            7
+        );
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("db-shm"));
+        let _ = fs::remove_file(path.with_extension("db-wal"));
     }
 }

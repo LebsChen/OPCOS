@@ -6440,13 +6440,23 @@ function Activity({
     '[{"id":"leader","sort_order":0,"session_id":"","state":"Active"}]',
   );
   const [activityTab, setActivityTab] = useState<
-    "audit" | "board" | "roles" | "tasks" | "messages" | "worklog" | "insights"
+    | "audit"
+    | "actions"
+    | "board"
+    | "roles"
+    | "tasks"
+    | "messages"
+    | "worklog"
+    | "insights"
   >("board");
   const [worklog, setWorklog] = useState<Record<string, unknown> | null>(null);
   const [insights, setInsights] = useState<Record<string, unknown> | null>(
     null,
   );
   const [auditEvents, setAuditEvents] = useState<Record<string, unknown>[]>([]);
+  const [actionLedger, setActionLedger] = useState<Record<string, unknown>[]>(
+    [],
+  );
   const load = () =>
     command<Coordination>("coordination_snapshot", { taskId })
       .then(setBoard)
@@ -6461,6 +6471,7 @@ function Activity({
           {(
             [
               "audit",
+              "actions",
               "board",
               "roles",
               "tasks",
@@ -6494,6 +6505,15 @@ function Activity({
                   })
                     .then(setAuditEvents)
                     .catch(onError);
+                if (item === "actions")
+                  void command<Record<string, unknown>[]>(
+                    "action_ledger_events",
+                    {
+                      limit: 200,
+                    },
+                  )
+                    .then(setActionLedger)
+                    .catch(onError);
               }}
             >
               <Icon
@@ -6501,6 +6521,7 @@ function Activity({
                   (
                     {
                       audit: "audit",
+                      actions: "audit",
                       board: "audit",
                       roles: "gear",
                       tasks: "code",
@@ -6528,6 +6549,8 @@ function Activity({
                     {
                       audit:
                         "Review durable security and configuration events.",
+                      actions:
+                        "Review cross-session records of OPCOS external actions.",
                       board: "Start or observe the active coordination board.",
                       roles: "Review board roles and their current state.",
                       tasks:
@@ -6583,6 +6606,38 @@ function Activity({
                   ) : null
                 }
                 empty="No audit events recorded yet."
+              />
+            )}
+            {activityTab === "actions" && (
+              <CollectionPage
+                search=""
+                onSearch={() => undefined}
+                searchPlaceholder="Filter action history"
+                rows={
+                  actionLedger.length ? (
+                    <>
+                      {actionLedger.map((action) => (
+                        <div
+                          className="manage-row px-4"
+                          key={String(action.action_id)}
+                        >
+                          <span>
+                            <strong>
+                              {String(action.action_type)} ·{" "}
+                              {String(action.platform)}
+                            </strong>
+                            <small>
+                              {String(action.status)} ·{" "}
+                              {String(action.account_id)} ·{" "}
+                              {String(action.idempotency_key)}
+                            </small>
+                          </span>
+                        </div>
+                      ))}
+                    </>
+                  ) : null
+                }
+                empty="No action ledger records yet."
               />
             )}
             {activityTab === "insights" && (
