@@ -13,7 +13,7 @@ use axum::{
     routing::any,
 };
 use base64::Engine;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use notify::Watcher;
 use opcos_assets::{
@@ -1219,6 +1219,10 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                task_id TEXT NOT NULL,
                depends_on TEXT NOT NULL,
                PRIMARY KEY(task_id,depends_on)
+             );
+             CREATE TABLE IF NOT EXISTS coordination_ingest_cursor (
+               session_id TEXT PRIMARY KEY,
+               sequence INTEGER NOT NULL DEFAULT 0
              );",
         )
         .map_err(|error| error.to_string())?;
@@ -1262,6 +1266,10 @@ fn migrate_coordination(connection: &Connection) -> Result<(), String> {
                task_id TEXT NOT NULL,
                depends_on TEXT NOT NULL,
                PRIMARY KEY(task_id,depends_on)
+             );
+             CREATE TABLE IF NOT EXISTS coordination_ingest_cursor (
+               session_id TEXT PRIMARY KEY,
+               sequence INTEGER NOT NULL DEFAULT 0
              );",
         )
         .map_err(|error| error.to_string())
@@ -4657,6 +4665,7 @@ async fn submit_turn(
     );
     match engine.submit_text(request.text).await {
         Ok(_) => {
+            let _ = coordination_ingest_session_inner(&state, &request.session_id, false).await;
             let calls = state
                 .store
                 .load_tool_calls_after(&request.session_id, sequence_before)
@@ -4920,6 +4929,11 @@ async fn submit_opencode_turn(
                             object.insert("turn".into(), json!(turn));
                         }
                         emit(&event_app, "turn_done", Some(&event_session), payload);
+                        if let Some(state) = event_app.try_state::<DesktopState>() {
+                            let _ =
+                                coordination_ingest_session_inner(&state, &event_session, false)
+                                    .await;
+                        }
                     }
                 }
             }
@@ -8738,7 +8752,17 @@ async fn coordination_start(
         .clone()
         .or_else(|| input.roles.first().map(|role| role.project_id.clone()))
         .unwrap_or_default();
-    let runtime = CoordinationRuntime::new(input.roles).map_err(|error| error.to_string())?;
+    let mut runtime = CoordinationRuntime::new(input.roles).map_err(|error| error.to_string())?;
+    let persisted = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        load_persisted_coord_messages(&connection, &input.task_id)?
+    };
+    runtime
+        .restore_messages(persisted)
+        .map_err(|error| format!("stored coordination history is invalid: {error}"))?;
     state
         .coordination
         .lock()
@@ -8781,7 +8805,17 @@ async fn coordination_start_project(
         .ok_or_else(|| "project not found".to_owned())?;
     let workflow = parse_workflow(&project.workflow_json)?;
     let task_id = format!("project-board:{project_id}");
-    let runtime = CoordinationRuntime::new(roles).map_err(|error| error.to_string())?;
+    let mut runtime = CoordinationRuntime::new(roles).map_err(|error| error.to_string())?;
+    let persisted = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        load_persisted_coord_messages(&connection, &task_id)?
+    };
+    runtime
+        .restore_messages(persisted)
+        .map_err(|error| format!("stored coordination history is invalid: {error}"))?;
     state
         .coordination
         .lock()
@@ -8883,6 +8917,58 @@ fn persist_coord_message(
         )
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn load_persisted_coord_messages(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<Vec<(Envelope, DateTime<Utc>)>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT task_id,from_role,to_role,kind,msg_id,reply_to,payload,created_at
+             FROM coord_messages WHERE task_id=?1 ORDER BY created_at,msg_id",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([task_id], |row| {
+            let kind: String = row.get(3)?;
+            let payload: String = row.get(6)?;
+            let created_at: String = row.get(7)?;
+            Ok((
+                Envelope {
+                    v: 1,
+                    task_id: row.get(0)?,
+                    from: row.get(1)?,
+                    to: row.get(2)?,
+                    kind: serde_json::from_str(&format!("\"{kind}\"")).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    msg_id: row.get(4)?,
+                    reply_to: row.get(5)?,
+                    payload: serde_json::from_str(&payload).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            6,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                },
+                created_at.parse::<DateTime<Utc>>().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        7,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -9077,43 +9163,170 @@ fn load_project_messages(connection: &Connection, project_id: &str) -> Result<Ve
 async fn coordination_ingest_session(
     state: State<'_, DesktopState>,
     session_id: String,
+    full: Option<bool>,
 ) -> Result<Value, String> {
-    let records = state
+    coordination_ingest_session_inner(&state, &session_id, full.unwrap_or(true)).await
+}
+
+async fn coordination_ingest_session_inner(
+    state: &DesktopState,
+    session_id: &str,
+    full: bool,
+) -> Result<Value, String> {
+    let cursor = if full {
+        0
+    } else {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        connection
+            .query_row(
+                "SELECT sequence FROM coordination_ingest_cursor WHERE session_id=?1",
+                [session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .unwrap_or(0)
+    };
+    let messages = state
         .store
-        .load_transcript(&session_id)
+        .load_messages(session_id)
         .map_err(|error| error.to_string())?;
     let mut accepted = 0usize;
-    for record in records {
-        let text = record
-            .payload
-            .as_str()
-            .map(str::to_owned)
-            .or_else(|| {
-                record
-                    .payload
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .unwrap_or_default();
+    let mut skipped = 0usize;
+    let mut rejected = Vec::new();
+    let mut max_sequence = cursor;
+    for record in messages
+        .into_iter()
+        .filter(|record| record.sequence > cursor)
+    {
+        max_sequence = max_sequence.max(record.sequence);
+        if record.role != "assistant" {
+            continue;
+        }
+        let Some(text) = coordination_text(&record.content) else {
+            continue;
+        };
         if !text.contains("[[COORD]]") {
             continue;
         }
-        let envelope = Envelope::decode(&text).map_err(|error| error.to_string())?;
-        let project_id = connection_project_for_task(&state, &envelope.task_id)?;
-        {
-            let mut runtimes = state.coordination.lock().await;
-            let runtime = runtimes
-                .get_mut(&envelope.task_id)
-                .ok_or_else(|| "coordination task is not started".to_owned())?;
-            runtime
-                .validate_and_record(&envelope, Utc::now())
-                .map_err(|error| error.to_string())?;
+        let envelope = match Envelope::decode(&text) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                rejected.push(json!({
+                    "reason": format!("coordination circuit breaker tripped: {error}")
+                }));
+                continue;
+            }
+        };
+        let already_recorded = {
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            connection
+                .query_row(
+                    "SELECT 1 FROM coord_messages WHERE msg_id=?1",
+                    [&envelope.msg_id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .is_some()
+        };
+        if already_recorded {
+            skipped += 1;
+            continue;
         }
-        persist_coord_message(&state, &project_id, &envelope.task_id, &envelope)?;
-        accepted += 1;
+        let project_id = match connection_project_for_task(state, &envelope.task_id) {
+            Ok(project_id) => project_id,
+            Err(error) => {
+                rejected.push(json!({
+                    "msgId": envelope.msg_id,
+                    "reason": error
+                }));
+                continue;
+            }
+        };
+        let result = {
+            let mut runtimes = state.coordination.lock().await;
+            if let Some(runtime) = runtimes.get_mut(&envelope.task_id) {
+                let source_matches_session = runtime
+                    .role(&envelope.from)
+                    .is_some_and(|role| role.session_id == session_id);
+                if !source_matches_session {
+                    Err("coordination envelope source session does not match role".to_owned())
+                } else {
+                    runtime
+                        .validate_and_record(&envelope, Utc::now())
+                        .map_err(|error| error.to_string())
+                }
+            } else {
+                Err("coordination task is not started".to_owned())
+            }
+        };
+        if let Err(reason) = result {
+            rejected.push(json!({
+                "msgId": envelope.msg_id,
+                "reason": format!("coordination circuit breaker tripped: {reason}")
+            }));
+            continue;
+        }
+        if let Err(error) = persist_coord_message(state, &project_id, &envelope.task_id, &envelope)
+        {
+            rejected.push(json!({"msgId": envelope.msg_id, "reason": error}));
+        } else {
+            accepted += 1;
+        }
     }
-    Ok(json!({"session_id":session_id,"accepted":accepted}))
+    if !full {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        connection
+            .execute(
+                "INSERT INTO coordination_ingest_cursor(session_id,sequence) VALUES (?1,?2)
+                 ON CONFLICT(session_id) DO UPDATE SET sequence=excluded.sequence",
+                params![session_id, max_sequence],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(json!({
+        "session_id": session_id,
+        "accepted": accepted,
+        "skipped": skipped,
+        "rejected": rejected
+    }))
+}
+
+fn coordination_text(content: &Value) -> Option<String> {
+    if let Some(text) = content.as_str() {
+        return Some(text.to_owned());
+    }
+    if let Some(text) = content.get("text").and_then(Value::as_str) {
+        return Some(text.to_owned());
+    }
+    if let Some(text) = content.get("content").and_then(Value::as_str) {
+        return Some(text.to_owned());
+    }
+    content
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    item.get("text")
+                        .and_then(Value::as_str)
+                        .or_else(|| item.as_str())
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .filter(|text| !text.is_empty())
 }
 
 #[tauri::command]
@@ -9378,13 +9591,27 @@ async fn verify_task_delivery(
     if !pr_url.starts_with("https://github.com/") || !pr_url.contains("/pull/") {
         return Err("completion requires a GitHub pull request URL".into());
     }
+    let path = pr_url
+        .trim_start_matches("https://github.com/")
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    let parts = path.split('/').collect::<Vec<_>>();
+    if parts.len() < 4 || parts[2] != "pull" {
+        return Err("completion requires a valid GitHub pull request URL".into());
+    }
+    let pr_repo = format!("{}/{}", parts[0], parts[1]);
+    let pr_number = parts[3]
+        .parse::<u64>()
+        .map_err(|_| "completion requires a valid pull request number".to_owned())?;
     let repo = project
         .repo_url
         .trim_end_matches(".git")
         .trim_start_matches("https://github.com/")
         .trim_start_matches("http://github.com/")
+        .trim_start_matches("git@github.com:")
         .trim_end_matches('/');
-    if !pr_url.contains(&format!("/{repo}/pull/")) {
+    if !repo.is_empty() && repo != pr_repo {
         return Err("pull request repository does not match the project repository".into());
     }
     let host = project_host(state, project).await?;
@@ -9417,14 +9644,45 @@ async fn verify_task_delivery(
             );
         }
     }
-    let response = reqwest::Client::new()
-        .get(pr_url)
-        .header("User-Agent", "OPCOS/0.1")
-        .send()
-        .await
-        .map_err(|error| format!("pull request verification failed: {error}"))?;
-    if !response.status().is_success() {
-        return Err("completion verification failed: pull request was not found".into());
+    let configured = scoped_secret_get(state, Some(&project.id), "connector-config", "github")?
+        .or(scoped_secret_get(
+            state,
+            Some(&project.id),
+            "connector-token",
+            "github",
+        )?)
+        .or(scoped_secret_get(
+            state,
+            Some(&project.id),
+            "asset-secret",
+            "github-token",
+        )?)
+        .ok_or_else(|| "GitHub token is not configured for completion verification".to_owned())?;
+    let token = serde_json::from_str::<Value>(&configured)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("token")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or(configured);
+    let api_url = format!("https://api.github.com/repos/{pr_repo}/pulls/{pr_number}");
+    let response = github_json(&token, reqwest::Method::GET, &api_url, None).await?;
+    if response
+        .get("head")
+        .and_then(|head| head.get("ref"))
+        .and_then(Value::as_str)
+        != Some(branch)
+    {
+        return Err(
+            "completion verification failed: pull request branch does not match task branch".into(),
+        );
+    }
+    if response.get("state").and_then(Value::as_str) == Some("closed")
+        && response.get("merged").and_then(Value::as_bool) != Some(true)
+    {
+        return Err("completion verification failed: pull request is closed without merge".into());
     }
     Ok(())
 }
