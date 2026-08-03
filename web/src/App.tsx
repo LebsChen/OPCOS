@@ -89,7 +89,7 @@ type ConnectorField = {
   type?: "text" | "password" | "url";
   placeholder?: string;
 };
-type DevinSettings = {
+type AgentSettings = {
   computer_use: boolean;
   default_agent: string;
   api_default_agent: string;
@@ -97,7 +97,7 @@ type DevinSettings = {
   batch_limit: number;
   message_usage_limit: number;
   share_prompts_in_prs: boolean;
-  require_devin_mention: boolean;
+  require_agent_mention: boolean;
   auto_add_reviewer: boolean;
   reviewer: string;
   open_prs_as: "draft" | "ready";
@@ -523,10 +523,6 @@ const OPENWORKER_CONNECTORS: ConnectorCatalogEntry[] = [
   {
     name: "PagerDuty",
     description: "See on-call schedules and review active incidents.",
-  },
-  {
-    name: "Devin",
-    description: "Import Devin Knowledge and Playbooks and connect Devin MCP.",
   },
 ];
 
@@ -2777,7 +2773,8 @@ function GitActions({
           拉取并处理评论
         </Button>
         <p className="muted small">
-          Bot 评论和未满足 @Devin 策略的评论会被跳过；凭据只在 Rust 后端使用。
+          Bot 评论和未满足 agent mention 策略的评论会被跳过；凭据只在 Rust
+          后端使用。
         </p>
       </details>
     </div>
@@ -3006,11 +3003,13 @@ function ManageSections({
   const [providerStatuses, setProviderStatuses] = useState<
     Record<string, string>
   >({});
-  const [devinSettings, setDevinSettings] = useState<DevinSettings | null>(
+  const [agentSettings, setAgentSettings] = useState<AgentSettings | null>(
     null,
   );
-  const [devinProjectId, setDevinProjectId] = useState<string | null>(null);
-  const [devinSettingsStatus, setDevinSettingsStatus] = useState("");
+  const [settingsProjectId, setSettingsProjectId] = useState<string | null>(
+    null,
+  );
+  const [agentSettingsStatus, setAgentSettingsStatus] = useState("");
   const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
   const [slashCommandName, setSlashCommandName] = useState("");
   const [slashCommandBody, setSlashCommandBody] = useState("");
@@ -3074,17 +3073,6 @@ function ManageSections({
   const [remoteAssetAction, setRemoteAssetAction] = useState<
     "discovering" | "importing" | "exporting" | null
   >(null);
-  const [devinKey, setDevinKey] = useState("");
-  const [devinKeyConfigured, setDevinKeyConfigured] = useState(false);
-  const [devinKeyStatus, setDevinKeyStatus] = useState("");
-  const [devinAssetItems, setDevinAssetItems] = useState<
-    Array<Record<string, unknown>>
-  >([]);
-  const [devinAssetOpen, setDevinAssetOpen] = useState(false);
-  const [devinAssetLoading, setDevinAssetLoading] = useState(false);
-  const [devinAssetImporting, setDevinAssetImporting] = useState<string | null>(
-    null,
-  );
   const [theme, setTheme] = useState<"light" | "dark" | "auto">(() => {
     const stored = localStorage.getItem("opcos.theme");
     return stored === "dark" || stored === "auto" ? stored : "light";
@@ -3101,9 +3089,6 @@ function ManageSections({
   useEffect(() => subscribeLocale(() => setCurrentLocale(getLocale())), []);
   useEffect(() => {
     if (tab !== "connectors") return;
-    void command<Record<string, unknown>>("devin_integration_status")
-      .then((status) => setDevinKeyConfigured(status.configured === true))
-      .catch(onError);
     for (const kind of [
       ...TOKEN_CONNECTOR_KINDS,
       ...OAUTH_CONNECTOR_KINDS,
@@ -3226,8 +3211,8 @@ function ManageSections({
     ],
     blueprint: ["Blueprint", "Read and manage the selected host blueprint."],
     appearance: [translate("general"), translate("appearanceDescription")],
-    devin: [
-      "Devin",
+    agent: [
+      "Agent defaults",
       "控制会话默认值、Computer use、用量上限和 Pull request 策略。",
     ],
     environment: [
@@ -3252,37 +3237,6 @@ function ManageSections({
     assetTabKind === "agents"
       ? "规则"
       : assetTabKind[0].toUpperCase() + assetTabKind.slice(1);
-  const loadDevinAssets = () => {
-    const kind = assetTabKind === "playbook" ? "playbooks" : "knowledge";
-    setDevinAssetLoading(true);
-    void command<Array<Record<string, unknown>>>(
-      kind === "playbooks" ? "devin_playbooks_list" : "devin_knowledge_list",
-    )
-      .then((items) => {
-        setDevinAssetItems(items);
-        setDevinAssetOpen(true);
-      })
-      .catch(onError)
-      .finally(() => setDevinAssetLoading(false));
-  };
-  const importDevinAsset = (item: Record<string, unknown>) => {
-    const sourceId = String(item.id || Date.now());
-    const kind = assetTabKind;
-    setDevinAssetImporting(sourceId);
-    void command("save_asset", {
-      id: `devin-${kind}-${sourceId}`,
-      kind,
-      title: String(item.title || item.name || "Devin asset"),
-      body: String(item.body || ""),
-      trigger: null,
-      scope: null,
-      scopeKind: "global",
-      enabled: true,
-    })
-      .then(onRefresh)
-      .catch(onError)
-      .finally(() => setDevinAssetImporting(null));
-  };
   useEffect(() => {
     if (tab !== "instructions") return;
     setInstructionsDraft(
@@ -3298,15 +3252,22 @@ function ManageSections({
       .catch(onError);
   }, []);
   useEffect(() => {
-    if (tab !== "devin") return;
-    void command<DevinSettings>("devin_settings", { projectId: devinProjectId })
-      .then(setDevinSettings)
+    if (tab !== "agent") return;
+    void command<AgentSettings>("agent_settings", {
+      projectId: settingsProjectId,
+    })
+      .then(setAgentSettings)
       .catch(onError);
-  }, [tab, devinProjectId, onError]);
+    void command<SlashCommand[]>("list_slash_commands", {
+      projectId: settingsProjectId,
+    })
+      .then(setSlashCommands)
+      .catch(onError);
+  }, [tab, settingsProjectId, onError]);
   useEffect(() => {
     if (tab !== "skill") return;
     void command<SkillUsageDashboard>("skill_usage_dashboard", {
-      projectId: devinProjectId,
+      projectId: settingsProjectId,
     })
       .then(setSkillUsage)
       .catch(onError);
@@ -3319,7 +3280,7 @@ function ManageSections({
     })
       .then(setSkillBrowse)
       .catch(onError);
-  }, [tab, devinProjectId, selected, onError]);
+  }, [tab, settingsProjectId, selected, onError]);
   useEffect(() => {
     if (tab !== "market") return;
     void command<MarketTemplate[]>("list_template_market")
@@ -3329,7 +3290,7 @@ function ManageSections({
   useEffect(() => {
     if (tab !== "environment") return;
     void command<EnvironmentRepository[]>("list_environment_repositories", {
-      projectId: devinProjectId,
+      projectId: settingsProjectId,
     })
       .then(setEnvironmentRepositories)
       .catch(onError);
@@ -3345,15 +3306,7 @@ function ManageSections({
         setBlueprintDraft(value.content);
       })
       .catch(onError);
-  }, [tab, devinProjectId, selected, onError]);
-  useEffect(() => {
-    if (tab !== "devin") return;
-    void command<SlashCommand[]>("list_slash_commands", {
-      projectId: devinProjectId,
-    })
-      .then(setSlashCommands)
-      .catch(onError);
-  }, [tab, devinProjectId, onError]);
+  }, [tab, settingsProjectId, selected, onError]);
   useEffect(() => {
     void command<
       Array<{ provider: string; base_url?: string; configured: boolean }>
@@ -3391,7 +3344,7 @@ function ManageSections({
           tab === "appearance" ||
           tab === "provider" ||
           tab === "blueprint" ||
-          tab === "devin" ||
+          tab === "agent" ||
           tab === "market"
             ? "rounded-xl2 border border-line bg-panel p-5"
             : ""
@@ -3506,14 +3459,14 @@ function ManageSections({
                         className="primary"
                         onClick={() =>
                           command("save_asset", {
-                            id: devinProjectId
-                              ? `project-blueprint-${devinProjectId}`
+                            id: settingsProjectId
+                              ? `project-blueprint-${settingsProjectId}`
                               : "global-blueprint",
                             kind: "blueprint",
                             title: "Blueprint",
                             body: blueprintDraft,
-                            scopeKind: devinProjectId ? "project" : "global",
-                            projectId: devinProjectId,
+                            scopeKind: settingsProjectId ? "project" : "global",
+                            projectId: settingsProjectId,
                             enabled: true,
                           })
                             .then(() =>
@@ -3644,7 +3597,7 @@ function ManageSections({
                     className="primary"
                     onClick={() =>
                       command("save_environment_repositories", {
-                        projectId: devinProjectId,
+                        projectId: settingsProjectId,
                         repositories: environmentRepositories,
                       })
                         .then(() => setEnvironmentStatus("顺序与设置已保存"))
@@ -3687,7 +3640,7 @@ function ManageSections({
             )}
           </div>
         )}
-        {tab === "devin" && devinSettings && (
+        {tab === "agent" && agentSettings && (
           <div className="divide-y divide-line">
             <label className="settings-row">
               <div>
@@ -3695,8 +3648,8 @@ function ManageSections({
                 <small>项目设置覆盖全局设置；未选择项目时编辑全局设置。</small>
               </div>
               <SelectMenu
-                value={devinProjectId || ""}
-                onChange={(value) => setDevinProjectId(value || null)}
+                value={settingsProjectId || ""}
+                onChange={(value) => setSettingsProjectId(value || null)}
                 options={[
                   { value: "", label: "全局" },
                   ...projects.map((project) => ({
@@ -3713,10 +3666,10 @@ function ManageSections({
               </div>
               <input
                 type="checkbox"
-                checked={devinSettings.computer_use}
+                checked={agentSettings.computer_use}
                 onChange={(event) =>
-                  setDevinSettings({
-                    ...devinSettings,
+                  setAgentSettings({
+                    ...agentSettings,
                     computer_use: event.target.checked,
                   })
                 }
@@ -3735,10 +3688,10 @@ function ManageSections({
                   <small>用于没有显式覆盖的新建会话。</small>
                 </div>
                 <input
-                  value={devinSettings[keyName]}
+                  value={agentSettings[keyName]}
                   onChange={(event) =>
-                    setDevinSettings({
-                      ...devinSettings,
+                    setAgentSettings({
+                      ...agentSettings,
                       [keyName]: event.target.value,
                     })
                   }
@@ -3754,10 +3707,10 @@ function ManageSections({
                 type="number"
                 min={1}
                 max={500}
-                value={devinSettings.batch_limit}
+                value={agentSettings.batch_limit}
                 onChange={(event) =>
-                  setDevinSettings({
-                    ...devinSettings,
+                  setAgentSettings({
+                    ...agentSettings,
                     batch_limit: Number(event.target.value),
                   })
                 }
@@ -3771,10 +3724,10 @@ function ManageSections({
               <input
                 type="number"
                 min={0}
-                value={devinSettings.message_usage_limit}
+                value={agentSettings.message_usage_limit}
                 onChange={(event) =>
-                  setDevinSettings({
-                    ...devinSettings,
+                  setAgentSettings({
+                    ...agentSettings,
                     message_usage_limit: Number(event.target.value),
                   })
                 }
@@ -3783,7 +3736,7 @@ function ManageSections({
             {(
               [
                 ["share_prompts_in_prs", "Share prompts in PRs"],
-                ["require_devin_mention", "Require @Devin to respond"],
+                ["require_agent_mention", "Require the agent to respond"],
                 ["auto_add_reviewer", "Auto-add reviewer"],
               ] as const
             ).map(([keyName, label]) => (
@@ -3794,10 +3747,10 @@ function ManageSections({
                 </div>
                 <input
                   type="checkbox"
-                  checked={devinSettings[keyName]}
+                  checked={agentSettings[keyName]}
                   onChange={(event) =>
-                    setDevinSettings({
-                      ...devinSettings,
+                    setAgentSettings({
+                      ...agentSettings,
                       [keyName]: event.target.checked,
                     })
                   }
@@ -3810,10 +3763,10 @@ function ManageSections({
                 <small>自动添加 reviewer 时使用的 GitHub 用户名。</small>
               </div>
               <input
-                value={devinSettings.reviewer}
+                value={agentSettings.reviewer}
                 onChange={(event) =>
-                  setDevinSettings({
-                    ...devinSettings,
+                  setAgentSettings({
+                    ...agentSettings,
                     reviewer: event.target.value,
                   })
                 }
@@ -3825,10 +3778,10 @@ function ManageSections({
                 <small>创建 Pull request 时的初始状态。</small>
               </div>
               <SelectMenu
-                value={devinSettings.open_prs_as}
+                value={agentSettings.open_prs_as}
                 onChange={(value) =>
-                  setDevinSettings({
-                    ...devinSettings,
+                  setAgentSettings({
+                    ...agentSettings,
                     open_prs_as: value as "draft" | "ready",
                   })
                 }
@@ -3844,10 +3797,10 @@ function ManageSections({
                 <small>是否响应机器人触发的消息。</small>
               </div>
               <SelectMenu
-                value={devinSettings.responding_to_bots}
+                value={agentSettings.responding_to_bots}
                 onChange={(value) =>
-                  setDevinSettings({
-                    ...devinSettings,
+                  setAgentSettings({
+                    ...agentSettings,
                     responding_to_bots: value as "ignore" | "respond",
                   })
                 }
@@ -3858,19 +3811,19 @@ function ManageSections({
               />
             </label>
             <div className="settings-row justify-end gap-3">
-              {devinSettingsStatus && <small>{devinSettingsStatus}</small>}
+              {agentSettingsStatus && <small>{agentSettingsStatus}</small>}
               <Button
                 className="primary"
                 onClick={() =>
-                  command("save_devin_settings", {
-                    projectId: devinProjectId,
-                    value: devinSettings,
+                  command("save_agent_settings", {
+                    projectId: settingsProjectId,
+                    value: agentSettings,
                   })
-                    .then(() => setDevinSettingsStatus("已保存"))
+                    .then(() => setAgentSettingsStatus("已保存"))
                     .catch(onError)
                 }
               >
-                保存 Devin 设置
+                保存 Agent 设置
               </Button>
             </div>
             <div className="pt-5">
@@ -3884,12 +3837,12 @@ function ManageSections({
                 <Button
                   onClick={() =>
                     command("reset_slash_commands", {
-                      projectId: devinProjectId,
+                      projectId: settingsProjectId,
                       name: null,
                     })
                       .then(() =>
                         command<SlashCommand[]>("list_slash_commands", {
-                          projectId: devinProjectId,
+                          projectId: settingsProjectId,
                         }),
                       )
                       .then(setSlashCommands)
@@ -3915,13 +3868,13 @@ function ManageSections({
                           <Button
                             onClick={() =>
                               command("reset_slash_commands", {
-                                projectId: devinProjectId,
+                                projectId: settingsProjectId,
                                 name: item.name,
                               })
                                 .then(() =>
                                   command<SlashCommand[]>(
                                     "list_slash_commands",
-                                    { projectId: devinProjectId },
+                                    { projectId: settingsProjectId },
                                   ),
                                 )
                                 .then(setSlashCommands)
@@ -3935,13 +3888,13 @@ function ManageSections({
                           <Button
                             onClick={() =>
                               command("delete_slash_command", {
-                                projectId: devinProjectId,
+                                projectId: settingsProjectId,
                                 name: item.name,
                               })
                                 .then(() =>
                                   command<SlashCommand[]>(
                                     "list_slash_commands",
-                                    { projectId: devinProjectId },
+                                    { projectId: settingsProjectId },
                                   ),
                                 )
                                 .then(setSlashCommands)
@@ -3971,7 +3924,7 @@ function ManageSections({
                         className="primary"
                         onClick={() =>
                           command("save_slash_command", {
-                            projectId: devinProjectId,
+                            projectId: settingsProjectId,
                             name: item.name,
                             body: item.body,
                             kind: item.kind,
@@ -4016,14 +3969,14 @@ function ManageSections({
                     className="primary justify-self-end"
                     onClick={() =>
                       command("save_slash_command", {
-                        projectId: devinProjectId,
+                        projectId: settingsProjectId,
                         name: slashCommandName,
                         body: slashCommandBody,
                         kind: slashCommandKind,
                       })
                         .then(() =>
                           command<SlashCommand[]>("list_slash_commands", {
-                            projectId: devinProjectId,
+                            projectId: settingsProjectId,
                           }),
                         )
                         .then((items) => {
@@ -4883,8 +4836,8 @@ function ManageSections({
                 <small>项目视图只统计该项目下会话的真实技能调用。</small>
               </div>
               <SelectMenu
-                value={devinProjectId || ""}
-                onChange={(value) => setDevinProjectId(value || null)}
+                value={settingsProjectId || ""}
+                onChange={(value) => setSettingsProjectId(value || null)}
                 options={[
                   { value: "", label: "全局" },
                   ...projects.map((project) => ({
@@ -5113,15 +5066,6 @@ function ManageSections({
                         )}
                         <Button
                           className="bordered"
-                          disabled={devinAssetLoading}
-                          onClick={loadDevinAssets}
-                        >
-                          {devinAssetLoading
-                            ? "Loading Devin…"
-                            : "从 Devin 导入"}
-                        </Button>
-                        <Button
-                          className="bordered"
                           disabled={remoteAssetAction !== null || !selected}
                           onClick={() =>
                             (() => {
@@ -5335,52 +5279,6 @@ function ManageSections({
                   }
                 />
               ))}
-            {devinAssetOpen && (tab === "knowledge" || tab === "playbook") && (
-              <div className="manage-card mt-4">
-                <div className="flex items-center justify-between">
-                  <strong>
-                    Devin{" "}
-                    {assetTabKind === "playbook" ? "Playbooks" : "Knowledge"}
-                  </strong>
-                  <Button
-                    className="bordered"
-                    onClick={() => {
-                      setDevinAssetOpen(false);
-                      setDevinAssetItems([]);
-                    }}
-                  >
-                    Close
-                  </Button>
-                </div>
-                {devinAssetItems.map((item) => {
-                  const itemId = String(item.id);
-                  return (
-                    <div className="manage-row mt-2" key={itemId}>
-                      <span>
-                        <strong>
-                          {String(item.title || item.name || itemId)}
-                        </strong>
-                        <small>{String(item.body || "").slice(0, 160)}</small>
-                      </span>
-                      <Button
-                        className="bordered"
-                        disabled={devinAssetImporting === itemId}
-                        onClick={() => importDevinAsset(item)}
-                      >
-                        {devinAssetImporting === itemId
-                          ? "Importing…"
-                          : "Import"}
-                      </Button>
-                    </div>
-                  );
-                })}
-                {!devinAssetItems.length && (
-                  <p className="px-4 py-6 text-[13px] text-muted">
-                    No Devin assets found.
-                  </p>
-                )}
-              </div>
-            )}
             {versionHistoryAsset && (
               <div className="manage-card mt-4">
                 <div className="flex items-center justify-between">
@@ -5592,23 +5490,17 @@ function ManageSections({
                     const configurable =
                       CONFIGURABLE_CONNECTOR_KINDS.has(connectorKind);
                     const integrated =
-                      configurable ||
-                      connector.name === "Linear" ||
-                      connector.name === "Devin";
+                      configurable || connector.name === "Linear";
                     const tokenStatus = connectorStatuses[connectorKind];
                     const status = configurable
                       ? tokenStatus?.connected
                         ? `Connected as ${tokenStatus.identity || "bot"}`
                         : "Configurable"
-                      : connector.name === "Devin"
-                        ? devinKeyConfigured
+                      : connector.name === "Linear"
+                        ? linearStatus.includes("Connected")
                           ? "Connected"
                           : "Configurable"
-                        : connector.name === "Linear"
-                          ? linearStatus.includes("Connected")
-                            ? "Connected"
-                            : "Configurable"
-                          : "Not integrated";
+                        : "Not integrated";
                     return (
                       <IntegrationCard
                         key={connector.name}
@@ -5821,64 +5713,6 @@ function ManageSections({
                     )}
                   </div>
                 )}
-            </div>
-            <div className="rounded-xl2 border border-line bg-panel p-5">
-              <h2 className="text-[15px] font-semibold text-ink">
-                Devin integrations
-              </h2>
-              <p className="muted mt-1">
-                Store a Devin API key securely to import Knowledge and Playbooks
-                and connect Devin MCP.
-              </p>
-              <div className="form-grid mt-4">
-                <label className="field-label">
-                  Devin API key
-                  <input
-                    type="password"
-                    value={devinKey}
-                    onChange={(event) => setDevinKey(event.target.value)}
-                    placeholder={
-                      devinKeyConfigured ? "Stored securely" : "devin_…"
-                    }
-                  />
-                </label>
-                <div className="flex gap-2 items-end">
-                  <Button
-                    className="primary"
-                    onClick={() =>
-                      command("devin_integration_save", { apiKey: devinKey })
-                        .then(() => {
-                          setDevinKey("");
-                          setDevinKeyConfigured(true);
-                          setDevinKeyStatus("Devin API key saved securely.");
-                        })
-                        .catch((error) => {
-                          setDevinKeyStatus(String(error));
-                          onError(error);
-                        })
-                    }
-                  >
-                    Save key
-                  </Button>
-                </div>
-              </div>
-              {devinKeyStatus && (
-                <div
-                  className={
-                    devinKeyStatus.includes("failed") ||
-                    devinKeyStatus.includes("cannot")
-                      ? "failure mt-3"
-                      : "success mt-3"
-                  }
-                >
-                  {devinKeyStatus}
-                </div>
-              )}
-              <div className="muted mt-3">
-                {devinKeyConfigured
-                  ? "Configured securely; the key value is not displayed."
-                  : "Not configured."}
-              </div>
             </div>
             <div className="rounded-xl2 border border-line bg-panel p-5">
               <h2 className="text-[15px] font-semibold text-ink">Linear</h2>
@@ -6239,7 +6073,6 @@ function McpManage({
   const [tools, setTools] = useState<Array<Record<string, unknown>>>([]);
   const [servers, setServers] = useState<Array<Record<string, unknown>>>([]);
   const [search, setSearch] = useState("");
-  const [devinMcpSaving, setDevinMcpSaving] = useState(false);
   useEffect(() => {
     void command<Array<Record<string, unknown>>>("list_mcp_servers")
       .then(setServers)
@@ -6254,72 +6087,8 @@ function McpManage({
   const filtered = tools.filter((tool) =>
     String(tool.name).toLowerCase().includes(search.toLowerCase()),
   );
-  const addDevinMcp = () => {
-    setDevinMcpSaving(true);
-    void command("devin_mcp_configure")
-      .then(() =>
-        command("save_asset", {
-          id: "devin-mcp",
-          kind: "mcp",
-          title: "Devin MCP",
-          body: JSON.stringify({
-            object_id: "devin-mcp",
-            server_key: "devin",
-            name: "Devin MCP",
-            transport: "streamable-http",
-            command: null,
-            args: [],
-            env: {},
-            cwd: null,
-            url: "https://mcp.devin.ai/mcp",
-            headers: {},
-            enabled: true,
-            requires_approval: true,
-          }),
-          trigger: null,
-          scope: null,
-          scopeKind: "global",
-          enabled: true,
-        }),
-      )
-      .then(() => command<Array<Record<string, unknown>>>("list_mcp_servers"))
-      .then(setServers)
-      .catch(onError)
-      .finally(() => setDevinMcpSaving(false));
-  };
   return (
     <>
-      <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,440px),440px))] gap-2.5 mb-4">
-        <IntegrationCard
-          icon="D"
-          title="Devin MCP"
-          badge={{
-            label: servers.some((server) => String(server.id) === "devin-mcp")
-              ? "Enabled"
-              : "Not configured",
-            tone: servers.some((server) => String(server.id) === "devin-mcp")
-              ? "success"
-              : "neutral",
-          }}
-          description="https://mcp.devin.ai/mcp · Streamable HTTP"
-          actions={
-            <Button
-              className="bordered"
-              disabled={
-                devinMcpSaving ||
-                servers.some((server) => String(server.id) === "devin-mcp")
-              }
-              onClick={addDevinMcp}
-            >
-              {devinMcpSaving
-                ? "Adding…"
-                : servers.some((server) => String(server.id) === "devin-mcp")
-                  ? "Added"
-                  : "Add Devin MCP"}
-            </Button>
-          }
-        />
-      </div>
       <CollectionPage
         search={search}
         onSearch={setSearch}

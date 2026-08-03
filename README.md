@@ -1,6 +1,6 @@
 # OPCOS
 
-OPCOS 是一个本地化的 Devin 客户端和 OPC（Open/Personal Computer）工作台：
+OPCOS 是一个本地化的 OPC（Open/Personal Computer）工作台：
 桌面端负责会话、界面、凭据和远程主机连接，远程执行仍由 Cloud-Dev 现有的
 `dev-agent` 提供。OPCOS 不替换或部署 RVM host，而是一个 client-only 的
 wire-protocol client。
@@ -151,11 +151,9 @@ OAuth connector 使用本机随机端口的一次性 callback listener、随机 
 PKCE（适用时），并在授权完成后调用身份端点。用户需要为 OAuth connector
 自行创建并填写 OAuth application credentials。
 
-### Devin and MCP
+### MCP
 
-- Devin API key 配置；
-- Devin Knowledge 和 Playbooks 列表及导入为本地资产；
-- Devin MCP 配置；
+- 手工配置任意 HTTP、Streamable HTTP 或 stdio MCP server；
 - MCP server 状态、重试、工具发现和缓存；
 - MCP 工具 Enable/Disable 状态切换；
 - SecretStore 凭据注入，不把 bearer token 放进 MCP 配置 JSON。
