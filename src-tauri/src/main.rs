@@ -2092,6 +2092,57 @@ fn git_worktree_add_command(
     }
 }
 
+fn filter_managed_worktree_status(status: &str) -> String {
+    status
+        .lines()
+        .filter(|line| {
+            let path = line.get(3..).unwrap_or("").trim().replace('\\', "/");
+            let path = path
+                .split(" -> ")
+                .last()
+                .unwrap_or(path.as_str())
+                .trim_matches('"');
+            !(path == "worktrees" || path.starts_with("worktrees/"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn remove_empty_worktree_container(
+    host: &Arc<dyn Host>,
+    project: &ProjectRecord,
+    platform: Option<&str>,
+) -> Option<String> {
+    let container = format!(
+        "{}/worktrees",
+        project.repo_root.trim_end_matches(['/', '\\'])
+    );
+    let command = if platform.is_some_and(|value| value.eq_ignore_ascii_case("windows")) {
+        format!("rmdir {}", quote_for(platform, &container))
+    } else {
+        format!("rmdir -- {}", quote_for(platform, &container))
+    };
+    let result = host
+        .exec(ExecRequest {
+            command,
+            cwd: None,
+            timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+            session: None,
+            env: None,
+        })
+        .await
+        .ok()?;
+    if result.result.exit_code != 0 {
+        let stderr = result.result.stderr.trim();
+        if !stderr.is_empty() && !stderr.contains("No such file") {
+            return Some(format!(
+                "managed worktree directory could not be removed: {stderr}"
+            ));
+        }
+    }
+    None
+}
+
 async fn remove_project_agent_worktree(
     host: &Arc<dyn Host>,
     project: &ProjectRecord,
@@ -2119,7 +2170,8 @@ async fn remove_project_agent_worktree(
                 result.result.stderr
             ));
         }
-        if !force && !result.result.stdout.trim().is_empty() {
+        let user_changes = filter_managed_worktree_status(&result.result.stdout);
+        if !force && !user_changes.trim().is_empty() {
             return Err("worktree has uncommitted changes; use force to remove it".to_owned());
         }
         return Ok(vec![]);
@@ -2395,11 +2447,11 @@ async fn delete_project(
         .map_err(|error| error.to_string())?;
     let host = project_host(&state, &project).await?;
     let mut warnings = Vec::new();
+    let platform = host.health().await.ok().and_then(|health| health.platform);
     if !agents.is_empty() {
         if !project_host_contains(&host, &project.repo_root) {
             return Err("project repository path is outside the bound host workspace".to_owned());
         }
-        let platform = host.health().await.ok().and_then(|health| health.platform);
         for agent in &agents {
             if !project_host_contains(&host, &agent.worktree_path) {
                 return Err("project worktree path is outside the bound host workspace".to_owned());
@@ -2415,6 +2467,11 @@ async fn delete_project(
                 .await?,
             );
         }
+    }
+    if let Some(warning) =
+        remove_empty_worktree_container(&host, &project, platform.as_deref()).await
+    {
+        warnings.push(warning);
     }
     state
         .store
@@ -2708,6 +2765,12 @@ async fn delete_project_agent(
         platform.as_deref(),
     )
     .await?;
+    let mut warnings = warnings;
+    if let Some(warning) =
+        remove_empty_worktree_container(&host, &project, platform.as_deref()).await
+    {
+        warnings.push(warning);
+    }
     state
         .store
         .delete_project_agent(&agent_id)
@@ -12969,6 +13032,19 @@ mod m7_tests {
         let error = validate_git_repository_result(128, "", "/tmp/not-a-repository").unwrap_err();
         assert!(error.contains("not a git repository"));
         assert!(validate_git_repository_result(0, "true\n", "/tmp/repository").is_ok());
+    }
+
+    #[test]
+    fn project_worktree_container_is_ignored_but_user_changes_block_cleanup() {
+        assert_eq!(
+            filter_managed_worktree_status("?? worktrees/\n M README.md\n"),
+            " M README.md"
+        );
+        assert!(filter_managed_worktree_status("?? worktrees/agent-code-1/\n").is_empty());
+        assert_eq!(
+            filter_managed_worktree_status(" M worktrees-not-managed/file\n"),
+            " M worktrees-not-managed/file"
+        );
     }
 
     #[test]

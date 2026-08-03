@@ -2289,7 +2289,13 @@ function ReviewView({
 }) {
   const [cwd, setCwd] = useState(selected.workspace || "/workspace");
   const [base, setBase] = useState("HEAD");
-  const changes = Array.isArray(review?.changes) ? review.changes : [];
+  const changes = Array.isArray(review?.changes)
+    ? review.changes
+    : review?.changes &&
+        typeof review.changes === "object" &&
+        Array.isArray((review.changes as { files?: unknown }).files)
+      ? (review.changes as { files: unknown[] }).files
+      : [];
   if (!selected.workspace) {
     return (
       <div className="surface-panel">
