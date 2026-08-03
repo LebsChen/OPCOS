@@ -1458,7 +1458,7 @@ fn tool_risk(name: &str) -> ToolRisk {
         "write_file" | "edit" => ToolRisk::Write,
         "git_create_branch" | "git_stage_commit" => ToolRisk::Write,
         "git_push" | "github_create_pull_request" => ToolRisk::External,
-        "github_get_pull_request" => ToolRisk::Read,
+        "github_get_pull_request" | "github_ci_status" | "github_ci_failure_log" => ToolRisk::Read,
         "run_shell" => ToolRisk::Execute,
         "background_job_start" | "background_job_kill" => ToolRisk::Execute,
         "background_job_status" | "background_job_output" => ToolRisk::Read,
@@ -1875,6 +1875,8 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"git_push","description":"Push the current Git branch to a configured Git remote using the project's forge credential. The remote must already be configured; requires approval and an external action record.","parameters":{"type":"object","properties":{"cwd":{"type":"string"},"remote":{"type":"string"},"branch":{"type":"string"}},"required":["cwd"]}}}),
         json!({"type":"function","function":{"name":"github_create_pull_request","description":"Create or reconcile a GitHub pull request for an existing pushed branch. Requires approval and is idempotent.","parameters":{"type":"object","properties":{"repo":{"type":"string"},"title":{"type":"string"},"head":{"type":"string"},"base":{"type":"string"},"body":{"type":"string"},"token_secret":{"type":"string"}},"required":["repo","title","head","base","body","token_secret"]}}}),
         json!({"type":"function","function":{"name":"github_get_pull_request","description":"Read a GitHub pull request, including issue comments and review comments.","parameters":{"type":"object","properties":{"repo":{"type":"string"},"number":{"type":"integer"},"token_secret":{"type":"string"}},"required":["repo","number","token_secret"]}}}),
+        json!({"type":"function","function":{"name":"github_ci_status","description":"Read GitHub Actions checks for the bound project repository by pull request number or commit SHA. Classifies code failures separately from billing, runner, cancellation, timeout, and indeterminate states; this is observational and not a delivery gate.","parameters":{"type":"object","properties":{"repo":{"type":"string"},"pull_request":{"type":"integer"},"commit":{"type":"string"}},"required":["repo"]}}}),
+        json!({"type":"function","function":{"name":"github_ci_failure_log","description":"Read a bounded tail or offset segment of a failed GitHub Actions job log. Optionally request a step; if it cannot be located, the result explicitly says the returned text is the bounded job tail.","parameters":{"type":"object","properties":{"repo":{"type":"string"},"run_id":{"type":"integer"},"job_id":{"type":"integer"},"step":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"},"tail":{"type":"boolean"}},"required":["repo","run_id"]}}}),
         json!({"type":"function","function":{"name":"propose_plan","description":"Propose a plan and wait for approval.","parameters":{"type":"object","properties":{"plan":{"type":"string"}},"required":["plan"]}}}),
         json!({"type":"function","function":{"name":"ask_user","description":"Ask the user a question and wait for an answer.","parameters":{"type":"object","properties":{"question":{"type":"string"}},"required":["question"]}}}),
         json!({"type":"function","function":{"name":"linear_get_issue","description":"Read a Linear issue by identifier. Read-only.","parameters":{"type":"object","properties":{"identifier":{"type":"string"}},"required":["identifier"]}}}),
@@ -2047,6 +2049,23 @@ mod tests {
         assert!(names.contains("background_job_status"));
         assert!(names.contains("background_job_output"));
         assert!(names.contains("background_job_kill"));
+    }
+
+    #[test]
+    fn ci_tools_are_read_only_and_defined() {
+        assert_eq!(tool_risk("github_ci_status"), ToolRisk::Read);
+        assert_eq!(tool_risk("github_ci_failure_log"), ToolRisk::Read);
+        let names = tool_definitions()
+            .into_iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<HashSet<_>>();
+        assert!(names.contains("github_ci_status"));
+        assert!(names.contains("github_ci_failure_log"));
     }
     #[derive(Clone)]
     struct FakeProvider;
