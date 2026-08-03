@@ -11,6 +11,7 @@ export function CollectionPage({
   rows,
   empty,
   form,
+  bare,
 }: {
   search: string;
   onSearch: (value: string) => void;
@@ -20,6 +21,7 @@ export function CollectionPage({
   rows: ReactNode;
   empty: string;
   form?: ReactNode;
+  bare?: boolean;
   columns?: string[];
   chips?: string[];
   activeChip?: string;
@@ -40,13 +42,17 @@ export function CollectionPage({
         {actions}
         {primary ?? null}
       </div>
-      <div className="rounded-xl2 border border-line bg-panel divide-y divide-line">
-        {hasRows ? (
-          rows
-        ) : (
-          <div className="px-4 py-6 text-[13px] text-muted">{empty}</div>
-        )}
-      </div>
+      {bare && hasRows ? (
+        rows
+      ) : (
+        <div className="rounded-xl2 border border-line bg-panel divide-y divide-line">
+          {hasRows ? (
+            rows
+          ) : (
+            <div className="px-4 py-6 text-[13px] text-muted">{empty}</div>
+          )}
+        </div>
+      )}
       {form && <div className="mt-4">{form}</div>}
     </>
   );

@@ -1743,69 +1743,83 @@ function ManageSections({
                 Add host
               </Button>
             }
+            bare
             rows={
               hosts.length ? (
-                <>
+                <div className="grid grid-cols-2 xl:grid-cols-3 gap-2.5">
                   {hosts.map((host) => (
-                    <div className="manage-row px-4" key={host.id}>
-                      <span>
-                        <strong>{host.name}</strong>
-                        <small>
+                    <div
+                      className="rounded-xl border border-line bg-panel px-3.5 py-3 flex flex-col gap-2.5"
+                      key={host.id}
+                    >
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <span className="rounded-lg border border-line grid place-items-center shrink-0 w-8 h-8 bg-paper">
+                          <span className="text-[13px] font-semibold text-muted">
+                            {host.name.slice(0, 1).toUpperCase()}
+                          </span>
+                        </span>
+                        <span className="min-w-0 flex-1">
+                          <span className="block text-[13px] font-semibold leading-tight truncate">
+                            {host.name}
+                          </span>
                           <span
                             className={
-                              host.online === true
+                              "block text-[11.5px] " +
+                              (host.online === true
                                 ? "status-online"
                                 : host.online === false
                                   ? "status-offline"
-                                  : "status-unknown"
+                                  : "status-unknown")
                             }
                           >
                             {hostStatusLabel(host)}
                           </span>
-                        </small>
-                      </span>
-                      {!host.builtin && (
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        {!host.builtin && (
+                          <Button
+                            onClick={() => {
+                              void onEditHost(host)
+                                .then(() => setHostFormOpen(true))
+                                .catch(onError);
+                            }}
+                          >
+                            Edit
+                          </Button>
+                        )}
                         <Button
+                          disabled={host.builtin || testingHostId === host.id}
                           onClick={() => {
-                            void onEditHost(host)
-                              .then(() => setHostFormOpen(true))
-                              .catch(onError);
+                            setTestingHostId(host.id);
+                            void onTestHost(host.id)
+                              .catch(onError)
+                              .finally(() => setTestingHostId(null));
                           }}
                         >
-                          Edit
+                          {testingHostId === host.id ? "Testing…" : "Test"}
                         </Button>
-                      )}
-                      <Button
-                        disabled={host.builtin || testingHostId === host.id}
-                        onClick={() => {
-                          setTestingHostId(host.id);
-                          void onTestHost(host.id)
-                            .catch(onError)
-                            .finally(() => setTestingHostId(null));
-                        }}
-                      >
-                        {testingHostId === host.id ? "Testing…" : "Test"}
-                      </Button>
-                      <Button
-                        className="danger"
-                        disabled={host.builtin}
-                        onClick={() => {
-                          if (confirmDeleteHostId === host.id) {
-                            void onDeleteHost(host.id)
-                              .then(() => setConfirmDeleteHostId(null))
-                              .catch(onError);
-                          } else {
-                            setConfirmDeleteHostId(host.id);
-                          }
-                        }}
-                      >
-                        {confirmDeleteHostId === host.id
-                          ? "Confirm delete"
-                          : "Delete"}
-                      </Button>
+                        <Button
+                          className="danger"
+                          disabled={host.builtin}
+                          onClick={() => {
+                            if (confirmDeleteHostId === host.id) {
+                              void onDeleteHost(host.id)
+                                .then(() => setConfirmDeleteHostId(null))
+                                .catch(onError);
+                            } else {
+                              setConfirmDeleteHostId(host.id);
+                            }
+                          }}
+                        >
+                          {confirmDeleteHostId === host.id
+                            ? "Confirm delete"
+                            : "Delete"}
+                        </Button>
+                      </div>
                     </div>
                   ))}
-                </>
+                </div>
               ) : null
             }
             empty={translate("noHosts")}
