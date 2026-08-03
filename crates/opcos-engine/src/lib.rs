@@ -1455,7 +1455,7 @@ fn tool_risk(name: &str) -> ToolRisk {
         | "work_queue_complete"
         | "work_queue_cancel"
         | "work_queue_requeue" => ToolRisk::Write,
-        "write_file" | "edit" => ToolRisk::Write,
+        "write_file" | "edit" | "edit_file" => ToolRisk::Write,
         "git_create_branch" | "git_stage_commit" => ToolRisk::Write,
         "git_push" | "github_create_pull_request" => ToolRisk::External,
         "github_get_pull_request" | "github_ci_status" | "github_ci_failure_log" => ToolRisk::Read,
@@ -1859,7 +1859,8 @@ where
 fn tool_definitions() -> Vec<Value> {
     let mut tools = vec![
         json!({"type":"function","function":{"name":"read_file","description":"Read a remote file.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}),
-        json!({"type":"function","function":{"name":"write_file","description":"Write a remote file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
+        json!({"type":"function","function":{"name":"write_file","description":"Write a remote file. For changes to an existing file, prefer edit_file so unrelated content is preserved.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
+        json!({"type":"function","function":{"name":"edit_file","description":"Apply one or more exact old_string/new_string replacements to a remote UTF-8 text file. Every old_string must match exactly once in the original file; ambiguous or missing matches fail with diagnostics. The whole call is atomic and preserves line endings. Prefer this over rewriting an existing file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"edits":{"type":"array","items":{"type":"object","properties":{"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["old_string","new_string"]}}},"required":["path","edits"]}}}),
         json!({"type":"function","function":{"name":"run_shell","description":"Run a remote shell command.","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}),
         json!({"type":"function","function":{"name":"background_job_start","description":"Start a long-running shell command in the background and return a job id. Output is retained with bounded storage.","parameters":{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"},"timeout_seconds":{"type":"integer"}},"required":["command"]}}}),
         json!({"type":"function","function":{"name":"background_job_status","description":"Read a background job status, exit code, and output counters.","parameters":{"type":"object","properties":{"job_id":{"type":"string"}},"required":["job_id"]}}}),
@@ -2066,6 +2067,21 @@ mod tests {
             .collect::<HashSet<_>>();
         assert!(names.contains("github_ci_status"));
         assert!(names.contains("github_ci_failure_log"));
+    }
+
+    #[test]
+    fn exact_edit_is_a_write_tool_and_prefers_existing_file_edits() {
+        assert_eq!(tool_risk("edit_file"), ToolRisk::Write);
+        let definition = tool_definitions()
+            .into_iter()
+            .find(|tool| tool["function"]["name"] == "edit_file")
+            .unwrap();
+        assert!(
+            definition["function"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Prefer this over rewriting")
+        );
     }
     #[derive(Clone)]
     struct FakeProvider;
