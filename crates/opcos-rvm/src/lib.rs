@@ -518,12 +518,17 @@ impl Serialize for ExecRequest {
 
 impl fmt::Debug for ExecRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let env_keys = self
+            .env
+            .as_ref()
+            .and_then(Value::as_object)
+            .map(|values| values.keys().cloned().collect::<Vec<_>>());
         f.debug_struct("ExecRequest")
             .field("command", &self.command)
             .field("cwd", &self.cwd)
             .field("timeout_seconds", &self.timeout_seconds)
             .field("session", &self.session)
-            .field("env", &self.env)
+            .field("env_keys", &env_keys)
             .finish()
     }
 }
@@ -1590,6 +1595,24 @@ mod tests {
         };
         assert!(!format!("{config:?}").contains(token));
         assert!(!format!("{request:?}").contains(token));
+    }
+
+    #[test]
+    fn exec_request_debug_lists_environment_keys_without_values() {
+        let request = ExecRequest {
+            command: "git push origin main".into(),
+            cwd: Some("/repo".into()),
+            timeout_seconds: DEFAULT_EXEC_TIMEOUT_SECONDS,
+            session: None,
+            env: Some(serde_json::json!({
+                "GIT_ASKPASS": "/tmp/helper",
+                "OPCOS_GIT_PASSWORD": "credential-must-not-be-logged",
+            })),
+        };
+        let debug = format!("{request:?}");
+        assert!(debug.contains("env_keys"));
+        assert!(debug.contains("OPCOS_GIT_PASSWORD"));
+        assert!(!debug.contains("credential-must-not-be-logged"));
     }
 
     #[test]

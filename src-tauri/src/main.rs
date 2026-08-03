@@ -70,6 +70,7 @@ use std::process::Command as ProcessCommand;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use uuid::Uuid;
 
 struct HostAssetReader {
     host: Arc<dyn Host>,
@@ -275,6 +276,125 @@ fn git_files_argument(arguments: &Value) -> Result<Vec<String>, String> {
     Ok(files)
 }
 
+fn validate_git_remote_name(remote: &str) -> Result<(), String> {
+    if remote.is_empty()
+        || remote == "."
+        || remote == ".."
+        || remote.starts_with(['/', '\\', '.'])
+        || remote.contains(['\0', '\r', '\n', ':', '@', '\\'])
+        || remote.contains("://")
+        || !remote
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
+    {
+        return Err(
+            "git remote must be an existing configured remote name, not a URL or path".into(),
+        );
+    }
+    Ok(())
+}
+
+async fn read_git_remote_url(
+    host: &dyn Host,
+    platform: Option<&str>,
+    cwd: &str,
+    remote: &str,
+) -> Result<String, String> {
+    let command = format!("git remote get-url -- {}", quote_for(platform, remote));
+    let result = host
+        .exec(ExecRequest {
+            command,
+            cwd: Some(cwd.to_owned()),
+            timeout_seconds: 15,
+            session: None,
+            env: None,
+        })
+        .await
+        .map_err(|error| format!("unable to inspect configured git remote: {error}"))?;
+    if result.result.exit_code != 0 {
+        return Err("configured git remote was not found".into());
+    }
+    let url = result.result.stdout.trim().to_owned();
+    if url.is_empty() {
+        return Err("configured git remote has no destination URL".into());
+    }
+    Ok(url)
+}
+
+fn git_remote_host(remote_url: &str) -> Option<String> {
+    if let Some((_, remainder)) = remote_url.split_once('@')
+        && let Some((host, _)) = remainder.split_once(':')
+    {
+        return Some(host.to_ascii_lowercase());
+    }
+    url::Url::parse(remote_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+}
+
+fn validate_git_remote_destination(
+    remote_url: &str,
+    store: &SqliteStore,
+    project_id: Option<&str>,
+) -> Result<(), String> {
+    let host = git_remote_host(remote_url)
+        .ok_or("configured git remote destination is not a recognized forge URL")?;
+    if host != "github.com" {
+        return Err("git push credentials are only allowed for github.com remotes".into());
+    }
+    if let Ok(parsed) = url::Url::parse(remote_url)
+        && (parsed.username() != "" || parsed.password().is_some())
+    {
+        return Err("configured git remote must not contain embedded credentials".into());
+    }
+    if let Some(project_id) = project_id
+        && let Some(project) = store
+            .load_project(project_id)
+            .map_err(|error| error.to_string())?
+        && let Some(expected_host) = git_remote_host(&project.repo_url)
+        && expected_host != host
+    {
+        return Err("git remote destination does not match the project forge host".into());
+    }
+    Ok(())
+}
+
+async fn install_askpass_helper(
+    host: &dyn Host,
+    platform: Option<&str>,
+    path: &str,
+    script: &str,
+) -> Result<(), String> {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
+    let command = if platform == Some("windows") {
+        let escaped_path = path.replace('\'', "''");
+        format!(
+            "$p = '{escaped_path}'; [IO.File]::WriteAllText($p, [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}')))"
+        )
+    } else {
+        format!(
+            "printf '%s' '{}' | base64 -d > {} && chmod 700 {}",
+            encoded,
+            quote_for(platform, path),
+            quote_for(platform, path)
+        )
+    };
+    let result = host
+        .exec(ExecRequest {
+            command,
+            cwd: None,
+            timeout_seconds: 15,
+            session: None,
+            env: None,
+        })
+        .await
+        .map_err(|error| format!("unable to install temporary git credential helper: {error}"))?;
+    if result.result.exit_code != 0 {
+        return Err("unable to install temporary git credential helper".into());
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_git_write(
     host: &dyn Host,
@@ -287,16 +407,22 @@ async fn execute_git_write(
     arguments: &Value,
 ) -> Result<Value, String> {
     let cwd = git_string_argument(arguments, "cwd")?;
+    let remote_name = arguments
+        .get("remote")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("origin");
+    if name == "git_push" {
+        validate_git_remote_name(remote_name)?;
+        let remote_url = read_git_remote_url(host, platform, &cwd, remote_name).await?;
+        validate_git_remote_destination(&remote_url, store, project_id)?;
+    }
     let push_action = if name == "git_push" {
-        let remote = arguments
-            .get("remote")
-            .and_then(Value::as_str)
-            .unwrap_or("origin");
         let branch = arguments
             .get("branch")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let key = format!("git-push:{cwd}:{remote}:{branch}");
+        let key = format!("git-push:{cwd}:{remote_name}:{branch}");
         match store
             .begin_action("git_push", "git", &key, &key, Some(session_id), project_id)
             .map_err(|error| error.to_string())?
@@ -350,15 +476,10 @@ async fn execute_git_write(
             )
         }
         "git_push" => {
-            let remote = arguments
-                .get("remote")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or("origin");
             let branch = arguments.get("branch").and_then(Value::as_str);
             format!(
                 "git push {}{}",
-                quote(remote),
+                quote(remote_name),
                 branch
                     .map(|value| format!(" {}", quote(value)))
                     .unwrap_or_default()
@@ -370,29 +491,38 @@ async fn execute_git_write(
     let mut env = serde_json::Map::new();
     let mut secret_values = Vec::new();
     let askpass_path = if name == "git_push" {
-        let token_name = git_string_argument(arguments, "credential_secret")?;
-        let token = scoped_secret_get_from_store(secrets, project_id, "asset-secret", &token_name)?
-            .ok_or("GitHub credential secret is not configured")?;
-        let username =
-            if let Some(username_name) = arguments.get("username_secret").and_then(Value::as_str) {
-                scoped_secret_get_from_store(secrets, project_id, "asset-secret", username_name)?
-                    .ok_or("GitHub username secret is not configured")?
-            } else {
-                "x-access-token".to_owned()
-            };
+        let token = scoped_secret_get_from_store(secrets, project_id, "connector-token", "github")?
+            .ok_or("project GitHub credential is not configured")?;
+        let username = "x-access-token".to_owned();
+        let suffix = Uuid::new_v4().simple().to_string();
         let path = if platform == Some("windows") {
-            format!("{cwd}\\.opcos-askpass.ps1")
+            let temp_path = host
+                .exec(ExecRequest {
+                    command: format!(
+                        "Write-Output ([IO.Path]::Combine($env:TEMP, 'opcos-askpass-{suffix}.ps1'))"
+                    ),
+                    cwd: None,
+                    timeout_seconds: 15,
+                    session: None,
+                    env: None,
+                })
+                .await
+                .map_err(|error| {
+                    format!("unable to determine temporary credential path: {error}")
+                })?;
+            if temp_path.result.exit_code != 0 {
+                return Err("unable to determine temporary credential path".into());
+            }
+            temp_path.result.stdout.trim().to_owned()
         } else {
-            format!("{cwd}/.opcos-askpass.sh")
+            format!("/tmp/opcos-askpass-{suffix}.sh")
         };
         let script = if platform == Some("windows") {
             ASKPASS_SCRIPT.to_owned()
         } else {
             "#!/bin/sh\ncase \"$1\" in *Username*) printf '%s' \"$OPCOS_GIT_USERNAME\";; *) printf '%s' \"$OPCOS_GIT_PASSWORD\";; esac\n".into()
         };
-        host.write(&path, &script).await.map_err(|error| {
-            format!("unable to install temporary git credential helper: {error}")
-        })?;
+        install_askpass_helper(host, platform, &path, &script).await?;
         env.insert("GIT_ASKPASS".into(), Value::String(path.clone()));
         env.insert("GIT_TERMINAL_PROMPT".into(), Value::String("0".into()));
         env.insert("OPCOS_GIT_USERNAME".into(), Value::String(username.clone()));
@@ -417,7 +547,7 @@ async fn execute_git_write(
             .exec(ExecRequest {
                 command: if platform == Some("windows") {
                     format!(
-                        "Remove-Item -LiteralPath '{}' -Force",
+                        "Remove-Item -LiteralPath '{}' -Force -ErrorAction SilentlyContinue",
                         path.replace('\'', "''")
                     )
                 } else {
@@ -17626,6 +17756,89 @@ agents:
             assert!(reject_dangerous_git(command).is_err(), "{command}");
         }
         assert!(reject_dangerous_git("git add -- src/lib.rs").is_ok());
+    }
+
+    #[test]
+    fn structured_push_rejects_url_and_path_remotes() {
+        for remote in [
+            "https://attacker.example/repo.git",
+            "git@attacker.example:repo.git",
+            "/tmp/repo",
+            "../repo",
+            "C:\\repo",
+        ] {
+            assert!(
+                validate_git_remote_name(remote).is_err(),
+                "remote should be rejected: {remote}"
+            );
+        }
+        assert!(validate_git_remote_name("origin").is_ok());
+        assert!(validate_git_remote_name("upstream-prod").is_ok());
+    }
+
+    #[test]
+    fn structured_push_allows_only_the_expected_github_destination() {
+        assert_eq!(
+            git_remote_host("git@github.com:LebsChen/OPCOS.git").as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(
+            git_remote_host("https://github.com/LebsChen/OPCOS.git").as_deref(),
+            Some("github.com")
+        );
+        assert!(git_remote_host("https://attacker.example/repo.git").is_some());
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert!(
+            validate_git_remote_destination("https://attacker.example/repo.git", &store, None)
+                .is_err()
+        );
+        assert!(
+            validate_git_remote_destination("https://github.com/LebsChen/OPCOS.git", &store, None)
+                .is_ok()
+        );
+        assert!(
+            validate_git_remote_destination(
+                "https://token@github.com/LebsChen/OPCOS.git",
+                &store,
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_push_rejects_an_unconfigured_remote_before_credentials() {
+        let root = std::env::temp_dir().join(format!("opcos-git-remote-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let host = LocalHost::new(&root).unwrap();
+        let initialized = host
+            .exec(ExecRequest {
+                command: "git init".into(),
+                cwd: Some(root.display().to_string()),
+                timeout_seconds: 15,
+                session: None,
+                env: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(initialized.result.exit_code, 0);
+        let error = read_git_remote_url(
+            &host,
+            Some(std::env::consts::OS),
+            &root.display().to_string(),
+            "origin",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "configured git remote was not found");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn askpass_scripts_only_read_environment_credentials() {
+        assert!(!ASKPASS_SCRIPT.contains("OPCOS_GIT_PASSWORD="));
+        assert!(ASKPASS_SCRIPT.contains("$env:OPCOS_GIT_PASSWORD"));
+        assert!(ASKPASS_SCRIPT.contains("$env:OPCOS_GIT_USERNAME"));
     }
 
     #[test]
