@@ -3534,6 +3534,7 @@ dependencies = [
  "opcos-assets",
  "opcos-engine",
  "opcos-hosts",
+ "opcos-lsp",
  "opcos-mcp",
  "opcos-policy",
  "opcos-provider",
@@ -3607,6 +3608,19 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.30.0",
  "uuid",
+]
+
+[[package]]
+name = "opcos-lsp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "opcos-hosts",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "url",
 ]
 
 [[package]]

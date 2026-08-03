@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/opcos-hosts",
+  "crates/opcos-lsp",
   "crates/opcos-rvm",
   "crates/opcos-provider",
   "crates/opcos-engine",
