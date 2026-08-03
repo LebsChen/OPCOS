@@ -369,6 +369,10 @@ pub struct TurnEngine<P, S, E> {
     telegram_tools_enabled: AtomicBool,
     discord_tools_enabled: AtomicBool,
     slack_tools_enabled: AtomicBool,
+    notion_tools_enabled: AtomicBool,
+    gitlab_tools_enabled: AtomicBool,
+    jira_tools_enabled: AtomicBool,
+    stripe_tools_enabled: AtomicBool,
     active_tool_calls: StdMutex<HashSet<String>>,
     policy_denied: AtomicBool,
 }
@@ -447,6 +451,10 @@ where
             telegram_tools_enabled: AtomicBool::new(false),
             discord_tools_enabled: AtomicBool::new(false),
             slack_tools_enabled: AtomicBool::new(false),
+            notion_tools_enabled: AtomicBool::new(false),
+            gitlab_tools_enabled: AtomicBool::new(false),
+            jira_tools_enabled: AtomicBool::new(false),
+            stripe_tools_enabled: AtomicBool::new(false),
             active_tool_calls: StdMutex::new(HashSet::new()),
             policy_denied: AtomicBool::new(false),
         }
@@ -478,6 +486,10 @@ where
             "telegram" => &self.telegram_tools_enabled,
             "discord" => &self.discord_tools_enabled,
             "slack" => &self.slack_tools_enabled,
+            "notion" => &self.notion_tools_enabled,
+            "gitlab" => &self.gitlab_tools_enabled,
+            "jira" => &self.jira_tools_enabled,
+            "stripe" => &self.stripe_tools_enabled,
             _ => return,
         };
         target.store(enabled, Ordering::SeqCst);
@@ -928,6 +940,10 @@ where
                             self.discord_tools_enabled.load(Ordering::SeqCst),
                         ),
                         ("slack_", self.slack_tools_enabled.load(Ordering::SeqCst)),
+                        ("notion_", self.notion_tools_enabled.load(Ordering::SeqCst)),
+                        ("gitlab_", self.gitlab_tools_enabled.load(Ordering::SeqCst)),
+                        ("jira_", self.jira_tools_enabled.load(Ordering::SeqCst)),
+                        ("stripe_", self.stripe_tools_enabled.load(Ordering::SeqCst)),
                     ] {
                         if !enabled {
                             tools.retain(|tool| {
@@ -1395,6 +1411,11 @@ fn tool_risk(name: &str) -> ToolRisk {
         | "github_list_repositories"
         | "github_list_issues"
         | "slack_list_channels"
+        | "notion_search"
+        | "gitlab_list_projects"
+        | "gitlab_list_issues"
+        | "jira_search_issues"
+        | "stripe_list_charges"
         | "repo_index_find_symbol"
         | "repo_index_glob"
         | "repo_index_search" => ToolRisk::Read,
@@ -1813,6 +1834,11 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"discord_send_message","description":"Send a Discord bot message to a channel. Requires approval.","parameters":{"type":"object","properties":{"channel_id":{"type":"string"},"content":{"type":"string"}},"required":["channel_id","content"]}}}),
         json!({"type":"function","function":{"name":"slack_list_channels","description":"List Slack channels visible to the configured bot. Read-only.","parameters":{"type":"object","properties":{}}}}),
         json!({"type":"function","function":{"name":"slack_post_message","description":"Post a Slack channel message. Requires approval.","parameters":{"type":"object","properties":{"channel":{"type":"string"},"text":{"type":"string"}},"required":["channel","text"]}}}),
+        json!({"type":"function","function":{"name":"notion_search","description":"Search Notion pages and databases. Read-only.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}),
+        json!({"type":"function","function":{"name":"gitlab_list_projects","description":"List GitLab projects visible to the configured account. Read-only.","parameters":{"type":"object","properties":{}}}}),
+        json!({"type":"function","function":{"name":"gitlab_list_issues","description":"List GitLab issues visible to the configured account. Read-only.","parameters":{"type":"object","properties":{}}}}),
+        json!({"type":"function","function":{"name":"jira_search_issues","description":"Search Jira issues with JQL. Read-only.","parameters":{"type":"object","properties":{"jql":{"type":"string"}},"required":["jql"]}}}),
+        json!({"type":"function","function":{"name":"stripe_list_charges","description":"List Stripe charges. Read-only.","parameters":{"type":"object","properties":{"limit":{"type":"integer"}}}}}),
         json!({"type":"function","function":{"name":"repo_index_find_symbol","description":"Find definitions and symbols in the repository index. Read-only.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}),
         json!({"type":"function","function":{"name":"repo_index_glob","description":"Find repository paths matching a glob. Read-only.","parameters":{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}}}),
         json!({"type":"function","function":{"name":"repo_index_search","description":"Search indexed symbol/content lines without loading whole files. Read-only.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}),

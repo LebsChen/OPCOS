@@ -151,6 +151,13 @@ pub fn descriptors() -> Vec<ProviderDescriptor> {
             "OPENROUTER_API_KEY",
             true,
         ),
+        descriptor(
+            "zai",
+            "Z AI",
+            "https://api.z.ai/api/paas/v4",
+            "ZAI_API_KEY",
+            true,
+        ),
         ProviderDescriptor {
             name: "vertex".into(),
             title: "Vertex AI (Google Cloud)".into(),
@@ -353,6 +360,7 @@ mod tests {
             ("meta", "https://api.meta.ai/v1"),
             ("fireworks", "https://api.fireworks.ai/inference/v1"),
             ("openrouter", "https://openrouter.ai/api/v1"),
+            ("zai", "https://api.z.ai/api/paas/v4"),
         ];
         let descriptors = descriptors();
         for (name, base_url) in expected {

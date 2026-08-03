@@ -76,6 +76,134 @@ type TokenConnectorStatus = {
   connected: boolean;
   identity?: string;
 };
+type ConnectorField = {
+  key: string;
+  label: string;
+  type?: "text" | "password" | "url";
+  placeholder?: string;
+};
+const TOKEN_CONNECTOR_KINDS = [
+  "github",
+  "telegram",
+  "discord",
+  "slack",
+  "notion",
+  "gitlab",
+  "stripe",
+  "asana",
+  "hubspot",
+  "clickup",
+  "pagerduty",
+  "posthog",
+  "apollo.io",
+  "hunter",
+  "close",
+  "attio",
+  "clay",
+  "figma",
+  "descript",
+  "monday.com",
+  "jira",
+  "confluence",
+  "zendesk",
+  "datadog",
+  "mixpanel",
+  "amplitude",
+] as const;
+const CONNECTOR_FIELDS: Record<string, ConnectorField[]> = {
+  github: [{ key: "token", label: "PAT", type: "password" }],
+  telegram: [{ key: "token", label: "Bot token", type: "password" }],
+  discord: [{ key: "token", label: "Bot token", type: "password" }],
+  slack: [{ key: "token", label: "Bot token", type: "password" }],
+  notion: [
+    { key: "token", label: "Internal integration token", type: "password" },
+  ],
+  gitlab: [
+    { key: "token", label: "PAT", type: "password" },
+    {
+      key: "base_url",
+      label: "GitLab URL",
+      type: "url",
+      placeholder: "https://gitlab.com",
+    },
+  ],
+  stripe: [{ key: "token", label: "Secret key", type: "password" }],
+  asana: [{ key: "token", label: "PAT", type: "password" }],
+  hubspot: [{ key: "token", label: "Private app token", type: "password" }],
+  clickup: [{ key: "token", label: "API token", type: "password" }],
+  pagerduty: [{ key: "token", label: "API token", type: "password" }],
+  posthog: [
+    { key: "token", label: "Personal API key", type: "password" },
+    {
+      key: "host",
+      label: "PostHog host",
+      type: "url",
+      placeholder: "https://us.posthog.com",
+    },
+  ],
+  "apollo.io": [{ key: "token", label: "API key", type: "password" }],
+  hunter: [{ key: "token", label: "API key", type: "password" }],
+  close: [{ key: "token", label: "API key", type: "password" }],
+  attio: [{ key: "token", label: "API key", type: "password" }],
+  clay: [{ key: "token", label: "API key", type: "password" }],
+  figma: [{ key: "token", label: "Personal access token", type: "password" }],
+  descript: [{ key: "token", label: "API token", type: "password" }],
+  "monday.com": [
+    { key: "token", label: "Personal API token", type: "password" },
+  ],
+  jira: [
+    {
+      key: "site",
+      label: "Atlassian site URL",
+      type: "url",
+      placeholder: "https://example.atlassian.net",
+    },
+    { key: "email", label: "Atlassian email", type: "text" },
+    { key: "token", label: "API token", type: "password" },
+  ],
+  confluence: [
+    {
+      key: "site",
+      label: "Atlassian site URL",
+      type: "url",
+      placeholder: "https://example.atlassian.net",
+    },
+    { key: "email", label: "Atlassian email", type: "text" },
+    { key: "token", label: "API token", type: "password" },
+  ],
+  zendesk: [
+    {
+      key: "subdomain",
+      label: "Subdomain",
+      type: "text",
+      placeholder: "your-subdomain",
+    },
+    { key: "email", label: "Account email", type: "text" },
+    { key: "token", label: "API token", type: "password" },
+  ],
+  datadog: [
+    {
+      key: "site",
+      label: "Datadog site",
+      type: "text",
+      placeholder: "datadoghq.com",
+    },
+    { key: "api_key", label: "API key", type: "password" },
+    { key: "app_key", label: "Application key", type: "password" },
+  ],
+  mixpanel: [
+    { key: "service_user", label: "Service account user", type: "text" },
+    {
+      key: "service_secret",
+      label: "Service account secret",
+      type: "password",
+    },
+  ],
+  amplitude: [
+    { key: "api_key", label: "API key", type: "password" },
+    { key: "secret_key", label: "Secret key", type: "password" },
+  ],
+};
 type InboxRecord = {
   session_id: string;
   call_id: string;
@@ -1184,7 +1312,7 @@ function ManageSections({
     void command<Record<string, unknown>>("devin_integration_status")
       .then((status) => setDevinKeyConfigured(status.configured === true))
       .catch(onError);
-    for (const kind of ["github", "telegram", "discord", "slack"]) {
+    for (const kind of TOKEN_CONNECTOR_KINDS) {
       void command<TokenConnectorStatus>("connector_status", { kind })
         .then((status) =>
           setConnectorStatuses((items) => ({ ...items, [kind]: status })),
@@ -1207,6 +1335,9 @@ function ManageSections({
   const [connectorTokens, setConnectorTokens] = useState<
     Record<string, string>
   >({});
+  const [connectorConfigs, setConnectorConfigs] = useState<
+    Record<string, Record<string, string>>
+  >({});
   const [connectorStatuses, setConnectorStatuses] = useState<
     Record<string, TokenConnectorStatus>
   >({});
@@ -1214,6 +1345,11 @@ function ManageSections({
     Record<string, string>
   >({});
   const [openConnector, setOpenConnector] = useState<string | null>(null);
+  const [secretFormOpen, setSecretFormOpen] = useState(false);
+  const [secretName, setSecretName] = useState("");
+  const [secretScope, setSecretScope] = useState("global");
+  const [secretPurpose, setSecretPurpose] = useState("");
+  const [secretValue, setSecretValue] = useState("");
   const [linearIssueId, setLinearIssueId] = useState("");
   const [linearIssue, setLinearIssue] = useState<Record<
     string,
@@ -2544,12 +2680,9 @@ function ManageSections({
               <div className="grid grid-cols-2 xl:grid-cols-3 gap-2.5 mt-4">
                 {OPENWORKER_CONNECTORS.map((connector) => {
                   const connectorKind = connector.name.toLowerCase();
-                  const tokenIntegrated = [
-                    "github",
-                    "telegram",
-                    "discord",
-                    "slack",
-                  ].includes(connectorKind);
+                  const tokenIntegrated = TOKEN_CONNECTOR_KINDS.includes(
+                    connectorKind as (typeof TOKEN_CONNECTOR_KINDS)[number],
+                  );
                   const integrated =
                     tokenIntegrated ||
                     connector.name === "Linear" ||
@@ -2628,41 +2761,59 @@ function ManageSections({
                 OPENWORKER_CONNECTORS.some(
                   (connector) =>
                     connector.name.toLowerCase() === openConnector &&
-                    ["github", "telegram", "discord", "slack"].includes(
-                      openConnector,
+                    TOKEN_CONNECTOR_KINDS.includes(
+                      openConnector as (typeof TOKEN_CONNECTOR_KINDS)[number],
                     ),
                 ) && (
-                  <div className="manage-row mt-2 px-4">
-                    <label className="field-label flex-1">
-                      {
-                        OPENWORKER_CONNECTORS.find(
-                          (connector) =>
-                            connector.name.toLowerCase() === openConnector,
-                        )?.name
-                      }{" "}
-                      token
-                      <input
-                        type="password"
-                        value={connectorTokens[openConnector] || ""}
-                        placeholder={
-                          connectorStatuses[openConnector]?.connected
-                            ? "Stored securely"
-                            : ""
-                        }
-                        onChange={(event) =>
-                          setConnectorTokens((items) => ({
-                            ...items,
-                            [openConnector]: event.target.value,
-                          }))
-                        }
-                      />
-                    </label>
+                  <div className="form-grid mt-2">
+                    {(CONNECTOR_FIELDS[openConnector] || []).map((field) => (
+                      <label className="field-label" key={field.key}>
+                        {field.label}
+                        <input
+                          type={field.type || "text"}
+                          value={
+                            field.key === "token"
+                              ? connectorTokens[openConnector] || ""
+                              : connectorConfigs[openConnector]?.[field.key] ||
+                                ""
+                          }
+                          placeholder={
+                            field.key === "token" &&
+                            connectorStatuses[openConnector]?.connected
+                              ? "Stored securely"
+                              : field.placeholder
+                          }
+                          onChange={(event) => {
+                            if (field.key === "token") {
+                              setConnectorTokens((items) => ({
+                                ...items,
+                                [openConnector]: event.target.value,
+                              }));
+                            } else {
+                              setConnectorConfigs((items) => ({
+                                ...items,
+                                [openConnector]: {
+                                  ...items[openConnector],
+                                  [field.key]: event.target.value,
+                                },
+                              }));
+                            }
+                          }}
+                        />
+                      </label>
+                    ))}
                     <Button
                       className="primary self-end"
                       onClick={() =>
                         command<TokenConnectorStatus>("connector_save", {
                           kind: openConnector,
-                          token: connectorTokens[openConnector] || "",
+                          token: connectorTokens[openConnector] || null,
+                          config: {
+                            ...connectorConfigs[openConnector],
+                            ...(connectorTokens[openConnector]
+                              ? { token: connectorTokens[openConnector] }
+                              : {}),
+                          },
                         })
                           .then((value) => {
                             setConnectorStatuses((items) => ({
@@ -2936,24 +3087,115 @@ function ManageSections({
             onSearch={() => undefined}
             searchPlaceholder={translate("searchSecretKeys")}
             primary={
-              <Button className="primary">{translate("addSecret")}</Button>
+              <Button
+                className="primary"
+                onClick={() => setSecretFormOpen((open) => !open)}
+              >
+                {secretFormOpen ? "Cancel" : translate("addSecret")}
+              </Button>
             }
             rows={
-              secrets.length ? (
-                <>
-                  {secrets.map((secret) => (
-                    <div className="manage-row px-4" key={secret.name}>
-                      <span>
-                        <strong>{secret.name}</strong>
-                        <small>
-                          {secret.scope} · {secret.purpose}
-                        </small>
-                      </span>
-                      <span className="muted">{translate("delete")}</span>
+              <>
+                {secretFormOpen && (
+                  <div className="manage-row px-4">
+                    <div className="form-grid w-full">
+                      <label className="field-label">
+                        Name
+                        <input
+                          value={secretName}
+                          onChange={(event) =>
+                            setSecretName(event.target.value)
+                          }
+                        />
+                      </label>
+                      <label className="field-label">
+                        Scope
+                        <input
+                          value={secretScope}
+                          onChange={(event) =>
+                            setSecretScope(event.target.value)
+                          }
+                        />
+                      </label>
+                      <label className="field-label">
+                        Purpose
+                        <input
+                          value={secretPurpose}
+                          onChange={(event) =>
+                            setSecretPurpose(event.target.value)
+                          }
+                        />
+                      </label>
+                      <label className="field-label">
+                        Value
+                        <input
+                          type="password"
+                          value={secretValue}
+                          onChange={(event) =>
+                            setSecretValue(event.target.value)
+                          }
+                        />
+                      </label>
+                      <Button
+                        className="primary"
+                        onClick={() =>
+                          command("save_secret_metadata", {
+                            name: secretName,
+                            scope: secretScope,
+                            purpose: secretPurpose,
+                            value: secretValue,
+                          })
+                            .then(() => {
+                              setSecretName("");
+                              setSecretPurpose("");
+                              setSecretValue("");
+                              setSecretFormOpen(false);
+                              onRefresh();
+                            })
+                            .catch(onError)
+                        }
+                        disabled={
+                          !secretName.trim() ||
+                          !secretPurpose.trim() ||
+                          !secretValue
+                        }
+                      >
+                        Save secret
+                      </Button>
                     </div>
-                  ))}
-                </>
-              ) : null
+                  </div>
+                )}
+                {secrets.length
+                  ? secrets.map((secret) => (
+                      <div className="manage-row px-4" key={secret.name}>
+                        <span>
+                          <strong>{secret.name}</strong>
+                          <small>
+                            {secret.scope} · {secret.purpose}
+                          </small>
+                        </span>
+                        <Button
+                          className="bordered"
+                          onClick={() => {
+                            if (
+                              !window.confirm(
+                                `Delete secret metadata "${secret.name}"?`,
+                              )
+                            )
+                              return;
+                            void command("delete_secret_metadata", {
+                              name: secret.name,
+                            })
+                              .then(onRefresh)
+                              .catch(onError);
+                          }}
+                        >
+                          {translate("delete")}
+                        </Button>
+                      </div>
+                    ))
+                  : null}
+              </>
             }
             empty={translate("noSecretMetadata")}
           />
@@ -2981,7 +3223,7 @@ function ManageSections({
             <textarea
               value={blueprintCommand}
               onChange={(event) => setBlueprintCommand(event.target.value)}
-              placeholder={translate("Execute a blueprint command")}
+              placeholder="Run remote command"
             />
             <div className="inline-actions">
               <Button
@@ -2998,7 +3240,7 @@ function ManageSections({
                     .catch(onError)
                 }
               >
-                Execute
+                Run remote command
               </Button>
               <Button
                 disabled={!selected}
@@ -3166,15 +3408,25 @@ function McpManage({
                   description={`${String(tool.transport || "remote")} · ${String(tool.command || tool.url || "host-provided")}`}
                   actions={
                     <Button
+                      disabled={!selected}
                       onClick={() =>
+                        selected &&
                         command("set_mcp_tool_enabled", {
-                          sessionId: selected?.id,
+                          sessionId: selected.id,
                           name: String(tool.name),
-                          enabled: true,
-                        }).catch(onError)
+                          enabled: tool.enabled !== true,
+                        })
+                          .then(() =>
+                            command<Array<Record<string, unknown>>>(
+                              "mcp_tools",
+                              { sessionId: selected.id },
+                            ),
+                          )
+                          .then(setTools)
+                          .catch(onError)
                       }
                     >
-                      Enable
+                      {tool.enabled === true ? "Disable" : "Enable"}
                     </Button>
                   }
                   key={String(tool.name)}

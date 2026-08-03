@@ -2078,16 +2078,18 @@ async fn engine_for(
         .get(&secret_key("asset-secret", "linear-pat"))
         .map_err(|error| error.to_string())?
         .is_some();
-    let connector_tools_enabled = ["github", "telegram", "discord", "slack"]
-        .into_iter()
-        .map(|kind| {
-            state
-                .secrets
-                .get(&secret_key("connector-token", kind))
-                .map(|value| (kind, value.is_some()))
-                .map_err(|error| error.to_string())
-        })
-        .collect::<Result<HashMap<_, _>, _>>()?;
+    let connector_tools_enabled = [
+        "github", "telegram", "discord", "slack", "notion", "gitlab", "jira", "stripe",
+    ]
+    .into_iter()
+    .map(|kind| {
+        state
+            .secrets
+            .get(&secret_key("connector-token", kind))
+            .map(|value| (kind, value.is_some()))
+            .map_err(|error| error.to_string())
+    })
+    .collect::<Result<HashMap<_, _>, _>>()?;
     let mcp_runtime = Arc::clone(&state.mcp);
     let (workspace, executor, remote_client, allowed_tools) = if host_id == "local" {
         if session_workspace.is_empty() {
@@ -2145,6 +2147,21 @@ async fn engine_for(
                 "slack_list_channels".to_owned(),
                 "slack_post_message".to_owned(),
             ]);
+        }
+        if connector_tools_enabled["notion"] {
+            allowed_tools.push("notion_search".to_owned());
+        }
+        if connector_tools_enabled["gitlab"] {
+            allowed_tools.extend([
+                "gitlab_list_projects".to_owned(),
+                "gitlab_list_issues".to_owned(),
+            ]);
+        }
+        if connector_tools_enabled["jira"] {
+            allowed_tools.push("jira_search_issues".to_owned());
+        }
+        if connector_tools_enabled["stripe"] {
+            allowed_tools.push("stripe_list_charges".to_owned());
         }
         (
             workspace.display().to_string(),
@@ -2268,7 +2285,9 @@ async fn engine_for(
         model,
     ));
     engine.set_linear_tools_enabled(linear_tools_enabled);
-    for kind in ["github", "telegram", "discord", "slack"] {
+    for kind in [
+        "github", "telegram", "discord", "slack", "notion", "gitlab", "jira", "stripe",
+    ] {
         engine.set_connector_tools_enabled(kind, connector_tools_enabled[kind]);
     }
     engine.set_unattended(
@@ -4977,12 +4996,30 @@ async fn mcp_tools(
         .mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
         .await
         .map_err(|error| error.to_string())?;
-    Ok(response
+    let tools = response
         .get("result")
         .and_then(|value| value.get("tools"))
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default())
+        .unwrap_or_default();
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let mut tools = tools;
+    for tool in &mut tools {
+        let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+        let enabled: bool = connection
+            .query_row(
+                "SELECT enabled FROM mcp_session_tools WHERE session_id=?1 AND source='host' AND name=?2",
+                params![session_id, name],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|value| value != 0)
+            .unwrap_or(true);
+        tool["enabled"] = Value::Bool(enabled);
+    }
+    Ok(tools)
 }
 
 async fn linear_graphql(
@@ -5083,12 +5120,20 @@ async fn linear_connection(state: State<'_, DesktopState>) -> Result<Value, Stri
     )
 }
 
-fn connector_token(state: &DesktopState, kind: &str) -> Result<String, String> {
+fn connector_config(state: &DesktopState, kind: &str) -> Result<Value, String> {
+    if let Some(value) = state
+        .secrets
+        .get(&secret_key("connector-config", kind))
+        .map_err(|error| format!("{kind} credentials unavailable: {error}"))?
+    {
+        return serde_json::from_str(&value).map_err(|_| format!("{kind} credentials are invalid"));
+    }
     state
         .secrets
         .get(&secret_key("connector-token", kind))
         .map_err(|error| format!("{kind} token unavailable: {error}"))?
-        .ok_or_else(|| format!("{kind} token is not configured"))
+        .map(|token| json!({"token": token}))
+        .ok_or_else(|| format!("{kind} credentials are not configured"))
 }
 
 async fn connector_json(request: reqwest::RequestBuilder, kind: &str) -> Result<Value, String> {
@@ -5108,14 +5153,15 @@ async fn connector_json(request: reqwest::RequestBuilder, kind: &str) -> Result<
 }
 
 async fn connector_identity(state: &DesktopState, kind: &str) -> Result<Value, String> {
-    let token = connector_token(state, kind)?;
+    let config = connector_config(state, kind)?;
+    let token = config.get("token").and_then(Value::as_str).unwrap_or("");
     let client = reqwest::Client::new();
     match kind {
         "github" => {
             let body = connector_json(
                 client
                     .get("https://api.github.com/user")
-                    .bearer_auth(&token)
+                    .bearer_auth(token)
                     .header("User-Agent", "OPCOS"),
                 "GitHub",
             )
@@ -5145,7 +5191,7 @@ async fn connector_identity(state: &DesktopState, kind: &str) -> Result<Value, S
             let body = connector_json(
                 client
                     .get("https://discord.com/api/v10/users/@me")
-                    .bearer_auth(&token),
+                    .bearer_auth(token),
                 "Discord",
             )
             .await?;
@@ -5159,7 +5205,7 @@ async fn connector_identity(state: &DesktopState, kind: &str) -> Result<Value, S
             let body = connector_json(
                 client
                     .get("https://slack.com/api/auth.test")
-                    .bearer_auth(&token),
+                    .bearer_auth(token),
                 "Slack",
             )
             .await?;
@@ -5173,6 +5219,354 @@ async fn connector_identity(state: &DesktopState, kind: &str) -> Result<Value, S
                 .unwrap_or("Slack bot");
             Ok(json!({"connected": true, "identity": identity}))
         }
+        "notion" => {
+            let body = connector_json(
+                client
+                    .get("https://api.notion.com/v1/users/me")
+                    .bearer_auth(token)
+                    .header("Notion-Version", "2022-06-28"),
+                "Notion",
+            )
+            .await?;
+            let identity = body
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| body.pointer("/bot/owner/user/name").and_then(Value::as_str))
+                .unwrap_or("Notion connection");
+            Ok(json!({"connected": true, "identity": identity}))
+        }
+        "gitlab" => {
+            let base_url = config
+                .get("base_url")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("https://gitlab.com")
+                .trim_end_matches('/');
+            let body = connector_json(
+                client
+                    .get(format!("{base_url}/api/v4/user"))
+                    .header("PRIVATE-TOKEN", token),
+                "GitLab",
+            )
+            .await?;
+            let identity = body
+                .get("username")
+                .and_then(Value::as_str)
+                .or_else(|| body.get("name").and_then(Value::as_str))
+                .unwrap_or("GitLab user");
+            Ok(json!({"connected": true, "identity": identity}))
+        }
+        "stripe" => {
+            let body = connector_json(
+                client
+                    .get("https://api.stripe.com/v1/account")
+                    .basic_auth(token, Some("")),
+                "Stripe",
+            )
+            .await?;
+            let identity = body
+                .get("business_profile")
+                .and_then(|value| value.get("name"))
+                .and_then(Value::as_str)
+                .or_else(|| body.get("email").and_then(Value::as_str))
+                .unwrap_or("Stripe account");
+            Ok(json!({"connected": true, "identity": identity}))
+        }
+        "asana" => {
+            let body = connector_json(
+                client
+                    .get("https://app.asana.com/api/1.0/users/me")
+                    .bearer_auth(token),
+                "Asana",
+            )
+            .await?;
+            let identity = body
+                .pointer("/data/name")
+                .and_then(Value::as_str)
+                .unwrap_or("Asana user");
+            Ok(json!({"connected": true, "identity": identity}))
+        }
+        "hubspot" => {
+            let body = connector_json(
+                client
+                    .get("https://api.hubapi.com/account-info/v3/details")
+                    .bearer_auth(token),
+                "HubSpot",
+            )
+            .await?;
+            let identity = body
+                .get("portalId")
+                .and_then(Value::as_str)
+                .unwrap_or("HubSpot account");
+            Ok(json!({"connected": true, "identity": identity}))
+        }
+        "clickup" => {
+            let body = connector_json(
+                client
+                    .get("https://api.clickup.com/api/v2/user")
+                    .header("Authorization", token),
+                "ClickUp",
+            )
+            .await?;
+            let identity = body
+                .pointer("/user/username")
+                .and_then(Value::as_str)
+                .or_else(|| body.pointer("/user/email").and_then(Value::as_str))
+                .unwrap_or("ClickUp user");
+            Ok(json!({"connected": true, "identity": identity}))
+        }
+        "pagerduty" => {
+            let request = client
+                .get("https://api.pagerduty.com/users/me")
+                .header("Authorization", format!("Token token={token}"))
+                .header("Accept", "application/vnd.pagerduty+json;version=2");
+            match connector_json(request, "PagerDuty").await {
+                Ok(body) => {
+                    let identity = body
+                        .pointer("/user/name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("PagerDuty user");
+                    Ok(json!({"connected": true, "identity": identity}))
+                }
+                Err(_) => {
+                    connector_json(
+                        client
+                            .get("https://api.pagerduty.com/abilities")
+                            .header("Authorization", format!("Token token={token}")),
+                        "PagerDuty",
+                    )
+                    .await?;
+                    Ok(json!({"connected": true, "identity": "PagerDuty account"}))
+                }
+            }
+        }
+        "posthog" => {
+            let host = config
+                .get("host")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("https://us.posthog.com")
+                .trim_end_matches('/');
+            let body = connector_json(
+                client
+                    .get(format!("{host}/api/users/@me/"))
+                    .bearer_auth(token),
+                "PostHog",
+            )
+            .await?;
+            let identity = body
+                .get("email")
+                .and_then(Value::as_str)
+                .or_else(|| body.get("name").and_then(Value::as_str))
+                .unwrap_or("PostHog user");
+            Ok(json!({"connected": true, "identity": identity}))
+        }
+        "apollo.io" => {
+            connector_json(
+                client
+                    .post("https://api.apollo.io/v1/auth/health")
+                    .header("x-api-key", token),
+                "Apollo.io",
+            )
+            .await?;
+            Ok(json!({"connected": true, "identity": "Apollo.io account"}))
+        }
+        "hunter" => {
+            let body = connector_json(
+                client
+                    .get("https://api.hunter.io/v2/account")
+                    .header("X-API-KEY", token),
+                "Hunter",
+            )
+            .await?;
+            let identity = body
+                .pointer("/data/email")
+                .and_then(Value::as_str)
+                .unwrap_or("Hunter account");
+            Ok(json!({"connected": true, "identity": identity}))
+        }
+        "close" => {
+            let body = connector_json(
+                client
+                    .get("https://api.close.com/api/v1/me/")
+                    .basic_auth(token, Some("")),
+                "Close",
+            )
+            .await?;
+            let identity = body
+                .get("email")
+                .and_then(Value::as_str)
+                .or_else(|| body.get("name").and_then(Value::as_str))
+                .unwrap_or("Close account");
+            Ok(json!({"connected": true, "identity": identity}))
+        }
+        "attio" => {
+            let body = connector_json(
+                client
+                    .get("https://api.attio.com/v2/self")
+                    .bearer_auth(token),
+                "Attio",
+            )
+            .await?;
+            let identity = body
+                .get("workspace_name")
+                .and_then(Value::as_str)
+                .unwrap_or("Attio workspace");
+            Ok(json!({"connected": true, "identity": identity}))
+        }
+        "clay" => Ok(json!({"connected": true, "identity": "Clay account"})),
+        "figma" => {
+            let body = connector_json(
+                client
+                    .get("https://api.figma.com/v1/me")
+                    .header("X-Figma-Token", token),
+                "Figma",
+            )
+            .await?;
+            let identity = body
+                .get("handle")
+                .and_then(Value::as_str)
+                .or_else(|| body.get("email").and_then(Value::as_str))
+                .unwrap_or("Figma user");
+            Ok(json!({"connected": true, "identity": identity}))
+        }
+        "descript" => Ok(json!({"connected": true, "identity": "Descript drive"})),
+        "monday.com" => {
+            let body = connector_json(
+                client
+                    .post("https://api.monday.com/v2")
+                    .header("Authorization", token)
+                    .json(&json!({"query":"query { me { name email } }"})),
+                "monday.com",
+            )
+            .await?;
+            let identity = body
+                .pointer("/data/me/0/name")
+                .and_then(Value::as_str)
+                .unwrap_or("monday.com user");
+            Ok(json!({"connected": true, "identity": identity}))
+        }
+        "jira" => {
+            let site = config
+                .get("site")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim_end_matches('/');
+            let email = config.get("email").and_then(Value::as_str).unwrap_or("");
+            let body = connector_json(
+                client
+                    .get(format!("{site}/rest/api/3/myself"))
+                    .basic_auth(email, Some(token)),
+                "Jira",
+            )
+            .await?;
+            let identity = body
+                .get("displayName")
+                .and_then(Value::as_str)
+                .unwrap_or("Jira user");
+            Ok(json!({"connected": true, "identity": identity}))
+        }
+        "confluence" => {
+            let site = config
+                .get("site")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim_end_matches('/');
+            let email = config.get("email").and_then(Value::as_str).unwrap_or("");
+            let body = connector_json(
+                client
+                    .get(format!("{site}/wiki/rest/api/user/current"))
+                    .basic_auth(email, Some(token)),
+                "Confluence",
+            )
+            .await?;
+            let identity = body
+                .get("displayName")
+                .and_then(Value::as_str)
+                .unwrap_or("Confluence user");
+            Ok(json!({"connected": true, "identity": identity}))
+        }
+        "zendesk" => {
+            let subdomain = config
+                .get("subdomain")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let email = config.get("email").and_then(Value::as_str).unwrap_or("");
+            let body = connector_json(
+                client
+                    .get(format!(
+                        "https://{subdomain}.zendesk.com/api/v2/users/me.json"
+                    ))
+                    .basic_auth(format!("{email}/token"), Some(token)),
+                "Zendesk",
+            )
+            .await?;
+            let identity = body
+                .pointer("/user/name")
+                .and_then(Value::as_str)
+                .unwrap_or("Zendesk user");
+            Ok(json!({"connected": true, "identity": identity}))
+        }
+        "datadog" => {
+            let site = config
+                .get("site")
+                .and_then(Value::as_str)
+                .unwrap_or("datadoghq.com");
+            let api_key = config.get("api_key").and_then(Value::as_str).unwrap_or("");
+            let app_key = config.get("app_key").and_then(Value::as_str).unwrap_or("");
+            let body = connector_json(
+                client
+                    .get(format!("https://api.{site}/api/v1/validate"))
+                    .header("DD-API-KEY", api_key)
+                    .header("DD-APPLICATION-KEY", app_key),
+                "Datadog",
+            )
+            .await?;
+            let identity = body
+                .get("valid")
+                .and_then(Value::as_bool)
+                .filter(|valid| *valid)
+                .map(|_| "Datadog account")
+                .unwrap_or("Datadog account");
+            Ok(json!({"connected": true, "identity": identity}))
+        }
+        "mixpanel" => {
+            let user = config
+                .get("service_user")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let secret = config
+                .get("service_secret")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let body = connector_json(
+                client
+                    .get("https://mixpanel.com/api/app/me")
+                    .basic_auth(user, Some(secret)),
+                "Mixpanel",
+            )
+            .await?;
+            let identity = body
+                .get("email")
+                .and_then(Value::as_str)
+                .unwrap_or("Mixpanel service account");
+            Ok(json!({"connected": true, "identity": identity}))
+        }
+        "amplitude" => {
+            let api_key = config.get("api_key").and_then(Value::as_str).unwrap_or("");
+            let secret_key = config
+                .get("secret_key")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            connector_json(
+                client
+                    .get("https://amplitude.com/api/2/userprofile")
+                    .basic_auth(api_key, Some(secret_key)),
+                "Amplitude",
+            )
+            .await?;
+            Ok(json!({"connected": true, "identity": "Amplitude project"}))
+        }
         _ => Err(format!("unsupported connector: {kind}")),
     }
 }
@@ -5181,20 +5575,147 @@ async fn connector_identity(state: &DesktopState, kind: &str) -> Result<Value, S
 async fn connector_save(
     state: State<'_, DesktopState>,
     kind: String,
-    token: String,
+    token: Option<String>,
+    config: Option<Value>,
 ) -> Result<Value, String> {
     let kind = kind.trim().to_ascii_lowercase();
-    if !matches!(kind.as_str(), "github" | "telegram" | "discord" | "slack") {
+    const SUPPORTED: &[&str] = &[
+        "github",
+        "telegram",
+        "discord",
+        "slack",
+        "notion",
+        "gitlab",
+        "stripe",
+        "asana",
+        "hubspot",
+        "clickup",
+        "pagerduty",
+        "posthog",
+        "apollo.io",
+        "hunter",
+        "close",
+        "attio",
+        "clay",
+        "figma",
+        "descript",
+        "monday.com",
+        "jira",
+        "confluence",
+        "zendesk",
+        "datadog",
+        "mixpanel",
+        "amplitude",
+    ];
+    if !SUPPORTED.contains(&kind.as_str()) {
         return Err(format!("unsupported connector: {kind}"));
     }
-    if token.trim().is_empty() {
-        return Err("connector token cannot be empty".into());
+    let mut credentials =
+        config.unwrap_or_else(|| json!({"token": token.clone().unwrap_or_default()}));
+    if let Some(value) = token.filter(|value| !value.trim().is_empty()) {
+        credentials["token"] = Value::String(value);
     }
-    let key = secret_key("connector-token", &kind);
+    let has_credentials = credentials.as_object().is_some_and(|object| {
+        object
+            .values()
+            .any(|value| value.as_str().is_some_and(|value| !value.trim().is_empty()))
+    });
+    if !has_credentials {
+        return Err("connector credentials cannot be empty".into());
+    }
+    if matches!(kind.as_str(), "jira" | "confluence")
+        && (credentials
+            .get("site")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .is_empty()
+            || credentials
+                .get("email")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .is_empty())
+    {
+        return Err("site and email are required".into());
+    }
+    if kind == "zendesk"
+        && (credentials
+            .get("subdomain")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .is_empty()
+            || credentials
+                .get("email")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .is_empty())
+    {
+        return Err("subdomain and email are required".into());
+    }
+    if kind == "datadog"
+        && (credentials
+            .get("api_key")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .is_empty()
+            || credentials
+                .get("app_key")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .is_empty())
+    {
+        return Err("Datadog API key and application key are required".into());
+    }
+    if kind == "mixpanel"
+        && (credentials
+            .get("service_user")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .is_empty()
+            || credentials
+                .get("service_secret")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .is_empty())
+    {
+        return Err("Mixpanel service account and secret are required".into());
+    }
+    if kind == "amplitude"
+        && (credentials
+            .get("api_key")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .is_empty()
+            || credentials
+                .get("secret_key")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .is_empty())
+    {
+        return Err("Amplitude API key and secret key are required".into());
+    }
+    let key = secret_key("connector-config", &kind);
     let previous = state.secrets.get(&key).map_err(|error| error.to_string())?;
+    if let Some(previous_value) = previous.as_deref()
+        && let Ok(previous_config) = serde_json::from_str::<Value>(previous_value)
+        && let (Some(current), Some(previous)) =
+            (credentials.as_object_mut(), previous_config.as_object())
+    {
+        for (field, value) in previous {
+            let missing = current
+                .get(field)
+                .and_then(Value::as_str)
+                .is_none_or(|value| value.trim().is_empty());
+            if missing {
+                current.insert(field.clone(), value.clone());
+            }
+        }
+    }
     state
         .secrets
-        .set(&key, &token)
+        .set(
+            &key,
+            &serde_json::to_string(&credentials).map_err(|error| error.to_string())?,
+        )
         .map_err(|error| error.to_string())?;
     match connector_identity(&state, &kind).await {
         Ok(value) => Ok(value),
@@ -5212,7 +5733,35 @@ async fn connector_save(
 #[tauri::command]
 async fn connector_status(state: State<'_, DesktopState>, kind: String) -> Result<Value, String> {
     let kind = kind.trim().to_ascii_lowercase();
-    if !matches!(kind.as_str(), "github" | "telegram" | "discord" | "slack") {
+    const SUPPORTED: &[&str] = &[
+        "github",
+        "telegram",
+        "discord",
+        "slack",
+        "notion",
+        "gitlab",
+        "stripe",
+        "asana",
+        "hubspot",
+        "clickup",
+        "pagerduty",
+        "posthog",
+        "apollo.io",
+        "hunter",
+        "close",
+        "attio",
+        "clay",
+        "figma",
+        "descript",
+        "monday.com",
+        "jira",
+        "confluence",
+        "zendesk",
+        "datadog",
+        "mixpanel",
+        "amplitude",
+    ];
+    if !SUPPORTED.contains(&kind.as_str()) {
         return Err(format!("unsupported connector: {kind}"));
     }
     connector_identity(&state, &kind).await
@@ -5246,16 +5795,32 @@ async fn execute_connector_tool(
     name: &str,
     arguments: Value,
 ) -> Result<Value, String> {
-    let kind = name.split('_').next().unwrap_or_default();
-    let token = secrets
-        .get(&secret_key("connector-token", kind))
-        .map_err(|error| format!("{kind} token unavailable: {error}"))?
-        .ok_or_else(|| format!("{kind} token is not configured"))?;
+    let kind = if name.starts_with("apollo_") {
+        "apollo.io"
+    } else if name.starts_with("monday_") {
+        "monday.com"
+    } else {
+        name.split('_').next().unwrap_or_default()
+    };
+    let config = secrets
+        .get(&secret_key("connector-config", kind))
+        .map_err(|error| format!("{kind} credentials unavailable: {error}"))?
+        .or_else(|| {
+            secrets
+                .get(&secret_key("connector-token", kind))
+                .ok()
+                .flatten()
+                .map(|token| json!({"token": token}).to_string())
+        })
+        .ok_or_else(|| format!("{kind} credentials are not configured"))?;
+    let config: Value =
+        serde_json::from_str(&config).map_err(|_| format!("{kind} credentials are invalid"))?;
+    let token = config.get("token").and_then(Value::as_str).unwrap_or("");
     let client = reqwest::Client::new();
     match name {
         "github_list_repositories" => {
             github_json(
-                &token,
+                token,
                 reqwest::Method::GET,
                 "https://api.github.com/user/repos?per_page=50&sort=updated",
                 None,
@@ -5272,7 +5837,7 @@ async fn execute_connector_tool(
                 .and_then(Value::as_str)
                 .ok_or("missing repo")?;
             let url = format!("https://api.github.com/repos/{owner}/{repo}/issues?state=all");
-            github_json(&token, reqwest::Method::GET, &url, None).await
+            github_json(token, reqwest::Method::GET, &url, None).await
         }
         "github_create_issue" => {
             let owner = arguments
@@ -5289,7 +5854,7 @@ async fn execute_connector_tool(
                 .ok_or("missing title")?;
             let url = format!("https://api.github.com/repos/{owner}/{repo}/issues");
             github_json(
-                &token,
+                token,
                 reqwest::Method::POST,
                 &url,
                 Some(
@@ -5329,7 +5894,7 @@ async fn execute_connector_tool(
             connector_json(
                 client
                     .post(url)
-                    .bearer_auth(&token)
+                    .bearer_auth(token)
                     .json(&json!({"content": content})),
                 "Discord",
             )
@@ -5339,7 +5904,7 @@ async fn execute_connector_tool(
             connector_json(
                 client
                     .get("https://slack.com/api/conversations.list")
-                    .bearer_auth(&token),
+                    .bearer_auth(token),
                 "Slack",
             )
             .await
@@ -5356,11 +5921,88 @@ async fn execute_connector_tool(
             connector_json(
                 client
                     .post("https://slack.com/api/chat.postMessage")
-                    .bearer_auth(&token)
+                    .bearer_auth(token)
                     .json(&json!({"channel": channel, "text": text})),
                 "Slack",
             )
             .await
+        }
+        "notion_search" => {
+            let query = arguments
+                .get("query")
+                .and_then(Value::as_str)
+                .ok_or("missing query")?;
+            connector_json(
+                client
+                    .post("https://api.notion.com/v1/search")
+                    .bearer_auth(token)
+                    .header("Notion-Version", "2022-06-28")
+                    .json(&json!({"query": query, "page_size": 50})),
+                "Notion",
+            )
+            .await
+        }
+        "gitlab_list_projects" => {
+            let base_url = config
+                .get("base_url")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("https://gitlab.com")
+                .trim_end_matches('/');
+            connector_json(
+                client
+                    .get(format!(
+                        "{base_url}/api/v4/projects?membership=true&per_page=50"
+                    ))
+                    .header("PRIVATE-TOKEN", token),
+                "GitLab",
+            )
+            .await
+        }
+        "gitlab_list_issues" => {
+            let base_url = config
+                .get("base_url")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("https://gitlab.com")
+                .trim_end_matches('/');
+            connector_json(
+                client
+                    .get(format!("{base_url}/api/v4/issues?scope=all&per_page=50"))
+                    .header("PRIVATE-TOKEN", token),
+                "GitLab",
+            )
+            .await
+        }
+        "jira_search_issues" => {
+            let site = config
+                .get("site")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim_end_matches('/');
+            let email = config.get("email").and_then(Value::as_str).unwrap_or("");
+            let jql = arguments
+                .get("jql")
+                .and_then(Value::as_str)
+                .ok_or("missing jql")?;
+            let mut url = reqwest::Url::parse(&format!("{site}/rest/api/3/search"))
+                .map_err(|_| "invalid Jira site URL")?;
+            url.query_pairs_mut()
+                .append_pair("jql", jql)
+                .append_pair("maxResults", "50");
+            connector_json(client.get(url).basic_auth(email, Some(token)), "Jira").await
+        }
+        "stripe_list_charges" => {
+            let limit = arguments
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(20)
+                .clamp(1, 100)
+                .to_string();
+            let mut url = reqwest::Url::parse("https://api.stripe.com/v1/charges")
+                .map_err(|_| "invalid Stripe URL")?;
+            url.query_pairs_mut().append_pair("limit", &limit);
+            connector_json(client.get(url).basic_auth(token, Some("")), "Stripe").await
         }
         _ => Err(format!("connector tool is unavailable: {name}")),
     }
@@ -7090,6 +7732,21 @@ fn list_secret_metadata(state: State<'_, DesktopState>) -> Result<Vec<Value>, St
 }
 
 #[tauri::command]
+fn delete_secret_metadata(state: State<'_, DesktopState>, name: String) -> Result<(), String> {
+    state
+        .secrets
+        .delete(&secret_key("asset-secret", &name))
+        .map_err(|error| error.to_string())?;
+    state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .execute("DELETE FROM secret_records WHERE name=?1", [name])
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 fn save_provider_key(
     state: State<'_, DesktopState>,
     provider: String,
@@ -7503,6 +8160,7 @@ fn main() {
             coordination_accept_task,
             save_secret_metadata,
             list_secret_metadata,
+            delete_secret_metadata,
             provider_settings,
             provider_configurations,
             save_provider_settings,
