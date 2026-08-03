@@ -74,7 +74,11 @@
 
 RVM 的 Host 能力适配器确实在 `crates/opcos-hosts/src/lib.rs:1171-1215` 的 `remote_capabilities` 已知名称列表中包含 `vnc`、`cdp`、`browser`、`computer_use` 和 `screenshot`。但这里的语义必须区分清楚：这些是 OPCOS 能识别的能力名，`available` 只有在远端 RVM 的 `RvmCapabilities.available` 声明对应名称时才为 true；它不是 OPCOS 已经验证了截图、定位、点击和校验动作链。LocalHost 反而在 `crates/opcos-hosts/src/lib.rs:501-518` 明确把 `computer_use`、`screenshot` 和 `vnc` 标为不可用。
 
-因此，多账号隔离方案不再是 OPCOS 自己维护 browser profile：**一个业务账号绑定一个 RVM Host（或本地 Docker Host）**，登录态、Cookie 和设备环境由 VM/容器边界隔离。当前仍缺：
+因此，多账号隔离方案不再是 OPCOS 自己维护 browser profile：**一个业务账号绑定一个 RVM Host**，登录态、Cookie 和设备环境由 VM/容器边界隔离。
+
+需要注意「Docker/VM」这两条路当前并不对等：VM 一侧有 `RvmHost` 可用；**容器一侧没有任何实现** —— `crates/` 下检索不到任何 Docker 相关代码，现有的另一个 Host 是 `LocalHost`，它是**进程内**实现，并且显式把 `vnc` / `computer_use` / `screenshot` / `pty` 标为不可用（`crates/opcos-hosts/src/lib.rs:501-518`）。所以「本地 Docker 隔离」等于要新增一个 `DockerHost` 实现，是独立的一笔工作量，不能算作已有能力。近期建议先只走 RVM 路径。
+
+当前仍缺：
 
 - 账号 ↔ Host 绑定和 Host 生命周期管理；
 - 在 CDP/VNC surface 之上的程序化动作循环（截图 → 定位 → 动作 → 结果校验 → 重试）；
@@ -153,9 +157,9 @@ LLM 可以参与 computer use，尤其是在异常分支和页面变化时；但
 2. **通用持久化任务队列**：在现有 SQLite `coord_tasks` / `coord_messages` / 依赖关系之上，补成面向业务事件的跨 session 真队列，并增加统一唤醒、重试和补偿语义。
 3. **自治规划循环**：一个能回答“现在该干什么”的规划器——输入是业务状态、事件和目标，输出是入队任务，并选择合适的 MCP/API/Computer-use actuator。这是“自主驱动”的核心含义。
 4. **事件总线**：把 cron / 文件 watcher / loopback callback / 出站轮询统一成一种 event 抽象，而不是四套各自为政的机制。
-5. **RVM/Docker 级 Computer use 与账号隔离**：采用“一个账号一个 Host”的模型，把账号、RVM（或本地 Docker）Host、workspace 和凭据绑定起来，并管理 Host 的创建、复用、暂停、销毁和故障恢复；在已有 VNC/CDP surface 之上补程序化动作循环（截图 → 定位 → 动作 → 校验 → 重试）。**前置依赖是环境复用：VM 快照或持久卷必须能保存登录态、Cookie 和设备环境；当前仓库尚无环境复用/快照机制**（`docs/07-automation.md:110-111`），所以应先补这一基础设施，再把账号绑定用于无人值守业务。
+5. **RVM 级 Computer use 与账号隔离**：采用“一个账号一个 Host”的模型，把账号、RVM Host、workspace 和凭据绑定起来（本地容器路径需先新增 `DockerHost`，见 2.3），并管理 Host 的创建、复用、暂停、销毁和故障恢复；在已有 VNC/CDP surface 之上补程序化动作循环（截图 → 定位 → 动作 → 校验 → 重试）。**前置依赖是环境复用：VM 快照或持久卷必须能保存登录态、Cookie 和设备环境；当前仓库尚无环境复用/快照机制**（`docs/07-automation.md:110-111`），所以应先补这一基础设施，再把账号绑定用于无人值守业务。
 
-上述第二步仍会反向要求第一步的框架补能力：MCP/API/Computer use 解决“怎么调用”，状态与幂等解决“调用后发生了什么”，自治循环解决“下一步做什么”，RVM/Docker Host 生命周期和快照/持久卷解决“账号在哪台隔离机器上持续运行”。
+上述第二步仍会反向要求第一步的框架补能力：MCP/API/Computer use 解决“怎么调用”，状态与幂等解决“调用后发生了什么”，自治循环解决“下一步做什么”，RVM Host 生命周期和快照/持久卷解决“账号在哪台隔离机器上持续运行”。
 
 ### 阶段 2：打通**一个**业务闭环——建议选跨境独立站
 
@@ -178,7 +182,7 @@ SEO                        ->  内容对象
 
 ### 阶段 3：横向复制 + 啃硬骨头
 
-- RVM/Docker Host 编排层（账号→Host 绑定、生命周期、快照/持久卷、风控和幂等重试）
+- Host 编排层（RVM，必要时补 `DockerHost`）（账号→Host 绑定、生命周期、快照/持久卷、风控和幂等重试）
 - 素材生成流水线（图片/文案/视频）
 - 闲鱼 → 淘宝 → 拼多多/京东 → 自媒体
 - 每个平台落成一个 Team 模板 + 一组 MCP/API/Computer-use 配置，而不是一堆 prompt，也不是一套平台专属业务代码
