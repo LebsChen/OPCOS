@@ -226,6 +226,337 @@ pub struct HostProcessSupervisor {
     process: Mutex<Option<Box<dyn HostProcess>>>,
 }
 
+const JOB_OUTPUT_LIMIT_BYTES: u64 = 32 * 1024 * 1024;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundJobStatus {
+    Running,
+    Terminating,
+    Exited,
+    Signaled,
+    Killed,
+    TimedOut,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackgroundJobSnapshot {
+    pub job_id: String,
+    pub status: BackgroundJobStatus,
+    pub exit_code: Option<i32>,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub total_bytes: u64,
+    pub total_lines: u64,
+    pub retained_bytes: u64,
+    pub retained_start_line: u64,
+    #[serde(skip_serializing)]
+    pub output_path: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackgroundJobOutput {
+    pub job_id: String,
+    pub text: String,
+    pub start_line: u64,
+    pub end_line: u64,
+    pub total_lines: u64,
+    pub total_bytes: u64,
+    pub omitted_before: u64,
+    pub omitted_after: u64,
+    pub truncated: bool,
+}
+
+struct BackgroundJobState {
+    snapshot: BackgroundJobSnapshot,
+    kill: Option<oneshot::Sender<()>>,
+    has_partial_line: bool,
+}
+
+#[derive(Clone)]
+pub struct BackgroundJobManager {
+    jobs: Arc<Mutex<HashMap<String, Arc<Mutex<BackgroundJobState>>>>>,
+    root: Arc<PathBuf>,
+}
+
+impl BackgroundJobManager {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+            root: Arc::new(root.into()),
+        }
+    }
+
+    pub async fn start(
+        &self,
+        host: &dyn Host,
+        request: SpawnRequest,
+        timeout_seconds: Option<u64>,
+    ) -> Result<BackgroundJobSnapshot, HostError> {
+        self.cleanup_finished(chrono::Duration::hours(1)).await;
+        let process = host.spawn(request).await?;
+        let job_id = format!("job-{}", Uuid::new_v4().simple());
+        fs::create_dir_all(self.root.as_ref()).await?;
+        let output_path = self.root.join(format!("{job_id}.log"));
+        let snapshot = BackgroundJobSnapshot {
+            job_id: job_id.clone(),
+            status: BackgroundJobStatus::Running,
+            exit_code: None,
+            started_at: Utc::now(),
+            finished_at: None,
+            total_bytes: 0,
+            total_lines: 0,
+            retained_bytes: 0,
+            retained_start_line: 0,
+            output_path: output_path.display().to_string(),
+        };
+        let (kill, killed) = oneshot::channel();
+        let state = Arc::new(Mutex::new(BackgroundJobState {
+            snapshot: snapshot.clone(),
+            kill: Some(kill),
+            has_partial_line: false,
+        }));
+        self.jobs
+            .lock()
+            .await
+            .insert(job_id.clone(), Arc::clone(&state));
+        let output_path_for_task = output_path.clone();
+        tokio::spawn(async move {
+            let mut process = process;
+            tokio::pin!(killed);
+            let deadline = timeout_seconds
+                .filter(|seconds| *seconds > 0)
+                .map(|seconds| tokio::time::sleep(Duration::from_secs(seconds)));
+            tokio::pin!(deadline);
+            let mut terminal_status = None;
+            loop {
+                let event = if let Some(deadline) = deadline.as_mut().as_pin_mut() {
+                    tokio::select! {
+                        event = process.next_event() => event,
+                        _ = &mut killed => {
+                            let _ = process.shutdown().await;
+                            terminal_status = Some(BackgroundJobStatus::Killed);
+                            break;
+                        }
+                        _ = deadline => {
+                            let _ = process.shutdown().await;
+                            terminal_status = Some(BackgroundJobStatus::TimedOut);
+                            break;
+                        }
+                    }
+                } else {
+                    Ok(
+                        match tokio::select! {
+                            event = process.next_event() => event,
+                            _ = &mut killed => {
+                                let _ = process.shutdown().await;
+                                terminal_status = Some(BackgroundJobStatus::Killed);
+                                break;
+                            }
+                        } {
+                            Ok(event) => event,
+                            Err(error) => {
+                                let mut current = state.lock().await;
+                                current.snapshot.status = BackgroundJobStatus::Failed;
+                                current.snapshot.finished_at = Some(Utc::now());
+                                drop(current);
+                                let _ = fs::remove_file(&output_path_for_task).await;
+                                let _ = error;
+                                return;
+                            }
+                        },
+                    )
+                };
+                match event {
+                    Ok(Some(ProcessEvent::Output(output))) => {
+                        if let Err(error) =
+                            append_job_output(&state, &output_path_for_task, &output).await
+                        {
+                            let mut current = state.lock().await;
+                            current.snapshot.status = BackgroundJobStatus::Failed;
+                            current.snapshot.finished_at = Some(Utc::now());
+                            let _ = error;
+                            break;
+                        }
+                    }
+                    Ok(Some(ProcessEvent::Exited(code))) => {
+                        terminal_status = Some(if code.is_some() {
+                            BackgroundJobStatus::Exited
+                        } else {
+                            BackgroundJobStatus::Signaled
+                        });
+                        let mut current = state.lock().await;
+                        current.snapshot.exit_code = code;
+                        break;
+                    }
+                    Ok(None) => {
+                        terminal_status = Some(BackgroundJobStatus::Signaled);
+                        break;
+                    }
+                    Err(_) => {
+                        terminal_status = Some(BackgroundJobStatus::Failed);
+                        break;
+                    }
+                }
+            }
+            let mut current = state.lock().await;
+            if current.snapshot.status == BackgroundJobStatus::Terminating {
+                current.snapshot.status = BackgroundJobStatus::Killed;
+                current.snapshot.finished_at = Some(Utc::now());
+            } else if current.snapshot.status == BackgroundJobStatus::Running {
+                current.snapshot.status = terminal_status.unwrap_or(BackgroundJobStatus::Failed);
+                current.snapshot.finished_at = Some(Utc::now());
+            }
+            drop(current);
+        });
+        Ok(snapshot)
+    }
+
+    pub async fn cleanup_finished(&self, max_age: chrono::Duration) {
+        let cutoff = Utc::now() - max_age;
+        let expired = {
+            let mut jobs = self.jobs.lock().await;
+            let expired = jobs
+                .iter()
+                .filter_map(|(job_id, state)| {
+                    let state = state.try_lock().ok()?;
+                    (state.snapshot.status != BackgroundJobStatus::Running
+                        && state
+                            .snapshot
+                            .finished_at
+                            .is_some_and(|finished| finished < cutoff))
+                    .then(|| (job_id.clone(), state.snapshot.output_path.clone()))
+                })
+                .collect::<Vec<_>>();
+            for (job_id, _) in &expired {
+                jobs.remove(job_id);
+            }
+            expired
+        };
+        for (_, path) in expired {
+            let _ = fs::remove_file(path).await;
+        }
+    }
+
+    pub async fn status(&self, job_id: &str) -> Result<BackgroundJobSnapshot, HostError> {
+        let state = self.jobs.lock().await.get(job_id).cloned().ok_or_else(|| {
+            HostError::InvalidResponse(format!("background job not found: {job_id}"))
+        })?;
+        Ok(state.lock().await.snapshot.clone())
+    }
+
+    pub async fn output(
+        &self,
+        job_id: &str,
+        offset: Option<u64>,
+        limit: Option<u64>,
+        tail: bool,
+    ) -> Result<BackgroundJobOutput, HostError> {
+        let state = self.jobs.lock().await.get(job_id).cloned().ok_or_else(|| {
+            HostError::InvalidResponse(format!("background job not found: {job_id}"))
+        })?;
+        let snapshot = state.lock().await.snapshot.clone();
+        let bytes = fs::read(&snapshot.output_path).await.unwrap_or_default();
+        let text = String::from_utf8_lossy(&bytes);
+        let lines = text.lines().collect::<Vec<_>>();
+        let total_lines = snapshot.total_lines;
+        let limit = limit.unwrap_or(200).clamp(1, 1000);
+        let start = if tail {
+            lines.len().saturating_sub(limit as usize) as u64
+        } else {
+            offset.unwrap_or(0).min(lines.len() as u64)
+        };
+        let end = (start + limit).min(lines.len() as u64);
+        let selected = lines[start as usize..end as usize].join("\n");
+        Ok(BackgroundJobOutput {
+            job_id: job_id.to_owned(),
+            text: selected,
+            start_line: snapshot.retained_start_line + start,
+            end_line: snapshot.retained_start_line + end,
+            total_lines,
+            total_bytes: snapshot.total_bytes,
+            omitted_before: snapshot.retained_start_line + start,
+            omitted_after: total_lines.saturating_sub(snapshot.retained_start_line + end),
+            truncated: start > 0 || end < lines.len() as u64 || snapshot.retained_start_line > 0,
+        })
+    }
+
+    pub async fn kill(&self, job_id: &str) -> Result<BackgroundJobSnapshot, HostError> {
+        let state = self.jobs.lock().await.get(job_id).cloned().ok_or_else(|| {
+            HostError::InvalidResponse(format!("background job not found: {job_id}"))
+        })?;
+        let mut current = state.lock().await;
+        if current.snapshot.status == BackgroundJobStatus::Running {
+            match current.kill.take() {
+                Some(kill) => {
+                    if kill.send(()).is_ok() {
+                        current.snapshot.status = BackgroundJobStatus::Terminating;
+                        current.snapshot.finished_at = None;
+                    } else {
+                        current.snapshot.status = BackgroundJobStatus::Failed;
+                        current.snapshot.finished_at = Some(Utc::now());
+                    }
+                }
+                None => {
+                    current.snapshot.status = BackgroundJobStatus::Failed;
+                    current.snapshot.finished_at = Some(Utc::now());
+                }
+            }
+        }
+        Ok(current.snapshot.clone())
+    }
+}
+
+async fn append_job_output(
+    state: &Arc<Mutex<BackgroundJobState>>,
+    path: &Path,
+    output: &str,
+) -> Result<(), HostError> {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
+    file.write_all(output.as_bytes()).await?;
+    file.flush().await?;
+    let mut current = state.lock().await;
+    current.snapshot.total_bytes += output.len() as u64;
+    let newline_count = output.bytes().filter(|byte| *byte == b'\n').count() as u64;
+    current.snapshot.total_lines += newline_count
+        + u64::from(!output.is_empty() && !output.ends_with('\n') && !current.has_partial_line);
+    current.has_partial_line = !output.is_empty() && !output.ends_with('\n');
+    current.snapshot.retained_bytes += output.len() as u64;
+    if current.snapshot.retained_bytes > JOB_OUTPUT_LIMIT_BYTES {
+        let keep_from = current.snapshot.retained_bytes - JOB_OUTPUT_LIMIT_BYTES;
+        let mut retained = fs::read(path).await?;
+        let requested = keep_from.min(retained.len() as u64) as usize;
+        let cut = retained
+            .iter()
+            .enumerate()
+            .skip(requested)
+            .find_map(|(index, byte)| (*byte == b'\n').then_some(index + 1))
+            .unwrap_or(requested);
+        retained.drain(..cut);
+        let retained_lines = count_output_lines(&String::from_utf8_lossy(&retained));
+        let retained_bytes = retained.len() as u64;
+        fs::write(path, retained).await?;
+        current.snapshot.retained_start_line =
+            current.snapshot.total_lines.saturating_sub(retained_lines);
+        current.snapshot.retained_bytes = retained_bytes;
+    }
+    Ok(())
+}
+
+fn count_output_lines(output: &str) -> u64 {
+    if output.is_empty() {
+        0
+    } else {
+        output.bytes().filter(|byte| *byte == b'\n').count() as u64
+            + u64::from(!output.ends_with('\n'))
+    }
+}
+
 impl HostProcessSupervisor {
     pub fn new(process: Box<dyn HostProcess>) -> Self {
         Self {
@@ -1614,6 +1945,137 @@ mod tests {
         }
         assert!(output.contains("streamed"));
         assert!(exited);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_job_supports_tail_offset_and_real_kill() {
+        let root = tempfile_dir();
+        let host = LocalHost::new(&root).unwrap();
+        let manager = BackgroundJobManager::new(root.join("job-logs"));
+        let started = manager
+            .start(
+                &host,
+                SpawnRequest {
+                    command: "i=1; while [ \"$i\" -le 20 ]; do printf 'line-%s\\n' \"$i\"; i=$((i+1)); done; sleep 30".into(),
+                    cwd: None,
+                    env: None,
+                    cols: 80,
+                    rows: 24,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        for _ in 0..50 {
+            if manager.status(&started.job_id).await.unwrap().total_lines >= 20 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let tail = manager
+            .output(&started.job_id, None, Some(3), true)
+            .await
+            .unwrap();
+        assert_eq!(tail.text, "line-18\nline-19\nline-20");
+        assert_eq!(tail.total_lines, 20);
+        assert_eq!(tail.omitted_before, 17);
+        assert!(tail.truncated);
+        let history = manager
+            .output(&started.job_id, Some(0), Some(2), false)
+            .await
+            .unwrap();
+        assert_eq!(history.text, "line-1\nline-2");
+        assert_eq!(history.omitted_after, 18);
+        let killed = manager.kill(&started.job_id).await.unwrap();
+        assert_eq!(killed.status, BackgroundJobStatus::Terminating);
+        for _ in 0..50 {
+            if manager.status(&started.job_id).await.unwrap().status == BackgroundJobStatus::Killed
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            manager.status(&started.job_id).await.unwrap().status,
+            BackgroundJobStatus::Killed
+        );
+        manager.cleanup_finished(chrono::Duration::zero()).await;
+        assert!(manager.status(&started.job_id).await.is_err());
+        assert!(!std::path::Path::new(&started.output_path).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_job_distinguishes_normal_exit_and_timeout() {
+        let root = tempfile_dir();
+        let host = LocalHost::new(&root).unwrap();
+        let manager = BackgroundJobManager::new(root.join("job-logs"));
+        let exited = manager
+            .start(
+                &host,
+                SpawnRequest {
+                    command: "printf done".into(),
+                    cwd: None,
+                    env: None,
+                    cols: 80,
+                    rows: 24,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        for _ in 0..50 {
+            if manager.status(&exited.job_id).await.unwrap().status != BackgroundJobStatus::Running
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let exited_status = manager.status(&exited.job_id).await.unwrap();
+        assert_eq!(exited_status.status, BackgroundJobStatus::Exited);
+        assert_eq!(exited_status.exit_code, Some(0));
+
+        let timed_out = manager
+            .start(
+                &host,
+                SpawnRequest {
+                    command: "sleep 30".into(),
+                    cwd: None,
+                    env: None,
+                    cols: 80,
+                    rows: 24,
+                },
+                Some(1),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(
+            manager.status(&timed_out.job_id).await.unwrap().status,
+            BackgroundJobStatus::TimedOut
+        );
+        let signaled = manager
+            .start(
+                &host,
+                SpawnRequest {
+                    command: "kill -TERM $$".into(),
+                    cwd: None,
+                    env: None,
+                    cols: 80,
+                    rows: 24,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            manager.status(&signaled.job_id).await.unwrap().status,
+            BackgroundJobStatus::Signaled
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
