@@ -27,6 +27,8 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("store migration error: {0}")]
     Migration(String),
+    #[error("store validation error: {0}")]
+    Validation(String),
     #[error("session not found: {0}")]
     SessionNotFound(String),
 }
@@ -1457,7 +1459,7 @@ impl SqliteStore {
 
     pub fn save_project_agent(&self, agent: &ProjectAgentRecord) -> Result<(), StoreError> {
         if agent.sort_order == 0 && !agent.role.eq_ignore_ascii_case("lead") {
-            return Err(StoreError::Migration(
+            return Err(StoreError::Validation(
                 "sort_order 0 project member must have Lead role".into(),
             ));
         }
@@ -1519,6 +1521,17 @@ impl SqliteStore {
             .execute(
                 "UPDATE project_agents SET session_id=?1,updated_at=?2 WHERE id=?3",
                 params![session_id, Utc::now().to_rfc3339(), agent_id],
+            )?;
+        Ok(())
+    }
+
+    pub fn clear_project_session_ownership(&self, project_id: &str) -> Result<(), StoreError> {
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "UPDATE sessions SET project_id=NULL,agent_id=NULL WHERE project_id=?1",
+                [project_id],
             )?;
         Ok(())
     }

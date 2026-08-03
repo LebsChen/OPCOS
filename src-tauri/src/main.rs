@@ -1550,11 +1550,7 @@ async fn project_host(
     project: &ProjectRecord,
 ) -> Result<Arc<dyn Host>, String> {
     if project.host_id == "local" {
-        let root = FsPath::new(&project.repo_root)
-            .parent()
-            .unwrap_or_else(|| FsPath::new(&project.repo_root));
-        std::fs::create_dir_all(root)
-            .map_err(|error| format!("project host unavailable: {error}"))?;
+        let root = dirs::home_dir().ok_or_else(|| "home directory is unavailable".to_owned())?;
         return Ok(Arc::new(
             LocalHost::new(root).map_err(|error| format!("project host unavailable: {error}"))?,
         ));
@@ -1574,6 +1570,117 @@ async fn project_host(
     )))
 }
 
+fn quote_for(platform: Option<&str>, value: &str) -> String {
+    if platform.is_some_and(|value| value.eq_ignore_ascii_case("windows")) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn project_host_contains(host: &Arc<dyn Host>, candidate: &str) -> bool {
+    if host.id() == "local" {
+        return dirs::home_dir()
+            .and_then(|root| std::fs::canonicalize(root).ok())
+            .is_some_and(|root| FsPath::new(candidate).starts_with(root));
+    }
+    host.contains(candidate)
+}
+
+fn git_worktree_add_command(
+    platform: Option<&str>,
+    repo_root: &str,
+    worktree_path: &str,
+    branch: &str,
+    existing_branch: bool,
+) -> String {
+    let quote = |value: &str| quote_for(platform, value);
+    if existing_branch {
+        format!(
+            "git -C {} worktree add {} {}",
+            quote(repo_root),
+            quote(worktree_path),
+            quote(branch)
+        )
+    } else {
+        format!(
+            "git -C {} worktree add {} -b {}",
+            quote(repo_root),
+            quote(worktree_path),
+            quote(branch)
+        )
+    }
+}
+
+async fn remove_project_agent_worktree(
+    host: &Arc<dyn Host>,
+    project: &ProjectRecord,
+    agent: &ProjectAgentRecord,
+    force: bool,
+    platform: Option<&str>,
+) -> Result<(), String> {
+    if agent.sort_order == 0 {
+        let result = host
+            .exec(ExecRequest {
+                command: format!(
+                    "git -C {} status --porcelain",
+                    quote_for(platform, &project.repo_root)
+                ),
+                cwd: None,
+                timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+                session: None,
+                env: None,
+            })
+            .await
+            .map_err(|error| format!("worktree status check failed: {error}"))?;
+        if result.result.exit_code != 0 {
+            return Err(format!(
+                "worktree status check failed: {}",
+                result.result.stderr
+            ));
+        }
+        if !force && !result.result.stdout.trim().is_empty() {
+            return Err("worktree has uncommitted changes; use force to remove it".to_owned());
+        }
+        return Ok(());
+    }
+    let quote = |value: &str| quote_for(platform, value);
+    let command = if force {
+        format!(
+            "git -C {} worktree remove --force {}",
+            quote(&project.repo_root),
+            quote(&agent.worktree_path)
+        )
+    } else {
+        format!(
+            "git -C {} worktree remove {}",
+            quote(&project.repo_root),
+            quote(&agent.worktree_path)
+        )
+    };
+    let result = host
+        .exec(ExecRequest {
+            command,
+            cwd: None,
+            timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+            session: None,
+            env: None,
+        })
+        .await
+        .map_err(|error| format!("worktree removal failed: {error}"))?;
+    if result.result.exit_code != 0 {
+        return Err(if force {
+            format!("worktree removal failed: {}", result.result.stderr)
+        } else {
+            format!(
+                "worktree has uncommitted changes or could not be removed: {}",
+                result.result.stderr
+            )
+        });
+    }
+    Ok(())
+}
+
 fn project_root(project_id: &str) -> Result<String, String> {
     let home = dirs::home_dir().ok_or_else(|| "home directory is unavailable".to_owned())?;
     home.join("OPCOS")
@@ -1591,32 +1698,43 @@ fn worktree_branch(role: &str, sequence: u32) -> String {
 }
 
 #[tauri::command]
-fn list_projects(state: State<'_, DesktopState>) -> Result<Vec<ProjectView>, String> {
+async fn list_projects(state: State<'_, DesktopState>) -> Result<Vec<ProjectView>, String> {
     let projects = state
         .store
         .load_projects()
         .map_err(|error| error.to_string())?;
-    let connection = state
-        .database
-        .lock()
-        .map_err(|_| "database lock poisoned")?;
-    projects
-        .into_iter()
-        .map(|project| {
-            let host_name = host_name(&connection, &project.host_id)?
-                .ok_or_else(|| "project host not found".to_owned())?;
-            let agents = state
-                .store
-                .load_project_agents(&project.id)
-                .map_err(|error| error.to_string())?;
-            Ok(ProjectView {
-                project,
-                agents,
-                host_name,
-                online: None,
+    let host_names = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        projects
+            .iter()
+            .map(|project| {
+                host_name(&connection, &project.host_id)?
+                    .ok_or_else(|| "project host not found".to_owned())
             })
-        })
-        .collect()
+            .collect::<Result<Vec<_>, String>>()?
+    };
+    let mut views = Vec::with_capacity(projects.len());
+    for (project, host_name) in projects.into_iter().zip(host_names) {
+        let agents = state
+            .store
+            .load_project_agents(&project.id)
+            .map_err(|error| error.to_string())?;
+        let online = tokio::time::timeout(Duration::from_secs(2), project_host(&state, &project))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .is_some();
+        views.push(ProjectView {
+            project,
+            agents,
+            host_name,
+            online: Some(online),
+        });
+    }
+    Ok(views)
 }
 
 #[tauri::command]
@@ -1661,38 +1779,17 @@ async fn create_project(
         updated_at: Utc::now(),
     };
     let host = project_host(&state, &project).await?;
-    if !host.contains(&project.repo_root) {
+    if !project_host_contains(&host, &project.repo_root) {
         return Err("project repository path is outside the bound host workspace".to_owned());
     }
-    let parent = FsPath::new(&project.repo_root)
-        .parent()
-        .ok_or_else(|| "project repository path has no parent".to_owned())?
-        .to_str()
-        .ok_or_else(|| "project parent path is not valid UTF-8".to_owned())?;
-    if !host.contains(parent) {
-        return Err("project parent path is outside the bound host workspace".to_owned());
-    }
-    host.exec(ExecRequest {
-        command: format!("mkdir -p {}", shell_arg(parent)),
-        cwd: None,
-        timeout_seconds: DEFAULT_EXEC_TIMEOUT_SECONDS,
-        session: None,
-        env: None,
-    })
-    .await
-    .map_err(|error| format!("project host unavailable: {error}"))?
-    .result
-    .exit_code
-    .eq(&0)
-    .then_some(())
-    .ok_or_else(|| "project directory could not be prepared".to_owned())?;
+    let platform = host.health().await.ok().and_then(|health| health.platform);
     if !project.repo_url.is_empty() {
         let result = host
             .exec(ExecRequest {
                 command: format!(
                     "git clone {} {}",
-                    shell_arg(&project.repo_url),
-                    shell_arg(&project.repo_root)
+                    quote_for(platform.as_deref(), &project.repo_url),
+                    quote_for(platform.as_deref(), &project.repo_root)
                 ),
                 cwd: None,
                 timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
@@ -1704,6 +1801,8 @@ async fn create_project(
         if result.result.exit_code != 0 {
             return Err(format!("repository clone failed: {}", result.result.stderr));
         }
+    } else if host.ls(Some(&project.repo_root)).await.is_err() {
+        return Err("repository path does not exist on the project host".to_owned());
     }
     state
         .store
@@ -1753,13 +1852,49 @@ fn update_project(
 }
 
 #[tauri::command]
-fn delete_project(state: State<'_, DesktopState>, id: String) -> Result<(), String> {
+async fn delete_project(
+    state: State<'_, DesktopState>,
+    id: String,
+    force: Option<bool>,
+) -> Result<(), String> {
+    let project = state
+        .store
+        .load_project(&id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
     let agents = state
         .store
         .load_project_agents(&id)
         .map_err(|error| error.to_string())?;
+    let host = project_host(&state, &project).await?;
     if !agents.is_empty() {
-        return Err("delete project members before deleting the project".to_owned());
+        if !project_host_contains(&host, &project.repo_root) {
+            return Err("project repository path is outside the bound host workspace".to_owned());
+        }
+        let platform = host.health().await.ok().and_then(|health| health.platform);
+        for agent in &agents {
+            if !project_host_contains(&host, &agent.worktree_path) {
+                return Err("project worktree path is outside the bound host workspace".to_owned());
+            }
+            remove_project_agent_worktree(
+                &host,
+                &project,
+                agent,
+                force.unwrap_or(false),
+                platform.as_deref(),
+            )
+            .await?;
+        }
+    }
+    state
+        .store
+        .clear_project_session_ownership(&id)
+        .map_err(|error| error.to_string())?;
+    for agent in agents {
+        state
+            .store
+            .delete_project_agent(&agent.id)
+            .map_err(|error| error.to_string())?;
     }
     state
         .store
@@ -1814,18 +1949,35 @@ async fn create_project_agent(
     };
     let branch = branch.unwrap_or_else(|| worktree_branch(&role, sort_order));
     let host = project_host(&state, &project).await?;
-    if !host.contains(&project.repo_root) || !host.contains(&worktree_path) {
+    if !project_host_contains(&host, &project.repo_root)
+        || !project_host_contains(&host, &worktree_path)
+    {
         return Err("project worktree path is outside the bound host workspace".to_owned());
     }
     if sort_order != 0 {
-        let result = host
+        let platform = host.health().await.ok().and_then(|health| health.platform);
+        let probe = host
             .exec(ExecRequest {
                 command: format!(
-                    "mkdir -p {} && (git -C {} show-ref --verify --quiet refs/heads/{} && git -C {} worktree add {} {} || git -C {} worktree add {} -b {})",
-                    shell_arg(&format!("{}/worktrees", project.repo_root.trim_end_matches('/'))),
-                    shell_arg(&project.repo_root), shell_arg(&branch), shell_arg(&project.repo_root),
-                    shell_arg(&worktree_path), shell_arg(&branch), shell_arg(&project.repo_root),
-                    shell_arg(&worktree_path), shell_arg(&branch)
+                    "git -C {} rev-parse --verify --quiet refs/heads/{}",
+                    quote_for(platform.as_deref(), &project.repo_root),
+                    quote_for(platform.as_deref(), &branch)
+                ),
+                cwd: None,
+                timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+                session: None,
+                env: None,
+            })
+            .await
+            .map_err(|error| format!("branch check failed: {error}"))?;
+        let result = host
+            .exec(ExecRequest {
+                command: git_worktree_add_command(
+                    platform.as_deref(),
+                    &project.repo_root,
+                    &worktree_path,
+                    &branch,
+                    probe.result.exit_code == 0,
                 ),
                 cwd: None,
                 timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
@@ -1882,36 +2034,21 @@ async fn delete_project_agent(
         .load_project(&agent.project_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "project not found".to_owned())?;
-    if agent.sort_order == 0 {
-        return Err("the Lead member cannot be deleted".to_owned());
-    }
     let host = project_host(&state, &project).await?;
-    if !host.contains(&project.repo_root) || !host.contains(&agent.worktree_path) {
+    if !project_host_contains(&host, &project.repo_root)
+        || !project_host_contains(&host, &agent.worktree_path)
+    {
         return Err("project worktree path is outside the bound host workspace".to_owned());
     }
-    let command = format!(
-        "git -C {} worktree remove {}{}",
-        shell_arg(&project.repo_root),
-        if force.unwrap_or(false) {
-            "--force "
-        } else {
-            ""
-        },
-        shell_arg(&agent.worktree_path)
-    );
-    let result = host
-        .exec(ExecRequest {
-            command,
-            cwd: None,
-            timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
-            session: None,
-            env: None,
-        })
-        .await
-        .map_err(|error| format!("worktree removal failed: {error}"))?;
-    if result.result.exit_code != 0 {
-        return Err(format!("worktree removal failed: {}", result.result.stderr));
-    }
+    let platform = host.health().await.ok().and_then(|health| health.platform);
+    remove_project_agent_worktree(
+        &host,
+        &project,
+        &agent,
+        force.unwrap_or(false),
+        platform.as_deref(),
+    )
+    .await?;
     state
         .store
         .delete_project_agent(&agent_id)
@@ -3388,7 +3525,10 @@ fn create_session(
     if !matches!(harness.as_str(), "builtin" | "opencode") {
         return Err(format!("unsupported harness: {harness}"));
     }
-    let (host_id, workspace, agent) =
+    if project_id.is_some() != agent_id.is_some() {
+        return Err("project_id and agent_id must be supplied together".to_owned());
+    }
+    let (host_id, agent) =
         if let (Some(project_id), Some(agent_id)) = (project_id.clone(), agent_id.clone()) {
             let project = state
                 .store
@@ -3406,26 +3546,16 @@ fn create_session(
             if agent.session_id.is_some() {
                 return Err("project member already has a session".to_owned());
             }
-            (
-                project.host_id,
-                Some(agent.worktree_path.clone()),
-                Some(agent),
-            )
+            (project.host_id, Some(agent))
         } else {
-            (
-                host_id.clone(),
-                if host_id == "local" && workspace.as_deref().is_none_or(str::is_empty) {
-                    Some(local_workspace_path(&id)?)
-                } else {
-                    workspace.filter(|value| !value.is_empty())
-                },
-                None,
-            )
+            (host_id.clone(), None)
         };
-    let workspace = if host_id == "local" && workspace.as_deref().is_none_or(str::is_empty) {
+    let workspace = if let Some(agent) = agent.as_ref() {
+        Some(agent.worktree_path.clone())
+    } else if host_id == "local" && workspace.as_deref().is_none_or(str::is_empty) {
         Some(local_workspace_path(&id)?)
     } else {
-        workspace
+        workspace.filter(|value| !value.is_empty())
     };
     let connection = state
         .database
@@ -7832,6 +7962,12 @@ async fn git_workflow(
         }));
     }
     let client = client_for(&state, &host_id)?.with_workspace(cwd.clone());
+    let platform = client
+        .health()
+        .await
+        .ok()
+        .and_then(|health| health.platform);
+    let quote = |value: &str| quote_for(platform.as_deref(), value);
     let command = match operation.as_str() {
         "branch" => git_branch_name(
             slug.as_deref().ok_or("branch slug is required")?,
@@ -7843,15 +7979,18 @@ async fn git_workflow(
             if files.is_empty() || files.iter().any(|path| path.trim().is_empty()) {
                 return Err("explicit files are required".into());
             }
-            files
-                .iter()
-                .map(|path| format!("git add -- {}", shell_quote(path)))
-                .collect::<Vec<_>>()
-                .join(" && ")
+            format!(
+                "git add -- {}",
+                files
+                    .iter()
+                    .map(|path| quote(path))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
         }
         "commit" => format!(
             "git commit -m {}",
-            shell_quote(message.as_deref().ok_or("commit message is required")?)
+            quote(message.as_deref().ok_or("commit message is required")?)
         ),
         "push" => "git push".into(),
         _ => return Err("unsupported git operation".into()),
@@ -7909,14 +8048,6 @@ async fn git_workflow(
             .await;
     }
     result.map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-fn shell_arg(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[tauri::command]
@@ -9598,6 +9729,32 @@ mod m7_tests {
         assert_eq!(
             git_branch_name("GitHub Workflow", 123).unwrap(),
             "devin/123-github-workflow"
+        );
+    }
+
+    #[test]
+    fn project_git_commands_quote_posix_and_windows_paths() {
+        let posix = git_worktree_add_command(
+            Some("linux"),
+            "/workspace/my repo",
+            "/workspace/my repo/worktrees/agent one",
+            "agent/code/review-1",
+            false,
+        );
+        assert_eq!(
+            posix,
+            "git -C '/workspace/my repo' worktree add '/workspace/my repo/worktrees/agent one' -b 'agent/code/review-1'"
+        );
+        let windows = git_worktree_add_command(
+            Some("windows"),
+            r"C:\workspace\my repo",
+            r"C:\workspace\my repo\worktrees\agent one",
+            "agent/code/review-1",
+            true,
+        );
+        assert_eq!(
+            windows,
+            r#"git -C "C:\workspace\my repo" worktree add "C:\workspace\my repo\worktrees\agent one" "agent/code/review-1""#
         );
     }
 
