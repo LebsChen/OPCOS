@@ -9653,25 +9653,49 @@ fn local_git_status(cwd: &str) -> Result<Value, String> {
     }))
 }
 
+fn git_change_type(status: &str) -> &'static str {
+    match status.chars().next() {
+        Some('A') => "added",
+        Some('D') => "deleted",
+        Some('R') => "renamed",
+        _ => "modified",
+    }
+}
+
 fn local_git_changes(cwd: &str, base: &str) -> Result<Value, String> {
     let output = local_git_command(cwd, &["diff", "--numstat", base, "--"])?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
     }
+    let status_output = local_git_command(
+        cwd,
+        &["diff", "--name-status", "--find-renames", base, "--"],
+    )?;
+    if !status_output.status.success() {
+        return Err(String::from_utf8_lossy(&status_output.stderr)
+            .trim()
+            .to_owned());
+    }
+    let change_types = String::from_utf8_lossy(&status_output.stdout)
+        .lines()
+        .map(|line| git_change_type(line.split('\t').next().unwrap_or_default()))
+        .collect::<Vec<_>>();
     let branch_output = local_git_command(cwd, &["branch", "--show-current"])?;
     let branch = String::from_utf8_lossy(&branch_output.stdout)
         .trim()
         .to_owned();
     let files = String::from_utf8_lossy(&output.stdout)
         .lines()
+        .enumerate()
         .filter_map(|line| {
+            let (index, line) = line;
             let mut fields = line.splitn(3, '\t');
             let additions = fields.next()?.parse::<i64>().ok()?;
             let deletions = fields.next()?.parse::<i64>().ok()?;
             let path = fields.next()?.to_owned();
             Some(json!({
                 "path": path,
-                "changeType": "modified",
+                "changeType": change_types.get(index).copied().unwrap_or("modified"),
                 "additions": additions,
                 "deletions": deletions,
             }))
@@ -13045,6 +13069,14 @@ mod m7_tests {
             filter_managed_worktree_status(" M worktrees-not-managed/file\n"),
             " M worktrees-not-managed/file"
         );
+    }
+
+    #[test]
+    fn git_change_types_map_name_status_codes() {
+        assert_eq!(git_change_type("A"), "added");
+        assert_eq!(git_change_type("M"), "modified");
+        assert_eq!(git_change_type("D"), "deleted");
+        assert_eq!(git_change_type("R100"), "renamed");
     }
 
     #[test]

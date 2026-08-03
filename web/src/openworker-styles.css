@@ -274,24 +274,18 @@ body {
 .main.rail-open .main-topbar {
   right: 332px;
 }
-/* Centered title column (§22, amended: the ⋯ menu removed — the nav row's hover cluster owns
-   pin/rename/archive/delete). Title + facts subtitle beneath.
-   ABSOLUTE centering (owner catch 2026-07-13: a long mention-spawned title painted over the
-   topbar icons): the flex sides can't guarantee clearance — the settings row's rest-state
-   glance occupies space by design, so every content-based flex floor over-reserves. Centering
-   on the BAR and capping against its width (100% here = the topbar, not the viewport — the
-   right rail sits outside it) makes the title ellipsize before it can reach either cluster:
-   332px ≈ 2 × (collapsed cluster + settings icon + gaps). */
+/* Left-aligned title column; the nav row's hover cluster owns
+   pin/rename/archive/delete. Title + facts subtitle beneath. */
 .main-title {
   position: absolute;
-  left: 50%;
+  left: 20px;
   top: 0;
   height: 100%;
-  transform: translateX(-50%);
+  transform: none;
   max-width: max(96px, calc(100% - 332px));
   display: flex;
   flex-direction: column;
-  align-items: center;
+  align-items: flex-start;
   justify-content: center;
   font-size: 13px;
   font-weight: 600;

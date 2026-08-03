@@ -1584,9 +1584,14 @@ input.workspace-chip {
 }
 .review-grid {
   display: grid;
-  grid-template-columns: 260px 1fr;
+  grid-template-columns: minmax(0, 1fr);
   gap: 14px;
   min-height: 500px;
+}
+@media (min-width: 900px) {
+  .review-grid {
+    grid-template-columns: minmax(200px, 260px) minmax(0, 1fr);
+  }
 }
 .file-row {
   display: flex;
