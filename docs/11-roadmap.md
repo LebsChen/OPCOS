@@ -1,5 +1,12 @@
 # 11 开发路线与 Todos
 
+> **当前代码校正：** 本文是历史路线和设计记录，不是完成状态。当前已经
+> 实现的能力包括 provider model discovery、action ledger、durable work queue、
+> autonomous planning/event persistence、Git/PR、GitHub CI read tools、
+> background jobs、精确编辑、本地 LSP、learned skills、Leader-only
+> coordination、Commands 和 MCP discovery。未完成项的事实状态、限制和阻塞
+> 原因以根目录 `todos.md` 为准；本文件中的目标态条目不能当作已实现。
+
 定位：**Devin 为主（Cloud 形态与产品完整度对标 Devin），Tembo / OpenWork / OpenWorker / Cloud-Dev 为辅（Local 形态的实现参照）**。见 [README](README.md)。
 
 每一项都写明：改哪里、验收标准。**验收标准是可执行的**——没有真机证据不算完成。所有项都受 [00](00-architecture.md) 硬约束与 [08](08-security.md) 的 token 边界限制。
