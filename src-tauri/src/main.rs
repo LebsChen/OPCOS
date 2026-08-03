@@ -472,6 +472,111 @@ fn execute_action_ledger_tool(
     }
 }
 
+fn execute_work_queue_tool(
+    store: &SqliteStore,
+    session_id: &str,
+    project_id: Option<&str>,
+    name: &str,
+    arguments: Value,
+) -> Result<Value, String> {
+    match name {
+        "work_queue_enqueue" => {
+            let task_type = action_ledger_argument(&arguments, "task_type")?;
+            let payload = arguments
+                .get("payload")
+                .ok_or_else(|| "missing payload argument".to_owned())?;
+            let item = store
+                .enqueue_work_item(
+                    task_type,
+                    payload,
+                    arguments.get("dedup_key").and_then(Value::as_str),
+                    arguments.get("idempotency_key").and_then(Value::as_str),
+                    arguments
+                        .get("max_attempts")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(3) as u32,
+                    arguments.get("compensates_for").and_then(Value::as_str),
+                    Some(session_id),
+                    project_id,
+                )
+                .map_err(|error| error.to_string())?;
+            serde_json::to_value(item).map_err(|error| error.to_string())
+        }
+        "work_queue_claim" => {
+            let item = store
+                .claim_work_item(
+                    session_id,
+                    arguments
+                        .get("lease_seconds")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(300) as u32,
+                )
+                .map_err(|error| error.to_string())?;
+            serde_json::to_value(item).map_err(|error| error.to_string())
+        }
+        "work_queue_renew" => {
+            let item = store
+                .renew_work_item(
+                    action_ledger_argument(&arguments, "queue_id")?,
+                    session_id,
+                    arguments
+                        .get("lease_generation")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| "missing lease_generation argument".to_owned())?,
+                    arguments
+                        .get("lease_seconds")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(300) as u32,
+                )
+                .map_err(|error| error.to_string())?;
+            serde_json::to_value(item).map_err(|error| error.to_string())
+        }
+        "work_queue_complete" => {
+            let item = store
+                .complete_work_item(
+                    action_ledger_argument(&arguments, "queue_id")?,
+                    session_id,
+                    arguments
+                        .get("lease_generation")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| "missing lease_generation argument".to_owned())?,
+                    action_ledger_argument(&arguments, "outcome")?,
+                    arguments.get("error_summary").and_then(Value::as_str),
+                )
+                .map_err(|error| error.to_string())?;
+            serde_json::to_value(item).map_err(|error| error.to_string())
+        }
+        "work_queue_cancel" => {
+            let item = store
+                .cancel_work_item(
+                    action_ledger_argument(&arguments, "queue_id")?,
+                    arguments.get("reason").and_then(Value::as_str),
+                )
+                .map_err(|error| error.to_string())?;
+            serde_json::to_value(item).map_err(|error| error.to_string())
+        }
+        "work_queue_requeue" => {
+            let item = store
+                .requeue_work_item(action_ledger_argument(&arguments, "queue_id")?)
+                .map_err(|error| error.to_string())?;
+            serde_json::to_value(item).map_err(|error| error.to_string())
+        }
+        "work_queue_list" => {
+            let items = store
+                .load_work_queue(
+                    arguments.get("status").and_then(Value::as_str),
+                    arguments
+                        .get("limit")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(100) as u32,
+                )
+                .map_err(|error| error.to_string())?;
+            serde_json::to_value(items).map_err(|error| error.to_string())
+        }
+        _ => Err(format!("work queue tool is unavailable: {name}")),
+    }
+}
+
 #[derive(Clone)]
 struct IdeProxyState {
     client: HttpRvmClient,
@@ -486,6 +591,15 @@ impl ToolExecutor for RemoteExecutor {
             "action_ledger_begin" | "action_ledger_finish" | "action_ledger_list"
         ) {
             return execute_action_ledger_tool(
+                &self.store,
+                &self.session_id,
+                self.project_id.as_deref(),
+                name,
+                arguments,
+            );
+        }
+        if name.starts_with("work_queue_") {
+            return execute_work_queue_tool(
                 &self.store,
                 &self.session_id,
                 self.project_id.as_deref(),
@@ -631,6 +745,15 @@ impl ToolExecutor for DesktopExecutor {
                     "action_ledger_begin" | "action_ledger_finish" | "action_ledger_list"
                 ) {
                     return execute_action_ledger_tool(
+                        &executor.store,
+                        &executor.session_id,
+                        executor.project_id.as_deref(),
+                        name,
+                        arguments,
+                    );
+                }
+                if name.starts_with("work_queue_") {
+                    return execute_work_queue_tool(
                         &executor.store,
                         &executor.session_id,
                         executor.project_id.as_deref(),
@@ -4775,6 +4898,13 @@ async fn engine_for(
             "action_ledger_begin".to_owned(),
             "action_ledger_finish".to_owned(),
             "action_ledger_list".to_owned(),
+            "work_queue_enqueue".to_owned(),
+            "work_queue_claim".to_owned(),
+            "work_queue_renew".to_owned(),
+            "work_queue_complete".to_owned(),
+            "work_queue_cancel".to_owned(),
+            "work_queue_requeue".to_owned(),
+            "work_queue_list".to_owned(),
         ]);
         if linear_tools_enabled {
             allowed_tools.extend([
@@ -13983,6 +14113,24 @@ fn action_ledger_events(
 }
 
 #[tauri::command]
+fn work_queue_events(
+    state: State<'_, DesktopState>,
+    status: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<Value>, String> {
+    state
+        .store
+        .load_work_queue(status.as_deref(), limit.unwrap_or(100))
+        .and_then(|items| {
+            items
+                .into_iter()
+                .map(|item| serde_json::to_value(item).map_err(opcos_store::StoreError::from))
+                .collect()
+        })
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn save_secret_metadata(
     state: State<'_, DesktopState>,
     name: String,
@@ -14766,6 +14914,7 @@ fn main() {
             trigger_http_info,
             audit_events,
             action_ledger_events,
+            work_queue_events,
             save_schedule,
             list_schedules,
             run_schedule,

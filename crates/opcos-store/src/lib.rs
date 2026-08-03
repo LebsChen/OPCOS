@@ -222,6 +222,30 @@ pub enum ActionBeginResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct WorkQueueItem {
+    pub queue_id: String,
+    pub task_type: String,
+    /// Callers must provide non-sensitive payload content; storage is not a security boundary.
+    pub payload: serde_json::Value,
+    pub dedup_key: Option<String>,
+    pub idempotency_key: Option<String>,
+    pub compensates_for: Option<String>,
+    pub status: String,
+    pub attempts: u32,
+    pub max_attempts: u32,
+    pub run_after: String,
+    pub lease_owner: Option<String>,
+    pub lease_generation: u64,
+    pub lease_until: Option<String>,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+    pub session_id: Option<String>,
+    pub project_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ArtifactRecord {
     pub id: String,
     pub session_id: String,
@@ -278,6 +302,43 @@ fn action_ledger_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActionLed
     })
 }
 
+fn work_queue_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkQueueItem> {
+    let payload: String = row.get(2)?;
+    let lease_generation = row.get::<_, i64>(11)?;
+    let lease_generation = u64::try_from(lease_generation)
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(11, lease_generation))?;
+    Ok(WorkQueueItem {
+        queue_id: row.get(0)?,
+        task_type: row.get(1)?,
+        payload: serde_json::from_str(&payload).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        dedup_key: row.get(3)?,
+        idempotency_key: row.get(4)?,
+        compensates_for: row.get(5)?,
+        status: row.get(6)?,
+        attempts: row.get(7)?,
+        max_attempts: row.get(8)?,
+        run_after: row.get(9)?,
+        lease_owner: row.get(10)?,
+        lease_generation,
+        lease_until: row.get(12)?,
+        last_error: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
+        completed_at: row.get(16)?,
+        session_id: row.get(17)?,
+        project_id: row.get(18)?,
+    })
+}
+
+const WORK_QUEUE_COLUMNS: &str = "queue_id,task_type,payload,dedup_key,idempotency_key,
+    compensates_for,status,attempts,max_attempts,run_after,lease_owner,lease_generation,
+    lease_until,last_error,created_at,updated_at,completed_at,session_id,project_id";
 // This is only best-effort cleanup. Callers must provide a non-sensitive summary;
 // marker matching is not a security boundary and cannot detect arbitrary bare secrets.
 fn safe_action_summary(summary: &str) -> Result<String, StoreError> {
@@ -1231,6 +1292,368 @@ impl SqliteStore {
             .map_err(StoreError::from)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_work_item(
+        &self,
+        task_type: &str,
+        payload: &serde_json::Value,
+        dedup_key: Option<&str>,
+        idempotency_key: Option<&str>,
+        max_attempts: u32,
+        compensates_for: Option<&str>,
+        session_id: Option<&str>,
+        project_id: Option<&str>,
+    ) -> Result<WorkQueueItem, StoreError> {
+        if task_type.trim().is_empty() {
+            return Err(StoreError::Validation("task_type cannot be empty".into()));
+        }
+        if task_type.len() > 512 {
+            return Err(StoreError::Validation("task_type is too long".into()));
+        }
+        if max_attempts == 0 || max_attempts > 100 {
+            return Err(StoreError::Validation(
+                "max_attempts must be between 1 and 100".into(),
+            ));
+        }
+        for (name, value) in [
+            ("dedup_key", dedup_key),
+            ("idempotency_key", idempotency_key),
+            ("compensates_for", compensates_for),
+        ] {
+            if value.is_some_and(|value| value.trim().is_empty()) {
+                return Err(StoreError::Validation(format!("{name} cannot be empty")));
+            }
+        }
+        let payload = serde_json::to_string(payload)?;
+        let now = Utc::now().to_rfc3339();
+        let queue_id = uuid::Uuid::new_v4().to_string();
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "INSERT INTO work_queue
+             (queue_id,task_type,payload,dedup_key,idempotency_key,compensates_for,status,
+              attempts,max_attempts,run_after,created_at,updated_at,session_id,project_id)
+             VALUES (?1,?2,?3,?4,?5,?6,'ready',0,?7,?8,?8,?8,?9,?10)
+             ON CONFLICT(dedup_key) DO NOTHING",
+            params![
+                queue_id,
+                task_type,
+                payload,
+                dedup_key,
+                idempotency_key,
+                compensates_for,
+                max_attempts,
+                now,
+                session_id,
+                project_id
+            ],
+        )?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT {WORK_QUEUE_COLUMNS} FROM work_queue
+             WHERE queue_id=?1 OR (?2 IS NOT NULL AND dedup_key=?2)
+             ORDER BY CASE WHEN queue_id=?1 THEN 0 ELSE 1 END
+             LIMIT 1"
+        ))?;
+        statement
+            .query_row(params![queue_id, dedup_key], work_queue_from_row)
+            .map_err(StoreError::from)
+    }
+
+    pub fn claim_work_item(
+        &self,
+        worker_id: &str,
+        lease_seconds: u32,
+    ) -> Result<Option<WorkQueueItem>, StoreError> {
+        if worker_id.trim().is_empty() {
+            return Err(StoreError::Validation("worker_id cannot be empty".into()));
+        }
+        if lease_seconds == 0 || lease_seconds > 86_400 {
+            return Err(StoreError::Validation(
+                "lease_seconds must be between 1 and 86400".into(),
+            ));
+        }
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute_batch("BEGIN IMMEDIATE")?;
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let lease_until = (now + chrono::Duration::seconds(i64::from(lease_seconds))).to_rfc3339();
+        let result = (|| -> Result<Option<WorkQueueItem>, StoreError> {
+            connection.execute(
+                "UPDATE work_queue
+                 SET status='dead_letter', lease_owner=NULL, lease_until=NULL,
+                     last_error=COALESCE(last_error, 'lease expired after max attempts'),
+                     updated_at=?1
+                 WHERE status='running' AND lease_until IS NOT NULL AND lease_until<=?1
+                   AND attempts>=max_attempts",
+                [&now_text],
+            )?;
+            let mut statement = connection.prepare(&format!(
+                "UPDATE work_queue SET status='running', lease_owner=?1,
+                        lease_until=?2, lease_generation=lease_generation+1,
+                        attempts=attempts+1, updated_at=?3
+                 WHERE queue_id=(
+                   SELECT queue_id FROM work_queue
+                   WHERE (status='ready' AND run_after<=?3)
+                      OR (status='running' AND lease_until IS NOT NULL
+                          AND lease_until<=?3 AND attempts<max_attempts)
+                   ORDER BY run_after,created_at
+                   LIMIT 1
+                 )
+                 RETURNING {WORK_QUEUE_COLUMNS}"
+            ))?;
+            match statement.query_row(
+                params![worker_id, lease_until, now_text],
+                work_queue_from_row,
+            ) {
+                Ok(item) => Ok(Some(item)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(error) => Err(StoreError::from(error)),
+            }
+        })();
+        match result {
+            Ok(value) => {
+                connection.execute_batch("COMMIT")?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    pub fn renew_work_item(
+        &self,
+        queue_id: &str,
+        worker_id: &str,
+        lease_generation: u64,
+        lease_seconds: u32,
+    ) -> Result<WorkQueueItem, StoreError> {
+        if queue_id.trim().is_empty() || worker_id.trim().is_empty() {
+            return Err(StoreError::Validation(
+                "queue_id and worker_id cannot be empty".into(),
+            ));
+        }
+        if lease_generation > i64::MAX as u64 {
+            return Err(StoreError::Validation(
+                "lease_generation is out of range".into(),
+            ));
+        }
+        if lease_seconds == 0 || lease_seconds > 86_400 {
+            return Err(StoreError::Validation(
+                "lease_seconds must be between 1 and 86400".into(),
+            ));
+        }
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let lease_until = (now + chrono::Duration::seconds(i64::from(lease_seconds))).to_rfc3339();
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let changed = connection.execute(
+            "UPDATE work_queue SET lease_until=?1, updated_at=?2
+             WHERE queue_id=?3 AND status='running' AND lease_owner=?4
+               AND lease_generation=?5 AND lease_until>?2",
+            params![
+                lease_until,
+                now_text,
+                queue_id,
+                worker_id,
+                lease_generation as i64
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::Validation(
+                "lease is missing, expired, or owned by another worker".into(),
+            ));
+        }
+        connection
+            .query_row(
+                &format!("SELECT {WORK_QUEUE_COLUMNS} FROM work_queue WHERE queue_id=?1"),
+                [queue_id],
+                work_queue_from_row,
+            )
+            .map_err(StoreError::from)
+    }
+
+    pub fn complete_work_item(
+        &self,
+        queue_id: &str,
+        worker_id: &str,
+        lease_generation: u64,
+        outcome: &str,
+        error_summary: Option<&str>,
+    ) -> Result<WorkQueueItem, StoreError> {
+        if queue_id.trim().is_empty() || worker_id.trim().is_empty() {
+            return Err(StoreError::Validation(
+                "queue_id and worker_id cannot be empty".into(),
+            ));
+        }
+        if lease_generation > i64::MAX as u64 {
+            return Err(StoreError::Validation(
+                "lease_generation is out of range".into(),
+            ));
+        }
+        if !matches!(outcome, "succeeded" | "failed" | "cancelled") {
+            return Err(StoreError::Validation(
+                "outcome must be succeeded, failed, or cancelled".into(),
+            ));
+        }
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let error_summary = error_summary.map(str::to_owned);
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<WorkQueueItem, StoreError> {
+            let attempts: u32 = connection
+                .query_row(
+                    "SELECT attempts FROM work_queue
+                     WHERE queue_id=?1 AND status='running' AND lease_owner=?2
+                       AND lease_generation=?3 AND lease_until>?4",
+                    params![queue_id, worker_id, lease_generation as i64, now_text],
+                    |row| row.get(0),
+                )
+                .map_err(|error| match error {
+                    rusqlite::Error::QueryReturnedNoRows => StoreError::Validation(
+                        "lease is missing, expired, or owned by another worker".into(),
+                    ),
+                    error => StoreError::from(error),
+                })?;
+            let max_attempts: u32 = connection.query_row(
+                "SELECT max_attempts FROM work_queue WHERE queue_id=?1",
+                [queue_id],
+                |row| row.get(0),
+            )?;
+            let will_dead_letter = outcome == "failed" && attempts >= max_attempts;
+            let (status, run_after, completed_at) = match outcome {
+                "succeeded" => ("succeeded", now_text.clone(), Some(now_text.clone())),
+                "cancelled" => ("cancelled", now_text.clone(), Some(now_text.clone())),
+                "failed" if will_dead_letter => {
+                    ("dead_letter", now_text.clone(), Some(now_text.clone()))
+                }
+                "failed" => {
+                    let exponent = attempts.saturating_sub(1).min(16);
+                    let delay = 2_i64.pow(exponent).min(86_400);
+                    (
+                        "ready",
+                        (now + chrono::Duration::seconds(delay)).to_rfc3339(),
+                        None,
+                    )
+                }
+                _ => unreachable!(),
+            };
+            let changed = connection.execute(
+                "UPDATE work_queue SET status=?1, run_after=?2, lease_owner=NULL,
+                 lease_until=NULL, last_error=?3, updated_at=?4, completed_at=?5
+                 WHERE queue_id=?6 AND status='running' AND lease_owner=?7
+                   AND lease_generation=?8 AND lease_until>?4",
+                params![
+                    status,
+                    run_after,
+                    error_summary,
+                    now_text,
+                    completed_at,
+                    queue_id,
+                    worker_id,
+                    lease_generation as i64
+                ],
+            )?;
+            if changed == 0 {
+                return Err(StoreError::Validation(
+                    "lease is missing, expired, or owned by another worker".into(),
+                ));
+            }
+            connection
+                .query_row(
+                    &format!("SELECT {WORK_QUEUE_COLUMNS} FROM work_queue WHERE queue_id=?1"),
+                    [queue_id],
+                    work_queue_from_row,
+                )
+                .map_err(StoreError::from)
+        })();
+        match result {
+            Ok(value) => {
+                connection.execute_batch("COMMIT")?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    pub fn cancel_work_item(
+        &self,
+        queue_id: &str,
+        reason: Option<&str>,
+    ) -> Result<WorkQueueItem, StoreError> {
+        if queue_id.trim().is_empty() {
+            return Err(StoreError::Validation("queue_id cannot be empty".into()));
+        }
+        let now = Utc::now().to_rfc3339();
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let changed = connection.execute(
+            "UPDATE work_queue SET status='cancelled', lease_owner=NULL, lease_until=NULL,
+             last_error=?1, completed_at=?2, updated_at=?2
+             WHERE queue_id=?3 AND status IN ('ready','running')",
+            params![reason, now, queue_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::Validation(
+                "queue item is missing or is not cancellable".into(),
+            ));
+        }
+        connection
+            .query_row(
+                &format!("SELECT {WORK_QUEUE_COLUMNS} FROM work_queue WHERE queue_id=?1"),
+                [queue_id],
+                work_queue_from_row,
+            )
+            .map_err(StoreError::from)
+    }
+
+    pub fn requeue_work_item(&self, queue_id: &str) -> Result<WorkQueueItem, StoreError> {
+        if queue_id.trim().is_empty() {
+            return Err(StoreError::Validation("queue_id cannot be empty".into()));
+        }
+        let now = Utc::now().to_rfc3339();
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let changed = connection.execute(
+            "UPDATE work_queue SET status='ready', attempts=0, run_after=?1,
+             lease_owner=NULL, lease_until=NULL, last_error=NULL, completed_at=NULL,
+             updated_at=?1
+             WHERE queue_id=?2 AND status='dead_letter'",
+            params![now, queue_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::Validation(
+                "queue item is missing or is not dead-lettered".into(),
+            ));
+        }
+        connection
+            .query_row(
+                &format!("SELECT {WORK_QUEUE_COLUMNS} FROM work_queue WHERE queue_id=?1"),
+                [queue_id],
+                work_queue_from_row,
+            )
+            .map_err(StoreError::from)
+    }
+
+    pub fn load_work_queue(
+        &self,
+        status: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<WorkQueueItem>, StoreError> {
+        let limit = limit.clamp(1, 500);
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(&format!(
+            "SELECT {WORK_QUEUE_COLUMNS} FROM work_queue
+             WHERE (?1 IS NULL OR status=?1)
+             ORDER BY run_after,created_at DESC LIMIT ?2"
+        ))?;
+        let rows = statement.query_map(params![status, limit], work_queue_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     pub fn load_tool_calls(&self, session_id: &str) -> Result<Vec<ToolCallRecord>, StoreError> {
         self.load_tool_calls_filtered(session_id, None, None)
     }
@@ -1522,6 +1945,31 @@ impl SqliteStore {
                ON action_ledger(created_at DESC);
              CREATE INDEX IF NOT EXISTS idx_action_ledger_target
                ON action_ledger(platform, account_id, status);
+             CREATE TABLE IF NOT EXISTS work_queue (
+               queue_id TEXT PRIMARY KEY,
+               task_type TEXT NOT NULL,
+               payload TEXT NOT NULL,
+               dedup_key TEXT UNIQUE,
+               idempotency_key TEXT,
+               compensates_for TEXT,
+               status TEXT NOT NULL,
+               attempts INTEGER NOT NULL,
+               max_attempts INTEGER NOT NULL,
+               run_after TEXT NOT NULL,
+               lease_owner TEXT,
+               lease_generation INTEGER NOT NULL DEFAULT 0,
+               lease_until TEXT,
+               last_error TEXT,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               completed_at TEXT,
+               session_id TEXT,
+               project_id TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_work_queue_ready
+               ON work_queue(status, run_after, created_at);
+             CREATE INDEX IF NOT EXISTS idx_work_queue_dedup
+               ON work_queue(dedup_key);
              ;",
             )?;
             ensure_artifact_schema(&connection)?;
@@ -1701,6 +2149,12 @@ impl SqliteStore {
             if version < 3 {
                 connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (3, ?1)",
+                    [Utc::now().to_rfc3339()],
+                )?;
+            }
+            if version < 4 {
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (4, ?1)",
                     [Utc::now().to_rfc3339()],
                 )?;
             }
@@ -3346,5 +3800,260 @@ mod tests {
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("db-shm"));
         let _ = fs::remove_file(path.with_extension("db-wal"));
+    }
+
+    #[test]
+    fn work_queue_deduplicates_and_reuses_action_idempotency_key_on_retry() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let first = store
+            .enqueue_work_item(
+                "publish",
+                &serde_json::json!({"sku": "SKU-123"}),
+                Some("event-1"),
+                Some("publish:shop:account-1:SKU-123"),
+                3,
+                None,
+                Some("session-1"),
+                Some("project-1"),
+            )
+            .unwrap();
+        let duplicate = store
+            .enqueue_work_item(
+                "publish",
+                &serde_json::json!({"sku": "ignored"}),
+                Some("event-1"),
+                Some("different-key"),
+                3,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(first.queue_id, duplicate.queue_id);
+        assert_eq!(first.payload, serde_json::json!({"sku": "SKU-123"}));
+        assert_eq!(
+            duplicate.idempotency_key.as_deref(),
+            Some("publish:shop:account-1:SKU-123")
+        );
+
+        for (worker, outcome) in [("worker-1", "failed"), ("worker-2", "failed")] {
+            let item = store.claim_work_item(worker, 60).unwrap().unwrap();
+            let action = store
+                .begin_action(
+                    "publish",
+                    "shop",
+                    "account-1",
+                    item.idempotency_key.as_deref().unwrap(),
+                    None,
+                    None,
+                )
+                .unwrap();
+            if outcome == "failed" {
+                if let ActionBeginResult::Fresh(record) = action {
+                    store
+                        .finish_action_succeeded(
+                            &record.action_id,
+                            Some("external-123"),
+                            Some("published"),
+                        )
+                        .unwrap();
+                } else {
+                    assert!(matches!(action, ActionBeginResult::AlreadySucceeded { .. }));
+                }
+                store
+                    .complete_work_item(
+                        &item.queue_id,
+                        worker,
+                        item.lease_generation,
+                        "failed",
+                        Some("worker interrupted"),
+                    )
+                    .unwrap();
+                store
+                    .connection
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE work_queue SET run_after='1970-01-01T00:00:00Z' WHERE queue_id=?1",
+                        [&item.queue_id],
+                    )
+                    .unwrap();
+            }
+        }
+        let item = store.claim_work_item("worker-3", 60).unwrap().unwrap();
+        assert!(matches!(
+            store
+                .begin_action(
+                    "publish",
+                    "shop",
+                    "account-1",
+                    item.idempotency_key.as_deref().unwrap(),
+                    None,
+                    None,
+                )
+                .unwrap(),
+            ActionBeginResult::AlreadySucceeded {
+                external_id: Some(_),
+                ..
+            }
+        ));
+        let actions = store.load_actions(None, None, None, 10).unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].external_id.as_deref(), Some("external-123"));
+    }
+
+    #[test]
+    fn work_queue_claim_is_atomic_across_competing_connections() {
+        let path = std::env::temp_dir().join(format!(
+            "opcos-work-queue-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let setup = SqliteStore::open(&path).unwrap();
+        setup
+            .enqueue_work_item(
+                "single",
+                &serde_json::json!({"value": 1}),
+                None,
+                None,
+                3,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        drop(setup);
+        let mut threads = Vec::new();
+        for index in 0..8 {
+            let path = path.clone();
+            threads.push(std::thread::spawn(move || {
+                SqliteStore::open(path)
+                    .unwrap()
+                    .claim_work_item(&format!("worker-{index}"), 60)
+                    .unwrap()
+            }));
+        }
+        let results = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|item| item.is_some()).count(), 1);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("db-shm"));
+        let _ = fs::remove_file(path.with_extension("db-wal"));
+    }
+
+    #[test]
+    fn work_queue_reclaims_expired_leases_and_rejects_stale_workers() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let item = store
+            .enqueue_work_item(
+                "lease",
+                &serde_json::json!({}),
+                None,
+                None,
+                3,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let first = store.claim_work_item("worker-1", 60).unwrap().unwrap();
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE work_queue SET lease_until='1970-01-01T00:00:00Z' WHERE queue_id=?1",
+                [&item.queue_id],
+            )
+            .unwrap();
+        let second = store.claim_work_item("worker-2", 60).unwrap().unwrap();
+        assert_eq!(second.attempts, 2);
+        assert!(
+            store
+                .renew_work_item(&first.queue_id, "worker-1", first.lease_generation, 60)
+                .is_err()
+        );
+        assert!(
+            store
+                .complete_work_item(
+                    &first.queue_id,
+                    "worker-1",
+                    first.lease_generation,
+                    "succeeded",
+                    None
+                )
+                .is_err()
+        );
+        store
+            .complete_work_item(
+                &second.queue_id,
+                "worker-2",
+                second.lease_generation,
+                "succeeded",
+                None,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn work_queue_dead_letters_after_bounded_failures_and_backs_off() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let item = store
+            .enqueue_work_item(
+                "bounded",
+                &serde_json::json!({}),
+                None,
+                None,
+                2,
+                Some("original-item"),
+                None,
+                None,
+            )
+            .unwrap();
+        let first = store.claim_work_item("worker", 60).unwrap().unwrap();
+        let failed = store
+            .complete_work_item(
+                &item.queue_id,
+                "worker",
+                first.lease_generation,
+                "failed",
+                Some("temporary"),
+            )
+            .unwrap();
+        assert_eq!(failed.status, "ready");
+        assert!(failed.run_after > failed.updated_at);
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE work_queue SET run_after='1970-01-01T00:00:00Z' WHERE queue_id=?1",
+                [&item.queue_id],
+            )
+            .unwrap();
+        let second = store.claim_work_item("worker", 60).unwrap().unwrap();
+        let dead = store
+            .complete_work_item(
+                &item.queue_id,
+                "worker",
+                second.lease_generation,
+                "failed",
+                Some("permanent"),
+            )
+            .unwrap();
+        assert_eq!(dead.status, "dead_letter");
+        assert_eq!(dead.compensates_for.as_deref(), Some("original-item"));
+        assert_eq!(
+            store
+                .load_work_queue(Some("dead_letter"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        let replayed = store.requeue_work_item(&item.queue_id).unwrap();
+        assert_eq!(replayed.status, "ready");
+        assert_eq!(replayed.attempts, 0);
     }
 }
