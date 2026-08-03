@@ -1416,7 +1416,19 @@ impl SqliteStore {
 
     pub fn save_project(&self, project: &ProjectRecord) -> Result<(), StoreError> {
         self.connection.lock().expect("sqlite mutex poisoned").execute(
-            "INSERT OR REPLACE INTO projects(id,name,host_id,repo_url,repo_root,default_branch,workflow_json,board_id,archived,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            "INSERT INTO projects(id,name,host_id,repo_url,repo_root,default_branch,workflow_json,board_id,archived,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+             ON CONFLICT(id) DO UPDATE SET
+               name=excluded.name,
+               host_id=excluded.host_id,
+               repo_url=excluded.repo_url,
+               repo_root=excluded.repo_root,
+               default_branch=excluded.default_branch,
+               workflow_json=excluded.workflow_json,
+               board_id=excluded.board_id,
+               archived=excluded.archived,
+               created_at=excluded.created_at,
+               updated_at=excluded.updated_at",
             params![
                 project.id, project.name, project.host_id, project.repo_url, project.repo_root,
                 project.default_branch, project.workflow_json, project.board_id, project.archived,
@@ -2261,6 +2273,27 @@ mod tests {
             ..lead
         };
         store.save_project_agent(&worker).unwrap();
+        assert_eq!(store.load_project_agents("project-1").unwrap().len(), 2);
+        store
+            .save_project(&ProjectRecord {
+                name: "Project renamed".into(),
+                workflow_json: r#"{"workflow":[]}"#.into(),
+                updated_at: now + chrono::Duration::seconds(1),
+                ..ProjectRecord {
+                    id: "project-1".into(),
+                    name: "Project".into(),
+                    host_id: "local".into(),
+                    repo_url: String::new(),
+                    repo_root: "/tmp/repo".into(),
+                    default_branch: "main".into(),
+                    workflow_json: "{}".into(),
+                    board_id: "board-1".into(),
+                    archived: false,
+                    created_at: now,
+                    updated_at: now,
+                }
+            })
+            .unwrap();
         assert_eq!(store.load_project_agents("project-1").unwrap().len(), 2);
         store
             .save_session(&SessionRecord {

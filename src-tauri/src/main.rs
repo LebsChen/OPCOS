@@ -1389,6 +1389,19 @@ fn default_agent_for_creation(settings: &Value, automated: bool) -> String {
         .to_owned()
 }
 
+fn project_session_target(
+    project: &ProjectRecord,
+    agent: &ProjectAgentRecord,
+) -> Result<(String, String), String> {
+    if agent.project_id != project.id {
+        return Err("project member does not belong to project".to_owned());
+    }
+    if agent.session_id.is_some() {
+        return Err("project member already has a session".to_owned());
+    }
+    Ok((project.host_id.clone(), agent.worktree_path.clone()))
+}
+
 fn computer_use_enabled(state: &DesktopState, project_id: Option<&str>) -> Result<bool, String> {
     let connection = state
         .database
@@ -4186,7 +4199,7 @@ async fn start_ide_proxy(
 fn create_session(
     state: State<'_, DesktopState>,
     title: String,
-    host_id: String,
+    host_id: Option<String>,
     model: Option<String>,
     provider: Option<String>,
     mode: Option<String>,
@@ -4221,15 +4234,10 @@ fn create_session(
                 .load_project_agent(&agent_id)
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| "project member not found".to_owned())?;
-            if agent.project_id != project.id {
-                return Err("project member does not belong to project".to_owned());
-            }
-            if agent.session_id.is_some() {
-                return Err("project member already has a session".to_owned());
-            }
-            (project.host_id, Some(agent))
+            let (host_id, _) = project_session_target(&project, &agent)?;
+            (host_id, Some(agent))
         } else {
-            (host_id.clone(), None)
+            (host_id.unwrap_or_default(), None)
         };
     let settings = {
         let connection = state
@@ -12845,6 +12853,49 @@ mod m7_tests {
         assert_eq!(
             default_agent_for_creation(&settings, true),
             "AutomationAgent"
+        );
+    }
+
+    #[test]
+    fn project_session_without_explicit_host_uses_member_worktree() {
+        let now = Utc::now();
+        let project = ProjectRecord {
+            id: "project-1".into(),
+            name: "Project".into(),
+            host_id: "rvm-1".into(),
+            repo_url: String::new(),
+            repo_root: "/workspace/repo".into(),
+            default_branch: "main".into(),
+            workflow_json: "{}".into(),
+            board_id: "board-1".into(),
+            archived: false,
+            created_at: now,
+            updated_at: now,
+        };
+        let agent = ProjectAgentRecord {
+            id: "agent-1".into(),
+            project_id: project.id.clone(),
+            sort_order: 1,
+            name: "Code".into(),
+            role: "Code".into(),
+            session_id: None,
+            provider: None,
+            model: "auto".into(),
+            harness: "builtin".into(),
+            mode: "Interactive".into(),
+            system_prompt: String::new(),
+            worktree_path: "/workspace/repo/.worktrees/code".into(),
+            branch: "code".into(),
+            state: "Active".into(),
+            created_at: now,
+            updated_at: now,
+        };
+        assert_eq!(
+            project_session_target(&project, &agent).unwrap(),
+            (
+                "rvm-1".to_owned(),
+                "/workspace/repo/.worktrees/code".to_owned()
+            )
         );
     }
 

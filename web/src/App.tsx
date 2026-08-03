@@ -1043,9 +1043,11 @@ function MemberDialog({
 function ProjectConfigPanel({
   project,
   onError,
+  onRefresh,
 }: {
   project: Project;
   onError: (error: unknown) => void;
+  onRefresh: () => Promise<void>;
 }) {
   const [assets, setAssets] = useState<Asset[]>([]);
   const [secrets, setSecrets] = useState<SecretMetadata[]>([]);
@@ -1096,6 +1098,7 @@ function ProjectConfigPanel({
       enabled: true,
     })
       .then(load)
+      .then(onRefresh)
       .then(reset)
       .catch(onError);
   };
@@ -1246,6 +1249,7 @@ function ProjectConfigPanel({
                   projectId: project.id,
                 })
                   .then(load)
+                  .then(onRefresh)
                   .then(() => {
                     setSecretName("");
                     setSecretPurpose("");
@@ -1282,6 +1286,7 @@ function ProjectConfigPanel({
                       projectId: project.id,
                     })
                       .then(load)
+                      .then(onRefresh)
                       .catch(onError)
                   }
                 >
@@ -1400,6 +1405,7 @@ function ProjectBoard({
   onRefresh,
   onOpenSession,
   onError,
+  onProjectDeleted,
 }: {
   project: Project;
   sessions: Session[];
@@ -1409,6 +1415,7 @@ function ProjectBoard({
   onRefresh: () => Promise<void>;
   onOpenSession: (id: string) => void;
   onError: (error: unknown) => void;
+  onProjectDeleted: () => void;
 }) {
   const [memberForm, setMemberForm] = useState<{
     mode: "add" | "edit";
@@ -1419,6 +1426,8 @@ function ProjectBoard({
     message: string;
   } | null>(null);
   const [memberSaving, setMemberSaving] = useState(false);
+  const [projectActionError, setProjectActionError] = useState("");
+  const [projectActionBusy, setProjectActionBusy] = useState(false);
   const submitMember = async (values: {
     name: string;
     role: string;
@@ -1475,6 +1484,51 @@ function ProjectBoard({
       setDeleteError({ agentId: agent.id, message: errorMessage(reason) });
     }
   };
+  const archiveProject = async () => {
+    if (
+      !window.confirm(
+        `确定归档项目「${project.name}」？归档不会删除 worktree。`,
+      )
+    )
+      return;
+    setProjectActionBusy(true);
+    setProjectActionError("");
+    try {
+      await command("update_project", {
+        id: project.id,
+        archived: true,
+      });
+      await onRefresh();
+      onProjectDeleted();
+    } catch (reason) {
+      setProjectActionError(errorMessage(reason));
+    } finally {
+      setProjectActionBusy(false);
+    }
+  };
+  const deleteProject = async (force = false) => {
+    if (
+      !force &&
+      !window.confirm(
+        `确定删除项目「${project.name}」？这会回收所有成员 worktree，且不可撤销。`,
+      )
+    )
+      return;
+    setProjectActionBusy(true);
+    setProjectActionError("");
+    try {
+      await command("delete_project", {
+        id: project.id,
+        force,
+      });
+      await onRefresh();
+      onProjectDeleted();
+    } catch (reason) {
+      setProjectActionError(errorMessage(reason));
+    } finally {
+      setProjectActionBusy(false);
+    }
+  };
   return (
     <main className="flex-1 overflow-y-auto p-8">
       <div className="max-w-6xl mx-auto">
@@ -1499,7 +1553,32 @@ function ProjectBoard({
           >
             添加成员
           </button>
+          <button
+            className="btn"
+            disabled={projectActionBusy}
+            onClick={archiveProject}
+          >
+            归档项目
+          </button>
+          <button
+            className="btn quiet-deny"
+            disabled={projectActionBusy}
+            onClick={() => void deleteProject()}
+          >
+            删除项目
+          </button>
         </div>
+        {projectActionError && (
+          <div className="mt-3 rounded-lg bg-danger/10 p-3 text-sm text-danger">
+            <p>{projectActionError}</p>
+            <button
+              className="btn mt-2"
+              onClick={() => void deleteProject(true)}
+            >
+              强制删除并回收 worktree
+            </button>
+          </div>
+        )}
         <div className="grid grid-cols-[repeat(auto-fill,minmax(240px,1fr))] gap-4">
           {project.agents.map((agent) => {
             const session = sessions.find(
@@ -1591,8 +1670,16 @@ function ProjectBoard({
             );
           })}
         </div>
-        <ProjectConfigPanel project={project} onError={onError} />
-        <ProjectCoordinationPanel project={project} onError={onError} />
+        <ProjectConfigPanel
+          project={project}
+          onError={onError}
+          onRefresh={onRefresh}
+        />
+        <ProjectCoordinationPanel
+          project={project}
+          onError={onError}
+          onRefresh={onRefresh}
+        />
       </div>
       {memberForm && (
         <MemberDialog
@@ -1613,9 +1700,11 @@ function ProjectBoard({
 function ProjectCoordinationPanel({
   project,
   onError,
+  onRefresh,
 }: {
   project: Project;
   onError: (error: unknown) => void;
+  onRefresh: () => Promise<void>;
 }) {
   const [snapshot, setSnapshot] = useState<Record<string, any> | null>(null);
   const [taskTitle, setTaskTitle] = useState("");
@@ -1648,6 +1737,7 @@ function ProjectCoordinationPanel({
         });
       }
       await load();
+      await onRefresh();
     } catch (error) {
       onError(error);
     } finally {
@@ -1675,6 +1765,7 @@ function ProjectCoordinationPanel({
       setTaskTitle("");
       setTaskAssignee("");
       await load();
+      await onRefresh();
     } catch (error) {
       onError(error);
     }
@@ -1699,6 +1790,7 @@ function ProjectCoordinationPanel({
             onClick={() =>
               command("coordination_start_project", { projectId: project.id })
                 .then(load)
+                .then(onRefresh)
                 .catch(onError)
             }
           >
@@ -1723,6 +1815,7 @@ function ProjectCoordinationPanel({
             onClick={() =>
               command("project_workflow_advance", { projectId: project.id })
                 .then(load)
+                .then(onRefresh)
                 .catch(onError)
             }
           >
@@ -1750,6 +1843,7 @@ function ProjectCoordinationPanel({
                 workflowJson: workflowText,
               })
                 .then(load)
+                .then(onRefresh)
                 .catch(onError)
             }
           >
@@ -7980,6 +8074,10 @@ function AppContent() {
               }
             }}
             onError={onError}
+            onProjectDeleted={() => {
+              setSelectedProject(null);
+              setSurface("manage");
+            }}
           />
         ) : surface === "session" && selected ? (
           <>
