@@ -228,30 +228,36 @@ async fn discover_tree<R: RemoteAssetReader>(
 ) -> Result<(), AssetError> {
     let mut pending = vec![path.to_owned()];
     while let Some(current) = pending.pop() {
-        let entries = reader.list(Some(&current)).await?;
+        let Ok(entries) = reader.list(Some(&current)).await else {
+            continue;
+        };
         for (name, dir) in entries {
             let child = join_remote_path(&current, &name);
             if dir {
                 pending.push(child);
             } else if name == "SKILL.md" {
-                bundle
-                    .skills
-                    .push(parse_skill(&child, &reader.read(&child).await?));
+                if let Ok(content) = reader.read(&child).await {
+                    bundle.skills.push(parse_skill(&child, &content));
+                }
             } else if child.replace('\\', "/").contains("/.agents/knowledge/")
                 && name.ends_with(".md")
             {
-                bundle
-                    .knowledge
-                    .push(parse_knowledge(&child, &reader.read(&child).await?)?);
+                if let Ok(content) = reader.read(&child).await {
+                    bundle.knowledge.push(parse_knowledge(&child, &content)?);
+                }
             } else if child.replace('\\', "/").contains("/.agents/playbooks/")
                 && name.ends_with(".md")
             {
-                bundle.playbook = Some(parse_playbook(&child, &reader.read(&child).await?));
-            } else if child.replace('\\', "/").contains("/.cursor/rules/") || name.ends_with(".md")
+                if let Ok(content) = reader.read(&child).await {
+                    bundle.playbook = Some(parse_playbook(&child, &content));
+                }
+            } else if (child.replace('\\', "/").contains("/.cursor/rules/")
+                || name.ends_with(".md"))
+                && let Ok(content) = reader.read(&child).await
             {
                 bundle.agents.push(InstructionSource {
                     path: child.clone(),
-                    content: reader.read(&child).await?,
+                    content,
                 });
             }
         }
@@ -339,5 +345,34 @@ mod tests {
         redact_secret(&mut value, secret);
         assert!(!value.to_string().contains(secret));
         assert_eq!(value["worklog"][0], "[REDACTED]");
+    }
+
+    struct SkillOnlyReader;
+
+    #[async_trait]
+    impl RemoteAssetReader for SkillOnlyReader {
+        async fn read(&self, path: &str) -> Result<String, AssetError> {
+            if path == "/repo/.agents/skills/demo/SKILL.md" {
+                Ok("# Demo\nUse the demo skill.".into())
+            } else {
+                Err(AssetError::Invalid("missing".into()))
+            }
+        }
+
+        async fn list(&self, path: Option<&str>) -> Result<Vec<(String, bool)>, AssetError> {
+            match path {
+                Some("/repo/.agents/skills") => Ok(vec![("demo".into(), true)]),
+                Some("/repo/.agents/skills/demo") => Ok(vec![("SKILL.md".into(), false)]),
+                _ => Err(AssetError::Invalid("missing".into())),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn discovers_skill_when_optional_rules_are_missing() {
+        let bundle = discover(&SkillOnlyReader, "/repo").await.unwrap();
+        assert_eq!(bundle.skills.len(), 1);
+        assert_eq!(bundle.skills[0].name, "demo");
+        assert!(bundle.agents.is_empty());
     }
 }

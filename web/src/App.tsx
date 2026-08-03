@@ -1426,6 +1426,9 @@ function ProjectBoard({
     message: string;
   } | null>(null);
   const [memberSaving, setMemberSaving] = useState(false);
+  const [projectEditing, setProjectEditing] = useState(false);
+  const [projectName, setProjectName] = useState(project.name);
+  const [projectBranch, setProjectBranch] = useState(project.default_branch);
   const [projectActionError, setProjectActionError] = useState("");
   const [projectActionBusy, setProjectActionBusy] = useState(false);
   const submitMember = async (values: {
@@ -1474,11 +1477,17 @@ function ProjectBoard({
     )
       return;
     try {
-      await command("delete_project_agent", {
-        agentId: agent.id,
-        force,
-      });
+      const result = await command<{ warnings?: string[] }>(
+        "delete_project_agent",
+        {
+          agentId: agent.id,
+          force,
+        },
+      );
       setDeleteError(null);
+      if (result.warnings?.length) {
+        onError(result.warnings.join("\n"));
+      }
       await onRefresh();
     } catch (reason) {
       setDeleteError({ agentId: agent.id, message: errorMessage(reason) });
@@ -1506,6 +1515,23 @@ function ProjectBoard({
       setProjectActionBusy(false);
     }
   };
+  const saveProjectDetails = async () => {
+    setProjectActionBusy(true);
+    setProjectActionError("");
+    try {
+      await command("update_project", {
+        id: project.id,
+        name: projectName.trim(),
+        defaultBranch: projectBranch.trim(),
+      });
+      await onRefresh();
+      setProjectEditing(false);
+    } catch (reason) {
+      setProjectActionError(errorMessage(reason));
+    } finally {
+      setProjectActionBusy(false);
+    }
+  };
   const deleteProject = async (force = false) => {
     if (
       !force &&
@@ -1517,11 +1543,14 @@ function ProjectBoard({
     setProjectActionBusy(true);
     setProjectActionError("");
     try {
-      await command("delete_project", {
+      const result = await command<{ warnings?: string[] }>("delete_project", {
         id: project.id,
         force,
       });
       await onRefresh();
+      if (result.warnings?.length) {
+        onError(result.warnings.join("\n"));
+      }
       onProjectDeleted();
     } catch (reason) {
       setProjectActionError(errorMessage(reason));
@@ -1556,6 +1585,17 @@ function ProjectBoard({
           <button
             className="btn"
             disabled={projectActionBusy}
+            onClick={() => {
+              setProjectName(project.name);
+              setProjectBranch(project.default_branch);
+              setProjectEditing((value) => !value);
+            }}
+          >
+            编辑项目
+          </button>
+          <button
+            className="btn"
+            disabled={projectActionBusy}
             onClick={archiveProject}
           >
             归档项目
@@ -1577,6 +1617,40 @@ function ProjectBoard({
             >
               强制删除并回收 worktree
             </button>
+          </div>
+        )}
+        {projectEditing && (
+          <div className="mt-4 grid gap-3 rounded-lg border border-line bg-panel p-4 md:grid-cols-[1fr_1fr_auto]">
+            <label className="field-label">
+              项目名称
+              <input
+                value={projectName}
+                onChange={(event) => setProjectName(event.target.value)}
+              />
+            </label>
+            <label className="field-label">
+              默认分支
+              <input
+                value={projectBranch}
+                onChange={(event) => setProjectBranch(event.target.value)}
+              />
+            </label>
+            <div className="flex items-end gap-2">
+              <button
+                className="btn approval-primary"
+                disabled={
+                  projectActionBusy ||
+                  !projectName.trim() ||
+                  !projectBranch.trim()
+                }
+                onClick={() => void saveProjectDetails()}
+              >
+                保存
+              </button>
+              <button className="btn" onClick={() => setProjectEditing(false)}>
+                取消
+              </button>
+            </div>
           </div>
         )}
         <div className="grid grid-cols-[repeat(auto-fill,minmax(240px,1fr))] gap-4">
@@ -1779,8 +1853,10 @@ function ProjectCoordinationPanel({
           </h2>
           <p className="mt-1 text-sm text-faint">
             当前阶段：
-            {snapshot?.workflow?.workflow?.[snapshot.stage_index]?.stage ||
-              "未启动"}
+            {snapshot?.status === "done"
+              ? "已完成"
+              : snapshot?.workflow?.workflow?.[snapshot.stage_index]?.stage ||
+                "未启动"}
           </p>
         </div>
         <div className="flex flex-wrap gap-2">

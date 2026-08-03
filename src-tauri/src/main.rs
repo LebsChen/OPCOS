@@ -1402,6 +1402,19 @@ fn project_session_target(
     Ok((project.host_id.clone(), agent.worktree_path.clone()))
 }
 
+fn validate_git_repository_result(
+    exit_code: i32,
+    stdout: &str,
+    repo_root: &str,
+) -> Result<(), String> {
+    if exit_code != 0 || stdout.trim() != "true" {
+        return Err(format!(
+            "repository path is not a git repository: {repo_root}"
+        ));
+    }
+    Ok(())
+}
+
 fn computer_use_enabled(state: &DesktopState, project_id: Option<&str>) -> Result<bool, String> {
     let connection = state
         .database
@@ -2085,7 +2098,7 @@ async fn remove_project_agent_worktree(
     agent: &ProjectAgentRecord,
     force: bool,
     platform: Option<&str>,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     if agent.sort_order == 0 {
         let result = host
             .exec(ExecRequest {
@@ -2109,7 +2122,7 @@ async fn remove_project_agent_worktree(
         if !force && !result.result.stdout.trim().is_empty() {
             return Err("worktree has uncommitted changes; use force to remove it".to_owned());
         }
-        return Ok(());
+        return Ok(vec![]);
     }
     let quote = |value: &str| quote_for(platform, value);
     let command = if force {
@@ -2145,7 +2158,36 @@ async fn remove_project_agent_worktree(
             )
         });
     }
-    Ok(())
+    let branch_result = match host
+        .exec(ExecRequest {
+            command: format!(
+                "git -C {} branch -D {}",
+                quote(&project.repo_root),
+                quote(&agent.branch)
+            ),
+            cwd: None,
+            timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+            session: None,
+            env: None,
+        })
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return Ok(vec![format!(
+                "worktree removed but branch '{}' cleanup failed: {error}",
+                agent.branch
+            )]);
+        }
+    };
+    if branch_result.result.exit_code != 0 {
+        return Ok(vec![format!(
+            "worktree removed but branch '{}' could not be deleted: {}",
+            agent.branch,
+            branch_result.result.stderr.trim()
+        )]);
+    }
+    Ok(vec![])
 }
 
 fn project_root(project_id: &str) -> Result<String, String> {
@@ -2271,6 +2313,24 @@ async fn create_project(
     } else if host.ls(Some(&project.repo_root)).await.is_err() {
         return Err("repository path does not exist on the project host".to_owned());
     }
+    let git_check = host
+        .exec(ExecRequest {
+            command: format!(
+                "git -C {} rev-parse --is-inside-work-tree",
+                quote_for(platform.as_deref(), &project.repo_root)
+            ),
+            cwd: None,
+            timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+            session: None,
+            env: None,
+        })
+        .await
+        .map_err(|error| format!("repository validation failed: {error}"))?;
+    validate_git_repository_result(
+        git_check.result.exit_code,
+        &git_check.result.stdout,
+        &project.repo_root,
+    )?;
     state
         .store
         .save_project(&project)
@@ -2323,7 +2383,7 @@ async fn delete_project(
     state: State<'_, DesktopState>,
     id: String,
     force: Option<bool>,
-) -> Result<(), String> {
+) -> Result<Value, String> {
     let project = state
         .store
         .load_project(&id)
@@ -2334,6 +2394,7 @@ async fn delete_project(
         .load_project_agents(&id)
         .map_err(|error| error.to_string())?;
     let host = project_host(&state, &project).await?;
+    let mut warnings = Vec::new();
     if !agents.is_empty() {
         if !project_host_contains(&host, &project.repo_root) {
             return Err("project repository path is outside the bound host workspace".to_owned());
@@ -2343,14 +2404,16 @@ async fn delete_project(
             if !project_host_contains(&host, &agent.worktree_path) {
                 return Err("project worktree path is outside the bound host workspace".to_owned());
             }
-            remove_project_agent_worktree(
-                &host,
-                &project,
-                agent,
-                force.unwrap_or(false),
-                platform.as_deref(),
-            )
-            .await?;
+            warnings.extend(
+                remove_project_agent_worktree(
+                    &host,
+                    &project,
+                    agent,
+                    force.unwrap_or(false),
+                    platform.as_deref(),
+                )
+                .await?,
+            );
         }
     }
     state
@@ -2390,7 +2453,8 @@ async fn delete_project(
     state
         .store
         .delete_project(&id)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    Ok(json!({"deleted": true, "warnings": warnings}))
 }
 
 fn clear_project_configuration(state: &DesktopState, project_id: &str) -> Result<(), String> {
@@ -2615,7 +2679,7 @@ async fn delete_project_agent(
     state: State<'_, DesktopState>,
     agent_id: String,
     force: Option<bool>,
-) -> Result<(), String> {
+) -> Result<Value, String> {
     let agent = state
         .store
         .load_project_agent(&agent_id)
@@ -2636,7 +2700,7 @@ async fn delete_project_agent(
         return Err("project worktree path is outside the bound host workspace".to_owned());
     }
     let platform = host.health().await.ok().and_then(|health| health.platform);
-    remove_project_agent_worktree(
+    let warnings = remove_project_agent_worktree(
         &host,
         &project,
         &agent,
@@ -2647,7 +2711,8 @@ async fn delete_project_agent(
     state
         .store
         .delete_project_agent(&agent_id)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    Ok(json!({"deleted": true, "warnings": warnings}))
 }
 
 #[tauri::command]
@@ -12897,6 +12962,13 @@ mod m7_tests {
                 "/workspace/repo/.worktrees/code".to_owned()
             )
         );
+    }
+
+    #[test]
+    fn project_creation_rejects_non_git_repository() {
+        let error = validate_git_repository_result(128, "", "/tmp/not-a-repository").unwrap_err();
+        assert!(error.contains("not a git repository"));
+        assert!(validate_git_repository_result(0, "true\n", "/tmp/repository").is_ok());
     }
 
     #[test]
