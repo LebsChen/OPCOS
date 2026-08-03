@@ -27,6 +27,9 @@ pub struct LoginValidationObservation {
     pub signal: Option<String>,
 }
 
+const ARCHIVE_TIMEOUT_SECONDS: u64 = 1_800;
+const ARCHIVE_TOO_LARGE_EXIT_CODE: i32 = 42;
+
 #[derive(Debug, Error)]
 pub enum LoginStateError {
     #[error("login-state operation requires a remote Windows host")]
@@ -37,6 +40,8 @@ pub enum LoginStateError {
     BrowserCheckFailed,
     #[error("login-state path is unavailable on the remote host")]
     PathUnavailable,
+    #[error("login-state profile is too large for the remote archive format")]
+    ProfileTooLarge,
     #[error("login-state backup integrity check failed")]
     IntegrityMismatch,
     #[error("login-state validation is undetermined; manual login is required")]
@@ -64,12 +69,15 @@ pub async fn backup_login_state(
         .exec(ExecRequest {
             command,
             cwd: None,
-            timeout_seconds: 300,
+            timeout_seconds: ARCHIVE_TIMEOUT_SECONDS,
             session: None,
             env: None,
         })
         .await
         .map_err(|_| LoginStateError::HostUnavailable)?;
+    if result.result.exit_code == ARCHIVE_TOO_LARGE_EXIT_CODE {
+        return Err(LoginStateError::ProfileTooLarge);
+    }
     if result.result.exit_code != 0 {
         return Err(LoginStateError::PathUnavailable);
     }
@@ -114,7 +122,7 @@ pub async fn restore_login_state(
         .exec(ExecRequest {
             command,
             cwd: None,
-            timeout_seconds: 300,
+            timeout_seconds: ARCHIVE_TIMEOUT_SECONDS,
             session: None,
             env: None,
         })
@@ -180,7 +188,7 @@ async fn ensure_browser_stopped(host: &dyn Host) -> Result<(), LoginStateError> 
 
 fn powershell_archive_command(profile_path: &str, backup_path: &str) -> String {
     powershell_path_command(
-        "New-Item -ItemType Directory -Force -Path (Split-Path -Parent $backupPath) | Out-Null; Compress-Archive -LiteralPath $profilePath -DestinationPath $backupPath -Force",
+        "Add-Type -AssemblyName System.IO.Compression.FileSystem; $bytes=(Get-ChildItem -LiteralPath $profilePath -Force -Recurse -File | Measure-Object -Property Length -Sum).Sum; if ($bytes -gt 1900000000) { exit 42 }; New-Item -ItemType Directory -Force -Path (Split-Path -Parent $backupPath) | Out-Null; Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue; $archive=[IO.Compression.ZipFile]::Open($backupPath,[IO.Compression.ZipArchiveMode]::Create); try { $profile=Get-Item -LiteralPath $profilePath -Force; $root=$profile.FullName.TrimEnd('\\')+'\\'; $archive.CreateEntry($profile.Name+'/') | Out-Null; Get-ChildItem -LiteralPath $profilePath -Force -Recurse | ForEach-Object { $relative=$_.FullName.Substring($root.Length).Replace('\\','/'); if ($_.PSIsContainer) { $archive.CreateEntry($profile.Name+'/'+$relative+'/') | Out-Null } else { $entry=$archive.CreateEntry($profile.Name+'/'+$relative); $input=[IO.File]::OpenRead($_.FullName); $output=$entry.Open(); try { $input.CopyTo($output) } finally { $output.Dispose(); $input.Dispose() } } } } finally { $archive.Dispose() }",
         profile_path,
         backup_path,
     )
@@ -190,7 +198,7 @@ fn powershell_extract_archive_command(backup_path: &str, profile_path: &str) -> 
     let backup_path = BASE64.encode(backup_path.as_bytes());
     let profile_path = BASE64.encode(profile_path.as_bytes());
     format!(
-        "powershell -NoProfile -NonInteractive -Command \"$profilePath=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{profile_path}')); $backupPath=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{backup_path}')); $restorePath=\\\"$($profilePath).__opcos_restore_$([Guid]::NewGuid().ToString('N'))\\\"; $previousPath=\\\"$($profilePath).__opcos_previous_$([Guid]::NewGuid().ToString('N'))\\\"; try {{ if (Test-Path -LiteralPath $profilePath) {{ Move-Item -LiteralPath $profilePath -Destination $previousPath -ErrorAction Stop }}; Expand-Archive -LiteralPath $backupPath -DestinationPath $restorePath -Force -ErrorAction Stop; Move-Item -LiteralPath $restorePath -Destination $profilePath -ErrorAction Stop; if (Test-Path -LiteralPath $previousPath) {{ Remove-Item -LiteralPath $previousPath -Recurse -Force -ErrorAction SilentlyContinue }} }} catch {{ if (Test-Path -LiteralPath $restorePath) {{ Remove-Item -LiteralPath $restorePath -Recurse -Force -ErrorAction SilentlyContinue }}; if ((Test-Path -LiteralPath $previousPath) -and -not (Test-Path -LiteralPath $profilePath)) {{ Move-Item -LiteralPath $previousPath -Destination $profilePath -ErrorAction SilentlyContinue }}; exit 1 }}\""
+        "powershell -NoProfile -NonInteractive -Command \"$profilePath=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{profile_path}')); $backupPath=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{backup_path}')); $restorePath=\\\"$($profilePath).__opcos_restore_$([Guid]::NewGuid().ToString('N'))\\\"; $previousPath=\\\"$($profilePath).__opcos_previous_$([Guid]::NewGuid().ToString('N'))\\\"; try {{ if (Test-Path -LiteralPath $profilePath) {{ Move-Item -LiteralPath $profilePath -Destination $previousPath -ErrorAction Stop }}; Expand-Archive -LiteralPath $backupPath -DestinationPath $restorePath -Force -ErrorAction Stop; $archiveRoot=@(Get-ChildItem -LiteralPath $restorePath -Force); if (($archiveRoot.Count -ne 1) -or -not $archiveRoot[0].PSIsContainer) {{ throw 'archive root is invalid' }}; New-Item -ItemType Directory -Force -Path $profilePath | Out-Null; Get-ChildItem -LiteralPath $archiveRoot[0].FullName -Force | Move-Item -Destination $profilePath -Force -ErrorAction Stop; Remove-Item -LiteralPath $restorePath -Recurse -Force -ErrorAction Stop; if (Test-Path -LiteralPath $previousPath) {{ Remove-Item -LiteralPath $previousPath -Recurse -Force -ErrorAction SilentlyContinue }} }} catch {{ if (Test-Path -LiteralPath $restorePath) {{ Remove-Item -LiteralPath $restorePath -Recurse -Force -ErrorAction SilentlyContinue }}; if (Test-Path -LiteralPath $previousPath) {{ if (Test-Path -LiteralPath $profilePath) {{ Remove-Item -LiteralPath $profilePath -Recurse -Force -ErrorAction SilentlyContinue }}; Move-Item -LiteralPath $previousPath -Destination $profilePath -ErrorAction SilentlyContinue }}; exit 1 }}\""
     )
 }
 
@@ -241,6 +249,11 @@ mod tests {
         let command = powershell_archive_command(profile, backup);
         assert!(!command.contains(profile));
         assert!(!command.contains(backup));
+        assert!(command.contains("ZipFile]::Open"));
+        assert!(command.contains("-Force -Recurse -File"));
+        assert!(command.contains("Get-ChildItem -LiteralPath $profilePath -Force -Recurse"));
+        assert!(command.contains("CreateEntry($profile.Name+'/')"));
+        assert!(command.contains("exit 42"));
     }
 
     #[test]
@@ -252,7 +265,32 @@ mod tests {
         assert!(command.contains("-DestinationPath $restorePath"));
         assert!(command.contains("Move-Item -LiteralPath $profilePath"));
         assert!(command.contains("$previousPath"));
+        assert!(command.contains("@(Get-ChildItem -LiteralPath $restorePath -Force)"));
+        assert!(command.contains("Get-ChildItem -LiteralPath $archiveRoot[0].FullName -Force"));
         assert!(command.contains("Move-Item -LiteralPath $previousPath -Destination $profilePath"));
         assert!(!command.contains("Expand-Archive -LiteralPath $profilePath"));
+    }
+
+    #[test]
+    fn archive_round_trip_strips_only_the_archive_root() {
+        let archive_entries = [
+            "Profile/Cookies",
+            "Profile/Preferences",
+            "Profile/.hidden/marker",
+            "Profile/EmptyDirectory/",
+        ];
+        let restored = archive_entries
+            .iter()
+            .map(|entry| entry.strip_prefix("Profile/").unwrap_or(entry))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            restored,
+            [
+                "Cookies",
+                "Preferences",
+                ".hidden/marker",
+                "EmptyDirectory/",
+            ]
+        );
     }
 }
