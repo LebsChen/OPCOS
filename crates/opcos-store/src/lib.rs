@@ -1516,22 +1516,25 @@ impl SqliteStore {
         if goal.status != "active" {
             return Err(StoreError::Validation("goal is not active".into()));
         }
+        let planning_now = DateTime::parse_from_rfc3339(now)
+            .map_err(|_| StoreError::Validation("invalid planning timestamp".into()))?;
         if let Some(last) = &goal.last_planned_at {
             let last = DateTime::parse_from_rfc3339(last)
                 .map_err(|_| StoreError::Validation("invalid goal timestamp".into()))?;
-            let now = DateTime::parse_from_rfc3339(now)
-                .map_err(|_| StoreError::Validation("invalid planning timestamp".into()))?;
-            if now.signed_duration_since(last).num_seconds() < goal.cadence_seconds as i64 {
+            if planning_now.signed_duration_since(last).num_seconds() < goal.cadence_seconds as i64
+            {
                 return Err(StoreError::Validation(
                     "goal cadence has not elapsed".into(),
                 ));
             }
         }
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let threshold =
+            (planning_now.with_timezone(&Utc) - chrono::Duration::hours(1)).to_rfc3339();
         let rounds: u32 = connection.query_row(
             "SELECT COUNT(*) FROM planning_rounds
-             WHERE goal_id=?1 AND started_at>=datetime(?2,'-1 hour')",
-            params![goal_id, now],
+             WHERE goal_id=?1 AND started_at>=?2",
+            params![goal_id, threshold],
             |row| row.get(0),
         )?;
         if rounds >= goal.max_rounds_per_hour {
@@ -4592,13 +4595,30 @@ mod tests {
                 &serde_json::json!({}),
                 None,
                 0,
-                &now,
-                Some(&now),
+                "2026-08-03T01:00:00+00:00",
+                Some("2026-08-03T01:00:01+00:00"),
             )
             .unwrap();
         assert!(
             store
-                .goal_planning_allowed(&frequency_limited.goal_id, &now)
+                .goal_planning_allowed(&frequency_limited.goal_id, "2026-08-03T23:00:00+00:00")
+                .is_ok()
+        );
+        store
+            .record_planning_round(
+                &frequency_limited.goal_id,
+                "succeeded",
+                &serde_json::json!({}),
+                &serde_json::json!({}),
+                None,
+                0,
+                "2026-08-03T22:30:00+00:00",
+                Some("2026-08-03T22:30:01+00:00"),
+            )
+            .unwrap();
+        assert!(
+            store
+                .goal_planning_allowed(&frequency_limited.goal_id, "2026-08-03T23:00:00+00:00")
                 .is_err()
         );
         let failed = store.record_goal_failure(&goal.goal_id).unwrap();
