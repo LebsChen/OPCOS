@@ -65,7 +65,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path as FsPath, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::mpsc as std_mpsc;
@@ -932,6 +932,430 @@ async fn execute_github_pull_request_tool(
     )
 }
 
+fn github_repo_from_url(repo_url: &str) -> Result<String, String> {
+    let repo_url = repo_url.trim();
+    let path = if let Some((_, path)) = repo_url.split_once("github.com/") {
+        path
+    } else if let Some((_, path)) = repo_url.split_once("github.com:") {
+        path
+    } else {
+        return Err("bound project repository is not a GitHub repository".into());
+    };
+    let configured = path.trim_end_matches(".git").trim_matches('/');
+    if configured.is_empty() || !configured.contains('/') {
+        return Err("bound project repository has an invalid GitHub path".into());
+    }
+    Ok(configured.to_owned())
+}
+
+fn configured_github_repo(
+    store: &SqliteStore,
+    project_id: Option<&str>,
+    requested: &str,
+) -> Result<String, String> {
+    let project_id = project_id.ok_or("GitHub CI tools require a bound project")?;
+    let project = store
+        .load_project(project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or("GitHub CI tools require a bound project")?;
+    let configured = github_repo_from_url(&project.repo_url)?;
+    let requested = requested.trim().trim_matches('/');
+    if requested != configured {
+        return Err("requested repository is outside the bound project repository".into());
+    }
+    Ok(configured)
+}
+
+fn ci_classification(status: &str, conclusion: Option<&str>, detail: &str) -> &'static str {
+    let status = status.to_ascii_lowercase();
+    let conclusion = conclusion.unwrap_or_default().to_ascii_lowercase();
+    let detail = detail.to_ascii_lowercase();
+    if matches!(
+        status.as_str(),
+        "queued" | "requested" | "waiting" | "pending" | "in_progress"
+    ) {
+        return "running";
+    }
+    if [
+        "billing",
+        "runner",
+        "infrastructure",
+        "resource not accessible",
+        "permission",
+        "fork",
+        "startup",
+        "no available runner",
+        "workflow could not start",
+    ]
+    .iter()
+    .any(|term| detail.contains(term))
+    {
+        return "infrastructure_failure";
+    }
+    match conclusion.as_str() {
+        "success" => "success",
+        "cancelled" | "timed_out" | "startup_failure" | "action_required" => {
+            "infrastructure_failure"
+        }
+        "failure" | "error" => "code_failure",
+        "skipped" | "neutral" => "not_run",
+        "" => "indeterminate",
+        _ => "indeterminate",
+    }
+}
+
+fn ci_rate_limit(response: &reqwest::Response) -> Value {
+    let remaining = response
+        .headers()
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let reset_at = response
+        .headers()
+        .get("x-ratelimit-reset")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+        .and_then(|value| DateTime::<Utc>::from_timestamp(value, 0))
+        .map(|value| value.to_rfc3339());
+    let warning = remaining
+        .filter(|remaining| *remaining <= 10)
+        .map(|remaining| format!("GitHub API rate limit is low ({remaining} requests remaining)"));
+    json!({"remaining": remaining, "reset_at": reset_at, "warning": warning})
+}
+
+async fn github_ci_json(
+    http: &reqwest::Client,
+    token: &str,
+    url: &str,
+) -> Result<(Value, Value), String> {
+    let response = http
+        .get(url)
+        .header("User-Agent", "OPCOS/0.1")
+        .header("Accept", "application/vnd.github+json")
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|error| format!("GitHub CI request failed: {error}"))?;
+    let rate_limit = ci_rate_limit(&response);
+    if response.status() == reqwest::StatusCode::FORBIDDEN
+        && rate_limit.get("remaining") == Some(&json!(0))
+    {
+        return Err(format!(
+            "GitHub API rate limit exhausted; retry after {}",
+            rate_limit
+                .get("reset_at")
+                .and_then(Value::as_str)
+                .unwrap_or("the reset time")
+        ));
+    }
+    if !response.status().is_success() {
+        return Err(format!(
+            "GitHub CI request failed with HTTP {}",
+            response.status()
+        ));
+    }
+    response
+        .json()
+        .await
+        .map(|value| (value, rate_limit))
+        .map_err(|error| format!("GitHub CI response was invalid JSON: {error}"))
+}
+
+fn ci_elapsed_seconds(value: Option<&str>) -> Option<i64> {
+    let started = value.and_then(|value| DateTime::parse_from_rfc3339(value).ok())?;
+    Some(
+        (Utc::now() - started.with_timezone(&Utc))
+            .num_seconds()
+            .max(0),
+    )
+}
+
+fn select_ci_step_log(raw: &str, requested: Option<&str>) -> (String, bool) {
+    let Some(requested) = requested else {
+        return (raw.to_owned(), false);
+    };
+    let requested = requested.to_ascii_lowercase();
+    let mut selected = Vec::new();
+    let mut current = Vec::new();
+    let mut matched = false;
+    for line in raw.lines() {
+        if line.contains("##[group]") || line.contains("##[section]") {
+            current.clear();
+            matched = line.to_ascii_lowercase().contains(&requested);
+        }
+        if matched {
+            current.push(line);
+        }
+        if matched && line.contains("##[endgroup]") {
+            selected = current;
+            break;
+        }
+    }
+    if selected.is_empty() {
+        (raw.to_owned(), false)
+    } else {
+        (selected.join("\n"), true)
+    }
+}
+
+async fn execute_github_ci_status(
+    secrets: &KeyringSecretStore,
+    project_id: Option<&str>,
+    store: &SqliteStore,
+    arguments: &Value,
+) -> Result<Value, String> {
+    let requested_repo = git_string_argument(arguments, "repo")?;
+    let repo = configured_github_repo(store, project_id, &requested_repo)?;
+    let token = scoped_secret_get_from_store(secrets, project_id, "connector-token", "github")?
+        .ok_or("GitHub connector credential is not configured")?;
+    let http = reqwest::Client::new();
+    let sha = if let Some(number) = arguments.get("pull_request").and_then(Value::as_u64) {
+        let (pull, rate_limit) = github_ci_json(
+            &http,
+            &token,
+            &format!("https://api.github.com/repos/{repo}/pulls/{number}"),
+        )
+        .await?;
+        let sha = pull
+            .get("head")
+            .and_then(|value| value.get("sha"))
+            .and_then(Value::as_str)
+            .ok_or("GitHub pull request did not include a head commit")?
+            .to_owned();
+        (sha, rate_limit)
+    } else {
+        (git_string_argument(arguments, "commit")?, Value::Null)
+    };
+    let (checks, checks_rate) = github_ci_json(
+        &http,
+        &token,
+        &format!(
+            "https://api.github.com/repos/{repo}/commits/{}/check-runs?per_page=100",
+            sha.0
+        ),
+    )
+    .await?;
+    let (runs, runs_rate) = github_ci_json(
+        &http,
+        &token,
+        &format!(
+            "https://api.github.com/repos/{repo}/actions/runs?head_sha={}&per_page=100",
+            sha.0
+        ),
+    )
+    .await?;
+    let mut entries = Vec::new();
+    if let Some(checks) = checks.get("check_runs").and_then(Value::as_array) {
+        for check in checks {
+            let status = check.get("status").and_then(Value::as_str).unwrap_or("");
+            let conclusion = check.get("conclusion").and_then(Value::as_str);
+            let detail = format!(
+                "{} {} {} {}",
+                check.get("name").and_then(Value::as_str).unwrap_or(""),
+                check
+                    .get("output")
+                    .and_then(|value| value.get("title"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                check
+                    .get("output")
+                    .and_then(|value| value.get("summary"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                check
+                    .get("output")
+                    .and_then(|value| value.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            );
+            entries.push(json!({
+                "name": check.get("name"),
+                "status": status,
+                "conclusion": conclusion,
+                "classification": ci_classification(status, conclusion, &detail),
+                "details_url": check.get("details_url"),
+            }));
+        }
+    }
+    if let Some(runs) = runs.get("workflow_runs").and_then(Value::as_array) {
+        for run in runs {
+            let status = run.get("status").and_then(Value::as_str).unwrap_or("");
+            let conclusion = run.get("conclusion").and_then(Value::as_str);
+            let detail = format!(
+                "{} {} {}",
+                run.get("name").and_then(Value::as_str).unwrap_or(""),
+                run.get("failure_reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                run.get("run_started_at")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            );
+            entries.push(json!({
+                "name": run.get("name"),
+                "run_id": run.get("id"),
+                "status": status,
+                "conclusion": conclusion,
+                "classification": ci_classification(status, conclusion, &detail),
+                "elapsed_seconds": ci_elapsed_seconds(run.get("run_started_at").and_then(Value::as_str)),
+                "html_url": run.get("html_url"),
+            }));
+        }
+    }
+    let classifications = entries
+        .iter()
+        .filter_map(|entry| entry.get("classification").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    let overall = if classifications.contains(&"running") {
+        "running"
+    } else if classifications.contains(&"code_failure") {
+        "code_failure"
+    } else if classifications.contains(&"infrastructure_failure") {
+        "infrastructure_failure"
+    } else if classifications.contains(&"indeterminate") {
+        "indeterminate"
+    } else if classifications.contains(&"success") && !classifications.is_empty() {
+        "success"
+    } else {
+        "not_run"
+    };
+    let next_query_seconds = (overall == "running").then_some(30);
+    Ok(json!({
+        "status": "ok",
+        "repo": repo,
+        "commit": sha.0,
+        "overall": overall,
+        "checks": entries,
+        "next_query_after_seconds": next_query_seconds,
+        "rate_limit": {"checks": checks_rate, "runs": runs_rate, "pull_request": sha.1},
+    }))
+}
+
+async fn execute_github_ci_failure_log(
+    secrets: &KeyringSecretStore,
+    project_id: Option<&str>,
+    store: &SqliteStore,
+    arguments: &Value,
+) -> Result<Value, String> {
+    let requested_repo = git_string_argument(arguments, "repo")?;
+    let repo = configured_github_repo(store, project_id, &requested_repo)?;
+    let token = scoped_secret_get_from_store(secrets, project_id, "connector-token", "github")?
+        .ok_or("GitHub connector credential is not configured")?;
+    let run_id = arguments
+        .get("run_id")
+        .and_then(Value::as_u64)
+        .ok_or("workflow run id is required")?;
+    let http = reqwest::Client::new();
+    let (jobs, _rate_limit) = github_ci_json(
+        &http,
+        &token,
+        &format!("https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs?per_page=100"),
+    )
+    .await?;
+    let requested_job = arguments.get("job_id").and_then(Value::as_u64);
+    let job = jobs
+        .get("jobs")
+        .and_then(Value::as_array)
+        .and_then(|jobs| {
+            requested_job
+                .and_then(|id| jobs.iter().find(|job| job.get("id") == Some(&json!(id))))
+                .or_else(|| {
+                    jobs.iter().find(|job| {
+                        matches!(
+                            job.get("conclusion").and_then(Value::as_str),
+                            Some("failure" | "timed_out" | "cancelled")
+                        )
+                    })
+                })
+        })
+        .ok_or("no failed job was found for this workflow run")?;
+    let job_id = job
+        .get("id")
+        .and_then(Value::as_u64)
+        .ok_or("GitHub job did not include an id")?;
+    let log_http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| format!("GitHub job log client setup failed: {error}"))?;
+    let response = log_http
+        .get(format!(
+            "https://api.github.com/repos/{repo}/actions/jobs/{job_id}/logs"
+        ))
+        .header("User-Agent", "OPCOS/0.1")
+        .header("Accept", "application/vnd.github+json")
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|error| format!("GitHub job log request failed: {error}"))?;
+    let rate = ci_rate_limit(&response);
+    let response = if response.status().is_redirection() {
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|value| value.to_str().ok())
+            .ok_or("GitHub job log response did not include a download URL")?;
+        log_http
+            .get(location)
+            .send()
+            .await
+            .map_err(|error| format!("GitHub job log download failed: {error}"))?
+    } else {
+        response
+    };
+    if !response.status().is_success() {
+        return Err(format!(
+            "GitHub job log request failed with HTTP {}",
+            response.status()
+        ));
+    }
+    let archive = response
+        .bytes()
+        .await
+        .map_err(|error| format!("GitHub job log response failed: {error}"))?;
+    let requested_step = arguments.get("step").and_then(Value::as_str);
+    let raw = if let Ok(mut zip) = zip::ZipArchive::new(Cursor::new(archive.clone())) {
+        let mut raw = String::new();
+        for index in 0..zip.len() {
+            let mut file = zip
+                .by_index(index)
+                .map_err(|error| format!("GitHub job log archive read failed: {error}"))?;
+            let name = file.name().to_owned();
+            let mut content = String::new();
+            file.read_to_string(&mut content)
+                .map_err(|error| format!("GitHub job log was not UTF-8: {error}"))?;
+            raw.push_str(&format!("== {name} ==\n{content}"));
+        }
+        raw
+    } else {
+        String::from_utf8(archive.to_vec())
+            .map_err(|_| "GitHub job logs were neither a valid archive nor UTF-8 text".to_owned())?
+    };
+    let (selected_raw, step_located) = select_ci_step_log(&raw, requested_step);
+    let offset = arguments.get("offset").and_then(Value::as_u64).unwrap_or(0);
+    let limit = arguments
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(200);
+    let tail = arguments
+        .get("tail")
+        .and_then(Value::as_bool)
+        .unwrap_or(arguments.get("offset").is_none());
+    let (text, metadata) = bounded_output_segment(&selected_raw, Some(offset), Some(limit), tail);
+    Ok(json!({
+        "status": "ok",
+        "repo": repo,
+        "run_id": run_id,
+        "job_id": job_id,
+        "job_name": job.get("name"),
+        "step_requested": requested_step,
+        "step_located": step_located,
+        "selection_note": if requested_step.is_some() && !step_located { "requested step was not located; returning bounded job tail" } else { "returning bounded job log" },
+        "text": text,
+        "metadata": metadata,
+        "rate_limit": rate,
+    }))
+}
+
 async fn execute_index_tool(
     root: &FsPath,
     host_id: &str,
@@ -1165,6 +1589,56 @@ fn bounded_output_text(value: &str) -> (String, Value) {
             "omitted_before": start as u64,
             "omitted_after": 0,
             "truncated": start > 0,
+        }),
+    )
+}
+
+fn bounded_output_segment(
+    value: &str,
+    offset: Option<u64>,
+    limit: Option<u64>,
+    tail: bool,
+) -> (String, Value) {
+    if offset.is_none() && limit.is_none() && tail {
+        return bounded_output_text(value);
+    }
+    let lines = value.lines().collect::<Vec<_>>();
+    let total_lines = lines.len() as u64;
+    let total_bytes = value.len() as u64;
+    let limit = limit.unwrap_or(200).clamp(1, 1000) as usize;
+    let start = if tail {
+        lines.len().saturating_sub(limit)
+    } else {
+        offset.unwrap_or(0).min(total_lines) as usize
+    };
+    let end = if tail {
+        lines.len()
+    } else {
+        (start + limit).min(lines.len())
+    };
+    let mut selected_start = start;
+    let mut selected_end = end;
+    while selected_start < selected_end
+        && lines[selected_start..selected_end].join("\n").len() > INLINE_SHELL_OUTPUT_LIMIT_BYTES
+    {
+        if tail {
+            selected_start += 1;
+        } else {
+            selected_end -= 1;
+        }
+    }
+    let output_end = if tail { end } else { selected_end };
+    let text = lines[selected_start..output_end].join("\n");
+    (
+        text,
+        json!({
+            "total_bytes": total_bytes,
+            "total_lines": total_lines,
+            "start_line": selected_start as u64,
+            "end_line": output_end as u64,
+            "omitted_before": selected_start as u64,
+            "omitted_after": (total_lines as usize - output_end) as u64,
+            "truncated": selected_start > 0 || output_end < lines.len(),
         }),
     )
 }
@@ -1965,6 +2439,24 @@ impl ToolExecutor for RemoteExecutor {
                 )
                 .await
             }
+            "github_ci_status" => {
+                execute_github_ci_status(
+                    &self.secrets,
+                    self.project_id.as_deref(),
+                    &self.store,
+                    &arguments,
+                )
+                .await
+            }
+            "github_ci_failure_log" => {
+                execute_github_ci_failure_log(
+                    &self.secrets,
+                    self.project_id.as_deref(),
+                    &self.store,
+                    &arguments,
+                )
+                .await
+            }
             "linear_get_issue"
             | "linear_list_my_issues"
             | "linear_comment_issue"
@@ -2149,6 +2641,24 @@ impl ToolExecutor for DesktopExecutor {
                             &executor.store,
                             &executor.session_id,
                             name,
+                            &arguments,
+                        )
+                        .await
+                    }
+                    "github_ci_status" => {
+                        execute_github_ci_status(
+                            &executor.secrets,
+                            executor.project_id.as_deref(),
+                            &executor.store,
+                            &arguments,
+                        )
+                        .await
+                    }
+                    "github_ci_failure_log" => {
+                        execute_github_ci_failure_log(
+                            &executor.secrets,
+                            executor.project_id.as_deref(),
+                            &executor.store,
                             &arguments,
                         )
                         .await
@@ -6248,6 +6758,8 @@ async fn engine_for(
                 "github_list_repositories".to_owned(),
                 "github_list_issues".to_owned(),
                 "github_create_issue".to_owned(),
+                "github_ci_status".to_owned(),
+                "github_ci_failure_log".to_owned(),
             ]);
         }
         if connector_tools_enabled["telegram"] {
@@ -17177,6 +17689,74 @@ mod m7_tests {
         assert!(!remote_background_supported(&["exec".into()]));
         assert!(remote_background_supported(&["pty".into()]));
         assert!(remote_background_supported(&["process_stream".into()]));
+    }
+
+    #[test]
+    fn ci_states_separate_code_failures_from_infrastructure_and_unknowns() {
+        assert_eq!(
+            ci_classification("completed", Some("failure"), "cargo test"),
+            "code_failure"
+        );
+        assert_eq!(
+            ci_classification("completed", Some("failure"), "billing blocked"),
+            "infrastructure_failure"
+        );
+        assert_eq!(
+            ci_classification("completed", Some("timed_out"), ""),
+            "infrastructure_failure"
+        );
+        assert_eq!(
+            ci_classification("completed", Some("cancelled"), ""),
+            "infrastructure_failure"
+        );
+        assert_eq!(
+            ci_classification("completed", Some("failure"), "runner failed to start"),
+            "infrastructure_failure"
+        );
+        assert_eq!(ci_classification("queued", None, ""), "running");
+        assert_eq!(ci_classification("completed", None, ""), "indeterminate");
+    }
+
+    #[test]
+    fn ci_repository_scope_accepts_only_the_bound_github_repository() {
+        assert_eq!(
+            github_repo_from_url("https://github.com/LebsChen/OPCOS.git").unwrap(),
+            "LebsChen/OPCOS"
+        );
+        assert_eq!(
+            github_repo_from_url("git@github.com:LebsChen/OPCOS.git").unwrap(),
+            "LebsChen/OPCOS"
+        );
+        assert!(github_repo_from_url("https://gitlab.com/LebsChen/OPCOS").is_err());
+    }
+
+    #[test]
+    fn ci_log_segments_report_tail_and_offset_metadata() {
+        let input = (0..20)
+            .map(|index| format!("line-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (tail, tail_metadata) = bounded_output_segment(&input, None, Some(3), true);
+        assert_eq!(tail, "line-17\nline-18\nline-19");
+        assert_eq!(tail_metadata["omitted_before"], 17);
+        assert_eq!(tail_metadata["omitted_after"], 0);
+        let (middle, middle_metadata) = bounded_output_segment(&input, Some(5), Some(4), false);
+        assert_eq!(middle, "line-5\nline-6\nline-7\nline-8");
+        assert_eq!(middle_metadata["start_line"], 5);
+        assert_eq!(middle_metadata["end_line"], 9);
+        assert_eq!(middle_metadata["omitted_before"], 5);
+        assert_eq!(middle_metadata["omitted_after"], 11);
+    }
+
+    #[test]
+    fn ci_step_selection_reports_when_a_step_was_not_located() {
+        let input = "##[group]Run cargo test\nfailure\n##[endgroup]\n";
+        let (selected, located) = select_ci_step_log(input, Some("cargo test"));
+        assert!(located);
+        assert!(selected.contains("failure"));
+        let (fallback, located) = select_ci_step_log(input, Some("npm test"));
+        assert!(!located);
+        assert_eq!(fallback, input);
     }
 
     #[test]

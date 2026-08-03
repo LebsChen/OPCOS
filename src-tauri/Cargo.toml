@@ -39,3 +39,4 @@ opcos-mcp = { path = "../crates/opcos-mcp" }
 opcos-store = { path = "../crates/opcos-store" }
 url.workspace = true
 uuid.workspace = true
+zip.workspace = true
