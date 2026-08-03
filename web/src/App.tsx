@@ -2336,24 +2336,59 @@ function ReviewView({
           <div>
             <h3>{translate("Changed files")}</h3>
             {changes.map((change) => {
-              const value =
-                typeof change === "string" ? change : JSON.stringify(change);
+              const file =
+                typeof change === "object" &&
+                change !== null &&
+                !Array.isArray(change)
+                  ? (change as {
+                      path?: unknown;
+                      additions?: unknown;
+                      deletions?: unknown;
+                      changeType?: unknown;
+                    })
+                  : null;
+              const path =
+                typeof file?.path === "string"
+                  ? file.path
+                  : typeof change === "string"
+                    ? change
+                    : "";
+              if (!path) return null;
+              const additions =
+                typeof file?.additions === "number" ? file.additions : null;
+              const deletions =
+                typeof file?.deletions === "number" ? file.deletions : null;
+              const changeType =
+                typeof file?.changeType === "string" ? file.changeType : null;
               return (
                 <button
                   className="file-row"
-                  key={value}
+                  key={path}
                   onClick={() =>
                     command<Record<string, unknown>>("review_file_diff", {
                       sessionId: selected.id,
                       cwd,
-                      path: value,
+                      path,
                       base,
                     })
                       .then(setDiff)
                       .catch(onError)
                   }
                 >
-                  {value}
+                  <span className="file-row-path" title={path}>
+                    {path}
+                  </span>
+                  {(changeType || additions !== null || deletions !== null) && (
+                    <span className="file-row-meta">
+                      {changeType || ""}
+                      {additions !== null && (
+                        <span className="diff-add"> +{additions}</span>
+                      )}
+                      {deletions !== null && (
+                        <span className="diff-del"> -{deletions}</span>
+                      )}
+                    </span>
+                  )}
                 </button>
               );
             })}

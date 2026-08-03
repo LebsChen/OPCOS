@@ -1589,7 +1589,9 @@ input.workspace-chip {
   min-height: 500px;
 }
 .file-row {
-  display: block;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
   width: 100%;
   padding: 8px;
   border: 0;
@@ -1598,8 +1600,17 @@ input.workspace-chip {
   color: var(--color-muted);
   text-align: left;
   overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
+}
+.file-row-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.file-row-meta {
+  flex: 0 0 auto;
+  color: var(--color-faint);
+  font-size: 0.78rem;
 }
 .file-row:hover {
   color: var(--color-ink);
