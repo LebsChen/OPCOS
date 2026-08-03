@@ -4865,9 +4865,15 @@ function SessionRightPanel({
     { id: "info", label: "Info", icon: "info" },
     { id: "artifacts", label: "Artifacts", icon: "file" },
     { id: "pr", label: "PR", icon: "branch" },
-    { id: "worklog", label: "Worklog", icon: "list" },
     { id: "insights", label: "Insights", icon: "sparkle" },
   ];
+  if (selected.host_id !== "local") {
+    informationTabs.splice(3, 0, {
+      id: "worklog",
+      label: "Worklog",
+      icon: "list",
+    });
+  }
   const workspaceTabs: Array<{
     id: typeof panelTab;
     label: string;
@@ -4877,12 +4883,15 @@ function SessionRightPanel({
     id: typeof panelTab;
     label: string;
     icon: RailIconName;
-  }> = [
-    { id: "terminal", label: "Shell", icon: "terminal" },
-    { id: "desktop", label: "Desktop", icon: "monitor" },
-    { id: "ide", label: "Web IDE", icon: "code" },
-    { id: "browser", label: "Browser", icon: "grid" },
-  ];
+  }> =
+    selected.host_id === "local"
+      ? []
+      : [
+          { id: "terminal", label: "Shell", icon: "terminal" },
+          { id: "desktop", label: "Desktop", icon: "monitor" },
+          { id: "ide", label: "Web IDE", icon: "code" },
+          { id: "browser", label: "Browser", icon: "grid" },
+        ];
   const tabs = [...informationTabs, ...workspaceTabs, ...remoteTabs];
   const workspaceTabIds: PanelTab[] = [
     "review",
@@ -6147,10 +6156,10 @@ function AppContent() {
                     </select>
                     <input
                       className="chip workspace-chip"
-                      title="远程 workspace"
+                      title="留空时使用默认本地 workspace"
                       value={homeWorkspace}
                       onChange={(event) => setHomeWorkspace(event.target.value)}
-                      placeholder="Workspace"
+                      placeholder="Workspace (默认 ~/OPCOS/workspaces/<id>)"
                     />
                     <span className="spacer" />
                     <SendButton

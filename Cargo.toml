@@ -30,6 +30,7 @@ aws-types = "1"
 aws-smithy-types = "1"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
 futures-util = "0.3"
 imap = "2.4.1"
 keyring = { version = "3", default-features = false, features = [

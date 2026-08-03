@@ -75,7 +75,7 @@ impl AnthropicProvider {
         for (name, value) in &self.config.headers {
             request = request.header(name, value);
         }
-        let response = request.send().await.map_err(ProviderError::Request)?;
+        let response = request.send().await.map_err(crate::request_error)?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
@@ -195,7 +195,7 @@ impl Provider for AnthropicProvider {
         let mut final_usage = None;
         let mut bytes = response.bytes_stream();
         while let Some(chunk) = bytes.next().await {
-            let chunk = chunk.map_err(ProviderError::Request)?;
+            let chunk = chunk.map_err(crate::request_error)?;
             for event in stream.push(&chunk) {
                 consume_event(
                     &event,

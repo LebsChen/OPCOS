@@ -152,8 +152,8 @@ impl fmt::Debug for ProviderConfig {
 
 #[derive(Debug, Error)]
 pub enum ProviderError {
-    #[error("provider request failed")]
-    Request(#[source] reqwest::Error),
+    #[error("provider request failed: {0}")]
+    Request(String),
     #[error("provider returned HTTP {status}: {message}")]
     Http { status: StatusCode, message: String },
     #[error("provider response was invalid: {0}")]
@@ -190,6 +190,10 @@ pub(crate) fn sanitize_secret(value: &str, secret: &str) -> String {
     }
 }
 
+pub(crate) fn request_error(error: reqwest::Error) -> ProviderError {
+    ProviderError::Request(sanitize_error(&error.to_string()))
+}
+
 pub(crate) fn classify_context_error(status: StatusCode, message: &str) -> Option<ProviderError> {
     let lower = message.to_ascii_lowercase();
     if status == StatusCode::PAYLOAD_TOO_LARGE
@@ -209,7 +213,7 @@ pub(crate) fn client(config: &ProviderConfig) -> Result<Client, ProviderError> {
         .timeout(std::time::Duration::from_secs(config.timeout_seconds))
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(ProviderError::Request)
+        .map_err(request_error)
 }
 
 pub(crate) fn apply_bearer_headers(

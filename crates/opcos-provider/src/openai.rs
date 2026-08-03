@@ -53,7 +53,7 @@ impl OpenAiProvider {
             let response = apply_bearer_headers(http.post(&url).json(&body), &self.config)
                 .send()
                 .await
-                .map_err(ProviderError::Request)?;
+                .map_err(crate::request_error)?;
             if response.status().is_success() {
                 return Ok(response);
             }
@@ -311,7 +311,7 @@ impl Provider for OpenAiProvider {
         let mut final_usage = None;
         let mut bytes = response.bytes_stream();
         while let Some(chunk) = bytes.next().await {
-            for event in decoder.push(&chunk.map_err(ProviderError::Request)?) {
+            for event in decoder.push(&chunk.map_err(crate::request_error)?) {
                 if event.data == "[DONE]" {
                     continue;
                 }

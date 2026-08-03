@@ -1313,6 +1313,25 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub fn update_session_workspace(
+        &self,
+        session_id: &str,
+        workspace: &str,
+    ) -> Result<(), StoreError> {
+        let changed = self
+            .connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "UPDATE sessions SET workspace=?1, updated_at=?2 WHERE session_id=?3",
+                params![workspace, Utc::now().to_rfc3339(), session_id],
+            )?;
+        if changed == 0 {
+            return Err(StoreError::SessionNotFound(session_id.into()));
+        }
+        Ok(())
+    }
+
     pub fn update_external_session_id(
         &self,
         session_id: &str,

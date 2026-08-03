@@ -54,6 +54,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path as FsPath, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1520,6 +1521,27 @@ fn session_for(state: &DesktopState, session_id: &str) -> Result<SessionRecord, 
         .ok_or_else(|| "session not found".to_owned())
 }
 
+fn local_workspace_path(session_id: &str) -> Result<String, String> {
+    let home = dirs::home_dir().ok_or_else(|| "home directory unavailable".to_owned())?;
+    let workspace = home.join("OPCOS").join("workspaces").join(session_id);
+    std::fs::create_dir_all(&workspace)
+        .map_err(|error| format!("local workspace unavailable: {error}"))?;
+    let workspace = workspace
+        .to_str()
+        .ok_or_else(|| "local workspace path is not valid UTF-8".to_owned())?
+        .to_owned();
+    Ok(workspace)
+}
+
+fn default_local_workspace(state: &DesktopState, session_id: &str) -> Result<String, String> {
+    let workspace = local_workspace_path(session_id)?;
+    state
+        .store
+        .update_session_workspace(session_id, &workspace)
+        .map_err(|error| error.to_string())?;
+    Ok(workspace)
+}
+
 fn session_status_payload(state: &DesktopState, session_id: &str) -> Value {
     session_status_payload_from_store(&state.store, session_id)
 }
@@ -1544,7 +1566,7 @@ fn session_host_id(state: &DesktopState, session_id: &str) -> Result<String, Str
 
 fn client_for(state: &DesktopState, host_id: &str) -> Result<HttpRvmClient, String> {
     if host_id == "local" {
-        return Err("本机 host 不支持该能力".into());
+        return Err("本机 host 不支持远程 RVM API；请使用本机等价能力或绑定远程主机".into());
     }
     let connection = state
         .database
@@ -1960,7 +1982,7 @@ async fn opencode_for(
     let workspace = if !session.workspace.is_empty() {
         session.workspace.clone()
     } else if session.host_id == "local" {
-        return Err("local OpenCode session requires an explicit workspace".into());
+        default_local_workspace(state, session_id)?
     } else {
         client_for(state, &session.host_id)?
             .health()
@@ -2022,7 +2044,7 @@ async fn engine_for(
     let resolved_workspace = if !session_workspace.is_empty() {
         session_workspace.clone()
     } else if host_id == "local" {
-        return Err("local session requires an explicit workspace directory".into());
+        default_local_workspace(state, session_id)?
     } else {
         client_for(state, &host_id)?
             .health()
@@ -2095,10 +2117,7 @@ async fn engine_for(
     .collect::<Result<HashMap<_, _>, _>>()?;
     let mcp_runtime = Arc::clone(&state.mcp);
     let (workspace, executor, remote_client, allowed_tools) = if host_id == "local" {
-        if session_workspace.is_empty() {
-            return Err("local session requires an explicit workspace directory".into());
-        }
-        let workspace = PathBuf::from(session_workspace);
+        let workspace = PathBuf::from(resolved_workspace.clone());
         let host = LocalHost::new(&workspace).map_err(|error| error.to_string())?;
         let _ = host.health().await.map_err(|error| error.to_string())?;
         let capabilities = host
@@ -2674,7 +2693,7 @@ fn save_host(
 #[tauri::command]
 fn host_binding(state: State<'_, DesktopState>, host_id: String) -> Result<String, String> {
     if host_id == "local" {
-        return Err("本机 host 不支持该能力".into());
+        return Err("本机 host 没有远程 RVM URL；无需绑定远程地址".into());
     }
     let connection = state
         .database
@@ -2802,6 +2821,13 @@ async fn start_surface(
         "cdp" => WsKind::Cdp,
         _ => return Err("unknown surface".into()),
     };
+    if host_id == "local" {
+        return Err(match kind {
+            WsKind::Pty => "本机 host 暂不支持远程 PTY，请使用本机内置终端能力".into(),
+            WsKind::Vnc => "本机 host 不支持 VNC/远程桌面，请绑定远程主机".into(),
+            WsKind::Cdp => "本机 host 不支持远程 CDP surface，请绑定远程主机".into(),
+        });
+    }
     let client = client_for(&state, &host_id)?;
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -2826,6 +2852,9 @@ async fn ide_bootstrap(
         return Err("IDE folder must be a vscode-remote URI".into());
     }
     let host_id = session_host_id(&state, &session_id)?;
+    if host_id == "local" {
+        return Err("本机 host 不支持远程 Web IDE，请绑定远程主机".into());
+    }
     client_for(&state, &host_id)?
         .ide_bootstrap(&folder_uri)
         .await
@@ -2841,6 +2870,9 @@ async fn start_ide_proxy(
     let host_id = session_host_id(&state, &session_id)?;
     if !folder_uri.starts_with("vscode-remote://") {
         return Err("IDE folder must be a vscode-remote URI".into());
+    }
+    if host_id == "local" {
+        return Err("本机 host 不支持远程 Web IDE，请绑定远程主机".into());
     }
     let client = client_for(&state, &host_id)?;
     let bootstrap = client
@@ -2908,9 +2940,11 @@ fn create_session(
     if !matches!(harness.as_str(), "builtin" | "opencode") {
         return Err(format!("unsupported harness: {harness}"));
     }
-    if host_id == "local" && workspace.as_deref().is_none_or(str::is_empty) {
-        return Err("local session requires an explicit workspace directory".into());
-    }
+    let workspace = if host_id == "local" && workspace.as_deref().is_none_or(str::is_empty) {
+        Some(local_workspace_path(&id)?)
+    } else {
+        workspace.filter(|value| !value.is_empty())
+    };
     let connection = state
         .database
         .lock()
@@ -3454,8 +3488,7 @@ async fn artifact_host(
     let host_id = session.host_id;
     if host_id == "local" {
         let workspace = if session.workspace.is_empty() {
-            std::env::current_dir()
-                .map_err(|error| format!("local workspace unavailable: {error}"))?
+            PathBuf::from(default_local_workspace(state, session_id)?)
         } else {
             PathBuf::from(session.workspace)
         };
@@ -3489,10 +3522,11 @@ async fn lifecycle_host(
     let session = session_for(state, session_id)?;
     let host_id = session.host_id;
     if host_id == "local" {
-        if session.workspace.is_empty() {
-            return Err("local lifecycle requires an explicit workspace directory".into());
-        }
-        let workspace = session.workspace;
+        let workspace = if session.workspace.is_empty() {
+            default_local_workspace(state, session_id)?
+        } else {
+            session.workspace
+        };
         let host = LocalHost::new(PathBuf::from(&workspace)).map_err(|error| error.to_string())?;
         host.health().await.map_err(|error| error.to_string())?;
         return Ok((Box::new(host), host_id, workspace));
@@ -4006,6 +4040,24 @@ async fn upload_text_attachment(
     let session = session_for(&state, &session_id)?;
     let host_id = session.host_id;
     let workspace = session.workspace;
+    if host_id == "local" {
+        let workspace = if workspace.is_empty() {
+            PathBuf::from(default_local_workspace(&state, &session_id)?)
+        } else {
+            PathBuf::from(workspace)
+        };
+        let host = LocalHost::new(&workspace).map_err(|error| error.to_string())?;
+        let path = host
+            .join(&format!(
+                ".opcos-upload-{}-{file_name}",
+                Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            ))
+            .map_err(|error| error.to_string())?;
+        host.write(&path, &content)
+            .await
+            .map_err(|error| error.to_string())?;
+        return Ok(path);
+    }
     let client = client_for(&state, &host_id)?;
     let workspace = if workspace.is_empty() {
         client
@@ -4791,6 +4843,9 @@ async fn export_assets(
     ids: Vec<String>,
 ) -> Result<usize, String> {
     let host_id = session_host_id(&state, &session_id)?;
+    if host_id == "local" {
+        return Err("本机资产导出尚未接入；请使用远程主机或在本机 workspace 中手动导出".into());
+    }
     let client = client_for(&state, &host_id)?;
     let health = client
         .health()
@@ -4858,6 +4913,9 @@ async fn import_assets(
     session_id: String,
 ) -> Result<AssetBundle, String> {
     let host_id = session_host_id(&state, &session_id)?;
+    if host_id == "local" {
+        return Err("本机资产导入尚未接入；请使用远程主机或在本机 workspace 中手动导入".into());
+    }
     let client = client_for(&state, &host_id)?;
     let health = client
         .health()
@@ -4973,6 +5031,9 @@ async fn discover_remote_assets(
     session_id: String,
 ) -> Result<AssetBundle, String> {
     let host_id = session_host_id(&state, &session_id)?;
+    if host_id == "local" {
+        return Err("本机资产发现尚未接入；请使用本地资产页面或绑定远程主机".into());
+    }
     let client = client_for(&state, &host_id)?;
     let workspace = if let Some(workspace) = session_workspace(&state, &session_id)? {
         workspace
@@ -4995,6 +5056,9 @@ async fn mcp_tools(
     session_id: String,
 ) -> Result<Vec<Value>, String> {
     let host_id = session_host_id(&state, &session_id)?;
+    if host_id == "local" {
+        return Err("本机 host 不提供远程 MCP tools；请绑定远程主机".into());
+    }
     let response = client_for(&state, &host_id)?
         .mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
         .await
@@ -7228,6 +7292,51 @@ async fn git_workflow(
         .await?;
     }
     let host_id = session_host_id(&state, &session_id)?;
+    if host_id == "local" {
+        let args = match operation.as_str() {
+            "branch" => vec![
+                "switch".to_owned(),
+                "-c".to_owned(),
+                git_branch_name(
+                    slug.as_deref().ok_or("branch slug is required")?,
+                    Utc::now().timestamp(),
+                )?,
+            ],
+            "add" => {
+                let files = files.ok_or("explicit files are required")?;
+                if files.is_empty() || files.iter().any(|path| path.trim().is_empty()) {
+                    return Err("explicit files are required".into());
+                }
+                let mut args = vec!["add".to_owned(), "--".to_owned()];
+                args.extend(files);
+                args
+            }
+            "commit" => vec![
+                "commit".to_owned(),
+                "-m".to_owned(),
+                message.ok_or("commit message is required")?,
+            ],
+            "push" => vec!["push".to_owned()],
+            _ => return Err("unsupported git operation".into()),
+        };
+        let command = args.join(" ");
+        reject_dangerous_git(&command)?;
+        let output = ProcessCommand::new("git")
+            .args(&args)
+            .current_dir(&cwd)
+            .output()
+            .map_err(|error| format!("本地 git 不可用: {error}"))?;
+        return Ok(json!({
+            "status": if output.status.success() { "ok" } else { "error" },
+            "result": {
+                "stdout": String::from_utf8_lossy(&output.stdout),
+                "stderr": String::from_utf8_lossy(&output.stderr),
+                "exit_code": output.status.code().unwrap_or(1),
+                "timed_out": false,
+                "cwd": cwd,
+            }
+        }));
+    }
     let client = client_for(&state, &host_id)?.with_workspace(cwd.clone());
     let command = match operation.as_str() {
         "branch" => git_branch_name(
@@ -7381,6 +7490,100 @@ async fn github_pull_request(
         .map_err(|error| error.to_string())
 }
 
+fn local_git_command(cwd: &str, args: &[&str]) -> Result<std::process::Output, String> {
+    ProcessCommand::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|error| format!("本地 git 不可用: {error}"))
+}
+
+fn local_git_status(cwd: &str) -> Result<Value, String> {
+    let output = local_git_command(cwd, &["status", "--porcelain=v1", "--branch"])?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines();
+    let branch_line = lines.next().unwrap_or("##");
+    let branch = branch_line
+        .strip_prefix("## ")
+        .unwrap_or(branch_line)
+        .split("...")
+        .next()
+        .unwrap_or("")
+        .to_owned();
+    let status_lines = lines.collect::<Vec<_>>();
+    let files = status_lines
+        .iter()
+        .filter(|line| line.len() >= 3)
+        .map(|line| {
+            json!({
+                "index": line.as_bytes().first().copied().unwrap_or(b' ') as char,
+                "worktree": line.as_bytes().get(1).copied().unwrap_or(b' ') as char,
+                "path": line[3..].to_owned(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let short_status = status_lines.join("\n");
+    let has_untracked = files.iter().any(|file| {
+        file.get("index").and_then(Value::as_str) == Some("?")
+            || file.get("worktree").and_then(Value::as_str) == Some("?")
+    });
+    let has_uncommitted = !files.is_empty();
+    Ok(json!({
+        "branch": branch,
+        "files": files,
+        "short_status": short_status,
+        "has_uncommitted": has_uncommitted,
+        "has_untracked": has_untracked,
+        "diff_count": files.len(),
+        "in_sync": !has_uncommitted,
+    }))
+}
+
+fn local_git_changes(cwd: &str, base: &str) -> Result<Value, String> {
+    let output = local_git_command(cwd, &["diff", "--numstat", base, "--"])?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    let branch_output = local_git_command(cwd, &["branch", "--show-current"])?;
+    let branch = String::from_utf8_lossy(&branch_output.stdout)
+        .trim()
+        .to_owned();
+    let files = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, '\t');
+            let additions = fields.next()?.parse::<i64>().ok()?;
+            let deletions = fields.next()?.parse::<i64>().ok()?;
+            let path = fields.next()?.to_owned();
+            Some(json!({
+                "path": path,
+                "changeType": "modified",
+                "additions": additions,
+                "deletions": deletions,
+            }))
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "base": base,
+        "branch": branch,
+        "files": files,
+    }))
+}
+
+fn local_git_file_diff(cwd: &str, path: &str, base: &str) -> Result<Value, String> {
+    if path.is_empty() || path.contains(['\0', '\n', '\r']) {
+        return Err("git file path is invalid".into());
+    }
+    let output = local_git_command(cwd, &["diff", base, "--", path])?;
+    Ok(json!({
+        "diff": String::from_utf8_lossy(&output.stdout),
+        "exit_code": output.status.code().unwrap_or(1),
+    }))
+}
+
 #[tauri::command]
 async fn review_snapshot(
     state: State<'_, DesktopState>,
@@ -7389,6 +7592,11 @@ async fn review_snapshot(
     base: String,
 ) -> Result<Value, String> {
     let host_id = session_host_id(&state, &session_id)?;
+    if host_id == "local" {
+        let status = local_git_status(&cwd)?;
+        let changes = local_git_changes(&cwd, &base)?;
+        return Ok(json!({"status":status,"changes":changes}));
+    }
     let client = client_for(&state, &host_id)?.with_workspace(cwd.clone());
     let status = client
         .git_status(&cwd)
@@ -7410,6 +7618,9 @@ async fn review_file_diff(
     base: String,
 ) -> Result<Value, String> {
     let host_id = session_host_id(&state, &session_id)?;
+    if host_id == "local" {
+        return local_git_file_diff(&cwd, &path, &base);
+    }
     client_for(&state, &host_id)?
         .with_workspace(cwd.clone())
         .git_file_diff(&cwd, &path, &base)
@@ -7425,6 +7636,9 @@ async fn session_worklog(
     limit: Option<u32>,
 ) -> Result<Value, String> {
     let host_id = session_host_id(&state, &session_id)?;
+    if host_id == "local" {
+        return Err("本机 host 不提供远程 worklog".into());
+    }
     let page = client_for(&state, &host_id)?
         .worklog_query(&after_id, limit.unwrap_or(200))
         .await

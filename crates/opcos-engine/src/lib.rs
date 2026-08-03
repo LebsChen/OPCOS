@@ -123,7 +123,7 @@ impl TurnHandle {
             .lock()
             .await
             .take()
-            .ok_or_else(|| HarnessError::TurnAlreadyAwaited)?;
+            .ok_or(HarnessError::TurnAlreadyAwaited)?;
         receiver.await.map_err(|_| HarnessError::TurnAbandoned)?
     }
 }
