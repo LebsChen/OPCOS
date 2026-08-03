@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 pub use opcos_rvm::ExecRequest;
@@ -6,6 +7,7 @@ use opcos_rvm::{
     Capabilities as RvmCapabilities, CommandResult, DirectoryListing, ExecResult, FileContent,
     Health, HttpRvmClient, RvmClient, RvmError, RvmWebSocket, WsKind, WsParams,
 };
+pub use opcos_rvm::{ComputerUseAction, ComputerUseResponse, ScreenBounds, Screenshot};
 pub use opcos_rvm::{DEFAULT_EXEC_TIMEOUT_SECONDS, LIFECYCLE_EXEC_TIMEOUT_SECONDS};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -254,6 +256,20 @@ pub trait Host: Send + Sync {
     async fn health(&self) -> Result<Health, HostError>;
     async fn capabilities(&self) -> Result<HostCapabilities, HostError>;
     async fn exec(&self, request: ExecRequest) -> Result<ExecResult, HostError>;
+    async fn screenshot(&self) -> Result<Screenshot, HostError> {
+        Err(HostError::Unsupported(
+            "host lacks screenshot capability".into(),
+        ))
+    }
+    async fn computer_use(
+        &self,
+        _action: ComputerUseAction,
+        _bounds: ScreenBounds,
+    ) -> Result<ComputerUseResponse, HostError> {
+        Err(HostError::Unsupported(
+            "host lacks computer-use capability".into(),
+        ))
+    }
     async fn spawn(&self, request: SpawnRequest) -> Result<Box<dyn HostProcess>, HostError>;
     async fn spawn_stdio(
         &self,
@@ -361,6 +377,13 @@ pub struct RvmHost {
     client: HttpRvmClient,
 }
 
+fn windows_clipboard_command(text: &str) -> String {
+    let encoded = BASE64.encode(text.as_bytes());
+    format!(
+        "powershell -NoProfile -NonInteractive -Command \"$b=[Convert]::FromBase64String('{encoded}'); Set-Clipboard -Value ([Text.Encoding]::UTF8.GetString($b))\""
+    )
+}
+
 impl RvmHost {
     pub fn new(id: impl Into<String>, workspace: impl Into<String>, client: HttpRvmClient) -> Self {
         Self {
@@ -389,6 +412,53 @@ impl Host for RvmHost {
 
     async fn exec(&self, request: ExecRequest) -> Result<ExecResult, HostError> {
         Ok(self.client.exec_sync(request).await?)
+    }
+
+    async fn screenshot(&self) -> Result<Screenshot, HostError> {
+        Ok(self.client.screenshot().await?)
+    }
+
+    async fn computer_use(
+        &self,
+        action: ComputerUseAction,
+        bounds: ScreenBounds,
+    ) -> Result<ComputerUseResponse, HostError> {
+        if let ComputerUseAction::Type { text } = &action
+            && self
+                .client
+                .health()
+                .await?
+                .platform
+                .as_deref()
+                .is_some_and(|platform| platform.eq_ignore_ascii_case("win32"))
+        {
+            let command = windows_clipboard_command(text);
+            let result = self
+                .client
+                .exec_sync(ExecRequest {
+                    command,
+                    cwd: None,
+                    timeout_seconds: DEFAULT_EXEC_TIMEOUT_SECONDS,
+                    session: None,
+                    env: None,
+                })
+                .await?;
+            if result.result.exit_code != 0 {
+                return Err(HostError::InvalidResponse(
+                    "Windows clipboard preparation failed".into(),
+                ));
+            }
+            return Ok(self
+                .client
+                .computer_use(
+                    ComputerUseAction::Key {
+                        key: "CTRL+V".into(),
+                    },
+                    bounds,
+                )
+                .await?);
+        }
+        Ok(self.client.computer_use(action, bounds).await?)
     }
 
     async fn spawn(&self, request: SpawnRequest) -> Result<Box<dyn HostProcess>, HostError> {
@@ -1404,6 +1474,15 @@ fn remote_capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_text_input_uses_encoded_clipboard_command() {
+        let text = "hello world 123 '中文'";
+        let command = windows_clipboard_command(text);
+        assert!(command.contains("Set-Clipboard"));
+        assert!(!command.contains(text));
+        assert!(command.contains("FromBase64String"));
+    }
 
     #[test]
     fn remote_spawn_env_line_does_not_contain_secret_value() {

@@ -23,14 +23,17 @@ use opcos_assets::{
 use opcos_engine::{
     AcpHarness, AcpHarnessConfig, AgentEngine, EngineError, Harness, OpenCodeHarness,
     OpenCodeHarnessConfig, SessionRecorder, ToolExecutor, TurnEngine,
+    computer_use::{
+        ComputerUseLoopConfig, ComputerUseStep, ScreenshotChangedVerifier, run_computer_use_loop,
+    },
     event_bus::{EventEffect, dispatch_event},
     orchestration::{BoardPhase, BoardTask},
     orchestration::{CoordinationRuntime, Envelope, Role},
     planner::{parse_planner_output, planner_dedup_key, planning_prompt},
 };
 use opcos_hosts::{
-    DEFAULT_EXEC_TIMEOUT_SECONDS, Host, LIFECYCLE_EXEC_TIMEOUT_SECONDS, LifecycleStage, LocalHost,
-    RvmHost, execute_lifecycle_stage,
+    ComputerUseAction, DEFAULT_EXEC_TIMEOUT_SECONDS, Host, LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+    LifecycleStage, LocalHost, RvmHost, ScreenBounds, execute_lifecycle_stage,
 };
 use opcos_mcp::{
     McpCredentialStore, McpManager, McpServerConfig, qualified_tool_name, stable_server_key,
@@ -5836,6 +5839,134 @@ fn host_binding(state: State<'_, DesktopState>, host_id: String) -> Result<Strin
         .get(&secret_key("rvm-url", &host_id))
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "remote host URL is missing".into())
+}
+
+#[tauri::command]
+fn bind_account_host(
+    state: State<'_, DesktopState>,
+    account_id: String,
+    host_id: String,
+) -> Result<opcos_store::AccountHostBinding, String> {
+    if host_id == "local" {
+        return Err("computer-use accounts cannot bind to LocalHost".into());
+    }
+    client_for(&state, &host_id)?;
+    state
+        .store
+        .bind_account_host(&account_id, &host_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn account_host_bindings(
+    state: State<'_, DesktopState>,
+) -> Result<Vec<opcos_store::AccountHostBinding>, String> {
+    state
+        .store
+        .list_account_host_bindings()
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ComputerUseRequest {
+    account_id: String,
+    idempotency_key: String,
+    actions: Vec<ComputerUseAction>,
+    screen_width: u32,
+    screen_height: u32,
+    #[serde(default = "default_computer_use_steps")]
+    max_steps: usize,
+    #[serde(default = "default_computer_use_retries")]
+    max_retries_per_step: usize,
+    #[serde(default = "default_computer_use_timeout")]
+    timeout_seconds: u64,
+}
+
+fn default_computer_use_steps() -> usize {
+    20
+}
+
+fn default_computer_use_retries() -> usize {
+    2
+}
+
+fn default_computer_use_timeout() -> u64 {
+    60
+}
+
+#[tauri::command]
+async fn run_computer_use(
+    state: State<'_, DesktopState>,
+    request: ComputerUseRequest,
+) -> Result<Value, String> {
+    let binding = state
+        .store
+        .account_host_binding(&request.account_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "account has no bound remote host".to_owned())?;
+    if binding.host_id == "local" {
+        return Err("computer use cannot run on LocalHost".into());
+    }
+    let client = client_for(&state, &binding.host_id)?;
+    let host = RvmHost::new(binding.host_id.clone(), "/", client);
+    let action = state
+        .store
+        .begin_action(
+            "computer_use",
+            "remote_host",
+            &request.account_id,
+            &request.idempotency_key,
+            None,
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+    let action_id = match action {
+        ActionBeginResult::Fresh(record) => record.action_id,
+        ActionBeginResult::AlreadySucceeded { action_id, .. } => {
+            return Ok(json!({
+                "status": "already_succeeded",
+                "action_id": action_id,
+            }));
+        }
+        ActionBeginResult::InFlight { .. } => {
+            return Err("computer-use action is already in flight".into());
+        }
+        ActionBeginResult::PreviouslyFailed { action_id, .. } => action_id,
+    };
+    let config = ComputerUseLoopConfig {
+        max_steps: request.max_steps,
+        max_retries_per_step: request.max_retries_per_step,
+        total_timeout: std::time::Duration::from_secs(request.timeout_seconds),
+        screen_bounds: ScreenBounds {
+            width: request.screen_width,
+            height: request.screen_height,
+        },
+    };
+    let steps = request
+        .actions
+        .into_iter()
+        .map(|action| ComputerUseStep { action })
+        .collect::<Vec<_>>();
+    match run_computer_use_loop(&host, &steps, config, &ScreenshotChangedVerifier).await {
+        Ok(results) => {
+            let summary = format!("completed {} computer-use steps", results.len());
+            state
+                .store
+                .finish_action_succeeded(&action_id, None, Some(&summary))
+                .map_err(|error| error.to_string())?;
+            Ok(json!({
+                "status": "succeeded",
+                "action_id": action_id,
+                "host_id": binding.host_id,
+                "steps": results,
+            }))
+        }
+        Err(error) => {
+            let reason = error.to_string();
+            let _ = state.store.finish_action_failed(&action_id, &reason);
+            Err(reason)
+        }
+    }
 }
 
 #[tauri::command]
@@ -15466,6 +15597,9 @@ fn main() {
             list_hosts,
             save_host,
             host_binding,
+            bind_account_host,
+            account_host_bindings,
+            run_computer_use,
             test_host,
             delete_host,
             create_session,
