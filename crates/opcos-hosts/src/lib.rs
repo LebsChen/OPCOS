@@ -1014,6 +1014,7 @@ impl LocalHost {
             "shell_persistent",
             "process_stream",
             "stdio",
+            "lsp",
         ];
         let unavailable = [
             ("pty", "not implemented by the in-process LocalHost"),
@@ -1069,6 +1070,8 @@ impl Host for LocalHost {
                 "ls",
                 "shell_persistent",
                 "process_stream",
+                "stdio",
+                "lsp",
             ]
             .into_iter()
             .map(str::to_owned)
@@ -1793,6 +1796,7 @@ fn remote_capabilities(
         "browser",
         "lsp",
         "dap",
+        "remote_lsp_declared",
         "screenshot",
         "computer_use",
         "ide",
@@ -1805,16 +1809,33 @@ fn remote_capabilities(
         items: known
             .into_iter()
             .map(|name| {
-                let available = name != "stdio"
-                    && (capabilities.available.iter().any(|item| item == name)
-                    || (name == "process_stream"
-                        && capabilities.available.iter().any(|item| item == "pty")));
+                let advertised = capabilities.available.iter().any(|item| item == name);
+                let available = if name == "remote_lsp_declared" {
+                    capabilities.available.iter().any(|item| item == "lsp")
+                } else {
+                    name != "stdio"
+                        && name != "lsp"
+                        && (advertised
+                            || (name == "process_stream"
+                                && capabilities.available.iter().any(|item| item == "pty")))
+                };
                 Capability {
                     name: name.into(),
                     available,
                     source: "remote-probe".into(),
                     observed_at,
-                    reason: if name == "stdio" {
+                    reason: if name == "lsp" {
+                        Some(
+                            "disabled: remote host advertises lsp, but OPCOS has no structured remote LSP channel"
+                                .into(),
+                        )
+                    } else if name == "remote_lsp_declared" {
+                        capabilities
+                            .available
+                            .iter()
+                            .any(|item| item == "lsp")
+                            .then(|| "remote host advertised lsp; not usable by OPCOS".into())
+                    } else if name == "stdio" {
                         Some(
                             "disabled: RVM only exposes PTY/WebSocket streams, which are unsafe for structured stdio"
                                 .into(),
@@ -1879,6 +1900,41 @@ mod tests {
             Some(
                 "disabled: RVM only exposes PTY/WebSocket streams, which are unsafe for structured stdio"
             )
+        );
+    }
+
+    #[test]
+    fn remote_lsp_declaration_is_distinguished_from_opcos_support() {
+        let capabilities = remote_capabilities(
+            RvmCapabilities {
+                available: vec!["lsp".into(), "pty".into()],
+            },
+            Utc::now(),
+        );
+        let lsp = capabilities
+            .items
+            .iter()
+            .find(|item| item.name == "lsp")
+            .unwrap();
+        assert!(!lsp.available);
+        assert!(
+            lsp.reason
+                .as_deref()
+                .unwrap()
+                .contains("no structured remote LSP channel")
+        );
+        let declared = capabilities
+            .items
+            .iter()
+            .find(|item| item.name == "remote_lsp_declared")
+            .unwrap();
+        assert!(declared.available);
+        assert!(
+            declared
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("remote host advertised lsp")
         );
     }
     use std::fs;

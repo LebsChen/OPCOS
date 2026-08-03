@@ -42,6 +42,7 @@ use opcos_hosts::{
     LIFECYCLE_EXEC_TIMEOUT_SECONDS, LifecycleStage, LocalHost, RvmHost, ScreenBounds, SpawnRequest,
     execute_lifecycle_stage,
 };
+use opcos_lsp::LspSession;
 use opcos_mcp::{
     McpCredentialStore, McpManager, McpServerConfig, qualified_tool_name, stable_server_key,
 };
@@ -242,6 +243,7 @@ struct LocalExecutor {
     project_id: Option<String>,
     store: Arc<SqliteStore>,
     jobs: Arc<BackgroundJobManager>,
+    lsp: Arc<AsyncMutex<HashMap<String, LspSession>>>,
 }
 
 enum DesktopExecutor {
@@ -2192,6 +2194,78 @@ fn execute_plan_tool(
     }
 }
 
+async fn execute_lsp_tool(
+    host: Arc<dyn Host>,
+    sessions: &Arc<AsyncMutex<HashMap<String, LspSession>>>,
+    root: &str,
+    name: &str,
+    arguments: &Value,
+) -> Result<Value, String> {
+    let path = arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or("missing string argument: path")?;
+    let language = arguments
+        .get("language")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            std::path::Path::new(path)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .and_then(|extension| match extension {
+                    "rs" => Some("rust".to_owned()),
+                    "ts" | "tsx" => Some("typescript".to_owned()),
+                    "js" | "jsx" => Some("javascript".to_owned()),
+                    "py" => Some("python".to_owned()),
+                    _ => None,
+                })
+        })
+        .ok_or("could not detect language from path; provide language explicitly")?;
+    let key = format!("{language}:{root}");
+    let session = {
+        let mut active = sessions.lock().await;
+        if let Some(session) = active.get(&key) {
+            session.clone()
+        } else {
+            let session = LspSession::start(Arc::clone(&host), root.to_owned(), &language)
+                .await
+                .map_err(|error| error.to_string())?;
+            active.insert(key, session.clone());
+            session
+        }
+    };
+    match name {
+        "lsp_definition" | "lsp_references" => {
+            let line = arguments
+                .get("line")
+                .and_then(Value::as_u64)
+                .ok_or("missing integer argument: line")? as u32;
+            let character = arguments
+                .get("character")
+                .and_then(Value::as_u64)
+                .ok_or("missing integer argument: character")? as u32;
+            if name == "lsp_definition" {
+                session
+                    .definition(path, line, character)
+                    .await
+                    .map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
+            } else {
+                session
+                    .references(path, line, character)
+                    .await
+                    .map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
+            }
+        }
+        "lsp_diagnostics" => session
+            .diagnostics(path)
+            .await
+            .map(|value| serde_json::to_value(value).unwrap_or(Value::Null)),
+        _ => Err(opcos_lsp::LspError::Protocol("unknown LSP tool".into())),
+    }
+    .map_err(|error| error.to_string())
+}
+
 async fn run_goal_planner(
     app: &tauri::AppHandle,
     state: &DesktopState,
@@ -2586,6 +2660,15 @@ impl ToolExecutor for RemoteExecutor {
                 arguments,
             );
         }
+        if matches!(
+            name,
+            "lsp_definition" | "lsp_references" | "lsp_diagnostics"
+        ) {
+            return Err(
+                "structured LSP is unavailable on RVM hosts: the remote host exposes PTY streams but no structured stdio or LSP proxy"
+                    .into(),
+            );
+        }
         let argument = |key: &str| {
             arguments
                 .get(key)
@@ -2836,6 +2919,19 @@ impl ToolExecutor for DesktopExecutor {
                         name,
                         arguments,
                     );
+                }
+                if matches!(
+                    name,
+                    "lsp_definition" | "lsp_references" | "lsp_diagnostics"
+                ) {
+                    return execute_lsp_tool(
+                        Arc::new(executor.host.clone()),
+                        &executor.lsp,
+                        &executor.workspace,
+                        name,
+                        &arguments,
+                    )
+                    .await;
                 }
                 let argument = |key: &str| {
                     arguments
@@ -7023,6 +7119,13 @@ async fn engine_for(
             "plan_revise".to_owned(),
             "ask_user".to_owned(),
         ]);
+        if host_id == "local" {
+            allowed_tools.extend([
+                "lsp_definition".to_owned(),
+                "lsp_references".to_owned(),
+                "lsp_diagnostics".to_owned(),
+            ]);
+        }
         allowed_tools.extend([
             "repo_index_find_symbol".to_owned(),
             "repo_index_glob".to_owned(),
@@ -7098,6 +7201,7 @@ async fn engine_for(
                 project_id: session.project_id.clone(),
                 store: Arc::clone(&state.store),
                 jobs: Arc::clone(&state.jobs),
+                lsp: Arc::new(AsyncMutex::new(HashMap::new())),
             }))),
             None,
             Some(allowed_tools),

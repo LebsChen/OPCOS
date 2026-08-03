@@ -1468,6 +1468,7 @@ fn tool_risk(name: &str) -> ToolRisk {
         | "repo_index_search" => ToolRisk::Read,
         "plan_get" => ToolRisk::Read,
         "plan_update" | "plan_revise" => ToolRisk::Write,
+        "lsp_definition" | "lsp_references" | "lsp_diagnostics" => ToolRisk::Read,
         "action_ledger_list" => ToolRisk::Read,
         "action_ledger_begin" | "action_ledger_finish" => ToolRisk::Write,
         "work_queue_list" => ToolRisk::Read,
@@ -1904,6 +1905,9 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"plan_get","description":"Read the current persisted plan, ordered steps, statuses, failure or abandonment reasons, and revision number.","parameters":{"type":"object","properties":{}}}}),
         json!({"type":"function","function":{"name":"plan_update","description":"Update one plan step. Valid statuses are not_started, in_progress, done, failed, and abandoned. Abandoned steps require a reason and failed steps cannot silently become done.","parameters":{"type":"object","properties":{"step_id":{"type":"string"},"status":{"type":"string","enum":["not_started","in_progress","done","failed","abandoned"]},"description":{"type":"string"},"reason":{"type":"string"}},"required":["step_id"]}}}),
         json!({"type":"function","function":{"name":"plan_revise","description":"Revise the current plan with an explicit summary and optional additional ordered steps. Revisions are retained in plan history; steps are never physically deleted.","parameters":{"type":"object","properties":{"summary":{"type":"string"},"add_steps":{"type":"array","items":{"type":"string"}}},"required":["summary"]}}}),
+        json!({"type":"function","function":{"name":"lsp_definition","description":"Use the local language server to find definitions. Only LocalHost supports structured LSP; remote RVM hosts return an explicit unsupported error. Results may be incomplete while indexing, and incomplete results must not be treated as a complete answer.","parameters":{"type":"object","properties":{"language":{"type":"string"},"path":{"type":"string"},"line":{"type":"integer"},"character":{"type":"integer"}},"required":["path","line","character"]}}}),
+        json!({"type":"function","function":{"name":"lsp_references","description":"Use the local language server to find references. Results are bounded with honest truncation metadata and may be explicitly incomplete while indexing; an incomplete result is not proof that no references exist.","parameters":{"type":"object","properties":{"language":{"type":"string"},"path":{"type":"string"},"line":{"type":"integer"},"character":{"type":"integer"}},"required":["path","line","character"]}}}),
+        json!({"type":"function","function":{"name":"lsp_diagnostics","description":"Read diagnostics from the local language server. Diagnostics are synchronized after edits and stale document versions are rejected. Missing servers and remote structured-stdio hosts are explicit errors, not empty results.","parameters":{"type":"object","properties":{"language":{"type":"string"},"path":{"type":"string"}},"required":["path"]}}}),
         json!({"type":"function","function":{"name":"ask_user","description":"Ask the user a question and wait for an answer.","parameters":{"type":"object","properties":{"question":{"type":"string"}},"required":["question"]}}}),
         json!({"type":"function","function":{"name":"linear_get_issue","description":"Read a Linear issue by identifier. Read-only.","parameters":{"type":"object","properties":{"identifier":{"type":"string"}},"required":["identifier"]}}}),
         json!({"type":"function","function":{"name":"linear_list_my_issues","description":"List Linear issues assigned to the current user. Read-only.","parameters":{"type":"object","properties":{"limit":{"type":"integer"}}}}}),
@@ -2059,6 +2063,7 @@ mod tests {
                 tool.get("function")
                     .and_then(|function| function.get("name"))
                     .and_then(Value::as_str)
+                    .map(str::to_owned)
             })
             .collect::<HashSet<_>>();
         assert!(names.contains("read_file"));
@@ -2139,6 +2144,25 @@ mod tests {
                 .unwrap()
                 .contains("Prefer this over rewriting")
         );
+    }
+
+    #[test]
+    fn lsp_tools_are_read_only_and_explicitly_defined() {
+        for name in ["lsp_definition", "lsp_references", "lsp_diagnostics"] {
+            assert_eq!(tool_risk(name), ToolRisk::Read);
+        }
+        let names = tool_definitions()
+            .into_iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<HashSet<_>>();
+        assert!(names.contains("lsp_definition"));
+        assert!(names.contains("lsp_references"));
+        assert!(names.contains("lsp_diagnostics"));
     }
     #[derive(Clone)]
     struct FakeProvider;
