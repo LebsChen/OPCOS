@@ -26,6 +26,16 @@ pub struct ProviderDescriptor {
     pub openai_compatible: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DiscoveredModel {
+    pub id: String,
+    pub label: String,
+    pub provider: String,
+    pub capabilities: Caps,
+    pub capabilities_known: bool,
+    pub likely_non_chat: bool,
+}
+
 impl fmt::Debug for ProviderDescriptor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProviderDescriptor")
@@ -188,6 +198,17 @@ pub fn descriptors() -> Vec<ProviderDescriptor> {
             env_key: None,
             openai_compatible: true,
         },
+        ProviderDescriptor {
+            name: "lmstudio".into(),
+            title: "LM Studio (local models)".into(),
+            available: true,
+            needs_key: false,
+            default_base_url: Some("http://localhost:1234/v1".into()),
+            fields: vec![field("base_url", "LM Studio server URL", false, false)],
+            recommended_model: None,
+            env_key: None,
+            openai_compatible: true,
+        },
     ]
 }
 
@@ -301,6 +322,197 @@ pub async fn discover_models(
         .unwrap_or_default())
 }
 
+pub(crate) fn model_from_id(provider: &str, id: String) -> DiscoveredModel {
+    let canonical_id = matrix::canonical_model_id(provider, &id);
+    if let Some(entry) = matrix::models_for_provider(provider)
+        .into_iter()
+        .find(|entry| matrix::canonical_model_id(provider, entry.id) == canonical_id)
+    {
+        let likely_non_chat = is_likely_non_chat_model(&canonical_id);
+        return DiscoveredModel {
+            id: canonical_id,
+            label: entry.label.to_owned(),
+            provider: provider.to_owned(),
+            capabilities: entry.capabilities.clone(),
+            capabilities_known: true,
+            likely_non_chat,
+        };
+    }
+    let likely_non_chat = is_likely_non_chat_model(&canonical_id);
+    DiscoveredModel {
+        id: canonical_id.clone(),
+        label: canonical_id.clone(),
+        provider: provider.to_owned(),
+        capabilities: Caps::default(),
+        capabilities_known: false,
+        likely_non_chat,
+    }
+}
+
+fn is_likely_non_chat_model(id: &str) -> bool {
+    let normalized = id.to_ascii_lowercase();
+    [
+        "embedding",
+        "embed-",
+        "whisper",
+        "tts",
+        "dall-e",
+        "dalle",
+        "moderation",
+        "rerank",
+        "reranker",
+    ]
+    .iter()
+    .any(|family| normalized.contains(family))
+}
+
+pub(crate) fn sort_discovered_models(models: &mut [DiscoveredModel]) {
+    models.sort_by_key(|model| {
+        (
+            !model.capabilities_known,
+            model.likely_non_chat,
+            model.id.to_ascii_lowercase(),
+        )
+    });
+}
+
+fn parse_openai_models(provider: &str, body: &serde_json::Value) -> Vec<DiscoveredModel> {
+    let mut models = body
+        .get("data")
+        .and_then(|data| data.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|model| model.get("id").and_then(|id| id.as_str()))
+        .map(|id| model_from_id(provider, id.to_owned()))
+        .collect::<Vec<_>>();
+    sort_discovered_models(&mut models);
+    models
+}
+
+fn parse_anthropic_models(body: &serde_json::Value) -> Vec<DiscoveredModel> {
+    let mut models = body
+        .get("data")
+        .and_then(|data| data.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|model| model.get("id").and_then(|id| id.as_str()))
+        .map(|id| model_from_id("anthropic", id.to_owned()))
+        .collect::<Vec<_>>();
+    sort_discovered_models(&mut models);
+    models
+}
+
+fn parse_ollama_models(body: &serde_json::Value) -> Vec<DiscoveredModel> {
+    let mut models = body
+        .get("models")
+        .and_then(|models| models.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            model
+                .get("name")
+                .or_else(|| model.get("model"))
+                .and_then(|id| id.as_str())
+        })
+        .map(|id| model_from_id("ollama", id.to_owned()))
+        .collect::<Vec<_>>();
+    sort_discovered_models(&mut models);
+    models
+}
+
+fn models_endpoint(base_url: &str, provider: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    match provider {
+        "anthropic" if base.ends_with("/v1") => format!("{base}/models"),
+        "anthropic" => format!("{base}/v1/models"),
+        "ollama" => {
+            let base = base.strip_suffix("/v1").unwrap_or(base);
+            format!("{base}/api/tags")
+        }
+        _ => format!("{base}/models"),
+    }
+}
+
+async fn discover_http_models(
+    client: &Client,
+    provider: &str,
+    base_url: &str,
+    api_key: Option<&str>,
+) -> Result<Vec<DiscoveredModel>, String> {
+    let endpoint = models_endpoint(base_url, provider);
+    let mut request = client.get(endpoint);
+    if provider == "anthropic" {
+        request = request
+            .header("x-api-key", api_key.unwrap_or_default())
+            .header("anthropic-version", "2023-06-01");
+    } else if let Some(api_key) = api_key.filter(|key| !key.is_empty()) {
+        request = request.bearer_auth(api_key);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|_| "provider model discovery request failed".to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "provider model discovery returned HTTP {}",
+            response.status()
+        ));
+    }
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|_| "invalid model discovery response".to_string())?;
+    let models = if provider == "anthropic" {
+        parse_anthropic_models(&body)
+    } else if provider == "ollama" {
+        parse_ollama_models(&body)
+    } else {
+        parse_openai_models(provider, &body)
+    };
+    if models.is_empty() {
+        return Err("provider returned no models".into());
+    }
+    Ok(models)
+}
+
+pub async fn discover_provider_models(
+    client: &Client,
+    provider: &str,
+    base_url: Option<&str>,
+    api_key: Option<&str>,
+    region: Option<&str>,
+) -> Result<Vec<DiscoveredModel>, String> {
+    match provider {
+        "bedrock" => {
+            crate::bedrock::BedrockProvider::new(region.unwrap_or("us-east-1"))
+                .discover_models()
+                .await
+        }
+        "anthropic" => {
+            let base_url = base_url.ok_or_else(|| {
+                "provider base URL is not configured for model discovery".to_string()
+            })?;
+            discover_http_models(client, provider, base_url, api_key).await
+        }
+        "vertex" => Err("model discovery is unsupported for Vertex AI".into()),
+        _ => {
+            let descriptor = descriptors()
+                .into_iter()
+                .find(|descriptor| descriptor.name == provider)
+                .ok_or_else(|| "unknown provider".to_string())?;
+            if !descriptor.openai_compatible {
+                return Err(format!(
+                    "model discovery is unsupported for provider {provider}"
+                ));
+            }
+            let base_url = base_url.ok_or_else(|| {
+                "provider base URL is not configured for model discovery".to_string()
+            })?;
+            discover_http_models(client, provider, base_url, api_key).await
+        }
+    }
+}
+
 pub async fn verify_openai_compatible(
     client: &Client,
     base_url: &str,
@@ -344,6 +556,7 @@ pub fn capabilities(model: &str) -> Caps {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn compatible_provider_directory_has_official_defaults() {
@@ -376,6 +589,94 @@ mod tests {
             assert_eq!(descriptor.default_base_url.as_deref(), Some(base_url));
             assert!(descriptor.needs_key, "{name} should require an API key");
         }
+    }
+
+    #[test]
+    fn parses_openai_and_marks_unknown_capabilities_conservatively() {
+        let models = parse_openai_models(
+            "openai",
+            &serde_json::json!({"data":[{"id":"gpt-5.6-sol"},{"id":"vendor-new-model"}]}),
+        );
+        assert_eq!(models[0].id, "gpt-5.6-sol");
+        assert!(models[0].capabilities_known);
+        assert!(models[0].capabilities.tools);
+        assert_eq!(models[1].id, "vendor-new-model");
+        assert!(!models[1].capabilities_known);
+        assert!(!models[1].capabilities.tools);
+        assert!(!models[1].capabilities.vision);
+    }
+
+    #[test]
+    fn sorts_chat_models_first_and_marks_non_chat_families_without_dropping_unknowns() {
+        let models = parse_openai_models(
+            "openai",
+            &serde_json::json!({
+                "data": [
+                    {"id":"text-embedding-3-large"},
+                    {"id":"vendor-new-chat-model"},
+                    {"id":"gpt-4o"},
+                    {"id":"whisper-1"},
+                    {"id":"vendor-embedding-chat"}
+                ]
+            }),
+        );
+        assert_eq!(models[0].id, "gpt-4o");
+        assert!(!models[0].likely_non_chat);
+        assert_eq!(models[1].id, "vendor-new-chat-model");
+        assert!(!models[1].likely_non_chat);
+        let embedding = models
+            .iter()
+            .find(|model| model.id == "text-embedding-3-large")
+            .unwrap();
+        assert!(embedding.likely_non_chat);
+        assert!(
+            models
+                .iter()
+                .any(|model| model.id == "vendor-embedding-chat")
+        );
+        assert!(
+            models
+                .iter()
+                .find(|model| model.id == "vendor-embedding-chat")
+                .unwrap()
+                .likely_non_chat
+        );
+    }
+
+    #[test]
+    fn parses_anthropic_and_ollama_wire_shapes() {
+        let anthropic = parse_anthropic_models(
+            &serde_json::json!({"data":[{"id":"claude-new","display_name":"Claude New"}]}),
+        );
+        assert_eq!(anthropic[0].id, "claude-new");
+        assert_eq!(anthropic[0].provider, "anthropic");
+
+        let ollama = parse_ollama_models(
+            &serde_json::json!({"models":[{"name":"llama3.2:latest"},{"model":"qwen2.5"}]}),
+        );
+        assert_eq!(
+            ollama
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["llama3.2:latest", "qwen2.5"]
+        );
+    }
+
+    #[test]
+    fn provider_endpoints_use_provider_specific_paths() {
+        assert_eq!(
+            models_endpoint("https://api.anthropic.com", "anthropic"),
+            "https://api.anthropic.com/v1/models"
+        );
+        assert_eq!(
+            models_endpoint("http://localhost:11434/v1", "ollama"),
+            "http://localhost:11434/api/tags"
+        );
+        assert_eq!(
+            models_endpoint("http://localhost:1234/v1", "lmstudio"),
+            "http://localhost:1234/v1/models"
+        );
     }
 
     #[test]
@@ -414,5 +715,94 @@ mod tests {
             validate_extra_headers(&[("x-a".into(), "1".into()), ("X-A".into(), "2".into())])
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn discovery_uses_provider_auth_headers_and_parses_live_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let size = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..size]).to_ascii_lowercase();
+            assert!(request.contains("authorization: bearer test-key"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 31\r\n\r\n{\"data\":[{\"id\":\"vendor-live\"}]}",
+                )
+                .await
+                .unwrap();
+        });
+        let models = discover_provider_models(
+            &Client::new(),
+            "openai",
+            Some(&format!("http://{address}")),
+            Some("test-key"),
+            None,
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(models[0].id, "vendor-live");
+        assert!(!models[0].capabilities_known);
+    }
+
+    #[tokio::test]
+    async fn anthropic_discovery_uses_api_key_and_version_headers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let size = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..size]).to_ascii_lowercase();
+            assert!(request.contains("x-api-key: test-key"));
+            assert!(request.contains("anthropic-version: 2023-06-01"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 31\r\n\r\n{\"data\":[{\"id\":\"claude-live\"}]}",
+                )
+                .await
+                .unwrap();
+        });
+        let models = discover_provider_models(
+            &Client::new(),
+            "anthropic",
+            Some(&format!("http://{address}")),
+            Some("test-key"),
+            None,
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(models[0].id, "claude-live");
+    }
+
+    #[tokio::test]
+    async fn discovery_failure_does_not_include_api_key_in_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let error = discover_provider_models(
+            &Client::new(),
+            "openai",
+            Some(&format!("http://{address}")),
+            Some("sk-secret-test-key"),
+            None,
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+        assert!(!error.contains("sk-secret-test-key"));
+        assert!(error.contains("401"));
     }
 }

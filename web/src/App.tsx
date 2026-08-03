@@ -59,6 +59,28 @@ type ProviderDescriptor = {
   default_base_url?: string | null;
   recommended_model?: string | null;
 };
+type ProviderModelOption = {
+  id: string;
+  label: string;
+  provider: string;
+  capabilities: {
+    tools: boolean;
+    vision: boolean;
+    pdf: boolean;
+    parallel_tool_calls: boolean;
+    streaming: boolean;
+    context_window: number | null;
+  };
+  capabilities_known: boolean;
+  likely_non_chat: boolean;
+};
+type ProviderModelsResponse = {
+  models: ProviderModelOption[];
+  source: "live" | "fallback";
+  fallback_reason?: string | null;
+  discovered_at: string;
+  cache_hit: boolean;
+};
 type Asset = {
   id: string;
   kind: "agents" | "instructions" | "knowledge" | "playbook" | "skill" | string;
@@ -3047,7 +3069,10 @@ function ManageSections({
   >([]);
   const [environmentStatus, setEnvironmentStatus] = useState("");
   const [providerModelOptions, setProviderModelOptions] = useState<
-    Record<string, Array<{ id: string; label: string }>>
+    Record<string, ProviderModelsResponse>
+  >({});
+  const [showAllProviderModels, setShowAllProviderModels] = useState<
+    Record<string, boolean>
   >({});
   const [providerModels, setProviderModels] = useState<Record<string, string>>(
     {},
@@ -3328,12 +3353,9 @@ function ManageSections({
         async (item) =>
           [
             item.name,
-            await command<Array<{ id: string; label: string }>>(
-              "provider_models",
-              {
-                provider: item.name,
-              },
-            ),
+            await command<ProviderModelsResponse>("provider_models", {
+              provider: item.name,
+            }),
           ] as const,
       ),
     ).then((entries) => setProviderModelOptions(Object.fromEntries(entries)));
@@ -4146,14 +4168,63 @@ function ManageSections({
                           }))
                         }
                         options={(
-                          providerModelOptions[descriptor.name] || []
-                        ).map((item) => ({
-                          value: item.id,
-                          label: item.label,
-                        }))}
+                          providerModelOptions[descriptor.name]?.models || []
+                        )
+                          .filter(
+                            (item) =>
+                              showAllProviderModels[descriptor.name] ||
+                              !item.likely_non_chat,
+                          )
+                          .map((item) => ({
+                            value: item.id,
+                            label: `${item.label}${item.capabilities_known ? "" : " (能力未知)"}`,
+                          }))}
                       />
                     </label>
                   </div>
+                  {providerModelOptions[descriptor.name] && (
+                    <div className="flex items-center gap-2 mt-2 text-[11.5px] text-faint">
+                      <span>
+                        来源：
+                        {providerModelOptions[descriptor.name].source === "live"
+                          ? "API 实时发现"
+                          : `内置回退（${providerModelOptions[descriptor.name].fallback_reason || "未知原因"}）`}
+                        ，上次刷新：
+                        {providerModelOptions[descriptor.name].discovered_at}
+                      </span>
+                      {providerModelOptions[descriptor.name].models.some(
+                        (item) => item.likely_non_chat,
+                      ) && (
+                        <Button
+                          onClick={() =>
+                            setShowAllProviderModels((items) => ({
+                              ...items,
+                              [descriptor.name]: !items[descriptor.name],
+                            }))
+                          }
+                        >
+                          {showAllProviderModels[descriptor.name]
+                            ? "收起非对话模型"
+                            : "显示全部模型"}
+                        </Button>
+                      )}
+                      <Button
+                        onClick={() =>
+                          command<ProviderModelsResponse>("provider_models", {
+                            provider: descriptor.name,
+                            refresh: true,
+                          }).then((value) =>
+                            setProviderModelOptions((items) => ({
+                              ...items,
+                              [descriptor.name]: value,
+                            })),
+                          )
+                        }
+                      >
+                        刷新
+                      </Button>
+                    </div>
+                  )}
                   <div className="flex items-center gap-2 mt-4">
                     <Button
                       className="primary"
@@ -8546,9 +8617,8 @@ function AppContent() {
   const [assets, setAssets] = useState<Asset[]>([]);
   const [providers, setProviders] = useState<ProviderDescriptor[]>([]);
   const [secrets, setSecrets] = useState<SecretMetadata[]>([]);
-  const [models, setModels] = useState<Array<{ id: string; label: string }>>(
-    [],
-  );
+  const [models, setModels] = useState<ProviderModelOption[]>([]);
+  const [showAllHomeModels, setShowAllHomeModels] = useState(false);
   const [homeInput, setHomeInput] = useState("");
   const [homePlusOpen, setHomePlusOpen] = useState(false);
   const [homeAttachment, setHomeAttachment] = useState<File | null>(null);
@@ -8691,10 +8761,10 @@ function AppContent() {
       .catch(() => setHomeAgentTemplates([]));
   }, []);
   useEffect(() => {
-    void command<Array<{ id: string; label: string }>>("provider_models", {
-      provider: "openai",
+    void command<ProviderModelsResponse>("provider_models", {
+      provider: homeProvider || "openai",
     })
-      .then(setModels)
+      .then((response) => setModels(response.models))
       .catch((reason) => {
         if (
           (window as Window & { __TAURI_INTERNALS__?: unknown })
@@ -8702,7 +8772,7 @@ function AppContent() {
         )
           setError(errorMessage(reason));
       });
-  }, []);
+  }, [homeProvider]);
   useEffect(() => {
     const currentGeneration = ++generation.current;
     setTranscript([]);
@@ -9465,12 +9535,27 @@ function AppContent() {
                       onChange={(event) => setHomeModel(event.target.value)}
                     >
                       <option value="auto">Auto</option>
-                      {models.map((model) => (
-                        <option key={model.id} value={model.id}>
-                          {model.label}
-                        </option>
-                      ))}
+                      {models
+                        .filter(
+                          (model) =>
+                            showAllHomeModels || !model.likely_non_chat,
+                        )
+                        .map((model) => (
+                          <option key={model.id} value={model.id}>
+                            {model.label}
+                            {model.likely_non_chat ? " (非对话模型)" : ""}
+                          </option>
+                        ))}
                     </select>
+                    {models.some((model) => model.likely_non_chat) && (
+                      <button
+                        className="chip"
+                        type="button"
+                        onClick={() => setShowAllHomeModels((value) => !value)}
+                      >
+                        {showAllHomeModels ? "收起非对话" : "显示全部模型"}
+                      </button>
+                    )}
                     <select
                       className="chip"
                       title="模式"

@@ -8354,23 +8354,171 @@ fn provider_descriptors() -> Vec<registry::ProviderDescriptor> {
     registry::descriptors()
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ModelDescriptor {
     id: String,
     label: String,
     provider: String,
+    capabilities: opcos_provider::Caps,
+    capabilities_known: bool,
+    likely_non_chat: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ProviderModelsResponse {
+    models: Vec<ModelDescriptor>,
+    source: String,
+    fallback_reason: Option<String>,
+    discovered_at: String,
+    cache_hit: bool,
 }
 
 #[tauri::command]
-fn provider_models(provider: String) -> Vec<ModelDescriptor> {
-    opcos_provider::matrix::models_for_provider(&provider)
+async fn provider_models(
+    state: State<'_, DesktopState>,
+    provider: String,
+    refresh: Option<bool>,
+) -> Result<ProviderModelsResponse, String> {
+    const CACHE_TTL_SECONDS: i64 = 300;
+    let descriptor = registry::descriptors()
+        .into_iter()
+        .find(|item| item.name == provider)
+        .ok_or_else(|| "unknown provider".to_owned())?;
+    let configured_base_url = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        connection
+            .query_row(
+                "SELECT value FROM settings WHERE key=?1",
+                [format!("provider.base_url.{}", provider)],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .or(descriptor.default_base_url.clone())
+    };
+    let base_url = configured_base_url.unwrap_or_default();
+    let region = if provider == "bedrock" {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='provider.region.bedrock'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .or_else(|| std::env::var("AWS_REGION").ok())
+            .unwrap_or_else(|| "us-east-1".into())
+    } else {
+        String::new()
+    };
+    let cache_base_url = if provider == "bedrock" {
+        format!("aws://bedrock/{region}")
+    } else if base_url.is_empty() {
+        format!("unsupported://{provider}")
+    } else {
+        base_url.clone()
+    };
+    if !refresh.unwrap_or(false)
+        && let Some(cached) = state
+            .store
+            .model_discovery(&provider, &cache_base_url)
+            .map_err(|error| error.to_string())?
+        && cached.is_fresh(chrono::Utc::now(), CACHE_TTL_SECONDS)
+    {
+        let models = serde_json::from_str(&cached.models_json)
+            .map_err(|_| "cached model discovery is invalid".to_owned())?;
+        return Ok(ProviderModelsResponse {
+            models,
+            source: cached.source,
+            fallback_reason: cached.fallback_reason,
+            discovered_at: cached.discovered_at,
+            cache_hit: true,
+        });
+    }
+
+    let key = state
+        .secrets
+        .get(&secret_key("provider-key", &provider))
+        .map_err(|error| error.to_string())?;
+    let reason = if descriptor.needs_key && key.is_none() {
+        Some("provider key is not configured".to_owned())
+    } else {
+        None
+    };
+    let discovered = if let Some(reason) = reason {
+        Err(reason)
+    } else {
+        let client = reqwest::Client::new();
+        registry::discover_provider_models(
+            &client,
+            &provider,
+            (!base_url.is_empty()).then_some(base_url.as_str()),
+            key.as_deref(),
+            (!region.is_empty()).then_some(region.as_str()),
+        )
+        .await
+    };
+    let (models, source, fallback_reason) = match discovered {
+        Ok(models) => (models, "live".to_owned(), None),
+        Err(error) => (
+            registry::descriptors()
+                .into_iter()
+                .find(|item| item.name == provider)
+                .map(|_| {
+                    opcos_provider::matrix::models_for_provider(&provider)
+                        .into_iter()
+                        .map(|model| registry::DiscoveredModel {
+                            id: opcos_provider::matrix::canonical_model_id(
+                                model.provider,
+                                model.id,
+                            ),
+                            label: model.label.into(),
+                            provider: model.provider.into(),
+                            capabilities: model.capabilities.clone(),
+                            capabilities_known: true,
+                            likely_non_chat: false,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+            "fallback".to_owned(),
+            Some(error),
+        ),
+    };
+    let models = models
         .into_iter()
         .map(|model| ModelDescriptor {
-            id: opcos_provider::matrix::canonical_model_id(model.provider, model.id),
-            label: model.label.into(),
-            provider: model.provider.into(),
+            id: model.id,
+            label: model.label,
+            provider: model.provider,
+            capabilities: model.capabilities,
+            capabilities_known: model.capabilities_known,
+            likely_non_chat: model.likely_non_chat,
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let models_json = serde_json::to_string(&models).map_err(|error| error.to_string())?;
+    let cached = state
+        .store
+        .save_model_discovery(
+            &provider,
+            &cache_base_url,
+            &models_json,
+            &source,
+            fallback_reason.as_deref(),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(ProviderModelsResponse {
+        models,
+        source: cached.source,
+        fallback_reason: cached.fallback_reason,
+        discovered_at: cached.discovered_at,
+        cache_hit: false,
+    })
 }
 
 #[tauri::command]
@@ -15693,9 +15841,6 @@ async fn validate_provider_key(
     if descriptor.needs_key && key.is_none() {
         return Err("provider key is not configured".to_owned());
     }
-    if provider == "bedrock" || descriptor.default_base_url.is_none() {
-        return Ok(true);
-    }
     let configured_base_url = {
         let connection = state
             .database
@@ -15703,44 +15848,30 @@ async fn validate_provider_key(
             .map_err(|_| "database lock poisoned")?;
         connection
             .query_row(
-                "SELECT value FROM settings WHERE key='provider.base_url'",
-                [],
+                "SELECT value FROM settings WHERE key=?1",
+                [format!("provider.base_url.{}", provider)],
                 |row| row.get::<_, String>(0),
             )
             .ok()
     };
-    let base_url = std::env::var("OPCOS_PROVIDER_BASE_URL")
-        .ok()
-        .or(configured_base_url)
-        .or(descriptor.default_base_url)
-        .ok_or_else(|| {
-            "provider base URL is not configured; open Provider settings first".to_owned()
-        })?;
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let client = reqwest::Client::new();
-    let request = if provider == "anthropic" {
-        client
-            .get(url)
-            .header("x-api-key", key.as_deref().unwrap_or_default())
-    } else if let Some(key) = key {
-        client
-            .get(url)
-            .header("Authorization", format!("Bearer {key}"))
-    } else {
-        client.get(url)
-    };
-    let response = request
-        .send()
-        .await
-        .map_err(|_| "provider validation request failed".to_owned())?;
-    if response.status().is_success() {
-        Ok(true)
-    } else {
-        Err(format!(
-            "provider rejected the key with HTTP {}",
-            response.status()
-        ))
+    let base_url = configured_base_url.or(descriptor.default_base_url);
+    if provider == "vertex" {
+        return Err("model discovery is unsupported for Vertex AI".into());
     }
+    let region = if provider == "bedrock" {
+        std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into())
+    } else {
+        String::new()
+    };
+    registry::discover_provider_models(
+        &reqwest::Client::new(),
+        &provider,
+        base_url.as_deref(),
+        key.as_deref(),
+        (!region.is_empty()).then_some(region.as_str()),
+    )
+    .await
+    .map(|_| true)
 }
 
 fn main() {
