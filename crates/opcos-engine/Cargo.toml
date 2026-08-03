@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+agent-client-protocol.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 futures-util.workspace = true

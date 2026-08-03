@@ -82,6 +82,13 @@ pub enum ProcessEvent {
     Exited(Option<i32>),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum StdioEvent {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    Exited(Option<i32>),
+}
+
 #[async_trait]
 pub trait HostProcess: Send {
     async fn next_event(&mut self) -> Result<Option<ProcessEvent>, HostError>;
@@ -96,6 +103,56 @@ struct LocalProcess {
     events: mpsc::Receiver<Result<ProcessEvent, HostError>>,
     stdin: ChildStdin,
     kill: Option<oneshot::Sender<()>>,
+}
+
+#[async_trait]
+pub trait HostStdioProcess: Send + Sync {
+    async fn next_event(&self) -> Result<Option<StdioEvent>, HostError>;
+    async fn write_stdin(&self, input: &[u8]) -> Result<(), HostError>;
+    async fn interrupt(&self) -> Result<(), HostError>;
+    async fn shutdown(&mut self) -> Result<(), HostError> {
+        self.interrupt().await
+    }
+}
+
+struct LocalStdioProcess {
+    events: Mutex<mpsc::Receiver<Result<StdioEvent, HostError>>>,
+    stdin: Mutex<ChildStdin>,
+    kill: Mutex<Option<oneshot::Sender<()>>>,
+}
+
+#[async_trait]
+impl HostStdioProcess for LocalStdioProcess {
+    async fn next_event(&self) -> Result<Option<StdioEvent>, HostError> {
+        match self.events.lock().await.recv().await {
+            Some(event) => event.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn write_stdin(&self, input: &[u8]) -> Result<(), HostError> {
+        let mut stdin = self.stdin.lock().await;
+        stdin.write_all(input).await?;
+        stdin.flush().await?;
+        Ok(())
+    }
+
+    async fn interrupt(&self) -> Result<(), HostError> {
+        if let Some(kill) = self.kill.lock().await.take() {
+            let _ = kill.send(());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for LocalStdioProcess {
+    fn drop(&mut self) {
+        if let Ok(mut kill_sender) = self.kill.try_lock()
+            && let Some(kill) = kill_sender.take()
+        {
+            let _ = kill.send(());
+        }
+    }
 }
 
 #[async_trait]
@@ -198,6 +255,14 @@ pub trait Host: Send + Sync {
     async fn capabilities(&self) -> Result<HostCapabilities, HostError>;
     async fn exec(&self, request: ExecRequest) -> Result<ExecResult, HostError>;
     async fn spawn(&self, request: SpawnRequest) -> Result<Box<dyn HostProcess>, HostError>;
+    async fn spawn_stdio(
+        &self,
+        _request: SpawnRequest,
+    ) -> Result<Box<dyn HostStdioProcess>, HostError> {
+        Err(HostError::Unsupported(
+            "host lacks structured stdio process capability".into(),
+        ))
+    }
     async fn read(&self, path: &str) -> Result<FileContent, HostError>;
     async fn write(&self, path: &str, content: &str) -> Result<Value, HostError>;
     async fn ls(&self, path: Option<&str>) -> Result<DirectoryListing, HostError>;
@@ -391,6 +456,15 @@ impl Host for RvmHost {
         }))
     }
 
+    async fn spawn_stdio(
+        &self,
+        _request: SpawnRequest,
+    ) -> Result<Box<dyn HostStdioProcess>, HostError> {
+        Err(HostError::Unsupported(
+            "RVM host exposes PTY process streams, not structured stdio".into(),
+        ))
+    }
+
     async fn read(&self, path: &str) -> Result<FileContent, HostError> {
         Ok(self.client.read(path).await?)
     }
@@ -507,6 +581,7 @@ impl LocalHost {
             "ls",
             "shell_persistent",
             "process_stream",
+            "stdio",
         ];
         let unavailable = [
             ("pty", "not implemented by the in-process LocalHost"),
@@ -718,6 +793,106 @@ impl Host for LocalHost {
             events: receiver,
             stdin,
             kill: Some(kill),
+        }))
+    }
+
+    async fn spawn_stdio(
+        &self,
+        request: SpawnRequest,
+    ) -> Result<Box<dyn HostStdioProcess>, HostError> {
+        let cwd = request
+            .cwd
+            .as_deref()
+            .map(|path| self.secure_path(path))
+            .transpose()?
+            .unwrap_or_else(|| self.root.clone());
+        let mut command = shell_command(&request.command, &cwd);
+        command
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(Value::Object(env)) = request.env {
+            for (key, value) in env {
+                if let Some(value) = value.as_str() {
+                    command.env(key, value);
+                }
+            }
+        }
+        let mut child = command.spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| HostError::InvalidResponse("local process stdin unavailable".into()))?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| HostError::InvalidResponse("local process stdout unavailable".into()))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| HostError::InvalidResponse("local process stderr unavailable".into()))?;
+        let (events, receiver) = mpsc::channel(64);
+        let output = events.clone();
+        tokio::spawn(async move {
+            let mut buffer = [0_u8; 4096];
+            loop {
+                match stdout.read(&mut buffer).await {
+                    Ok(0) => break,
+                    Ok(size) => {
+                        if output
+                            .send(Ok(StdioEvent::Stdout(buffer[..size].to_vec())))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = output.send(Err(HostError::Io(error))).await;
+                        return;
+                    }
+                }
+            }
+        });
+        let output = events.clone();
+        tokio::spawn(async move {
+            let mut buffer = [0_u8; 4096];
+            loop {
+                match stderr.read(&mut buffer).await {
+                    Ok(0) => break,
+                    Ok(size) => {
+                        if output
+                            .send(Ok(StdioEvent::Stderr(buffer[..size].to_vec())))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = output.send(Err(HostError::Io(error))).await;
+                        return;
+                    }
+                }
+            }
+        });
+        let (kill, killed) = oneshot::channel();
+        tokio::spawn(async move {
+            let code = tokio::select! {
+                result = child.wait() => result.ok().and_then(|status| status.code()),
+                _ = killed => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    None
+                }
+            };
+            let _ = events.send(Ok(StdioEvent::Exited(code))).await;
+        });
+        Ok(Box::new(LocalStdioProcess {
+            events: Mutex::new(receiver),
+            stdin: Mutex::new(stdin),
+            kill: Mutex::new(Some(kill)),
         }))
     }
 
@@ -1180,6 +1355,7 @@ fn remote_capabilities(
         "ls",
         "pty",
         "process_stream",
+        "stdio",
         "vnc",
         "cdp",
         "browser",
@@ -1197,15 +1373,21 @@ fn remote_capabilities(
         items: known
             .into_iter()
             .map(|name| {
-                let available = capabilities.available.iter().any(|item| item == name)
+                let available = name != "stdio"
+                    && (capabilities.available.iter().any(|item| item == name)
                     || (name == "process_stream"
-                        && capabilities.available.iter().any(|item| item == "pty"));
+                        && capabilities.available.iter().any(|item| item == "pty")));
                 Capability {
                     name: name.into(),
                     available,
                     source: "remote-probe".into(),
                     observed_at,
-                    reason: if name == "process_stream" && available {
+                    reason: if name == "stdio" {
+                        Some(
+                            "disabled: RVM only exposes PTY/WebSocket streams, which are unsafe for structured stdio"
+                                .into(),
+                        )
+                    } else if name == "process_stream" && available {
                         Some(
                             "uses remote PTY bytes; echo, control sequences, wrapping, and no exit code may affect structured output"
                                 .into(),
@@ -1234,6 +1416,29 @@ mod tests {
         assert!(command.contains("chmod 600"));
         assert!(command.contains(&path));
         assert!(remote_env_file(Some(&env)).unwrap().contains(sentinel));
+    }
+
+    #[test]
+    fn remote_structured_stdio_is_always_unavailable() {
+        let observed_at = Utc::now();
+        let capabilities = remote_capabilities(
+            RvmCapabilities {
+                available: vec!["stdio".into(), "pty".into()],
+            },
+            observed_at,
+        );
+        let stdio = capabilities
+            .items
+            .iter()
+            .find(|item| item.name == "stdio")
+            .unwrap();
+        assert!(!stdio.available);
+        assert_eq!(
+            stdio.reason.as_deref(),
+            Some(
+                "disabled: RVM only exposes PTY/WebSocket streams, which are unsafe for structured stdio"
+            )
+        );
     }
     use std::fs;
 
@@ -1300,6 +1505,34 @@ mod tests {
         assert!(output.contains("streamed"));
         assert!(exited);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_host_structured_stdio_separates_stdout_and_stderr() {
+        let host = LocalHost::new(std::env::temp_dir()).unwrap();
+        let process = host
+            .spawn_stdio(SpawnRequest {
+                command: "printf out; printf err >&2".into(),
+                cwd: None,
+                env: None,
+                cols: 80,
+                rows: 24,
+            })
+            .await
+            .unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        loop {
+            match process.next_event().await.unwrap() {
+                Some(StdioEvent::Stdout(bytes)) => stdout.extend(bytes),
+                Some(StdioEvent::Stderr(bytes)) => stderr.extend(bytes),
+                Some(StdioEvent::Exited(Some(0))) => break,
+                Some(StdioEvent::Exited(code)) => panic!("unexpected exit: {code:?}"),
+                None => panic!("stdio stream closed before exit"),
+            }
+        }
+        assert_eq!(stdout, b"out");
+        assert_eq!(stderr, b"err");
     }
 
     #[cfg(unix)]

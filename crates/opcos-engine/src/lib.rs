@@ -20,9 +20,11 @@ use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
+mod acp;
 mod opencode;
 pub mod orchestration;
 
+pub use acp::{AcpHarness, AcpHarnessConfig};
 pub use opencode::{OpenCodeHarness, OpenCodeHarnessConfig};
 
 #[derive(Debug, Error)]
@@ -81,6 +83,7 @@ pub trait AgentEngine: Send + Sync {
 pub enum HarnessKind {
     Builtin,
     OpenCode,
+    Acp,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
