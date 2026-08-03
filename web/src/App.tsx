@@ -6443,6 +6443,7 @@ function Activity({
     | "audit"
     | "actions"
     | "queue"
+    | "goals"
     | "board"
     | "roles"
     | "tasks"
@@ -6459,6 +6460,11 @@ function Activity({
     [],
   );
   const [workQueue, setWorkQueue] = useState<Record<string, unknown>[]>([]);
+  const [goals, setGoals] = useState<Record<string, unknown>[]>([]);
+  const [planningHistory, setPlanningHistory] = useState<
+    Record<string, unknown>[]
+  >([]);
+  const [goalDescription, setGoalDescription] = useState("");
   const load = () =>
     command<Coordination>("coordination_snapshot", { taskId })
       .then(setBoard)
@@ -6475,6 +6481,7 @@ function Activity({
               "audit",
               "actions",
               "queue",
+              "goals",
               "board",
               "roles",
               "tasks",
@@ -6523,6 +6530,19 @@ function Activity({
                   })
                     .then(setWorkQueue)
                     .catch(onError);
+                if (item === "goals") {
+                  void command<Record<string, unknown>[]>(
+                    "autonomous_goals",
+                    {},
+                  )
+                    .then(setGoals)
+                    .catch(onError);
+                  void command<Record<string, unknown>[]>("planning_history", {
+                    limit: 100,
+                  })
+                    .then(setPlanningHistory)
+                    .catch(onError);
+                }
               }}
             >
               <Icon
@@ -6532,6 +6552,7 @@ function Activity({
                       audit: "audit",
                       actions: "audit",
                       queue: "audit",
+                      goals: "sparkle",
                       board: "audit",
                       roles: "gear",
                       tasks: "code",
@@ -6563,6 +6584,8 @@ function Activity({
                         "Review cross-session records of OPCOS external actions.",
                       queue:
                         "Review durable work items, retries, and dead-letter records.",
+                      goals:
+                        "Define bounded autonomous goals and review planning rounds.",
                       board: "Start or observe the active coordination board.",
                       roles: "Review board roles and their current state.",
                       tasks:
@@ -6673,6 +6696,26 @@ function Activity({
                               attempts {String(item.attempts)}/
                               {String(item.max_attempts)} ·{" "}
                               {String(item.queue_id)}
+                              {item.status === "pending_approval" && (
+                                <button
+                                  className="ml-2 text-accent underline"
+                                  onClick={() =>
+                                    void command("approve_work_queue_item", {
+                                      queueId: String(item.queue_id),
+                                    })
+                                      .then(() =>
+                                        command<Record<string, unknown>[]>(
+                                          "work_queue_events",
+                                          { limit: 200 },
+                                        ),
+                                      )
+                                      .then(setWorkQueue)
+                                      .catch(onError)
+                                  }
+                                >
+                                  approve
+                                </button>
+                              )}
                             </small>
                           </span>
                         </div>
@@ -6682,6 +6725,125 @@ function Activity({
                 }
                 empty="No durable work queue records yet."
               />
+            )}
+            {activityTab === "goals" && (
+              <div className="space-y-5">
+                <div className="rounded-xl2 border border-line bg-panel p-5 space-y-3">
+                  <h2 className="text-[15px] font-semibold">New goal</h2>
+                  <input
+                    className="w-full"
+                    value={goalDescription}
+                    onChange={(event) => setGoalDescription(event.target.value)}
+                    placeholder="Describe the outcome this company is pursuing"
+                  />
+                  <p className="text-[12px] text-muted">
+                    New goals default to propose mode, one planning round per
+                    hour, and a bounded queue.
+                  </p>
+                  <Button
+                    className="primary"
+                    onClick={() =>
+                      void command("save_autonomous_goal", {
+                        input: {
+                          description: goalDescription,
+                          sessionId: selected?.id ?? null,
+                          projectId: selected?.project_id ?? null,
+                          autonomyLevel: "propose",
+                        },
+                      })
+                        .then(() => setGoalDescription(""))
+                        .then(() =>
+                          command<Record<string, unknown>[]>(
+                            "autonomous_goals",
+                            {},
+                          ),
+                        )
+                        .then(setGoals)
+                        .catch(onError)
+                    }
+                    disabled={!goalDescription.trim() || !selected}
+                  >
+                    Create goal
+                  </Button>
+                </div>
+                <CollectionPage
+                  search=""
+                  onSearch={() => undefined}
+                  searchPlaceholder="Filter goals"
+                  rows={
+                    goals.length ? (
+                      <>
+                        {goals.map((goal) => (
+                          <div
+                            className="manage-row px-4"
+                            key={String(goal.goal_id)}
+                          >
+                            <span>
+                              <strong>
+                                {String(goal.description)} ·{" "}
+                                {String(goal.status)}
+                              </strong>
+                              <small>
+                                {String(goal.autonomy_level)} · failures{" "}
+                                {String(goal.consecutive_failures)}/
+                                {String(goal.failure_limit)}
+                                <button
+                                  className="ml-2 text-accent underline"
+                                  onClick={() =>
+                                    void command("run_autonomous_goal", {
+                                      goalId: String(goal.goal_id),
+                                    })
+                                      .then(() =>
+                                        command<Record<string, unknown>[]>(
+                                          "planning_history",
+                                          { goalId: String(goal.goal_id) },
+                                        ),
+                                      )
+                                      .then(setPlanningHistory)
+                                      .catch(onError)
+                                  }
+                                >
+                                  plan now
+                                </button>
+                              </small>
+                            </span>
+                          </div>
+                        ))}
+                      </>
+                    ) : null
+                  }
+                  empty="No autonomous goals yet."
+                />
+                <CollectionPage
+                  search=""
+                  onSearch={() => undefined}
+                  searchPlaceholder="Filter planning rounds"
+                  rows={
+                    planningHistory.length ? (
+                      <>
+                        {planningHistory.map((round) => (
+                          <div
+                            className="manage-row px-4"
+                            key={String(round.round_id)}
+                          >
+                            <span>
+                              <strong>
+                                {String(round.status)} · goal{" "}
+                                {String(round.goal_id)}
+                              </strong>
+                              <small>
+                                produced {String(round.produced_count)} ·{" "}
+                                {String(round.reason ?? "completed")}
+                              </small>
+                            </span>
+                          </div>
+                        ))}
+                      </>
+                    ) : null
+                  }
+                  empty="No planning rounds yet."
+                />
+              </div>
             )}
             {activityTab === "insights" && (
               <div className="rounded-xl2 border border-line bg-panel p-5">
