@@ -1471,6 +1471,8 @@ fn tool_risk(name: &str) -> ToolRisk {
         "lsp_definition" | "lsp_references" | "lsp_diagnostics" => ToolRisk::Read,
         "skill_search_learned" | "skill_get_learned" => ToolRisk::Read,
         "skill_save_learned" => ToolRisk::Write,
+        "coordination_dispatch" => ToolRisk::External,
+        "coordination_status" => ToolRisk::Read,
         "action_ledger_list" => ToolRisk::Read,
         "action_ledger_begin" | "action_ledger_finish" => ToolRisk::Write,
         "work_queue_list" => ToolRisk::Read,
@@ -1936,7 +1938,15 @@ fn tool_definitions() -> Vec<Value> {
     ];
     tools.extend(action_ledger_tool_definitions());
     tools.extend(work_queue_tool_definitions());
+    tools.extend(coordination_tool_definitions());
     tools
+}
+
+pub fn coordination_tool_definitions() -> Vec<Value> {
+    vec![
+        json!({"type":"function","function":{"name":"coordination_dispatch","description":"Dispatch work asynchronously from the current builtin OPCOS Leader session to an existing Worker role. Only a Leader may call this tool; the caller role is derived from the bound session and cannot be supplied by the model. This never creates sessions or recursively spawns agents. Returns a task id and pending status; Worker reports are not completion evidence.","parameters":{"type":"object","properties":{"task_id":{"type":"string"},"worker_role_id":{"type":"string"},"message":{"type":"string"}},"required":["task_id","worker_role_id","message"]}}}),
+        json!({"type":"function","function":{"name":"coordination_status","description":"Read bounded status for an asynchronously dispatched coordination task. Worker self-reports remain worker_reported/awaiting_verification; only verified branch, push, PR, and GitHub API checks can establish delivery. Returns recommended_after_seconds and does not block or encourage tight polling.","parameters":{"type":"object","properties":{"task_id":{"type":"string"},"limit":{"type":"integer"}},"required":["task_id"]}}}),
+    ]
 }
 
 fn format_plan_context(plan: &opcos_store::PlanRecord) -> String {
@@ -3500,5 +3510,24 @@ mod tests {
         assert_eq!(messages.iter().filter(|m| m.display_only).count(), 0);
         assert!(messages.iter().any(|m| m.role == "user"));
         assert!(messages.iter().any(|m| m.role == "assistant"));
+    }
+
+    #[test]
+    fn coordination_tools_are_leader_dispatch_only_and_do_not_accept_from_role() {
+        let tools = coordination_tool_definitions();
+        let dispatch = tools
+            .iter()
+            .find(|tool| {
+                tool.pointer("/function/name").and_then(Value::as_str)
+                    == Some("coordination_dispatch")
+            })
+            .unwrap();
+        let properties = dispatch.pointer("/function/parameters/properties").unwrap();
+        assert!(properties.get("task_id").is_some());
+        assert!(properties.get("worker_role_id").is_some());
+        assert!(properties.get("message").is_some());
+        assert!(properties.get("from_role").is_none());
+        assert_eq!(tool_risk("coordination_dispatch"), ToolRisk::External);
+        assert_eq!(tool_risk("coordination_status"), ToolRisk::Read);
     }
 }

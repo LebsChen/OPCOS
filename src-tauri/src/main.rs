@@ -161,10 +161,10 @@ fn reject_dangerous_git(command: &str) -> Result<(), String> {
 }
 
 struct DesktopState {
-    database: Mutex<Connection>,
+    database: Arc<Mutex<Connection>>,
     secrets: KeyringSecretStore,
     store: Arc<SqliteStore>,
-    engines: AsyncMutex<HashMap<String, Arc<GuiEngine>>>,
+    engines: Arc<AsyncMutex<HashMap<String, Arc<GuiEngine>>>>,
     opencode_engines: AsyncMutex<HashMap<String, Arc<opcos_engine::OpenCodeHarness<SqliteStore>>>>,
     opencode_event_sessions: AsyncMutex<HashSet<String>>,
     acp_engines: AsyncMutex<HashMap<String, Arc<opcos_engine::AcpHarness<SqliteStore>>>>,
@@ -176,7 +176,7 @@ struct DesktopState {
     trigger_watcher_stop: Mutex<Option<std_mpsc::Sender<()>>>,
     surfaces: AsyncMutex<HashMap<u16, tauri::async_runtime::JoinHandle<()>>>,
     ide_proxies: AsyncMutex<HashMap<u16, tauri::async_runtime::JoinHandle<()>>>,
-    coordination: AsyncMutex<HashMap<String, CoordinationRuntime>>,
+    coordination: Arc<AsyncMutex<HashMap<String, CoordinationRuntime>>>,
     index_root: PathBuf,
     mcp: Arc<McpManager<McpCredentialAdapter>>,
     jobs: Arc<BackgroundJobManager>,
@@ -231,6 +231,9 @@ struct RemoteExecutor {
     session_id: String,
     store: Arc<SqliteStore>,
     jobs: Arc<BackgroundJobManager>,
+    database: Arc<Mutex<Connection>>,
+    engines: Arc<AsyncMutex<HashMap<String, Arc<GuiEngine>>>>,
+    coordination: Arc<AsyncMutex<HashMap<String, CoordinationRuntime>>>,
 }
 
 struct LocalExecutor {
@@ -244,6 +247,9 @@ struct LocalExecutor {
     store: Arc<SqliteStore>,
     jobs: Arc<BackgroundJobManager>,
     lsp: Arc<AsyncMutex<HashMap<String, LspSession>>>,
+    database: Arc<Mutex<Connection>>,
+    engines: Arc<AsyncMutex<HashMap<String, Arc<GuiEngine>>>>,
+    coordination: Arc<AsyncMutex<HashMap<String, CoordinationRuntime>>>,
 }
 
 enum DesktopExecutor {
@@ -2904,6 +2910,18 @@ impl ToolExecutor for RemoteExecutor {
                 arguments,
             );
         }
+        if matches!(name, "coordination_dispatch" | "coordination_status") {
+            return execute_coordination_tool(
+                &self.store,
+                &self.database,
+                &self.engines,
+                &self.coordination,
+                &self.session_id,
+                name,
+                &arguments,
+            )
+            .await;
+        }
         if matches!(
             name,
             "skill_save_learned" | "skill_search_learned" | "skill_get_learned"
@@ -3183,6 +3201,18 @@ impl ToolExecutor for DesktopExecutor {
                         name,
                         arguments,
                     );
+                }
+                if matches!(name, "coordination_dispatch" | "coordination_status") {
+                    return execute_coordination_tool(
+                        &executor.store,
+                        &executor.database,
+                        &executor.engines,
+                        &executor.coordination,
+                        &executor.session_id,
+                        name,
+                        &arguments,
+                    )
+                    .await;
                 }
                 if matches!(
                     name,
@@ -3946,7 +3976,9 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                require_acceptance INTEGER NOT NULL,
                verified_pr_url TEXT,
                branch TEXT,
-               pr TEXT
+               pr TEXT,
+               dispatch_count INTEGER NOT NULL DEFAULT 0,
+               dispatch_limit INTEGER NOT NULL DEFAULT 8
              );
              CREATE TABLE IF NOT EXISTS coord_messages (
                project_id TEXT NOT NULL,
@@ -4814,6 +4846,22 @@ fn migrate_coordination(connection: &Connection) -> Result<(), String> {
         connection
             .execute(
                 "ALTER TABLE coord_tasks ADD COLUMN project_id TEXT NOT NULL DEFAULT ''",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    if !columns.iter().any(|column| column == "dispatch_count") {
+        connection
+            .execute(
+                "ALTER TABLE coord_tasks ADD COLUMN dispatch_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    if !columns.iter().any(|column| column == "dispatch_limit") {
+        connection
+            .execute(
+                "ALTER TABLE coord_tasks ADD COLUMN dispatch_limit INTEGER NOT NULL DEFAULT 8",
                 [],
             )
             .map_err(|error| error.to_string())?;
@@ -7438,6 +7486,8 @@ async fn engine_for(
             "work_queue_cancel".to_owned(),
             "work_queue_requeue".to_owned(),
             "work_queue_list".to_owned(),
+            "coordination_dispatch".to_owned(),
+            "coordination_status".to_owned(),
         ]);
         if linear_tools_enabled {
             allowed_tools.extend([
@@ -7496,6 +7546,9 @@ async fn engine_for(
                 store: Arc::clone(&state.store),
                 jobs: Arc::clone(&state.jobs),
                 lsp: Arc::new(AsyncMutex::new(HashMap::new())),
+                database: Arc::clone(&state.database),
+                engines: Arc::clone(&state.engines),
+                coordination: Arc::clone(&state.coordination),
             }))),
             None,
             Some(allowed_tools),
@@ -7532,6 +7585,9 @@ async fn engine_for(
                 session_id: session_id.to_owned(),
                 store: Arc::clone(&state.store),
                 jobs: Arc::clone(&state.jobs),
+                database: Arc::clone(&state.database),
+                engines: Arc::clone(&state.engines),
+                coordination: Arc::clone(&state.coordination),
             }))),
             Some(executor_client),
             None,
@@ -15726,6 +15782,269 @@ async fn coordination_message(
     Ok(json!({"accepted":true,"msg_id":envelope.msg_id}))
 }
 
+fn reject_coordination_sensitive(text: &str) -> Result<(), String> {
+    let lower = text.to_ascii_lowercase();
+    if ["bearer ", "token=", "key=", "password=", "secret="]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        || text.split_whitespace().any(|word| {
+            word.find('@').is_some_and(|at| {
+                let prefix = &word[..at];
+                prefix.contains(':') && prefix.contains("://")
+            })
+        })
+    {
+        return Err("coordination payload rejected: credential-like content is not allowed".into());
+    }
+    Ok(())
+}
+
+async fn execute_coordination_tool(
+    store: &SqliteStore,
+    database: &Arc<Mutex<Connection>>,
+    engines: &Arc<AsyncMutex<HashMap<String, Arc<GuiEngine>>>>,
+    coordination: &Arc<AsyncMutex<HashMap<String, CoordinationRuntime>>>,
+    session_id: &str,
+    name: &str,
+    arguments: &Value,
+) -> Result<Value, String> {
+    let caller = store
+        .load_project_agent_by_session(session_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "coordination tools require a project agent session".to_owned())?;
+    if name == "coordination_dispatch" {
+        if arguments.get("from_role").is_some() {
+            return Err(
+                "coordination dispatch denied: from_role is system-bound and cannot be supplied"
+                    .to_owned(),
+            );
+        }
+        if caller.sort_order != 0 || !caller.role.eq_ignore_ascii_case("lead") {
+            return Err(
+                "coordination dispatch denied: only the bound Leader session may dispatch"
+                    .to_owned(),
+            );
+        }
+        let task_id = arguments
+            .get("task_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("task_id is required")?;
+        let worker_role_id = arguments
+            .get("worker_role_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("worker_role_id is required")?;
+        let message = arguments
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("message is required")?;
+        reject_coordination_sensitive(message)?;
+        let worker = store
+            .load_project_agent(worker_role_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "coordination target Worker role does not exist".to_owned())?;
+        if worker.project_id != caller.project_id || worker.sort_order == 0 {
+            return Err(
+                "coordination dispatch denied: target must be an existing Worker in the same project"
+                    .to_owned(),
+            );
+        }
+        if worker.session_id.is_none() {
+            return Err("coordination target Worker session is not started".to_owned());
+        }
+        if !worker.harness.eq_ignore_ascii_case("builtin") {
+            return Err(
+                "coordination dispatch unavailable: only builtin TurnEngine Worker sessions are supported; ACP/OpenCode sessions are not bridged"
+                    .to_owned(),
+            );
+        }
+        let envelope = Envelope {
+            v: 1,
+            task_id: task_id.to_owned(),
+            from: caller.id.clone(),
+            to: worker.id.clone(),
+            kind: opcos_engine::orchestration::EnvelopeKind::Request,
+            msg_id: format!("coord-{}", Uuid::new_v4()),
+            reply_to: None,
+            payload: json!({"message": message}),
+        };
+        {
+            let connection = database.lock().map_err(|_| "database lock poisoned")?;
+            let task = load_coord_task(&connection, task_id)?;
+            if task.project_id != caller.project_id {
+                return Err("coordination task is outside the caller project".to_owned());
+            }
+            let changed = connection
+                .execute(
+                    "UPDATE coord_tasks SET dispatch_count=dispatch_count+1
+                     WHERE id=?1 AND dispatch_count < dispatch_limit",
+                    [task_id],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed == 0 {
+                return Err(format!(
+                    "coordination dispatch budget exhausted: {}/{}",
+                    task.dispatch_count, task.dispatch_limit
+                ));
+            }
+        }
+        let runtime_result = {
+            let mut runtimes = coordination.lock().await;
+            runtimes
+                .get_mut(task_id)
+                .ok_or_else(|| "coordination task is not started".to_owned())
+                .and_then(|runtime| {
+                    runtime
+                        .validate_and_record(&envelope, Utc::now())
+                        .map_err(|error| error.to_string())
+                })
+        };
+        if let Err(error) = runtime_result {
+            let connection = database.lock().map_err(|_| "database lock poisoned")?;
+            connection
+                .execute(
+                    "UPDATE coord_tasks SET dispatch_count=dispatch_count-1 WHERE id=?1 AND dispatch_count > 0",
+                    [task_id],
+                )
+                .map_err(|db_error| db_error.to_string())?;
+            return Err(error);
+        }
+        let task = {
+            let connection = database.lock().map_err(|_| "database lock poisoned")?;
+            connection
+                .execute(
+                    "INSERT INTO coord_messages
+                     (project_id,task_id,msg_id,from_role,to_role,kind,reply_to,payload,created_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    params![
+                        caller.project_id,
+                        envelope.task_id,
+                        envelope.msg_id,
+                        envelope.from,
+                        envelope.to,
+                        "request",
+                        envelope.reply_to,
+                        envelope.payload.to_string(),
+                        Utc::now().to_rfc3339(),
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            load_coord_task(&connection, task_id)?
+        };
+        let target_session = worker
+            .session_id
+            .as_deref()
+            .ok_or_else(|| "coordination target Worker session is not started".to_owned())?;
+        let engine = engines
+            .lock()
+            .await
+            .get(target_session)
+            .cloned()
+            .ok_or_else(|| "coordination target Worker session is not running".to_owned())?;
+        engine
+            .queue_steering(envelope.encode(None).map_err(|error| error.to_string())?)
+            .await
+            .map_err(|error| error.to_string())?;
+        return Ok(json!({
+            "task_id": task.id,
+            "status": "dispatched",
+            "worker_status": "awaiting_worker",
+            "async": true,
+            "recommended_after_seconds": 30,
+            "dispatch_count": task.dispatch_count,
+            "dispatch_limit": task.dispatch_limit,
+            "message_id": envelope.msg_id
+        }));
+    }
+    if name == "coordination_status" {
+        let task_id = arguments
+            .get("task_id")
+            .and_then(Value::as_str)
+            .ok_or("task_id is required")?;
+        let limit = arguments
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(5)
+            .clamp(1, 5) as usize;
+        let connection = database.lock().map_err(|_| "database lock poisoned")?;
+        let task = load_coord_task(&connection, task_id)?;
+        if task.project_id != caller.project_id {
+            return Err("coordination task is outside the caller project".to_owned());
+        }
+        let mut statement = connection
+            .prepare(
+                "SELECT msg_id,from_role,to_role,kind,payload,created_at
+                 FROM coord_messages WHERE task_id=?1 ORDER BY created_at DESC LIMIT ?2",
+            )
+            .map_err(|error| error.to_string())?;
+        let messages = statement
+            .query_map(params![task_id, limit as i64], |row| {
+                let payload: String = row.get(4)?;
+                Ok(json!({
+                    "msg_id": row.get::<_, String>(0)?,
+                    "from": row.get::<_, String>(1)?,
+                    "to": row.get::<_, String>(2)?,
+                    "kind": row.get::<_, String>(3)?,
+                    "payload": serde_json::from_str::<Value>(&payload).unwrap_or(Value::Null),
+                    "created_at": row.get::<_, String>(5)?
+                }))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let total_messages: usize = connection
+            .query_row(
+                "SELECT COUNT(*) FROM coord_messages WHERE task_id=?1",
+                [task_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| error.to_string())? as usize;
+        let worker_reported = messages.iter().any(|message| {
+            matches!(
+                message.get("kind").and_then(Value::as_str),
+                Some("result" | "status")
+            )
+        });
+        let status = if task.phase == BoardPhase::Done {
+            "done"
+        } else if task.phase == BoardPhase::AwaitingAcceptance {
+            "awaiting_acceptance"
+        } else if task.verified_pr_url.is_some() {
+            "verified_delivery"
+        } else if worker_reported {
+            "worker_reported"
+        } else {
+            "awaiting_worker"
+        };
+        return Ok(json!({
+            "task_id": task.id,
+            "status": status,
+            "worker_status": if worker_reported { "worker_reported" } else { "awaiting_worker" },
+            "verification_status": if task.verified_pr_url.is_some() {
+                "verified_delivery"
+            } else if worker_reported {
+                "awaiting_verification"
+            } else {
+                "not_started"
+            },
+            "async": true,
+            "recommended_after_seconds": 30,
+            "dispatch_count": task.dispatch_count,
+            "dispatch_limit": task.dispatch_limit,
+            "messages": messages,
+            "messages_bounded": true,
+            "message_limit": limit,
+            "total_messages": total_messages,
+            "omitted_messages": total_messages.saturating_sub(messages.len()),
+            "truncated": total_messages > messages.len(),
+            "completion_note": "Worker self-reports never establish completion; branch, push, PR, and GitHub API verification are required"
+        }));
+    }
+    Err(format!("unsupported coordination tool: {name}"))
+}
+
 fn connection_project_for_task(state: &DesktopState, task_id: &str) -> Result<String, String> {
     state
         .database
@@ -15938,7 +16257,7 @@ fn load_project_tasks(connection: &Connection, project_id: &str) -> Result<Vec<V
     let mut statement = connection
         .prepare(
             "SELECT id,title,phase,assignee,lease_generation,lease_until,require_acceptance,
-                    verified_pr_url,branch,pr
+                    verified_pr_url,branch,pr,dispatch_count,dispatch_limit
              FROM coord_tasks WHERE project_id=?1 ORDER BY id",
         )
         .map_err(|error| error.to_string())?;
@@ -15954,7 +16273,9 @@ fn load_project_tasks(connection: &Connection, project_id: &str) -> Result<Vec<V
                 "require_acceptance": row.get::<_, i64>(6)? != 0,
                 "verified_pr_url": row.get::<_, Option<String>>(7)?,
                 "branch": row.get::<_, Option<String>>(8)?,
-                "pr": row.get::<_, Option<String>>(9)?
+                "pr": row.get::<_, Option<String>>(9)?,
+                "dispatch_count": row.get::<_, i64>(10)?,
+                "dispatch_limit": row.get::<_, i64>(11)?
             }))
         })
         .map_err(|error| error.to_string())?;
@@ -16258,7 +16579,7 @@ async fn coordination_snapshot(
 fn load_coord_task(connection: &Connection, id: &str) -> Result<BoardTask, String> {
     connection
         .query_row(
-            "SELECT project_id,id,title,phase,assignee,lease_generation,lease_until,require_acceptance,verified_pr_url,branch,pr FROM coord_tasks WHERE id=?1",
+            "SELECT project_id,id,title,phase,assignee,lease_generation,lease_until,require_acceptance,verified_pr_url,branch,pr,dispatch_count,dispatch_limit FROM coord_tasks WHERE id=?1",
             [id],
             |row| {
                 let phase: String = row.get(3)?;
@@ -16276,6 +16597,8 @@ fn load_coord_task(connection: &Connection, id: &str) -> Result<BoardTask, Strin
                     verified_pr_url: row.get(8)?,
                     branch: row.get(9)?,
                     pr: row.get(10)?,
+                    dispatch_count: row.get::<_, i64>(11)? as u32,
+                    dispatch_limit: row.get::<_, i64>(12)? as u32,
                 })
             },
         )
@@ -16289,7 +16612,7 @@ fn save_coord_task(connection: &Connection, task: &BoardTask) -> Result<(), Stri
         .to_owned();
     connection
         .execute(
-            "INSERT OR REPLACE INTO coord_tasks(project_id,id,title,phase,assignee,lease_generation,lease_until,require_acceptance,verified_pr_url,branch,pr) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            "INSERT OR REPLACE INTO coord_tasks(project_id,id,title,phase,assignee,lease_generation,lease_until,require_acceptance,verified_pr_url,branch,pr,dispatch_count,dispatch_limit) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 task.project_id,
                 task.id,
@@ -16302,6 +16625,8 @@ fn save_coord_task(connection: &Connection, task: &BoardTask) -> Result<(), Stri
                 task.verified_pr_url,
                 task.branch,
                 task.pr,
+                task.dispatch_count as i64,
+                task.dispatch_limit as i64,
             ],
         )
         .map_err(|error| error.to_string())?;
@@ -16332,6 +16657,8 @@ fn coordination_create_task(
         verified_pr_url: None,
         branch,
         pr,
+        dispatch_count: 0,
+        dispatch_limit: 8,
     };
     let connection = state
         .database
@@ -18092,11 +18419,14 @@ fn main() {
             trigger_listener
                 .set_nonblocking(true)
                 .map_err(tauri::Error::from)?;
+            let database = Arc::new(Mutex::new(database));
+            let engines = Arc::new(AsyncMutex::new(HashMap::new()));
+            let coordination = Arc::new(AsyncMutex::new(HashMap::new()));
             app.manage(DesktopState {
-                database: Mutex::new(database),
+                database: Arc::clone(&database),
                 secrets,
                 store,
-                engines: AsyncMutex::new(HashMap::new()),
+                engines: Arc::clone(&engines),
                 opencode_engines: AsyncMutex::new(HashMap::new()),
                 opencode_event_sessions: AsyncMutex::new(HashSet::new()),
                 acp_engines: AsyncMutex::new(HashMap::new()),
@@ -18104,7 +18434,7 @@ fn main() {
                 trigger_runs: AsyncMutex::new(HashSet::new()),
                 surfaces: AsyncMutex::new(HashMap::new()),
                 ide_proxies: AsyncMutex::new(HashMap::new()),
-                coordination: AsyncMutex::new(HashMap::new()),
+                coordination: Arc::clone(&coordination),
                 index_root: {
                     let mut root = path.clone();
                     root.set_file_name("repository-indexes");
@@ -18430,6 +18760,26 @@ mod m7_tests {
                 .as_str()
                 .unwrap()
                 .contains("human-authored")
+        );
+    }
+
+    #[test]
+    fn coordination_payload_rejects_credentials_and_from_role_is_not_a_tool_field() {
+        assert!(reject_coordination_sensitive("Bearer xxx").is_err());
+        assert!(reject_coordination_sensitive("TOKEN=xxx").is_err());
+        assert!(reject_coordination_sensitive("https://user:pass@example.com").is_err());
+        let tools = opcos_engine::coordination_tool_definitions();
+        let dispatch = tools
+            .iter()
+            .find(|tool| {
+                tool.pointer("/function/name").and_then(Value::as_str)
+                    == Some("coordination_dispatch")
+            })
+            .unwrap();
+        assert!(
+            dispatch
+                .pointer("/function/parameters/properties/from_role")
+                .is_none()
         );
     }
 

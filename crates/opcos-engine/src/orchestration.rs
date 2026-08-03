@@ -113,6 +113,14 @@ pub struct BoardTask {
     pub verified_pr_url: Option<String>,
     pub branch: Option<String>,
     pub pr: Option<String>,
+    #[serde(default)]
+    pub dispatch_count: u32,
+    #[serde(default = "default_dispatch_limit")]
+    pub dispatch_limit: u32,
+}
+
+fn default_dispatch_limit() -> u32 {
+    8
 }
 
 pub struct Board {
@@ -154,6 +162,17 @@ impl Board {
 }
 
 impl BoardTask {
+    pub fn reserve_dispatch(&mut self) -> Result<(), CoordinationError> {
+        if self.dispatch_count >= self.dispatch_limit {
+            return Err(CoordinationError::CircuitBreaker(format!(
+                "dispatch budget exhausted: {}/{}",
+                self.dispatch_count, self.dispatch_limit
+            )));
+        }
+        self.dispatch_count += 1;
+        Ok(())
+    }
+
     pub fn claim(&mut self, worker: &str, now: DateTime<Utc>) -> Result<(), CoordinationError> {
         if matches!(
             self.phase,
@@ -503,6 +522,8 @@ mod tests {
             verified_pr_url: None,
             branch: None,
             pr: None,
+            dispatch_count: 0,
+            dispatch_limit: 8,
         };
         task.claim("worker-a", now).unwrap();
         assert_eq!(
@@ -528,6 +549,8 @@ mod tests {
             verified_pr_url: None,
             branch: None,
             pr: None,
+            dispatch_count: 0,
+            dispatch_limit: 8,
         };
         task.claim("worker-a", now).unwrap();
         assert_eq!(
@@ -561,6 +584,8 @@ mod tests {
             verified_pr_url: None,
             branch: Some("feature/gate".into()),
             pr: None,
+            dispatch_count: 0,
+            dispatch_limit: 8,
         };
         task.claim("worker-a", now).unwrap();
         task.complete("worker-a", now, None).unwrap();
@@ -619,6 +644,37 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_budget_is_explicit_and_durable_in_task_state() {
+        let mut task = BoardTask {
+            project_id: "project".into(),
+            id: "budget".into(),
+            title: "budget".into(),
+            phase: BoardPhase::Open,
+            assignee: None,
+            lease_generation: 0,
+            lease_until: None,
+            require_acceptance: false,
+            verified_pr_url: None,
+            branch: None,
+            pr: None,
+            dispatch_count: 0,
+            dispatch_limit: 2,
+        };
+        task.reserve_dispatch().unwrap();
+        task.reserve_dispatch().unwrap();
+        assert_eq!(
+            task.reserve_dispatch(),
+            Err(CoordinationError::CircuitBreaker(
+                "dispatch budget exhausted: 2/2".into()
+            ))
+        );
+        let restored: BoardTask =
+            serde_json::from_value(serde_json::to_value(&task).unwrap()).unwrap();
+        assert_eq!(restored.dispatch_count, 2);
+        assert_eq!(restored.dispatch_limit, 2);
+    }
+
+    #[test]
     fn shared_branch_is_serial_but_independent_branches_parallel() {
         let mut board = Board::new();
         board.insert(BoardTask {
@@ -633,6 +689,8 @@ mod tests {
             verified_pr_url: None,
             branch: Some("feature/a".into()),
             pr: Some("pr-1".into()),
+            dispatch_count: 0,
+            dispatch_limit: 8,
         });
         board.insert(BoardTask {
             project_id: "project".into(),
@@ -646,6 +704,8 @@ mod tests {
             verified_pr_url: None,
             branch: Some("feature/a".into()),
             pr: Some("pr-1".into()),
+            dispatch_count: 0,
+            dispatch_limit: 8,
         });
         assert!(matches!(
             board.dispatch("b"),

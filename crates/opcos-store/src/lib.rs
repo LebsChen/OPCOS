@@ -4206,6 +4206,21 @@ impl SqliteStore {
             .map_err(StoreError::from)
     }
 
+    pub fn load_project_agent_by_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ProjectAgentRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .query_row(
+                "SELECT id,project_id,sort_order,name,role,session_id,provider,model,harness,mode,system_prompt,worktree_path,branch,state,created_at,updated_at FROM project_agents WHERE session_id=?1",
+                [session_id],
+                project_agent_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     pub fn load_project_agents(
         &self,
         project_id: &str,
