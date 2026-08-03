@@ -2594,6 +2594,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn switching_a_running_engine_to_auto_allows_write_tools() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Interactive,
+            "fake",
+        );
+        let write = ToolCall {
+            id: "write-1".into(),
+            name: "write_file".into(),
+            arguments: json!({"path":"x","content":"x"}),
+        };
+
+        assert!(matches!(
+            engine.execute_tools(1, std::slice::from_ref(&write)).await,
+            Err(EngineError::ApprovalPending(id)) if id == "write-1"
+        ));
+        store.delete_pending("s", "write-1").unwrap();
+
+        engine.set_mode(PermissionMode::Auto).await;
+        let results = engine
+            .execute_tools(2, std::slice::from_ref(&write))
+            .await
+            .unwrap();
+        assert_eq!(results, vec![json!("ok")]);
+    }
+
+    #[tokio::test]
     async fn plan_and_ask_user_are_durable_pending_turns() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let provider = ApprovalProvider {

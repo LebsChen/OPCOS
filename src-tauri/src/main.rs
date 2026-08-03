@@ -1521,6 +1521,27 @@ fn session_for(state: &DesktopState, session_id: &str) -> Result<SessionRecord, 
         .ok_or_else(|| "session not found".to_owned())
 }
 
+fn parse_permission_mode(value: &str) -> Result<PermissionMode, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "discuss" => Ok(PermissionMode::Discuss),
+        "plan" => Ok(PermissionMode::Plan),
+        "interactive" => Ok(PermissionMode::Interactive),
+        "auto" => Ok(PermissionMode::Auto),
+        "custom" => Ok(PermissionMode::Custom),
+        _ => Err(format!("unsupported permission mode: {value}")),
+    }
+}
+
+fn permission_mode_name(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Discuss => "Discuss",
+        PermissionMode::Plan => "Plan",
+        PermissionMode::Interactive => "Interactive",
+        PermissionMode::Auto => "Auto",
+        PermissionMode::Custom => "Custom",
+    }
+}
+
 fn local_workspace_path(session_id: &str) -> Result<String, String> {
     let home = dirs::home_dir().ok_or_else(|| "home directory unavailable".to_owned())?;
     let workspace = home.join("OPCOS").join("workspaces").join(session_id);
@@ -2290,13 +2311,7 @@ async fn engine_for(
         }
         name => return Err(format!("provider {name} is not supported for sessions")),
     };
-    let permission_mode = match mode.as_str() {
-        "Discuss" => PermissionMode::Discuss,
-        "Plan" => PermissionMode::Plan,
-        "Auto" => PermissionMode::Auto,
-        "Custom" => PermissionMode::Custom,
-        _ => PermissionMode::Interactive,
-    };
+    let permission_mode = parse_permission_mode(&mode).unwrap_or(PermissionMode::Interactive);
     let engine = Arc::new(TurnEngine::new(
         provider,
         Arc::clone(&state.store),
@@ -2936,6 +2951,7 @@ fn create_session(
     );
     let model = model.unwrap_or_else(|| "auto".into());
     let mode = mode.unwrap_or_else(|| "Interactive".into());
+    let mode = permission_mode_name(parse_permission_mode(&mode)?).to_owned();
     let harness = harness.unwrap_or_else(|| "builtin".into());
     if !matches!(harness.as_str(), "builtin" | "opencode") {
         return Err(format!("unsupported harness: {harness}"));
@@ -4300,14 +4316,8 @@ async fn change_mode(
     session_id: String,
     mode: String,
 ) -> Result<(), String> {
-    let permission_mode = match mode.to_ascii_lowercase().as_str() {
-        "discuss" => opcos_policy::PermissionMode::Discuss,
-        "plan" => opcos_policy::PermissionMode::Plan,
-        "interactive" => opcos_policy::PermissionMode::Interactive,
-        "auto" => opcos_policy::PermissionMode::Auto,
-        "custom" => opcos_policy::PermissionMode::Custom,
-        _ => return Err(format!("unsupported permission mode: {mode}")),
-    };
+    let permission_mode = parse_permission_mode(&mode)?;
+    let mode = permission_mode_name(permission_mode).to_owned();
     if let Some(engine) = state.engines.lock().await.get(&session_id).cloned() {
         engine.set_mode(permission_mode).await;
     }
@@ -6819,6 +6829,8 @@ async fn linear_create_session_from_issue(
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "remote host not found; session was not created".to_owned())?;
     drop(connection);
+    let mode = mode.unwrap_or_else(|| "Interactive".into());
+    let mode = permission_mode_name(parse_permission_mode(&mode)?).to_owned();
     let now = Utc::now();
     state
         .store
@@ -6826,7 +6838,7 @@ async fn linear_create_session_from_issue(
             session_id: session_id.clone(),
             workspace,
             model: model.unwrap_or_else(|| "auto".into()),
-            mode: mode.unwrap_or_else(|| "Interactive".into()),
+            mode,
             harness: harness.unwrap_or_else(|| "builtin".into()),
             title: title.unwrap_or_else(|| {
                 format!(
