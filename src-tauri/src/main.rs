@@ -58,6 +58,38 @@ use std::process::Command as ProcessCommand;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+struct HostAssetReader {
+    host: Box<dyn Host>,
+}
+
+#[async_trait]
+impl opcos_assets::RemoteAssetReader for HostAssetReader {
+    async fn read(&self, path: &str) -> Result<String, opcos_assets::AssetError> {
+        self.host
+            .read(path)
+            .await
+            .map(|content| content.content)
+            .map_err(|error| opcos_assets::AssetError::Invalid(error.to_string()))
+    }
+
+    async fn list(
+        &self,
+        path: Option<&str>,
+    ) -> Result<Vec<(String, bool)>, opcos_assets::AssetError> {
+        self.host
+            .ls(path)
+            .await
+            .map(|listing| {
+                listing
+                    .items
+                    .into_iter()
+                    .map(|item| (item.name, item.dir))
+                    .collect()
+            })
+            .map_err(|error| opcos_assets::AssetError::Invalid(error.to_string()))
+    }
+}
 use tauri::{Emitter, Manager, RunEvent, State};
 use tauri_plugin_opener::OpenerExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1236,6 +1268,15 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
              CREATE TABLE IF NOT EXISTS coordination_ingest_cursor (
                session_id TEXT PRIMARY KEY,
                sequence INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS skill_usage (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               session_id TEXT NOT NULL,
+               project_id TEXT,
+               skill_name TEXT NOT NULL,
+               skill_path TEXT NOT NULL,
+               source TEXT NOT NULL,
+               used_at TEXT NOT NULL
              );",
         )
         .map_err(|error| error.to_string())?;
@@ -3046,6 +3087,36 @@ fn append_session_config_assets(bundle: &mut AssetBundle, assets: Vec<SessionCon
     }
 }
 
+fn record_skill_usage(
+    connection: &Connection,
+    session_id: &str,
+    project_id: Option<&str>,
+    bundle: &AssetBundle,
+) -> Result<(), String> {
+    for skill in bundle.skills.iter().filter(|skill| skill.active) {
+        connection
+            .execute(
+                "INSERT INTO skill_usage
+                 (session_id,project_id,skill_name,skill_path,source,used_at)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                params![
+                    session_id,
+                    project_id,
+                    skill.name,
+                    skill.path,
+                    if skill.path.starts_with(".agents/") {
+                        "repository"
+                    } else {
+                        "configured"
+                    },
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 async fn opencode_for(
     state: &DesktopState,
     session_id: &str,
@@ -3590,6 +3661,18 @@ async fn engine_for(
         &mut bundle,
         load_session_config_assets(state, session_id).unwrap_or_default(),
     );
+    {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        record_skill_usage(
+            &connection,
+            session_id,
+            session.project_id.as_deref(),
+            &bundle,
+        )?;
+    }
     engine
         .set_system_instructions(Some(bundle.system_instructions()))
         .await;
@@ -6296,6 +6379,121 @@ async fn discover_remote_assets(
     discover_assets(&client.with_workspace(workspace.clone()), &workspace)
         .await
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn browse_skill_rules(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Value, String> {
+    let session = session_for(&state, &session_id)?;
+    let (host, workspace) = if session.host_id == "local" {
+        let workspace = if session.workspace.is_empty() {
+            default_local_workspace(&state, &session_id)?
+        } else {
+            session.workspace.clone()
+        };
+        let host = LocalHost::new(PathBuf::from(&workspace))
+            .map_err(|error| format!("本机 workspace 不可用: {error}"))?;
+        (Box::new(host) as Box<dyn Host>, workspace)
+    } else {
+        let client = client_for(&state, &session.host_id)?;
+        let health = client
+            .health()
+            .await
+            .map_err(|error| format!("remote host unavailable: {error}"))?;
+        let workspace = if session.workspace.is_empty() {
+            health
+                .workspace
+                .ok_or_else(|| "remote host did not provide a workspace".to_owned())?
+        } else {
+            session.workspace
+        };
+        (
+            Box::new(RvmHost::new(
+                session.host_id.clone(),
+                workspace.clone(),
+                client.with_workspace(workspace.clone()),
+            )) as Box<dyn Host>,
+            workspace,
+        )
+    };
+    let bundle = discover_assets(&HostAssetReader { host }, &workspace)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(json!({
+        "skills": bundle.skills.into_iter().map(|item| json!({
+            "name": item.name,
+            "path": item.path,
+            "content": item.content,
+            "source": "repository"
+        })).collect::<Vec<_>>(),
+        "rules": bundle.agents.into_iter().map(|item| json!({
+            "path": item.path,
+            "content": item.content,
+            "source": if item.path.replace('\\', "/").contains("/.cursor/rules/") {
+                ".cursor/rules"
+            } else {
+                "repository"
+            }
+        })).collect::<Vec<_>>()
+    }))
+}
+
+#[tauri::command]
+fn skill_usage_dashboard(
+    state: State<'_, DesktopState>,
+    project_id: Option<String>,
+) -> Result<Value, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let project_filter = project_id
+        .as_deref()
+        .map(|_| " AND project_id=?1")
+        .unwrap_or("");
+    let params = project_id
+        .as_deref()
+        .map(|id| vec![id.to_owned()])
+        .unwrap_or_default();
+    let mut by_skill = connection
+        .prepare(&format!(
+            "SELECT skill_name,skill_path,source,COUNT(*),COUNT(DISTINCT session_id),MAX(used_at)
+             FROM skill_usage WHERE 1=1{project_filter}
+             GROUP BY skill_name,skill_path,source ORDER BY COUNT(*) DESC,skill_name"
+        ))
+        .map_err(|error| error.to_string())?;
+    let rows = by_skill
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok(json!({
+                "name": row.get::<_, String>(0)?,
+                "path": row.get::<_, String>(1)?,
+                "source": row.get::<_, String>(2)?,
+                "calls": row.get::<_, i64>(3)?,
+                "sessions": row.get::<_, i64>(4)?,
+                "last_used": row.get::<_, String>(5)?,
+            }))
+        })
+        .map_err(|error| error.to_string())?;
+    let skills = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut timeline = connection
+        .prepare(&format!(
+            "SELECT substr(used_at,1,10),COUNT(*) FROM skill_usage
+             WHERE 1=1{project_filter} GROUP BY substr(used_at,1,10) ORDER BY substr(used_at,1,10)"
+        ))
+        .map_err(|error| error.to_string())?;
+    let rows = timeline
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok(json!({"date": row.get::<_, String>(0)?, "calls": row.get::<_, i64>(1)?}))
+        })
+        .map_err(|error| error.to_string())?;
+    let timeline = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(json!({"skills": skills, "timeline": timeline}))
 }
 
 #[tauri::command]
@@ -11527,6 +11725,8 @@ fn main() {
             save_slash_command,
             delete_slash_command,
             reset_slash_commands,
+            browse_skill_rules,
+            skill_usage_dashboard,
             provider_configurations,
             save_provider_settings,
             save_provider_key,
@@ -11651,6 +11851,65 @@ mod m7_tests {
         assert_ne!(
             project_secret_key("project-1", "asset-secret", "token"),
             secret_key("asset-secret", "token")
+        );
+    }
+
+    #[test]
+    fn skill_usage_records_only_active_injected_skills_with_project_scope() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE skill_usage (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   session_id TEXT NOT NULL,
+                   project_id TEXT,
+                   skill_name TEXT NOT NULL,
+                   skill_path TEXT NOT NULL,
+                   source TEXT NOT NULL,
+                   used_at TEXT NOT NULL
+                 )",
+            )
+            .unwrap();
+        let bundle = AssetBundle {
+            skills: vec![
+                SkillEntry {
+                    name: "active".into(),
+                    path: ".agents/skills/active/SKILL.md".into(),
+                    content: "active".into(),
+                    active: true,
+                },
+                SkillEntry {
+                    name: "inactive".into(),
+                    path: ".agents/skills/inactive/SKILL.md".into(),
+                    content: "inactive".into(),
+                    active: false,
+                },
+            ],
+            ..AssetBundle::default()
+        };
+        record_skill_usage(&connection, "session-1", Some("project-1"), &bundle).unwrap();
+        let row: (String, String, String, String) = connection
+            .query_row(
+                "SELECT session_id,project_id,skill_name,source FROM skill_usage",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "session-1".into(),
+                "project-1".into(),
+                "active".into(),
+                "repository".into()
+            )
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM skill_usage", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
         );
     }
 

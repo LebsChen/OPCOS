@@ -110,6 +110,26 @@ type SlashCommand = {
   scope: string;
   default_body?: string;
 };
+type SkillUsageDashboard = {
+  skills: Array<{
+    name: string;
+    path: string;
+    source: string;
+    calls: number;
+    sessions: number;
+    last_used: string;
+  }>;
+  timeline: Array<{ date: string; calls: number }>;
+};
+type SkillRulesBrowse = {
+  skills: Array<{
+    name: string;
+    path: string;
+    content: string;
+    source: string;
+  }>;
+  rules: Array<{ path: string; content: string; source: string }>;
+};
 const TOKEN_CONNECTOR_KINDS = [
   "github",
   "telegram",
@@ -2509,6 +2529,10 @@ function ManageSections({
   const [slashCommandKind, setSlashCommandKind] = useState<"system" | "custom">(
     "custom",
   );
+  const [skillUsage, setSkillUsage] = useState<SkillUsageDashboard | null>(
+    null,
+  );
+  const [skillBrowse, setSkillBrowse] = useState<SkillRulesBrowse | null>(null);
   const [providerModelOptions, setProviderModelOptions] = useState<
     Record<string, Array<{ id: string; label: string }>>
   >({});
@@ -2710,6 +2734,8 @@ function ManageSections({
   const assetTabKind = assetKinds.includes(tab as (typeof assetKinds)[number])
     ? (tab as Asset["kind"])
     : "knowledge";
+  const assetTabVisible =
+    tab !== "skill" && assetKinds.includes(tab as (typeof assetKinds)[number]);
   const assetLabel =
     assetTabKind === "agents"
       ? "规则"
@@ -2765,6 +2791,23 @@ function ManageSections({
       .then(setDevinSettings)
       .catch(onError);
   }, [tab, devinProjectId, onError]);
+  useEffect(() => {
+    if (tab !== "skill") return;
+    void command<SkillUsageDashboard>("skill_usage_dashboard", {
+      projectId: devinProjectId,
+    })
+      .then(setSkillUsage)
+      .catch(onError);
+    if (!selected) {
+      setSkillBrowse(null);
+      return;
+    }
+    void command<SkillRulesBrowse>("browse_skill_rules", {
+      sessionId: selected.id,
+    })
+      .then(setSkillBrowse)
+      .catch(onError);
+  }, [tab, devinProjectId, selected, onError]);
   useEffect(() => {
     if (tab !== "devin") return;
     void command<SlashCommand[]>("list_slash_commands", {
@@ -3792,7 +3835,154 @@ function ManageSections({
             })()}
           </div>
         )}
-        {assetKinds.includes(tab as (typeof assetKinds)[number]) && (
+        {tab === "skill" && (
+          <div className="space-y-6">
+            <label className="settings-row">
+              <div>
+                <strong>Skills & Rules 作用域</strong>
+                <small>项目视图只统计该项目下会话的真实技能调用。</small>
+              </div>
+              <SelectMenu
+                value={devinProjectId || ""}
+                onChange={(value) => setDevinProjectId(value || null)}
+                options={[
+                  { value: "", label: "全局" },
+                  ...projects.map((project) => ({
+                    value: project.id,
+                    label: project.name,
+                  })),
+                ]}
+              />
+            </label>
+            <section className="rounded-lg border border-line p-4">
+              <div className="flex items-center justify-between mb-3">
+                <div>
+                  <strong>技能用量</strong>
+                  <small className="block">
+                    数据来自技能实际注入会话上下文时的埋点；没有调用记录时保持为空。
+                  </small>
+                </div>
+              </div>
+              {!skillUsage?.skills.length ? (
+                <div className="text-sm text-muted py-6">暂无技能调用记录</div>
+              ) : (
+                <>
+                  <div className="grid grid-cols-3 gap-2 mb-4">
+                    <div className="rounded-md bg-panel p-3">
+                      <small>调用次数</small>
+                      <strong className="block text-lg">
+                        {skillUsage.skills.reduce(
+                          (sum, item) => sum + item.calls,
+                          0,
+                        )}
+                      </strong>
+                    </div>
+                    <div className="rounded-md bg-panel p-3">
+                      <small>涉及技能</small>
+                      <strong className="block text-lg">
+                        {skillUsage.skills.length}
+                      </strong>
+                    </div>
+                    <div className="rounded-md bg-panel p-3">
+                      <small>时间范围</small>
+                      <strong className="block text-lg">
+                        {skillUsage.timeline.length
+                          ? `${skillUsage.timeline[0].date} – ${skillUsage.timeline.at(-1)?.date}`
+                          : "—"}
+                      </strong>
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    {skillUsage.skills.map((item) => (
+                      <div
+                        className="flex items-center gap-3 rounded-md border border-line p-3"
+                        key={`${item.source}:${item.path}`}
+                      >
+                        <code className="flex-1">{item.name}</code>
+                        <span className="text-xs text-muted">
+                          {item.calls} 次 · {item.sessions} 个会话 · 最近{" "}
+                          {item.last_used}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                  {skillUsage.timeline.length > 0 && (
+                    <div className="mt-4 text-xs text-muted">
+                      随时间变化：
+                      {skillUsage.timeline
+                        .map((item) => ` ${item.date} (${item.calls})`)
+                        .join(" · ")}
+                    </div>
+                  )}
+                </>
+              )}
+            </section>
+            <section className="rounded-lg border border-line p-4">
+              <div className="flex items-center justify-between mb-3">
+                <div>
+                  <strong>Browse</strong>
+                  <small className="block">
+                    浏览仓库发现的 .agents/skills 与规则文件；Skill 不在此创建。
+                  </small>
+                </div>
+              </div>
+              {!selected ? (
+                <div className="text-sm text-muted py-6">
+                  请先打开一个项目会话以浏览仓库技能和规则
+                </div>
+              ) : !skillBrowse ? (
+                <div className="text-sm text-muted py-6">正在读取仓库资产…</div>
+              ) : (
+                <div className="space-y-4">
+                  <div>
+                    <h4 className="font-medium mb-2">Skills · 仓库来源</h4>
+                    {!skillBrowse.skills.length ? (
+                      <div className="text-sm text-muted">暂无仓库 Skill</div>
+                    ) : (
+                      skillBrowse.skills.map((item) => (
+                        <details
+                          className="border-b border-line py-2"
+                          key={item.path}
+                        >
+                          <summary className="cursor-pointer">
+                            {item.name}{" "}
+                            <span className="text-xs text-muted">
+                              {item.path}
+                            </span>
+                          </summary>
+                          <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap text-xs">
+                            {item.content}
+                          </pre>
+                        </details>
+                      ))
+                    )}
+                  </div>
+                  <div>
+                    <h4 className="font-medium mb-2">Rules · 仓库来源</h4>
+                    {!skillBrowse.rules.length ? (
+                      <div className="text-sm text-muted">暂无仓库规则</div>
+                    ) : (
+                      skillBrowse.rules.map((item) => (
+                        <details
+                          className="border-b border-line py-2"
+                          key={item.path}
+                        >
+                          <summary className="cursor-pointer">
+                            {item.path}
+                          </summary>
+                          <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap text-xs">
+                            {item.content}
+                          </pre>
+                        </details>
+                      ))
+                    )}
+                  </div>
+                </div>
+              )}
+            </section>
+          </div>
+        )}
+        {assetTabVisible && (
           <div>
             {(
               [
