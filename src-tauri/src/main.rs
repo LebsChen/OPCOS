@@ -2042,19 +2042,27 @@ fn clear_project_configuration(state: &DesktopState, project_id: &str) -> Result
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?
     };
-    for name in secret_names {
-        let (prefix, id) = project_secret_descriptor(&name);
-        state
-            .secrets
-            .delete(&project_secret_key(project_id, prefix, id))
-            .map_err(|error| error.to_string())?;
-    }
+    clear_project_secret_values(&state.secrets, project_id, &secret_names)?;
     connection
         .execute(
             "DELETE FROM secret_records WHERE project_id=?1",
             [project_id],
         )
         .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn clear_project_secret_values(
+    store: &KeyringSecretStore,
+    project_id: &str,
+    names: &[String],
+) -> Result<(), String> {
+    for name in names {
+        let (prefix, id) = project_secret_descriptor(name);
+        store
+            .delete(&project_secret_key(project_id, prefix, id))
+            .map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
@@ -10131,6 +10139,39 @@ mod m7_tests {
             project_secret_descriptor("asset-name"),
             ("asset-secret", "asset-name")
         );
+    }
+
+    #[test]
+    fn project_secret_cleanup_removes_all_scoped_values() {
+        let path = std::env::temp_dir().join(format!(
+            "opcos-secret-test-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let store = KeyringSecretStore::with_fallback("opcos-test", path.clone());
+        let project_id = "project-cleanup";
+        let names = vec![
+            "asset-name".to_owned(),
+            "provider-key:anthropic".to_owned(),
+            "mcp-credential:server".to_owned(),
+            "connector-token:github".to_owned(),
+        ];
+        for name in &names {
+            let (prefix, id) = project_secret_descriptor(name);
+            store
+                .set(&project_secret_key(project_id, prefix, id), "test")
+                .unwrap();
+        }
+        clear_project_secret_values(&store, project_id, &names).unwrap();
+        for name in &names {
+            let (prefix, id) = project_secret_descriptor(name);
+            assert!(
+                store
+                    .get(&project_secret_key(project_id, prefix, id))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
