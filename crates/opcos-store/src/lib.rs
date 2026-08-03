@@ -278,12 +278,13 @@ fn action_ledger_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActionLed
     })
 }
 
+// This is only best-effort cleanup. Callers must provide a non-sensitive summary;
+// marker matching is not a security boundary and cannot detect arbitrary bare secrets.
 fn safe_action_summary(summary: &str) -> Result<String, StoreError> {
     if summary.len() > 4096 {
         return Err(StoreError::Validation("action summary is too long".into()));
     }
-    let mut value = summary.to_owned();
-    for marker in [
+    let markers = [
         "authorization:",
         "authorization=",
         "bearer ",
@@ -296,21 +297,40 @@ fn safe_action_summary(summary: &str) -> Result<String, StoreError> {
         "secret:",
         "token=",
         "token:",
-    ] {
-        let lower = value.to_ascii_lowercase();
-        let mut offset = 0;
-        while let Some(position) = lower[offset..].find(marker) {
-            let start = offset + position;
-            let value_start = start + marker.len();
-            let end = value[value_start..]
-                .find(|character: char| character.is_whitespace() || matches!(character, ',' | ';'))
-                .map(|index| value_start + index)
-                .unwrap_or(value.len());
-            value.replace_range(value_start..end, "[REDACTED]");
-            offset = value_start + "[REDACTED]".len();
-        }
+    ];
+    let lower = summary.to_ascii_lowercase();
+    let mut output = String::with_capacity(summary.len());
+    let mut cursor = 0;
+    let mut search_from = 0;
+    while search_from < lower.len() {
+        let Some((start, marker)) = markers
+            .iter()
+            .filter_map(|marker| {
+                lower[search_from..]
+                    .find(marker)
+                    .map(|offset| (search_from + offset, *marker))
+            })
+            .min_by_key(|(start, _)| *start)
+        else {
+            break;
+        };
+        let value_start = start + marker.len();
+        let end = summary[value_start..]
+            .char_indices()
+            .find(|(_, character)| character.is_whitespace() || matches!(character, ',' | ';'))
+            .map(|(index, _)| value_start + index)
+            .unwrap_or(summary.len());
+        output.push_str(&summary[cursor..value_start]);
+        output.push_str("[REDACTED]");
+        cursor = end;
+        search_from = end;
     }
-    Ok(value)
+    if cursor == 0 {
+        Ok(summary.to_owned())
+    } else {
+        output.push_str(&summary[cursor..]);
+        Ok(output)
+    }
 }
 
 fn ensure_artifact_schema(connection: &Connection) -> Result<(), StoreError> {
@@ -3225,7 +3245,7 @@ mod tests {
     }
 
     #[test]
-    fn action_ledger_keeps_in_flight_explicit_and_redacts_sensitive_summaries() {
+    fn action_ledger_keeps_in_flight_explicit_and_best_effort_redacts_summaries() {
         let store = SqliteStore::open_in_memory().unwrap();
         let action_id = match store
             .begin_action("ship", "market", "account-1", "idem-in-flight", None, None)
@@ -3261,6 +3281,29 @@ mod tests {
                 .unwrap()
                 .contains("[REDACTED]")
         );
+    }
+
+    #[test]
+    fn action_summary_redaction_handles_repeated_markers_and_utf8() {
+        let cases = [
+            ("token=abc", "token=[REDACTED]"),
+            ("token=aaaa token=b", "token=[REDACTED] token=[REDACTED]"),
+            (
+                "token=a token=bbbbbbbbbbbbbbbb",
+                "token=[REDACTED] token=[REDACTED]",
+            ),
+            (
+                "secret=x secret=y secret=z",
+                "secret=[REDACTED] secret=[REDACTED] secret=[REDACTED]",
+            ),
+            (
+                "token=привет token=мир",
+                "token=[REDACTED] token=[REDACTED]",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(safe_action_summary(input).unwrap(), expected);
+        }
     }
 
     #[test]
