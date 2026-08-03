@@ -1500,6 +1500,163 @@ async fn execute_index_tool(
     }
 }
 
+fn edit_line_number(content: &str, offset: usize) -> usize {
+    content[..offset]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1
+}
+
+fn edit_diagnostic(content: &str, old_string: &str) -> String {
+    let normalized_old = old_string.replace("\r\n", "\n");
+    let normalized_content = content.replace("\r\n", "\n");
+    if normalized_content.contains(&normalized_old) {
+        return "candidate differs only by line endings (CRLF versus LF)".into();
+    }
+    let compact_old = old_string.split_whitespace().collect::<String>();
+    if !compact_old.is_empty()
+        && content
+            .split_whitespace()
+            .collect::<String>()
+            .contains(&compact_old)
+    {
+        return "candidate differs only by whitespace or indentation".into();
+    }
+    let hint = old_string
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or_default();
+    if !hint.is_empty()
+        && let Some((line, _)) = content
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains(hint))
+    {
+        return format!(
+            "nearest line {}: candidate contains the requested text with different context",
+            line + 1
+        );
+    }
+    "no close candidate found; include more surrounding context".into()
+}
+
+async fn execute_edit_file_tool(host: &dyn Host, arguments: &Value) -> Result<Value, String> {
+    let path = arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or("missing string argument: path")?;
+    let edits = arguments
+        .get("edits")
+        .and_then(Value::as_array)
+        .ok_or("missing array argument: edits")?;
+    if edits.is_empty() {
+        return Err("edits must contain at least one replacement".into());
+    }
+    let file = host.read(path).await.map_err(|error| error.to_string())?;
+    let original_hash = format!("{:x}", Sha256::digest(file.content.as_bytes()));
+    let crlf_count = file.content.matches("\r\n").count();
+    let lf_count = file
+        .content
+        .matches('\n')
+        .count()
+        .saturating_sub(crlf_count);
+    let crlf = crlf_count > lf_count;
+    let mut replacements = Vec::with_capacity(edits.len());
+    for (index, edit) in edits.iter().enumerate() {
+        let old = edit
+            .get("old_string")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("edit {index} is missing old_string"))?;
+        let new = edit
+            .get("new_string")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("edit {index} is missing new_string"))?;
+        if old.is_empty() {
+            return Err(format!("edit {index} has an empty old_string"));
+        }
+        let matches = file.content.match_indices(old).collect::<Vec<_>>();
+        if matches.len() != 1 {
+            let locations = matches
+                .iter()
+                .map(|(offset, _)| edit_line_number(&file.content, *offset))
+                .collect::<Vec<_>>();
+            if matches.is_empty() {
+                return Err(format!(
+                    "edit {index} old_string was not found; {}",
+                    edit_diagnostic(&file.content, old)
+                ));
+            }
+            return Err(format!(
+                "edit {index} old_string matched {} times at lines {:?}; provide more context",
+                matches.len(),
+                locations
+            ));
+        }
+        let (start, matched) = matches[0];
+        let replacement = if crlf {
+            new.replace("\r\n", "\n").replace('\n', "\r\n")
+        } else {
+            new.to_owned()
+        };
+        replacements.push((
+            start,
+            start + matched.len(),
+            replacement,
+            edit_line_number(&file.content, start),
+        ));
+    }
+    replacements.sort_by_key(|(start, _, _, _)| *start);
+    for pair in replacements.windows(2) {
+        if pair[0].1 > pair[1].0 {
+            return Err("edits overlap in the original file; no changes were applied".into());
+        }
+    }
+    let mut updated = String::with_capacity(file.content.len());
+    let mut cursor = 0;
+    let mut changed = Vec::with_capacity(replacements.len());
+    for (start, end, replacement, line) in &replacements {
+        updated.push_str(&file.content[cursor..*start]);
+        updated.push_str(replacement);
+        changed.push(json!({
+            "line": line,
+            "old_bytes": end - start,
+            "new_bytes": replacement.len(),
+        }));
+        cursor = *end;
+    }
+    updated.push_str(&file.content[cursor..]);
+    let updated_lines = updated.lines().collect::<Vec<_>>();
+    for item in &mut changed {
+        let line = item["line"].as_u64().unwrap_or(1) as usize;
+        let start = line.saturating_sub(2);
+        let end = (line + 1).min(updated_lines.len());
+        item["context"] = json!(updated_lines[start..end].to_vec());
+    }
+    let current_content = host
+        .read(path)
+        .await
+        .map_err(|error| format!("could not verify edit version: {error}"))?
+        .content;
+    let current_hash = format!("{:x}", Sha256::digest(current_content.as_bytes()));
+    if current_hash != original_hash {
+        return Err("file changed externally after it was read; no changes were applied".into());
+    }
+    host.write(path, &updated)
+        .await
+        .map_err(|error| format!("failed to apply atomic edit: {error}"))?;
+    Ok(json!({
+        "status": "ok",
+        "path": path,
+        "edits": changed,
+        "bytes": updated.len(),
+        "line_endings": if crlf { "CRLF" } else { "LF" },
+        "final_newline": updated.ends_with('\n'),
+        "verified_hash": current_hash,
+    }))
+}
+
 async fn execute_background_job_tool(
     jobs: &BackgroundJobManager,
     host: &dyn Host,
@@ -2345,6 +2502,14 @@ impl ToolExecutor for RemoteExecutor {
                 .write(argument("path")?, argument("content")?)
                 .await
                 .map_err(|error| error.to_string()),
+            "edit_file" => {
+                let host = RvmHost::new(
+                    self.host_id.clone(),
+                    self.workspace.clone(),
+                    self.client.clone(),
+                );
+                execute_edit_file_tool(&host, &arguments).await
+            }
             "list_dir" => self
                 .client
                 .ls(arguments.get("path").and_then(Value::as_str))
@@ -2578,6 +2743,7 @@ impl ToolExecutor for DesktopExecutor {
                         .write(argument("path")?, argument("content")?)
                         .await
                         .map_err(|error| error.to_string()),
+                    "edit_file" => execute_edit_file_tool(&executor.host, &arguments).await,
                     "list_dir" => executor
                         .host
                         .ls(arguments.get("path").and_then(Value::as_str))
@@ -17678,6 +17844,105 @@ fn main() {
 #[cfg(test)]
 mod m7_tests {
     use super::*;
+
+    fn edit_test_host() -> (PathBuf, LocalHost) {
+        let root = std::env::temp_dir().join(format!("opcos-edit-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let host = LocalHost::new(&root).unwrap();
+        (root, host)
+    }
+
+    #[tokio::test]
+    async fn exact_edit_applies_unique_match_and_reports_context() {
+        let (root, host) = edit_test_host();
+        std::fs::write(root.join("file.txt"), "one\nneedle\nthree\n").unwrap();
+        let result = execute_edit_file_tool(
+            &host,
+            &json!({
+                "path": "file.txt",
+                "edits": [{"old_string": "needle", "new_string": "changed"}]
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("file.txt")).unwrap(),
+            "one\nchanged\nthree\n"
+        );
+        assert_eq!(result["edits"][0]["line"], 2);
+        assert!(
+            result["edits"][0]["context"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|line| line == "changed")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_edit_rejects_ambiguous_and_missing_matches_with_diagnostics() {
+        let (root, host) = edit_test_host();
+        std::fs::write(root.join("file.txt"), "let x = 1;\nlet x = 1;\n").unwrap();
+        let error = execute_edit_file_tool(
+            &host,
+            &json!({"path":"file.txt","edits":[{"old_string":"let x = 1;","new_string":"let x = 2;"}]}),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("matched 2 times"));
+        assert!(error.contains("[1, 2]"));
+        let error = execute_edit_file_tool(
+            &host,
+            &json!({"path":"file.txt","edits":[{"old_string":"let  x = 1;","new_string":"x"}]}),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("whitespace"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_edit_is_atomic_and_preserves_crlf_and_final_newline() {
+        let (root, host) = edit_test_host();
+        let original = b"first\r\nsecond\r\nthird\r\n";
+        std::fs::write(root.join("file.txt"), original).unwrap();
+        let error = execute_edit_file_tool(
+            &host,
+            &json!({"path":"file.txt","edits":[
+                {"old_string":"first","new_string":"1"},
+                {"old_string":"missing","new_string":"2"}
+            ]}),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("edit 1"));
+        assert_eq!(std::fs::read(root.join("file.txt")).unwrap(), original);
+        execute_edit_file_tool(
+            &host,
+            &json!({"path":"file.txt","edits":[{"old_string":"second","new_string":"middle\nline"}]}),
+        )
+        .await
+        .unwrap();
+        let updated = std::fs::read(root.join("file.txt")).unwrap();
+        assert_eq!(updated, b"first\r\nmiddle\r\nline\r\nthird\r\n");
+        assert!(updated.ends_with(b"\r\n"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_edit_rejects_binary_files() {
+        let (root, host) = edit_test_host();
+        std::fs::write(root.join("binary"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+        let error = execute_edit_file_tool(
+            &host,
+            &json!({"path":"binary","edits":[{"old_string":"x","new_string":"y"}]}),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_lowercase().contains("utf"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn inline_shell_output_is_tail_bounded_with_honest_metadata() {
