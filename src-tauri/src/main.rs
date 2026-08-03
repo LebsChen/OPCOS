@@ -1513,6 +1513,213 @@ fn seed_builtin_templates(connection: &Connection) -> Result<(), String> {
             "dependencies:\n  - cargo fetch\n  - (cd web && npm install)\nbuild:\n  - cargo build\n  - (cd web && npm run build)\npre-push:\n  - cargo fmt --check\n  - cargo clippy --workspace --all-targets -- -D warnings\n  - cargo test\n  - (cd web && npx tsc --noEmit)\n"
         ),
     )?;
+    let rules = [
+        (
+            "template-rules-general",
+            "通用工程工作准则",
+            "适用于所有项目的最小变更、安全和交付准则。",
+            r#"# 通用工程工作准则
+
+- 先理解现有结构和约定，再做最小、聚焦的改动；不要为了“顺手”重排或重写无关代码。
+- 优先复用现有抽象和工具，保持行为、边界条件和错误处理的一致性。
+- 不把凭据、个人数据或临时调试输出写入源代码、日志、测试夹具、transcript 或提交。
+- 不修改测试来掩盖实现问题；新增行为应有能够证明验收条件的测试。
+- 提交前运行项目规定的格式化、静态检查、类型检查和测试，并准确报告未通过的门禁。
+"#,
+        ),
+        (
+            "template-rules-rust-typescript",
+            "Rust/TypeScript 项目准则",
+            "针对 Rust 后端和 TypeScript 前端协作项目的实现与验证要求。",
+            r#"# Rust/TypeScript 项目准则
+
+- Rust 代码遵循现有错误传播、异步、数据库事务和模块分层模式；不要绕过类型系统或用静默 fallback 隐藏失败。
+- TypeScript/React 代码保持现有组件边界、Tauri invoke/event 通信方式和状态更新习惯，不引入无必要的 sidecar 或全局状态。
+- 修改跨前后端契约时，同时检查 command 名称、参数序列化、返回值和错误文案，并为关键路径补充端到端可验证的测试。
+- 合并前至少运行 `cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test`，以及前端的类型检查、构建和格式检查。
+"#,
+        ),
+    ];
+    for (id, name, description, content) in rules {
+        seed_builtin_template(connection, id, "rules", name, description, &json!(content))?;
+    }
+    let knowledge = [
+        (
+            "template-knowledge-verification",
+            "提交前验证清单",
+            "一份可重复使用的本地提交前检查清单。",
+            r#"# 提交前验证清单
+
+1. 检查 `git diff`，确认变更只覆盖任务范围，没有凭据、临时文件或无关格式化。
+2. 运行格式化检查和 lint，修复所有警告而不是跳过检查。
+3. 运行后端单元测试、集成测试和前端类型检查；涉及 UI 时再运行生产构建。
+4. 用 `git diff --check` 检查空白错误，确认新增迁移和配置变更可重复执行。
+5. 在提交说明或交付报告中记录实际运行的命令、结果和仍存在的环境限制。
+"#,
+        ),
+        (
+            "template-knowledge-git-review",
+            "Git 分支与评审约定",
+            "帮助 agent 保持可审查、可回滚的 Git 工作流。",
+            r#"# Git 分支与评审约定
+
+- 从最新目标分支创建描述清晰的任务分支，不直接在主分支上开发。
+- 提交前先查看状态和完整 diff，显式暂存相关文件，不使用会把无关文件全部加入的命令。
+- 一个提交应表达一个完整、可验证的目的；不要混入无关重构或生成物。
+- 需要评审时提供变更摘要、验证证据、风险和待决策事项；不要把未验证的“应该可以”当作结论。
+- 遇到冲突或失败时保留可复现证据，优先修复根因，并确保回滚路径清楚。
+"#,
+        ),
+    ];
+    for (id, name, description, content) in knowledge {
+        seed_builtin_template(
+            connection,
+            id,
+            "knowledge",
+            name,
+            description,
+            &json!(content),
+        )?;
+    }
+    let runbooks = [
+        (
+            "template-runbook-new-feature",
+            "实现一个新功能",
+            "从需求澄清到验证交付的可执行功能开发流程。",
+            r#"# 实现一个新功能
+
+1. **澄清目标**：列出用户可观察行为、边界条件和不做的事情。完成判据：验收条件可逐条检查。
+2. **调查代码**：定位现有入口、数据模型、调用链和相邻测试。完成判据：能说明复用点、影响面和兼容约束。
+3. **设计最小方案**：先确定跨层契约、错误处理和迁移策略，再拆成可独立验证的小改动。完成判据：方案不会破坏现有行为。
+4. **实现与测试**：按既有风格编码，补充覆盖正常、失败和边界路径的测试。完成判据：测试能证明每条验收条件。
+5. **运行门禁**：执行项目要求的格式化、lint、类型检查、构建和测试。完成判据：所有相关门禁通过，或限制已被明确记录。
+6. **审查交付**：复查 diff、清理调试内容和凭据，整理摘要、验证证据与风险。完成判据：变更可审查、可回滚、可交接。
+"#,
+        ),
+        (
+            "template-runbook-fix-bug",
+            "定位并修复 Bug",
+            "从复现、定位到回归验证的故障处理流程。",
+            r#"# 定位并修复 Bug
+
+1. **固定现象**：记录输入、环境、预期和实际结果，先建立稳定复现步骤。完成判据：同一条件下能重复看到问题。
+2. **缩小范围**：沿调用链检查日志、错误返回、持久化数据和边界输入，比较正常与异常路径。完成判据：提出有证据支持的根因假设。
+3. **添加回归测试**：在修复前或同时写出能失败的最小测试。完成判据：测试确实捕获原始问题。
+4. **修复根因**：采用与现有架构一致的最小改动，不通过吞错、放宽校验或修改测试规避失败。完成判据：回归测试和相邻测试均通过。
+5. **验证影响面**：运行相关门禁并检查迁移、错误文案、日志和安全边界。完成判据：没有引入新的回归或敏感信息暴露。
+6. **交付记录**：说明根因、修复、验证命令和未解决限制。完成判据：其他成员无需重新调查即可复核结论。
+"#,
+        ),
+    ];
+    for (id, name, description, content) in runbooks {
+        seed_builtin_template(
+            connection,
+            id,
+            "runbook",
+            name,
+            description,
+            &json!(content),
+        )?;
+    }
+    let skills = [
+        (
+            "template-skill-code-review",
+            "代码审查",
+            "按风险优先级检查实现正确性、安全性、兼容性和测试覆盖。",
+            r#"---
+name: code-review
+description: 按风险优先级审查代码变更并给出可执行结论。
+---
+
+# 代码审查
+
+1. 先阅读任务要求、变更范围和相关调用链，再检查 diff。
+2. 优先寻找会导致错误行为、数据丢失、凭据泄露、权限绕过或回归的具体问题。
+3. 检查错误路径、边界输入、并发/事务行为和向后兼容性。
+4. 对每个问题给出文件位置、影响、复现条件和最小修复建议；没有问题时说明检查过的风险面。
+5. 不用个人偏好替代项目约定，也不把纯风格建议冒充阻塞问题。
+"#,
+        ),
+        (
+            "template-skill-test-design",
+            "测试设计",
+            "把验收条件转换为稳定、聚焦且能捕获回归的测试。",
+            r#"---
+name: test-design
+description: 为新行为和缺陷修复设计覆盖正常、失败及边界条件的测试。
+---
+
+# 测试设计
+
+1. 从用户可观察的验收条件开始，而不是从实现细节开始。
+2. 为正常路径、无效输入、外部失败、边界值和重复执行分别确定断言。
+3. 优先使用仓库已有的 fixture、测试 helper 和临时资源，避免依赖真实凭据或不稳定网络。
+4. 让失败信息能指出哪条行为契约被破坏，并确认测试不会只验证 mock 自己的实现。
+5. 运行最小相关测试后再运行完整门禁，记录命令和结果。
+"#,
+        ),
+    ];
+    for (id, name, description, content) in skills {
+        seed_builtin_template(connection, id, "skill", name, description, &json!(content))?;
+    }
+    let mcp_servers = [
+        (
+            "template-mcp-filesystem",
+            "本地文件系统 MCP",
+            "使用官方 filesystem stdio server 访问明确传入的工作目录，不包含任何凭据。",
+            json!({
+                "transport":"stdio",
+                "command":"npx",
+                "args":["-y","@modelcontextprotocol/server-filesystem","/workspace"],
+                "env":{},
+                "enabled":true,
+                "requires_approval":true
+            }),
+        ),
+        (
+            "template-mcp-fetch",
+            "网页抓取 MCP",
+            "使用 fetch stdio server 读取公开网页，不包含任何凭据或授权 header。",
+            json!({
+                "transport":"stdio",
+                "command":"uvx",
+                "args":["mcp-server-fetch"],
+                "env":{},
+                "enabled":true,
+                "requires_approval":true
+            }),
+        ),
+    ];
+    for (id, name, description, content) in mcp_servers {
+        seed_builtin_template(connection, id, "mcp", name, description, &content)?;
+    }
+    let connectors = [
+        (
+            "template-connector-github",
+            "GitHub 连接器",
+            "从连接器目录启用 GitHub；凭据必须由用户在 SecretStore 中配置。",
+            json!({
+                "connector":"github",
+                "catalog_name":"GitHub",
+                "description":"Work with issues, pull requests, files, and CI status.",
+                "credential_storage":"SecretStore"
+            }),
+        ),
+        (
+            "template-connector-browser",
+            "浏览器连接器",
+            "从连接器目录启用 Browser；连接器本身不内置凭据。",
+            json!({
+                "connector":"browser",
+                "catalog_name":"Browser",
+                "description":"Navigate, read, and act on websites with approval.",
+                "requires_credentials":false
+            }),
+        ),
+    ];
+    for (id, name, description, content) in connectors {
+        seed_builtin_template(connection, id, "connector", name, description, &content)?;
+    }
     Ok(())
 }
 
@@ -1524,6 +1731,20 @@ fn seed_builtin_template(
     description: &str,
     content: &Value,
 ) -> Result<(), String> {
+    let already_defined: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM config_object
+               WHERE scope_kind='global' AND status <> 'deleted'
+                 AND kind=?1 AND name=?2
+             )",
+            params![kind, name],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if already_defined {
+        return Ok(());
+    }
     let now = Utc::now().to_rfc3339();
     let metadata = serde_json::to_string(&json!({"description":description}))
         .map_err(|error| error.to_string())?;
@@ -7163,19 +7384,23 @@ fn repository_template_paths(
         return Err("template name cannot produce a repository filename".into());
     }
     let (directory, filename) = match kind {
-        "agent-template" => (".agents/templates/agents", format!("{slug}.yaml")),
-        "team-template" => (".agents/templates/teams", format!("{slug}.yaml")),
-        "rules" => (".", "AGENTS.md".to_owned()),
-        "knowledge" => (".agents/knowledge", format!("{slug}.md")),
-        "runbook" => (".agents/playbooks", format!("{slug}.md")),
-        "blueprint" => (".devin", "blueprint.yaml".to_owned()),
+        "agent-template" => (
+            ".agents/templates/agents".to_owned(),
+            format!("{slug}.yaml"),
+        ),
+        "team-template" => (".agents/templates/teams".to_owned(), format!("{slug}.yaml")),
+        "rules" => (".".to_owned(), "AGENTS.md".to_owned()),
+        "knowledge" => (".agents/knowledge".to_owned(), format!("{slug}.md")),
+        "runbook" => (".agents/playbooks".to_owned(), format!("{slug}.md")),
+        "skill" => (format!(".agents/skills/{slug}"), "SKILL.md".to_owned()),
+        "blueprint" => (".devin".to_owned(), "blueprint.yaml".to_owned()),
         other => {
             return Err(format!(
                 "repository export is unsupported for template kind '{other}'"
             ));
         }
     };
-    let directory_path = repository_path(host, repository_root, directory)?;
+    let directory_path = repository_path(host, repository_root, &directory)?;
     let relative_file = if directory == "." {
         filename.clone()
     } else {
@@ -8091,8 +8316,12 @@ async fn export_assets(
     let mut exported = 0;
     for (id, kind, title, body, metadata_json, scope) in rows {
         let (directory, filename) = match kind.as_str() {
-            "knowledge" => (".agents/knowledge", format!("{id}.md")),
-            "runbook" => (".agents/playbooks", format!("{id}.md")),
+            "knowledge" => (".agents/knowledge".to_owned(), format!("{id}.md")),
+            "runbook" => (".agents/playbooks".to_owned(), format!("{id}.md")),
+            "skill" => (
+                format!(".agents/skills/{}", repository_template_slug(&title)),
+                "SKILL.md".to_owned(),
+            ),
             _ => continue,
         };
         let metadata = serde_json::from_str::<Value>(&metadata_json).unwrap_or_else(|_| json!({}));
@@ -8222,6 +8451,40 @@ async fn import_assets(
                     item.body,
                     content_hash(&item.body),
                     Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    for item in &bundle.skills {
+        let object_id = format!("config:skill:{}", item.name);
+        let version_id = format!("{object_id}:v1");
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO config_object
+                 (id,kind,name,scope_kind,scope_key,status,created_at,current_version_id)
+                 VALUES (?1,'skill',?2,'repo',?3,'active',?4,?5)",
+                params![
+                    object_id,
+                    item.name,
+                    workspace,
+                    Utc::now().to_rfc3339(),
+                    version_id
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO config_object_version
+                 (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+                 VALUES (?1,?2,1,?3,?4,?5,'imported',?6)",
+                params![
+                    version_id,
+                    object_id,
+                    item.content,
+                    content_hash(&item.content),
+                    Utc::now().to_rfc3339(),
+                    serde_json::to_string(&json!({"path": item.path}))
+                        .map_err(|error| error.to_string())?
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -14064,10 +14327,10 @@ mod m7_tests {
                    UNIQUE(object_id,version)
                  );
                  INSERT INTO config_object VALUES
-                   ('template-agent-lead','agent-template','My Lead','my-lead',
-                    'template','custom','active','now','template-agent-lead:v1');
+                   ('custom-agent-lead','agent-template','Lead','my-lead',
+                    'global',NULL,'active','now','custom-agent-lead:v1');
                  INSERT INTO config_object_version VALUES
-                   ('template-agent-lead:v1','template-agent-lead',1,
+                   ('custom-agent-lead:v1','custom-agent-lead',1,
                     '{\"role\":\"Custom\"}','hash','now','custom','{}');",
             )
             .unwrap();
@@ -14076,7 +14339,7 @@ mod m7_tests {
         let custom: String = connection
             .query_row(
                 "SELECT content FROM config_object_version
-                 WHERE id='template-agent-lead:v1'",
+                 WHERE id='custom-agent-lead:v1'",
                 [],
                 |row| row.get(0),
             )
@@ -14089,7 +14352,26 @@ mod m7_tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(builtin_count, 7);
+        assert_eq!(builtin_count, 19);
+        for kind in [
+            "rules",
+            "knowledge",
+            "runbook",
+            "skill",
+            "mcp",
+            "connector",
+            "blueprint",
+        ] {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM config_object
+                     WHERE status='builtin' AND kind=?1",
+                    [kind],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(count > 0, "expected builtin preset for {kind}");
+        }
     }
 
     #[test]
@@ -14347,6 +14629,17 @@ mod m7_tests {
         assert_eq!(
             missing,
             format!("{}/.agents/templates/teams", root.display())
+        );
+        let (skill_dir, skill_path) =
+            repository_template_paths("skill", "Code Review", &host, &root.display().to_string())
+                .unwrap();
+        assert_eq!(
+            skill_dir,
+            format!("{}/.agents/skills/code-review", root.display())
+        );
+        assert_eq!(
+            skill_path,
+            format!("{}/.agents/skills/code-review/SKILL.md", root.display())
         );
         std::fs::remove_dir_all(root).unwrap();
     }
