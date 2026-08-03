@@ -70,6 +70,7 @@ use std::process::Command as ProcessCommand;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use uuid::Uuid;
 
 struct HostAssetReader {
     host: Arc<dyn Host>,
@@ -242,6 +243,689 @@ struct LocalExecutor {
 enum DesktopExecutor {
     Remote(Box<RemoteExecutor>),
     Local(LocalExecutor),
+}
+
+fn git_string_argument(arguments: &Value, key: &str) -> Result<String, String> {
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .filter(|value| !value.contains(['\0', '\r', '\n']))
+        .map(str::to_owned)
+        .ok_or_else(|| format!("missing or invalid git argument: {key}"))
+}
+
+fn git_files_argument(arguments: &Value) -> Result<Vec<String>, String> {
+    let files = arguments
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or("git files must be an explicit array")?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|path| !path.trim().is_empty())
+                .filter(|path| !path.contains(['\0', '\r', '\n']))
+                .map(str::to_owned)
+                .ok_or("git files must contain non-empty paths")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if files.is_empty() {
+        return Err("git files must not be empty".into());
+    }
+    Ok(files)
+}
+
+fn validate_git_remote_name(remote: &str) -> Result<(), String> {
+    if remote.is_empty()
+        || remote == "."
+        || remote == ".."
+        || remote.starts_with(['/', '\\', '.'])
+        || remote.contains(['\0', '\r', '\n', ':', '@', '\\'])
+        || remote.contains("://")
+        || !remote
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
+    {
+        return Err(
+            "git remote must be an existing configured remote name, not a URL or path".into(),
+        );
+    }
+    Ok(())
+}
+
+async fn read_git_remote_url(
+    host: &dyn Host,
+    platform: Option<&str>,
+    cwd: &str,
+    remote: &str,
+) -> Result<String, String> {
+    let command = format!("git remote get-url -- {}", quote_for(platform, remote));
+    let result = host
+        .exec(ExecRequest {
+            command,
+            cwd: Some(cwd.to_owned()),
+            timeout_seconds: 15,
+            session: None,
+            env: None,
+        })
+        .await
+        .map_err(|error| format!("unable to inspect configured git remote: {error}"))?;
+    if result.result.exit_code != 0 {
+        return Err("configured git remote was not found".into());
+    }
+    let url = result.result.stdout.trim().to_owned();
+    if url.is_empty() {
+        return Err("configured git remote has no destination URL".into());
+    }
+    Ok(url)
+}
+
+fn git_remote_host(remote_url: &str) -> Option<String> {
+    if let Some((_, remainder)) = remote_url.split_once('@')
+        && let Some((host, _)) = remainder.split_once(':')
+    {
+        return Some(host.to_ascii_lowercase());
+    }
+    url::Url::parse(remote_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+}
+
+fn validate_git_remote_destination(
+    remote_url: &str,
+    store: &SqliteStore,
+    project_id: Option<&str>,
+) -> Result<(), String> {
+    let host = git_remote_host(remote_url)
+        .ok_or("configured git remote destination is not a recognized forge URL")?;
+    if host != "github.com" {
+        return Err("git push credentials are only allowed for github.com remotes".into());
+    }
+    if let Ok(parsed) = url::Url::parse(remote_url)
+        && (parsed.username() != "" || parsed.password().is_some())
+    {
+        return Err("configured git remote must not contain embedded credentials".into());
+    }
+    if let Some(project_id) = project_id
+        && let Some(project) = store
+            .load_project(project_id)
+            .map_err(|error| error.to_string())?
+        && let Some(expected_host) = git_remote_host(&project.repo_url)
+        && expected_host != host
+    {
+        return Err("git remote destination does not match the project forge host".into());
+    }
+    Ok(())
+}
+
+async fn install_askpass_helper(
+    host: &dyn Host,
+    platform: Option<&str>,
+    path: &str,
+    script: &str,
+) -> Result<(), String> {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
+    let command = if platform == Some("windows") {
+        let escaped_path = path.replace('\'', "''");
+        format!(
+            "$p = '{escaped_path}'; [IO.File]::WriteAllText($p, [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}')))"
+        )
+    } else {
+        format!(
+            "printf '%s' '{}' | base64 -d > {} && chmod 700 {}",
+            encoded,
+            quote_for(platform, path),
+            quote_for(platform, path)
+        )
+    };
+    let result = host
+        .exec(ExecRequest {
+            command,
+            cwd: None,
+            timeout_seconds: 15,
+            session: None,
+            env: None,
+        })
+        .await
+        .map_err(|error| format!("unable to install temporary git credential helper: {error}"))?;
+    if result.result.exit_code != 0 {
+        return Err("unable to install temporary git credential helper".into());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_git_write(
+    host: &dyn Host,
+    platform: Option<&str>,
+    secrets: &KeyringSecretStore,
+    project_id: Option<&str>,
+    store: &SqliteStore,
+    session_id: &str,
+    name: &str,
+    arguments: &Value,
+) -> Result<Value, String> {
+    let cwd = git_string_argument(arguments, "cwd")?;
+    let remote_name = arguments
+        .get("remote")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("origin");
+    if name == "git_push" {
+        validate_git_remote_name(remote_name)?;
+        let remote_url = read_git_remote_url(host, platform, &cwd, remote_name).await?;
+        validate_git_remote_destination(&remote_url, store, project_id)?;
+    }
+    let push_action = if name == "git_push" {
+        let branch = arguments
+            .get("branch")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let key = format!("git-push:{cwd}:{remote_name}:{branch}");
+        match store
+            .begin_action("git_push", "git", &key, &key, Some(session_id), project_id)
+            .map_err(|error| error.to_string())?
+        {
+            ActionBeginResult::Fresh(record) => Some(record.action_id),
+            ActionBeginResult::AlreadySucceeded {
+                action_id,
+                external_id,
+                result_summary,
+            } => {
+                return Ok(json!({
+                    "status": "already_succeeded",
+                    "action_id": action_id,
+                    "external_id": external_id,
+                    "result_summary": result_summary,
+                }));
+            }
+            ActionBeginResult::InFlight { action_id, .. } => {
+                return Err(format!(
+                    "git push action {action_id} is still in flight; reconcile before retrying"
+                ));
+            }
+            ActionBeginResult::PreviouslyFailed { action_id, .. } => {
+                return Err(format!(
+                    "git push action {action_id} previously failed; inspect and use a new retry key"
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    let quote = |value: &str| quote_for(platform, value);
+    let command = match name {
+        "git_create_branch" => {
+            format!(
+                "git switch -c {}",
+                quote(&git_string_argument(arguments, "branch")?)
+            )
+        }
+        "git_stage_commit" => {
+            let files = git_files_argument(arguments)?;
+            let message = git_string_argument(arguments, "message")?;
+            format!(
+                "git add -- {} && git commit -m {}",
+                files
+                    .iter()
+                    .map(|file| quote(file))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                quote(&message)
+            )
+        }
+        "git_push" => {
+            let branch = arguments.get("branch").and_then(Value::as_str);
+            format!(
+                "git push {}{}",
+                quote(remote_name),
+                branch
+                    .map(|value| format!(" {}", quote(value)))
+                    .unwrap_or_default()
+            )
+        }
+        _ => return Err(format!("unsupported structured git write: {name}")),
+    };
+    reject_dangerous_git(&command)?;
+    let mut env = serde_json::Map::new();
+    let mut secret_values = Vec::new();
+    let askpass_path = if name == "git_push" {
+        let token = scoped_secret_get_from_store(secrets, project_id, "connector-token", "github")?
+            .ok_or("project GitHub credential is not configured")?;
+        let username = "x-access-token".to_owned();
+        let suffix = Uuid::new_v4().simple().to_string();
+        let path = if platform == Some("windows") {
+            let temp_path = host
+                .exec(ExecRequest {
+                    command: format!(
+                        "Write-Output ([IO.Path]::Combine($env:TEMP, 'opcos-askpass-{suffix}.ps1'))"
+                    ),
+                    cwd: None,
+                    timeout_seconds: 15,
+                    session: None,
+                    env: None,
+                })
+                .await
+                .map_err(|error| {
+                    format!("unable to determine temporary credential path: {error}")
+                })?;
+            if temp_path.result.exit_code != 0 {
+                return Err("unable to determine temporary credential path".into());
+            }
+            temp_path.result.stdout.trim().to_owned()
+        } else {
+            format!("/tmp/opcos-askpass-{suffix}.sh")
+        };
+        let script = if platform == Some("windows") {
+            ASKPASS_SCRIPT.to_owned()
+        } else {
+            "#!/bin/sh\ncase \"$1\" in *Username*) printf '%s' \"$OPCOS_GIT_USERNAME\";; *) printf '%s' \"$OPCOS_GIT_PASSWORD\";; esac\n".into()
+        };
+        install_askpass_helper(host, platform, &path, &script).await?;
+        env.insert("GIT_ASKPASS".into(), Value::String(path.clone()));
+        env.insert("GIT_TERMINAL_PROMPT".into(), Value::String("0".into()));
+        env.insert("OPCOS_GIT_USERNAME".into(), Value::String(username.clone()));
+        env.insert("OPCOS_GIT_PASSWORD".into(), Value::String(token.clone()));
+        secret_values.push(token);
+        secret_values.push(username);
+        Some(path)
+    } else {
+        None
+    };
+    let result = host
+        .exec(ExecRequest {
+            command,
+            cwd: Some(cwd.clone()),
+            timeout_seconds: 120,
+            session: None,
+            env: Some(Value::Object(env)),
+        })
+        .await;
+    if let Some(path) = askpass_path {
+        let _ = host
+            .exec(ExecRequest {
+                command: if platform == Some("windows") {
+                    format!(
+                        "Remove-Item -LiteralPath '{}' -Force -ErrorAction SilentlyContinue",
+                        path.replace('\'', "''")
+                    )
+                } else {
+                    format!("rm -f -- {}", quote(&path))
+                },
+                cwd: Some(cwd.clone()),
+                timeout_seconds: 10,
+                session: None,
+                env: None,
+            })
+            .await;
+    }
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            if let Some(action_id) = push_action {
+                let _ = store.finish_action_failed(&action_id, &error.to_string());
+            }
+            return Err(error.to_string());
+        }
+    };
+    let mut output = if name == "git_stage_commit" {
+        serde_json::to_value(opcos_engine::git::commit_result(
+            result.result.exit_code,
+            &result.result.stdout,
+            &result.result.stderr,
+            &cwd,
+        ))
+        .unwrap_or(Value::Null)
+    } else if name == "git_create_branch" {
+        serde_json::to_value(opcos_engine::git::branch_result(
+            result.result.exit_code,
+            &result.result.stdout,
+            &result.result.stderr,
+            &cwd,
+        ))
+        .unwrap_or(Value::Null)
+    } else {
+        json!({
+            "status": if result.result.exit_code == 0 { "ok" } else { "failed" },
+            "exit_code": result.result.exit_code,
+            "stdout": result.result.stdout,
+            "stderr": result.result.stderr,
+            "cwd": cwd,
+        })
+    };
+    for secret in secret_values {
+        redact_json_strings(&mut output, &secret);
+    }
+    if name == "git_push" && output.get("status").and_then(Value::as_str) == Some("failed") {
+        output["failure_kind"] = serde_json::to_value(opcos_engine::git::classify_push_failure(
+            output
+                .get("stderr")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            output.get("exit_code").and_then(Value::as_i64).unwrap_or(1) as i32,
+        ))
+        .unwrap_or_else(|_| json!("other"));
+    }
+    if let Some(action_id) = push_action {
+        if output.get("status").and_then(Value::as_str) == Some("ok") {
+            let summary =
+                serde_json::to_string(&output).unwrap_or_else(|_| "git push succeeded".into());
+            let _ = store.finish_action_succeeded(&action_id, None, Some(&summary));
+        } else {
+            let summary = output.to_string();
+            let _ = store.finish_action_failed(&action_id, &summary);
+        }
+    }
+    Ok(output)
+}
+
+async fn execute_local_git_read(
+    host: &dyn Host,
+    operation: &str,
+    arguments: &Value,
+) -> Result<Value, String> {
+    let cwd = git_string_argument(arguments, "cwd")?;
+    let command = match operation {
+        "status" => "git status --porcelain=v1 --branch".to_owned(),
+        "diff" => format!(
+            "git diff --stat{} --",
+            arguments
+                .get("reference")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| format!(" {}", quote_for(None, value)))
+                .unwrap_or_default()
+        ),
+        "log" => format!(
+            "git log --pretty=format:%H%x09%an%x09%ad%x09%s --date=iso-strict -n {}",
+            arguments
+                .get("count")
+                .and_then(Value::as_u64)
+                .unwrap_or(20)
+                .min(100)
+        ),
+        "rev_parse" => format!(
+            "git rev-parse {}",
+            quote_for(None, &git_string_argument(arguments, "reference")?)
+        ),
+        _ => return Err(format!("unsupported structured git read: {operation}")),
+    };
+    let result = host
+        .exec(ExecRequest {
+            command,
+            cwd: Some(cwd.clone()),
+            timeout_seconds: 30,
+            session: None,
+            env: None,
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    if result.result.exit_code != 0 {
+        return Ok(json!({
+            "status": "failed",
+            "exit_code": result.result.exit_code,
+            "stdout": result.result.stdout,
+            "stderr": result.result.stderr,
+            "cwd": cwd,
+        }));
+    }
+    let stdout = result.result.stdout;
+    let value = match operation {
+        "status" => {
+            let mut lines = stdout.lines();
+            let branch = lines
+                .next()
+                .unwrap_or_default()
+                .trim_start_matches("## ")
+                .split("...")
+                .next()
+                .unwrap_or_default();
+            let files = lines
+                .filter(|line| line.len() >= 3)
+                .map(|line| {
+                    json!({
+                        "index": line.as_bytes()[0] as char,
+                        "worktree": line.as_bytes()[1] as char,
+                        "path": &line[3..],
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "status": "ok",
+                "branch": branch,
+                "files": files,
+                "has_uncommitted": !files.is_empty(),
+                "cwd": cwd,
+            })
+        }
+        "diff" => {
+            json!({"status":"ok","reference":arguments.get("reference"),"stat":stdout,"cwd":cwd})
+        }
+        "log" => {
+            let commits = stdout
+                .lines()
+                .filter_map(|line| {
+                    let mut fields = line.splitn(4, '\t');
+                    Some(json!({
+                        "sha": fields.next()?,
+                        "author": fields.next()?,
+                        "date": fields.next()?,
+                        "subject": fields.next()?,
+                    }))
+                })
+                .collect::<Vec<_>>();
+            json!({"status":"ok","commits":commits,"cwd":cwd})
+        }
+        "rev_parse" => json!({
+            "status": "ok",
+            "reference": arguments.get("reference"),
+            "sha": stdout.trim(),
+            "cwd": cwd,
+        }),
+        _ => unreachable!(),
+    };
+    Ok(value)
+}
+
+async fn execute_github_pull_request_tool(
+    secrets: &KeyringSecretStore,
+    project_id: Option<&str>,
+    store: &SqliteStore,
+    session_id: &str,
+    name: &str,
+    arguments: &Value,
+) -> Result<Value, String> {
+    let repo = git_string_argument(arguments, "repo")?;
+    let token_name = git_string_argument(arguments, "token_secret")?;
+    let token = scoped_secret_get_from_store(secrets, project_id, "asset-secret", &token_name)?
+        .ok_or("GitHub token secret is not configured")?;
+    let http = reqwest::Client::new();
+    let endpoint = format!("https://api.github.com/repos/{repo}");
+    let request = |request: reqwest::RequestBuilder| {
+        request
+            .header("User-Agent", "OPCOS/0.1")
+            .bearer_auth(&token)
+    };
+    if name == "github_get_pull_request" {
+        let number = arguments
+            .get("number")
+            .and_then(Value::as_u64)
+            .ok_or("pull request number is required")?;
+        let pull = request(http.get(format!("{endpoint}/pulls/{number}")))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        if !pull.status().is_success() {
+            return Err(format!(
+                "GitHub pull request read failed with HTTP {}",
+                pull.status()
+            ));
+        }
+        let pull: Value = pull.json().await.map_err(|error| error.to_string())?;
+        let issue_comments: Value =
+            request(http.get(format!("{endpoint}/issues/{number}/comments")))
+                .send()
+                .await
+                .map_err(|error| error.to_string())?
+                .json()
+                .await
+                .map_err(|error| error.to_string())?;
+        let review_comments: Value =
+            request(http.get(format!("{endpoint}/pulls/{number}/comments")))
+                .send()
+                .await
+                .map_err(|error| error.to_string())?
+                .json()
+                .await
+                .map_err(|error| error.to_string())?;
+        let reviews: Value = request(http.get(format!("{endpoint}/pulls/{number}/reviews")))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?
+            .json()
+            .await
+            .map_err(|error| error.to_string())?;
+        return Ok(json!({
+            "status": "ok",
+            "pull_request": pull,
+            "issue_comments": issue_comments,
+            "review_comments": review_comments,
+            "reviews": reviews,
+        }));
+    }
+
+    let title = git_string_argument(arguments, "title")?;
+    let head = git_string_argument(arguments, "head")?;
+    let base = git_string_argument(arguments, "base")?;
+    let body = arguments
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let key = format!("github-pr:{repo}:{head}:{base}");
+    let action_id = match store
+        .begin_action(
+            "github_create_pull_request",
+            "github",
+            &repo,
+            &key,
+            Some(session_id),
+            project_id,
+        )
+        .map_err(|error| error.to_string())?
+    {
+        ActionBeginResult::Fresh(record) => record.action_id,
+        ActionBeginResult::AlreadySucceeded {
+            action_id,
+            external_id,
+            result_summary,
+        } => {
+            let mut result = json!({
+                "status": "already_succeeded",
+                "action_id": action_id,
+                "external_id": external_id,
+                "result_summary": result_summary,
+            });
+            if let Some(summary) = result
+                .get("result_summary")
+                .and_then(Value::as_str)
+                .and_then(|summary| serde_json::from_str::<Value>(summary).ok())
+            {
+                result["result"] = summary;
+            }
+            return Ok(result);
+        }
+        ActionBeginResult::InFlight { action_id, .. } => {
+            return Err(format!(
+                "pull request action {action_id} is still in flight; reconcile before retrying"
+            ));
+        }
+        ActionBeginResult::PreviouslyFailed { action_id, .. } => {
+            return Err(format!(
+                "pull request action {action_id} previously failed; use a new retry key"
+            ));
+        }
+    };
+    let existing = request(http.get(format!(
+        "{endpoint}/pulls?state=open&head={}&base={}",
+        head.replace(' ', "%20"),
+        base.replace(' ', "%20")
+    )))
+    .send()
+    .await;
+    let existing = match existing {
+        Ok(response) if response.status().is_success() => response
+            .json::<Vec<Value>>()
+            .await
+            .map_err(|error| error.to_string())?,
+        Ok(response) => {
+            let error = format!(
+                "GitHub pull request lookup failed with HTTP {}",
+                response.status()
+            );
+            let _ = store.finish_action_failed(&action_id, &error);
+            return Err(error);
+        }
+        Err(error) => {
+            let error = error.to_string();
+            let _ = store.finish_action_failed(&action_id, &error);
+            return Err(error);
+        }
+    };
+    if let Some(pull) = existing.first() {
+        let number = pull
+            .get("number")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let url = pull
+            .get("html_url")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let summary = json!({"number":number,"url":url,"reconciled":true}).to_string();
+        let _ =
+            store.finish_action_succeeded(&action_id, Some(&number.to_string()), Some(&summary));
+        return Ok(json!({
+            "status": "already_exists",
+            "action_id": action_id,
+            "number": number,
+            "url": url,
+        }));
+    }
+    let response = request(http.post(format!("{endpoint}/pulls")))
+        .json(&json!({"title":title,"head":head,"base":base,"body":body}))
+        .send()
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            let error = error.to_string();
+            let _ = store.finish_action_failed(&action_id, &error);
+            return Err(error);
+        }
+    };
+    if !response.status().is_success() {
+        let error = format!(
+            "GitHub pull request creation failed with HTTP {}",
+            response.status()
+        );
+        let _ = store.finish_action_failed(&action_id, &error);
+        return Err(error);
+    }
+    let pull: Value = response.json().await.map_err(|error| error.to_string())?;
+    let number = pull
+        .get("number")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let url = pull
+        .get("html_url")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let summary = json!({"number":number,"url":url}).to_string();
+    let _ = store.finish_action_succeeded(&action_id, Some(&number.to_string()), Some(&summary));
+    Ok(
+        json!({"status":"created","action_id":action_id,"number":number,"url":url,"pull_request":pull}),
+    )
 }
 
 async fn execute_index_tool(
@@ -1069,6 +1753,15 @@ impl ToolExecutor for RemoteExecutor {
                 .await
                 .map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
                 .map_err(|error| error.to_string()),
+            "git_diff" => self
+                .client
+                .git_diff(
+                    argument("cwd")?,
+                    arguments.get("reference").and_then(Value::as_str),
+                )
+                .await
+                .map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
+                .map_err(|error| error.to_string()),
             "git_log" => self
                 .client
                 .git_log(
@@ -1078,6 +1771,46 @@ impl ToolExecutor for RemoteExecutor {
                 .await
                 .map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
                 .map_err(|error| error.to_string()),
+            "git_rev_parse" => self
+                .client
+                .git_rev_parse(argument("cwd")?, argument("reference")?)
+                .await
+                .map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
+                .map_err(|error| error.to_string()),
+            "git_create_branch" | "git_stage_commit" | "git_push" => {
+                let host = RvmHost::new(
+                    self.host_id.clone(),
+                    self.workspace.clone(),
+                    self.client.clone(),
+                );
+                execute_git_write(
+                    &host,
+                    self.client
+                        .health()
+                        .await
+                        .ok()
+                        .and_then(|health| health.platform)
+                        .as_deref(),
+                    &self.secrets,
+                    self.project_id.as_deref(),
+                    &self.store,
+                    &self.session_id,
+                    name,
+                    &arguments,
+                )
+                .await
+            }
+            "github_create_pull_request" | "github_get_pull_request" => {
+                execute_github_pull_request_tool(
+                    &self.secrets,
+                    self.project_id.as_deref(),
+                    &self.store,
+                    &self.session_id,
+                    name,
+                    &arguments,
+                )
+                .await
+            }
             "linear_get_issue"
             | "linear_list_my_issues"
             | "linear_comment_issue"
@@ -1225,6 +1958,36 @@ impl ToolExecutor for DesktopExecutor {
                             redact_json_strings(&mut output, &value);
                         }
                         Ok(output)
+                    }
+                    "git_status" => execute_local_git_read(&executor.host, "status", &arguments).await,
+                    "git_diff" => execute_local_git_read(&executor.host, "diff", &arguments).await,
+                    "git_log" => execute_local_git_read(&executor.host, "log", &arguments).await,
+                    "git_rev_parse" => {
+                        execute_local_git_read(&executor.host, "rev_parse", &arguments).await
+                    }
+                    "git_create_branch" | "git_stage_commit" | "git_push" => {
+                        execute_git_write(
+                            &executor.host,
+                            None,
+                            &executor.secrets,
+                            executor.project_id.as_deref(),
+                            &executor.store,
+                            &executor.session_id,
+                            name,
+                            &arguments,
+                        )
+                        .await
+                    }
+                    "github_create_pull_request" | "github_get_pull_request" => {
+                        execute_github_pull_request_tool(
+                            &executor.secrets,
+                            executor.project_id.as_deref(),
+                            &executor.store,
+                            &executor.session_id,
+                            name,
+                            &arguments,
+                        )
+                        .await
                     }
                     "linear_get_issue" | "linear_list_my_issues" | "linear_comment_issue"
                     | "linear_update_issue_status" => {
@@ -16993,6 +17756,89 @@ agents:
             assert!(reject_dangerous_git(command).is_err(), "{command}");
         }
         assert!(reject_dangerous_git("git add -- src/lib.rs").is_ok());
+    }
+
+    #[test]
+    fn structured_push_rejects_url_and_path_remotes() {
+        for remote in [
+            "https://attacker.example/repo.git",
+            "git@attacker.example:repo.git",
+            "/tmp/repo",
+            "../repo",
+            "C:\\repo",
+        ] {
+            assert!(
+                validate_git_remote_name(remote).is_err(),
+                "remote should be rejected: {remote}"
+            );
+        }
+        assert!(validate_git_remote_name("origin").is_ok());
+        assert!(validate_git_remote_name("upstream-prod").is_ok());
+    }
+
+    #[test]
+    fn structured_push_allows_only_the_expected_github_destination() {
+        assert_eq!(
+            git_remote_host("git@github.com:LebsChen/OPCOS.git").as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(
+            git_remote_host("https://github.com/LebsChen/OPCOS.git").as_deref(),
+            Some("github.com")
+        );
+        assert!(git_remote_host("https://attacker.example/repo.git").is_some());
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert!(
+            validate_git_remote_destination("https://attacker.example/repo.git", &store, None)
+                .is_err()
+        );
+        assert!(
+            validate_git_remote_destination("https://github.com/LebsChen/OPCOS.git", &store, None)
+                .is_ok()
+        );
+        assert!(
+            validate_git_remote_destination(
+                "https://token@github.com/LebsChen/OPCOS.git",
+                &store,
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_push_rejects_an_unconfigured_remote_before_credentials() {
+        let root = std::env::temp_dir().join(format!("opcos-git-remote-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let host = LocalHost::new(&root).unwrap();
+        let initialized = host
+            .exec(ExecRequest {
+                command: "git init".into(),
+                cwd: Some(root.display().to_string()),
+                timeout_seconds: 15,
+                session: None,
+                env: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(initialized.result.exit_code, 0);
+        let error = read_git_remote_url(
+            &host,
+            Some(std::env::consts::OS),
+            &root.display().to_string(),
+            "origin",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "configured git remote was not found");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn askpass_scripts_only_read_environment_credentials() {
+        assert!(!ASKPASS_SCRIPT.contains("OPCOS_GIT_PASSWORD="));
+        assert!(ASKPASS_SCRIPT.contains("$env:OPCOS_GIT_PASSWORD"));
+        assert!(ASKPASS_SCRIPT.contains("$env:OPCOS_GIT_USERNAME"));
     }
 
     #[test]

@@ -38,3 +38,4 @@ opcos-rvm = { path = "../crates/opcos-rvm" }
 opcos-mcp = { path = "../crates/opcos-mcp" }
 opcos-store = { path = "../crates/opcos-store" }
 url.workspace = true
+uuid.workspace = true
