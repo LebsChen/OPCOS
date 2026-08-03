@@ -21,8 +21,8 @@ use opcos_assets::{
     discover as discover_assets, parse_blueprint,
 };
 use opcos_engine::{
-    AgentEngine, EngineError, Harness, OpenCodeHarness, OpenCodeHarnessConfig, SessionRecorder,
-    ToolExecutor, TurnEngine,
+    AcpHarness, AcpHarnessConfig, AgentEngine, EngineError, Harness, OpenCodeHarness,
+    OpenCodeHarnessConfig, SessionRecorder, ToolExecutor, TurnEngine,
     orchestration::{BoardPhase, BoardTask},
     orchestration::{CoordinationRuntime, Envelope, Role},
 };
@@ -152,6 +152,8 @@ struct DesktopState {
     engines: AsyncMutex<HashMap<String, Arc<GuiEngine>>>,
     opencode_engines: AsyncMutex<HashMap<String, Arc<opcos_engine::OpenCodeHarness<SqliteStore>>>>,
     opencode_event_sessions: AsyncMutex<HashSet<String>>,
+    acp_engines: AsyncMutex<HashMap<String, Arc<opcos_engine::AcpHarness<SqliteStore>>>>,
+    acp_event_sessions: AsyncMutex<HashSet<String>>,
     trigger_runs: AsyncMutex<HashSet<String>>,
     trigger_http_token: String,
     trigger_http_port: u16,
@@ -1720,6 +1722,17 @@ description: 为新行为和缺陷修复设计覆盖正常、失败及边界条�
     for (id, name, description, content) in connectors {
         seed_builtin_template(connection, id, "connector", name, description, &content)?;
     }
+    seed_builtin_template(
+        connection,
+        "template-acp-agent-claude-code",
+        "acp-agent",
+        "Claude Code ACP",
+        "通过 ACP 接入本机 Claude Code agent；凭据名称仅用于从 SecretStore 注入环境变量。",
+        &json!({
+            "command": "npx -y @agentclientprotocol/claude-agent-acp",
+            "env": {}
+        }),
+    )?;
     Ok(())
 }
 
@@ -4338,6 +4351,145 @@ async fn opencode_for(
     Ok(harness)
 }
 
+fn select_acp_agent_content<I>(rows: I) -> Option<String>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut selected = Vec::<(String, String)>::new();
+    let mut seen_names = HashSet::new();
+    for (name, content) in rows {
+        if seen_names.insert(name.clone()) {
+            selected.push((name, content));
+        }
+    }
+    selected.into_iter().next().map(|(_, content)| content)
+}
+
+fn acp_agent_config(
+    state: &DesktopState,
+    project_id: Option<&str>,
+) -> Result<AcpHarnessConfig, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let mut statement = connection
+        .prepare(
+            "SELECT o.name,v.content
+             FROM config_object o
+             JOIN config_object_version v ON v.id=o.current_version_id
+             LEFT JOIN project_config_selection selection
+               ON selection.project_id=?1 AND selection.object_id=o.id
+             WHERE o.kind='acp-agent' AND o.status <> 'deleted'
+               AND ((o.scope_kind='global' AND COALESCE(selection.enabled,1)=1)
+                 OR (o.scope_kind='project' AND o.scope_key=?1))
+             ORDER BY CASE WHEN o.scope_kind='project' THEN 0 ELSE 1 END,o.name",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([project_id.unwrap_or_default()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (name, content) = row.map_err(|error| error.to_string())?;
+        candidates.push((name, content));
+    }
+    let content = select_acp_agent_content(candidates)
+        .ok_or_else(|| "ACP unavailable: no ACP agent command is configured".to_owned())?;
+    let value: Value = serde_json::from_str(&content)
+        .map_err(|error| format!("invalid ACP agent config: {error}"))?;
+    let command = value
+        .get("command")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "ACP agent configuration has no command".to_owned())?
+        .to_owned();
+    let mut env = serde_json::Map::new();
+    for (key, value) in value
+        .get("env")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(literal) = value.as_str() {
+            env.insert(key.clone(), Value::String(literal.to_owned()));
+        } else {
+            let secret_name = value.get("secret").and_then(Value::as_str).ok_or_else(|| {
+                format!("ACP environment entry {key} must be a string or SecretStore reference")
+            })?;
+            let secret = scoped_secret_get_from_store(
+                &state.secrets,
+                project_id,
+                "asset-secret",
+                secret_name,
+            )?
+            .ok_or_else(|| format!("ACP credential is not configured: {secret_name}"))?;
+            env.insert(key.clone(), Value::String(secret));
+        }
+    }
+    Ok(AcpHarnessConfig {
+        workspace: String::new(),
+        command,
+        env: (!env.is_empty()).then_some(Value::Object(env)),
+    })
+}
+
+async fn acp_for(
+    state: &DesktopState,
+    session_id: &str,
+) -> Result<Arc<AcpHarness<SqliteStore>>, String> {
+    {
+        let engines = state.acp_engines.lock().await;
+        if let Some(engine) = engines.get(session_id) {
+            return Ok(Arc::clone(engine));
+        }
+    }
+    let session = session_for(state, session_id)?;
+    if session.harness != "acp" {
+        return Err("session is not configured for the ACP harness".into());
+    }
+    let workspace = if !session.workspace.is_empty() {
+        session.workspace.clone()
+    } else if session.host_id == "local" {
+        default_local_workspace(state, session_id)?
+    } else {
+        client_for(state, &session.host_id)?
+            .health()
+            .await
+            .map_err(|error| format!("remote host unavailable: {error}"))?
+            .workspace
+            .ok_or_else(|| "remote host did not provide a workspace".to_owned())?
+    };
+    let host: Arc<dyn Host> = if session.host_id == "local" {
+        Arc::new(LocalHost::new(&workspace).map_err(|error| error.to_string())?)
+    } else {
+        let client = client_for(state, &session.host_id)?.with_workspace(workspace.clone());
+        Arc::new(RvmHost::new(
+            session.host_id.clone(),
+            workspace.clone(),
+            client,
+        ))
+    };
+    let mut config = acp_agent_config(state, session.project_id.as_deref())?;
+    config.workspace = workspace;
+    let harness = AcpHarness::start(
+        host,
+        Arc::new(SessionRecorder::new(Arc::clone(&state.store), session_id)),
+        session_id,
+        config,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    state
+        .acp_engines
+        .lock()
+        .await
+        .insert(session_id.into(), Arc::clone(&harness));
+    Ok(harness)
+}
+
 async fn engine_for(
     app: &tauri::AppHandle,
     state: &DesktopState,
@@ -5257,7 +5409,7 @@ fn create_session(
     let mode = mode.unwrap_or_else(|| "Interactive".into());
     let mode = permission_mode_name(parse_permission_mode(&mode)?).to_owned();
     let harness = harness.unwrap_or_else(|| "builtin".into());
-    if !matches!(harness.as_str(), "builtin" | "opencode") {
+    if !matches!(harness.as_str(), "builtin" | "opencode" | "acp") {
         return Err(format!("unsupported harness: {harness}"));
     }
     if project_id.is_some() != agent_id.is_some() {
@@ -5447,7 +5599,7 @@ async fn change_harness(
     session_id: String,
     harness: String,
 ) -> Result<(), String> {
-    if !matches!(harness.as_str(), "builtin" | "opencode") {
+    if !matches!(harness.as_str(), "builtin" | "opencode" | "acp") {
         return Err(format!("unsupported harness: {harness}"));
     }
     let session = session_for(&state, &session_id)?;
@@ -5473,21 +5625,22 @@ async fn change_harness(
                 .into(),
         );
     }
-    if harness == "opencode" {
+    if matches!(harness.as_str(), "opencode" | "acp") {
         let options = harness_options(
             state.clone(),
             session.host_id.clone(),
             (!session.workspace.is_empty()).then_some(session.workspace.clone()),
+            session.project_id.clone(),
         )
         .await?;
         let option = options
             .into_iter()
-            .find(|option| option.id == "opencode")
-            .ok_or_else(|| "OpenCode availability could not be determined".to_owned())?;
+            .find(|option| option.id == harness)
+            .ok_or_else(|| format!("{harness} availability could not be determined"))?;
         if !option.available {
             return Err(option
                 .reason
-                .unwrap_or_else(|| "OpenCode is unavailable".into()));
+                .unwrap_or_else(|| format!("{harness} is unavailable")));
         }
     }
     state
@@ -5514,6 +5667,7 @@ async fn harness_options(
     state: State<'_, DesktopState>,
     host_id: String,
     workspace: Option<String>,
+    project_id: Option<String>,
 ) -> Result<Vec<HarnessAvailability>, String> {
     let mut options = vec![HarnessAvailability {
         id: "builtin".into(),
@@ -5538,6 +5692,47 @@ async fn harness_options(
         ))
     };
     let capabilities = host.capabilities().await.map_err(|e| e.to_string())?;
+    let stdio = capabilities.items.iter().find(|item| item.name == "stdio");
+    let acp_option = if stdio.is_some_and(|item| item.available) {
+        match acp_agent_config(&state, project_id.as_deref()) {
+            Ok(config) => {
+                let executable = config.command.split_whitespace().next().unwrap_or_default();
+                let probe = host
+                    .exec(ExecRequest {
+                        command: format!("command -v {executable}"),
+                        cwd: None,
+                        timeout_seconds: 10,
+                        session: None,
+                        env: None,
+                    })
+                    .await
+                    .map_err(|e| format!("cannot probe ACP agent on host: {e}"))?;
+                HarnessAvailability {
+                    id: "acp".into(),
+                    label: "ACP".into(),
+                    available: probe.result.exit_code == 0,
+                    reason: (probe.result.exit_code != 0)
+                        .then(|| format!("{executable} is not installed on this host")),
+                }
+            }
+            Err(reason) => HarnessAvailability {
+                id: "acp".into(),
+                label: "ACP".into(),
+                available: false,
+                reason: Some(reason),
+            },
+        }
+    } else {
+        HarnessAvailability {
+            id: "acp".into(),
+            label: "ACP".into(),
+            available: false,
+            reason: stdio
+                .and_then(|item| item.reason.clone())
+                .or_else(|| Some("Host does not provide structured stdio".into())),
+        }
+    };
+    options.push(acp_option);
     let Some(process_stream) = capabilities
         .items
         .iter()
@@ -6143,8 +6338,11 @@ async fn submit_turn(
             .map_err(|_| "database lock poisoned")?;
         expand_slash_command(&connection, session.project_id.as_deref(), &request.text)?
     };
-    if session_for(&state, &request.session_id)?.harness == "opencode" {
+    if session.harness == "opencode" {
         return submit_opencode_turn(app, state, request).await;
+    }
+    if session.harness == "acp" {
+        return submit_acp_turn(app, state, request).await;
     }
     let host_id = session_host_id(&state, &request.session_id)?;
     if host_id != "local" {
@@ -6473,6 +6671,122 @@ async fn submit_opencode_turn(
     Ok(())
 }
 
+async fn submit_acp_turn(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    request: SubmitRequest,
+) -> Result<(), String> {
+    let harness = match acp_for(&state, &request.session_id).await {
+        Ok(harness) => harness,
+        Err(error) => {
+            emit(
+                &app,
+                "notice",
+                Some(&request.session_id),
+                json!({"kind":"error","text":error}),
+            );
+            return Err(error);
+        }
+    };
+    let start_events = {
+        let mut sessions = state.acp_event_sessions.lock().await;
+        sessions.insert(request.session_id.clone())
+    };
+    if start_events {
+        let mut events = harness.events().map_err(|error| error.to_string())?;
+        let event_app = app.clone();
+        let event_session = request.session_id.clone();
+        let event_store = Arc::clone(&state.store);
+        tauri::async_runtime::spawn(async move {
+            while let Some(event) = events.recv().await {
+                match event {
+                    opcos_engine::HarnessEvent::AssistantTextDelta { text } => emit(
+                        &event_app,
+                        "message",
+                        Some(&event_session),
+                        json!({"role":"assistant","text":text}),
+                    ),
+                    opcos_engine::HarnessEvent::AssistantReasoningDelta { text } => emit(
+                        &event_app,
+                        "thinking",
+                        Some(&event_session),
+                        json!({"text":text}),
+                    ),
+                    opcos_engine::HarnessEvent::ToolCallDelta {
+                        call_id,
+                        tool,
+                        arguments_fragment,
+                    } => emit(
+                        &event_app,
+                        "stream",
+                        Some(&event_session),
+                        json!({"tool_call_delta":{"id":call_id,"name":tool,"arguments_fragment":arguments_fragment}}),
+                    ),
+                    opcos_engine::HarnessEvent::ApprovalRequested(request) => {
+                        let unattended = event_store.is_unattended(&event_session).unwrap_or(false);
+                        if unattended {
+                            let _ = event_store.set_pending_visibility(
+                                &event_session,
+                                &request.request_id,
+                                "inbox",
+                            );
+                            emit(
+                                &event_app,
+                                "notice",
+                                Some(&event_session),
+                                json!({"kind":"approval_pending","text":"Approval request sent to the Inbox"}),
+                            );
+                            emit(
+                                &event_app,
+                                "turn_done",
+                                Some(&event_session),
+                                session_status_payload_from_store(&event_store, &event_session),
+                            );
+                        } else {
+                            emit(
+                                &event_app,
+                                "approval",
+                                Some(&event_session),
+                                json!({"call_id":request.request_id,"tool":request.tool,"arguments":redact_approval_value(&request.arguments)}),
+                            );
+                        }
+                    }
+                    opcos_engine::HarnessEvent::Error { message } => emit(
+                        &event_app,
+                        "notice",
+                        Some(&event_session),
+                        json!({"kind":"error","text":message}),
+                    ),
+                    opcos_engine::HarnessEvent::TurnFinished { turn } => {
+                        let mut payload =
+                            session_status_payload_from_store(&event_store, &event_session);
+                        if let Some(object) = payload.as_object_mut() {
+                            object.insert("turn".into(), json!(turn));
+                        }
+                        emit(&event_app, "turn_done", Some(&event_session), payload);
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+    let handle = harness
+        .start_turn(opcos_engine::HarnessTurnInput {
+            text: request.text.clone(),
+            model: String::new(),
+            ..Default::default()
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    emit(
+        &app,
+        "message",
+        Some(&request.session_id),
+        json!({"role":"user","text":request.text,"turn_id":handle.id()}),
+    );
+    Ok(())
+}
+
 #[tauri::command]
 async fn upload_text_attachment(
     state: State<'_, DesktopState>,
@@ -6555,6 +6869,15 @@ async fn interrupt(
             .map_err(|error| error.to_string())?;
         return Ok(());
     }
+    if session_for(&state, &session_id)?.harness == "acp" {
+        let harness = acp_for(&state, &session_id).await?;
+        harness.interrupt();
+        state
+            .store
+            .update_session_status(&session_id, "interrupted", "user_interrupt")
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
     let engine = engine_for(&app, &state, &session_id).await?;
     engine.interrupt();
     audit(
@@ -6610,6 +6933,35 @@ async fn resolve_approval(
 ) -> Result<(), String> {
     if session_for(&state, &session_id)?.harness == "opencode" {
         let harness = opencode_for(&state, &session_id).await?;
+        harness
+            .reply_approval(
+                &call_id,
+                if approve {
+                    opcos_engine::ApprovalOutcome::Approve
+                } else {
+                    opcos_engine::ApprovalOutcome::Deny
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        state
+            .store
+            .resolve_inbox(
+                &session_id,
+                &call_id,
+                if approve { "allow" } else { "deny" },
+            )
+            .map_err(|error| error.to_string())?;
+        emit(
+            &app,
+            "approval_resolved",
+            Some(&session_id),
+            json!({"call_id":call_id,"approve":approve}),
+        );
+        return Ok(());
+    }
+    if session_for(&state, &session_id)?.harness == "acp" {
+        let harness = acp_for(&state, &session_id).await?;
         harness
             .reply_approval(
                 &call_id,
@@ -7031,6 +7383,7 @@ fn save_template(
             | "runbook"
             | "mcp"
             | "connector"
+            | "acp-agent"
             | "blueprint"
     ) {
         return Err("unsupported template kind".into());
@@ -7949,6 +8302,7 @@ fn save_asset(
             | "skill"
             | "agents"
             | "mcp"
+            | "acp-agent"
             | "connectors"
             | "blueprint"
     ) {
@@ -14082,6 +14436,8 @@ fn main() {
                 engines: AsyncMutex::new(HashMap::new()),
                 opencode_engines: AsyncMutex::new(HashMap::new()),
                 opencode_event_sessions: AsyncMutex::new(HashSet::new()),
+                acp_engines: AsyncMutex::new(HashMap::new()),
+                acp_event_sessions: AsyncMutex::new(HashSet::new()),
                 trigger_runs: AsyncMutex::new(HashSet::new()),
                 surfaces: AsyncMutex::new(HashMap::new()),
                 ide_proxies: AsyncMutex::new(HashMap::new()),
@@ -14310,6 +14666,24 @@ mod m7_tests {
     use super::*;
 
     #[test]
+    fn acp_agent_selection_preserves_scope_and_name_order() {
+        assert_eq!(
+            select_acp_agent_content(vec![
+                ("claude".into(), r#"{"command":"global"}"#.into()),
+                ("other".into(), r#"{"command":"other"}"#.into()),
+            ]),
+            Some(r#"{"command":"global"}"#.into())
+        );
+        assert_eq!(
+            select_acp_agent_content(vec![
+                ("claude".into(), r#"{"command":"project"}"#.into()),
+                ("claude".into(), r#"{"command":"global"}"#.into()),
+            ]),
+            Some(r#"{"command":"project"}"#.into())
+        );
+    }
+
+    #[test]
     fn builtin_template_seed_is_idempotent_and_never_overwrites_custom_content() {
         let connection = Connection::open_in_memory().unwrap();
         connection
@@ -14352,7 +14726,7 @@ mod m7_tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(builtin_count, 19);
+        assert_eq!(builtin_count, 20);
         for kind in [
             "rules",
             "knowledge",
@@ -14360,6 +14734,7 @@ mod m7_tests {
             "skill",
             "mcp",
             "connector",
+            "acp-agent",
             "blueprint",
         ] {
             let count: i64 = connection
