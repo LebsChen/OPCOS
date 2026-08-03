@@ -1442,6 +1442,13 @@ fn tool_risk(name: &str) -> ToolRisk {
         | "repo_index_search" => ToolRisk::Read,
         "action_ledger_list" => ToolRisk::Read,
         "action_ledger_begin" | "action_ledger_finish" => ToolRisk::Write,
+        "work_queue_list" => ToolRisk::Read,
+        "work_queue_enqueue"
+        | "work_queue_claim"
+        | "work_queue_renew"
+        | "work_queue_complete"
+        | "work_queue_cancel"
+        | "work_queue_requeue" => ToolRisk::Write,
         "write_file" | "edit" => ToolRisk::Write,
         "run_shell" => ToolRisk::Execute,
         _ => ToolRisk::External,
@@ -1867,6 +1874,7 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"repo_index_search","description":"Search indexed symbol/content lines without loading whole files. Read-only.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}),
     ];
     tools.extend(action_ledger_tool_definitions());
+    tools.extend(work_queue_tool_definitions());
     tools
 }
 
@@ -1875,6 +1883,18 @@ pub fn action_ledger_tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"action_ledger_begin","description":"Claim an idempotent external action before performing it. An in-flight result is unsafe to retry without reconciliation.","parameters":{"type":"object","properties":{"action_type":{"type":"string"},"platform":{"type":"string"},"account_id":{"type":"string"},"idempotency_key":{"type":"string"}},"required":["action_type","platform","account_id","idempotency_key"]}}}),
         json!({"type":"function","function":{"name":"action_ledger_finish","description":"Record the result of a previously begun external action.","parameters":{"type":"object","properties":{"action_id":{"type":"string"},"status":{"type":"string","enum":["succeeded","failed"]},"external_id":{"type":"string"},"result_summary":{"type":"string"},"error_summary":{"type":"string"}},"required":["action_id","status"]}}}),
         json!({"type":"function","function":{"name":"action_ledger_list","description":"List OPCOS action history across sessions. Platform entities remain authoritative in their APIs or MCP servers.","parameters":{"type":"object","properties":{"platform":{"type":"string"},"account_id":{"type":"string"},"status":{"type":"string"},"limit":{"type":"integer"}}}}}),
+    ]
+}
+
+pub fn work_queue_tool_definitions() -> Vec<Value> {
+    vec![
+        json!({"type":"function","function":{"name":"work_queue_enqueue","description":"Enqueue a durable business work item. The payload must be non-sensitive. Reuse the same idempotency_key for every retry of the same external action; dedup_key makes duplicate event delivery idempotent.","parameters":{"type":"object","properties":{"task_type":{"type":"string"},"payload":{"type":"object"},"dedup_key":{"type":"string"},"idempotency_key":{"type":"string"},"max_attempts":{"type":"integer"},"compensates_for":{"type":"string"}},"required":["task_type","payload"]}}}),
+        json!({"type":"function","function":{"name":"work_queue_claim","description":"Atomically claim one ready durable work item for this session. Expired leases are reclaimed only within the item's max_attempts bound.","parameters":{"type":"object","properties":{"lease_seconds":{"type":"integer"}}}}}),
+        json!({"type":"function","function":{"name":"work_queue_renew","description":"Renew a claimed work item lease. The lease_generation must match the claim; stale workers cannot renew reclaimed work.","parameters":{"type":"object","properties":{"queue_id":{"type":"string"},"lease_generation":{"type":"integer"},"lease_seconds":{"type":"integer"}},"required":["queue_id","lease_generation"]}}}),
+        json!({"type":"function","function":{"name":"work_queue_complete","description":"Complete, fail, or cancel a claimed work item. Failed items use bounded exponential backoff and become dead-lettered after max_attempts.","parameters":{"type":"object","properties":{"queue_id":{"type":"string"},"lease_generation":{"type":"integer"},"outcome":{"type":"string","enum":["succeeded","failed","cancelled"]},"error_summary":{"type":"string"}},"required":["queue_id","lease_generation","outcome"]}}}),
+        json!({"type":"function","function":{"name":"work_queue_cancel","description":"Cancel a ready or running work item without performing automatic compensation.","parameters":{"type":"object","properties":{"queue_id":{"type":"string"},"reason":{"type":"string"}},"required":["queue_id"]}}}),
+        json!({"type":"function","function":{"name":"work_queue_requeue","description":"Explicitly replay a dead-lettered work item. This is manual recovery; the queue performs no automatic compensation.","parameters":{"type":"object","properties":{"queue_id":{"type":"string"}},"required":["queue_id"]}}}),
+        json!({"type":"function","function":{"name":"work_queue_list","description":"List durable work items across sessions, including attempts and dead-letter status.","parameters":{"type":"object","properties":{"status":{"type":"string"},"limit":{"type":"integer"}}}}}),
     ]
 }
 

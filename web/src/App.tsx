@@ -6442,6 +6442,7 @@ function Activity({
   const [activityTab, setActivityTab] = useState<
     | "audit"
     | "actions"
+    | "queue"
     | "board"
     | "roles"
     | "tasks"
@@ -6457,6 +6458,7 @@ function Activity({
   const [actionLedger, setActionLedger] = useState<Record<string, unknown>[]>(
     [],
   );
+  const [workQueue, setWorkQueue] = useState<Record<string, unknown>[]>([]);
   const load = () =>
     command<Coordination>("coordination_snapshot", { taskId })
       .then(setBoard)
@@ -6472,6 +6474,7 @@ function Activity({
             [
               "audit",
               "actions",
+              "queue",
               "board",
               "roles",
               "tasks",
@@ -6514,6 +6517,12 @@ function Activity({
                   )
                     .then(setActionLedger)
                     .catch(onError);
+                if (item === "queue")
+                  void command<Record<string, unknown>[]>("work_queue_events", {
+                    limit: 200,
+                  })
+                    .then(setWorkQueue)
+                    .catch(onError);
               }}
             >
               <Icon
@@ -6522,6 +6531,7 @@ function Activity({
                     {
                       audit: "audit",
                       actions: "audit",
+                      queue: "audit",
                       board: "audit",
                       roles: "gear",
                       tasks: "code",
@@ -6551,6 +6561,8 @@ function Activity({
                         "Review durable security and configuration events.",
                       actions:
                         "Review cross-session records of OPCOS external actions.",
+                      queue:
+                        "Review durable work items, retries, and dead-letter records.",
                       board: "Start or observe the active coordination board.",
                       roles: "Review board roles and their current state.",
                       tasks:
@@ -6638,6 +6650,37 @@ function Activity({
                   ) : null
                 }
                 empty="No action ledger records yet."
+              />
+            )}
+            {activityTab === "queue" && (
+              <CollectionPage
+                search=""
+                onSearch={() => undefined}
+                searchPlaceholder="Filter durable work queue"
+                rows={
+                  workQueue.length ? (
+                    <>
+                      {workQueue.map((item) => (
+                        <div
+                          className="manage-row px-4"
+                          key={String(item.queue_id)}
+                        >
+                          <span>
+                            <strong>
+                              {String(item.task_type)} · {String(item.status)}
+                            </strong>
+                            <small>
+                              attempts {String(item.attempts)}/
+                              {String(item.max_attempts)} ·{" "}
+                              {String(item.queue_id)}
+                            </small>
+                          </span>
+                        </div>
+                      ))}
+                    </>
+                  ) : null
+                }
+                empty="No durable work queue records yet."
               />
             )}
             {activityTab === "insights" && (
