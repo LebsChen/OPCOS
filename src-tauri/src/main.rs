@@ -138,6 +138,7 @@ struct DesktopState {
 #[derive(Clone)]
 struct McpCredentialAdapter {
     store: KeyringSecretStore,
+    project_id: Option<String>,
 }
 
 #[async_trait]
@@ -146,10 +147,13 @@ impl McpCredentialStore for McpCredentialAdapter {
         &self,
         server_id: &str,
     ) -> Result<Option<HashMap<String, String>>, opcos_mcp::McpClientError> {
-        let value = self
-            .store
-            .get(&secret_key("mcp-credential", server_id))
-            .map_err(|_| opcos_mcp::McpClientError::Transport)?;
+        let value = scoped_secret_get_from_store(
+            &self.store,
+            self.project_id.as_deref(),
+            "mcp-credential",
+            server_id,
+        )
+        .map_err(|_| opcos_mcp::McpClientError::Transport)?;
         value
             .map(|value| {
                 serde_json::from_str(&value).map_err(|_| opcos_mcp::McpClientError::Transport)
@@ -176,6 +180,7 @@ struct RemoteExecutor {
     index_root: PathBuf,
     host_id: String,
     workspace: String,
+    project_id: Option<String>,
 }
 
 struct LocalExecutor {
@@ -185,6 +190,7 @@ struct LocalExecutor {
     mcp: Arc<McpManager<McpCredentialAdapter>>,
     index_root: PathBuf,
     workspace: String,
+    project_id: Option<String>,
 }
 
 enum DesktopExecutor {
@@ -369,11 +375,13 @@ impl ToolExecutor for RemoteExecutor {
                 let mut env = serde_json::Map::new();
                 let mut values = Vec::new();
                 for name in names {
-                    let value = self
-                        .secrets
-                        .get(&secret_key("asset-secret", name))
-                        .map_err(|error| error.to_string())?
-                        .ok_or_else(|| format!("secret is not configured: {name}"))?;
+                    let value = scoped_secret_get_from_store(
+                        &self.secrets,
+                        self.project_id.as_deref(),
+                        "asset-secret",
+                        name,
+                    )?
+                    .ok_or_else(|| format!("secret is not configured: {name}"))?;
                     env.insert(name.to_owned(), Value::String(value.clone()));
                     values.push(value);
                 }
@@ -409,14 +417,16 @@ impl ToolExecutor for RemoteExecutor {
             | "linear_list_my_issues"
             | "linear_comment_issue"
             | "linear_update_issue_status" => {
-                execute_linear_tool(&self.secrets, name, arguments).await
+                execute_linear_tool(&self.secrets, self.project_id.as_deref(), name, arguments)
+                    .await
             }
             name if name.starts_with("github_")
                 || name.starts_with("telegram_")
                 || name.starts_with("discord_")
                 || name.starts_with("slack_") =>
             {
-                execute_connector_tool(&self.secrets, name, arguments).await
+                execute_connector_tool(&self.secrets, self.project_id.as_deref(), name, arguments)
+                    .await
             }
             "repo_index_find_symbol" | "repo_index_glob" | "repo_index_search" => {
                 let host = RvmHost::new(
@@ -500,10 +510,12 @@ impl ToolExecutor for DesktopExecutor {
                         let mut env = serde_json::Map::new();
                         let mut values = Vec::new();
                         for name in names {
-                            let value = executor
-                                .secrets
-                                .get(&secret_key("asset-secret", name))
-                                .map_err(|error| error.to_string())?
+                            let value = scoped_secret_get_from_store(
+                                    &executor.secrets,
+                                    executor.project_id.as_deref(),
+                                    "asset-secret",
+                                    name,
+                        )?
                                 .ok_or_else(|| format!("secret is not configured: {name}"))?;
                             env.insert(name.to_owned(), Value::String(value.clone()));
                             values.push(value);
@@ -530,14 +542,26 @@ impl ToolExecutor for DesktopExecutor {
                     }
                     "linear_get_issue" | "linear_list_my_issues" | "linear_comment_issue"
                     | "linear_update_issue_status" => {
-                        execute_linear_tool(&executor.secrets, name, arguments).await
+                        execute_linear_tool(
+                            &executor.secrets,
+                            executor.project_id.as_deref(),
+                            name,
+                            arguments,
+                        )
+                        .await
                     }
                     name if name.starts_with("github_")
                         || name.starts_with("telegram_")
                         || name.starts_with("discord_")
                         || name.starts_with("slack_") =>
                     {
-                        execute_connector_tool(&executor.secrets, name, arguments).await
+                        execute_connector_tool(
+                            &executor.secrets,
+                            executor.project_id.as_deref(),
+                            name,
+                            arguments,
+                        )
+                        .await
                     }
                     "repo_index_find_symbol" | "repo_index_glob" | "repo_index_search" => {
                         execute_index_tool(
@@ -786,6 +810,37 @@ fn emit_pending_approval(
 
 fn secret_key(prefix: &str, id: &str) -> String {
     format!("{prefix}:{id}")
+}
+
+fn project_secret_key(project_id: &str, prefix: &str, id: &str) -> String {
+    format!("project:{project_id}/{}", secret_key(prefix, id))
+}
+
+fn scoped_secret_get_from_store(
+    store: &KeyringSecretStore,
+    project_id: Option<&str>,
+    prefix: &str,
+    id: &str,
+) -> Result<Option<String>, String> {
+    if let Some(project_id) = project_id
+        && let Some(value) = store
+            .get(&project_secret_key(project_id, prefix, id))
+            .map_err(|error| error.to_string())?
+    {
+        return Ok(Some(value));
+    }
+    store
+        .get(&secret_key(prefix, id))
+        .map_err(|error| error.to_string())
+}
+
+fn scoped_secret_get(
+    state: &DesktopState,
+    project_id: Option<&str>,
+    prefix: &str,
+    id: &str,
+) -> Result<Option<String>, String> {
+    scoped_secret_get_from_store(&state.secrets, project_id, prefix, id)
 }
 
 async fn devin_api_request(state: &DesktopState, path: &str) -> Result<Value, String> {
@@ -1096,7 +1151,8 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
              CREATE TABLE IF NOT EXISTS secret_records (
                name TEXT PRIMARY KEY,
                scope TEXT NOT NULL,
-               purpose TEXT NOT NULL
+               purpose TEXT NOT NULL,
+               project_id TEXT NOT NULL DEFAULT ''
              );
              CREATE TABLE IF NOT EXISTS mcp_session_tools (
                session_id TEXT NOT NULL,
@@ -1143,9 +1199,44 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
              );",
         )
         .map_err(|error| error.to_string())?;
+    migrate_secret_records(&mut connection)?;
     migrate_mcp_session_tools(&connection)?;
     migrate_config_objects(&mut connection)?;
     Ok(connection)
+}
+
+fn migrate_secret_records(connection: &mut Connection) -> Result<(), String> {
+    let has_project_id = connection
+        .prepare("PRAGMA table_info(secret_records)")
+        .map_err(|error| error.to_string())?
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?
+        .iter()
+        .any(|name| name == "project_id");
+    if has_project_id {
+        return Ok(());
+    }
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute_batch(
+            "CREATE TABLE secret_records_v2 (
+               name TEXT NOT NULL,
+               scope TEXT NOT NULL,
+               purpose TEXT NOT NULL,
+               project_id TEXT NOT NULL DEFAULT '',
+               PRIMARY KEY(name, project_id)
+             );
+             INSERT INTO secret_records_v2(name,scope,purpose,project_id)
+               SELECT name,scope,purpose,'' FROM secret_records;
+             DROP TABLE secret_records;
+             ALTER TABLE secret_records_v2 RENAME TO secret_records;",
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 fn migrate_mcp_session_tools(connection: &Connection) -> Result<(), String> {
@@ -1896,10 +1987,74 @@ async fn delete_project(
             .delete_project_agent(&agent.id)
             .map_err(|error| error.to_string())?;
     }
+    clear_project_configuration(&state, &id)?;
     state
         .store
         .delete_project(&id)
         .map_err(|error| error.to_string())
+}
+
+fn clear_project_configuration(state: &DesktopState, project_id: &str) -> Result<(), String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let object_ids = {
+        let mut statement = connection
+            .prepare("SELECT id FROM config_object WHERE scope_kind='project' AND scope_key=?1")
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map([project_id], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+    for object_id in object_ids {
+        connection
+            .execute(
+                "DELETE FROM session_config_versions WHERE object_id=?1",
+                [&object_id],
+            )
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute(
+                "DELETE FROM session_config_bindings WHERE object_id=?1",
+                [&object_id],
+            )
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute(
+                "DELETE FROM config_object_version WHERE object_id=?1",
+                [&object_id],
+            )
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute("DELETE FROM config_object WHERE id=?1", [&object_id])
+            .map_err(|error| error.to_string())?;
+    }
+    let secret_names = {
+        let mut statement = connection
+            .prepare("SELECT name FROM secret_records WHERE project_id=?1")
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map([project_id], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+    for name in secret_names {
+        state
+            .secrets
+            .delete(&project_secret_key(project_id, "asset-secret", &name))
+            .map_err(|error| error.to_string())?;
+    }
+    connection
+        .execute(
+            "DELETE FROM secret_records WHERE project_id=?1",
+            [project_id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -2416,6 +2571,7 @@ fn bind_session_config_versions(
     session_id: &str,
     workspace: &str,
     host_id: &str,
+    project_id: Option<&str>,
 ) -> Result<(), String> {
     let connection = state
         .database
@@ -2439,15 +2595,19 @@ fn bind_session_config_versions(
             "SELECT o.id,o.current_version_id,COALESCE(selection.enabled,1)
              FROM config_object o
              LEFT JOIN asset_session_selection selection
-               ON selection.session_id=?3 AND selection.asset_id=o.id
-             WHERE o.status='active' AND o.current_version_id IS NOT NULL
+               ON selection.session_id=?4 AND selection.asset_id=o.id
+            WHERE o.status='active' AND o.current_version_id IS NOT NULL
                AND (o.scope_kind='global'
+                 OR (o.scope_kind='project' AND o.scope_key=?3)
                  OR (o.scope_kind='repo' AND o.scope_key=?1)
-                 OR (o.scope_kind='host' AND o.scope_key=?2))",
+                 OR (o.scope_kind='host' AND o.scope_key=?2))
+             ORDER BY CASE o.scope_kind
+               WHEN 'global' THEN 0 WHEN 'project' THEN 1
+               WHEN 'repo' THEN 2 WHEN 'host' THEN 3 ELSE 4 END, o.id",
         )
         .map_err(|error| error.to_string())?;
     let objects = statement
-        .query_map(params![workspace, host_id, session_id], |row| {
+        .query_map(params![workspace, host_id, project_id, session_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -2644,7 +2804,13 @@ async fn engine_for(
             .workspace
             .ok_or_else(|| "remote host did not provide a workspace".to_owned())?
     };
-    bind_session_config_versions(state, session_id, &resolved_workspace, &host_id)?;
+    bind_session_config_versions(
+        state,
+        session_id,
+        &resolved_workspace,
+        &host_id,
+        session.project_id.as_deref(),
+    )?;
     let (provider_id, configured_base_url) = {
         let connection = state
             .database
@@ -2689,24 +2855,38 @@ async fn engine_for(
         .or(configured_base_url)
         .or(descriptor.default_base_url)
         .unwrap_or_default();
-    let linear_tools_enabled = state
-        .secrets
-        .get(&secret_key("asset-secret", "linear-pat"))
-        .map_err(|error| error.to_string())?
-        .is_some();
+    let linear_tools_enabled = scoped_secret_get(
+        state,
+        session.project_id.as_deref(),
+        "asset-secret",
+        "linear-pat",
+    )?
+    .is_some();
     let connector_tools_enabled = [
         "github", "telegram", "discord", "slack", "notion", "gitlab", "jira", "stripe",
     ]
     .into_iter()
     .map(|kind| {
-        state
-            .secrets
-            .get(&secret_key("connector-token", kind))
-            .map(|value| (kind, value.is_some()))
-            .map_err(|error| error.to_string())
+        scoped_secret_get(
+            state,
+            session.project_id.as_deref(),
+            "connector-token",
+            kind,
+        )
+        .map(|value| (kind, value.is_some()))
+        .map_err(|error| error.to_string())
     })
     .collect::<Result<HashMap<_, _>, _>>()?;
-    let mcp_runtime = Arc::clone(&state.mcp);
+    let mcp_runtime = session
+        .project_id
+        .as_ref()
+        .map(|project_id| {
+            Arc::new(McpManager::new(Arc::new(McpCredentialAdapter {
+                store: state.secrets.clone(),
+                project_id: Some(project_id.clone()),
+            })))
+        })
+        .unwrap_or_else(|| Arc::clone(&state.mcp));
     let (workspace, executor, remote_client, allowed_tools) = if host_id == "local" {
         let workspace = PathBuf::from(resolved_workspace.clone());
         let host = LocalHost::new(&workspace).map_err(|error| error.to_string())?;
@@ -2785,6 +2965,7 @@ async fn engine_for(
                 mcp: Arc::clone(&mcp_runtime),
                 index_root: state.index_root.clone(),
                 workspace: workspace.display().to_string(),
+                project_id: session.project_id.clone(),
             })),
             None,
             Some(allowed_tools),
@@ -2800,7 +2981,7 @@ async fn engine_for(
         let workspace = if session_workspace.is_empty() {
             health.workspace.unwrap_or_else(|| "/workspace".into())
         } else {
-            session_workspace
+            session_workspace.clone()
         };
         let executor_client = client.clone().with_workspace(workspace.clone());
         (
@@ -2817,6 +2998,7 @@ async fn engine_for(
                 index_root: state.index_root.clone(),
                 host_id: host_id.clone(),
                 workspace: workspace.clone(),
+                project_id: session.project_id.clone(),
             }))),
             Some(executor_client),
             None,
@@ -2854,20 +3036,24 @@ async fn engine_for(
             );
         }
         "anthropic" => {
-            let key = state
-                .secrets
-                .get(&secret_key("provider-key", &provider_id))
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| {
-                    "provider key is not configured; open Provider settings first".to_owned()
-                })?;
+            let key = scoped_secret_get(
+                state,
+                session.project_id.as_deref(),
+                "provider-key",
+                &provider_id,
+            )?
+            .ok_or_else(|| {
+                "provider key is not configured; open Provider settings first".to_owned()
+            })?;
             Box::new(AnthropicProvider::new(ProviderConfig::new(base_url, key)))
         }
         _name if descriptor.openai_compatible => {
-            let stored_key = state
-                .secrets
-                .get(&secret_key("provider-key", &provider_id))
-                .map_err(|error| error.to_string())?;
+            let stored_key = scoped_secret_get(
+                state,
+                session.project_id.as_deref(),
+                "provider-key",
+                &provider_id,
+            )?;
             let key = match stored_key {
                 Some(key) => key,
                 None if descriptor.needs_key => {
@@ -2948,20 +3134,27 @@ async fn engine_for(
                 "SELECT o.id,o.name,COALESCE(o.server_key,''),o.current_version_id,v.content
                  FROM config_object o
                  JOIN config_object_version v ON v.id=o.current_version_id
-                 WHERE o.kind='mcp' AND o.status='active'",
+                 WHERE o.kind='mcp' AND o.status='active'
+                   AND (o.scope_kind='global'
+                     OR (o.scope_kind='project' AND o.scope_key=?1)
+                     OR (o.scope_kind='repo' AND o.scope_key=?2)
+                     OR (o.scope_kind='host' AND o.scope_key=?3))",
             )
             .map_err(|error| error.to_string())?;
         statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    serde_json::from_str::<Value>(&row.get::<_, String>(4)?)
-                        .unwrap_or_else(|_| json!({})),
-                ))
-            })
+            .query_map(
+                params![session.project_id, session_workspace, host_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        serde_json::from_str::<Value>(&row.get::<_, String>(4)?)
+                            .unwrap_or_else(|_| json!({})),
+                    ))
+                },
+            )
             .map_err(|error| error.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?
@@ -5082,7 +5275,11 @@ fn provider_models(provider: String) -> Vec<ModelDescriptor> {
 }
 
 #[tauri::command]
-fn list_assets(state: State<'_, DesktopState>, kind: Option<String>) -> Result<Vec<Value>, String> {
+fn list_assets(
+    state: State<'_, DesktopState>,
+    kind: Option<String>,
+    project_id: Option<String>,
+) -> Result<Vec<Value>, String> {
     let kind = kind.map(|kind| match kind.as_str() {
         "agents" => "rules".to_owned(),
         "playbook" => "runbook".to_owned(),
@@ -5099,11 +5296,12 @@ fn list_assets(state: State<'_, DesktopState>, kind: Option<String>) -> Result<V
              FROM config_object o
              JOIN config_object_version v ON v.id=o.current_version_id
              WHERE (?1 IS NULL OR o.kind=?1) AND o.status <> 'deleted'
+               AND (?2 IS NULL OR (o.scope_kind='project' AND o.scope_key=?2))
              ORDER BY o.name",
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
-        .query_map([kind], |row| {
+        .query_map(params![kind, project_id], |row| {
             let metadata: Value = serde_json::from_str::<Value>(&row.get::<_, String>(4)?)
                 .unwrap_or_else(|_| json!({}));
             Ok(json!({
@@ -5141,10 +5339,18 @@ fn save_asset(
     scope: Option<String>,
     scope_kind: Option<String>,
     enabled: Option<bool>,
+    project_id: Option<String>,
 ) -> Result<(), String> {
     if !matches!(
         kind.as_str(),
-        "instructions" | "knowledge" | "playbook" | "skill" | "agents" | "mcp"
+        "instructions"
+            | "knowledge"
+            | "playbook"
+            | "skill"
+            | "agents"
+            | "mcp"
+            | "connectors"
+            | "blueprint"
     ) {
         return Err("unsupported asset kind".into());
     }
@@ -5173,6 +5379,7 @@ fn save_asset(
         Some("global") => "global",
         Some("repo") if scope_key.is_some() => "repo",
         Some("host") if scope_key.is_some() => "host",
+        Some("project") if project_id.as_deref().is_some_and(|id| !id.is_empty()) => "project",
         _ if scope_key.is_some() => "repo",
         _ => "global",
     };
@@ -5181,6 +5388,8 @@ fn save_asset(
     }
     let scope_key = if scope_kind == "global" {
         None
+    } else if scope_kind == "project" {
+        project_id
     } else {
         scope_key
     };
@@ -5754,11 +5963,11 @@ async fn linear_graphql_token(token: &str, query: &str, variables: Value) -> Res
 
 async fn execute_linear_tool(
     secrets: &KeyringSecretStore,
+    project_id: Option<&str>,
     name: &str,
     arguments: Value,
 ) -> Result<Value, String> {
-    let token = secrets
-        .get(&secret_key("asset-secret", "linear-pat"))
+    let token = scoped_secret_get_from_store(secrets, project_id, "asset-secret", "linear-pat")
         .map_err(|error| format!("Linear PAT unavailable: {error}"))?
         .ok_or_else(|| "Linear PAT is not configured".to_owned())?;
     match name {
@@ -7153,6 +7362,7 @@ async fn github_json(
 
 async fn execute_connector_tool(
     secrets: &KeyringSecretStore,
+    project_id: Option<&str>,
     name: &str,
     arguments: Value,
 ) -> Result<Value, String> {
@@ -7163,12 +7373,10 @@ async fn execute_connector_tool(
     } else {
         name.split('_').next().unwrap_or_default()
     };
-    let config = secrets
-        .get(&secret_key("connector-config", kind))
+    let config = scoped_secret_get_from_store(secrets, project_id, "connector-config", kind)
         .map_err(|error| format!("{kind} credentials unavailable: {error}"))?
         .or_else(|| {
-            secrets
-                .get(&secret_key("connector-token", kind))
+            scoped_secret_get_from_store(secrets, project_id, "connector-token", kind)
                 .ok()
                 .flatten()
                 .map(|token| json!({"token": token}).to_string())
@@ -7672,14 +7880,45 @@ async fn read_blueprint(
     session_id: String,
 ) -> Result<Value, String> {
     let (host, _, _) = lifecycle_host(&state, &session_id).await?;
-    let content = host
-        .read(".devin/blueprint.yaml")
-        .await
-        .map_err(|error| error.to_string())?
-        .content;
+    let session = session_for(&state, &session_id)?;
+    let content = match project_blueprint_content(&state, session.project_id.as_deref())? {
+        Some(content) => content,
+        None => {
+            host.read(".devin/blueprint.yaml")
+                .await
+                .map_err(|error| error.to_string())?
+                .content
+        }
+    };
     let value: serde_yaml::Value =
         serde_yaml::from_str(&content).map_err(|error| format!("invalid blueprint: {error}"))?;
     serde_json::to_value(value).map_err(|error| error.to_string())
+}
+
+fn project_blueprint_content(
+    state: &DesktopState,
+    project_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(project_id) = project_id else {
+        return Ok(None);
+    };
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    connection
+        .query_row(
+            "SELECT v.content
+             FROM config_object o
+             JOIN config_object_version v ON v.id=o.current_version_id
+             WHERE o.kind='blueprint' AND o.scope_kind='project'
+               AND o.scope_key=?1 AND o.status='active'
+             LIMIT 1",
+            [project_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -7846,14 +8085,17 @@ async fn run_configured_lifecycle_stage(
     cwd: Option<String>,
 ) -> Result<Value, String> {
     let (host, _, workspace) = lifecycle_host(state, session_id).await?;
-    let blueprint = parse_blueprint(
-        &host
-            .read(".devin/blueprint.yaml")
-            .await
-            .map_err(|error| error.to_string())?
-            .content,
-    )
-    .map_err(|error| error.to_string())?;
+    let session = session_for(state, session_id)?;
+    let blueprint_content = match project_blueprint_content(state, session.project_id.as_deref())? {
+        Some(content) => content,
+        None => {
+            host.read(".devin/blueprint.yaml")
+                .await
+                .map_err(|error| error.to_string())?
+                .content
+        }
+    };
+    let blueprint = parse_blueprint(&blueprint_content).map_err(|error| error.to_string())?;
     let commands = match stage {
         LifecycleStage::Clone => blueprint.clone,
         LifecycleStage::Initialize => {
@@ -9213,41 +9455,55 @@ fn save_secret_metadata(
     scope: String,
     purpose: String,
     value: String,
+    project_id: Option<String>,
 ) -> Result<(), String> {
     if value.is_empty() {
         return Err("secret value cannot be empty".into());
     }
+    let key = project_id
+        .as_deref()
+        .map(|id| project_secret_key(id, "asset-secret", &name))
+        .unwrap_or_else(|| secret_key("asset-secret", &name));
     state
         .secrets
-        .set(&secret_key("asset-secret", &name), &value)
+        .set(&key, &value)
         .map_err(|error| error.to_string())?;
     state
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?
         .execute(
-            "INSERT OR REPLACE INTO secret_records(name,scope,purpose) VALUES (?1,?2,?3)",
-            params![name, scope, purpose],
+            "INSERT OR REPLACE INTO secret_records(name,scope,purpose,project_id) VALUES (?1,?2,?3,?4)",
+            params![name, scope, purpose, project_id.unwrap_or_default()],
         )
         .map_err(|error| error.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
-fn list_secret_metadata(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
+fn list_secret_metadata(
+    state: State<'_, DesktopState>,
+    project_id: Option<String>,
+) -> Result<Vec<Value>, String> {
     let connection = state
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?;
     let mut statement = connection
-        .prepare("SELECT name,scope,purpose FROM secret_records ORDER BY name")
+        .prepare(
+            "SELECT name,scope,purpose,project_id FROM secret_records
+             WHERE (?1 IS NULL OR project_id=?1 OR project_id='')
+             ORDER BY name",
+        )
         .map_err(|error| error.to_string())?;
     let rows = statement
-        .query_map([], |row| {
+        .query_map([project_id], |row| {
+            let project_id = row.get::<_, String>(3)?;
             Ok(json!({
                 "name": row.get::<_, String>(0)?,
                 "scope": row.get::<_, String>(1)?,
                 "purpose": row.get::<_, String>(2)?,
+                "project_id": if project_id.is_empty() { Value::Null } else { Value::String(project_id) },
             }))
         })
         .map_err(|error| error.to_string())?;
@@ -9256,16 +9512,27 @@ fn list_secret_metadata(state: State<'_, DesktopState>) -> Result<Vec<Value>, St
 }
 
 #[tauri::command]
-fn delete_secret_metadata(state: State<'_, DesktopState>, name: String) -> Result<(), String> {
+fn delete_secret_metadata(
+    state: State<'_, DesktopState>,
+    name: String,
+    project_id: Option<String>,
+) -> Result<(), String> {
+    let key = project_id
+        .as_deref()
+        .map(|id| project_secret_key(id, "asset-secret", &name))
+        .unwrap_or_else(|| secret_key("asset-secret", &name));
     state
         .secrets
-        .delete(&secret_key("asset-secret", &name))
+        .delete(&key)
         .map_err(|error| error.to_string())?;
     state
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?
-        .execute("DELETE FROM secret_records WHERE name=?1", [name])
+        .execute(
+            "DELETE FROM secret_records WHERE name=?1 AND project_id=?2",
+            params![name, project_id.unwrap_or_default()],
+        )
         .map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -9496,6 +9763,7 @@ fn main() {
             eprintln!("secret_backend={secret_backend}");
             let mcp = Arc::new(McpManager::new(Arc::new(McpCredentialAdapter {
                 store: secrets.clone(),
+                project_id: None,
             })));
             let mut trigger_token_bytes = [0_u8; 32];
             getrandom::fill(&mut trigger_token_bytes).map_err(|error| {
@@ -9726,6 +9994,19 @@ fn main() {
 #[cfg(test)]
 mod m7_tests {
     use super::*;
+
+    #[test]
+    fn project_secret_key_isolated_from_legacy_global_key() {
+        assert_eq!(secret_key("asset-secret", "token"), "asset-secret:token");
+        assert_eq!(
+            project_secret_key("project-1", "asset-secret", "token"),
+            "project:project-1/asset-secret:token"
+        );
+        assert_ne!(
+            project_secret_key("project-1", "asset-secret", "token"),
+            secret_key("asset-secret", "token")
+        );
+    }
 
     #[test]
     fn branch_names_follow_devin_convention() {

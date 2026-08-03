@@ -69,7 +69,12 @@ type Asset = {
   scope_kind?: string;
   enabled: boolean;
 };
-type SecretMetadata = { name: string; scope: string; purpose: string };
+type SecretMetadata = {
+  name: string;
+  scope: string;
+  purpose: string;
+  project_id?: string | null;
+};
 type ConnectorCatalogEntry = {
   name: string;
   description: string;
@@ -984,6 +989,256 @@ function MemberDialog({
   );
 }
 
+function ProjectConfigPanel({
+  project,
+  onError,
+}: {
+  project: Project;
+  onError: (error: unknown) => void;
+}) {
+  const [assets, setAssets] = useState<Asset[]>([]);
+  const [secrets, setSecrets] = useState<SecretMetadata[]>([]);
+  const [kind, setKind] = useState<
+    "agents" | "knowledge" | "playbook" | "mcp" | "connectors" | "blueprint"
+  >("agents");
+  const [title, setTitle] = useState("");
+  const [body, setBody] = useState("");
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [secretName, setSecretName] = useState("");
+  const [secretPurpose, setSecretPurpose] = useState("");
+  const [secretValue, setSecretValue] = useState("");
+  const [secretFormOpen, setSecretFormOpen] = useState(false);
+  const load = async () => {
+    const [nextAssets, nextSecrets] = await Promise.all([
+      command<Asset[]>("list_assets", { projectId: project.id }),
+      command<SecretMetadata[]>("list_secret_metadata", {
+        projectId: project.id,
+      }),
+    ]);
+    setAssets(nextAssets);
+    setSecrets(nextSecrets);
+  };
+  useEffect(() => {
+    void load().catch(onError);
+  }, [project.id]);
+  const reset = () => {
+    setTitle("");
+    setBody("");
+    setEditingId(null);
+  };
+  const save = () => {
+    void command("save_asset", {
+      id: editingId || `project-${project.id}-${kind}-${Date.now()}`,
+      kind,
+      title: title.trim() || kind,
+      body,
+      trigger: null,
+      scope: project.id,
+      scopeKind: "project",
+      projectId: project.id,
+      enabled: true,
+    })
+      .then(load)
+      .then(reset)
+      .catch(onError);
+  };
+  return (
+    <section className="mt-8 rounded-xl border border-line bg-panel p-5">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 className="text-lg font-semibold text-ink">项目配置</h2>
+          <p className="mt-1 text-sm text-faint">
+            项目配置会继承到项目成员会话，全局配置仍可回退使用。
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {[
+            ["agents", "规则"],
+            ["knowledge", "Knowledge"],
+            ["playbook", "Playbook"],
+            ["mcp", "MCP"],
+            ["connectors", "Connectors"],
+            ["blueprint", "Blueprint"],
+          ].map(([value, label]) => (
+            <button
+              key={value}
+              className={`btn ${kind === value ? "approval-primary" : ""}`}
+              onClick={() => {
+                setKind(value as typeof kind);
+                reset();
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="mt-5 grid gap-3">
+        {assets
+          .filter((asset) => asset.kind === kind)
+          .map((asset) => (
+            <div
+              className="flex items-start justify-between gap-3 rounded-lg border border-line p-3"
+              key={asset.id}
+            >
+              <div className="min-w-0">
+                <strong className="text-ink">{asset.title}</strong>
+                <p className="mt-1 whitespace-pre-wrap break-words text-xs text-faint">
+                  {asset.body}
+                </p>
+              </div>
+              <div className="flex shrink-0 gap-2">
+                <button
+                  className="btn"
+                  onClick={() => {
+                    setEditingId(asset.id);
+                    setTitle(asset.title);
+                    setBody(asset.body);
+                  }}
+                >
+                  编辑
+                </button>
+                <button
+                  className="btn"
+                  onClick={() =>
+                    command("delete_asset", { id: asset.id })
+                      .then(load)
+                      .catch(onError)
+                  }
+                >
+                  删除
+                </button>
+              </div>
+            </div>
+          ))}
+        <div className="grid gap-3 rounded-lg border border-line p-4">
+          <label className="field-label">
+            名称
+            <input
+              value={title}
+              onChange={(event) => setTitle(event.target.value)}
+              placeholder="配置名称"
+            />
+          </label>
+          <label className="field-label">
+            内容
+            <textarea
+              value={body}
+              onChange={(event) => setBody(event.target.value)}
+              placeholder={
+                kind === "blueprint"
+                  ? "clone:\n  - git fetch"
+                  : "项目级配置内容"
+              }
+            />
+          </label>
+          <div>
+            <button className="btn approval-primary" onClick={save}>
+              {editingId ? "保存更改" : "新增配置"}
+            </button>
+            {editingId && (
+              <button className="btn ml-2" onClick={reset}>
+                取消编辑
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+      <div className="mt-6 border-t border-line pt-5">
+        <div className="flex items-center justify-between">
+          <div>
+            <h3 className="font-medium text-ink">项目 Secrets</h3>
+            <p className="mt-1 text-xs text-faint">
+              项目 Secret 优先于全局同名 Secret，值不会显示。
+            </p>
+          </div>
+          <button
+            className="btn"
+            onClick={() => setSecretFormOpen((value) => !value)}
+          >
+            {secretFormOpen ? "取消" : "新增 Secret"}
+          </button>
+        </div>
+        {secretFormOpen && (
+          <div className="mt-3 grid gap-3 rounded-lg border border-line p-4">
+            <input
+              value={secretName}
+              onChange={(event) => setSecretName(event.target.value)}
+              placeholder="Secret 名称"
+            />
+            <input
+              value={secretPurpose}
+              onChange={(event) => setSecretPurpose(event.target.value)}
+              placeholder="用途"
+            />
+            <input
+              type="password"
+              value={secretValue}
+              onChange={(event) => setSecretValue(event.target.value)}
+              placeholder="Secret 值"
+            />
+            <button
+              className="btn approval-primary"
+              disabled={!secretName || !secretPurpose || !secretValue}
+              onClick={() =>
+                command("save_secret_metadata", {
+                  name: secretName,
+                  scope: `project:${project.id}`,
+                  purpose: secretPurpose,
+                  value: secretValue,
+                  projectId: project.id,
+                })
+                  .then(load)
+                  .then(() => {
+                    setSecretName("");
+                    setSecretPurpose("");
+                    setSecretValue("");
+                    setSecretFormOpen(false);
+                  })
+                  .catch(onError)
+              }
+            >
+              保存 Secret
+            </button>
+          </div>
+        )}
+        <div className="mt-3 grid gap-2">
+          {secrets.map((secret) => (
+            <div
+              className="flex items-center justify-between rounded-lg border border-line p-3 text-sm"
+              key={`${secret.project_id || "global"}:${secret.name}`}
+            >
+              <span>
+                <strong>{secret.name}</strong>
+                <span className="ml-2 text-xs text-faint">
+                  {secret.project_id
+                    ? secret.purpose
+                    : `${secret.purpose} · 全局回退`}
+                </span>
+              </span>
+              {secret.project_id === project.id && (
+                <button
+                  className="btn"
+                  onClick={() =>
+                    command("delete_secret_metadata", {
+                      name: secret.name,
+                      projectId: project.id,
+                    })
+                      .then(load)
+                      .catch(onError)
+                  }
+                >
+                  删除
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function ProjectBoard({
   project,
   sessions,
@@ -1184,6 +1439,7 @@ function ProjectBoard({
             );
           })}
         </div>
+        <ProjectConfigPanel project={project} onError={onError} />
       </div>
       {memberForm && (
         <MemberDialog
