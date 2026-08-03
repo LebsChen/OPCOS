@@ -111,6 +111,31 @@ pub struct AccountHostBinding {
     pub updated_at: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LoginProfileRecord {
+    pub account_id: String,
+    pub host_id: String,
+    pub profile_path: String,
+    pub backup_dir: String,
+    pub latest_validation_status: Option<String>,
+    pub latest_validation_at: Option<String>,
+    pub latest_validation_reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LoginStateBackupRecord {
+    pub backup_id: String,
+    pub account_id: String,
+    pub host_id: String,
+    pub profile_path: String,
+    pub backup_path: String,
+    pub hash: String,
+    pub size: u64,
+    pub created_at: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct StoredMessage {
     pub session_id: String,
@@ -377,6 +402,60 @@ fn action_ledger_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActionLed
         updated_at: row.get(13)?,
         session_id: row.get(14)?,
         project_id: row.get(15)?,
+    })
+}
+
+fn login_profile_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoginProfileRecord> {
+    Ok(LoginProfileRecord {
+        account_id: row.get(0)?,
+        host_id: row.get(1)?,
+        profile_path: row.get(2)?,
+        backup_dir: row.get(3)?,
+        latest_validation_status: row.get(4)?,
+        latest_validation_at: row.get(5)?,
+        latest_validation_reason: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+fn load_login_profile_optional(
+    connection: &Connection,
+    account_id: &str,
+) -> Result<Option<LoginProfileRecord>, StoreError> {
+    Ok(connection
+        .query_row(
+            "SELECT account_id,host_id,profile_path,backup_dir,
+                    latest_validation_status,latest_validation_at,latest_validation_reason,
+                    created_at,updated_at
+             FROM login_profiles WHERE account_id=?1",
+            [account_id],
+            login_profile_from_row,
+        )
+        .optional()?)
+}
+
+fn load_login_profile(
+    connection: &Connection,
+    account_id: &str,
+) -> Result<LoginProfileRecord, StoreError> {
+    load_login_profile_optional(connection, account_id)?
+        .ok_or_else(|| StoreError::Validation("login profile not found".into()))
+}
+
+fn login_state_backup_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<LoginStateBackupRecord> {
+    let size: i64 = row.get(6)?;
+    Ok(LoginStateBackupRecord {
+        backup_id: row.get(0)?,
+        account_id: row.get(1)?,
+        host_id: row.get(2)?,
+        profile_path: row.get(3)?,
+        backup_path: row.get(4)?,
+        hash: row.get(5)?,
+        size: u64::try_from(size).unwrap_or_default(),
+        created_at: row.get(7)?,
     })
 }
 
@@ -1308,6 +1387,123 @@ impl SqliteStore {
                 [account_id],
             )?;
         Ok(())
+    }
+
+    pub fn save_login_profile(
+        &self,
+        account_id: &str,
+        host_id: &str,
+        profile_path: &str,
+        backup_dir: &str,
+    ) -> Result<LoginProfileRecord, StoreError> {
+        for (name, value) in [
+            ("account_id", account_id),
+            ("host_id", host_id),
+            ("profile_path", profile_path),
+            ("backup_dir", backup_dir),
+        ] {
+            if value.trim().is_empty() {
+                return Err(StoreError::Validation(format!("{name} cannot be empty")));
+            }
+        }
+        let now = Utc::now().to_rfc3339();
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "INSERT INTO login_profiles
+             (account_id,host_id,profile_path,backup_dir,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?5)
+             ON CONFLICT(account_id) DO UPDATE SET host_id=excluded.host_id,
+             profile_path=excluded.profile_path, backup_dir=excluded.backup_dir,
+             updated_at=excluded.updated_at",
+            params![account_id, host_id, profile_path, backup_dir, now],
+        )?;
+        load_login_profile(&connection, account_id)
+    }
+
+    pub fn login_profile(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<LoginProfileRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        load_login_profile_optional(&connection, account_id)
+    }
+
+    pub fn add_login_state_backup(
+        &self,
+        account_id: &str,
+        host_id: &str,
+        profile_path: &str,
+        backup_path: &str,
+        hash: &str,
+        size: u64,
+    ) -> Result<LoginStateBackupRecord, StoreError> {
+        let size = i64::try_from(size)
+            .map_err(|_| StoreError::Validation("backup size is too large".into()))?;
+        let record = LoginStateBackupRecord {
+            backup_id: uuid::Uuid::new_v4().to_string(),
+            account_id: account_id.into(),
+            host_id: host_id.into(),
+            profile_path: profile_path.into(),
+            backup_path: backup_path.into(),
+            hash: hash.into(),
+            size: size as u64,
+            created_at: Utc::now().to_rfc3339(),
+        };
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "INSERT INTO login_state_backups
+             (backup_id,account_id,host_id,profile_path,backup_path,hash,size,created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                record.backup_id,
+                record.account_id,
+                record.host_id,
+                record.profile_path,
+                record.backup_path,
+                record.hash,
+                size,
+                record.created_at
+            ],
+        )?;
+        Ok(record)
+    }
+
+    pub fn login_state_backups(
+        &self,
+        account_id: &str,
+    ) -> Result<Vec<LoginStateBackupRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT backup_id,account_id,host_id,profile_path,backup_path,hash,size,created_at
+             FROM login_state_backups WHERE account_id=?1 ORDER BY created_at DESC",
+        )?;
+        let rows = statement.query_map([account_id], login_state_backup_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn record_login_validation(
+        &self,
+        account_id: &str,
+        status: &str,
+        reason: Option<&str>,
+    ) -> Result<LoginProfileRecord, StoreError> {
+        if !matches!(status, "valid" | "invalid" | "undetermined") {
+            return Err(StoreError::Validation(
+                "invalid login validation status".into(),
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let changed = connection.execute(
+            "UPDATE login_profiles SET latest_validation_status=?1,
+             latest_validation_at=?2, latest_validation_reason=?3, updated_at=?2
+             WHERE account_id=?4",
+            params![status, now, reason, account_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::Validation("login profile not found".into()));
+        }
+        load_login_profile(&connection, account_id)
     }
 
     pub fn append_audit(
@@ -3062,6 +3258,29 @@ impl SqliteStore {
                created_at TEXT NOT NULL,
                updated_at TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS login_profiles (
+               account_id TEXT PRIMARY KEY,
+               host_id TEXT NOT NULL,
+               profile_path TEXT NOT NULL,
+               backup_dir TEXT NOT NULL,
+               latest_validation_status TEXT,
+               latest_validation_at TEXT,
+               latest_validation_reason TEXT,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS login_state_backups (
+               backup_id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               host_id TEXT NOT NULL,
+               profile_path TEXT NOT NULL,
+               backup_path TEXT NOT NULL,
+               hash TEXT NOT NULL,
+               size INTEGER NOT NULL,
+               created_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_login_backups_account
+               ON login_state_backups(account_id,created_at DESC);
              CREATE INDEX IF NOT EXISTS idx_action_ledger_created_at
                ON action_ledger(created_at DESC);
              CREATE INDEX IF NOT EXISTS idx_action_ledger_target
@@ -5573,5 +5792,50 @@ mod tests {
         assert_eq!(store.list_account_host_bindings().unwrap().len(), 1);
         store.unbind_account_host("account-a").unwrap();
         assert!(store.account_host_binding("account-a").unwrap().is_none());
+    }
+
+    #[test]
+    fn login_state_profile_backups_and_validation_are_persistent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let profile = store
+            .save_login_profile(
+                "account-a",
+                "host-a",
+                r"C:\Users\Agent\AppData\Chrome\User Data",
+                r"C:\Users\Agent\OPCOS\login-backups",
+            )
+            .unwrap();
+        assert_eq!(profile.latest_validation_status, None);
+        let backup = store
+            .add_login_state_backup(
+                "account-a",
+                "host-a",
+                &profile.profile_path,
+                r"C:\Users\Agent\OPCOS\login-backups\backup.zip",
+                "sha256:abc",
+                42,
+            )
+            .unwrap();
+        assert_eq!(
+            store.login_state_backups("account-a").unwrap(),
+            vec![backup]
+        );
+        let profile = store
+            .record_login_validation("account-a", "undetermined", Some("no signal"))
+            .unwrap();
+        assert_eq!(
+            profile.latest_validation_status.as_deref(),
+            Some("undetermined")
+        );
+        assert!(
+            store
+                .record_login_validation("account-a", "valid", None)
+                .is_ok()
+        );
+        assert!(
+            store
+                .record_login_validation("account-a", "unknown", None)
+                .is_err()
+        );
     }
 }

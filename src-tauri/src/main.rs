@@ -28,6 +28,11 @@ use opcos_engine::{
         run_computer_use_loop,
     },
     event_bus::{EventEffect, dispatch_event},
+    login_state::{
+        LoginStateBackupEvidence, LoginValidationExpectation, LoginValidationStatus,
+        backup_login_state as engine_backup_login_state, classify_login_validation,
+        restore_login_state as engine_restore_login_state,
+    },
     orchestration::{BoardPhase, BoardTask},
     orchestration::{CoordinationRuntime, Envelope, Role},
     planner::{parse_planner_output, planner_dedup_key, planning_prompt},
@@ -46,12 +51,13 @@ use opcos_provider::openai::OpenAiProvider;
 use opcos_provider::registry;
 use opcos_provider::{Provider, ProviderConfig};
 use opcos_rvm::{
-    ExecRequest, HttpRvmClient, IdeBootstrap, PersistentShell, RvmClient, RvmClientConfig, WsKind,
-    WsParams, join_remote_path,
+    ExecRequest, HttpRvmClient, IdeBootstrap, PersistentShell, RemotePathGuard, RvmClient,
+    RvmClientConfig, WsKind, WsParams, join_remote_path,
 };
 use opcos_store::{
-    ActionBeginResult, ArtifactRecord, KeyringSecretStore, ProjectAgentRecord, ProjectRecord,
-    SecretStore, SessionRecord, SessionStore, SqliteStore, ToolCallRecord,
+    ActionBeginResult, ArtifactRecord, KeyringSecretStore, LoginProfileRecord,
+    LoginStateBackupRecord, ProjectAgentRecord, ProjectRecord, SecretStore, SessionRecord,
+    SessionStore, SqliteStore, ToolCallRecord,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -5905,6 +5911,303 @@ fn default_computer_use_settle() -> u64 {
 
 fn default_computer_use_retry_delay() -> u64 {
     500
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct LoginProfileRequest {
+    account_id: String,
+    profile_path: String,
+    backup_dir: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct LoginStateBackupRequest {
+    account_id: String,
+    idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct LoginStateRestoreRequest {
+    account_id: String,
+    backup_id: String,
+    idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct LoginStateValidationRequest {
+    account_id: String,
+    url: String,
+    expected_signal: String,
+    observed_signal: Option<String>,
+}
+
+fn login_path_root(profile_path: &str, backup_dir: &str) -> Result<String, String> {
+    for path in [profile_path, backup_dir] {
+        if path.trim().is_empty() || path.contains('\0') || path.replace('\\', "/").contains("../")
+        {
+            return Err("login-state remote path rejected".into());
+        }
+    }
+    let drive = profile_path
+        .get(..2)
+        .filter(|value| value.as_bytes().get(1) == Some(&b':'))
+        .ok_or_else(|| "login-state paths must be absolute Windows paths".to_owned())?;
+    if !backup_dir
+        .get(..2)
+        .is_some_and(|value| value.eq_ignore_ascii_case(drive))
+    {
+        return Err("profile and backup must remain on the same Host drive".into());
+    }
+    Ok(format!("{drive}\\"))
+}
+
+fn validate_login_paths(profile_path: &str, backup_dir: &str) -> Result<(String, String), String> {
+    let root = login_path_root(profile_path, backup_dir)?;
+    let guard = RemotePathGuard::new(&root);
+    let profile = guard
+        .path(profile_path)
+        .map_err(|error| error.to_string())?;
+    let backup = guard.path(backup_dir).map_err(|error| error.to_string())?;
+    Ok((profile, backup))
+}
+
+#[tauri::command]
+fn save_login_profile(
+    state: State<'_, DesktopState>,
+    request: LoginProfileRequest,
+) -> Result<LoginProfileRecord, String> {
+    let binding = state
+        .store
+        .account_host_binding(&request.account_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "account has no bound Host".to_owned())?;
+    let (profile_path, backup_dir) =
+        validate_login_paths(&request.profile_path, &request.backup_dir)?;
+    state
+        .store
+        .save_login_profile(
+            &request.account_id,
+            &binding.host_id,
+            &profile_path,
+            &backup_dir,
+        )
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn login_profile(
+    state: State<'_, DesktopState>,
+    account_id: String,
+) -> Result<Option<LoginProfileRecord>, String> {
+    state
+        .store
+        .login_profile(&account_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn login_state_backups(
+    state: State<'_, DesktopState>,
+    account_id: String,
+) -> Result<Vec<LoginStateBackupRecord>, String> {
+    state
+        .store
+        .login_state_backups(&account_id)
+        .map_err(|error| error.to_string())
+}
+
+async fn login_state_host(
+    state: &DesktopState,
+    account_id: &str,
+    profile_path: &str,
+) -> Result<(String, RvmHost), String> {
+    let binding = state
+        .store
+        .account_host_binding(account_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "account has no bound Host".to_owned())?;
+    if binding.host_id == "local" {
+        return Err("LocalHost cannot store or restore login state".into());
+    }
+    let root = login_path_root(profile_path, profile_path)?;
+    let client = client_for(state, &binding.host_id)
+        .map_err(|error| format!("remote host unavailable: {error}"))?
+        .with_workspace(root.clone());
+    Ok((
+        binding.host_id.clone(),
+        RvmHost::new(binding.host_id, root, client),
+    ))
+}
+
+#[tauri::command]
+async fn backup_login_state(
+    state: State<'_, DesktopState>,
+    request: LoginStateBackupRequest,
+) -> Result<LoginStateBackupRecord, String> {
+    let profile = state
+        .store
+        .login_profile(&request.account_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "login profile is not configured".to_owned())?;
+    let binding = state
+        .store
+        .account_host_binding(&request.account_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "account has no bound Host".to_owned())?;
+    if binding.host_id != profile.host_id {
+        return Err("login profile Host does not match account binding".into());
+    }
+    let (profile_path, backup_dir) =
+        validate_login_paths(&profile.profile_path, &profile.backup_dir)?;
+    let (_, host) = login_state_host(&state, &request.account_id, &profile_path).await?;
+    let action = state
+        .store
+        .begin_action(
+            "login_state_backup",
+            "browser",
+            &request.account_id,
+            &request.idempotency_key,
+            None,
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+    let action_id = match action {
+        ActionBeginResult::Fresh(record) => record.action_id,
+        ActionBeginResult::PreviouslyFailed { action_id, .. } => action_id,
+        ActionBeginResult::AlreadySucceeded { action_id, .. } => {
+            return Err(format!("login-state backup already succeeded: {action_id}"));
+        }
+        ActionBeginResult::InFlight { .. } => {
+            return Err("login-state backup is already in flight".into());
+        }
+    };
+    let backup_path = format!(
+        "{}\\opcos-login-state-{}.zip",
+        backup_dir.trim_end_matches(['\\', '/']),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    match engine_backup_login_state(&host, &profile_path, &backup_path).await {
+        Ok(LoginStateBackupEvidence { hash, size }) => {
+            let result = state
+                .store
+                .add_login_state_backup(
+                    &request.account_id,
+                    &profile.host_id,
+                    &profile_path,
+                    &backup_path,
+                    &hash,
+                    size,
+                )
+                .map_err(|error| error.to_string())?;
+            state
+                .store
+                .finish_action_succeeded(&action_id, None, Some("login-state backup completed"))
+                .map_err(|error| error.to_string())?;
+            Ok(result)
+        }
+        Err(error) => {
+            let _ = state
+                .store
+                .finish_action_failed(&action_id, &error.to_string());
+            Err(error.to_string())
+        }
+    }
+}
+
+#[tauri::command]
+async fn restore_login_state(
+    state: State<'_, DesktopState>,
+    request: LoginStateRestoreRequest,
+) -> Result<Value, String> {
+    let profile = state
+        .store
+        .login_profile(&request.account_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "login profile is not configured".to_owned())?;
+    let backup = state
+        .store
+        .login_state_backups(&request.account_id)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|backup| backup.backup_id == request.backup_id)
+        .ok_or_else(|| "login-state backup not found".to_owned())?;
+    let binding = state
+        .store
+        .account_host_binding(&request.account_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "account has no bound Host".to_owned())?;
+    if backup.host_id != binding.host_id || profile.host_id != binding.host_id {
+        return Err("cross-Host login-state restore is forbidden".into());
+    }
+    let (profile_path, _) = validate_login_paths(&profile.profile_path, &profile.backup_dir)?;
+    let (_, host) = login_state_host(&state, &request.account_id, &profile_path).await?;
+    let action = state
+        .store
+        .begin_action(
+            "login_state_restore",
+            "browser",
+            &request.account_id,
+            &request.idempotency_key,
+            None,
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+    let action_id = match action {
+        ActionBeginResult::Fresh(record) => record.action_id,
+        ActionBeginResult::PreviouslyFailed { action_id, .. } => action_id,
+        ActionBeginResult::AlreadySucceeded { action_id, .. } => {
+            return Ok(json!({"status": "already_succeeded", "action_id": action_id}));
+        }
+        ActionBeginResult::InFlight { .. } => {
+            return Err("login-state restore is already in flight".into());
+        }
+    };
+    match engine_restore_login_state(&host, &backup.backup_path, &backup.hash, &profile_path).await
+    {
+        Ok(()) => {
+            state
+                .store
+                .finish_action_succeeded(&action_id, None, Some("login-state restore completed"))
+                .map_err(|error| error.to_string())?;
+            Ok(json!({"status": "succeeded"}))
+        }
+        Err(error) => {
+            let _ = state
+                .store
+                .finish_action_failed(&action_id, &error.to_string());
+            Err(error.to_string())
+        }
+    }
+}
+
+#[tauri::command]
+fn validate_login_state(
+    state: State<'_, DesktopState>,
+    request: LoginStateValidationRequest,
+) -> Result<LoginValidationStatus, String> {
+    if request.url.trim().is_empty() || request.expected_signal.trim().is_empty() {
+        return Err("login validation URL and expected signal are required".into());
+    }
+    let profile = state
+        .store
+        .login_profile(&request.account_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "login profile is not configured".to_owned())?;
+    let expectation = LoginValidationExpectation {
+        url: request.url,
+        expected_signal: request.expected_signal,
+    };
+    let observation = classify_login_validation(&expectation, request.observed_signal.as_deref());
+    let status = match &observation.status {
+        LoginValidationStatus::Valid => "valid",
+        LoginValidationStatus::Invalid => "invalid",
+        LoginValidationStatus::Undetermined => "undetermined",
+    };
+    state
+        .store
+        .record_login_validation(&profile.account_id, status, observation.signal.as_deref())
+        .map_err(|error| error.to_string())?;
+    Ok(observation.status)
 }
 
 #[tauri::command]
@@ -15714,6 +16017,12 @@ fn main() {
             run_autonomous_goal,
             planning_history,
             approve_work_queue_item,
+            save_login_profile,
+            login_profile,
+            login_state_backups,
+            backup_login_state,
+            restore_login_state,
+            validate_login_state,
             save_schedule,
             list_schedules,
             run_schedule,

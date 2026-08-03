@@ -81,9 +81,9 @@ RVM 的 Host 能力适配器确实在 `crates/opcos-hosts/src/lib.rs:1171-1215` 
 
 - 账号 ↔ Host 绑定和 Host 生命周期管理；
 - 在 CDP/VNC surface 之上的程序化动作循环（截图 → 定位 → 动作 → 结果校验 → 重试）；
-- VM 快照或持久卷形式的登录态持久化。
+- RVM agent 1.0.32 没有快照、克隆或恢复端点；不能改主机侧来补这个能力。当前采用一个账号一个长期在线 Host，并在该 Host 上对浏览器 profile 做备份/恢复。备份和恢复前必须确认浏览器已退出，备份完整性用远端 storage hash 校验，登录态有效性由调用方提供 URL 与期望信号显式验证。
 
-第三项是明确的前置依赖：`docs/07-automation.md:110-111` 写明当前 OPCOS 尚无环境复用、快照或环境就绪缓存机制，`post-build` 也不会产生可复用快照。因此如果每次创建新 VM 都必须重新登录，就会重新经历登录和风控流程，“一个账号一台机器”的隔离边界虽明确，长期运行所需的环境复用仍未成立。
+第三项是明确的边界：RVM 没有环境快照 API，因此不能把登录态设计成 VM 快照复用。长期在线 Host 上的 profile 级备份/恢复才是当前可行路径；profile 内容默认留在绑定的 Host 上，不下载到 OPCOS 本机，也禁止跨 Host 恢复。若有效性检查返回无法判定，必须停下来人工重新登录，不能继续使用该会话。
 
 电商和自媒体还需要操作原语的幂等与重试、验证码/滑块等异常处理，以及可重放、可断点续传的采集流水线。真正的缺口是**通道之上的 computer-use 动作循环、账号→Host 编排和环境持久化**，不是“不能让 LLM 点击”。
 
@@ -156,7 +156,7 @@ LLM 可以参与 computer use，尤其是在异常分支和页面变化时；但
 2. **通用持久化任务队列**：在现有 SQLite `coord_tasks` / `coord_messages` / 依赖关系之上，补成面向业务事件的跨 session 真队列，并增加统一唤醒、重试和补偿语义。
 3. **自治规划循环**：一个能回答“现在该干什么”的规划器——输入是平台当前快照、动作账本、外部事件和目标，输出是入队任务，并选择合适的 MCP/API/Computer-use actuator。这是“自主驱动”的核心含义。
 4. **事件总线**：把 cron / 文件 watcher / loopback callback / 出站轮询统一成一种 event 抽象，而不是四套各自为政的机制。
-5. **RVM 级 Computer use 与账号隔离**：采用“一个账号一个 Host”的模型，把账号、RVM Host、workspace 和凭据绑定起来（本地容器路径需先新增 `DockerHost`，见 2.3），并管理 Host 的创建、复用、暂停、销毁和故障恢复；在已有 VNC/CDP surface 之上补程序化动作循环（截图 → 定位 → 动作 → 校验 → 重试）。**前置依赖是环境复用：VM 快照或持久卷必须能保存登录态、Cookie 和设备环境；当前仓库尚无环境复用/快照机制**（`docs/07-automation.md:110-111`），所以应先补这一基础设施，再把账号绑定用于无人值守业务。
+5. **RVM 级 Computer use 与账号隔离**：采用“一个账号一个 Host”的模型，把账号、RVM Host、workspace 和凭据绑定起来（本地容器路径需先新增 `DockerHost`，见 2.3），并管理 Host 的复用、暂停、销毁和故障恢复；在已有 VNC/CDP surface 之上补程序化动作循环（截图 → 定位 → 动作 → 校验 → 重试）。RVM agent 当前没有快照/克隆/恢复端点，因此登录态复用采用绑定 Host 上的 profile 级备份、hash 完整性校验和显式有效性检查，而不是 VM 快照。
 
 上述第二步仍会反向要求第一步的框架补能力：MCP/API/Computer use 解决“怎么调用”，状态与幂等解决“调用后发生了什么”，自治循环解决“下一步做什么”，RVM Host 生命周期和快照/持久卷解决“账号在哪台隔离机器上持续运行”。
 
@@ -219,7 +219,7 @@ SEO                        ->  内容生成与发布
 5. **行数与外部平台政策**：#36 分支上的 `opcos-engine` 实际为 6134 行，原稿的 6499 行已修正。淘宝准入政策来自平台官方文档（见脚注），是有来源的外部事实，与仓库内可核验的代码事实分开标注；闲鱼/拼多多/京东的政策以及“YouTube 有官方 API”未经核验，已改为不作断言。
 6. **邮件能力表述**：UI catalog 有邮件能力描述，但源码当前确认的是 Gmail/Outlook OAuth 配置和 IMAP 登录/身份验证路径，未找到对应的 engine 收发工具 dispatch；报告已不再把邮件收发写成已完成能力。
 7. **统一 actuator 的架构修正**：用户提出并经本次评审接受：业务 agent 应通过 `agent + MCP`、`agent + API`、`agent + Computer use` 触达平台，取代原稿中容易被理解为“每个平台手写确定性业务能力层”的表述。平台实体当前状态由对应 API/MCP 提供，OPCOS 不复制平台业务 schema；需要补的是平台无关的 OPCOS 动作账本，用来记录动作关联、幂等映射、结果和历史。
-8. **账号隔离方案修正**：用户提出并经本次评审接受：多账号登录态不再设计为 OPCOS 自己维护 browser profile，而采用“一个账号一个 Host”的 VM/容器级隔离。注意用户提到的 Docker 路径当前没有实现（`crates/` 下无 Docker 代码，`LocalHost` 为进程内实现且 `computer_use`/`screenshot`/`vnc` 不可用，见 2.3），因此近期只有 RVM 路径可走。根据 `crates/opcos-hosts/src/lib.rs:1171-1215`，RVM 能力适配器已知 `vnc`、`cdp`、`browser`、`computer_use` 和 `screenshot` 这些能力名，但 `available` 只反映远端能力声明，不代表动作循环已经实现；根据 `docs/07-automation.md:110-111`，环境复用/快照/就绪缓存当前不存在，因此阶段 1 必须先补快照或持久卷，再实现账号→Host 绑定和 Host 生命周期。可借鉴 Devin 的 VM/Computer-use/事件驱动形态，但本文不对其内部实现作断言；平台业务实体当前状态由 API/MCP 提供，OPCOS 自己建设动作账本。
+8. **账号隔离方案修正**：用户提出并经本次评审接受：多账号登录态必须继续采用“一个账号一个 Host”的隔离，profile 备份也只能留在该 Host，禁止跨 Host 复制。RVM agent 没有快照、克隆或恢复端点，所以不能把登录态复用描述成 VM 快照；当前实现使用远端 profile 级备份/恢复、浏览器进程锁检查、storage hash 完整性校验和三态登录有效性检查。注意用户提到的 Docker 路径当前没有实现（`crates/` 下无 Docker 代码，`LocalHost` 为进程内实现且 `computer_use`/`screenshot`/`vnc` 不可用，见 2.3），因此近期只有 RVM 路径可走。根据 `crates/opcos-hosts/src/lib.rs:1171-1215`，RVM 能力适配器已知 `vnc`、`cdp`、`browser`、`computer_use` 和 `screenshot` 这些能力名，但 `available` 只反映远端能力声明，不代表动作循环已经实现；平台业务实体当前状态由 API/MCP 提供，OPCOS 自己建设动作账本。
 9. **动作账本修正**：这是用户提出的第三轮架构修正。本轮明确收回“业务事实层/业务实体层”以及“实体 + 事件 + 来源/账号上下文 + 幂等键 + 结果状态”的镜像式方案：平台实体不由 OPCOS 保存，平台 API/MCP 是当前状态的事实源。OPCOS 只保留较小的 action ledger，记录自身动作类型、目标平台/账号、幂等键、幂等键→外部 ID 映射、结果和时间戳。账本仍因幂等映射、无 API 的 Computer use 动作、变更历史以及自治循环的增量/成本约束而必要。
 
 ---

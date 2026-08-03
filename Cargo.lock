@@ -3554,6 +3554,7 @@ version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "futures-util",
  "opcos-hosts",
