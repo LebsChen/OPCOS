@@ -130,6 +130,16 @@ type SkillRulesBrowse = {
   }>;
   rules: Array<{ path: string; content: string; source: string }>;
 };
+type EnvironmentRepository = {
+  position: number;
+  repository: string;
+  setup_command: string;
+};
+type BlueprintStatus = {
+  source: "project" | "global" | "repository";
+  content: string;
+  value: Record<string, unknown>;
+};
 const TOKEN_CONNECTOR_KINDS = [
   "github",
   "telegram",
@@ -2533,6 +2543,16 @@ function ManageSections({
     null,
   );
   const [skillBrowse, setSkillBrowse] = useState<SkillRulesBrowse | null>(null);
+  const [environmentTab, setEnvironmentTab] = useState<
+    "blueprints" | "snapshots" | "advanced" | "outposts"
+  >("blueprints");
+  const [blueprintStatus, setBlueprintStatus] =
+    useState<BlueprintStatus | null>(null);
+  const [blueprintDraft, setBlueprintDraft] = useState("");
+  const [environmentRepositories, setEnvironmentRepositories] = useState<
+    EnvironmentRepository[]
+  >([]);
+  const [environmentStatus, setEnvironmentStatus] = useState("");
   const [providerModelOptions, setProviderModelOptions] = useState<
     Record<string, Array<{ id: string; label: string }>>
   >({});
@@ -2723,6 +2743,10 @@ function ManageSections({
       "Devin",
       "控制会话默认值、Computer use、用量上限和 Pull request 策略。",
     ],
+    environment: [
+      "Environment",
+      "管理 Blueprint、固定环境说明、有序仓库 setup 和长期主机。",
+    ],
   };
   const assetKinds = [
     "agents",
@@ -2809,6 +2833,26 @@ function ManageSections({
       .catch(onError);
   }, [tab, devinProjectId, selected, onError]);
   useEffect(() => {
+    if (tab !== "environment") return;
+    void command<EnvironmentRepository[]>("list_environment_repositories", {
+      projectId: devinProjectId,
+    })
+      .then(setEnvironmentRepositories)
+      .catch(onError);
+    if (!selected) {
+      setBlueprintStatus(null);
+      return;
+    }
+    void command<BlueprintStatus>("blueprint_status", {
+      sessionId: selected.id,
+    })
+      .then((value) => {
+        setBlueprintStatus(value);
+        setBlueprintDraft(value.content);
+      })
+      .catch(onError);
+  }, [tab, devinProjectId, selected, onError]);
+  useEffect(() => {
     if (tab !== "devin") return;
     void command<SlashCommand[]>("list_slash_commands", {
       projectId: devinProjectId,
@@ -2892,6 +2936,260 @@ function ManageSections({
                 ]}
               />
             </div>
+          </div>
+        )}
+        {tab === "environment" && (
+          <div className="space-y-5">
+            <div className="flex gap-2 border-b border-line pb-2">
+              {(
+                [
+                  ["blueprints", "Blueprints"],
+                  ["snapshots", "Snapshots"],
+                  ["advanced", "Advanced"],
+                  ["outposts", "Outposts"],
+                ] as const
+              ).map(([value, label]) => (
+                <button
+                  className={`px-3 py-1.5 rounded-md text-sm ${
+                    environmentTab === value
+                      ? "bg-paper text-accent font-medium"
+                      : "text-muted"
+                  }`}
+                  key={value}
+                  onClick={() => setEnvironmentTab(value)}
+                  type="button"
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            {environmentTab === "blueprints" && (
+              <section className="rounded-lg border border-line p-4 space-y-3">
+                <div>
+                  <strong>Blueprints</strong>
+                  <small className="block">
+                    当前生效来源：
+                    {blueprintStatus?.source === "project"
+                      ? "项目 Blueprint"
+                      : blueprintStatus?.source === "global"
+                        ? "全局 Blueprint"
+                        : blueprintStatus?.source === "repository"
+                          ? "仓库 .devin/blueprint.yaml"
+                          : "未读取"}
+                  </small>
+                </div>
+                {!selected ? (
+                  <div className="text-sm text-muted">
+                    请先打开一个项目会话查看 Blueprint
+                  </div>
+                ) : (
+                  <>
+                    <textarea
+                      className="w-full min-h-64 rounded-md border border-line bg-paper p-3 font-mono text-xs"
+                      value={blueprintDraft}
+                      onChange={(event) =>
+                        setBlueprintDraft(event.target.value)
+                      }
+                      placeholder="YAML Blueprint"
+                    />
+                    <div className="flex justify-end gap-2">
+                      <Button
+                        onClick={() =>
+                          command<BlueprintStatus>("blueprint_status", {
+                            sessionId: selected.id,
+                          })
+                            .then((value) => {
+                              setBlueprintStatus(value);
+                              setBlueprintDraft(value.content);
+                            })
+                            .catch(onError)
+                        }
+                      >
+                        重新读取
+                      </Button>
+                      <Button
+                        className="primary"
+                        onClick={() =>
+                          command("save_asset", {
+                            id: devinProjectId
+                              ? `project-blueprint-${devinProjectId}`
+                              : "global-blueprint",
+                            kind: "blueprint",
+                            title: "Blueprint",
+                            body: blueprintDraft,
+                            scopeKind: devinProjectId ? "project" : "global",
+                            projectId: devinProjectId,
+                            enabled: true,
+                          })
+                            .then(() =>
+                              setEnvironmentStatus("Blueprint 已保存"),
+                            )
+                            .catch(onError)
+                        }
+                      >
+                        保存当前作用域
+                      </Button>
+                    </div>
+                    {environmentStatus && (
+                      <small className="text-muted">{environmentStatus}</small>
+                    )}
+                  </>
+                )}
+              </section>
+            )}
+            {environmentTab === "snapshots" && (
+              <section className="rounded-lg border border-line p-4">
+                <strong>Snapshots</strong>
+                <p className="mt-2 text-sm text-muted">
+                  本产品不适用：Local/RVM
+                  是长期固定环境，不提供快照，也不伪造等价的快照能力。
+                </p>
+              </section>
+            )}
+            {environmentTab === "advanced" && (
+              <section className="rounded-lg border border-line p-4 space-y-3">
+                <div>
+                  <strong>Advanced · Repositories</strong>
+                  <small className="block">
+                    setup executor 会按此列表顺序执行 clone 与 setup。
+                  </small>
+                </div>
+                {environmentRepositories.map((item, index) => (
+                  <div
+                    className="grid grid-cols-[1fr_1fr_auto] gap-2"
+                    key={index}
+                  >
+                    <input
+                      value={item.repository}
+                      placeholder="仓库 URL"
+                      onChange={(event) =>
+                        setEnvironmentRepositories((current) =>
+                          current.map((entry, entryIndex) =>
+                            entryIndex === index
+                              ? { ...entry, repository: event.target.value }
+                              : entry,
+                          ),
+                        )
+                      }
+                    />
+                    <input
+                      value={item.setup_command}
+                      placeholder="setup 命令（可留空）"
+                      onChange={(event) =>
+                        setEnvironmentRepositories((current) =>
+                          current.map((entry, entryIndex) =>
+                            entryIndex === index
+                              ? { ...entry, setup_command: event.target.value }
+                              : entry,
+                          ),
+                        )
+                      }
+                    />
+                    <div className="flex gap-1">
+                      <Button
+                        disabled={index === 0}
+                        onClick={() =>
+                          setEnvironmentRepositories((current) => {
+                            const next = [...current];
+                            [next[index - 1], next[index]] = [
+                              next[index],
+                              next[index - 1],
+                            ];
+                            return next;
+                          })
+                        }
+                      >
+                        ↑
+                      </Button>
+                      <Button
+                        disabled={index === environmentRepositories.length - 1}
+                        onClick={() =>
+                          setEnvironmentRepositories((current) => {
+                            const next = [...current];
+                            [next[index], next[index + 1]] = [
+                              next[index + 1],
+                              next[index],
+                            ];
+                            return next;
+                          })
+                        }
+                      >
+                        ↓
+                      </Button>
+                      <Button
+                        onClick={() =>
+                          setEnvironmentRepositories((current) =>
+                            current.filter(
+                              (_, entryIndex) => entryIndex !== index,
+                            ),
+                          )
+                        }
+                      >
+                        删除
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+                <div className="flex justify-between">
+                  <Button
+                    onClick={() =>
+                      setEnvironmentRepositories((current) => [
+                        ...current,
+                        {
+                          position: current.length,
+                          repository: "",
+                          setup_command: "",
+                        },
+                      ])
+                    }
+                  >
+                    添加仓库
+                  </Button>
+                  <Button
+                    className="primary"
+                    onClick={() =>
+                      command("save_environment_repositories", {
+                        projectId: devinProjectId,
+                        repositories: environmentRepositories,
+                      })
+                        .then(() => setEnvironmentStatus("顺序与设置已保存"))
+                        .catch(onError)
+                    }
+                  >
+                    保存顺序
+                  </Button>
+                </div>
+                {environmentStatus && (
+                  <small className="text-muted">{environmentStatus}</small>
+                )}
+              </section>
+            )}
+            {environmentTab === "outposts" && (
+              <section className="rounded-lg border border-line p-4">
+                <strong>Outposts</strong>
+                <p className="mt-2 text-sm text-muted">
+                  OPCOS 将 Outposts 映射为已登记的长期主机（Local/RVM）；
+                  这里展示主机清单，不额外虚构独立 Outpost 资源。
+                </p>
+                <div className="mt-3 space-y-2">
+                  {hosts.length === 0 ? (
+                    <div className="text-sm text-muted">暂无已登记主机</div>
+                  ) : (
+                    hosts.map((host) => (
+                      <div
+                        className="flex items-center justify-between rounded-md border border-line p-3"
+                        key={host.id}
+                      >
+                        <span>{host.name}</span>
+                        <span className="text-xs text-muted">
+                          {host.id} · {host.online === false ? "离线" : "在线"}
+                        </span>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </section>
+            )}
           </div>
         )}
         {tab === "devin" && devinSettings && (
@@ -3859,17 +4157,17 @@ function ManageSections({
                 <div>
                   <strong>技能用量</strong>
                   <small className="block">
-                    数据来自技能实际注入会话上下文时的埋点；没有调用记录时保持为空。
+                    数据来自技能实际注入会话上下文时的埋点；同一会话同一技能只计一次。
                   </small>
                 </div>
               </div>
               {!skillUsage?.skills.length ? (
-                <div className="text-sm text-muted py-6">暂无技能调用记录</div>
+                <div className="text-sm text-muted py-6">暂无技能启用记录</div>
               ) : (
                 <>
                   <div className="grid grid-cols-3 gap-2 mb-4">
                     <div className="rounded-md bg-panel p-3">
-                      <small>调用次数</small>
+                      <small>启用次数</small>
                       <strong className="block text-lg">
                         {skillUsage.skills.reduce(
                           (sum, item) => sum + item.calls,
@@ -3900,7 +4198,7 @@ function ManageSections({
                       >
                         <code className="flex-1">{item.name}</code>
                         <span className="text-xs text-muted">
-                          {item.calls} 次 · {item.sessions} 个会话 · 最近{" "}
+                          {item.calls} 次 · {item.sessions} 个会话 · 最近启用{" "}
                           {item.last_used}
                         </span>
                       </div>
@@ -3908,7 +4206,7 @@ function ManageSections({
                   </div>
                   {skillUsage.timeline.length > 0 && (
                     <div className="mt-4 text-xs text-muted">
-                      随时间变化：
+                      随时间变化（启用）：
                       {skillUsage.timeline
                         .map((item) => ` ${item.date} (${item.calls})`)
                         .join(" · ")}

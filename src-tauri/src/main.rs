@@ -1277,7 +1277,21 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                skill_path TEXT NOT NULL,
                source TEXT NOT NULL,
                used_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS environment_repositories (
+               scope TEXT NOT NULL,
+               position INTEGER NOT NULL,
+               repository TEXT NOT NULL,
+               setup_command TEXT NOT NULL DEFAULT '',
+               PRIMARY KEY(scope,position)
              );",
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS skill_usage_session_skill
+             ON skill_usage(session_id,skill_path)",
+            [],
         )
         .map_err(|error| error.to_string())?;
     migrate_secret_records(&mut connection)?;
@@ -2350,6 +2364,12 @@ fn clear_project_configuration(state: &DesktopState, project_id: &str) -> Result
             [format!("project:{project_id}")],
         )
         .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "DELETE FROM environment_repositories WHERE scope=?1",
+            [format!("project:{project_id}")],
+        )
+        .map_err(|error| error.to_string())?;
     let object_ids = {
         let mut statement = connection
             .prepare("SELECT id FROM config_object WHERE scope_kind='project' AND scope_key=?1")
@@ -3096,7 +3116,7 @@ fn record_skill_usage(
     for skill in bundle.skills.iter().filter(|skill| skill.active) {
         connection
             .execute(
-                "INSERT INTO skill_usage
+                "INSERT OR IGNORE INTO skill_usage
                  (session_id,project_id,skill_name,skill_path,source,used_at)
                  VALUES (?1,?2,?3,?4,?5,?6)",
                 params![
@@ -8511,30 +8531,240 @@ async fn read_blueprint(
     serde_json::to_value(value).map_err(|error| error.to_string())
 }
 
-fn project_blueprint_content(
-    state: &DesktopState,
-    project_id: Option<&str>,
-) -> Result<Option<String>, String> {
-    let Some(project_id) = project_id else {
-        return Ok(None);
+#[tauri::command]
+async fn blueprint_status(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Value, String> {
+    let (host, _, _) = lifecycle_host(&state, &session_id).await?;
+    let session = session_for(&state, &session_id)?;
+    let (source, content) = match project_blueprint_content(&state, session.project_id.as_deref())?
+    {
+        Some(content) => (
+            configured_blueprint_scope(&state, session.project_id.as_deref())?
+                .unwrap_or_else(|| "global".into()),
+            content,
+        ),
+        None => (
+            "repository".to_owned(),
+            host.read(".devin/blueprint.yaml")
+                .await
+                .map_err(|error| error.to_string())?
+                .content,
+        ),
     };
+    let parsed: Value = serde_yaml::from_str::<serde_yaml::Value>(&content)
+        .map_err(|error| format!("invalid blueprint: {error}"))
+        .and_then(|value| serde_json::to_value(value).map_err(|error| error.to_string()))?;
+    Ok(json!({"source": source, "content": content, "value": parsed}))
+}
+
+#[tauri::command]
+fn list_environment_repositories(
+    state: State<'_, DesktopState>,
+    project_id: Option<String>,
+) -> Result<Vec<Value>, String> {
     let connection = state
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?;
+    let repositories = load_environment_repositories(&connection, project_id.as_deref())?;
+    Ok(repositories
+        .into_iter()
+        .enumerate()
+        .map(|(position, (repository, setup_command))| {
+            json!({
+                "position": position,
+                "repository": repository,
+                "setup_command": setup_command
+            })
+        })
+        .collect())
+}
+
+#[tauri::command]
+fn save_environment_repositories(
+    state: State<'_, DesktopState>,
+    project_id: Option<String>,
+    repositories: Vec<Value>,
+) -> Result<(), String> {
+    let scope = project_id
+        .as_deref()
+        .map(|id| format!("project:{id}"))
+        .unwrap_or_else(|| "global".to_owned());
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM environment_repositories WHERE scope=?1",
+            [&scope],
+        )
+        .map_err(|error| error.to_string())?;
+    for (position, item) in repositories.iter().enumerate() {
+        let repository = item
+            .get("repository")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if repository.is_empty() {
+            return Err("repository URL cannot be empty".into());
+        }
+        let setup = item
+            .get("setup_command")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        transaction
+            .execute(
+                "INSERT INTO environment_repositories(scope,position,repository,setup_command)
+                 VALUES (?1,?2,?3,?4)",
+                params![scope, position as i64, repository, setup],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn project_blueprint_content(
+    state: &DesktopState,
+    project_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let project_content = project_id
+        .map(|id| {
+            connection
+                .query_row(
+                    "SELECT v.content
+                     FROM config_object o
+                     JOIN config_object_version v ON v.id=o.current_version_id
+                     WHERE o.kind='blueprint' AND o.scope_kind='project'
+                       AND o.scope_key=?1 AND o.status='active'
+                     LIMIT 1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()
+        })
+        .transpose()
+        .map_err(|error| error.to_string())?
+        .flatten();
+    if project_content.is_some() {
+        return Ok(project_content);
+    }
     connection
         .query_row(
             "SELECT v.content
              FROM config_object o
              JOIN config_object_version v ON v.id=o.current_version_id
-             WHERE o.kind='blueprint' AND o.scope_kind='project'
-               AND o.scope_key=?1 AND o.status='active'
+             WHERE o.kind='blueprint' AND o.scope_kind='global'
+               AND o.status='active'
              LIMIT 1",
-            [project_id],
+            [],
             |row| row.get(0),
         )
         .optional()
         .map_err(|error| error.to_string())
+}
+
+fn configured_blueprint_scope(
+    state: &DesktopState,
+    project_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    if let Some(project_id) = project_id {
+        let project_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM config_object
+                   WHERE kind='blueprint' AND scope_kind='project'
+                     AND scope_key=?1 AND status='active'
+                 )",
+                [project_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if project_exists {
+            return Ok(Some("project".into()));
+        }
+    }
+    let global_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM config_object
+               WHERE kind='blueprint' AND scope_kind='global' AND status='active'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(global_exists.then_some("global".into()))
+}
+
+fn load_environment_repositories(
+    connection: &Connection,
+    project_id: Option<&str>,
+) -> Result<Vec<(String, String)>, String> {
+    let project_scope = project_id.map(|id| format!("project:{id}"));
+    let scope = if let Some(scope) = project_scope.as_deref() {
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM environment_repositories WHERE scope=?1",
+                [scope],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if count > 0 {
+            scope.to_owned()
+        } else {
+            "global".to_owned()
+        }
+    } else {
+        "global".to_owned()
+    };
+    let mut statement = connection
+        .prepare(
+            "SELECT repository,setup_command FROM environment_repositories
+             WHERE scope=?1 ORDER BY position",
+        )
+        .map_err(|error| error.to_string())?;
+    statement
+        .query_map([scope], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+fn environment_repository_commands(
+    repositories: &[(String, String)],
+    platform: Option<&str>,
+) -> Vec<String> {
+    repositories
+        .iter()
+        .enumerate()
+        .flat_map(|(index, (repository, setup))| {
+            let target = format!("repository-{index}");
+            let mut commands = vec![format!(
+                "git clone {} {}",
+                quote_for(platform, repository),
+                quote_for(platform, &target)
+            )];
+            if !setup.trim().is_empty() {
+                commands.push(setup.trim().to_owned());
+            }
+            commands
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -8713,7 +8943,18 @@ async fn run_configured_lifecycle_stage(
     };
     let blueprint = parse_blueprint(&blueprint_content).map_err(|error| error.to_string())?;
     let commands = match stage {
-        LifecycleStage::Clone => blueprint.clone,
+        LifecycleStage::Clone => {
+            let repositories = {
+                let connection = state
+                    .database
+                    .lock()
+                    .map_err(|_| "database lock poisoned")?;
+                load_environment_repositories(&connection, session.project_id.as_deref())?
+            };
+            let mut commands = environment_repository_commands(&repositories, None);
+            commands.extend(blueprint.clone);
+            commands
+        }
         LifecycleStage::Initialize => {
             let mut commands = blueprint.dependencies;
             commands.extend(blueprint.initialize);
@@ -11727,6 +11968,9 @@ fn main() {
             reset_slash_commands,
             browse_skill_rules,
             skill_usage_dashboard,
+            blueprint_status,
+            list_environment_repositories,
+            save_environment_repositories,
             provider_configurations,
             save_provider_settings,
             save_provider_key,
@@ -11867,7 +12111,9 @@ mod m7_tests {
                    skill_path TEXT NOT NULL,
                    source TEXT NOT NULL,
                    used_at TEXT NOT NULL
-                 )",
+                 );
+                 CREATE UNIQUE INDEX skill_usage_session_skill
+                   ON skill_usage(session_id,skill_path)",
             )
             .unwrap();
         let bundle = AssetBundle {
@@ -11887,6 +12133,7 @@ mod m7_tests {
             ],
             ..AssetBundle::default()
         };
+        record_skill_usage(&connection, "session-1", Some("project-1"), &bundle).unwrap();
         record_skill_usage(&connection, "session-1", Some("project-1"), &bundle).unwrap();
         let row: (String, String, String, String) = connection
             .query_row(
@@ -11910,6 +12157,57 @@ mod m7_tests {
                     .get::<_, i64>(0))
                 .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn environment_repository_commands_preserve_saved_order() {
+        let repositories = vec![
+            (
+                "https://example.test/first.git".into(),
+                "setup-first".into(),
+            ),
+            (
+                "https://example.test/second.git".into(),
+                "setup-second".into(),
+            ),
+        ];
+        let commands = environment_repository_commands(&repositories, Some("linux"));
+        assert_eq!(
+            commands,
+            vec![
+                "git clone 'https://example.test/first.git' 'repository-0'",
+                "setup-first",
+                "git clone 'https://example.test/second.git' 'repository-1'",
+                "setup-second",
+            ]
+        );
+    }
+
+    #[test]
+    fn environment_repository_scope_prefers_project_order_over_global() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE environment_repositories (
+                   scope TEXT NOT NULL,
+                   position INTEGER NOT NULL,
+                   repository TEXT NOT NULL,
+                   setup_command TEXT NOT NULL DEFAULT '',
+                   PRIMARY KEY(scope,position)
+                 );
+                 INSERT INTO environment_repositories VALUES
+                   ('global',0,'global-first','global-setup'),
+                   ('project:p1',0,'project-first','project-setup');",
+            )
+            .unwrap();
+        assert_eq!(
+            load_environment_repositories(&connection, Some("p1")).unwrap(),
+            vec![("project-first".into(), "project-setup".into())]
+        );
+        assert_eq!(
+            load_environment_repositories(&connection, Some("p2")).unwrap(),
+            vec![("global-first".into(), "global-setup".into())]
         );
     }
 
