@@ -1541,6 +1541,7 @@ function ProjectBoard({
           })}
         </div>
         <ProjectConfigPanel project={project} onError={onError} />
+        <ProjectCoordinationPanel project={project} onError={onError} />
       </div>
       {memberForm && (
         <MemberDialog
@@ -1555,6 +1556,240 @@ function ProjectBoard({
         />
       )}
     </main>
+  );
+}
+
+function ProjectCoordinationPanel({
+  project,
+  onError,
+}: {
+  project: Project;
+  onError: (error: unknown) => void;
+}) {
+  const [snapshot, setSnapshot] = useState<Record<string, any> | null>(null);
+  const [taskTitle, setTaskTitle] = useState("");
+  const [taskAssignee, setTaskAssignee] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [workflowText, setWorkflowText] = useState("");
+  const taskId = `project-board:${project.id}`;
+  const load = async () => {
+    const value = await command<Record<string, any>>(
+      "project_workflow_snapshot",
+      { projectId: project.id },
+    );
+    setSnapshot(value);
+    if (value.workflow) {
+      setWorkflowText(JSON.stringify(value.workflow, null, 2));
+    }
+  };
+  useEffect(() => {
+    void load().catch(onError);
+  }, [project.id]);
+  const setAllRoles = async (state: string) => {
+    try {
+      setLoading(true);
+      await command("coordination_start_project", { projectId: project.id });
+      for (const agent of project.agents) {
+        await command("coordination_set_role_state", {
+          taskId,
+          roleId: agent.id,
+          stateName: state,
+        });
+      }
+      await load();
+    } catch (error) {
+      onError(error);
+    } finally {
+      setLoading(false);
+    }
+  };
+  const createTask = async () => {
+    if (!taskTitle.trim()) return;
+    try {
+      const id = `task-${Date.now()}`;
+      await command("coordination_create_task", {
+        id,
+        projectId: project.id,
+        title: taskTitle.trim(),
+        requireAcceptance: true,
+        branch: null,
+        pr: null,
+      });
+      if (taskAssignee) {
+        await command("coordination_claim_task", {
+          id,
+          worker: taskAssignee,
+        });
+      }
+      setTaskTitle("");
+      setTaskAssignee("");
+      await load();
+    } catch (error) {
+      onError(error);
+    }
+  };
+  return (
+    <section className="mt-8 rounded-xl border border-line bg-panel p-5">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 className="text-lg font-semibold text-ink">
+            Workflow 与 Lead 指挥
+          </h2>
+          <p className="mt-1 text-sm text-faint">
+            当前阶段：
+            {snapshot?.workflow?.workflow?.[snapshot.stage_index]?.stage ||
+              "未启动"}
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <button
+            className="btn approval-primary"
+            disabled={loading}
+            onClick={() =>
+              command("coordination_start_project", { projectId: project.id })
+                .then(load)
+                .catch(onError)
+            }
+          >
+            启动全部
+          </button>
+          <button
+            className="btn"
+            disabled={loading}
+            onClick={() => void setAllRoles("paused")}
+          >
+            暂停
+          </button>
+          <button
+            className="btn"
+            disabled={loading}
+            onClick={() => void setAllRoles("active")}
+          >
+            恢复
+          </button>
+          <button
+            className="btn"
+            onClick={() =>
+              command("project_workflow_advance", { projectId: project.id })
+                .then(load)
+                .catch(onError)
+            }
+          >
+            推进阶段
+          </button>
+        </div>
+      </div>
+      <div className="mt-5 grid gap-3">
+        <div className="grid gap-2 rounded-lg border border-line p-4">
+          <h3 className="font-medium text-ink">Workflow 定义</h3>
+          <p className="text-xs text-faint">
+            使用 {"{ workflow: [{ stage, roles, gate }], serial }"} 格式；gate
+            支持 none、build+test、accept、pass。
+          </p>
+          <textarea
+            value={workflowText}
+            onChange={(event) => setWorkflowText(event.target.value)}
+            placeholder='{"workflow":[{"stage":"plan","roles":["Lead"],"gate":"none"}],"serial":true}'
+          />
+          <button
+            className="btn"
+            onClick={() =>
+              command("save_project_workflow", {
+                projectId: project.id,
+                workflowJson: workflowText,
+              })
+                .then(load)
+                .catch(onError)
+            }
+          >
+            保存 Workflow
+          </button>
+        </div>
+        <div className="grid gap-2 rounded-lg border border-line p-4">
+          <h3 className="font-medium text-ink">任务</h3>
+          <div className="grid gap-2 md:grid-cols-[1fr_180px_auto]">
+            <input
+              value={taskTitle}
+              onChange={(event) => setTaskTitle(event.target.value)}
+              placeholder="任务标题"
+            />
+            <input
+              value={taskAssignee}
+              onChange={(event) => setTaskAssignee(event.target.value)}
+              placeholder="指派角色 ID"
+            />
+            <button className="btn approval-primary" onClick={createTask}>
+              新建任务
+            </button>
+          </div>
+          <div className="grid gap-2">
+            {(snapshot?.tasks || []).map((task: any) => (
+              <div
+                className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-line p-3 text-sm"
+                key={task.id}
+              >
+                <span>
+                  <strong>{task.title}</strong>
+                  <span className="ml-2 text-faint">
+                    {task.phase} · {task.assignee || "未指派"}
+                  </span>
+                </span>
+                <div className="flex gap-2">
+                  {taskAssignee && (
+                    <button
+                      className="btn"
+                      onClick={() =>
+                        command("coordination_claim_task", {
+                          id: task.id,
+                          worker: taskAssignee,
+                        })
+                          .then(load)
+                          .catch(onError)
+                      }
+                    >
+                      租约指派
+                    </button>
+                  )}
+                  <button
+                    className="btn"
+                    onClick={() =>
+                      command("coordination_ingest_session", {
+                        sessionId: project.agents.find(
+                          (agent) => agent.id === task.assignee,
+                        )?.session_id,
+                      })
+                        .then(load)
+                        .catch(onError)
+                    }
+                  >
+                    同步回执
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="grid gap-2 rounded-lg border border-line p-4">
+          <h3 className="font-medium text-ink">协同消息历史</h3>
+          {(snapshot?.messages || []).map((message: any) => (
+            <div
+              className="rounded-lg border border-line p-3 text-xs"
+              key={message.msg_id}
+            >
+              <strong>
+                {message.from} → {message.to} · {message.kind}
+              </strong>
+              <pre className="mt-1 whitespace-pre-wrap text-faint">
+                {JSON.stringify(message.payload)}
+              </pre>
+            </div>
+          ))}
+          {!snapshot?.messages?.length && (
+            <p className="text-sm text-faint">暂无协同消息。</p>
+          )}
+        </div>
+      </div>
+    </section>
   );
 }
 

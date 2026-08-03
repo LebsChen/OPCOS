@@ -9,6 +9,8 @@ const SUFFIX: &str = "[[/COORD]]";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Role {
+    #[serde(default)]
+    pub project_id: String,
     pub id: String,
     pub sort_order: u32,
     pub session_id: String,
@@ -99,6 +101,8 @@ pub enum BoardPhase {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BoardTask {
+    #[serde(default)]
+    pub project_id: String,
     pub id: String,
     pub title: String,
     pub phase: BoardPhase,
@@ -342,18 +346,21 @@ mod tests {
     fn runtime() -> CoordinationRuntime {
         CoordinationRuntime::new(vec![
             Role {
+                project_id: "project".into(),
                 id: "leader".into(),
                 sort_order: 0,
                 session_id: "s0".into(),
                 state: RoleState::Active,
             },
             Role {
+                project_id: "project".into(),
                 id: "worker-a".into(),
                 sort_order: 1,
                 session_id: "s1".into(),
                 state: RoleState::Active,
             },
             Role {
+                project_id: "project".into(),
                 id: "worker-b".into(),
                 sort_order: 2,
                 session_id: "s2".into(),
@@ -434,6 +441,7 @@ mod tests {
     fn lease_expiry_reclaim_and_acceptance_need_real_pr() {
         let now = Utc::now();
         let mut task = BoardTask {
+            project_id: "project".into(),
             id: "t".into(),
             title: "work".into(),
             phase: BoardPhase::Open,
@@ -475,6 +483,7 @@ mod tests {
     fn shared_branch_is_serial_but_independent_branches_parallel() {
         let mut board = Board::new();
         board.insert(BoardTask {
+            project_id: "project".into(),
             id: "a".into(),
             title: "a".into(),
             phase: BoardPhase::Claimed,
@@ -487,6 +496,7 @@ mod tests {
             pr: Some("pr-1".into()),
         });
         board.insert(BoardTask {
+            project_id: "project".into(),
             id: "b".into(),
             title: "b".into(),
             phase: BoardPhase::Open,

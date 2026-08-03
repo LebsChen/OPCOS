@@ -1187,6 +1187,7 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
              );
              CREATE TABLE IF NOT EXISTS coord_tasks (
                id TEXT PRIMARY KEY,
+               project_id TEXT NOT NULL DEFAULT '',
                title TEXT NOT NULL,
                phase TEXT NOT NULL,
                assignee TEXT,
@@ -1196,13 +1197,74 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                verified_pr_url TEXT,
                branch TEXT,
                pr TEXT
+             );
+             CREATE TABLE IF NOT EXISTS coord_messages (
+               project_id TEXT NOT NULL,
+               task_id TEXT NOT NULL,
+               msg_id TEXT PRIMARY KEY,
+               from_role TEXT NOT NULL,
+               to_role TEXT NOT NULL,
+               kind TEXT NOT NULL,
+               reply_to TEXT,
+               payload TEXT NOT NULL,
+               created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS project_workflow_state (
+               project_id TEXT PRIMARY KEY,
+               stage_index INTEGER NOT NULL DEFAULT 0,
+               status TEXT NOT NULL DEFAULT 'open',
+               updated_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS coord_task_dependencies (
+               task_id TEXT NOT NULL,
+               depends_on TEXT NOT NULL,
+               PRIMARY KEY(task_id,depends_on)
              );",
         )
         .map_err(|error| error.to_string())?;
     migrate_secret_records(&mut connection)?;
     migrate_mcp_session_tools(&connection)?;
     migrate_config_objects(&mut connection)?;
+    migrate_coordination(&connection)?;
     Ok(connection)
+}
+
+fn migrate_coordination(connection: &Connection) -> Result<(), String> {
+    let columns = connection
+        .prepare("PRAGMA table_info(coord_tasks)")
+        .map_err(|error| error.to_string())?
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    if !columns.iter().any(|column| column == "project_id") {
+        connection
+            .execute(
+                "ALTER TABLE coord_tasks ADD COLUMN project_id TEXT NOT NULL DEFAULT ''",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS coord_messages (
+               project_id TEXT NOT NULL,
+               task_id TEXT NOT NULL,
+               msg_id TEXT PRIMARY KEY,
+               from_role TEXT NOT NULL,
+               to_role TEXT NOT NULL,
+               kind TEXT NOT NULL,
+               reply_to TEXT,
+               payload TEXT NOT NULL,
+               created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS coord_task_dependencies (
+               task_id TEXT NOT NULL,
+               depends_on TEXT NOT NULL,
+               PRIMARY KEY(task_id,depends_on)
+             );",
+        )
+        .map_err(|error| error.to_string())
 }
 
 fn migrate_secret_records(connection: &mut Connection) -> Result<(), String> {
@@ -1981,6 +2043,29 @@ async fn delete_project(
         .store
         .clear_project_session_ownership(&id)
         .map_err(|error| error.to_string())?;
+    state
+        .coordination
+        .lock()
+        .await
+        .remove(&format!("project-board:{id}"));
+    {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        connection
+            .execute("DELETE FROM coord_messages WHERE project_id=?1", [&id])
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute("DELETE FROM coord_tasks WHERE project_id=?1", [&id])
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute(
+                "DELETE FROM project_workflow_state WHERE project_id=?1",
+                [&id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
     for agent in agents {
         state
             .store
@@ -8561,8 +8646,84 @@ struct ScheduleInput {
     prompt: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum WorkflowGate {
+    #[serde(rename = "none")]
+    None,
+    #[serde(rename = "build+test")]
+    BuildTest,
+    #[serde(rename = "accept")]
+    Accept,
+    #[serde(rename = "pass")]
+    Pass,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct WorkflowStage {
+    stage: String,
+    roles: Vec<String>,
+    gate: WorkflowGate,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct WorkflowDefinition {
+    #[serde(default = "default_workflow_stages")]
+    workflow: Vec<WorkflowStage>,
+    #[serde(default = "default_workflow_serial")]
+    serial: bool,
+}
+
+fn default_workflow_serial() -> bool {
+    true
+}
+
+fn default_workflow_stages() -> Vec<WorkflowStage> {
+    vec![WorkflowStage {
+        stage: "plan".into(),
+        roles: vec!["Lead".into()],
+        gate: WorkflowGate::None,
+    }]
+}
+
+fn parse_workflow(value: &str) -> Result<WorkflowDefinition, String> {
+    let definition: WorkflowDefinition =
+        serde_json::from_str(value).map_err(|error| format!("invalid workflow_json: {error}"))?;
+    if definition.workflow.is_empty()
+        || definition
+            .workflow
+            .iter()
+            .any(|stage| stage.stage.trim().is_empty() || stage.roles.is_empty())
+    {
+        return Err("workflow must contain named stages with roles".into());
+    }
+    Ok(definition)
+}
+
+#[tauri::command]
+fn save_project_workflow(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    workflow_json: String,
+) -> Result<Value, String> {
+    let mut project = state
+        .store
+        .load_project(&project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    parse_workflow(&workflow_json)?;
+    project.workflow_json = workflow_json;
+    project.updated_at = Utc::now();
+    state
+        .store
+        .save_project(&project)
+        .map_err(|error| error.to_string())?;
+    Ok(json!({"project_id":project_id,"saved":true}))
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct CoordinationStartInput {
+    project_id: Option<String>,
     task_id: String,
     roles: Vec<Role>,
 }
@@ -8572,13 +8733,67 @@ async fn coordination_start(
     state: State<'_, DesktopState>,
     input: CoordinationStartInput,
 ) -> Result<Value, String> {
+    let project_id = input
+        .project_id
+        .clone()
+        .or_else(|| input.roles.first().map(|role| role.project_id.clone()))
+        .unwrap_or_default();
     let runtime = CoordinationRuntime::new(input.roles).map_err(|error| error.to_string())?;
     state
         .coordination
         .lock()
         .await
         .insert(input.task_id.clone(), runtime);
-    Ok(json!({"task_id":input.task_id,"started":true}))
+    Ok(json!({"project_id":project_id,"task_id":input.task_id,"started":true}))
+}
+
+#[tauri::command]
+async fn coordination_start_project(
+    state: State<'_, DesktopState>,
+    project_id: String,
+) -> Result<Value, String> {
+    let agents = state
+        .store
+        .load_project_agents(&project_id)
+        .map_err(|error| error.to_string())?;
+    let roles = agents
+        .into_iter()
+        .map(|agent| {
+            Ok(Role {
+                project_id: project_id.clone(),
+                id: agent.id,
+                sort_order: agent.sort_order,
+                session_id: agent
+                    .session_id
+                    .ok_or_else(|| "all project members must have started sessions".to_owned())?,
+                state: match agent.state.as_str() {
+                    "Paused" | "paused" => opcos_engine::orchestration::RoleState::Paused,
+                    "Sleep" | "sleep" => opcos_engine::orchestration::RoleState::Sleep,
+                    _ => opcos_engine::orchestration::RoleState::Active,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let project = state
+        .store
+        .load_project(&project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    let workflow = parse_workflow(&project.workflow_json)?;
+    let task_id = format!("project-board:{project_id}");
+    let runtime = CoordinationRuntime::new(roles).map_err(|error| error.to_string())?;
+    state
+        .coordination
+        .lock()
+        .await
+        .insert(task_id.clone(), runtime);
+    Ok(json!({
+        "project_id": project_id,
+        "board_id": project.board_id,
+        "task_id": task_id,
+        "stage": workflow.workflow.first().map(|stage| &stage.stage),
+        "started": true
+    }))
 }
 
 #[tauri::command]
@@ -8589,14 +8804,316 @@ async fn coordination_message(
 ) -> Result<Value, String> {
     let envelope: Envelope = serde_json::from_value(envelope)
         .map_err(|_| "malformed coordination envelope".to_owned())?;
-    let mut runtimes = state.coordination.lock().await;
-    let runtime = runtimes
-        .get_mut(&task_id)
-        .ok_or_else(|| "coordination task is not started".to_owned())?;
-    runtime
-        .validate_and_record(&envelope, Utc::now())
-        .map_err(|error| error.to_string())?;
+    let worker_session = {
+        let mut runtimes = state.coordination.lock().await;
+        let runtime = runtimes
+            .get_mut(&task_id)
+            .ok_or_else(|| "coordination task is not started".to_owned())?;
+        runtime
+            .validate_and_record(&envelope, Utc::now())
+            .map_err(|error| error.to_string())?;
+        if envelope.kind == opcos_engine::orchestration::EnvelopeKind::Request {
+            Some(
+                runtime
+                    .role(&envelope.to)
+                    .ok_or_else(|| "coordination target role is unavailable".to_owned())?
+                    .session_id
+                    .clone(),
+            )
+        } else {
+            None
+        }
+    };
+    let project_id = connection_project_for_task(&state, &task_id)?;
+    persist_coord_message(&state, &project_id, &task_id, &envelope)?;
+    if let Some(worker_session) = worker_session {
+        let engine = state
+            .engines
+            .lock()
+            .await
+            .get(&worker_session)
+            .cloned()
+            .ok_or_else(|| "coordination target session is not started".to_owned())?;
+        engine
+            .queue_steering(envelope.encode(None).map_err(|error| error.to_string())?)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
     Ok(json!({"accepted":true,"msg_id":envelope.msg_id}))
+}
+
+fn connection_project_for_task(state: &DesktopState, task_id: &str) -> Result<String, String> {
+    state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .query_row(
+            "SELECT project_id FROM coord_tasks WHERE id=?1",
+            [task_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn persist_coord_message(
+    state: &DesktopState,
+    project_id: &str,
+    task_id: &str,
+    envelope: &Envelope,
+) -> Result<(), String> {
+    state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .execute(
+            "INSERT INTO coord_messages
+             (project_id,task_id,msg_id,from_role,to_role,kind,reply_to,payload,created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                project_id,
+                task_id,
+                envelope.msg_id,
+                envelope.from,
+                envelope.to,
+                serde_json::to_string(&envelope.kind).map_err(|error| error.to_string())?,
+                envelope.reply_to,
+                envelope.payload.to_string(),
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn project_workflow_snapshot(
+    state: State<'_, DesktopState>,
+    project_id: String,
+) -> Result<Value, String> {
+    let project = state
+        .store
+        .load_project(&project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    let workflow = parse_workflow(&project.workflow_json)?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let (stage_index, status): (i64, String) = connection
+        .query_row(
+            "SELECT stage_index,status FROM project_workflow_state WHERE project_id=?1",
+            [&project_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .unwrap_or((0, "open".to_owned()));
+    let tasks = load_project_tasks(&connection, &project_id)?;
+    let messages = load_project_messages(&connection, &project_id)?;
+    Ok(json!({
+        "project_id": project_id,
+        "workflow": workflow,
+        "stage_index": stage_index,
+        "status": status,
+        "tasks": tasks,
+        "messages": messages
+    }))
+}
+
+#[tauri::command]
+fn project_workflow_advance(
+    state: State<'_, DesktopState>,
+    project_id: String,
+) -> Result<Value, String> {
+    let project = state
+        .store
+        .load_project(&project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    let workflow = parse_workflow(&project.workflow_json)?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let (stage_index, _): (i64, String) = connection
+        .query_row(
+            "SELECT stage_index,status FROM project_workflow_state WHERE project_id=?1",
+            [&project_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .unwrap_or((0, "open".to_owned()));
+    let index = usize::try_from(stage_index).map_err(|_| "invalid workflow stage".to_owned())?;
+    let Some(stage) = workflow.workflow.get(index) else {
+        return Ok(json!({"project_id":project_id,"done":true,"stage_index":stage_index}));
+    };
+    let tasks = load_project_tasks(&connection, &project_id)?;
+    let relevant = tasks.iter().filter(|task| {
+        task.get("assignee")
+            .and_then(Value::as_str)
+            .is_some_and(|assignee| stage.roles.iter().any(|role| role == assignee))
+    });
+    let blocked = match stage.gate {
+        WorkflowGate::None => false,
+        WorkflowGate::BuildTest | WorkflowGate::Pass => {
+            relevant.clone().any(|task| task["phase"] != "Done")
+        }
+        WorkflowGate::Accept => relevant.clone().any(|task| {
+            task["phase"] != "Done"
+                || task
+                    .get("verified_pr_url")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+        }),
+    };
+    if blocked {
+        return Err(format!(
+            "workflow stage '{}' gate has not passed",
+            stage.stage
+        ));
+    }
+    let next = stage_index + 1;
+    connection
+        .execute(
+            "INSERT INTO project_workflow_state(project_id,stage_index,status,updated_at)
+             VALUES (?1,?2,?3,?4)
+             ON CONFLICT(project_id) DO UPDATE SET stage_index=excluded.stage_index,
+               status=excluded.status,updated_at=excluded.updated_at",
+            params![
+                project_id,
+                next,
+                if usize::try_from(next).unwrap_or(usize::MAX) >= workflow.workflow.len() {
+                    "done"
+                } else {
+                    "open"
+                },
+                Utc::now().to_rfc3339()
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(
+        json!({"project_id":project_id,"stage_index":next,"stage":workflow.workflow.get(next as usize)}),
+    )
+}
+
+fn load_project_tasks(connection: &Connection, project_id: &str) -> Result<Vec<Value>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id,title,phase,assignee,lease_generation,lease_until,require_acceptance,
+                    verified_pr_url,branch,pr
+             FROM coord_tasks WHERE project_id=?1 ORDER BY id",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([project_id], |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "title": row.get::<_, String>(1)?,
+                "phase": row.get::<_, String>(2)?,
+                "assignee": row.get::<_, Option<String>>(3)?,
+                "lease_generation": row.get::<_, i64>(4)?,
+                "lease_until": row.get::<_, Option<String>>(5)?,
+                "require_acceptance": row.get::<_, i64>(6)? != 0,
+                "verified_pr_url": row.get::<_, Option<String>>(7)?,
+                "branch": row.get::<_, Option<String>>(8)?,
+                "pr": row.get::<_, Option<String>>(9)?
+            }))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut tasks = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    for task in &mut tasks {
+        let id = task
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "coordination task has no id".to_owned())?;
+        let mut dependencies = connection
+            .prepare(
+                "SELECT depends_on FROM coord_task_dependencies
+                 WHERE task_id=?1 ORDER BY depends_on",
+            )
+            .map_err(|error| error.to_string())?;
+        let values = dependencies
+            .query_map([id], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        if let Some(object) = task.as_object_mut() {
+            object.insert("dependencies".into(), json!(values));
+        }
+    }
+    Ok(tasks)
+}
+
+fn load_project_messages(connection: &Connection, project_id: &str) -> Result<Vec<Value>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT task_id,msg_id,from_role,to_role,kind,reply_to,payload,created_at
+             FROM coord_messages WHERE project_id=?1 ORDER BY created_at",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([project_id], |row| {
+            Ok(json!({
+                "task_id": row.get::<_, String>(0)?,
+                "msg_id": row.get::<_, String>(1)?,
+                "from": row.get::<_, String>(2)?,
+                "to": row.get::<_, String>(3)?,
+                "kind": row.get::<_, String>(4)?,
+                "reply_to": row.get::<_, Option<String>>(5)?,
+                "payload": serde_json::from_str::<Value>(&row.get::<_, String>(6)?).unwrap_or(Value::Null),
+                "created_at": row.get::<_, String>(7)?
+            }))
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn coordination_ingest_session(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Value, String> {
+    let records = state
+        .store
+        .load_transcript(&session_id)
+        .map_err(|error| error.to_string())?;
+    let mut accepted = 0usize;
+    for record in records {
+        let text = record
+            .payload
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| {
+                record
+                    .payload
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
+        if !text.contains("[[COORD]]") {
+            continue;
+        }
+        let envelope = Envelope::decode(&text).map_err(|error| error.to_string())?;
+        let project_id = connection_project_for_task(&state, &envelope.task_id)?;
+        {
+            let mut runtimes = state.coordination.lock().await;
+            let runtime = runtimes
+                .get_mut(&envelope.task_id)
+                .ok_or_else(|| "coordination task is not started".to_owned())?;
+            runtime
+                .validate_and_record(&envelope, Utc::now())
+                .map_err(|error| error.to_string())?;
+        }
+        persist_coord_message(&state, &project_id, &envelope.task_id, &envelope)?;
+        accepted += 1;
+    }
+    Ok(json!({"session_id":session_id,"accepted":accepted}))
 }
 
 #[tauri::command]
@@ -8619,6 +9136,24 @@ async fn coordination_set_role_state(
     runtime
         .set_role_state(&role_id, role_state)
         .map_err(|error| error.to_string())?;
+    let project_id = runtime
+        .role(&role_id)
+        .map(|role| role.project_id.clone())
+        .ok_or_else(|| "coordination role is not available".to_owned())?;
+    drop(runtimes);
+    if let Some(mut agent) = state
+        .store
+        .load_project_agent(&role_id)
+        .map_err(|error| error.to_string())?
+    {
+        agent.state = state_name.clone();
+        state
+            .store
+            .save_project_agent(&agent)
+            .map_err(|error| error.to_string())?;
+    } else {
+        return Err(format!("project role not found: {project_id}/{role_id}"));
+    }
     Ok(json!({"task_id":task_id,"role_id":role_id,"state":state_name}))
 }
 
@@ -8626,6 +9161,7 @@ async fn coordination_set_role_state(
 async fn coordination_snapshot(
     state: State<'_, DesktopState>,
     task_id: String,
+    project_id: Option<String>,
 ) -> Result<Value, String> {
     let runtimes = state.coordination.lock().await;
     let runtime = runtimes
@@ -8639,10 +9175,13 @@ async fn coordination_snapshot(
             .lock()
             .map_err(|_| "database lock poisoned")?;
         let mut statement = connection
-            .prepare("SELECT id FROM coord_tasks ORDER BY id")
+            .prepare(
+                "SELECT id FROM coord_tasks
+                 WHERE (?1 IS NULL OR project_id=?1) ORDER BY id",
+            )
             .map_err(|error| error.to_string())?;
         let ids = statement
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([project_id], |row| row.get::<_, String>(0))
             .map_err(|error| error.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
@@ -8656,23 +9195,24 @@ async fn coordination_snapshot(
 fn load_coord_task(connection: &Connection, id: &str) -> Result<BoardTask, String> {
     connection
         .query_row(
-            "SELECT id,title,phase,assignee,lease_generation,lease_until,require_acceptance,verified_pr_url,branch,pr FROM coord_tasks WHERE id=?1",
+            "SELECT project_id,id,title,phase,assignee,lease_generation,lease_until,require_acceptance,verified_pr_url,branch,pr FROM coord_tasks WHERE id=?1",
             [id],
             |row| {
-                let phase: String = row.get(2)?;
-                let lease_until: Option<String> = row.get(5)?;
+                let phase: String = row.get(3)?;
+                let lease_until: Option<String> = row.get(6)?;
                 Ok(BoardTask {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
+                    project_id: row.get(0)?,
+                    id: row.get(1)?,
+                    title: row.get(2)?,
                     phase: serde_json::from_str(&format!("\"{phase}\""))
                         .unwrap_or(BoardPhase::Open),
-                    assignee: row.get(3)?,
-                    lease_generation: row.get::<_, i64>(4)? as u64,
+                    assignee: row.get(4)?,
+                    lease_generation: row.get::<_, i64>(5)? as u64,
                     lease_until: lease_until.and_then(|value| value.parse().ok()),
-                    require_acceptance: row.get::<_, i64>(6)? != 0,
-                    verified_pr_url: row.get(7)?,
-                    branch: row.get(8)?,
-                    pr: row.get(9)?,
+                    require_acceptance: row.get::<_, i64>(7)? != 0,
+                    verified_pr_url: row.get(8)?,
+                    branch: row.get(9)?,
+                    pr: row.get(10)?,
                 })
             },
         )
@@ -8686,8 +9226,9 @@ fn save_coord_task(connection: &Connection, task: &BoardTask) -> Result<(), Stri
         .to_owned();
     connection
         .execute(
-            "INSERT OR REPLACE INTO coord_tasks(id,title,phase,assignee,lease_generation,lease_until,require_acceptance,verified_pr_url,branch,pr) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            "INSERT OR REPLACE INTO coord_tasks(project_id,id,title,phase,assignee,lease_generation,lease_until,require_acceptance,verified_pr_url,branch,pr) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![
+                task.project_id,
                 task.id,
                 task.title,
                 phase,
@@ -8705,15 +9246,19 @@ fn save_coord_task(connection: &Connection, task: &BoardTask) -> Result<(), Stri
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn coordination_create_task(
     state: State<'_, DesktopState>,
     id: String,
+    project_id: Option<String>,
     title: String,
     require_acceptance: bool,
     branch: Option<String>,
     pr: Option<String>,
+    dependencies: Option<Vec<String>>,
 ) -> Result<Value, String> {
     let task = BoardTask {
+        project_id: project_id.unwrap_or_default(),
         id,
         title,
         phase: BoardPhase::Open,
@@ -8730,6 +9275,14 @@ fn coordination_create_task(
         .lock()
         .map_err(|_| "database lock poisoned")?;
     save_coord_task(&connection, &task)?;
+    for dependency in dependencies.unwrap_or_default() {
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO coord_task_dependencies(task_id,depends_on) VALUES (?1,?2)",
+                params![task.id, dependency],
+            )
+            .map_err(|error| error.to_string())?;
+    }
     serde_json::to_value(task).map_err(|error| error.to_string())
 }
 
@@ -8769,12 +9322,34 @@ fn coordination_renew_task(
 }
 
 #[tauri::command]
-fn coordination_complete_task(
+async fn coordination_complete_task(
     state: State<'_, DesktopState>,
     id: String,
     worker: String,
     verified_pr_url: Option<String>,
 ) -> Result<Value, String> {
+    let (initial_task, project) = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let task = load_coord_task(&connection, &id)?;
+        let project = if task.project_id.is_empty() {
+            None
+        } else {
+            Some(
+                state
+                    .store
+                    .load_project(&task.project_id)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "project not found for coordination task".to_owned())?,
+            )
+        };
+        (task, project)
+    };
+    if let Some(project) = project.as_ref() {
+        verify_task_delivery(&state, project, &initial_task, verified_pr_url.as_deref()).await?;
+    }
     let connection = state
         .database
         .lock()
@@ -8784,6 +9359,74 @@ fn coordination_complete_task(
         .map_err(|error| error.to_string())?;
     save_coord_task(&connection, &task)?;
     serde_json::to_value(task).map_err(|error| error.to_string())
+}
+
+async fn verify_task_delivery(
+    state: &State<'_, DesktopState>,
+    project: &ProjectRecord,
+    task: &BoardTask,
+    verified_pr_url: Option<&str>,
+) -> Result<(), String> {
+    let branch = task
+        .branch
+        .as_deref()
+        .ok_or_else(|| "completion requires a branch".to_owned())?;
+    let pr_url = verified_pr_url
+        .or(task.verified_pr_url.as_deref())
+        .or(task.pr.as_deref())
+        .ok_or_else(|| "completion requires a pull request URL".to_owned())?;
+    if !pr_url.starts_with("https://github.com/") || !pr_url.contains("/pull/") {
+        return Err("completion requires a GitHub pull request URL".into());
+    }
+    let repo = project
+        .repo_url
+        .trim_end_matches(".git")
+        .trim_start_matches("https://github.com/")
+        .trim_start_matches("http://github.com/")
+        .trim_end_matches('/');
+    if !pr_url.contains(&format!("/{repo}/pull/")) {
+        return Err("pull request repository does not match the project repository".into());
+    }
+    let host = project_host(state, project).await?;
+    let platform = host.health().await.ok().and_then(|health| health.platform);
+    for command in [
+        format!(
+            "git -C {} rev-parse --verify refs/heads/{}",
+            quote_for(platform.as_deref(), &project.repo_root),
+            quote_for(platform.as_deref(), branch)
+        ),
+        format!(
+            "git -C {} ls-remote --exit-code origin refs/heads/{}",
+            quote_for(platform.as_deref(), &project.repo_root),
+            quote_for(platform.as_deref(), branch)
+        ),
+    ] {
+        let result = host
+            .exec(ExecRequest {
+                command,
+                cwd: None,
+                timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+                session: None,
+                env: None,
+            })
+            .await
+            .map_err(|error| format!("completion verification failed: {error}"))?;
+        if result.result.exit_code != 0 {
+            return Err(
+                "completion verification failed: branch is not committed and pushed".into(),
+            );
+        }
+    }
+    let response = reqwest::Client::new()
+        .get(pr_url)
+        .header("User-Agent", "OPCOS/0.1")
+        .send()
+        .await
+        .map_err(|error| format!("pull request verification failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err("completion verification failed: pull request was not found".into());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -10048,7 +10691,9 @@ fn main() {
             list_schedules,
             run_schedule,
             coordination_start,
+            coordination_start_project,
             coordination_message,
+            coordination_ingest_session,
             coordination_set_role_state,
             coordination_snapshot,
             coordination_create_task,
@@ -10056,6 +10701,9 @@ fn main() {
             coordination_renew_task,
             coordination_complete_task,
             coordination_accept_task,
+            project_workflow_snapshot,
+            project_workflow_advance,
+            save_project_workflow,
             save_secret_metadata,
             list_secret_metadata,
             delete_secret_metadata,
