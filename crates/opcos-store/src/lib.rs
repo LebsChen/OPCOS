@@ -1733,27 +1733,59 @@ impl SqliteStore {
                 "consumer_id and positive limit are required".into(),
             ));
         }
+        let initialized_at = Utc::now().to_rfc3339();
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let cursor: i64 = connection
-            .query_row(
+        connection.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<Vec<EventRecord>, StoreError> {
+            connection.execute(
+                "INSERT OR IGNORE INTO event_cursors(consumer_id,sequence,updated_at)
+                 VALUES (?1, (SELECT COALESCE(MAX(sequence),0) FROM events), ?2)",
+                params![consumer_id, initialized_at],
+            )?;
+            let cursor: i64 = connection.query_row(
                 "SELECT sequence FROM event_cursors WHERE consumer_id=?1",
                 [consumer_id],
                 |row| row.get(0),
+            )?;
+            let mut statement = connection.prepare(
+                "SELECT event_id,kind,source,subject,payload,occurred_at,sequence,
+                        dedup_key,caused_by,cause_depth
+                 FROM events WHERE sequence>?1 ORDER BY sequence LIMIT ?2",
+            )?;
+            statement
+                .query_map(params![cursor, i64::from(limit)], event_from_row)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })();
+        match result {
+            Ok(events) => {
+                connection.execute_batch("COMMIT")?;
+                Ok(events)
+            }
+            Err(error) => {
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    pub fn load_event_cursor(&self, consumer_id: &str) -> Result<Option<EventCursor>, StoreError> {
+        if consumer_id.trim().is_empty() {
+            return Err(StoreError::Validation("consumer_id cannot be empty".into()));
+        }
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .query_row(
+                "SELECT consumer_id,sequence FROM event_cursors WHERE consumer_id=?1",
+                [consumer_id],
+                |row| {
+                    Ok(EventCursor {
+                        consumer_id: row.get(0)?,
+                        sequence: row.get(1)?,
+                    })
+                },
             )
-            .optional()?
-            .unwrap_or(connection.query_row(
-                "SELECT COALESCE(MAX(sequence),0) FROM events",
-                [],
-                |row| row.get(0),
-            )?);
-        let mut statement = connection.prepare(
-            "SELECT event_id,kind,source,subject,payload,occurred_at,sequence,
-                    dedup_key,caused_by,cause_depth
-             FROM events WHERE sequence>?1 ORDER BY sequence LIMIT ?2",
-        )?;
-        statement
-            .query_map(params![cursor, i64::from(limit)], event_from_row)?
-            .collect::<Result<Vec<_>, _>>()
+            .optional()
             .map_err(StoreError::from)
     }
 
@@ -5309,6 +5341,11 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        let initial_cursor = store
+            .load_event_cursor("planner-event-pump")
+            .unwrap()
+            .unwrap();
+        assert_eq!(initial_cursor.sequence, 1);
         let newest = store
             .publish_event(
                 "external.new",
@@ -5319,6 +5356,19 @@ mod tests {
                 None,
             )
             .unwrap();
+        let pending = store
+            .load_events_after_from_tail("planner-event-pump", 10)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].sequence, newest.sequence);
+        assert_eq!(
+            store
+                .load_event_cursor("planner-event-pump")
+                .unwrap()
+                .unwrap()
+                .sequence,
+            initial_cursor.sequence
+        );
         store
             .ack_event("planner-event-pump", newest.sequence)
             .unwrap();
