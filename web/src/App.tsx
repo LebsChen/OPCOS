@@ -6473,6 +6473,18 @@ function Activity({
   const [accountBindings, setAccountBindings] = useState<
     Record<string, unknown>[]
   >([]);
+  const [loginProfilePath, setLoginProfilePath] = useState("");
+  const [loginBackupDir, setLoginBackupDir] = useState("");
+  const [loginProfile, setLoginProfile] = useState<Record<
+    string,
+    unknown
+  > | null>(null);
+  const [loginBackups, setLoginBackups] = useState<Record<string, unknown>[]>(
+    [],
+  );
+  const [loginValidationUrl, setLoginValidationUrl] = useState("");
+  const [loginExpectedSignal, setLoginExpectedSignal] = useState("");
+  const [loginObservedSignal, setLoginObservedSignal] = useState("");
   const load = () =>
     command<Coordination>("coordination_snapshot", { taskId })
       .then(setBoard)
@@ -6568,6 +6580,20 @@ function Activity({
                   )
                     .then(setAccountBindings)
                     .catch(onError);
+                  if (accountId.trim()) {
+                    void command<Record<string, unknown> | null>(
+                      "login_profile",
+                      { accountId },
+                    )
+                      .then(setLoginProfile)
+                      .catch(onError);
+                    void command<Record<string, unknown>[]>(
+                      "login_state_backups",
+                      { accountId },
+                    )
+                      .then(setLoginBackups)
+                      .catch(onError);
+                  }
                 }
               }}
             >
@@ -6899,6 +6925,173 @@ function Activity({
                       ) : null
                     }
                     empty="No account host bindings."
+                  />
+                </div>
+                <div className="rounded-xl2 border border-line bg-panel p-5 space-y-3">
+                  <h2 className="text-[15px] font-semibold">Login state</h2>
+                  <div className="grid grid-cols-2 gap-3">
+                    <input
+                      value={loginProfilePath}
+                      onChange={(event) =>
+                        setLoginProfilePath(event.target.value)
+                      }
+                      placeholder="Remote browser profile path"
+                    />
+                    <input
+                      value={loginBackupDir}
+                      onChange={(event) =>
+                        setLoginBackupDir(event.target.value)
+                      }
+                      placeholder="Remote backup directory"
+                    />
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      className="primary"
+                      onClick={() =>
+                        void command("save_login_profile", {
+                          request: {
+                            accountId,
+                            profilePath: loginProfilePath,
+                            backupDir: loginBackupDir,
+                          },
+                        })
+                          .then((profile) =>
+                            setLoginProfile(profile as Record<string, unknown>),
+                          )
+                          .catch(onError)
+                      }
+                      disabled={
+                        !accountId.trim() ||
+                        !loginProfilePath.trim() ||
+                        !loginBackupDir.trim()
+                      }
+                    >
+                      Save profile
+                    </Button>
+                    <Button
+                      onClick={() =>
+                        void command("backup_login_state", {
+                          request: {
+                            accountId,
+                            idempotencyKey: `ui-login-backup-${Date.now()}`,
+                          },
+                        })
+                          .then((backup) =>
+                            setLoginBackups((items) => [
+                              backup as Record<string, unknown>,
+                              ...items,
+                            ]),
+                          )
+                          .catch(onError)
+                      }
+                      disabled={!accountId.trim() || !loginProfile}
+                    >
+                      Backup
+                    </Button>
+                  </div>
+                  {loginProfile ? (
+                    <small className="text-muted">
+                      validation ·{" "}
+                      {String(
+                        loginProfile.latest_validation_status ?? "not checked",
+                      )}{" "}
+                      {String(loginProfile.latest_validation_at ?? "")}
+                    </small>
+                  ) : null}
+                  <div className="grid grid-cols-3 gap-3">
+                    <input
+                      value={loginValidationUrl}
+                      onChange={(event) =>
+                        setLoginValidationUrl(event.target.value)
+                      }
+                      placeholder="Validation URL"
+                    />
+                    <input
+                      value={loginExpectedSignal}
+                      onChange={(event) =>
+                        setLoginExpectedSignal(event.target.value)
+                      }
+                      placeholder="Expected signal"
+                    />
+                    <input
+                      value={loginObservedSignal}
+                      onChange={(event) =>
+                        setLoginObservedSignal(event.target.value)
+                      }
+                      placeholder="Observed signal (optional)"
+                    />
+                  </div>
+                  <Button
+                    onClick={() =>
+                      void command("validate_login_state", {
+                        request: {
+                          accountId,
+                          url: loginValidationUrl,
+                          expectedSignal: loginExpectedSignal,
+                          observedSignal: loginObservedSignal || null,
+                        },
+                      })
+                        .then((status) =>
+                          setLoginProfile((profile) =>
+                            profile
+                              ? {
+                                  ...profile,
+                                  latest_validation_status: status,
+                                  latest_validation_at:
+                                    new Date().toISOString(),
+                                }
+                              : profile,
+                          ),
+                        )
+                        .catch(onError)
+                    }
+                    disabled={
+                      !accountId.trim() ||
+                      !loginValidationUrl.trim() ||
+                      !loginExpectedSignal.trim()
+                    }
+                  >
+                    Check login
+                  </Button>
+                  <CollectionPage
+                    search=""
+                    onSearch={() => undefined}
+                    searchPlaceholder="Filter login backups"
+                    rows={
+                      loginBackups.length ? (
+                        <>
+                          {loginBackups.map((backup) => (
+                            <div
+                              className="manage-row px-4"
+                              key={String(backup.backup_id)}
+                            >
+                              <span>
+                                <strong>{String(backup.created_at)}</strong>
+                                <small>
+                                  {String(backup.size)} bytes · hash{" "}
+                                  {String(backup.hash)}
+                                </small>
+                              </span>
+                              <Button
+                                onClick={() =>
+                                  void command("restore_login_state", {
+                                    request: {
+                                      accountId,
+                                      backupId: String(backup.backup_id),
+                                      idempotencyKey: `ui-login-restore-${String(backup.backup_id)}-${Date.now()}`,
+                                    },
+                                  }).catch(onError)
+                                }
+                              >
+                                Restore
+                              </Button>
+                            </div>
+                          ))}
+                        </>
+                      ) : null
+                    }
+                    empty="No login-state backups."
                   />
                 </div>
                 <div className="rounded-xl2 border border-line bg-panel p-5 space-y-3">

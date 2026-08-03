@@ -166,6 +166,29 @@ pub struct DirectoryListing {
     pub items: Vec<DirectoryEntry>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct StorageStat {
+    pub path: String,
+    pub size: u64,
+    #[serde(rename = "isFile")]
+    pub is_file: bool,
+    #[serde(rename = "isDir")]
+    pub is_dir: bool,
+    #[serde(default, rename = "isSymlink")]
+    pub is_symlink: bool,
+    #[serde(default)]
+    pub mode: Option<Value>,
+    #[serde(default)]
+    pub mtime: Option<Value>,
+    #[serde(default)]
+    pub ctime: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct StorageHash {
+    pub hash: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GitChanges {
     pub base: String,
@@ -552,6 +575,18 @@ pub trait RvmClient: Send + Sync {
     async fn info(&self) -> Result<Info, RvmError>;
     async fn capabilities(&self) -> Result<Capabilities, RvmError>;
     async fn exec_sync(&self, request: ExecRequest) -> Result<ExecResult, RvmError>;
+    async fn storage_stat(&self, path: &str) -> Result<StorageStat, RvmError> {
+        let _ = path;
+        Err(RvmError::Unsupported("storage stat".into()))
+    }
+    async fn storage_hash(&self, path: &str) -> Result<StorageHash, RvmError> {
+        let _ = path;
+        Err(RvmError::Unsupported("storage hash".into()))
+    }
+    async fn storage_exists(&self, path: &str) -> Result<bool, RvmError> {
+        let _ = path;
+        Err(RvmError::Unsupported("storage exists".into()))
+    }
     async fn screenshot(&self) -> Result<Screenshot, RvmError> {
         Err(RvmError::Unsupported("screenshot".into()))
     }
@@ -1212,6 +1247,54 @@ impl RvmClient for HttpRvmClient {
 
     async fn exec_sync(&self, request: ExecRequest) -> Result<ExecResult, RvmError> {
         self.post_json("/api/exec-sync", &request).await
+    }
+
+    async fn storage_stat(&self, path: &str) -> Result<StorageStat, RvmError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            path: &'a str,
+        }
+        self.post_json(
+            "/api/storage/stat",
+            &Body {
+                path: &self.remote_path(path)?,
+            },
+        )
+        .await
+    }
+
+    async fn storage_hash(&self, path: &str) -> Result<StorageHash, RvmError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            path: &'a str,
+        }
+        self.post_json(
+            "/api/storage/hash",
+            &Body {
+                path: &self.remote_path(path)?,
+            },
+        )
+        .await
+    }
+
+    async fn storage_exists(&self, path: &str) -> Result<bool, RvmError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            path: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct Response {
+            exists: bool,
+        }
+        Ok(self
+            .post_json::<_, Response>(
+                "/api/storage/exists",
+                &Body {
+                    path: &self.remote_path(path)?,
+                },
+            )
+            .await?
+            .exists)
     }
 
     async fn screenshot(&self) -> Result<Screenshot, RvmError> {

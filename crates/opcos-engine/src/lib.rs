@@ -23,6 +23,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 mod acp;
 pub mod computer_use;
 pub mod event_bus;
+pub mod login_state;
 mod opencode;
 pub mod orchestration;
 pub mod planner;

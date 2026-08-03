@@ -9,6 +9,7 @@ use opcos_rvm::{
 };
 pub use opcos_rvm::{ComputerUseAction, ComputerUseResponse, ScreenBounds, Screenshot};
 pub use opcos_rvm::{DEFAULT_EXEC_TIMEOUT_SECONDS, LIFECYCLE_EXEC_TIMEOUT_SECONDS};
+pub use opcos_rvm::{StorageHash, StorageStat};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -256,6 +257,24 @@ pub trait Host: Send + Sync {
     async fn health(&self) -> Result<Health, HostError>;
     async fn capabilities(&self) -> Result<HostCapabilities, HostError>;
     async fn exec(&self, request: ExecRequest) -> Result<ExecResult, HostError>;
+    async fn storage_stat(&self, path: &str) -> Result<StorageStat, HostError> {
+        let _ = path;
+        Err(HostError::Unsupported(
+            "host lacks storage stat capability".into(),
+        ))
+    }
+    async fn storage_hash(&self, path: &str) -> Result<StorageHash, HostError> {
+        let _ = path;
+        Err(HostError::Unsupported(
+            "host lacks storage hash capability".into(),
+        ))
+    }
+    async fn storage_exists(&self, path: &str) -> Result<bool, HostError> {
+        let _ = path;
+        Err(HostError::Unsupported(
+            "host lacks storage exists capability".into(),
+        ))
+    }
     async fn screenshot(&self) -> Result<Screenshot, HostError> {
         Err(HostError::Unsupported(
             "host lacks screenshot capability".into(),
@@ -412,6 +431,18 @@ impl Host for RvmHost {
 
     async fn exec(&self, request: ExecRequest) -> Result<ExecResult, HostError> {
         Ok(self.client.exec_sync(request).await?)
+    }
+
+    async fn storage_stat(&self, path: &str) -> Result<StorageStat, HostError> {
+        Ok(self.client.storage_stat(path).await?)
+    }
+
+    async fn storage_hash(&self, path: &str) -> Result<StorageHash, HostError> {
+        Ok(self.client.storage_hash(path).await?)
+    }
+
+    async fn storage_exists(&self, path: &str) -> Result<bool, HostError> {
+        Ok(self.client.storage_exists(path).await?)
     }
 
     async fn screenshot(&self) -> Result<Screenshot, HostError> {
