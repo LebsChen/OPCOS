@@ -103,6 +103,14 @@ pub struct ProjectAgentRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AccountHostBinding {
+    pub account_id: String,
+    pub host_id: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct StoredMessage {
     pub session_id: String,
@@ -1191,6 +1199,115 @@ impl SqliteStore {
         };
         store.migrate()?;
         Ok(store)
+    }
+
+    pub fn bind_account_host(
+        &self,
+        account_id: &str,
+        host_id: &str,
+    ) -> Result<AccountHostBinding, StoreError> {
+        if account_id.trim().is_empty() || host_id.trim().is_empty() {
+            return Err(StoreError::Validation(
+                "account_id and host_id are required".into(),
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        if connection
+            .query_row(
+                "SELECT account_id FROM account_host_bindings
+                 WHERE host_id=?1 AND account_id<>?2",
+                params![host_id, account_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Err(StoreError::Validation(
+                "host is already bound to another account".into(),
+            ));
+        }
+        connection.execute(
+            "INSERT INTO account_host_bindings(account_id,host_id,created_at,updated_at)
+             VALUES (?1,?2,?3,?3)
+             ON CONFLICT(account_id) DO UPDATE SET
+               host_id=excluded.host_id,updated_at=excluded.updated_at",
+            params![account_id, host_id, now],
+        )?;
+        connection
+            .query_row(
+                "SELECT account_id,host_id,created_at,updated_at
+                 FROM account_host_bindings WHERE account_id=?1",
+                [account_id],
+                |row| {
+                    Ok(AccountHostBinding {
+                        account_id: row.get(0)?,
+                        host_id: row.get(1)?,
+                        created_at: row.get(2)?,
+                        updated_at: row.get(3)?,
+                    })
+                },
+            )
+            .map_err(StoreError::from)
+    }
+
+    pub fn account_host_binding(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<AccountHostBinding>, StoreError> {
+        if account_id.trim().is_empty() {
+            return Err(StoreError::Validation("account_id is required".into()));
+        }
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .query_row(
+                "SELECT account_id,host_id,created_at,updated_at
+                 FROM account_host_bindings WHERE account_id=?1",
+                [account_id],
+                |row| {
+                    Ok(AccountHostBinding {
+                        account_id: row.get(0)?,
+                        host_id: row.get(1)?,
+                        created_at: row.get(2)?,
+                        updated_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn list_account_host_bindings(&self) -> Result<Vec<AccountHostBinding>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT account_id,host_id,created_at,updated_at
+             FROM account_host_bindings ORDER BY account_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok(AccountHostBinding {
+                    account_id: row.get(0)?,
+                    host_id: row.get(1)?,
+                    created_at: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn unbind_account_host(&self, account_id: &str) -> Result<(), StoreError> {
+        if account_id.trim().is_empty() {
+            return Err(StoreError::Validation("account_id is required".into()));
+        }
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "DELETE FROM account_host_bindings WHERE account_id=?1",
+                [account_id],
+            )?;
+        Ok(())
     }
 
     pub fn append_audit(
@@ -2938,6 +3055,12 @@ impl SqliteStore {
                updated_at TEXT NOT NULL,
                session_id TEXT,
                project_id TEXT
+             );
+             CREATE TABLE IF NOT EXISTS account_host_bindings (
+               account_id TEXT PRIMARY KEY,
+               host_id TEXT NOT NULL UNIQUE,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_action_ledger_created_at
                ON action_ledger(created_at DESC);
@@ -5429,5 +5552,26 @@ mod tests {
                 .unwrap()
                 .enabled
         );
+    }
+
+    #[test]
+    fn account_host_bindings_are_one_to_one_and_persistent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let binding = store.bind_account_host("account-a", "host-a").unwrap();
+        assert_eq!(binding.host_id, "host-a");
+        assert!(store.bind_account_host("account-b", "host-a").is_err());
+        let updated = store.bind_account_host("account-a", "host-b").unwrap();
+        assert_eq!(updated.host_id, "host-b");
+        assert_eq!(
+            store
+                .account_host_binding("account-a")
+                .unwrap()
+                .unwrap()
+                .host_id,
+            "host-b"
+        );
+        assert_eq!(store.list_account_host_bindings().unwrap().len(), 1);
+        store.unbind_account_host("account-a").unwrap();
+        assert!(store.account_host_binding("account-a").unwrap().is_none());
     }
 }

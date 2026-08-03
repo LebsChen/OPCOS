@@ -6468,6 +6468,11 @@ function Activity({
     Record<string, unknown>[]
   >([]);
   const [goalDescription, setGoalDescription] = useState("");
+  const [accountId, setAccountId] = useState("");
+  const [accountHostId, setAccountHostId] = useState("");
+  const [accountBindings, setAccountBindings] = useState<
+    Record<string, unknown>[]
+  >([]);
   const load = () =>
     command<Coordination>("coordination_snapshot", { taskId })
       .then(setBoard)
@@ -6556,6 +6561,12 @@ function Activity({
                     limit: 100,
                   })
                     .then(setPlanningHistory)
+                    .catch(onError);
+                  void command<Record<string, unknown>[]>(
+                    "account_host_bindings",
+                    {},
+                  )
+                    .then(setAccountBindings)
                     .catch(onError);
                 }
               }}
@@ -6830,6 +6841,66 @@ function Activity({
             )}
             {activityTab === "goals" && (
               <div className="space-y-5">
+                <div className="rounded-xl2 border border-line bg-panel p-5 space-y-3">
+                  <h2 className="text-[15px] font-semibold">
+                    Account host bindings
+                  </h2>
+                  <div className="grid grid-cols-2 gap-3">
+                    <input
+                      value={accountId}
+                      onChange={(event) => setAccountId(event.target.value)}
+                      placeholder="Account ID"
+                    />
+                    <input
+                      value={accountHostId}
+                      onChange={(event) => setAccountHostId(event.target.value)}
+                      placeholder="Remote host ID"
+                    />
+                  </div>
+                  <Button
+                    className="primary"
+                    onClick={() =>
+                      void command("bind_account_host", {
+                        accountId,
+                        hostId: accountHostId,
+                      })
+                        .then(() =>
+                          command<Record<string, unknown>[]>(
+                            "account_host_bindings",
+                            {},
+                          ),
+                        )
+                        .then(setAccountBindings)
+                        .catch(onError)
+                    }
+                    disabled={!accountId.trim() || !accountHostId.trim()}
+                  >
+                    Bind account to host
+                  </Button>
+                  <CollectionPage
+                    search=""
+                    onSearch={() => undefined}
+                    searchPlaceholder="Filter bindings"
+                    rows={
+                      accountBindings.length ? (
+                        <>
+                          {accountBindings.map((binding) => (
+                            <div
+                              className="manage-row px-4"
+                              key={String(binding.account_id)}
+                            >
+                              <span>
+                                <strong>{String(binding.account_id)}</strong>
+                                <small>host · {String(binding.host_id)}</small>
+                              </span>
+                            </div>
+                          ))}
+                        </>
+                      ) : null
+                    }
+                    empty="No account host bindings."
+                  />
+                </div>
                 <div className="rounded-xl2 border border-line bg-panel p-5 space-y-3">
                   <h2 className="text-[15px] font-semibold">New goal</h2>
                   <input

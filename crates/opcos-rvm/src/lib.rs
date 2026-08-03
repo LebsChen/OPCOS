@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::Bytes;
 use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -61,12 +62,16 @@ pub enum RvmError {
     Http { status: StatusCode, message: String },
     #[error("RVM response JSON was invalid: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("RVM response was invalid: {0}")]
+    InvalidResponse(String),
     #[error("RVM JSON-RPC error {code}: {message}")]
     JsonRpc { code: i64, message: String },
     #[error("RVM websocket failed: {0}")]
     WebSocket(String),
     #[error("RVM capability is unavailable: {0}")]
     Unsupported(String),
+    #[error("invalid computer-use action: {0}")]
+    InvalidComputerAction(String),
     #[error("remote path rejected: {0}")]
     Path(String),
     #[error("RVM persistent session could not be recovered: {0}")]
@@ -249,6 +254,209 @@ pub struct Capabilities {
     pub available: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ScreenBounds {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl ScreenBounds {
+    pub fn validate_coordinate(self, coordinate: [i32; 2]) -> Result<(), RvmError> {
+        if self.width == 0
+            || self.height == 0
+            || coordinate[0] < 0
+            || coordinate[1] < 0
+            || coordinate[0] as u32 >= self.width
+            || coordinate[1] as u32 >= self.height
+        {
+            return Err(RvmError::InvalidComputerAction(
+                "coordinate is outside the declared screen bounds".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Screenshot {
+    pub image: String,
+    #[serde(default = "default_png_format")]
+    pub format: String,
+}
+
+impl Screenshot {
+    pub fn decoded_rgba(&self) -> Result<(ScreenBounds, Vec<u8>), RvmError> {
+        let bytes = BASE64.decode(&self.image).map_err(|error| {
+            RvmError::InvalidResponse(format!("screenshot base64 is invalid: {error}"))
+        })?;
+        let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+        let mut reader = decoder.read_info().map_err(|error| {
+            RvmError::InvalidResponse(format!("screenshot PNG is invalid: {error}"))
+        })?;
+        let mut buffer = vec![0; reader.output_buffer_size()];
+        let output = reader.next_frame(&mut buffer).map_err(|error| {
+            RvmError::InvalidResponse(format!("screenshot PNG frame is invalid: {error}"))
+        })?;
+        let pixels = match output.color_type {
+            png::ColorType::Rgba => buffer[..output.buffer_size()].to_vec(),
+            png::ColorType::Rgb => buffer[..output.buffer_size()]
+                .chunks_exact(3)
+                .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], 255])
+                .collect(),
+            png::ColorType::Grayscale => buffer[..output.buffer_size()]
+                .iter()
+                .flat_map(|value| [*value, *value, *value, 255])
+                .collect(),
+            png::ColorType::GrayscaleAlpha => buffer[..output.buffer_size()]
+                .chunks_exact(2)
+                .flat_map(|pixel| [pixel[0], pixel[0], pixel[0], pixel[1]])
+                .collect(),
+            png::ColorType::Indexed => {
+                return Err(RvmError::InvalidResponse(
+                    "indexed screenshots are unsupported".into(),
+                ));
+            }
+        };
+        Ok((
+            ScreenBounds {
+                width: output.width,
+                height: output.height,
+            },
+            pixels,
+        ))
+    }
+
+    pub fn dimensions(&self) -> Result<ScreenBounds, RvmError> {
+        self.decoded_rgba().map(|(bounds, _)| bounds)
+    }
+}
+
+fn default_png_format() -> String {
+    "png".into()
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ComputerUseAction {
+    Screenshot,
+    CursorPosition,
+    Wait,
+    Key {
+        key: String,
+    },
+    Type {
+        text: String,
+    },
+    MouseMove {
+        coordinate: [i32; 2],
+    },
+    Scroll {
+        coordinate: [i32; 2],
+        direction: String,
+        amount: i32,
+    },
+    LeftClick {
+        coordinate: [i32; 2],
+    },
+    RightClick {
+        coordinate: [i32; 2],
+    },
+    MiddleClick {
+        coordinate: [i32; 2],
+    },
+    DoubleClick {
+        coordinate: [i32; 2],
+    },
+    TripleClick {
+        coordinate: [i32; 2],
+    },
+    LeftClickDrag {
+        coordinate: [i32; 2],
+        #[serde(rename = "coordinate2")]
+        coordinate_end: [i32; 2],
+    },
+    LeftMouseDown {
+        coordinate: [i32; 2],
+    },
+    LeftMouseUp {
+        coordinate: [i32; 2],
+    },
+    HoldKey {
+        key: String,
+    },
+}
+
+impl ComputerUseAction {
+    pub fn validate(&self, bounds: ScreenBounds) -> Result<(), RvmError> {
+        let coord_check = |coordinate: [i32; 2]| bounds.validate_coordinate(coordinate);
+        let text = |value: &str, field: &str| {
+            if value.trim().is_empty() {
+                return Err(RvmError::InvalidComputerAction(format!(
+                    "{field} cannot be empty"
+                )));
+            }
+            if value.chars().count() > 16_384 {
+                return Err(RvmError::InvalidComputerAction(format!(
+                    "{field} exceeds 16384 characters"
+                )));
+            }
+            Ok(())
+        };
+        match self {
+            Self::Screenshot | Self::CursorPosition | Self::Wait => Ok(()),
+            Self::Key { key } | Self::HoldKey { key } => text(key, "key"),
+            Self::Type { text: value } => text(value, "text"),
+            Self::MouseMove { coordinate }
+            | Self::LeftClick { coordinate }
+            | Self::RightClick { coordinate }
+            | Self::MiddleClick { coordinate }
+            | Self::DoubleClick { coordinate }
+            | Self::TripleClick { coordinate }
+            | Self::LeftMouseDown { coordinate }
+            | Self::LeftMouseUp { coordinate } => coord_check(*coordinate),
+            Self::Scroll {
+                coordinate,
+                direction,
+                amount,
+            } => {
+                coord_check(*coordinate)?;
+                if !matches!(direction.as_str(), "up" | "down" | "left" | "right") {
+                    return Err(RvmError::InvalidComputerAction(
+                        "scroll direction must be up, down, left, or right".into(),
+                    ));
+                }
+                if *amount <= 0 || *amount > 10_000 {
+                    return Err(RvmError::InvalidComputerAction(
+                        "scroll amount must be between 1 and 10000".into(),
+                    ));
+                }
+                Ok(())
+            }
+            Self::LeftClickDrag {
+                coordinate,
+                coordinate_end,
+            } => {
+                coord_check(*coordinate)?;
+                coord_check(*coordinate_end)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ComputerUseResponse {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub coordinate: Option<[i32; 2]>,
+    #[serde(default)]
+    pub x: Option<i32>,
+    #[serde(default)]
+    pub y: Option<i32>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct ExecRequest {
     pub command: String,
@@ -344,6 +552,17 @@ pub trait RvmClient: Send + Sync {
     async fn info(&self) -> Result<Info, RvmError>;
     async fn capabilities(&self) -> Result<Capabilities, RvmError>;
     async fn exec_sync(&self, request: ExecRequest) -> Result<ExecResult, RvmError>;
+    async fn screenshot(&self) -> Result<Screenshot, RvmError> {
+        Err(RvmError::Unsupported("screenshot".into()))
+    }
+    async fn computer_use(
+        &self,
+        action: ComputerUseAction,
+        bounds: ScreenBounds,
+    ) -> Result<ComputerUseResponse, RvmError> {
+        action.validate(bounds)?;
+        Err(RvmError::Unsupported("computer_use".into()))
+    }
     async fn read(&self, path: &str) -> Result<FileContent, RvmError>;
     async fn write(&self, path: &str, content: &str) -> Result<Value, RvmError>;
     async fn ls(&self, path: Option<&str>) -> Result<DirectoryListing, RvmError>;
@@ -995,6 +1214,37 @@ impl RvmClient for HttpRvmClient {
         self.post_json("/api/exec-sync", &request).await
     }
 
+    async fn screenshot(&self) -> Result<Screenshot, RvmError> {
+        let screenshot: Screenshot = self.get_json("/api/screenshot", true).await?;
+        if screenshot.image.trim().is_empty() {
+            return Err(RvmError::InvalidResponse(
+                "screenshot image is empty".into(),
+            ));
+        }
+        Ok(screenshot)
+    }
+
+    async fn computer_use(
+        &self,
+        action: ComputerUseAction,
+        bounds: ScreenBounds,
+    ) -> Result<ComputerUseResponse, RvmError> {
+        action.validate(bounds)?;
+        let response: ComputerUseResponse = self.post_json("/api/computer-use", &action).await?;
+        if let Some(error) = response.error.clone() {
+            return Err(RvmError::Request(format!(
+                "computer-use rejected: {}",
+                RvmError::redact(&error, &self.config.token)
+            )));
+        }
+        if !response.ok {
+            return Err(RvmError::Request(
+                "computer-use returned an unsuccessful response".into(),
+            ));
+        }
+        Ok(response)
+    }
+
     async fn read(&self, path: &str) -> Result<FileContent, RvmError> {
         #[derive(Serialize)]
         struct Body<'a> {
@@ -1236,6 +1486,7 @@ impl RvmClient for HttpRvmClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Router, body::Body, http::Request, routing::post};
     use std::collections::VecDeque;
     use std::sync::{
         Arc, Mutex,
@@ -1303,6 +1554,101 @@ mod tests {
     fn worklog_limit_is_clamped() {
         assert_eq!(1_u32.clamp(1, 1000), 1);
         assert_eq!(1001_u32.clamp(1, 1000), 1000);
+    }
+
+    #[test]
+    fn computer_use_actions_reject_missing_or_unsafe_parameters() {
+        let bounds = ScreenBounds {
+            width: 100,
+            height: 100,
+        };
+        assert!(serde_json::from_str::<ComputerUseAction>(r#"{"action":"left_click"}"#).is_err());
+        assert!(
+            ComputerUseAction::LeftClick {
+                coordinate: [100, 1]
+            }
+            .validate(bounds)
+            .is_err()
+        );
+        assert!(
+            ComputerUseAction::Type { text: " ".into() }
+                .validate(bounds)
+                .is_err()
+        );
+        assert!(
+            ComputerUseAction::Scroll {
+                coordinate: [1, 1],
+                direction: "sideways".into(),
+                amount: 1,
+            }
+            .validate(bounds)
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn computer_use_actions_serialize_to_strict_wire_shapes() {
+        let action = ComputerUseAction::LeftClick { coordinate: [4, 5] };
+        assert_eq!(
+            serde_json::to_value(action).unwrap(),
+            serde_json::json!({"action":"left_click","coordinate":[4,5]})
+        );
+    }
+
+    #[test]
+    fn screenshot_dimensions_are_read_from_png_header() {
+        let screenshot = Screenshot {
+            image: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".into(),
+            format: "png".into(),
+        };
+        assert_eq!(
+            screenshot.dimensions().unwrap(),
+            ScreenBounds {
+                width: 1,
+                height: 1
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_computer_use_never_reaches_http_server() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        let app = Router::new().route(
+            "/api/computer-use",
+            post(move |_request: Request<Body>| {
+                let counter = Arc::clone(&counter);
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    r#"{"ok":true}"#
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let config = RvmClientConfig::new(
+            Url::parse(&format!("http://{address}/")).unwrap(),
+            "test-token",
+        )
+        .unwrap();
+        let client = HttpRvmClient::new(config).unwrap();
+        let error = client
+            .computer_use(
+                ComputerUseAction::LeftClick {
+                    coordinate: [500, 500],
+                },
+                ScreenBounds {
+                    width: 10,
+                    height: 10,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RvmError::InvalidComputerAction(_)));
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
     }
 
     #[test]
