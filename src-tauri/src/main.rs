@@ -994,9 +994,9 @@ fn ci_classification(status: &str, conclusion: Option<&str>, detail: &str) -> &'
     }
     match conclusion.as_str() {
         "success" => "success",
-        "cancelled" | "timed_out" | "startup_failure" | "action_required" => {
-            "infrastructure_failure"
-        }
+        "cancelled" => "indeterminate",
+        "timed_out" | "startup_failure" => "infrastructure_failure",
+        "action_required" => "not_run",
         "failure" | "error" => "code_failure",
         "skipped" | "neutral" => "not_run",
         "" => "indeterminate",
@@ -1273,6 +1273,8 @@ async fn execute_github_ci_failure_log(
         .get("id")
         .and_then(Value::as_u64)
         .ok_or("GitHub job did not include an id")?;
+    let job_conclusion = job.get("conclusion").and_then(Value::as_str);
+    let cancelled = job_conclusion == Some("cancelled");
     let log_http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -1347,9 +1349,18 @@ async fn execute_github_ci_failure_log(
         "run_id": run_id,
         "job_id": job_id,
         "job_name": job.get("name"),
+        "job_status": job.get("status"),
+        "job_conclusion": job_conclusion,
+        "log_complete": !cancelled,
         "step_requested": requested_step,
         "step_located": step_located,
-        "selection_note": if requested_step.is_some() && !step_located { "requested step was not located; returning bounded job tail" } else { "returning bounded job log" },
+        "selection_note": if cancelled {
+            "job was cancelled; log may be incomplete and must not be treated as a complete failure explanation"
+        } else if requested_step.is_some() && !step_located {
+            "requested step was not located; returning bounded job tail"
+        } else {
+            "returning bounded job log"
+        },
         "text": text,
         "metadata": metadata,
         "rate_limit": rate,
@@ -17707,7 +17718,11 @@ mod m7_tests {
         );
         assert_eq!(
             ci_classification("completed", Some("cancelled"), ""),
-            "infrastructure_failure"
+            "indeterminate"
+        );
+        assert_eq!(
+            ci_classification("completed", Some("action_required"), ""),
+            "not_run"
         );
         assert_eq!(
             ci_classification("completed", Some("failure"), "runner failed to start"),
