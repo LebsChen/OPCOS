@@ -48,16 +48,16 @@ impl AcpTerminalState {
     async fn append(&self, text: &str) {
         let mut output = self.output.lock().await;
         output.push_str(text);
-        if let Some(limit) = self.output_byte_limit {
-            while output.len() > limit {
-                if let Some((index, _)) = output.char_indices().nth(1) {
-                    output.drain(..index);
-                } else {
-                    output.clear();
-                    break;
-                }
-                *self.truncated.lock().await = true;
-            }
+        if let Some(limit) = self.output_byte_limit
+            && output.len() > limit
+        {
+            let excess = output.len() - limit;
+            let boundary = output
+                .char_indices()
+                .find_map(|(index, _)| (index >= excess).then_some(index))
+                .unwrap_or(output.len());
+            output.drain(..boundary);
+            *self.truncated.lock().await = true;
         }
     }
 
@@ -969,6 +969,17 @@ mod tests {
         let (again, _, again_status) = state.snapshot().await;
         assert_eq!(again, output);
         assert_eq!(again_status, exit_status);
+    }
+
+    #[tokio::test]
+    async fn terminal_output_limit_truncates_large_utf8_chunk_once() {
+        let (state, _) = AcpTerminalState::new(Some(16));
+        let state = Arc::new(state);
+        state.append(&"😀".repeat(250_000)).await;
+        let (output, truncated, _) = state.snapshot().await;
+        assert!(output.len() <= 16);
+        assert!(std::str::from_utf8(output.as_bytes()).is_ok());
+        assert!(truncated);
     }
 
     #[tokio::test]
