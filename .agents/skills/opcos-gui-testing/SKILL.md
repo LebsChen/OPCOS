@@ -196,6 +196,171 @@ in the report — it is the host's UI, not something OPCOS leaks.
   one prompt — that is the cheapest way to exercise the continuation-approval path (deny the first,
   allow the retry, allow the second) without switching sessions.
 
+## Projects / team workspaces (P1-P4 surfaces)
+
+- **No remote host needed for project testing.** Host `local` (`本机`) is built in (`main.rs:3777`) and
+  `project_host_contains` restricts local project paths to **under `$HOME`** (`main.rs:2035`). So a
+  throwaway `git init` repo under `~` (e.g. `~/opcos-test/demo-repo`, one commit, branch `main`) is a
+  complete fixture — put its absolute path in the 新建项目 dialog's 仓库路径 field, leave 仓库 URL empty.
+- UI path: sidebar 「项目」 row `+` → 新建项目 → board. Board has 添加成员 / per-card 启动会话·编辑·删除,
+  then 项目配置 (规则/Knowledge/Playbook/MCP/Connectors/Blueprint + 项目 Secrets + 项目运行凭据), then
+  「Workflow 与 Lead 指挥」 (启动全部 / 暂停 / 恢复 / 推进阶段 / Workflow 定义 / 任务 / 协同消息历史).
+- Member semantics: `sort_order==0` ⇒ role must be `Lead`, worktree = repo root; others get
+  `<repo>/worktrees/<agent-id>` and branch `agent/<role>-<n>` via a real `git worktree add`.
+  **Always verify with `git -C <repo> worktree list` + `ls`** — the UI card is not evidence.
+
+### The trap that wastes the most time: stale UI + WAL-invisible DB
+
+- **The project board does not refresh when backend rows disappear.** It keeps rendering member cards
+  from React state, with no error. Never conclude "the data is still there" from the board — kill the
+  process and re-launch, or read the DB *after* a clean shutdown.
+- `~/.config/com.opcos.desktop/opcos.db` is tiny; **everything lives in `opcos.db-wal`**. Reading the
+  live DB (even `mode=ro`) returns stale/empty tables intermittently, and copying db/-wal/-shm while
+  the app runs races. Reliable recipe: `pkill -f target/debug/opcos; sleep 4;` then open the db
+  normally (shutdown checkpoints the WAL). There is no `sqlite3` CLI on the box — use
+  `python3 -c "import sqlite3; ..."`.
+- Symptom decoder: `启动全部` returning `coordination topology violation` usually means
+  `load_project_agents` returned **zero** rows (`CoordinationRuntime::new` rejects an empty role set),
+  i.e. your members are already gone — not a workflow-definition problem.
+
+### Known-broken paths to re-check before writing them off as your own mistake
+
+(The first three were fixed in `a69d6dc`; keep them as regression checks, they are cheap.)
+
+- `保存 Workflow` (and any `update_project`: rename / default branch / archive) once **silently deleted
+  every project member**: `save_project` used `INSERT OR REPLACE INTO projects` while
+  `project_agents.project_id … ON DELETE CASCADE`, and rusqlite's bundled SQLite defaults
+  `SQLITE_DEFAULT_FOREIGN_KEYS=1`. Correct form is `INSERT … ON CONFLICT(id) DO UPDATE SET …`.
+  Always snapshot member count **in sqlite after a clean shutdown** before/after any project-level save.
+- `启动会话` on a member card once failed with `command create_session missing required key hostId`.
+  `host_id` is now `Option<String>` and the host/workspace are resolved from the project + member.
+  If it breaks again, create a session from the **首页 New session composer** if you only need *a*
+  session to test other surfaces.
+- Project archive/delete live on the **project board header** (`归档项目` / `删除项目`), not the sidebar;
+  both use `window.confirm`, and delete surfaces the raw backend error on the board with a
+  `强制删除并回收 worktree` follow-up button. Grep `web/src` for the command name before assuming an entry
+  point exists — e.g. rename / default-branch edit still have **no UI entry** (only archive calls
+  `update_project`).
+- Settings → Skill → **Browse** could report `暂无仓库 Skill` plus a banner
+  `local host I/O failed: No such file or directory (os error 2)` even when a valid
+  `.agents/skills/<x>/SKILL.md` existed in the session workspace (`join_remote_path` used `\` on
+  POSIX; fixed in `4d4d5e0`). Verify with a real SKILL.md + `.cursor/rules/*.md` you dropped in the
+  workspace yourself before concluding "the repo just has no skills", and check the listed paths use
+  `/` separators.
+- The session right rail's **Diff** panel (4th rail icon from the top → `Refresh`) lists changed files
+  since `b287ac6`; since `9229c87` each row renders the real `change.path` plus `changeType` and
+  `+additions/-deletions` (assert against `git diff --numstat HEAD`). Earlier builds rendered
+  `JSON.stringify(file)` and passed that string as `path`, so unreadable `{"additions":1,…}` rows and
+  a blank diff pane mean you are on a pre-`9229c87` frontend.
+  Layout: since `fe29895` the panel uses a **container query** (`.review-panel { container-type:
+  inline-size }` + `@container (min-width: 900px)`), so the narrow right rail renders single-column
+  (file list on top, `Select a changed file.` placeholder / diff below, `.diff-view` scrolling on its
+  own between 240-420px) and only wide containers get 2 columns. Between `b287ac6` and `a10e280` the
+  rail clipped the diff to a ~10px sliver (`a10e280`'s `@media (min-width: 900px)` was a *viewport*
+  query, useless for a ~180px rail) — if you see that sliver you are on an old frontend.
+  The 放大（独立窗口打开）pop-out is still useful for wide 2-column viewing, but note it opens at
+  ~575px, i.e. **single-column** until you maximize it past 900px.
+  Long paths are CSS-ellipsized with the full path in
+  `title` — hover to screenshot the tooltip, and check the diff header `diff --git a/<full path>` to
+  prove the click sent the full, untruncated path.
+  Since `a10e280` local `changeType` comes from `git diff --name-status --find-renames`
+  (added / modified / deleted / renamed); before that everything was hardcoded `modified`. Good
+  one-shot fixture to check the numstat↔name-status zip doesn't slip: in one repo state stage an
+  added file, a modified file, a `git rm`-ed file and a `git mv`-ed file, then compare all four rows.
+  File tree / Web IDE / Shell / Desktop / Browser tabs only exist for **non-local** hosts
+  (`App.tsx:7133-7145`), so with no RVM they are untestable.
+- (Fixed in `4d4d5e0`) Deleting a member/project now also runs `git branch -D <agent branch>`, so
+  `git branch --list 'agent/*'` should be empty afterwards and the same repo can be reused. Before
+  that fix a second project on the same repo failed with
+  `fatal: 'agent/code-1' is already used by worktree`.
+- (Fixed in `b287ac6`) `删除项目` used to be blocked as dirty for any project with a non-Lead member,
+  because OPCOS's own untracked `<repo>/worktrees/` dirtied the Lead checkout. The Lead dirty check
+  now filters that path and the empty container is `rmdir`-ed after cleanup. Regression recipe: with a
+  **clean** fixture repo, create project + Lead + Code member, then delete without force — it must
+  succeed and leave `git worktree list` at main only, `git branch --list 'agent/*'` empty, and no
+  `<repo>/worktrees` dir. Counter-check: modify a **tracked** file first; the delete must still fail
+  with `worktree has uncommitted changes; use force to remove it`, and force must not revert the edit.
+- After deleting a project, the retained session's workspace points at the removed worktree; opening
+  Settings → Skill then pops a red toast
+  `本机 workspace 不可用: local host I/O failed: No such file or directory (os error 2)`. Expected
+  fallout, not a Skill-discovery regression.
+- Adding the **first** member with a non-Lead role fails with
+  `store validation error: sort_order 0 project member must have Lead role` — always create the Lead
+  first.
+- (Fixed in `4d4d5e0`) Advancing past the last workflow stage now renders 当前阶段 as `已完成`
+  (previously `未启动`). Save a **single-stage** workflow to reach that state in one click.
+- `delete_project` keeps the member sessions and only nulls their `project_id`/`agent_id`; their
+  `workspace` then points at a deleted worktree. Expected today — assert on nulled ownership, not on
+  the session rows disappearing.
+- Slash-command completion only works in the **session** composer; the 首页 New session composer is not
+  passed `slashCommands`, so `/` there legitimately shows nothing.
+
+## Template / preset market (Settings → 市场)
+
+- Fresh config dir ⇒ 8 builtin templates are seeded (`main.rs:1322-1417`): agent Lead/Code/Review/
+  Test/DevOps, teams `Lead + Code + Review` and `Lead + Code + Review + Test + DevOps`, plus one
+  blueprint. Verify with
+  `python3 -c "import sqlite3; …select id,kind,name,status from config_object where scope_kind='template'"`.
+  Builtins render `内置模板只读。` + `另存为` only; there is **no** edit/delete UI at all
+  (`delete_template` has no frontend call site), so "builtins can't be deleted" can only be proven
+  at the UI level — say so rather than claiming the backend guard was exercised.
+- **Repository import/export must resolve `.agents/templates/*` against `project.repo_root`**
+  (`repository_path()`, added in `a658853`; local hosts concatenate `repo_root`, remote hosts derive
+  a workspace-relative path). Regression symptom if it ever reverts to the host root: 从仓库导入
+  aborts with a bare `"local host I/O failed: No such file or directory (os error 2)"` and imports
+  nothing (`LocalHost::secure_path` canonicalizes the missing `$HOME/.agents` parent), or the export
+  confirm dialog shows a `$HOME/.agents/...` target. **Always `rm -rf $HOME/.agents` before this
+  test and re-`ls` it after each import/export assertion** — an existing `$HOME/.agents` silently
+  masks the bug, and never create one as a fixture "workaround". Missing template directories are
+  non-fatal (the `ls` error path just `continue`s), so a repo with only `.agents/knowledge` +
+  `AGENTS.md` must still import those with an empty `rejected` list.
+- Import semantics to assert (they are per-record, `main.rs:6892`): first run `imported`, unchanged
+  re-run `unchanged` with empty `conflicts` (an all-`conflict` second run is the old bug), edited
+  source `updated` + version bump on the market card, malformed YAML and name-less YAML rejected
+  **individually** with full path + reason while the valid files still import.
+- Project 配置模板 lifecycle (fixed in `a658853`; `list_project_configuration_templates` now selects
+  `p.status`): checking copies the template into project scope and the box **stays ✓** across page
+  switches; unchecking pops `将删除项目作用域配置「…」`, and OK flips the row to `status='deleted'`;
+  re-checking revives it to `active` with the template's *current* content. If the box springs back
+  to unchecked and re-clicking just re-copies, the `applied` column mapping has regressed.
+  Verify state in sqlite: `config_object where scope_kind='project'`
+  (object id is `project-<project_id>-<template_id>`).
+- After the template source changes, a checked project copy keeps the old content and the row shows
+  `· 已本地修改`; re-checking then pops `重新勾选将用模板当前内容覆盖本地修改` and OK pulls the new
+  content. Good one-shot proof of copy-not-reference plus the overwrite warning.
+- Team-template project creation writes the workflow and copies checked config templates in one
+  command; assert `project_agents.sort_order=0` is Lead, `projects.workflow_json` stages, and the
+  project-scope `config_object`. On disk expect **N-1 worktrees**: the Lead uses the repo root and
+  gets the project's default branch (`main`) as of `a658853` — a Lead card showing `agent/lead-0`
+  is a regression, since that branch is never created.
+  Failure rollback works (non-git repo ⇒ explicit error, no project/member/worktree left).
+- Save-As duplicate names error with `同名自定义模板已存在: <name>`; assert no orphans by snapshotting
+  `count(config_object)` / `count(config_object_version)` before and after the failing retry.
+  当前项目另存为 Team reuses existing templates by kind + content hash (builtin first) as of
+  `a658853`, so it should add exactly **one** row (the Team template) — snapshot
+  `count(config_object)`/`count(config_object_version)` around it and check
+  `group by kind,name having count(*)>1` is empty.
+- New-session Agent template prefill: there is no visible system-prompt field; the prompt is stored
+  on session create as a session-scope `config_object` named `Agent template system prompt`
+  (`session-<id>-agent-template`). Read it from sqlite to prove prefill + manual edits survived.
+
+### Cheap, high-signal assertions for these surfaces
+
+- Secrets isolation: store a project secret, **plus a global control secret**, then open global
+  Settings → Secrets. An empty global list alone proves nothing — the control secret must be visible
+  while the project one is not. Back it with `secret_records(name, project_id)` and a counting-only
+  `grep -c` over `secrets.enc`.
+- Scope switching: the Devin tab's 配置作用域 `SelectMenu` overlays the rows below it — press `Escape`
+  and re-screenshot before clicking Computer use / Batch limit, or your clicks land on the dropdown.
+- Session↔worktree binding: after 启动会话, check the right-rail Info panel (HOST / WORKSPACE) for the
+  visual proof, and after a clean shutdown assert in sqlite that `sessions.workspace` equals the
+  member's `project_agents.worktree_path`, `host_id` equals the project host, and the agent has
+  exactly one session row. A duplicate-start attempt cannot be triggered from the UI (the button
+  becomes 打开会话) — report it as untested rather than passed.
+- Member delete: dirty the worktree first (`echo dirty > <wt>/dirty.txt`); the expected error is
+  `worktree has uncommitted changes…` with a 强制删除 button, and force must remove the directory
+  from disk, not just the card.
+
 ## Devin secrets needed
 
 - `RVM_WIN_TOKEN` — valid for DevBox `https://devbox.windevos.com` only (Antec `win.windevos.com`
