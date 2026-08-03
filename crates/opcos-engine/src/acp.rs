@@ -17,7 +17,63 @@ use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 
 type AcpTurnResult = Result<Option<opcos_provider::AssistantTurn>, HarnessError>;
 type AcpTurnReceiver = Arc<Mutex<Option<oneshot::Receiver<AcpTurnResult>>>>;
-type AcpTerminal = Arc<Mutex<Box<dyn HostProcess>>>;
+type AcpTerminalProcess = Arc<Mutex<Box<dyn HostProcess>>>;
+type AcpTerminal = Arc<AcpTerminalState>;
+
+struct AcpTerminalState {
+    output: Mutex<String>,
+    exit_status: Mutex<Option<Option<i32>>>,
+    truncated: Mutex<bool>,
+    output_byte_limit: Option<usize>,
+    interrupt: mpsc::Sender<()>,
+    exited: Notify,
+}
+
+impl AcpTerminalState {
+    fn new(output_byte_limit: Option<usize>) -> (Self, mpsc::Receiver<()>) {
+        let (interrupt, receiver) = mpsc::channel(1);
+        (
+            Self {
+                output: Mutex::new(String::new()),
+                exit_status: Mutex::new(None),
+                truncated: Mutex::new(false),
+                output_byte_limit,
+                interrupt,
+                exited: Notify::new(),
+            },
+            receiver,
+        )
+    }
+
+    async fn append(&self, text: &str) {
+        let mut output = self.output.lock().await;
+        output.push_str(text);
+        if let Some(limit) = self.output_byte_limit {
+            while output.len() > limit {
+                if let Some((index, _)) = output.char_indices().nth(1) {
+                    output.drain(..index);
+                } else {
+                    output.clear();
+                    break;
+                }
+                *self.truncated.lock().await = true;
+            }
+        }
+    }
+
+    async fn mark_exited(&self, code: Option<i32>) {
+        *self.exit_status.lock().await = Some(code);
+        self.exited.notify_waiters();
+    }
+
+    async fn snapshot(&self) -> (String, bool, Option<Option<i32>>) {
+        (
+            self.output.lock().await.clone(),
+            *self.truncated.lock().await,
+            *self.exit_status.lock().await,
+        )
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct AcpHarnessConfig {
@@ -566,6 +622,14 @@ where
                 .get("path")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+            if params.get("line").is_some() || params.get("limit").is_some() {
+                return state
+                    .error(
+                        id,
+                        "ACP fs/read_text_file line/limit slicing is not supported",
+                    )
+                    .await;
+            }
             match state.host.read(path).await {
                 Ok(file) => state.respond(id, json!({"content": file.content})).await,
                 Err(error) => state.error(id, &error.to_string()).await,
@@ -644,18 +708,31 @@ where
                 .spawn(SpawnRequest {
                     command,
                     cwd: params.get("cwd").and_then(Value::as_str).map(str::to_owned),
-                    env: params.get("env").cloned(),
+                    env: terminal_env(params.get("env"))?,
                     cols: 240,
                     rows: 64,
                 })
                 .await
                 .map_err(|error| HarnessError::External(error.to_string()))?;
             let terminal_id = format!("terminal-{}", state.next_id.fetch_add(1, Ordering::Relaxed));
+            let terminal_process = Arc::new(Mutex::new(process));
+            let (terminal_state, interrupt) = AcpTerminalState::new(
+                params
+                    .get("outputByteLimit")
+                    .and_then(Value::as_u64)
+                    .map(|limit| limit as usize),
+            );
+            let terminal_state = Arc::new(terminal_state);
+            tokio::spawn(drain_terminal(
+                terminal_process,
+                terminal_state.clone(),
+                interrupt,
+            ));
             state
                 .terminals
                 .lock()
                 .await
-                .insert(terminal_id.clone(), Arc::new(Mutex::new(process)));
+                .insert(terminal_id.clone(), terminal_state);
             state.respond(id, json!({"terminalId": terminal_id})).await
         }
         "terminal/output" => {
@@ -670,22 +747,12 @@ where
                 .get(terminal_id)
                 .cloned()
                 .ok_or_else(|| HarnessError::External("ACP terminal not found".into()))?;
-            let event = terminal
-                .lock()
-                .await
-                .next_event()
-                .await
-                .map_err(|error| HarnessError::External(error.to_string()))?;
-            let output = match event {
-                Some(opcos_hosts::ProcessEvent::Output(text)) => {
-                    json!({"output": text, "truncated": false})
-                }
-                Some(opcos_hosts::ProcessEvent::Exited(code)) => {
-                    json!({"output": "", "truncated": false, "exitStatus": {"exitCode": code}})
-                }
-                None => json!({"output": "", "truncated": false}),
-            };
-            state.respond(id, output).await
+            let (output, truncated, exit_status) = terminal.snapshot().await;
+            let mut result = json!({"output": output, "truncated": truncated});
+            if let Some(code) = exit_status {
+                result["exitStatus"] = json!({"exitCode": code});
+            }
+            state.respond(id, result).await
         }
         "terminal/wait_for_exit" => {
             let terminal_id = params
@@ -699,19 +766,15 @@ where
                 .get(terminal_id)
                 .cloned()
                 .ok_or_else(|| HarnessError::External("ACP terminal not found".into()))?;
-            let mut terminal = terminal.lock().await;
-            let mut exit_code = None;
-            while let Some(event) = terminal
-                .next_event()
-                .await
-                .map_err(|error| HarnessError::External(error.to_string()))?
-            {
-                if let opcos_hosts::ProcessEvent::Exited(code) = event {
-                    exit_code = code;
+            loop {
+                let notified = terminal.exited.notified();
+                if let Some(exit_code) = *terminal.exit_status.lock().await {
+                    state.respond(id, json!({"exitCode": exit_code})).await?;
                     break;
                 }
+                notified.await;
             }
-            state.respond(id, json!({"exitCode": exit_code})).await
+            Ok(())
         }
         "terminal/kill" => {
             let terminal_id = params
@@ -724,12 +787,9 @@ where
                 .await
                 .remove(terminal_id)
                 .ok_or_else(|| HarnessError::External("ACP terminal not found".into()))?;
-            terminal
-                .lock()
-                .await
-                .interrupt()
-                .await
-                .map_err(|error| HarnessError::External(error.to_string()))?;
+            terminal.interrupt.send(()).await.map_err(|_| {
+                HarnessError::External("ACP terminal process is unavailable".into())
+            })?;
             state.respond(id, json!({})).await
         }
         "terminal/release" => {
@@ -745,6 +805,40 @@ where
             state
                 .error(id, &format!("unsupported ACP client request: {method}"))
                 .await
+        }
+    }
+}
+
+async fn drain_terminal(
+    process: AcpTerminalProcess,
+    state: AcpTerminal,
+    mut interrupt: mpsc::Receiver<()>,
+) {
+    loop {
+        let event = tokio::select! {
+            event = async {
+                process.lock().await.next_event().await
+            } => event,
+            Some(()) = interrupt.recv() => {
+                let _ = process.lock().await.interrupt().await;
+                continue;
+            }
+            else => {
+                let _ = process.lock().await.interrupt().await;
+                state.mark_exited(None).await;
+                break;
+            }
+        };
+        match event {
+            Ok(Some(opcos_hosts::ProcessEvent::Output(text))) => state.append(&text).await,
+            Ok(Some(opcos_hosts::ProcessEvent::Exited(code))) => {
+                state.mark_exited(code).await;
+                break;
+            }
+            Ok(None) | Err(_) => {
+                state.mark_exited(None).await;
+                break;
+            }
         }
     }
 }
@@ -784,6 +878,30 @@ fn permission_option_ids(params: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn terminal_env(value: Option<&Value>) -> Result<Option<Value>, HarnessError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(entries) = value.as_array() else {
+        return Err(HarnessError::External(
+            "ACP terminal/create env must be an array".into(),
+        ));
+    };
+    let mut environment = serde_json::Map::new();
+    for entry in entries {
+        let name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| HarnessError::External("ACP terminal env entry lacks name".into()))?;
+        let value = entry
+            .get("value")
+            .and_then(Value::as_str)
+            .ok_or_else(|| HarnessError::External("ACP terminal env entry lacks value".into()))?;
+        environment.insert(name.into(), value.into());
+    }
+    Ok(Some(Value::Object(environment)))
+}
+
 fn config_workspace(workspace: &str) -> &str {
     workspace
 }
@@ -796,7 +914,7 @@ fn shell_quote(value: &str) -> String {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use opcos_hosts::LocalHost;
+    use opcos_hosts::{Host, LocalHost, ProcessEvent, SpawnRequest};
     use opcos_store::{SessionRecord, SqliteStore};
     use std::fs;
     use std::sync::Arc;
@@ -827,6 +945,96 @@ mod tests {
             permission_option_ids(&params),
             vec!["allow-once".to_owned(), "reject".to_owned()]
         );
+    }
+
+    #[test]
+    fn converts_acp_terminal_environment_array() {
+        let converted = terminal_env(Some(&json!([
+            {"name": "ACP_TEST", "value": "visible"}
+        ])))
+        .unwrap();
+        assert_eq!(converted, Some(json!({"ACP_TEST": "visible"})));
+    }
+
+    #[tokio::test]
+    async fn terminal_output_snapshot_keeps_complete_unicode_tail_after_exit() {
+        let (state, _) = AcpTerminalState::new(Some(6));
+        let state = Arc::new(state);
+        state.append("ab😀cd").await;
+        state.mark_exited(Some(0)).await;
+        let (output, truncated, exit_status) = state.snapshot().await;
+        assert_eq!(output, "😀cd");
+        assert!(truncated);
+        assert_eq!(exit_status, Some(Some(0)));
+        let (again, _, again_status) = state.snapshot().await;
+        assert_eq!(again, output);
+        assert_eq!(again_status, exit_status);
+    }
+
+    #[tokio::test]
+    async fn terminal_drain_preserves_output_for_output_and_wait_for_exit() {
+        let root = std::env::temp_dir();
+        let host = LocalHost::new(&root).unwrap();
+        let process = host
+            .spawn(SpawnRequest {
+                command: "printf 'first'; printf 'second'".into(),
+                cwd: None,
+                env: None,
+                cols: 80,
+                rows: 24,
+            })
+            .await
+            .unwrap();
+        let (state, interrupt) = AcpTerminalState::new(None);
+        let state = Arc::new(state);
+        tokio::spawn(drain_terminal(
+            Arc::new(Mutex::new(process)),
+            state.clone(),
+            interrupt,
+        ));
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if state.exit_status.lock().await.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let first = state.snapshot().await;
+        assert_eq!(first.0, "firstsecond");
+        assert_eq!(first.2, Some(Some(0)));
+        let second = state.snapshot().await;
+        assert_eq!(second, first);
+    }
+
+    #[tokio::test]
+    async fn converted_terminal_environment_reaches_child_process() {
+        let root = std::env::temp_dir();
+        let host = LocalHost::new(&root).unwrap();
+        let process = host
+            .spawn(SpawnRequest {
+                command: "printf \"$ACP_TEST\"".into(),
+                cwd: None,
+                env: terminal_env(Some(&json!([
+                    {"name": "ACP_TEST", "value": "visible"}
+                ])))
+                .unwrap(),
+                cols: 80,
+                rows: 24,
+            })
+            .await
+            .unwrap();
+        let mut process = process;
+        let mut output = String::new();
+        while let Some(event) = process.next_event().await.unwrap() {
+            match event {
+                ProcessEvent::Output(text) => output.push_str(&text),
+                ProcessEvent::Exited(_) => break,
+            }
+        }
+        assert_eq!(output, "visible");
     }
 
     #[test]

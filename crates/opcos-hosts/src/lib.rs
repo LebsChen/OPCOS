@@ -1373,15 +1373,21 @@ fn remote_capabilities(
         items: known
             .into_iter()
             .map(|name| {
-                let available = capabilities.available.iter().any(|item| item == name)
+                let available = name != "stdio"
+                    && (capabilities.available.iter().any(|item| item == name)
                     || (name == "process_stream"
-                        && capabilities.available.iter().any(|item| item == "pty"));
+                        && capabilities.available.iter().any(|item| item == "pty")));
                 Capability {
                     name: name.into(),
                     available,
                     source: "remote-probe".into(),
                     observed_at,
-                    reason: if name == "process_stream" && available {
+                    reason: if name == "stdio" {
+                        Some(
+                            "disabled: RVM only exposes PTY/WebSocket streams, which are unsafe for structured stdio"
+                                .into(),
+                        )
+                    } else if name == "process_stream" && available {
                         Some(
                             "uses remote PTY bytes; echo, control sequences, wrapping, and no exit code may affect structured output"
                                 .into(),
@@ -1410,6 +1416,29 @@ mod tests {
         assert!(command.contains("chmod 600"));
         assert!(command.contains(&path));
         assert!(remote_env_file(Some(&env)).unwrap().contains(sentinel));
+    }
+
+    #[test]
+    fn remote_structured_stdio_is_always_unavailable() {
+        let observed_at = Utc::now();
+        let capabilities = remote_capabilities(
+            RvmCapabilities {
+                available: vec!["stdio".into(), "pty".into()],
+            },
+            observed_at,
+        );
+        let stdio = capabilities
+            .items
+            .iter()
+            .find(|item| item.name == "stdio")
+            .unwrap();
+        assert!(!stdio.available);
+        assert_eq!(
+            stdio.reason.as_deref(),
+            Some(
+                "disabled: RVM only exposes PTY/WebSocket streams, which are unsafe for structured stdio"
+            )
+        );
     }
     use std::fs;
 
