@@ -3,7 +3,6 @@ import { listen } from "@tauri-apps/api/event";
 import {
   Component,
   FormEvent,
-  Fragment,
   ReactNode,
   useEffect,
   useMemo,
@@ -39,6 +38,7 @@ import { SettingsView, type SettingsSection } from "./components/SettingsView";
 import { Icon } from "./components/Icon";
 import type { Item } from "./types";
 import { CollectionPage } from "./components/CollectionPage";
+import { IntegrationCard } from "./components/IntegrationCard";
 import { getLocale, setLocale, subscribeLocale, translate } from "./i18n";
 import "./openworker-tailwind.css";
 import "./openworker-styles.css";
@@ -1410,36 +1410,42 @@ function ManageSections({
                   (item) => item.provider === descriptor.name,
                 );
                 return (
-                  <button
+                  <IntegrationCard
                     key={descriptor.name}
-                    className="flex items-center gap-2.5 rounded-xl border border-line bg-panel px-3 py-2.5 text-left hover:border-lineStrong transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+                    icon={descriptor.title.slice(0, 1)}
+                    title={descriptor.title}
+                    badge={{
+                      label:
+                        descriptor.available === false
+                          ? "Not integrated"
+                          : config?.configured
+                            ? "Enabled"
+                            : "Not configured",
+                      tone:
+                        descriptor.available === false || !config?.configured
+                          ? "neutral"
+                          : "success",
+                    }}
+                    description={
+                      descriptor.available === false
+                        ? "Not integrated."
+                        : config?.configured
+                          ? "Configured securely."
+                          : config?.base_url || "Not configured yet."
+                    }
                     disabled={descriptor.available === false}
                     onClick={() =>
                       descriptor.available !== false &&
                       setSelectedProvider(descriptor.name)
                     }
-                  >
-                    <span className="rounded-lg border border-line grid place-items-center shrink-0 w-8 h-8 bg-paper">
-                      <span className="text-[13px] font-semibold text-muted">
-                        {descriptor.title.slice(0, 1)}
-                      </span>
-                    </span>
-                    <span className="min-w-0 flex-1">
-                      <span className="block text-[13px] font-semibold leading-tight truncate">
-                        {descriptor.title}
-                      </span>
-                      <span className="block text-[11.5px] text-faint truncate">
-                        {descriptor.available === false
-                          ? "Not integrated."
-                          : config?.configured
-                            ? "✓ Configured securely."
-                            : config?.base_url
-                              ? config.base_url
-                              : "Not configured yet."}
-                      </span>
-                    </span>
-                    <span className="text-faint text-[14px]">›</span>
-                  </button>
+                    actions={
+                      descriptor.available !== false ? (
+                        <span className="ml-auto text-faint text-[14px]">
+                          ›
+                        </span>
+                      ) : undefined
+                    }
+                  />
                 );
               })}
             </div>
@@ -1748,76 +1754,63 @@ function ManageSections({
               hosts.length ? (
                 <div className="grid grid-cols-2 xl:grid-cols-3 gap-2.5">
                   {hosts.map((host) => (
-                    <div
-                      className="rounded-xl border border-line bg-panel px-3.5 py-3 flex flex-col gap-2.5"
+                    <IntegrationCard
                       key={host.id}
-                    >
-                      <div className="flex items-center gap-2.5 min-w-0">
-                        <span className="rounded-lg border border-line grid place-items-center shrink-0 w-8 h-8 bg-paper">
-                          <span className="text-[13px] font-semibold text-muted">
-                            {host.name.slice(0, 1).toUpperCase()}
-                          </span>
-                        </span>
-                        <span className="min-w-0 flex-1">
-                          <span className="block text-[13px] font-semibold leading-tight truncate">
-                            {host.name}
-                          </span>
-                          <span
-                            className={
-                              "block text-[11.5px] " +
-                              (host.online === true
-                                ? "status-online"
-                                : host.online === false
-                                  ? "status-offline"
-                                  : "status-unknown")
-                            }
-                          >
-                            {hostStatusLabel(host)}
-                          </span>
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        {!host.builtin && (
+                      icon={host.name.slice(0, 1).toUpperCase()}
+                      title={host.name}
+                      badge={{
+                        label: hostStatusLabel(host),
+                        tone: host.online === true ? "success" : "neutral",
+                      }}
+                      description={
+                        host.online === false ? (
+                          <span className="status-offline">Offline</span>
+                        ) : undefined
+                      }
+                      actions={
+                        <>
+                          {!host.builtin && (
+                            <Button
+                              onClick={() => {
+                                void onEditHost(host)
+                                  .then(() => setHostFormOpen(true))
+                                  .catch(onError);
+                              }}
+                            >
+                              Edit
+                            </Button>
+                          )}
                           <Button
+                            disabled={host.builtin || testingHostId === host.id}
                             onClick={() => {
-                              void onEditHost(host)
-                                .then(() => setHostFormOpen(true))
-                                .catch(onError);
+                              setTestingHostId(host.id);
+                              void onTestHost(host.id)
+                                .catch(onError)
+                                .finally(() => setTestingHostId(null));
                             }}
                           >
-                            Edit
+                            {testingHostId === host.id ? "Testing…" : "Test"}
                           </Button>
-                        )}
-                        <Button
-                          disabled={host.builtin || testingHostId === host.id}
-                          onClick={() => {
-                            setTestingHostId(host.id);
-                            void onTestHost(host.id)
-                              .catch(onError)
-                              .finally(() => setTestingHostId(null));
-                          }}
-                        >
-                          {testingHostId === host.id ? "Testing…" : "Test"}
-                        </Button>
-                        <Button
-                          className="danger"
-                          disabled={host.builtin}
-                          onClick={() => {
-                            if (confirmDeleteHostId === host.id) {
-                              void onDeleteHost(host.id)
-                                .then(() => setConfirmDeleteHostId(null))
-                                .catch(onError);
-                            } else {
-                              setConfirmDeleteHostId(host.id);
-                            }
-                          }}
-                        >
-                          {confirmDeleteHostId === host.id
-                            ? "Confirm delete"
-                            : "Delete"}
-                        </Button>
-                      </div>
-                    </div>
+                          <Button
+                            className="danger"
+                            disabled={host.builtin}
+                            onClick={() => {
+                              if (confirmDeleteHostId === host.id) {
+                                void onDeleteHost(host.id)
+                                  .then(() => setConfirmDeleteHostId(null))
+                                  .catch(onError);
+                              } else {
+                                setConfirmDeleteHostId(host.id);
+                              }
+                            }}
+                          >
+                            {confirmDeleteHostId === host.id
+                              ? "Confirm delete"
+                              : "Delete"}
+                          </Button>
+                        </>
+                      }
+                    />
                   ))}
                 </div>
               ) : null
@@ -2548,7 +2541,7 @@ function ManageSections({
                 Default connector catalog from OpenWorker. OPCOS only enables
                 integrations that are implemented locally.
               </p>
-              <div className="manage-list mt-4">
+              <div className="grid grid-cols-2 xl:grid-cols-3 gap-2.5 mt-4">
                 {OPENWORKER_CONNECTORS.map((connector) => {
                   const connectorKind = connector.name.toLowerCase();
                   const tokenIntegrated = [
@@ -2576,104 +2569,140 @@ function ManageSections({
                           : "Configurable"
                         : "Not integrated";
                   return (
-                    <Fragment key={connector.name}>
-                      <div className="manage-row px-4">
-                        <span>
-                          <strong>{connector.name}</strong>
-                          <small>{connector.description}</small>
-                        </span>
-                        <span className="flex items-center gap-2">
-                          <span className="muted">{status}</span>
-                          {tokenIntegrated ? (
-                            <Button
-                              className="bordered"
-                              onClick={() =>
-                                setOpenConnector((value) =>
-                                  value === connectorKind
-                                    ? null
-                                    : connectorKind,
-                                )
-                              }
-                            >
-                              {openConnector === connectorKind
-                                ? "Close"
-                                : "Configure"}
-                            </Button>
-                          ) : !integrated ? (
-                            <Button className="bordered" disabled>
-                              Unavailable
-                            </Button>
-                          ) : null}
-                        </span>
-                      </div>
-                      {tokenIntegrated && openConnector === connectorKind && (
-                        <div className="manage-row px-4">
-                          <label className="field-label flex-1">
-                            {connector.name} token
-                            <input
-                              type="password"
-                              value={connectorTokens[connectorKind] || ""}
-                              placeholder={
-                                tokenStatus?.connected ? "Stored securely" : ""
-                              }
-                              onChange={(event) =>
-                                setConnectorTokens((items) => ({
-                                  ...items,
-                                  [connectorKind]: event.target.value,
-                                }))
-                              }
-                            />
-                          </label>
+                    <IntegrationCard
+                      key={connector.name}
+                      icon={connector.name.slice(0, 1)}
+                      title={connector.name}
+                      badge={{
+                        label:
+                          tokenIntegrated && tokenStatus?.connected
+                            ? "Connected"
+                            : status === "Configurable"
+                              ? "Configurable"
+                              : status === "Connected"
+                                ? "Connected"
+                                : "Not integrated",
+                        tone:
+                          (tokenIntegrated && tokenStatus?.connected) ||
+                          status === "Connected"
+                            ? "success"
+                            : status === "Configurable"
+                              ? "info"
+                              : "neutral",
+                      }}
+                      description={connector.description}
+                      disabled={!tokenIntegrated}
+                      onClick={
+                        tokenIntegrated
+                          ? () =>
+                              setOpenConnector((value) =>
+                                value === connectorKind ? null : connectorKind,
+                              )
+                          : undefined
+                      }
+                      actions={
+                        tokenIntegrated ? (
                           <Button
-                            className="primary self-end"
+                            className="bordered"
                             onClick={() =>
-                              command<TokenConnectorStatus>("connector_save", {
-                                kind: connectorKind,
-                                token: connectorTokens[connectorKind] || "",
-                              })
-                                .then((value) => {
-                                  setConnectorStatuses((items) => ({
-                                    ...items,
-                                    [connectorKind]: value,
-                                  }));
-                                  setConnectorTokens((items) => ({
-                                    ...items,
-                                    [connectorKind]: "",
-                                  }));
-                                  setConnectorMessages((items) => ({
-                                    ...items,
-                                    [connectorKind]: `Connected as ${value.identity || "bot"}.`,
-                                  }));
-                                })
-                                .catch((error) => {
-                                  setConnectorMessages((items) => ({
-                                    ...items,
-                                    [connectorKind]: errorMessage(error),
-                                  }));
-                                })
+                              setOpenConnector((value) =>
+                                value === connectorKind ? null : connectorKind,
+                              )
                             }
                           >
-                            Save & verify
+                            {openConnector === connectorKind
+                              ? "Close"
+                              : "Configure"}
                           </Button>
-                          {connectorMessages[connectorKind] && (
-                            <small
-                              className={
-                                connectorMessages[connectorKind].startsWith(
-                                  "Connected",
-                                )
-                                  ? "success"
-                                  : "failure"
-                              }
-                            >
-                              {connectorMessages[connectorKind]}
-                            </small>
-                          )}
-                        </div>
-                      )}
-                    </Fragment>
+                        ) : !integrated ? (
+                          <Button className="bordered" disabled>
+                            Unavailable
+                          </Button>
+                        ) : undefined
+                      }
+                    />
                   );
                 })}
               </div>
+              {openConnector &&
+                OPENWORKER_CONNECTORS.some(
+                  (connector) =>
+                    connector.name.toLowerCase() === openConnector &&
+                    ["github", "telegram", "discord", "slack"].includes(
+                      openConnector,
+                    ),
+                ) && (
+                  <div className="manage-row mt-2 px-4">
+                    <label className="field-label flex-1">
+                      {
+                        OPENWORKER_CONNECTORS.find(
+                          (connector) =>
+                            connector.name.toLowerCase() === openConnector,
+                        )?.name
+                      }{" "}
+                      token
+                      <input
+                        type="password"
+                        value={connectorTokens[openConnector] || ""}
+                        placeholder={
+                          connectorStatuses[openConnector]?.connected
+                            ? "Stored securely"
+                            : ""
+                        }
+                        onChange={(event) =>
+                          setConnectorTokens((items) => ({
+                            ...items,
+                            [openConnector]: event.target.value,
+                          }))
+                        }
+                      />
+                    </label>
+                    <Button
+                      className="primary self-end"
+                      onClick={() =>
+                        command<TokenConnectorStatus>("connector_save", {
+                          kind: openConnector,
+                          token: connectorTokens[openConnector] || "",
+                        })
+                          .then((value) => {
+                            setConnectorStatuses((items) => ({
+                              ...items,
+                              [openConnector]: value,
+                            }));
+                            setConnectorTokens((items) => ({
+                              ...items,
+                              [openConnector]: "",
+                            }));
+                            setConnectorMessages((items) => ({
+                              ...items,
+                              [openConnector]: `Connected as ${value.identity || "bot"}.`,
+                            }));
+                          })
+                          .catch((error) => {
+                            setConnectorMessages((items) => ({
+                              ...items,
+                              [openConnector]: errorMessage(error),
+                            }));
+                          })
+                      }
+                    >
+                      Save & verify
+                    </Button>
+                    {connectorMessages[openConnector] && (
+                      <small
+                        className={
+                          connectorMessages[openConnector].startsWith(
+                            "Connected",
+                          )
+                            ? "success"
+                            : "failure"
+                        }
+                      >
+                        {connectorMessages[openConnector]}
+                      </small>
+                    )}
+                  </div>
+                )}
             </div>
             <div className="rounded-xl2 border border-line bg-panel p-5">
               <h2 className="text-[15px] font-semibold text-ink">
@@ -3051,35 +3080,45 @@ function McpManage({
   };
   return (
     <>
-      <div className="manage-card mb-4">
-        <div className="manage-row px-4">
-          <span>
-            <strong>Devin MCP</strong>
-            <small>https://mcp.devin.ai/mcp · Streamable HTTP</small>
-          </span>
-          <Button
-            className="bordered"
-            disabled={
-              devinMcpSaving ||
-              servers.some((server) => String(server.id) === "devin-mcp")
-            }
-            onClick={addDevinMcp}
-          >
-            {devinMcpSaving
-              ? "Adding…"
-              : servers.some((server) => String(server.id) === "devin-mcp")
-                ? "Added"
-                : "Add Devin MCP"}
-          </Button>
-        </div>
+      <div className="grid grid-cols-2 xl:grid-cols-3 gap-2.5 mb-4">
+        <IntegrationCard
+          icon="D"
+          title="Devin MCP"
+          badge={{
+            label: servers.some((server) => String(server.id) === "devin-mcp")
+              ? "Enabled"
+              : "Not configured",
+            tone: servers.some((server) => String(server.id) === "devin-mcp")
+              ? "success"
+              : "neutral",
+          }}
+          description="https://mcp.devin.ai/mcp · Streamable HTTP"
+          actions={
+            <Button
+              className="bordered"
+              disabled={
+                devinMcpSaving ||
+                servers.some((server) => String(server.id) === "devin-mcp")
+              }
+              onClick={addDevinMcp}
+            >
+              {devinMcpSaving
+                ? "Adding…"
+                : servers.some((server) => String(server.id) === "devin-mcp")
+                  ? "Added"
+                  : "Add Devin MCP"}
+            </Button>
+          }
+        />
       </div>
       <CollectionPage
         search={search}
         onSearch={setSearch}
         searchPlaceholder={translate("searchMcp")}
+        bare
         rows={
           filtered.length || servers.length ? (
-            <>
+            <div className="grid grid-cols-2 xl:grid-cols-3 gap-2.5">
               {servers
                 .filter((server) =>
                   String(server.name)
@@ -3087,56 +3126,61 @@ function McpManage({
                     .includes(search.toLowerCase()),
                 )
                 .map((server) => (
-                  <div className="manage-row px-4" key={String(server.id)}>
-                    <span>
-                      <strong>{String(server.name)}</strong>
-                      <small>
-                        {String(server.transport || "remote")} ·{" "}
-                        {String(server.status || "configured")}
-                      </small>
-                    </span>
-                    <Button
-                      onClick={() =>
-                        command("retry_mcp_server", {
-                          serverId: String(server.id),
-                        })
-                          .then(() =>
-                            command<Array<Record<string, unknown>>>(
-                              "list_mcp_servers",
-                            ),
-                          )
-                          .then(setServers)
-                          .catch(onError)
-                      }
-                    >
-                      Retry
-                    </Button>
-                  </div>
+                  <IntegrationCard
+                    icon={String(server.name).slice(0, 1).toUpperCase()}
+                    title={String(server.name)}
+                    badge={{
+                      label: String(server.status || "configured"),
+                      tone:
+                        String(server.status || "").toLowerCase() === "error"
+                          ? "neutral"
+                          : "success",
+                    }}
+                    description={`${String(server.transport || "remote")} · ${String(server.url || "configured")}`}
+                    actions={
+                      <Button
+                        onClick={() =>
+                          command("retry_mcp_server", {
+                            serverId: String(server.id),
+                          })
+                            .then(() =>
+                              command<Array<Record<string, unknown>>>(
+                                "list_mcp_servers",
+                              ),
+                            )
+                            .then(setServers)
+                            .catch(onError)
+                        }
+                      >
+                        Retry
+                      </Button>
+                    }
+                    key={String(server.id)}
+                  />
                 ))}
               {filtered.map((tool) => (
-                <div className="manage-row px-4" key={String(tool.name)}>
-                  <span>
-                    <strong>{String(tool.name)}</strong>
-                    <small>
-                      {String(tool.transport || "remote")} ·{" "}
-                      {String(tool.command || tool.url || "host-provided")} ·
-                      Enabled
-                    </small>
-                  </span>
-                  <Button
-                    onClick={() =>
-                      command("set_mcp_tool_enabled", {
-                        sessionId: selected?.id,
-                        name: String(tool.name),
-                        enabled: true,
-                      }).catch(onError)
-                    }
-                  >
-                    Enable
-                  </Button>
-                </div>
+                <IntegrationCard
+                  icon={String(tool.name).slice(0, 1).toUpperCase()}
+                  title={String(tool.name)}
+                  badge={{ label: "Enabled", tone: "success" }}
+                  description={`${String(tool.transport || "remote")} · ${String(tool.command || tool.url || "host-provided")}`}
+                  actions={
+                    <Button
+                      onClick={() =>
+                        command("set_mcp_tool_enabled", {
+                          sessionId: selected?.id,
+                          name: String(tool.name),
+                          enabled: true,
+                        }).catch(onError)
+                      }
+                    >
+                      Enable
+                    </Button>
+                  }
+                  key={String(tool.name)}
+                />
               ))}
-            </>
+            </div>
           ) : null
         }
         empty={
