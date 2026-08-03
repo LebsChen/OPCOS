@@ -232,6 +232,7 @@ const JOB_OUTPUT_LIMIT_BYTES: u64 = 32 * 1024 * 1024;
 #[serde(rename_all = "snake_case")]
 pub enum BackgroundJobStatus {
     Running,
+    Terminating,
     Exited,
     Signaled,
     Killed,
@@ -400,7 +401,10 @@ impl BackgroundJobManager {
                 }
             }
             let mut current = state.lock().await;
-            if current.snapshot.status == BackgroundJobStatus::Running {
+            if current.snapshot.status == BackgroundJobStatus::Terminating {
+                current.snapshot.status = BackgroundJobStatus::Killed;
+                current.snapshot.finished_at = Some(Utc::now());
+            } else if current.snapshot.status == BackgroundJobStatus::Running {
                 current.snapshot.status = terminal_status.unwrap_or(BackgroundJobStatus::Failed);
                 current.snapshot.finished_at = Some(Utc::now());
             }
@@ -484,11 +488,21 @@ impl BackgroundJobManager {
         })?;
         let mut current = state.lock().await;
         if current.snapshot.status == BackgroundJobStatus::Running {
-            if let Some(kill) = current.kill.take() {
-                let _ = kill.send(());
+            match current.kill.take() {
+                Some(kill) => {
+                    if kill.send(()).is_ok() {
+                        current.snapshot.status = BackgroundJobStatus::Terminating;
+                        current.snapshot.finished_at = None;
+                    } else {
+                        current.snapshot.status = BackgroundJobStatus::Failed;
+                        current.snapshot.finished_at = Some(Utc::now());
+                    }
+                }
+                None => {
+                    current.snapshot.status = BackgroundJobStatus::Failed;
+                    current.snapshot.finished_at = Some(Utc::now());
+                }
             }
-            current.snapshot.status = BackgroundJobStatus::Killed;
-            current.snapshot.finished_at = Some(Utc::now());
         }
         Ok(current.snapshot.clone())
     }
@@ -1975,7 +1989,18 @@ mod tests {
         assert_eq!(history.text, "line-1\nline-2");
         assert_eq!(history.omitted_after, 18);
         let killed = manager.kill(&started.job_id).await.unwrap();
-        assert_eq!(killed.status, BackgroundJobStatus::Killed);
+        assert_eq!(killed.status, BackgroundJobStatus::Terminating);
+        for _ in 0..50 {
+            if manager.status(&started.job_id).await.unwrap().status == BackgroundJobStatus::Killed
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            manager.status(&started.job_id).await.unwrap().status,
+            BackgroundJobStatus::Killed
+        );
         manager.cleanup_finished(chrono::Duration::zero()).await;
         assert!(manager.status(&started.job_id).await.is_err());
         assert!(!std::path::Path::new(&started.output_path).exists());
