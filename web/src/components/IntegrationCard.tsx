@@ -25,7 +25,7 @@ export function IntegrationCard({
   const clickable = Boolean(onClick) && !disabled;
   return (
     <div
-      className={`w-full max-w-[440px] rounded-xl border border-line bg-panel px-3.5 py-3 transition-colors ${
+      className={`w-full min-w-[220px] max-w-[440px] rounded-xl border border-line bg-panel px-3.5 py-3 transition-colors ${
         clickable ? "cursor-pointer hover:border-lineStrong" : ""
       } ${disabled ? "opacity-60" : ""}`}
       onClick={clickable ? onClick : undefined}
@@ -39,7 +39,7 @@ export function IntegrationCard({
       tabIndex={clickable ? 0 : undefined}
       aria-disabled={disabled || undefined}
     >
-      <div className="flex items-center gap-2.5 min-w-0">
+      <div className="flex flex-wrap items-center gap-2.5 min-w-0">
         <span className="rounded-lg border border-line grid place-items-center shrink-0 w-8 h-8 bg-paper">
           <span className="text-[13px] font-semibold text-muted">{icon}</span>
         </span>

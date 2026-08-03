@@ -1646,7 +1646,7 @@ function ManageSections({
         )}
         {tab === "provider" &&
           (selectedProvider === null ? (
-            <div className="grid grid-cols-2 xl:grid-cols-3 gap-2.5">
+            <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-2.5">
               {providers.map((descriptor) => {
                 const config = providerConfigs.find(
                   (item) => item.provider === descriptor.name,
@@ -1994,7 +1994,7 @@ function ManageSections({
             bare
             rows={
               hosts.length ? (
-                <div className="grid grid-cols-2 xl:grid-cols-3 gap-2.5">
+                <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-2.5">
                   {hosts.map((host) => (
                     <IntegrationCard
                       key={host.id}
@@ -2788,7 +2788,7 @@ function ManageSections({
                 </>
               )}
               {!openConnector && (
-                <div className="grid grid-cols-2 xl:grid-cols-3 gap-2.5 mt-4">
+                <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-2.5 mt-4">
                   {OPENWORKER_CONNECTORS.map((connector) => {
                     const connectorKind = connector.name.toLowerCase();
                     const configurable =
@@ -3491,7 +3491,7 @@ function McpManage({
   };
   return (
     <>
-      <div className="grid grid-cols-2 xl:grid-cols-3 gap-2.5 mb-4">
+      <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-2.5 mb-4">
         <IntegrationCard
           icon="D"
           title="Devin MCP"
@@ -3529,7 +3529,7 @@ function McpManage({
         bare
         rows={
           filtered.length || servers.length ? (
-            <div className="grid grid-cols-2 xl:grid-cols-3 gap-2.5">
+            <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-2.5">
               {servers
                 .filter((server) =>
                   String(server.name)
