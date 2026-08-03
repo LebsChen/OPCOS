@@ -1008,6 +1008,12 @@ function ProjectConfigPanel({
   const [secretPurpose, setSecretPurpose] = useState("");
   const [secretValue, setSecretValue] = useState("");
   const [secretFormOpen, setSecretFormOpen] = useState(false);
+  const [providerName, setProviderName] = useState("");
+  const [providerKey, setProviderKey] = useState("");
+  const [mcpServerId, setMcpServerId] = useState("");
+  const [mcpCredential, setMcpCredential] = useState("");
+  const [connectorKind, setConnectorKind] = useState("");
+  const [connectorToken, setConnectorToken] = useState("");
   const load = async () => {
     const [nextAssets, nextSecrets] = await Promise.all([
       command<Asset[]>("list_assets", { projectId: project.id }),
@@ -1233,6 +1239,101 @@ function ProjectConfigPanel({
               )}
             </div>
           ))}
+        </div>
+      </div>
+      <div className="mt-6 grid gap-3 border-t border-line pt-5">
+        <h3 className="font-medium text-ink">项目运行凭据</h3>
+        <p className="text-xs text-faint">
+          凭据只显示输入状态，保存后按项目优先、全局回退读取。
+        </p>
+        <div className="grid gap-3 md:grid-cols-2">
+          <div className="grid gap-2 rounded-lg border border-line p-3">
+            <strong className="text-sm text-ink">Provider key</strong>
+            <input
+              value={providerName}
+              onChange={(event) => setProviderName(event.target.value)}
+              placeholder="Provider ID"
+            />
+            <input
+              type="password"
+              value={providerKey}
+              onChange={(event) => setProviderKey(event.target.value)}
+              placeholder="Provider key"
+            />
+            <button
+              className="btn"
+              disabled={!providerName || !providerKey}
+              onClick={() =>
+                command("save_provider_key", {
+                  provider: providerName,
+                  key: providerKey,
+                  projectId: project.id,
+                })
+                  .then(() => setProviderKey(""))
+                  .catch(onError)
+              }
+            >
+              保存 Provider key
+            </button>
+          </div>
+          <div className="grid gap-2 rounded-lg border border-line p-3">
+            <strong className="text-sm text-ink">MCP credential</strong>
+            <input
+              value={mcpServerId}
+              onChange={(event) => setMcpServerId(event.target.value)}
+              placeholder="MCP server ID"
+            />
+            <input
+              type="password"
+              value={mcpCredential}
+              onChange={(event) => setMcpCredential(event.target.value)}
+              placeholder="Credential JSON"
+            />
+            <button
+              className="btn"
+              disabled={!mcpServerId || !mcpCredential}
+              onClick={() =>
+                command("save_mcp_credential", {
+                  serverId: mcpServerId,
+                  value: mcpCredential,
+                  projectId: project.id,
+                })
+                  .then(() => setMcpCredential(""))
+                  .catch(onError)
+              }
+            >
+              保存 MCP credential
+            </button>
+          </div>
+          <div className="grid gap-2 rounded-lg border border-line p-3">
+            <strong className="text-sm text-ink">Connector token</strong>
+            <input
+              value={connectorKind}
+              onChange={(event) => setConnectorKind(event.target.value)}
+              placeholder="Connector kind"
+            />
+            <input
+              type="password"
+              value={connectorToken}
+              onChange={(event) => setConnectorToken(event.target.value)}
+              placeholder="Token"
+            />
+            <button
+              className="btn"
+              disabled={!connectorKind || !connectorToken}
+              onClick={() =>
+                command("save_connector_token", {
+                  kind: connectorKind,
+                  value: connectorToken,
+                  projectId: project.id,
+                })
+                  .then(() => setConnectorToken(""))
+                  .catch(onError)
+              }
+            >
+              保存 Connector token
+            </button>
+          </div>
         </div>
       </div>
     </section>
@@ -2625,6 +2726,7 @@ function ManageSections({
                               ? command("save_provider_key", {
                                   provider: descriptor.name,
                                   key: providerKeys[descriptor.name],
+                                  projectId: null,
                                 })
                               : undefined,
                           )
@@ -2753,7 +2855,13 @@ function ManageSections({
                     provider,
                     baseUrl: baseUrl || null,
                   })
-                    .then(() => command("save_provider_key", { provider, key }))
+                    .then(() =>
+                      command("save_provider_key", {
+                        provider,
+                        key,
+                        projectId: null,
+                      }),
+                    )
                     .then(() =>
                       command<boolean>("validate_provider_key", { provider }),
                     )

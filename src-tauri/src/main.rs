@@ -2043,9 +2043,10 @@ fn clear_project_configuration(state: &DesktopState, project_id: &str) -> Result
             .map_err(|error| error.to_string())?
     };
     for name in secret_names {
+        let (prefix, id) = project_secret_descriptor(&name);
         state
             .secrets
-            .delete(&project_secret_key(project_id, "asset-secret", &name))
+            .delete(&project_secret_key(project_id, prefix, id))
             .map_err(|error| error.to_string())?;
     }
     connection
@@ -2055,6 +2056,17 @@ fn clear_project_configuration(state: &DesktopState, project_id: &str) -> Result
         )
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn project_secret_descriptor(name: &str) -> (&str, &str) {
+    name.split_once(':')
+        .filter(|(prefix, _)| {
+            matches!(
+                *prefix,
+                "provider-key" | "mcp-credential" | "connector-token"
+            )
+        })
+        .unwrap_or(("asset-secret", name))
 }
 
 #[tauri::command]
@@ -9492,7 +9504,8 @@ fn list_secret_metadata(
     let mut statement = connection
         .prepare(
             "SELECT name,scope,purpose,project_id FROM secret_records
-             WHERE (?1 IS NULL OR project_id=?1 OR project_id='')
+             WHERE (?1 IS NULL AND project_id='')
+                OR (?1 IS NOT NULL AND (project_id=?1 OR project_id=''))
              ORDER BY name",
         )
         .map_err(|error| error.to_string())?;
@@ -9542,20 +9555,95 @@ fn save_provider_key(
     state: State<'_, DesktopState>,
     provider: String,
     key: String,
+    project_id: Option<String>,
 ) -> Result<(), String> {
     if key.trim().is_empty() {
         return Err("provider key cannot be empty".into());
     }
+    let secret_key_value = project_id
+        .as_deref()
+        .map(|id| project_secret_key(id, "provider-key", &provider))
+        .unwrap_or_else(|| secret_key("provider-key", &provider));
     state
         .secrets
-        .set(&secret_key("provider-key", &provider), &key)
+        .set(&secret_key_value, &key)
         .map_err(|error| error.to_string())?;
+    if let Some(project_id) = project_id {
+        record_project_secret(&state, &format!("provider-key:{provider}"), &project_id)?;
+    }
     audit(
         &state,
         "",
         "provider_key_saved",
         json!({"provider": provider}),
     );
+    Ok(())
+}
+
+#[tauri::command]
+fn save_mcp_credential(
+    state: State<'_, DesktopState>,
+    server_id: String,
+    value: String,
+    project_id: Option<String>,
+) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err("MCP credential cannot be empty".into());
+    }
+    let key = project_id
+        .as_deref()
+        .map(|id| project_secret_key(id, "mcp-credential", &server_id))
+        .unwrap_or_else(|| secret_key("mcp-credential", &server_id));
+    state
+        .secrets
+        .set(&key, &value)
+        .map_err(|error| error.to_string())?;
+    if let Some(project_id) = project_id {
+        record_project_secret(&state, &format!("mcp-credential:{server_id}"), &project_id)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn save_connector_token(
+    state: State<'_, DesktopState>,
+    kind: String,
+    value: String,
+    project_id: Option<String>,
+) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err("connector token cannot be empty".into());
+    }
+    let key = project_id
+        .as_deref()
+        .map(|id| project_secret_key(id, "connector-token", &kind))
+        .unwrap_or_else(|| secret_key("connector-token", &kind));
+    state
+        .secrets
+        .set(&key, &value)
+        .map_err(|error| error.to_string())?;
+    if let Some(project_id) = project_id {
+        record_project_secret(&state, &format!("connector-token:{kind}"), &project_id)?;
+    }
+    Ok(())
+}
+
+fn record_project_secret(state: &DesktopState, name: &str, project_id: &str) -> Result<(), String> {
+    state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .execute(
+            "INSERT OR REPLACE INTO secret_records(name,scope,purpose,project_id)
+             VALUES (?1,?2,?3,?4)",
+            params![
+                name,
+                format!("project:{project_id}"),
+                "project secret",
+                project_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -9967,6 +10055,8 @@ fn main() {
             provider_configurations,
             save_provider_settings,
             save_provider_key,
+            save_mcp_credential,
+            save_connector_token,
             delete_provider_key,
             validate_provider_key,
             start_surface,
@@ -9994,6 +10084,54 @@ fn main() {
 #[cfg(test)]
 mod m7_tests {
     use super::*;
+
+    #[test]
+    fn global_secret_listing_excludes_project_names() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE secret_records (
+                   name TEXT NOT NULL, scope TEXT NOT NULL, purpose TEXT NOT NULL,
+                   project_id TEXT NOT NULL DEFAULT '', PRIMARY KEY(name, project_id)
+                 );
+                 INSERT INTO secret_records VALUES
+                   ('global-token','global','test',''),
+                   ('project-token','project:project-1','test','project-1');",
+            )
+            .unwrap();
+        let names = connection
+            .prepare(
+                "SELECT name FROM secret_records
+                 WHERE (?1 IS NULL AND project_id='')
+                    OR (?1 IS NOT NULL AND (project_id=?1 OR project_id=''))",
+            )
+            .unwrap()
+            .query_map([Option::<String>::None], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(names, vec!["global-token"]);
+    }
+
+    #[test]
+    fn project_secret_cleanup_covers_all_scoped_prefixes() {
+        assert_eq!(
+            project_secret_descriptor("provider-key:anthropic"),
+            ("provider-key", "anthropic")
+        );
+        assert_eq!(
+            project_secret_descriptor("mcp-credential:server-1"),
+            ("mcp-credential", "server-1")
+        );
+        assert_eq!(
+            project_secret_descriptor("connector-token:github"),
+            ("connector-token", "github")
+        );
+        assert_eq!(
+            project_secret_descriptor("asset-name"),
+            ("asset-secret", "asset-name")
+        );
+    }
 
     #[test]
     fn project_secret_key_isolated_from_legacy_global_key() {
