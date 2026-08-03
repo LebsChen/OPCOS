@@ -1,5 +1,12 @@
 # OPCOS 距「一人公司系统」终极目标的差距评审
 
+> **当前代码校正（origin/dev，2026-）：** 本文包含早期目标态和路线建议。
+> #38–#53 已落地的 action ledger、work queue、planning、event bus、Git/PR、
+> CI 查询、background jobs、LSP、learned skills、coordination 和 Commands
+> 不应再按“尚未实现”阅读。仍未完成的是跨重启 background job、远程结构化
+> LSP、通用 forge/CI、CI 自动修复循环、ACP 协同工具桥和完整 computer-use
+> actuator。当前真实状态和阻塞原因见仓库根目录 `todos.md`。
+
 > 评审对象：`dev` 分支 + 在途的 #35 / #36
 > 终极目标：OPC = 一人公司，OPCOS = 一人公司系统。完全自动化、自主驱动 + 事件驱动的 agent 工作台，通过 Team 模板快速创建软件开发、跨境独立站、闲鱼/淘宝/拼多多/京东电商、自媒体等业务团队。
 

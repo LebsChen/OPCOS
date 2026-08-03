@@ -1,5 +1,14 @@
 # Devin 与 OPCOS 功能差距盘点
 
+> **当前代码校正（origin/dev，2026-）：** 本文的历史盘点基线早于 #44–#53，
+> 不能直接作为当前实现清单。当前已存在 Git/PR 工具、GitHub Actions CI
+> status/failure-log、background jobs、精确 `edit_file`、tracked plans、
+> learned skills、Leader-only coordination、Commands 和 `.agents/mcp`
+> discovery。它们仍有明确非等价边界：CI 没有自动修复循环，background job
+> 没有跨重启接管，LSP 只支持 LocalHost，Git push/PR verification 只支持
+> GitHub，ACP 不经过 builtin tool catalog，协同 Worker 自述不构成完成证据。
+> 本文后续表格保留历史证据；决定下一步时应以 `todos.md` 和当前源码为准。
+
 基线来自 `docs/13-devin-behavior.md`，判定标准是「数据模型 + 后端行为 + UI 入口三者齐备才算『有』」。盘点时点 = `dev@fa78271`。
 
 ## A. 首页（新建会话页）

@@ -1,5 +1,11 @@
 # 07 自动化与生命周期 hooks
 
+> **当前代码校正：** OPCOS 当前已有本地调度、durable work queue、autonomous
+> planning/event persistence、background jobs 和 GitHub CI 查询工具，但没有
+> 把 CI 失败自动修复到绿的循环，也没有完整的 Blueprint lifecycle
+> `clone/initialize/maintenance/post-build/pre-push` 门禁实现。本文的
+> “目标态/推断”段落保持设计参考性质；不要把它们当作已完成实现。
+
 现状：OPCOS 只有本地 cron（`src-tauri/src/scheduler.rs` + `run_schedule` / `run_schedule_for`）。三个参照系统都做到了「定时 + 事件 + 外部 webhook」三类触发，且都把环境准备拆成了带明确失败语义的阶段。
 
 ## 7.1 触发器
