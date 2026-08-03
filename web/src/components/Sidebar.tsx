@@ -8,6 +8,7 @@ import type {
   SurfaceVisibility,
 } from "../types";
 import type { SessionInfo } from "../types";
+import type { Project } from "../gui";
 import { isProjectScoped, shortPersonaName } from "../personaScope";
 import { Icon, type IconName } from "./Icon";
 import { PersonaGlyph, personaGlyph } from "./personaIcon";
@@ -151,6 +152,9 @@ interface Props {
   // Collapse controls (⌘B). The collapsed state remains an icon-only rail in the grid.
   collapsed?: boolean;
   onCollapse?: () => void;
+  projectItems?: Project[];
+  onOpenProject?: (id: string) => void;
+  onCreateProject?: () => void;
 }
 
 // Compact age for project session rows: "now" / "5m" / "6h" / "3d" / "2w" / "4mo" / "2y".
@@ -205,6 +209,9 @@ export function Sidebar(props: SidebarProps) {
   const onRenameSession = props.onRenameSession ?? (() => undefined);
   const onOpenAutomation = props.onOpenAutomation ?? (() => undefined);
   const onNewProject = props.onNewProject ?? (() => undefined);
+  const projectItems = props.projectItems ?? [];
+  const onOpenProject = props.onOpenProject ?? (() => undefined);
+  const onCreateProject = props.onCreateProject ?? (() => undefined);
   const activeSession = props.activeSession ?? "";
   const [searchModalOpen, setSearchModalOpen] = useState(false);
   const [appMenuOpen, setAppMenuOpen] = useState(false);
@@ -432,7 +439,13 @@ export function Sidebar(props: SidebarProps) {
   // Recent = every non-pinned, non-archived, real session across ALL personas, newest first
   // (by updated_at; missing timestamps keep store order), search-filtered. Drives the flat layout.
   const recentSessions = [...props.sessions]
-    .filter((s) => !s.archived && !s.session_id.startsWith("__") && !s.pinned)
+    .filter(
+      (s) =>
+        !s.archived &&
+        !s.session_id.startsWith("__") &&
+        !s.pinned &&
+        !s.project_id,
+    )
     .filter((s) => personaVisible(s.agent))
     .filter(matches)
     .sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""));
@@ -1091,6 +1104,68 @@ export function Sidebar(props: SidebarProps) {
         <div className="space-y-4">
           {pinnedBand()}
           {scheduledBand()}
+          <div>
+            <div className="flex items-center justify-between px-1.5 mb-1">
+              <span className="text-[10.5px] uppercase tracking-[0.07em] text-faint font-semibold">
+                项目
+              </span>
+              <button
+                className="w-6 h-6 grid place-items-center rounded-md text-faint hover:text-ink hover:bg-paper"
+                title="新建项目"
+                onClick={onCreateProject}
+              >
+                <Icon name="plus" size={14} />
+              </button>
+            </div>
+            <div className="space-y-0.5">
+              {projectItems.map((project) => {
+                const projectSessions = props.sessions.filter(
+                  (session) =>
+                    session.project_id === project.id &&
+                    !session.archived &&
+                    !session.pinned,
+                );
+                return (
+                  <div key={project.id}>
+                    <button
+                      className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-left text-[13px] hover:bg-paper"
+                      onClick={() => onOpenProject(project.id)}
+                    >
+                      <span className="min-w-0 flex-1 truncate">
+                        {project.name}
+                      </span>
+                      <span className="text-[11px] text-faint">
+                        {project.agents.length}
+                      </span>
+                    </button>
+                    {projectSessions.map((session) => (
+                      <button
+                        key={session.session_id}
+                        className="w-full pl-6 pr-2 py-1 rounded-lg text-left text-[12px] text-muted hover:bg-paper hover:text-ink truncate"
+                        onClick={() =>
+                          onSelectSession(
+                            session.session_id,
+                            session.workspace,
+                            session.agent,
+                          )
+                        }
+                      >
+                        {session.title || session.session_id}
+                      </button>
+                    ))}
+                  </div>
+                );
+              })}
+              {projectItems.length === 0 && (
+                <button
+                  className="w-full px-2 py-1.5 text-left text-[12px] text-faint hover:text-ink"
+                  onClick={onCreateProject}
+                >
+                  新建项目
+                </button>
+              )}
+            </div>
+          </div>
           <div>
             {recentHeader()}
             {layout === "grouped" ? (

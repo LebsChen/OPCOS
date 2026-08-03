@@ -16,6 +16,7 @@ import "@xterm/xterm/css/xterm.css";
 import {
   Host,
   Session,
+  Project,
   SurfaceTab,
   hostFailureMessage,
   hostStatusLabel,
@@ -640,6 +641,136 @@ async function command<T>(
     return new Promise<T>(() => {});
   }
   return invoke<T>(name, args);
+}
+
+function ProjectBoard({
+  project,
+  sessions,
+  onRefresh,
+  onOpenSession,
+  onError,
+}: {
+  project: Project;
+  sessions: Session[];
+  onRefresh: () => Promise<void>;
+  onOpenSession: (id: string) => void;
+  onError: (error: unknown) => void;
+}) {
+  const addMember = () => {
+    const name = window.prompt("成员名称");
+    const role = window.prompt("角色", "Code");
+    if (!name || !role) return;
+    void command("create_project_agent", {
+      projectId: project.id,
+      name,
+      role,
+      model: "auto",
+      harness: "builtin",
+      mode: "Interactive",
+    })
+      .then(onRefresh)
+      .catch(onError);
+  };
+  return (
+    <main className="flex-1 overflow-y-auto p-8">
+      <div className="max-w-6xl mx-auto">
+        <div className="flex items-start justify-between gap-4 mb-8">
+          <div>
+            <h1 className="text-2xl font-semibold text-ink">{project.name}</h1>
+            <p className="text-sm text-faint mt-2">
+              {project.host_name} · {project.online === false ? "离线" : "在线"}{" "}
+              · {project.repo_root}
+            </p>
+            <p className="text-sm text-faint mt-1">
+              默认分支：{project.default_branch}
+            </p>
+          </div>
+          <button className="btn approval-primary" onClick={addMember}>
+            添加成员
+          </button>
+        </div>
+        <div className="grid grid-cols-[repeat(auto-fill,minmax(240px,1fr))] gap-4">
+          {project.agents.map((agent) => {
+            const session = sessions.find(
+              (item) => item.id === agent.session_id,
+            );
+            return (
+              <div
+                key={agent.id}
+                className="rounded-xl border border-line bg-panel p-4 shadow-sm"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs rounded-full bg-faint/20 px-2 py-1 text-muted">
+                    {agent.role}
+                  </span>
+                  <span className="text-xs text-faint">{agent.state}</span>
+                </div>
+                <h2 className="mt-4 font-medium text-ink">{agent.name}</h2>
+                <p className="mt-2 text-xs text-faint truncate">
+                  {agent.branch}
+                </p>
+                <div className="mt-4 flex items-center gap-2">
+                  {session ? (
+                    <button
+                      className="btn approval-primary"
+                      onClick={() => onOpenSession(session.id)}
+                    >
+                      打开会话
+                    </button>
+                  ) : (
+                    <button
+                      className="btn approval-primary"
+                      onClick={() =>
+                        command<Session>("create_session", {
+                          title: agent.name,
+                          projectId: project.id,
+                          agentId: agent.id,
+                        })
+                          .then((next) => {
+                            onOpenSession(next.id);
+                            return onRefresh();
+                          })
+                          .catch(onError)
+                      }
+                    >
+                      启动会话
+                    </button>
+                  )}
+                  <button
+                    className="btn"
+                    onClick={() => {
+                      const name = window.prompt("成员名称", agent.name);
+                      if (!name) return;
+                      void command("update_project_agent", {
+                        id: agent.id,
+                        name,
+                      })
+                        .then(onRefresh)
+                        .catch(onError);
+                    }}
+                  >
+                    编辑
+                  </button>
+                  {agent.sort_order !== 0 && (
+                    <button
+                      className="btn"
+                      onClick={() =>
+                        command("delete_project_agent", { agentId: agent.id })
+                          .then(onRefresh)
+                          .catch(onError)
+                      }
+                    >
+                      删除
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </main>
+  );
 }
 
 function Button({
@@ -5305,8 +5436,10 @@ function AppContent() {
   const [selected, setSelected] = useState<Session | null>(null);
   const [transcript, setTranscript] = useState<TranscriptViewItem[]>([]);
   const [surface, setSurface] = useState<
-    "session" | "automations" | "manage" | "activity" | "inbox"
+    "session" | "automations" | "manage" | "activity" | "inbox" | "project"
   >("session");
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [selectedProject, setSelectedProject] = useState<Project | null>(null);
   const [inbox, setInbox] = useState<InboxRecord[]>([]);
   const [unattended, setUnattended] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsSection>("provider");
@@ -5408,6 +5541,13 @@ function AppContent() {
     setProviders(nextProviders);
     setSecrets(nextSecrets);
     setInbox(nextInbox);
+    const nextProjects = await command<Project[]>("list_projects");
+    setProjects(nextProjects);
+    if (selectedProject) {
+      setSelectedProject(
+        nextProjects.find((item) => item.id === selectedProject.id) || null,
+      );
+    }
     if (selected) {
       const current = nextSessions.find((item) => item.id === selected.id);
       if (current) setSelected(current);
@@ -5808,10 +5948,36 @@ function AppContent() {
           attention: 0,
           liveness: selected?.id === session.id && running ? "working" : "idle",
           stop_reason: session.stop_reason,
+          project_id: session.project_id,
         }))}
         agent="opcos"
         workspace={selected?.workspace || ""}
         activeSession={selected?.id || ""}
+        projectItems={projects}
+        onOpenProject={(id) => {
+          const project = projects.find((item) => item.id === id);
+          if (project) {
+            setSelectedProject(project);
+            setSurface("project");
+          }
+        }}
+        onCreateProject={() => {
+          const name = window.prompt("项目名称");
+          const hostId = window.prompt("主机 ID", hosts[0]?.id || "local");
+          if (!name || !hostId) return;
+          void command<Project>("create_project", {
+            name,
+            hostId,
+            repoUrl: window.prompt("仓库 URL（可留空）", "") || null,
+            defaultBranch: "main",
+          })
+            .then((project) => {
+              setProjects((items) => [...items, project]);
+              setSelectedProject(project);
+              setSurface("project");
+            })
+            .catch(onError);
+        }}
         selected={selected}
         query={query}
         onQuery={setQuery}
@@ -5853,7 +6019,21 @@ function AppContent() {
         onCollapse={toggleNav}
       />
       <main className="main">
-        {surface === "session" && selected ? (
+        {surface === "project" && selectedProject ? (
+          <ProjectBoard
+            project={selectedProject}
+            sessions={sessions}
+            onRefresh={() => refresh().catch(onError)}
+            onOpenSession={(id) => {
+              const next = sessions.find((item) => item.id === id);
+              if (next) {
+                setSelected(next);
+                setSurface("session");
+              }
+            }}
+            onError={onError}
+          />
+        ) : surface === "session" && selected ? (
           <>
             {/* OpenWorker session topbar: surfaces/gui/src/App.tsx:1365-1442.
                 Only the facts and Tauri panel action are adapted to OPCOS. */}

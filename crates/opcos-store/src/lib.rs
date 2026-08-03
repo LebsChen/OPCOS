@@ -60,6 +60,43 @@ pub struct SessionRecord {
     pub stop_reason: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub project_id: Option<String>,
+    pub agent_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProjectRecord {
+    pub id: String,
+    pub name: String,
+    pub host_id: String,
+    pub repo_url: String,
+    pub repo_root: String,
+    pub default_branch: String,
+    pub workflow_json: String,
+    pub board_id: String,
+    pub archived: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProjectAgentRecord {
+    pub id: String,
+    pub project_id: String,
+    pub sort_order: u32,
+    pub name: String,
+    pub role: String,
+    pub session_id: Option<String>,
+    pub provider: Option<String>,
+    pub model: String,
+    pub harness: String,
+    pub mode: String,
+    pub system_prompt: String,
+    pub worktree_path: String,
+    pub branch: String,
+    pub state: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -302,6 +339,45 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> Result<SessionRecord, rusqlite::
         stop_reason: row.get(17)?,
         created_at: parse_timestamp(row.get(18)?)?,
         updated_at: parse_timestamp(row.get(19)?)?,
+        project_id: row.get(20)?,
+        agent_id: row.get(21)?,
+    })
+}
+
+fn project_from_row(row: &rusqlite::Row<'_>) -> Result<ProjectRecord, rusqlite::Error> {
+    Ok(ProjectRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        host_id: row.get(2)?,
+        repo_url: row.get(3)?,
+        repo_root: row.get(4)?,
+        default_branch: row.get(5)?,
+        workflow_json: row.get(6)?,
+        board_id: row.get(7)?,
+        archived: row.get::<_, i64>(8)? != 0,
+        created_at: parse_timestamp(row.get(9)?)?,
+        updated_at: parse_timestamp(row.get(10)?)?,
+    })
+}
+
+fn project_agent_from_row(row: &rusqlite::Row<'_>) -> Result<ProjectAgentRecord, rusqlite::Error> {
+    Ok(ProjectAgentRecord {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        sort_order: row.get::<_, i64>(2)? as u32,
+        name: row.get(3)?,
+        role: row.get(4)?,
+        session_id: row.get(5)?,
+        provider: row.get(6)?,
+        model: row.get(7)?,
+        harness: row.get(8)?,
+        mode: row.get(9)?,
+        system_prompt: row.get(10)?,
+        worktree_path: row.get(11)?,
+        branch: row.get(12)?,
+        state: row.get(13)?,
+        created_at: parse_timestamp(row.get(14)?)?,
+        updated_at: parse_timestamp(row.get(15)?)?,
     })
 }
 
@@ -1121,7 +1197,41 @@ impl SqliteStore {
                run_state TEXT NOT NULL DEFAULT 'idle',
                stop_reason TEXT NOT NULL DEFAULT 'none',
                created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               project_id TEXT,
+               agent_id TEXT
+             );
+             CREATE TABLE IF NOT EXISTS projects (
+               id TEXT PRIMARY KEY,
+               name TEXT NOT NULL,
+               host_id TEXT NOT NULL,
+               repo_url TEXT NOT NULL,
+               repo_root TEXT NOT NULL,
+               default_branch TEXT NOT NULL,
+               workflow_json TEXT NOT NULL,
+               board_id TEXT NOT NULL,
+               archived INTEGER NOT NULL DEFAULT 0,
+               created_at TEXT NOT NULL,
                updated_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS project_agents (
+               id TEXT PRIMARY KEY,
+               project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+               sort_order INTEGER NOT NULL,
+               name TEXT NOT NULL,
+               role TEXT NOT NULL,
+               session_id TEXT,
+               provider TEXT,
+               model TEXT NOT NULL,
+               harness TEXT NOT NULL,
+               mode TEXT NOT NULL,
+               system_prompt TEXT NOT NULL,
+               worktree_path TEXT NOT NULL,
+               branch TEXT NOT NULL,
+               state TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               UNIQUE(project_id, sort_order)
              );
              CREATE TABLE IF NOT EXISTS schema_migrations (
                version INTEGER PRIMARY KEY,
@@ -1179,6 +1289,12 @@ impl SqliteStore {
                     "ALTER TABLE sessions ADD COLUMN stop_reason TEXT NOT NULL DEFAULT 'none'",
                     [],
                 )?;
+            }
+            if !session_columns.iter().any(|column| column == "project_id") {
+                connection.execute("ALTER TABLE sessions ADD COLUMN project_id TEXT", [])?;
+            }
+            if !session_columns.iter().any(|column| column == "agent_id") {
+                connection.execute("ALTER TABLE sessions ADD COLUMN agent_id TEXT", [])?;
             }
             let pending_columns = table_columns(&connection, "pending")?;
             for (name, definition) in [
@@ -1243,7 +1359,7 @@ impl SqliteStore {
 
     pub fn save_session(&self, session: &SessionRecord) -> Result<(), StoreError> {
         self.connection.lock().expect("sqlite mutex poisoned").execute(
-            "INSERT OR REPLACE INTO sessions(session_id,workspace,model,mode,harness,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+            "INSERT OR REPLACE INTO sessions(session_id,workspace,model,mode,harness,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,created_at,updated_at,project_id,agent_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
             params![
                 session.session_id,
                 session.workspace,
@@ -1265,6 +1381,8 @@ impl SqliteStore {
                 session.stop_reason,
                 session.created_at.to_rfc3339(),
                 session.updated_at.to_rfc3339(),
+                session.project_id,
+                session.agent_id,
             ],
         )?;
         Ok(())
@@ -1273,7 +1391,7 @@ impl SqliteStore {
     pub fn load_session(&self, session_id: &str) -> Result<Option<SessionRecord>, StoreError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let result = connection.query_row(
-            "SELECT session_id,workspace,model,mode,harness,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,created_at,updated_at FROM sessions WHERE session_id=?1",
+            "SELECT session_id,workspace,model,mode,harness,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,created_at,updated_at,project_id,agent_id FROM sessions WHERE session_id=?1",
             [session_id],
             session_from_row,
         );
@@ -1287,11 +1405,122 @@ impl SqliteStore {
     pub fn load_sessions(&self) -> Result<Vec<SessionRecord>, StoreError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT session_id,workspace,model,mode,harness,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,created_at,updated_at FROM sessions ORDER BY created_at DESC",
+            "SELECT session_id,workspace,model,mode,harness,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,created_at,updated_at,project_id,agent_id FROM sessions ORDER BY created_at DESC",
         )?;
         let rows = statement.query_map([], session_from_row)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
+    }
+
+    pub fn save_project(&self, project: &ProjectRecord) -> Result<(), StoreError> {
+        self.connection.lock().expect("sqlite mutex poisoned").execute(
+            "INSERT OR REPLACE INTO projects(id,name,host_id,repo_url,repo_root,default_branch,workflow_json,board_id,archived,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![
+                project.id, project.name, project.host_id, project.repo_url, project.repo_root,
+                project.default_branch, project.workflow_json, project.board_id, project.archived,
+                project.created_at.to_rfc3339(), project.updated_at.to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_project(&self, id: &str) -> Result<Option<ProjectRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .query_row(
+                "SELECT id,name,host_id,repo_url,repo_root,default_branch,workflow_json,board_id,archived,created_at,updated_at FROM projects WHERE id=?1",
+                [id],
+                project_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn load_projects(&self) -> Result<Vec<ProjectRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT id,name,host_id,repo_url,repo_root,default_branch,workflow_json,board_id,archived,created_at,updated_at FROM projects WHERE archived=0 ORDER BY updated_at DESC",
+        )?;
+        statement
+            .query_map([], project_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn delete_project(&self, id: &str) -> Result<(), StoreError> {
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute("DELETE FROM projects WHERE id=?1", [id])?;
+        Ok(())
+    }
+
+    pub fn save_project_agent(&self, agent: &ProjectAgentRecord) -> Result<(), StoreError> {
+        if agent.sort_order == 0 && !agent.role.eq_ignore_ascii_case("lead") {
+            return Err(StoreError::Migration(
+                "sort_order 0 project member must have Lead role".into(),
+            ));
+        }
+        self.connection.lock().expect("sqlite mutex poisoned").execute(
+            "INSERT INTO project_agents(id,project_id,sort_order,name,role,session_id,provider,model,harness,mode,system_prompt,worktree_path,branch,state,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+             ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,sort_order=excluded.sort_order,name=excluded.name,role=excluded.role,session_id=excluded.session_id,provider=excluded.provider,model=excluded.model,harness=excluded.harness,mode=excluded.mode,system_prompt=excluded.system_prompt,worktree_path=excluded.worktree_path,branch=excluded.branch,state=excluded.state,created_at=excluded.created_at,updated_at=excluded.updated_at",
+            params![
+                agent.id, agent.project_id, agent.sort_order, agent.name, agent.role,
+                agent.session_id, agent.provider, agent.model, agent.harness, agent.mode,
+                agent.system_prompt, agent.worktree_path, agent.branch, agent.state,
+                agent.created_at.to_rfc3339(), agent.updated_at.to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_project_agent(&self, id: &str) -> Result<Option<ProjectAgentRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .query_row(
+                "SELECT id,project_id,sort_order,name,role,session_id,provider,model,harness,mode,system_prompt,worktree_path,branch,state,created_at,updated_at FROM project_agents WHERE id=?1",
+                [id],
+                project_agent_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn load_project_agents(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<ProjectAgentRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT id,project_id,sort_order,name,role,session_id,provider,model,harness,mode,system_prompt,worktree_path,branch,state,created_at,updated_at FROM project_agents WHERE project_id=?1 ORDER BY sort_order,id",
+        )?;
+        statement
+            .query_map([project_id], project_agent_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn delete_project_agent(&self, id: &str) -> Result<(), StoreError> {
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute("DELETE FROM project_agents WHERE id=?1", [id])?;
+        Ok(())
+    }
+
+    pub fn update_project_agent_session(
+        &self,
+        agent_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "UPDATE project_agents SET session_id=?1,updated_at=?2 WHERE id=?3",
+                params![session_id, Utc::now().to_rfc3339(), agent_id],
+            )?;
+        Ok(())
     }
 
     pub fn update_session_provider(
@@ -1912,6 +2141,8 @@ mod tests {
             stop_reason: "none".into(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            project_id: None,
+            agent_id: None,
         };
         store.save_session(&session).unwrap();
         store
@@ -1954,6 +2185,8 @@ mod tests {
                 stop_reason: "future_stop_reason".into(),
                 created_at: now,
                 updated_at: now,
+                project_id: None,
+                agent_id: None,
             })
             .unwrap();
         store
@@ -1962,6 +2195,107 @@ mod tests {
         let session = store.load_session("status-session").unwrap().unwrap();
         assert_eq!(session.run_state, "error");
         assert_eq!(session.stop_reason, "host_unavailable");
+    }
+
+    #[test]
+    fn projects_agents_and_session_ownership_round_trip() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let now = Utc::now();
+        store
+            .save_project(&ProjectRecord {
+                id: "project-1".into(),
+                name: "Project".into(),
+                host_id: "local".into(),
+                repo_url: String::new(),
+                repo_root: "/tmp/repo".into(),
+                default_branch: "main".into(),
+                workflow_json: "{}".into(),
+                board_id: "board-1".into(),
+                archived: false,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        let lead = ProjectAgentRecord {
+            id: "agent-1".into(),
+            project_id: "project-1".into(),
+            sort_order: 0,
+            name: "Lead".into(),
+            role: "Lead".into(),
+            session_id: None,
+            provider: None,
+            model: "auto".into(),
+            harness: "builtin".into(),
+            mode: "Interactive".into(),
+            system_prompt: String::new(),
+            worktree_path: "/tmp/repo".into(),
+            branch: "main".into(),
+            state: "Active".into(),
+            created_at: now,
+            updated_at: now,
+        };
+        store.save_project_agent(&lead).unwrap();
+        let duplicate = ProjectAgentRecord {
+            id: "agent-2".into(),
+            ..lead.clone()
+        };
+        assert!(store.save_project_agent(&duplicate).is_err());
+        let worker = ProjectAgentRecord {
+            id: "agent-2".into(),
+            sort_order: 1,
+            name: "Code".into(),
+            role: "Code".into(),
+            ..lead
+        };
+        store.save_project_agent(&worker).unwrap();
+        assert_eq!(store.load_project_agents("project-1").unwrap().len(), 2);
+        store
+            .save_session(&SessionRecord {
+                session_id: "session-1".into(),
+                workspace: "/tmp/worktree".into(),
+                model: "auto".into(),
+                mode: "Interactive".into(),
+                harness: "builtin".into(),
+                title: "Session".into(),
+                extra_roots: vec![],
+                grants: serde_json::json!({}),
+                pinned: false,
+                archived: false,
+                origin: None,
+                origin_label: None,
+                compaction: serde_json::json!({}),
+                host_id: "local".into(),
+                provider: None,
+                external_session_id: None,
+                run_state: "idle".into(),
+                stop_reason: "none".into(),
+                created_at: now,
+                updated_at: now,
+                project_id: Some("project-1".into()),
+                agent_id: Some("agent-2".into()),
+            })
+            .unwrap();
+        store
+            .update_project_agent_session("agent-2", Some("session-1"))
+            .unwrap();
+        assert_eq!(
+            store
+                .load_session("session-1")
+                .unwrap()
+                .unwrap()
+                .project_id
+                .as_deref(),
+            Some("project-1")
+        );
+        assert_eq!(
+            store
+                .load_project_agent("agent-2")
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("session-1")
+        );
     }
 
     #[test]

@@ -2235,6 +2235,8 @@ mod tests {
                 stop_reason: "none".into(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
+                project_id: None,
+                agent_id: None,
             })
             .unwrap();
         let engine = Arc::new(TurnEngine::new(
@@ -2483,6 +2485,8 @@ mod tests {
                 stop_reason: "none".into(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
+                project_id: None,
+                agent_id: None,
             })
             .unwrap();
         store

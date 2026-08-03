@@ -117,6 +117,7 @@ export interface SessionInfo {
   // "From Slack" group and the row's platform icon.
   origin?: string;
   origin_label?: string;
+  project_id?: string | null;
 }
 
 // Attachments (images, PDFs, text files) sent with a user message.

@@ -44,8 +44,8 @@ use opcos_rvm::{
     WsParams, join_remote_path,
 };
 use opcos_store::{
-    ArtifactRecord, KeyringSecretStore, SecretStore, SessionRecord, SessionStore, SqliteStore,
-    ToolCallRecord,
+    ArtifactRecord, KeyringSecretStore, ProjectAgentRecord, ProjectRecord, SecretStore,
+    SessionRecord, SessionStore, SqliteStore, ToolCallRecord,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -707,6 +707,17 @@ struct SessionView {
     workspace: String,
     run_state: String,
     stop_reason: String,
+    project_id: Option<String>,
+    agent_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ProjectView {
+    #[serde(flatten)]
+    project: ProjectRecord,
+    agents: Vec<ProjectAgentRecord>,
+    host_name: String,
+    online: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1532,6 +1543,412 @@ fn session_for(state: &DesktopState, session_id: &str) -> Result<SessionRecord, 
         .load_session(session_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "session not found".to_owned())
+}
+
+async fn project_host(
+    state: &State<'_, DesktopState>,
+    project: &ProjectRecord,
+) -> Result<Arc<dyn Host>, String> {
+    if project.host_id == "local" {
+        let root = FsPath::new(&project.repo_root)
+            .parent()
+            .unwrap_or_else(|| FsPath::new(&project.repo_root));
+        std::fs::create_dir_all(root)
+            .map_err(|error| format!("project host unavailable: {error}"))?;
+        return Ok(Arc::new(
+            LocalHost::new(root).map_err(|error| format!("project host unavailable: {error}"))?,
+        ));
+    }
+    let client = client_for(state, &project.host_id)?;
+    let health = client
+        .health()
+        .await
+        .map_err(|error| format!("remote host unavailable: {error}"))?;
+    let workspace = health
+        .workspace
+        .ok_or_else(|| "remote host did not provide a workspace".to_owned())?;
+    Ok(Arc::new(RvmHost::new(
+        project.host_id.clone(),
+        workspace.clone(),
+        client.with_workspace(workspace),
+    )))
+}
+
+fn project_root(project_id: &str) -> Result<String, String> {
+    let home = dirs::home_dir().ok_or_else(|| "home directory is unavailable".to_owned())?;
+    home.join("OPCOS")
+        .join("projects")
+        .join(project_id)
+        .join("repo")
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "project path is not valid UTF-8".to_owned())
+}
+
+fn worktree_branch(role: &str, sequence: u32) -> String {
+    let role = role.trim().to_ascii_lowercase().replace(' ', "-");
+    format!("agent/{role}-{sequence}")
+}
+
+#[tauri::command]
+fn list_projects(state: State<'_, DesktopState>) -> Result<Vec<ProjectView>, String> {
+    let projects = state
+        .store
+        .load_projects()
+        .map_err(|error| error.to_string())?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    projects
+        .into_iter()
+        .map(|project| {
+            let host_name = host_name(&connection, &project.host_id)?
+                .ok_or_else(|| "project host not found".to_owned())?;
+            let agents = state
+                .store
+                .load_project_agents(&project.id)
+                .map_err(|error| error.to_string())?;
+            Ok(ProjectView {
+                project,
+                agents,
+                host_name,
+                online: None,
+            })
+        })
+        .collect()
+}
+
+#[tauri::command]
+async fn create_project(
+    state: State<'_, DesktopState>,
+    name: String,
+    host_id: String,
+    repo_url: Option<String>,
+    repo_root: Option<String>,
+    default_branch: Option<String>,
+) -> Result<ProjectView, String> {
+    let id = format!(
+        "project-{}",
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let repo_root = if let Some(repo_root) = repo_root.filter(|value| !value.trim().is_empty()) {
+        repo_root
+    } else if host_id == "local" {
+        project_root(&id)?
+    } else {
+        let client = client_for(&state, &host_id)?;
+        let health = client
+            .health()
+            .await
+            .map_err(|error| format!("remote host unavailable: {error}"))?;
+        let workspace = health
+            .workspace
+            .ok_or_else(|| "remote host did not provide a workspace".to_owned())?;
+        format!("{workspace}/OPCOS/projects/{id}/repo")
+    };
+    let project = ProjectRecord {
+        id: id.clone(),
+        name,
+        host_id,
+        repo_url: repo_url.unwrap_or_default(),
+        repo_root,
+        default_branch: default_branch.unwrap_or_else(|| "main".into()),
+        workflow_json: "{}".into(),
+        board_id: format!("board-{id}"),
+        archived: false,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let host = project_host(&state, &project).await?;
+    if !host.contains(&project.repo_root) {
+        return Err("project repository path is outside the bound host workspace".to_owned());
+    }
+    let parent = FsPath::new(&project.repo_root)
+        .parent()
+        .ok_or_else(|| "project repository path has no parent".to_owned())?
+        .to_str()
+        .ok_or_else(|| "project parent path is not valid UTF-8".to_owned())?;
+    if !host.contains(parent) {
+        return Err("project parent path is outside the bound host workspace".to_owned());
+    }
+    host.exec(ExecRequest {
+        command: format!("mkdir -p {}", shell_arg(parent)),
+        cwd: None,
+        timeout_seconds: DEFAULT_EXEC_TIMEOUT_SECONDS,
+        session: None,
+        env: None,
+    })
+    .await
+    .map_err(|error| format!("project host unavailable: {error}"))?
+    .result
+    .exit_code
+    .eq(&0)
+    .then_some(())
+    .ok_or_else(|| "project directory could not be prepared".to_owned())?;
+    if !project.repo_url.is_empty() {
+        let result = host
+            .exec(ExecRequest {
+                command: format!(
+                    "git clone {} {}",
+                    shell_arg(&project.repo_url),
+                    shell_arg(&project.repo_root)
+                ),
+                cwd: None,
+                timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+                session: None,
+                env: None,
+            })
+            .await
+            .map_err(|error| format!("repository clone failed: {error}"))?;
+        if result.result.exit_code != 0 {
+            return Err(format!("repository clone failed: {}", result.result.stderr));
+        }
+    }
+    state
+        .store
+        .save_project(&project)
+        .map_err(|error| error.to_string())?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    Ok(ProjectView {
+        host_name: host_name(&connection, &project.host_id)?
+            .unwrap_or_else(|| project.host_id.clone()),
+        agents: vec![],
+        online: Some(true),
+        project,
+    })
+}
+
+#[tauri::command]
+fn update_project(
+    state: State<'_, DesktopState>,
+    id: String,
+    name: Option<String>,
+    default_branch: Option<String>,
+    archived: Option<bool>,
+) -> Result<ProjectRecord, String> {
+    let mut project = state
+        .store
+        .load_project(&id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    if let Some(name) = name.filter(|value| !value.trim().is_empty()) {
+        project.name = name;
+    }
+    if let Some(branch) = default_branch.filter(|value| !value.trim().is_empty()) {
+        project.default_branch = branch;
+    }
+    if let Some(archived) = archived {
+        project.archived = archived;
+    }
+    project.updated_at = Utc::now();
+    state
+        .store
+        .save_project(&project)
+        .map_err(|error| error.to_string())?;
+    Ok(project)
+}
+
+#[tauri::command]
+fn delete_project(state: State<'_, DesktopState>, id: String) -> Result<(), String> {
+    let agents = state
+        .store
+        .load_project_agents(&id)
+        .map_err(|error| error.to_string())?;
+    if !agents.is_empty() {
+        return Err("delete project members before deleting the project".to_owned());
+    }
+    state
+        .store
+        .delete_project(&id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn list_project_agents(
+    state: State<'_, DesktopState>,
+    project_id: String,
+) -> Result<Vec<ProjectAgentRecord>, String> {
+    state
+        .store
+        .load_project_agents(&project_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn create_project_agent(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    name: String,
+    role: String,
+    sort_order: Option<u32>,
+    provider: Option<String>,
+    model: Option<String>,
+    harness: Option<String>,
+    mode: Option<String>,
+    system_prompt: Option<String>,
+    branch: Option<String>,
+) -> Result<ProjectAgentRecord, String> {
+    let project = state
+        .store
+        .load_project(&project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    let agents = state
+        .store
+        .load_project_agents(&project_id)
+        .map_err(|error| error.to_string())?;
+    let sort_order = sort_order.unwrap_or(agents.len() as u32);
+    let id = format!(
+        "agent-{}",
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let worktree_path = if sort_order == 0 {
+        project.repo_root.clone()
+    } else {
+        format!("{}/worktrees/{id}", project.repo_root.trim_end_matches('/'))
+    };
+    let branch = branch.unwrap_or_else(|| worktree_branch(&role, sort_order));
+    let host = project_host(&state, &project).await?;
+    if !host.contains(&project.repo_root) || !host.contains(&worktree_path) {
+        return Err("project worktree path is outside the bound host workspace".to_owned());
+    }
+    if sort_order != 0 {
+        let result = host
+            .exec(ExecRequest {
+                command: format!(
+                    "mkdir -p {} && (git -C {} show-ref --verify --quiet refs/heads/{} && git -C {} worktree add {} {} || git -C {} worktree add {} -b {})",
+                    shell_arg(&format!("{}/worktrees", project.repo_root.trim_end_matches('/'))),
+                    shell_arg(&project.repo_root), shell_arg(&branch), shell_arg(&project.repo_root),
+                    shell_arg(&worktree_path), shell_arg(&branch), shell_arg(&project.repo_root),
+                    shell_arg(&worktree_path), shell_arg(&branch)
+                ),
+                cwd: None,
+                timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+                session: None,
+                env: None,
+            })
+            .await
+            .map_err(|error| format!("worktree creation failed: {error}"))?;
+        if result.result.exit_code != 0 {
+            return Err(format!(
+                "worktree creation failed: {}",
+                result.result.stderr
+            ));
+        }
+    }
+    let agent = ProjectAgentRecord {
+        id,
+        project_id,
+        sort_order,
+        name,
+        role,
+        session_id: None,
+        provider,
+        model: model.unwrap_or_else(|| "auto".into()),
+        harness: harness.unwrap_or_else(|| "builtin".into()),
+        mode: mode.unwrap_or_else(|| "Interactive".into()),
+        system_prompt: system_prompt.unwrap_or_default(),
+        worktree_path,
+        branch,
+        state: "Active".into(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    state
+        .store
+        .save_project_agent(&agent)
+        .map_err(|error| error.to_string())?;
+    Ok(agent)
+}
+
+#[tauri::command]
+async fn delete_project_agent(
+    state: State<'_, DesktopState>,
+    agent_id: String,
+    force: Option<bool>,
+) -> Result<(), String> {
+    let agent = state
+        .store
+        .load_project_agent(&agent_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project member not found".to_owned())?;
+    let project = state
+        .store
+        .load_project(&agent.project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    if agent.sort_order == 0 {
+        return Err("the Lead member cannot be deleted".to_owned());
+    }
+    let host = project_host(&state, &project).await?;
+    if !host.contains(&project.repo_root) || !host.contains(&agent.worktree_path) {
+        return Err("project worktree path is outside the bound host workspace".to_owned());
+    }
+    let command = format!(
+        "git -C {} worktree remove {}{}",
+        shell_arg(&project.repo_root),
+        if force.unwrap_or(false) {
+            "--force "
+        } else {
+            ""
+        },
+        shell_arg(&agent.worktree_path)
+    );
+    let result = host
+        .exec(ExecRequest {
+            command,
+            cwd: None,
+            timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+            session: None,
+            env: None,
+        })
+        .await
+        .map_err(|error| format!("worktree removal failed: {error}"))?;
+    if result.result.exit_code != 0 {
+        return Err(format!("worktree removal failed: {}", result.result.stderr));
+    }
+    state
+        .store
+        .delete_project_agent(&agent_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn update_project_agent(
+    state: State<'_, DesktopState>,
+    id: String,
+    name: Option<String>,
+    role: Option<String>,
+    state_name: Option<String>,
+) -> Result<ProjectAgentRecord, String> {
+    let mut agent = state
+        .store
+        .load_project_agent(&id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project member not found".to_owned())?;
+    if let Some(name) = name.filter(|value| !value.trim().is_empty()) {
+        agent.name = name;
+    }
+    if let Some(role) = role.filter(|value| !value.trim().is_empty()) {
+        if agent.sort_order == 0 && !role.eq_ignore_ascii_case("lead") {
+            return Err("sort_order 0 project member must have Lead role".to_owned());
+        }
+        agent.role = role;
+    }
+    if let Some(state_name) = state_name.filter(|value| !value.trim().is_empty()) {
+        agent.state = state_name;
+    }
+    agent.updated_at = Utc::now();
+    state
+        .store
+        .save_project_agent(&agent)
+        .map_err(|error| error.to_string())?;
+    Ok(agent)
 }
 
 fn parse_permission_mode(value: &str) -> Result<PermissionMode, String> {
@@ -2957,6 +3374,8 @@ fn create_session(
     mode: Option<String>,
     harness: Option<String>,
     workspace: Option<String>,
+    project_id: Option<String>,
+    agent_id: Option<String>,
 ) -> Result<SessionView, String> {
     let id = format!(
         "session-{}",
@@ -2969,10 +3388,44 @@ fn create_session(
     if !matches!(harness.as_str(), "builtin" | "opencode") {
         return Err(format!("unsupported harness: {harness}"));
     }
+    let (host_id, workspace, agent) =
+        if let (Some(project_id), Some(agent_id)) = (project_id.clone(), agent_id.clone()) {
+            let project = state
+                .store
+                .load_project(&project_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "project not found".to_owned())?;
+            let agent = state
+                .store
+                .load_project_agent(&agent_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "project member not found".to_owned())?;
+            if agent.project_id != project.id {
+                return Err("project member does not belong to project".to_owned());
+            }
+            if agent.session_id.is_some() {
+                return Err("project member already has a session".to_owned());
+            }
+            (
+                project.host_id,
+                Some(agent.worktree_path.clone()),
+                Some(agent),
+            )
+        } else {
+            (
+                host_id.clone(),
+                if host_id == "local" && workspace.as_deref().is_none_or(str::is_empty) {
+                    Some(local_workspace_path(&id)?)
+                } else {
+                    workspace.filter(|value| !value.is_empty())
+                },
+                None,
+            )
+        };
     let workspace = if host_id == "local" && workspace.as_deref().is_none_or(str::is_empty) {
         Some(local_workspace_path(&id)?)
     } else {
-        workspace.filter(|value| !value.is_empty())
+        workspace
     };
     let connection = state
         .database
@@ -3006,8 +3459,16 @@ fn create_session(
             stop_reason: "none".into(),
             created_at: now,
             updated_at: now,
+            project_id: project_id.clone(),
+            agent_id: agent_id.clone(),
         })
         .map_err(|error| error.to_string())?;
+    if let Some(agent) = agent {
+        state
+            .store
+            .update_project_agent_session(&agent.id, Some(&id))
+            .map_err(|error| error.to_string())?;
+    }
     audit(
         &state,
         &id,
@@ -3026,6 +3487,8 @@ fn create_session(
         workspace: workspace.unwrap_or_default(),
         run_state: "idle".into(),
         stop_reason: "none".into(),
+        project_id: project_id.clone(),
+        agent_id: agent_id.clone(),
     })
 }
 
@@ -3209,6 +3672,8 @@ fn session_view_for_host(
         workspace: session.workspace,
         run_state: session.run_state,
         stop_reason: session.stop_reason,
+        project_id: session.project_id,
+        agent_id: session.agent_id,
     }))
 }
 
@@ -6880,6 +7345,8 @@ async fn linear_create_session_from_issue(
             stop_reason: "none".into(),
             created_at: now,
             updated_at: now,
+            project_id: None,
+            agent_id: None,
         })
         .map_err(|error| error.to_string())?;
     audit(
@@ -7446,6 +7913,10 @@ async fn git_workflow(
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+fn shell_arg(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[tauri::command]
@@ -9010,6 +9481,14 @@ fn main() {
             test_host,
             delete_host,
             create_session,
+            list_projects,
+            create_project,
+            update_project,
+            delete_project,
+            list_project_agents,
+            create_project_agent,
+            update_project_agent,
+            delete_project_agent,
             harness_options,
             change_harness,
             list_sessions,
@@ -9363,6 +9842,8 @@ mod m7_tests {
             stop_reason: "none".into(),
             created_at: now,
             updated_at: now,
+            project_id: None,
+            agent_id: None,
         };
         assert!(
             session_view_for_host(&connection, session)
