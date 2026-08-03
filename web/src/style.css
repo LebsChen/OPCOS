@@ -1655,7 +1655,8 @@ input.workspace-chip {
   color: var(--color-warn);
 }
 .page {
-  min-height: 100%;
+  flex: 1;
+  min-height: 0;
   overflow: auto;
   color: var(--color-ink);
   background: var(--color-panel);

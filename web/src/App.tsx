@@ -3399,8 +3399,8 @@ function Activity({
       .then(setBoard)
       .catch(onError);
   return (
-    <main className="flex-1 min-w-0 flex bg-paper">
-      <div className="flex min-h-full">
+    <main className="flex-1 min-w-0 min-h-0 flex bg-paper">
+      <div className="flex flex-1 min-w-0 min-h-0">
         <nav className="page-subnav w-[208px] shrink-0 border-r border-line bg-panel/40 px-3 py-4">
           <div className="px-2 text-[13.5px] font-semibold mb-3 flex items-center gap-2">
             <Icon name="audit" size={16} /> Activity
