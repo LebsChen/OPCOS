@@ -56,7 +56,7 @@ pub enum RvmError {
     #[error("invalid RVM URL")]
     InvalidUrl,
     #[error("RVM request failed: {0}")]
-    Request(#[from] reqwest::Error),
+    Request(String),
     #[error("RVM returned HTTP {status}: {message}")]
     Http { status: StatusCode, message: String },
     #[error("RVM response JSON was invalid: {0}")]
@@ -74,21 +74,26 @@ pub enum RvmError {
 }
 
 impl RvmError {
+    fn redact(text: &str, token: &str) -> String {
+        if token.is_empty() {
+            return text.to_owned();
+        }
+        let encoded = url::form_urlencoded::byte_serialize(token.as_bytes()).collect::<String>();
+        text.replace(token, "[redacted]")
+            .replace(&encoded, "[redacted]")
+    }
+
+    fn request(error: reqwest::Error, token: &str) -> Self {
+        Self::Request(Self::redact(&error.to_string(), token))
+    }
+
     fn http(status: StatusCode, body: &str, token: &str) -> Self {
-        let message = if token.is_empty() {
-            body.to_owned()
-        } else {
-            body.replace(token, "[redacted]")
-        };
+        let message = Self::redact(body, token);
         Self::Http { status, message }
     }
 
     fn json_rpc(code: i64, message: &str, token: &str) -> Self {
-        let message = if token.is_empty() {
-            message.to_owned()
-        } else {
-            message.replace(token, "[redacted]")
-        };
+        let message = Self::redact(message, token);
         Self::JsonRpc { code, message }
     }
 }
@@ -591,7 +596,8 @@ impl HttpRvmClient {
         let http = Client::builder()
             .timeout(config.request_timeout)
             .redirect(reqwest::redirect::Policy::none())
-            .build()?;
+            .build()
+            .map_err(|error| RvmError::request(error, &config.token))?;
         Ok(Self {
             config,
             http,
@@ -609,12 +615,18 @@ impl HttpRvmClient {
             "opcos-local-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|error| RvmError::WebSocket(error.to_string()))?
+                .map_err(|error| RvmError::WebSocket(RvmError::redact(
+                    &error.to_string(),
+                    &self.config.token,
+                )))?
                 .as_nanos()
         );
         let mut cookies: Vec<String> = Vec::new();
         let mut url = self.config.base_url.clone();
         url.set_path("/ide/");
+        // The deployed RVM/serve-web path currently requires the connection
+        // token in its URL for IDE bootstrap compatibility; retain this until
+        // the host accepts the Bearer header for the complete IDE flow.
         url.query_pairs_mut()
             .append_pair("tkn", &self.config.token)
             .append_pair("folder", folder);
@@ -629,7 +641,10 @@ impl HttpRvmClient {
             if !cookies.is_empty() {
                 request = request.header(header::COOKIE, cookies.join("; "));
             }
-            let response = request.send().await?;
+            let response = request
+                .send()
+                .await
+                .map_err(|error| RvmError::request(error, &self.config.token))?;
             for value in response.headers().get_all(header::SET_COOKIE) {
                 if let Ok(value) = value.to_str()
                     && let Some(pair) = cookie_pair(value)
@@ -655,14 +670,20 @@ impl HttpRvmClient {
             }
             if !response.status().is_success() {
                 let status = response.status();
-                let bytes = response.bytes().await?;
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|error| RvmError::request(error, &self.config.token))?;
                 return Err(RvmError::http(
                     status,
                     &String::from_utf8_lossy(&bytes),
                     &self.config.token,
                 ));
             }
-            let bytes = response.bytes().await?;
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|error| RvmError::request(error, &self.config.token))?;
             let html = String::from_utf8_lossy(&bytes).into_owned();
             return Ok(IdeBootstrap {
                 html: redact_workbench_token(&html, &self.config.token, &proxy_token),
@@ -687,6 +708,8 @@ impl HttpRvmClient {
         let pairs = url
             .query_pairs()
             .map(|(key, value)| {
+                // The deployed RVM/serve-web path currently requires query
+                // authentication for IDE asset bridges.
                 let key_is_token = key.eq_ignore_ascii_case("token")
                     || key.eq_ignore_ascii_case("tkn")
                     || key.eq_ignore_ascii_case("connectionToken")
@@ -720,9 +743,15 @@ impl HttpRvmClient {
         if !cookies.is_empty() {
             request = request.header(header::COOKIE, cookies.join("; "));
         }
-        let response = request.send().await?;
+        let response = request
+            .send()
+            .await
+            .map_err(|error| RvmError::request(error, &self.config.token))?;
         let status = response.status();
-        let bytes = response.bytes().await?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| RvmError::request(error, &self.config.token))?;
         if !status.is_success() {
             return Err(RvmError::http(
                 status,
@@ -768,6 +797,8 @@ impl HttpRvmClient {
         let pairs = url
             .query_pairs()
             .map(|(key, value)| {
+                // The deployed RVM/serve-web path currently requires query
+                // authentication for IDE WebSocket upgrades.
                 let key_is_token = key.eq_ignore_ascii_case("token")
                     || key.eq_ignore_ascii_case("tkn")
                     || key.eq_ignore_ascii_case("connectionToken")
@@ -789,10 +820,9 @@ impl HttpRvmClient {
                 query.append_pair(&key, &value);
             }
         }
-        let mut request = url
-            .as_str()
-            .into_client_request()
-            .map_err(|error| RvmError::WebSocket(error.to_string()))?;
+        let mut request = url.as_str().into_client_request().map_err(|error| {
+            RvmError::WebSocket(RvmError::redact(&error.to_string(), &self.config.token))
+        })?;
         if cookies.is_empty() {
             request.headers_mut().insert(
                 header::AUTHORIZATION,
@@ -814,7 +844,9 @@ impl HttpRvmClient {
         connect_async(request)
             .await
             .map(|(stream, _)| stream)
-            .map_err(|error| RvmError::WebSocket(error.to_string()))
+            .map_err(|error| {
+                RvmError::WebSocket(RvmError::redact(&error.to_string(), &self.config.token))
+            })
     }
 
     fn remote_path(&self, path: &str) -> Result<String, RvmError> {
@@ -847,9 +879,13 @@ impl HttpRvmClient {
             .header(header::AUTHORIZATION, self.config.auth_header())
             .json(body)
             .send()
-            .await?;
+            .await
+            .map_err(|error| RvmError::request(error, &self.config.token))?;
         let status = response.status();
-        let bytes = response.bytes().await?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| RvmError::request(error, &self.config.token))?;
         if !status.is_success() {
             return Err(RvmError::http(
                 status,
@@ -874,9 +910,15 @@ impl HttpRvmClient {
         if authenticated {
             request = request.header(header::AUTHORIZATION, self.config.auth_header());
         }
-        let response = request.send().await?;
+        let response = request
+            .send()
+            .await
+            .map_err(|error| RvmError::request(error, &self.config.token))?;
         let status = response.status();
-        let bytes = response.bytes().await?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| RvmError::request(error, &self.config.token))?;
         if !status.is_success() {
             return Err(RvmError::http(
                 status,
@@ -898,9 +940,13 @@ impl HttpRvmClient {
             )
             .header(header::AUTHORIZATION, self.config.auth_header())
             .send()
-            .await?;
+            .await
+            .map_err(|error| RvmError::request(error, &self.config.token))?;
         let status = response.status();
-        let bytes = response.bytes().await?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| RvmError::request(error, &self.config.token))?;
         if !status.is_success() {
             return Err(RvmError::http(
                 status,
@@ -1114,9 +1160,13 @@ impl RvmClient for HttpRvmClient {
             .header(header::CONTENT_TYPE, "application/json")
             .json(&request)
             .send()
-            .await?;
+            .await
+            .map_err(|error| RvmError::request(error, &self.config.token))?;
         let status = response.status();
-        let bytes = response.bytes().await?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| RvmError::request(error, &self.config.token))?;
         if !status.is_success() {
             return Err(RvmError::http(
                 status,
@@ -1164,10 +1214,9 @@ impl RvmClient for HttpRvmClient {
                 }
             }
         }
-        let mut request = url
-            .as_str()
-            .into_client_request()
-            .map_err(|error| RvmError::WebSocket(error.to_string()))?;
+        let mut request = url.as_str().into_client_request().map_err(|error| {
+            RvmError::WebSocket(RvmError::redact(&error.to_string(), &self.config.token))
+        })?;
         request.headers_mut().insert(
             header::AUTHORIZATION,
             self.config
@@ -1178,7 +1227,9 @@ impl RvmClient for HttpRvmClient {
         connect_async(request)
             .await
             .map(|(stream, _)| stream)
-            .map_err(|error| RvmError::WebSocket(error.to_string()))
+            .map_err(|error| {
+                RvmError::WebSocket(RvmError::redact(&error.to_string(), &self.config.token))
+            })
     }
 }
 
@@ -1221,6 +1272,18 @@ mod tests {
             readable.to_string(),
             "RVM returned HTTP 400 Bad Request: missing token"
         );
+    }
+
+    #[tokio::test]
+    async fn request_errors_redact_tokens_in_urls() {
+        let token = "secret-token";
+        let error = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:1/?tkn={token}"))
+            .send()
+            .await
+            .unwrap_err();
+        let error = RvmError::request(error, token);
+        assert!(!error.to_string().contains(token));
     }
 
     #[test]
