@@ -117,28 +117,6 @@ OpenWorker 当前实际 client 使用 `stdio_client` 和 `streamablehttp_client`
 
 ## 5.3 参照系统对照
 
-### Devin MCP
-
-Devin MCP 使用 `https://mcp.devin.ai/mcp` 的 Streamable HTTP，并使用 bearer 认证［Devin文］。已在调研中确认的 13 个 tool 名为：
-
-```text
-read_wiki_structure
-read_wiki_contents
-ask_question
-list_available_repos
-devin_session_create
-devin_session_search
-devin_session_interact
-devin_session_events
-devin_session_gather
-devin_playbook_manage
-devin_knowledge_manage
-devin_schedule_manage
-list_integrations
-```
-
-tool 参数以 Devin MCP schema 为准；本篇不复制未在 OPCOS 中实现的 provider/org 参数，也不记录任何 credential［Devin文］。
-
 ### Tembo MCP
 
 Tembo 支持 `stdio`、`http`、`sse`，并支持 OAuth-based remote MCP［Tembo文］。tool 清单在当前公开抓取文档中未形成可核实的完整固定列表，OPCOS 不编造名称。

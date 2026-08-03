@@ -9,7 +9,7 @@ import { translate } from "../i18n";
 
 export type SettingsSection =
   | "appearance"
-  | "devin"
+  | "agent"
   | "environment"
   | "market"
   | "provider"
@@ -27,7 +27,7 @@ export type SettingsSection =
 
 const tabs: Array<{ key: SettingsSection; label: string; icon: IconName }> = [
   { key: "appearance", label: "general", icon: "sliders" },
-  { key: "devin", label: "Devin", icon: "sparkle" },
+  { key: "agent", label: "Agent defaults", icon: "sparkle" },
   { key: "environment", label: "Environment", icon: "folder" },
   { key: "market", label: "市场", icon: "sparkle" },
   { key: "provider", label: "provider", icon: "sparkle" },

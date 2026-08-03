@@ -112,9 +112,6 @@ fn configure_no_window(command: &mut ProcessCommand) {
 fn configure_no_window(_command: &mut ProcessCommand) {}
 
 const SECRET_SERVICE: &str = "com.opcos.desktop";
-const DEVIN_API_BASE: &str = "https://api.devin.ai";
-const DEVIN_MCP_URL: &str = "https://mcp.devin.ai/mcp";
-const DEVIN_MCP_SERVER_ID: &str = "devin-mcp";
 const ASKPASS_SCRIPT: &str = "if (($args -join ' ') -match 'Username') { $env:OPCOS_GIT_USERNAME } else { $env:OPCOS_GIT_PASSWORD }";
 mod repo_index;
 mod scheduler;
@@ -875,70 +872,6 @@ fn scoped_secret_get(
     scoped_secret_get_from_store(&state.secrets, project_id, prefix, id)
 }
 
-async fn devin_api_request(state: &DesktopState, path: &str) -> Result<Value, String> {
-    let api_key = state
-        .secrets
-        .get(&secret_key("devin-api-key", "default"))
-        .map_err(|error| error.to_string())?
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "Devin API key is not configured".to_owned())?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .map_err(|error| error.to_string())?;
-    let response = client
-        .get(format!("{DEVIN_API_BASE}{path}"))
-        .bearer_auth(api_key)
-        .send()
-        .await
-        .map_err(|error| format!("Devin API request failed: {error}"))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "Devin API request failed with status {}",
-            response.status()
-        ));
-    }
-    response
-        .json::<Value>()
-        .await
-        .map_err(|error| format!("invalid Devin API response: {error}"))
-}
-
-fn devin_items(value: Value, kind: &str) -> Vec<Value> {
-    let items = value
-        .get("items")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    items
-        .into_iter()
-        .filter_map(|item| {
-            let id = item
-                .get("id")
-                .or_else(|| item.get(format!("{kind}_id")))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let name = item
-                .get("name")
-                .or_else(|| item.get("title"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let body = item
-                .get("body")
-                .or_else(|| item.get("content"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            if id.is_empty() || name.is_empty() {
-                return None;
-            }
-            Some(json!({"id": id, "name": name, "title": name, "body": body}))
-        })
-        .collect()
-}
-
 fn redact_approval_value(value: &Value) -> Value {
     match value {
         Value::Object(values) => Value::Object(
@@ -1167,7 +1100,7 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                key TEXT PRIMARY KEY,
                value TEXT NOT NULL
              );
-             CREATE TABLE IF NOT EXISTS devin_settings (
+             CREATE TABLE IF NOT EXISTS agent_settings (
                scope TEXT PRIMARY KEY,
                value TEXT NOT NULL,
                updated_at TEXT NOT NULL
@@ -1295,12 +1228,67 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
         )
         .map_err(|error| error.to_string())?;
     migrate_secret_records(&mut connection)?;
+    migrate_agent_settings(&connection)?;
     migrate_mcp_session_tools(&connection)?;
     migrate_config_objects(&mut connection)?;
     migrate_config_scope_model(&connection)?;
     seed_builtin_templates(&connection)?;
     migrate_coordination(&connection)?;
     Ok(connection)
+}
+
+fn migrate_agent_settings(connection: &Connection) -> Result<(), String> {
+    let has_legacy = connection
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM sqlite_master
+               WHERE type='table' AND name='devin_settings'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if has_legacy {
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        let rows = {
+            let mut statement = transaction
+                .prepare("SELECT scope,value,updated_at FROM devin_settings")
+                .map_err(|error| error.to_string())?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+        for (scope, value, updated_at) in rows {
+            let mut value = serde_json::from_str::<Value>(&value).unwrap_or_else(|_| json!({}));
+            if let Some(object) = value.as_object_mut()
+                && let Some(legacy) = object.remove("require_devin_mention")
+            {
+                object.entry("require_agent_mention").or_insert(legacy);
+            }
+            transaction
+                .execute(
+                    "INSERT INTO agent_settings(scope,value,updated_at) VALUES (?1,?2,?3)
+                     ON CONFLICT(scope) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                    rusqlite::params![scope, value.to_string(), updated_at],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction
+            .execute_batch("DROP TABLE devin_settings;")
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn migrate_config_scope_model(connection: &Connection) -> Result<(), String> {
@@ -1410,7 +1398,7 @@ fn migrate_config_scope_model(connection: &Connection) -> Result<(), String> {
     tx.commit().map_err(|error| error.to_string())
 }
 
-fn default_devin_settings() -> Value {
+fn default_agent_settings() -> Value {
     json!({
         "computer_use": true,
         "default_agent": "Fusion",
@@ -1419,7 +1407,7 @@ fn default_devin_settings() -> Value {
         "batch_limit": 50,
         "message_usage_limit": 0,
         "share_prompts_in_prs": true,
-        "require_devin_mention": false,
+        "require_agent_mention": false,
         "auto_add_reviewer": false,
         "reviewer": "",
         "open_prs_as": "ready",
@@ -1584,11 +1572,11 @@ fn merge_settings(base: &mut Value, override_value: &Value) {
     }
 }
 
-fn load_devin_settings(connection: &Connection, project_id: Option<&str>) -> Result<Value, String> {
-    let mut result = default_devin_settings();
+fn load_agent_settings(connection: &Connection, project_id: Option<&str>) -> Result<Value, String> {
+    let mut result = default_agent_settings();
     let global = connection
         .query_row(
-            "SELECT value FROM devin_settings WHERE scope='global'",
+            "SELECT value FROM agent_settings WHERE scope='global'",
             [],
             |row| row.get::<_, String>(0),
         )
@@ -1601,7 +1589,7 @@ fn load_devin_settings(connection: &Connection, project_id: Option<&str>) -> Res
         let scope = format!("project:{project_id}");
         let project = connection
             .query_row(
-                "SELECT value FROM devin_settings WHERE scope=?1",
+                "SELECT value FROM agent_settings WHERE scope=?1",
                 [&scope],
                 |row| row.get::<_, String>(0),
             )
@@ -1624,7 +1612,7 @@ fn save_session_via_factory(
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?;
-        load_devin_settings(&connection, session.project_id.as_deref())?
+        load_agent_settings(&connection, session.project_id.as_deref())?
     };
     let agent = default_agent_for_creation(&settings, automated);
     session.origin_label = Some(agent);
@@ -1678,7 +1666,7 @@ fn computer_use_enabled(state: &DesktopState, project_id: Option<&str>) -> Resul
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?;
-    Ok(load_devin_settings(&connection, project_id)?
+    Ok(load_agent_settings(&connection, project_id)?
         .get("computer_use")
         .and_then(Value::as_bool)
         .unwrap_or(true))
@@ -3216,7 +3204,7 @@ fn clear_project_configuration(state: &DesktopState, project_id: &str) -> Result
         .map_err(|_| "database lock poisoned")?;
     connection
         .execute(
-            "DELETE FROM devin_settings WHERE scope=?1",
+            "DELETE FROM agent_settings WHERE scope=?1",
             [format!("project:{project_id}")],
         )
         .map_err(|error| error.to_string())?;
@@ -4173,7 +4161,7 @@ async fn engine_for(
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?;
-        load_devin_settings(&connection, session.project_id.as_deref())?
+        load_agent_settings(&connection, session.project_id.as_deref())?
     };
     let (provider_id, configured_base_url) = {
         let connection = state
@@ -4698,67 +4686,6 @@ fn list_hosts(state: State<'_, DesktopState>) -> Result<Vec<HostView>, String> {
 }
 
 #[tauri::command]
-fn devin_integration_status(state: State<'_, DesktopState>) -> Result<Value, String> {
-    let configured = state
-        .secrets
-        .get(&secret_key("devin-api-key", "default"))
-        .map_err(|error| error.to_string())?
-        .is_some_and(|value| !value.is_empty());
-    Ok(json!({
-        "configured": configured,
-        "api_base": DEVIN_API_BASE,
-        "mcp_url": DEVIN_MCP_URL,
-    }))
-}
-
-#[tauri::command]
-fn devin_integration_save(state: State<'_, DesktopState>, api_key: String) -> Result<(), String> {
-    let api_key = api_key.trim();
-    if api_key.is_empty() {
-        return Err("Devin API key cannot be empty".into());
-    }
-    state
-        .secrets
-        .set(&secret_key("devin-api-key", "default"), api_key)
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-async fn devin_knowledge_list(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
-    Ok(devin_items(
-        devin_api_request(&state, "/v1/knowledge").await?,
-        "knowledge",
-    ))
-}
-
-#[tauri::command]
-async fn devin_playbooks_list(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
-    Ok(devin_items(
-        devin_api_request(&state, "/v1/playbooks").await?,
-        "playbook",
-    ))
-}
-
-#[tauri::command]
-fn devin_mcp_configure(state: State<'_, DesktopState>) -> Result<(), String> {
-    let api_key = state
-        .secrets
-        .get(&secret_key("devin-api-key", "default"))
-        .map_err(|error| error.to_string())?
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "Devin API key is not configured".to_owned())?;
-    let credentials = serde_json::to_string(&json!({"bearer_token": api_key}))
-        .map_err(|error| error.to_string())?;
-    state
-        .secrets
-        .set(
-            &secret_key("mcp-credential", DEVIN_MCP_SERVER_ID),
-            &credentials,
-        )
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
 fn save_host(
     state: State<'_, DesktopState>,
     id: Option<String>,
@@ -4987,7 +4914,7 @@ async fn start_surface(
     if matches!(kind, WsKind::Vnc | WsKind::Cdp)
         && !computer_use_enabled(&state, project_id.as_deref())?
     {
-        return Err("Computer use is disabled in Devin settings".into());
+        return Err("Computer use is disabled in agent settings".into());
     }
     if host_id == "local" {
         return Err(match kind {
@@ -5137,7 +5064,7 @@ fn create_session(
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?;
-        load_devin_settings(&connection, project_id.as_deref())?
+        load_agent_settings(&connection, project_id.as_deref())?
     };
     if host_id.trim().is_empty() {
         let platform = settings
@@ -9947,7 +9874,7 @@ fn github_comment_allowed(comment: &Value, settings: &Value) -> Result<(), Strin
         return Err("bot comment ignored by Responding to bots".into());
     }
     if settings
-        .get("require_devin_mention")
+        .get("require_agent_mention")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
@@ -9956,8 +9883,8 @@ fn github_comment_allowed(comment: &Value, settings: &Value) -> Result<(), Strin
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_ascii_lowercase();
-        if !body.contains("@devin") {
-            return Err("comment does not mention @Devin".into());
+        if !body.to_ascii_lowercase().contains("@opcos") {
+            return Err("comment does not mention @OPCOS".into());
         }
     }
     Ok(())
@@ -9998,7 +9925,7 @@ async fn github_process_pull_request_comments(
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?;
-        load_devin_settings(&connection, session.project_id.as_deref())?
+        load_agent_settings(&connection, session.project_id.as_deref())?
     };
     let configured = scoped_secret_get(
         &state,
@@ -11245,15 +11172,15 @@ async fn github_pull_request(
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?;
-        load_devin_settings(&connection, project_id.as_deref())?
+        load_agent_settings(&connection, project_id.as_deref())?
     };
     if settings
-        .get("require_devin_mention")
+        .get("require_agent_mention")
         .and_then(Value::as_bool)
         .unwrap_or(false)
-        && !body.contains("@Devin")
+        && !body.contains("@OPCOS")
     {
-        return Err("Pull request policy requires @Devin to respond".into());
+        return Err("Pull request policy requires @OPCOS to respond".into());
     }
     if let Some(session_id) = session_id.as_deref() {
         run_configured_lifecycle_stage(&state, session_id, LifecycleStage::PrePush, None).await?;
@@ -13499,7 +13426,7 @@ fn provider_settings(state: State<'_, DesktopState>) -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn devin_settings(
+fn agent_settings(
     state: State<'_, DesktopState>,
     project_id: Option<String>,
 ) -> Result<Value, String> {
@@ -13507,20 +13434,20 @@ fn devin_settings(
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?;
-    load_devin_settings(&connection, project_id.as_deref())
+    load_agent_settings(&connection, project_id.as_deref())
 }
 
 #[tauri::command]
-fn save_devin_settings(
+fn save_agent_settings(
     state: State<'_, DesktopState>,
     project_id: Option<String>,
     value: Value,
 ) -> Result<Value, String> {
-    let mut settings = default_devin_settings();
+    let mut settings = default_agent_settings();
     merge_settings(&mut settings, &value);
     let object = settings
         .as_object_mut()
-        .ok_or_else(|| "Devin settings must be an object".to_owned())?;
+        .ok_or_else(|| "Agent settings must be an object".to_owned())?;
     let batch_limit = object
         .get("batch_limit")
         .and_then(Value::as_i64)
@@ -13552,7 +13479,7 @@ fn save_devin_settings(
         .map_err(|_| "database lock poisoned")?;
     connection
         .execute(
-            "INSERT INTO devin_settings(scope,value,updated_at) VALUES (?1,?2,?3)
+            "INSERT INTO agent_settings(scope,value,updated_at) VALUES (?1,?2,?3)
              ON CONFLICT(scope) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
             params![scope, settings.to_string(), Utc::now().to_rfc3339()],
         )
@@ -13843,6 +13770,20 @@ fn main() {
             let mut secret_path = path.clone();
             secret_path.set_file_name("secrets.enc");
             let secrets = KeyringSecretStore::with_fallback(SECRET_SERVICE, secret_path);
+            secrets
+                .delete(&secret_key("devin-api-key", "default"))
+                .map_err(|error| {
+                    let cause: Box<dyn std::error::Error> =
+                        Box::new(std::io::Error::other(error.to_string()));
+                    tauri::Error::Setup(cause.into())
+                })?;
+            secrets
+                .delete(&secret_key("mcp-credential", "devin-mcp"))
+                .map_err(|error| {
+                    let cause: Box<dyn std::error::Error> =
+                        Box::new(std::io::Error::other(error.to_string()));
+                    tauri::Error::Setup(cause.into())
+                })?;
             let secret_backend = secrets.backend();
             eprintln!("secret_backend={secret_backend}");
             let mcp = Arc::new(McpManager::new(Arc::new(McpCredentialAdapter {
@@ -13957,11 +13898,6 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             list_hosts,
-            devin_integration_status,
-            devin_integration_save,
-            devin_knowledge_list,
-            devin_playbooks_list,
-            devin_mcp_configure,
             save_host,
             host_binding,
             test_host,
@@ -14066,8 +14002,8 @@ fn main() {
             list_secret_metadata,
             delete_secret_metadata,
             provider_settings,
-            devin_settings,
-            save_devin_settings,
+            agent_settings,
+            save_agent_settings,
             list_slash_commands,
             save_slash_command,
             delete_slash_command,
@@ -15193,11 +15129,11 @@ agents:
     }
 
     #[test]
-    fn devin_settings_project_override_changes_effective_behavior() {
+    fn agent_settings_project_override_changes_effective_behavior() {
         let connection = Connection::open_in_memory().unwrap();
         connection
             .execute(
-                "CREATE TABLE devin_settings (
+                "CREATE TABLE agent_settings (
                     scope TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -15207,7 +15143,7 @@ agents:
             .unwrap();
         connection
             .execute(
-                "INSERT INTO devin_settings(scope,value,updated_at)
+                "INSERT INTO agent_settings(scope,value,updated_at)
                  VALUES ('global',?1,'now'),('project:p1',?2,'now')",
                 params![
                     json!({"computer_use":true,"batch_limit":50}).to_string(),
@@ -15215,8 +15151,8 @@ agents:
                 ],
             )
             .unwrap();
-        let global = load_devin_settings(&connection, None).unwrap();
-        let project = load_devin_settings(&connection, Some("p1")).unwrap();
+        let global = load_agent_settings(&connection, None).unwrap();
+        let project = load_agent_settings(&connection, Some("p1")).unwrap();
         assert_eq!(global["computer_use"], true);
         assert_eq!(global["batch_limit"], 50);
         assert_eq!(project["computer_use"], false);
@@ -15224,11 +15160,50 @@ agents:
     }
 
     #[test]
-    fn devin_settings_defaults_are_real_runtime_limits() {
+    fn legacy_agent_settings_migrate_without_losing_values() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE agent_settings (
+                   scope TEXT PRIMARY KEY,
+                   value TEXT NOT NULL,
+                   updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE devin_settings (
+                   scope TEXT PRIMARY KEY,
+                   value TEXT NOT NULL,
+                   updated_at TEXT NOT NULL
+                 );
+                 INSERT INTO devin_settings(scope,value,updated_at)
+                 VALUES
+                   ('global','{\"batch_limit\":7,\"require_devin_mention\":true}','2024-01-01'),
+                   ('project:p1','{\"reviewer\":\"alice\"}','2024-01-02');",
+            )
+            .unwrap();
+
+        migrate_agent_settings(&connection).unwrap();
+
+        let settings = load_agent_settings(&connection, Some("p1")).unwrap();
+        assert_eq!(settings["batch_limit"], 7);
+        assert_eq!(settings["require_agent_mention"], true);
+        assert_eq!(settings["reviewer"], "alice");
+        assert!(
+            connection
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='devin_settings'",
+                    [],
+                    |_| Ok(()),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn agent_settings_defaults_are_real_runtime_limits() {
         let connection = Connection::open_in_memory().unwrap();
         connection
             .execute(
-                "CREATE TABLE devin_settings (
+                "CREATE TABLE agent_settings (
                     scope TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -15236,7 +15211,7 @@ agents:
                 [],
             )
             .unwrap();
-        let settings = load_devin_settings(&connection, None).unwrap();
+        let settings = load_agent_settings(&connection, None).unwrap();
         assert_eq!(settings["batch_limit"], 50);
         assert_eq!(settings["message_usage_limit"], 0);
         assert_eq!(settings["open_prs_as"], "ready");
@@ -15333,12 +15308,12 @@ agents:
     #[test]
     fn github_comment_policy_handles_bot_and_mention_combinations() {
         let human =
-            json!({"id":1,"body":"@Devin please inspect","user":{"type":"User","login":"alice"}});
+            json!({"id":1,"body":"@OPCOS please inspect","user":{"type":"User","login":"alice"}});
         let human_without_mention =
             json!({"id":2,"body":"please inspect","user":{"type":"User","login":"alice"}});
         let bot =
-            json!({"id":3,"body":"@Devin generated report","user":{"type":"Bot","login":"ci"}});
-        let bot_suffix = json!({"id":4,"body":"@Devin generated report","user":{"type":"User","login":"renovate[bot]"}});
+            json!({"id":3,"body":"@OPCOS generated report","user":{"type":"Bot","login":"ci"}});
+        let bot_suffix = json!({"id":4,"body":"@OPCOS generated report","user":{"type":"User","login":"renovate[bot]"}});
         let comments = [&human, &human_without_mention, &bot, &bot_suffix];
         let cases = [
             (false, false, vec![1, 2]),
@@ -15348,7 +15323,7 @@ agents:
         ];
         for (require_mention, respond_to_bots, expected) in cases {
             let settings = json!({
-                "require_devin_mention": require_mention,
+                "require_agent_mention": require_mention,
                 "responding_to_bots": if respond_to_bots { "respond" } else { "ignore" }
             });
             let accepted = comments
