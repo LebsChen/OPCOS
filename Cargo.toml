@@ -31,6 +31,7 @@ aws-smithy-types = "1"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
+imap = "2.4.1"
 keyring = { version = "3", default-features = false, features = [
     "sync-secret-service",
     "apple-native",
@@ -47,6 +48,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "process", "io-util"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 notify = "8"
+native-tls = "0.2"
 getrandom = "0.3"
 subtle = "2"
 tracing = "0.1"

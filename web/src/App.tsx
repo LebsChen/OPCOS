@@ -110,6 +110,25 @@ const TOKEN_CONNECTOR_KINDS = [
   "mixpanel",
   "amplitude",
 ] as const;
+const OAUTH_CONNECTOR_KINDS = [
+  "gmail",
+  "google calendar",
+  "google drive",
+  "outlook",
+  "salesforce",
+  "quickbooks",
+  "docusign",
+  "canva",
+  "dropbox",
+  "box",
+] as const;
+const CONFIGURABLE_CONNECTOR_KINDS = new Set<string>([
+  ...TOKEN_CONNECTOR_KINDS,
+  ...OAUTH_CONNECTOR_KINDS,
+  "whatsapp",
+  "email (imap)",
+  "browser",
+]);
 const CONNECTOR_FIELDS: Record<string, ConnectorField[]> = {
   github: [{ key: "token", label: "PAT", type: "password" }],
   telegram: [{ key: "token", label: "Bot token", type: "password" }],
@@ -150,6 +169,62 @@ const CONNECTOR_FIELDS: Record<string, ConnectorField[]> = {
   descript: [{ key: "token", label: "API token", type: "password" }],
   "monday.com": [
     { key: "token", label: "Personal API token", type: "password" },
+  ],
+  gmail: [
+    { key: "client_id", label: "OAuth client ID" },
+    { key: "client_secret", label: "OAuth client secret", type: "password" },
+  ],
+  "google calendar": [
+    { key: "client_id", label: "OAuth client ID" },
+    { key: "client_secret", label: "OAuth client secret", type: "password" },
+  ],
+  "google drive": [
+    { key: "client_id", label: "OAuth client ID" },
+    { key: "client_secret", label: "OAuth client secret", type: "password" },
+  ],
+  outlook: [
+    { key: "client_id", label: "Microsoft application client ID" },
+    {
+      key: "client_secret",
+      label: "Microsoft client secret",
+      type: "password",
+    },
+  ],
+  salesforce: [
+    { key: "client_id", label: "Connected App client ID" },
+    {
+      key: "client_secret",
+      label: "Connected App client secret",
+      type: "password",
+    },
+  ],
+  quickbooks: [
+    { key: "client_id", label: "OAuth client ID" },
+    { key: "client_secret", label: "OAuth client secret", type: "password" },
+  ],
+  docusign: [
+    { key: "client_id", label: "Integration key" },
+    { key: "client_secret", label: "Client secret", type: "password" },
+  ],
+  canva: [{ key: "client_id", label: "OAuth client ID" }],
+  dropbox: [
+    { key: "client_id", label: "App key" },
+    { key: "client_secret", label: "App secret", type: "password" },
+  ],
+  box: [
+    { key: "client_id", label: "OAuth client ID" },
+    { key: "client_secret", label: "OAuth client secret", type: "password" },
+  ],
+  whatsapp: [
+    { key: "access_token", label: "Cloud API access token", type: "password" },
+    { key: "phone_number_id", label: "Phone number ID" },
+    { key: "graph_version", label: "Graph API version", placeholder: "v20.0" },
+  ],
+  "email (imap)": [
+    { key: "imap_host", label: "IMAP host" },
+    { key: "imap_port", label: "IMAP port", placeholder: "993" },
+    { key: "username", label: "Username" },
+    { key: "password", label: "Password", type: "password" },
   ],
   jira: [
     {
@@ -1312,13 +1387,44 @@ function ManageSections({
     void command<Record<string, unknown>>("devin_integration_status")
       .then((status) => setDevinKeyConfigured(status.configured === true))
       .catch(onError);
-    for (const kind of TOKEN_CONNECTOR_KINDS) {
+    for (const kind of [
+      ...TOKEN_CONNECTOR_KINDS,
+      ...OAUTH_CONNECTOR_KINDS,
+      "whatsapp",
+      "email (imap)",
+    ]) {
       void command<TokenConnectorStatus>("connector_status", { kind })
         .then((status) =>
           setConnectorStatuses((items) => ({ ...items, [kind]: status })),
         )
         .catch(() => undefined);
     }
+    let disposed = false;
+    const subscription = listen<{ kind: string }>(
+      "connector-oauth-complete",
+      (event) => {
+        if (disposed) return;
+        const kind = event.payload.kind;
+        void command<TokenConnectorStatus>("connector_status", { kind })
+          .then((status) => {
+            setConnectorStatuses((items) => ({ ...items, [kind]: status }));
+            setConnectorMessages((items) => ({
+              ...items,
+              [kind]: `Connected as ${status.identity || "account"}.`,
+            }));
+          })
+          .catch((error) => {
+            setConnectorMessages((items) => ({
+              ...items,
+              [kind]: errorMessage(error),
+            }));
+          });
+      },
+    );
+    return () => {
+      disposed = true;
+      void subscription.then((unlisten) => unlisten());
+    };
   }, [tab, onError]);
   const [blueprint, setBlueprint] = useState<Record<string, unknown> | null>(
     null,
@@ -2670,102 +2776,139 @@ function ManageSections({
         {tab === "connectors" && (
           <div className="space-y-5">
             <div className="rounded-xl2 border border-line bg-panel p-5">
-              <h2 className="text-[15px] font-semibold text-ink">
-                OpenWorker connector directory
-              </h2>
-              <p className="muted mt-1">
-                Default connector catalog from OpenWorker. OPCOS only enables
-                integrations that are implemented locally.
-              </p>
-              <div className="grid grid-cols-2 xl:grid-cols-3 gap-2.5 mt-4">
-                {OPENWORKER_CONNECTORS.map((connector) => {
-                  const connectorKind = connector.name.toLowerCase();
-                  const tokenIntegrated = TOKEN_CONNECTOR_KINDS.includes(
-                    connectorKind as (typeof TOKEN_CONNECTOR_KINDS)[number],
-                  );
-                  const integrated =
-                    tokenIntegrated ||
-                    connector.name === "Linear" ||
-                    connector.name === "Devin";
-                  const tokenStatus = connectorStatuses[connectorKind];
-                  const status = tokenIntegrated
-                    ? tokenStatus?.connected
-                      ? `Connected as ${tokenStatus.identity || "bot"}`
-                      : "Configurable"
-                    : connector.name === "Devin"
-                      ? devinKeyConfigured
-                        ? "Connected"
+              {!openConnector && (
+                <>
+                  <h2 className="text-[15px] font-semibold text-ink">
+                    OpenWorker connector directory
+                  </h2>
+                  <p className="muted mt-1">
+                    Default connector catalog from OpenWorker. OPCOS only
+                    enables integrations that are implemented locally.
+                  </p>
+                </>
+              )}
+              {!openConnector && (
+                <div className="grid grid-cols-2 xl:grid-cols-3 gap-2.5 mt-4">
+                  {OPENWORKER_CONNECTORS.map((connector) => {
+                    const connectorKind = connector.name.toLowerCase();
+                    const configurable =
+                      CONFIGURABLE_CONNECTOR_KINDS.has(connectorKind);
+                    const integrated =
+                      configurable ||
+                      connector.name === "Linear" ||
+                      connector.name === "Devin";
+                    const tokenStatus = connectorStatuses[connectorKind];
+                    const status = configurable
+                      ? tokenStatus?.connected
+                        ? `Connected as ${tokenStatus.identity || "bot"}`
                         : "Configurable"
-                      : connector.name === "Linear"
-                        ? linearStatus.includes("Connected")
+                      : connector.name === "Devin"
+                        ? devinKeyConfigured
                           ? "Connected"
                           : "Configurable"
-                        : "Not integrated";
-                  return (
-                    <IntegrationCard
-                      key={connector.name}
-                      icon={connector.name.slice(0, 1)}
-                      title={connector.name}
-                      badge={{
-                        label:
-                          tokenIntegrated && tokenStatus?.connected
+                        : connector.name === "Linear"
+                          ? linearStatus.includes("Connected")
                             ? "Connected"
-                            : status === "Configurable"
-                              ? "Configurable"
-                              : status === "Connected"
-                                ? "Connected"
-                                : "Not integrated",
-                        tone:
-                          (tokenIntegrated && tokenStatus?.connected) ||
-                          status === "Connected"
-                            ? "success"
-                            : status === "Configurable"
-                              ? "info"
-                              : "neutral",
-                      }}
-                      description={connector.description}
-                      disabled={!tokenIntegrated}
-                      onClick={
-                        tokenIntegrated
-                          ? () =>
-                              setOpenConnector((value) =>
-                                value === connectorKind ? null : connectorKind,
-                              )
-                          : undefined
-                      }
-                      actions={
-                        tokenIntegrated ? (
-                          <Button
-                            className="bordered"
-                            onClick={() =>
-                              setOpenConnector((value) =>
-                                value === connectorKind ? null : connectorKind,
-                              )
-                            }
-                          >
-                            {openConnector === connectorKind
-                              ? "Close"
-                              : "Configure"}
-                          </Button>
-                        ) : !integrated ? (
-                          <Button className="bordered" disabled>
-                            Unavailable
-                          </Button>
-                        ) : undefined
-                      }
-                    />
-                  );
-                })}
-              </div>
+                            : "Configurable"
+                          : "Not integrated";
+                    return (
+                      <IntegrationCard
+                        key={connector.name}
+                        icon={connector.name.slice(0, 1)}
+                        title={connector.name}
+                        badge={{
+                          label:
+                            configurable && tokenStatus?.connected
+                              ? "Connected"
+                              : status === "Configurable"
+                                ? "Configurable"
+                                : status === "Connected"
+                                  ? "Connected"
+                                  : "Not integrated",
+                          tone:
+                            (configurable && tokenStatus?.connected) ||
+                            status === "Connected"
+                              ? "success"
+                              : status === "Configurable"
+                                ? "info"
+                                : "neutral",
+                        }}
+                        description={connector.description}
+                        disabled={!configurable}
+                        onClick={
+                          configurable
+                            ? () =>
+                                setOpenConnector((value) =>
+                                  value === connectorKind
+                                    ? null
+                                    : connectorKind,
+                                )
+                            : undefined
+                        }
+                        actions={
+                          configurable ? (
+                            <Button
+                              className="bordered"
+                              onClick={() =>
+                                setOpenConnector((value) =>
+                                  value === connectorKind
+                                    ? null
+                                    : connectorKind,
+                                )
+                              }
+                            >
+                              {openConnector === connectorKind
+                                ? "Close"
+                                : "Configure"}
+                            </Button>
+                          ) : !integrated ? (
+                            <Button className="bordered" disabled>
+                              Unavailable
+                            </Button>
+                          ) : undefined
+                        }
+                      />
+                    );
+                  })}
+                </div>
+              )}
               {openConnector &&
-                OPENWORKER_CONNECTORS.some(
-                  (connector) =>
-                    connector.name.toLowerCase() === openConnector &&
-                    TOKEN_CONNECTOR_KINDS.includes(
-                      openConnector as (typeof TOKEN_CONNECTOR_KINDS)[number],
-                    ),
-                ) && (
+                CONFIGURABLE_CONNECTOR_KINDS.has(openConnector) && (
                   <div className="form-grid mt-2">
+                    <div className="col-span-full flex items-center gap-3 border-b border-line pb-3">
+                      <Button
+                        className="bordered"
+                        onClick={() => setOpenConnector(null)}
+                      >
+                        ‹ All connectors
+                      </Button>
+                      <div>
+                        <h3 className="text-[15px] font-semibold text-ink">
+                          {openConnector}
+                        </h3>
+                        <p className="muted">
+                          {
+                            OPENWORKER_CONNECTORS.find(
+                              (item) =>
+                                item.name.toLowerCase() === openConnector,
+                            )?.description
+                          }
+                        </p>
+                      </div>
+                      {connectorStatuses[openConnector]?.connected && (
+                        <span className="status-success ml-auto">
+                          Connected
+                        </span>
+                      )}
+                    </div>
+                    {OAUTH_CONNECTOR_KINDS.includes(
+                      openConnector as (typeof OAUTH_CONNECTOR_KINDS)[number],
+                    ) && (
+                      <p className="muted col-span-full">
+                        Use your own OAuth application credentials. OPCOS opens
+                        the provider authorization page in your browser.
+                      </p>
+                    )}
                     {(CONNECTOR_FIELDS[openConnector] || []).map((field) => (
                       <label className="field-label" key={field.key}>
                         {field.label}
@@ -2804,29 +2947,49 @@ function ManageSections({
                     ))}
                     <Button
                       className="primary self-end"
-                      onClick={() =>
-                        command<TokenConnectorStatus>("connector_save", {
-                          kind: openConnector,
-                          token: connectorTokens[openConnector] || null,
-                          config: {
-                            ...connectorConfigs[openConnector],
-                            ...(connectorTokens[openConnector]
-                              ? { token: connectorTokens[openConnector] }
-                              : {}),
-                          },
-                        })
+                      onClick={() => {
+                        const config = {
+                          ...connectorConfigs[openConnector],
+                          ...(connectorTokens[openConnector]
+                            ? { token: connectorTokens[openConnector] }
+                            : {}),
+                        };
+                        const request = OAUTH_CONNECTOR_KINDS.includes(
+                          openConnector as (typeof OAUTH_CONNECTOR_KINDS)[number],
+                        )
+                          ? command<void>("connector_oauth_start", {
+                              kind: openConnector,
+                              config,
+                            })
+                          : openConnector === "browser"
+                            ? command<TokenConnectorStatus>(
+                                "connector_browser_check",
+                                { hostId: selected?.host_id || "local" },
+                              )
+                            : command<TokenConnectorStatus>("connector_save", {
+                                kind: openConnector,
+                                token: connectorTokens[openConnector] || null,
+                                config,
+                              });
+                        void request
                           .then((value) => {
-                            setConnectorStatuses((items) => ({
-                              ...items,
-                              [openConnector]: value,
-                            }));
+                            if (value) {
+                              setConnectorStatuses((items) => ({
+                                ...items,
+                                [openConnector]: value,
+                              }));
+                            }
                             setConnectorTokens((items) => ({
                               ...items,
                               [openConnector]: "",
                             }));
                             setConnectorMessages((items) => ({
                               ...items,
-                              [openConnector]: `Connected as ${value.identity || "bot"}.`,
+                              [openConnector]: OAUTH_CONNECTOR_KINDS.includes(
+                                openConnector as (typeof OAUTH_CONNECTOR_KINDS)[number],
+                              )
+                                ? "Authorization started in your browser."
+                                : `Connected as ${value?.identity || "host capability"}.`,
                             }));
                           })
                           .catch((error) => {
@@ -2834,10 +2997,16 @@ function ManageSections({
                               ...items,
                               [openConnector]: errorMessage(error),
                             }));
-                          })
-                      }
+                          });
+                      }}
                     >
-                      Save & verify
+                      {OAUTH_CONNECTOR_KINDS.includes(
+                        openConnector as (typeof OAUTH_CONNECTOR_KINDS)[number],
+                      )
+                        ? "Connect"
+                        : openConnector === "browser"
+                          ? "Connect"
+                          : "Save & verify"}
                     </Button>
                     {connectorMessages[openConnector] && (
                       <small

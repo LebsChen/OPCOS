@@ -52,10 +52,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Write};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::{Emitter, Manager, RunEvent, State};
+use tauri_plugin_opener::OpenerExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex as AsyncMutex;
@@ -5152,9 +5155,406 @@ async fn connector_json(request: reqwest::RequestBuilder, kind: &str) -> Result<
     Ok(body)
 }
 
+fn oauth_provider(kind: &str) -> Option<(&'static str, &'static str, &'static str, bool)> {
+    match kind {
+        "gmail" | "google calendar" | "google drive" => Some((
+            "https://accounts.google.com/o/oauth2/v2/auth",
+            "https://oauth2.googleapis.com/token",
+            "",
+            false,
+        )),
+        "outlook" => Some((
+            "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+            "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+            "offline_access Mail.Read Mail.Send Calendars.ReadWrite User.Read",
+            false,
+        )),
+        "salesforce" => Some((
+            "https://login.salesforce.com/services/oauth2/authorize",
+            "https://login.salesforce.com/services/oauth2/token",
+            "api refresh_token",
+            false,
+        )),
+        "quickbooks" => Some((
+            "https://appcenter.intuit.com/connect/oauth2",
+            "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer",
+            "com.intuit.quickbooks.accounting",
+            false,
+        )),
+        "docusign" => Some((
+            "https://account.docusign.com/oauth/auth",
+            "https://account.docusign.com/oauth/token",
+            "signature",
+            false,
+        )),
+        "canva" => Some((
+            "https://www.canva.com/api/oauth/authorize",
+            "https://api.canva.com/rest/v1/oauth/token",
+            "openid",
+            true,
+        )),
+        "dropbox" => Some((
+            "https://www.dropbox.com/oauth2/authorize",
+            "https://api.dropboxapi.com/oauth2/token",
+            "",
+            false,
+        )),
+        "box" => Some((
+            "https://account.box.com/api/oauth2/authorize",
+            "https://api.box.com/oauth2/token",
+            "",
+            false,
+        )),
+        _ => None,
+    }
+}
+
+fn oauth_scopes(kind: &str) -> &'static str {
+    match kind {
+        "gmail" => {
+            "openid email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send"
+        }
+        "google calendar" => "openid email https://www.googleapis.com/auth/calendar",
+        "google drive" => "openid email https://www.googleapis.com/auth/drive",
+        _ => oauth_provider(kind)
+            .map(|(_, _, scope, _)| scope)
+            .unwrap_or(""),
+    }
+}
+
+fn random_urlsafe(bytes: usize) -> Result<String, String> {
+    let mut value = vec![0_u8; bytes];
+    getrandom::fill(&mut value).map_err(|error| format!("random generation failed: {error}"))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value))
+}
+
+fn pkce_challenge(verifier: &str) -> String {
+    let digest = Sha256::digest(verifier.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+}
+
+fn imap_login<S: Read + Write>(
+    client: imap::Client<S>,
+    username: String,
+    password: String,
+) -> Result<Value, String> {
+    let identity = username.clone();
+    let _session = client
+        .login(username, password)
+        .map_err(|_| "IMAP login failed".to_owned())?;
+    Ok(json!({"connected": true, "identity": identity}))
+}
+
+async fn exchange_oauth_code(
+    client: &reqwest::Client,
+    kind: &str,
+    config: &Value,
+    code: &str,
+    redirect_uri: &str,
+    verifier: &str,
+) -> Result<Value, String> {
+    let (_, token_url, _, pkce_required) =
+        oauth_provider(kind).ok_or_else(|| "unsupported OAuth connector".to_owned())?;
+    let client_id = config
+        .get("client_id")
+        .and_then(Value::as_str)
+        .ok_or("OAuth client ID is required")?;
+    let client_secret = config
+        .get("client_secret")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let mut form = vec![
+        ("grant_type", "authorization_code".to_owned()),
+        ("code", code.to_owned()),
+        ("client_id", client_id.to_owned()),
+        ("redirect_uri", redirect_uri.to_owned()),
+    ];
+    if !client_secret.is_empty() {
+        form.push(("client_secret", client_secret.to_owned()));
+    }
+    if pkce_required {
+        form.push(("code_verifier", verifier.to_owned()));
+    }
+    let encoded_form = {
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        for (key, value) in &form {
+            serializer.append_pair(key, value);
+        }
+        serializer.finish()
+    };
+    let response = client
+        .post(token_url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(encoded_form)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|_| format!("{kind} OAuth token request failed"))?;
+    if !response.status().is_success() {
+        return Err(format!("{kind} OAuth token exchange failed"));
+    }
+    response
+        .json::<Value>()
+        .await
+        .map_err(|_| format!("{kind} OAuth token response was invalid"))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn oauth_callback(
+    listener: TcpListener,
+    kind: String,
+    expected_state: String,
+    verifier: String,
+    config: Value,
+    secrets: KeyringSecretStore,
+    app: tauri::AppHandle,
+    redirect_uri: String,
+) {
+    let Ok((mut stream, _)) = listener.accept().await else {
+        return;
+    };
+    let mut buffer = Vec::with_capacity(8192);
+    let mut header_end = None;
+    while buffer.len() < 64 * 1024 {
+        let mut chunk = [0_u8; 4096];
+        let Ok(size) = stream.read(&mut chunk).await else {
+            return;
+        };
+        if size == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..size]);
+        if let Some(index) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            header_end = Some(index + 4);
+            break;
+        }
+    }
+    let Some(header_end) = header_end else {
+        return;
+    };
+    let request = String::from_utf8_lossy(&buffer[..header_end]);
+    let target = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("/");
+    let callback_url = format!("http://127.0.0.1{target}");
+    let Ok(url) = url::Url::parse(&callback_url) else {
+        return;
+    };
+    let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
+    let valid_state = query.get("state").map(String::as_str) == Some(expected_state.as_str());
+    let html = if !valid_state {
+        "<html><body>OPCOS authorization failed.</body></html>"
+    } else if query.contains_key("error") {
+        "<html><body>OPCOS authorization was cancelled.</body></html>"
+    } else {
+        "<html><body>OPCOS authorization completed. You can return to OPCOS.</body></html>"
+    };
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        html.len(),
+        html
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let Some(code) = query.get("code") else {
+        return;
+    };
+    if !valid_state {
+        return;
+    }
+    let client = reqwest::Client::new();
+    let Ok(mut tokens) =
+        exchange_oauth_code(&client, &kind, &config, code, &redirect_uri, &verifier).await
+    else {
+        return;
+    };
+    if let Some(object) = tokens.as_object_mut() {
+        object.insert("client_id".into(), config["client_id"].clone());
+        object.insert(
+            "client_secret".into(),
+            config.get("client_secret").cloned().unwrap_or(Value::Null),
+        );
+        let received_at = Utc::now().timestamp();
+        object.insert("token_received_at".into(), json!(received_at));
+        if let Some(expires_in) = object.get("expires_in").and_then(Value::as_i64) {
+            object.insert("expiry".into(), json!(received_at + expires_in));
+        }
+        if kind == "quickbooks"
+            && let Some(realm_id) = query.get("realmId")
+        {
+            object.insert("realm_id".into(), Value::String(realm_id.clone()));
+        }
+    }
+    if let Ok(serialized) = serde_json::to_string(&tokens) {
+        let _ = secrets.set(&secret_key("connector-config", &kind), &serialized);
+        let _ = app.emit("connector-oauth-complete", json!({"kind": kind}));
+    }
+}
+
+#[tauri::command]
+async fn connector_oauth_start(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    kind: String,
+    config: Value,
+) -> Result<(), String> {
+    let kind = kind.trim().to_ascii_lowercase();
+    let (auth_url, _, _, pkce_required) =
+        oauth_provider(&kind).ok_or_else(|| format!("unsupported OAuth connector: {kind}"))?;
+    let client_id = config
+        .get("client_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("OAuth client ID is required")?;
+    if !pkce_required
+        && config
+            .get("client_secret")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        && matches!(kind.as_str(), "salesforce" | "docusign")
+    {
+        return Err("OAuth client secret is required".into());
+    }
+    let verifier = random_urlsafe(48)?;
+    let state_value = random_urlsafe(32)?;
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .map_err(|_| "could not start OAuth callback listener")?;
+    let port = listener
+        .local_addr()
+        .map_err(|_| "could not determine OAuth callback port")?
+        .port();
+    let redirect_uri = format!("http://127.0.0.1:{port}/oauth/callback");
+    let mut url = url::Url::parse(auth_url).map_err(|_| "invalid OAuth URL")?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("response_type", "code");
+        query.append_pair("client_id", client_id);
+        query.append_pair("redirect_uri", &redirect_uri);
+        query.append_pair("scope", oauth_scopes(&kind));
+        query.append_pair("state", &state_value);
+        if pkce_required {
+            query.append_pair("code_challenge", &pkce_challenge(&verifier));
+            query.append_pair("code_challenge_method", "S256");
+        }
+        if kind == "dropbox" {
+            query.append_pair("token_access_type", "offline");
+        }
+    }
+    let task_kind = kind.clone();
+    let task_config = config.clone();
+    let task_state = state_value;
+    let task_verifier = verifier;
+    let task_redirect = redirect_uri;
+    let task_app = app.clone();
+    let secrets = state.secrets.clone();
+    tauri::async_runtime::spawn(async move {
+        oauth_callback(
+            listener,
+            task_kind,
+            task_state,
+            task_verifier,
+            task_config,
+            secrets,
+            task_app,
+            task_redirect,
+        )
+        .await;
+    });
+    app.opener()
+        .open_url(url.to_string(), None::<&str>)
+        .map_err(|_| "could not open the system browser")?;
+    Ok(())
+}
+
+async fn oauth_config(state: &DesktopState, kind: &str) -> Result<Value, String> {
+    let mut config = connector_config(state, kind)?;
+    let expiry = config.get("expiry").and_then(Value::as_i64).unwrap_or(0);
+    let expires_in = config
+        .get("expires_in")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let received = config
+        .get("token_received_at")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let now = Utc::now().timestamp();
+    let expired = (expiry > 0 && now >= expiry - 60)
+        || (expiry == 0 && expires_in > 0 && now >= received + expires_in - 60);
+    if expired && let Some(refresh_token) = config.get("refresh_token").and_then(Value::as_str) {
+        let (_, token_url, _, _) =
+            oauth_provider(kind).ok_or_else(|| "unsupported OAuth connector".to_owned())?;
+        let client_id = config
+            .get("client_id")
+            .and_then(Value::as_str)
+            .ok_or("OAuth client ID is missing")?;
+        let client_secret = config
+            .get("client_secret")
+            .and_then(Value::as_str)
+            .and_then(|value| (!value.is_empty()).then_some(value));
+        let mut form = vec![
+            ("grant_type", "refresh_token".to_owned()),
+            ("refresh_token", refresh_token.to_owned()),
+            ("client_id", client_id.to_owned()),
+        ];
+        if let Some(secret) = client_secret {
+            form.push(("client_secret", secret.to_owned()));
+        }
+        let encoded_form = {
+            let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+            for (key, value) in &form {
+                serializer.append_pair(key, value);
+            }
+            serializer.finish()
+        };
+        let refreshed = reqwest::Client::new()
+            .post(token_url)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(encoded_form)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|_| format!("{kind} OAuth refresh failed"))?;
+        if !refreshed.status().is_success() {
+            return Err(format!("{kind} OAuth refresh failed"));
+        }
+        let refreshed = refreshed
+            .json::<Value>()
+            .await
+            .map_err(|_| format!("{kind} OAuth refresh response was invalid"))?;
+        if let (Some(current), Some(next)) = (config.as_object_mut(), refreshed.as_object()) {
+            for (name, value) in next {
+                current.insert(name.clone(), value.clone());
+            }
+            let received_at = Utc::now().timestamp();
+            current.insert("token_received_at".into(), json!(received_at));
+            if let Some(expires_in) = current.get("expires_in").and_then(Value::as_i64) {
+                current.insert("expiry".into(), json!(received_at + expires_in));
+            }
+        }
+        let serialized = serde_json::to_string(&config).map_err(|_| "OAuth credentials invalid")?;
+        state
+            .secrets
+            .set(&secret_key("connector-config", kind), &serialized)
+            .map_err(|_| format!("{kind} OAuth credentials could not be saved"))?;
+    }
+    Ok(config)
+}
+
 async fn connector_identity(state: &DesktopState, kind: &str) -> Result<Value, String> {
-    let config = connector_config(state, kind)?;
-    let token = config.get("token").and_then(Value::as_str).unwrap_or("");
+    let config = if oauth_provider(kind).is_some() {
+        oauth_config(state, kind).await?
+    } else {
+        connector_config(state, kind)?
+    };
+    let token = config
+        .get("token")
+        .or_else(|| config.get("access_token"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let client = reqwest::Client::new();
     match kind {
         "github" => {
@@ -5567,6 +5967,199 @@ async fn connector_identity(state: &DesktopState, kind: &str) -> Result<Value, S
             .await?;
             Ok(json!({"connected": true, "identity": "Amplitude project"}))
         }
+        "gmail" | "google calendar" | "google drive" => {
+            let body = connector_json(
+                client
+                    .get("https://openidconnect.googleapis.com/v1/userinfo")
+                    .bearer_auth(token),
+                "Google",
+            )
+            .await?;
+            let identity = body
+                .get("email")
+                .and_then(Value::as_str)
+                .or_else(|| body.get("name").and_then(Value::as_str))
+                .unwrap_or("Google account");
+            Ok(json!({"connected": true, "identity": identity}))
+        }
+        "outlook" => {
+            let body = connector_json(
+                client
+                    .get("https://graph.microsoft.com/v1.0/me")
+                    .bearer_auth(token),
+                "Outlook",
+            )
+            .await?;
+            let identity = body
+                .get("mail")
+                .and_then(Value::as_str)
+                .or_else(|| body.get("userPrincipalName").and_then(Value::as_str))
+                .unwrap_or("Microsoft account");
+            Ok(json!({"connected": true, "identity": identity}))
+        }
+        "salesforce" => {
+            let instance = config
+                .get("instance_url")
+                .and_then(Value::as_str)
+                .ok_or("Salesforce instance URL is missing")?
+                .trim_end_matches('/');
+            let body = connector_json(
+                client
+                    .get(format!("{instance}/services/oauth2/userinfo"))
+                    .bearer_auth(token),
+                "Salesforce",
+            )
+            .await?;
+            let identity = body
+                .get("preferred_username")
+                .and_then(Value::as_str)
+                .or_else(|| body.get("username").and_then(Value::as_str))
+                .unwrap_or("Salesforce user");
+            Ok(json!({"connected": true, "identity": identity}))
+        }
+        "quickbooks" => {
+            let realm_id = config
+                .get("realm_id")
+                .and_then(Value::as_str)
+                .ok_or("QuickBooks realm ID is missing")?;
+            connector_json(
+                client
+                    .get(format!(
+                        "https://quickbooks.api.intuit.com/v3/company/{realm_id}/companyinfo/{realm_id}"
+                    ))
+                    .bearer_auth(token)
+                    .header("Accept", "application/json"),
+                "QuickBooks",
+            )
+            .await?;
+            Ok(json!({"connected": true, "identity": format!("Company {realm_id}")}))
+        }
+        "docusign" => {
+            let body = connector_json(
+                client
+                    .get("https://account.docusign.com/oauth/userinfo")
+                    .bearer_auth(token),
+                "Docusign",
+            )
+            .await?;
+            let identity = body
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| body.get("email").and_then(Value::as_str))
+                .unwrap_or("Docusign user");
+            Ok(json!({"connected": true, "identity": identity}))
+        }
+        "canva" => {
+            let body = connector_json(
+                client
+                    .get("https://api.canva.com/rest/v1/users/me")
+                    .bearer_auth(token),
+                "Canva",
+            )
+            .await?;
+            let identity = body
+                .get("display_name")
+                .and_then(Value::as_str)
+                .or_else(|| body.get("email").and_then(Value::as_str))
+                .unwrap_or("Canva user");
+            Ok(json!({"connected": true, "identity": identity}))
+        }
+        "dropbox" => {
+            let body = connector_json(
+                client
+                    .post("https://api.dropboxapi.com/2/users/get_current_account")
+                    .bearer_auth(token),
+                "Dropbox",
+            )
+            .await?;
+            let identity = body
+                .get("email")
+                .and_then(Value::as_str)
+                .or_else(|| body.pointer("/name/display_name").and_then(Value::as_str))
+                .unwrap_or("Dropbox account");
+            Ok(json!({"connected": true, "identity": identity}))
+        }
+        "box" => {
+            let body = connector_json(
+                client
+                    .get("https://api.box.com/2.0/users/me")
+                    .bearer_auth(token),
+                "Box",
+            )
+            .await?;
+            let identity = body
+                .get("login")
+                .and_then(Value::as_str)
+                .or_else(|| body.get("name").and_then(Value::as_str))
+                .unwrap_or("Box user");
+            Ok(json!({"connected": true, "identity": identity}))
+        }
+        "whatsapp" => {
+            let version = config
+                .get("graph_version")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("v20.0");
+            let phone_number_id = config
+                .get("phone_number_id")
+                .and_then(Value::as_str)
+                .ok_or("WhatsApp phone number ID is missing")?;
+            let body = connector_json(
+                client
+                    .get(format!(
+                        "https://graph.facebook.com/{version}/{phone_number_id}"
+                    ))
+                    .bearer_auth(token),
+                "WhatsApp",
+            )
+            .await?;
+            let identity = body
+                .get("display_phone_number")
+                .and_then(Value::as_str)
+                .or_else(|| body.get("verified_name").and_then(Value::as_str))
+                .unwrap_or("WhatsApp phone number");
+            Ok(json!({"connected": true, "identity": identity}))
+        }
+        "email (imap)" => {
+            let host = config
+                .get("imap_host")
+                .and_then(Value::as_str)
+                .ok_or("IMAP host is required")?
+                .to_owned();
+            let port = config
+                .get("imap_port")
+                .and_then(Value::as_u64)
+                .unwrap_or(993) as u16;
+            let username = config
+                .get("username")
+                .and_then(Value::as_str)
+                .ok_or("IMAP username is required")?
+                .to_owned();
+            let password = config
+                .get("password")
+                .and_then(Value::as_str)
+                .ok_or("IMAP password is required")?
+                .to_owned();
+            let tls = config.get("tls").and_then(Value::as_bool).unwrap_or(true);
+            let result = tokio::task::spawn_blocking(move || {
+                if tls {
+                    let tls_connector = native_tls::TlsConnector::new()
+                        .map_err(|_| "IMAP TLS setup failed".to_owned())?;
+                    let client =
+                        imap::connect((host.as_str(), port), host.as_str(), &tls_connector)
+                            .map_err(|_| "IMAP connection failed".to_owned())?;
+                    imap_login(client, username, password)
+                } else {
+                    let stream = std::net::TcpStream::connect((host.as_str(), port))
+                        .map_err(|_| "IMAP connection failed".to_owned())?;
+                    let client = imap::Client::new(stream);
+                    imap_login(client, username, password)
+                }
+            })
+            .await
+            .map_err(|_| "IMAP validation task failed".to_owned())??;
+            Ok(result)
+        }
         _ => Err(format!("unsupported connector: {kind}")),
     }
 }
@@ -5606,6 +6199,8 @@ async fn connector_save(
         "datadog",
         "mixpanel",
         "amplitude",
+        "whatsapp",
+        "email (imap)",
     ];
     if !SUPPORTED.contains(&kind.as_str()) {
         return Err(format!("unsupported connector: {kind}"));
@@ -5693,6 +6288,34 @@ async fn connector_save(
     {
         return Err("Amplitude API key and secret key are required".into());
     }
+    if kind == "whatsapp"
+        && credentials
+            .get("phone_number_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .is_empty()
+    {
+        return Err("WhatsApp phone number ID is required".into());
+    }
+    if kind == "email (imap)"
+        && (credentials
+            .get("imap_host")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .is_empty()
+            || credentials
+                .get("username")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .is_empty()
+            || credentials
+                .get("password")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .is_empty())
+    {
+        return Err("IMAP host, username, and password are required".into());
+    }
     let key = secret_key("connector-config", &kind);
     let previous = state.secrets.get(&key).map_err(|error| error.to_string())?;
     if let Some(previous_value) = previous.as_deref()
@@ -5760,6 +6383,18 @@ async fn connector_status(state: State<'_, DesktopState>, kind: String) -> Resul
         "datadog",
         "mixpanel",
         "amplitude",
+        "whatsapp",
+        "email (imap)",
+        "gmail",
+        "google calendar",
+        "google drive",
+        "outlook",
+        "salesforce",
+        "quickbooks",
+        "docusign",
+        "canva",
+        "dropbox",
+        "box",
     ];
     if !SUPPORTED.contains(&kind.as_str()) {
         return Err(format!("unsupported connector: {kind}"));
@@ -5770,6 +6405,47 @@ async fn connector_status(state: State<'_, DesktopState>, kind: String) -> Resul
 #[tauri::command]
 async fn connector_validate(state: State<'_, DesktopState>, kind: String) -> Result<Value, String> {
     connector_status(state, kind).await
+}
+
+#[tauri::command]
+async fn connector_browser_check(
+    state: State<'_, DesktopState>,
+    host_id: String,
+) -> Result<Value, String> {
+    let available = if host_id == "local" {
+        let capabilities = LocalHost::new(FsPath::new("/"))
+            .map_err(|error| error.to_string())?
+            .capabilities()
+            .await
+            .map_err(|error| error.to_string())?;
+        capabilities
+            .items
+            .iter()
+            .filter(|item| item.available)
+            .map(|item| item.name.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+    } else {
+        client_for(&state, &host_id)?
+            .capabilities()
+            .await
+            .map_err(|error| format!("remote host unavailable: {error}"))?
+            .available
+            .into_iter()
+            .map(|item| item.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+    };
+    let browser = available
+        .iter()
+        .any(|item| item == "browser" || item.contains("cdp") || item.contains("playwright"));
+    if browser {
+        Ok(json!({
+            "connected": true,
+            "identity": "Host browser/CDP",
+            "enabled": true,
+        }))
+    } else {
+        Err("The selected host does not expose a browser/CDP capability".into())
+    }
 }
 
 async fn github_json(
@@ -8127,6 +8803,8 @@ fn main() {
             connector_save,
             connector_status,
             connector_validate,
+            connector_oauth_start,
+            connector_browser_check,
             linear_connection,
             linear_get_issue,
             linear_list_my_issues,
