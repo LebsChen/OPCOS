@@ -34,6 +34,7 @@ OPCOS 是本地优先的 one-person-company 工作台：Rust 内核 + Tauri v2 �
 | [09-cloud.md](09-cloud.md)                       | OPCOS Cloud 分层与形态演进                                |
 | [10-reference-matrix.md](10-reference-matrix.md) | 五方对照与事实来源                                        |
 | [11-roadmap.md](11-roadmap.md)                   | 开发路线与 Todos                                          |
+| [16-opc-gap.md](16-opc-gap.md)                   | OPC 一人公司终极目标差距评审                              |
 
 ## 事实来源标记
 
