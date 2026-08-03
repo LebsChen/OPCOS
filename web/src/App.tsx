@@ -103,6 +103,13 @@ type DevinSettings = {
   open_prs_as: "draft" | "ready";
   responding_to_bots: "ignore" | "respond";
 };
+type SlashCommand = {
+  name: string;
+  kind: "system" | "custom";
+  body: string;
+  scope: string;
+  default_body?: string;
+};
 const TOKEN_CONNECTOR_KINDS = [
   "github",
   "telegram",
@@ -2496,6 +2503,12 @@ function ManageSections({
   );
   const [devinProjectId, setDevinProjectId] = useState<string | null>(null);
   const [devinSettingsStatus, setDevinSettingsStatus] = useState("");
+  const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
+  const [slashCommandName, setSlashCommandName] = useState("");
+  const [slashCommandBody, setSlashCommandBody] = useState("");
+  const [slashCommandKind, setSlashCommandKind] = useState<"system" | "custom">(
+    "custom",
+  );
   const [providerModelOptions, setProviderModelOptions] = useState<
     Record<string, Array<{ id: string; label: string }>>
   >({});
@@ -2750,6 +2763,14 @@ function ManageSections({
     if (tab !== "devin") return;
     void command<DevinSettings>("devin_settings", { projectId: devinProjectId })
       .then(setDevinSettings)
+      .catch(onError);
+  }, [tab, devinProjectId, onError]);
+  useEffect(() => {
+    if (tab !== "devin") return;
+    void command<SlashCommand[]>("list_slash_commands", {
+      projectId: devinProjectId,
+    })
+      .then(setSlashCommands)
       .catch(onError);
   }, [tab, devinProjectId, onError]);
   useEffect(() => {
@@ -3015,6 +3036,172 @@ function ManageSections({
               >
                 保存 Devin 设置
               </Button>
+            </div>
+            <div className="pt-5">
+              <div className="flex items-center justify-between mb-3">
+                <div>
+                  <strong>Manage commands</strong>
+                  <small className="block">
+                    System 命令可覆盖或 Reset；Custom 命令可添加、编辑和删除。
+                  </small>
+                </div>
+                <Button
+                  onClick={() =>
+                    command("reset_slash_commands", {
+                      projectId: devinProjectId,
+                      name: null,
+                    })
+                      .then(() =>
+                        command<SlashCommand[]>("list_slash_commands", {
+                          projectId: devinProjectId,
+                        }),
+                      )
+                      .then(setSlashCommands)
+                      .catch(onError)
+                  }
+                >
+                  Reset system
+                </Button>
+              </div>
+              <div className="space-y-2">
+                {slashCommands.map((item) => (
+                  <div
+                    className="rounded-lg border border-line p-3"
+                    key={item.name}
+                  >
+                    <div className="flex items-center gap-2">
+                      <code className="text-accent">{item.name}</code>
+                      <span className="text-[11px] text-muted">
+                        {item.kind === "system" ? "System" : "Custom"}
+                      </span>
+                      <span className="ml-auto flex gap-2">
+                        {item.kind === "system" && (
+                          <Button
+                            onClick={() =>
+                              command("reset_slash_commands", {
+                                projectId: devinProjectId,
+                                name: item.name,
+                              })
+                                .then(() =>
+                                  command<SlashCommand[]>(
+                                    "list_slash_commands",
+                                    { projectId: devinProjectId },
+                                  ),
+                                )
+                                .then(setSlashCommands)
+                                .catch(onError)
+                            }
+                          >
+                            Reset
+                          </Button>
+                        )}
+                        {item.kind === "custom" && (
+                          <Button
+                            onClick={() =>
+                              command("delete_slash_command", {
+                                projectId: devinProjectId,
+                                name: item.name,
+                              })
+                                .then(() =>
+                                  command<SlashCommand[]>(
+                                    "list_slash_commands",
+                                    { projectId: devinProjectId },
+                                  ),
+                                )
+                                .then(setSlashCommands)
+                                .catch(onError)
+                            }
+                          >
+                            删除
+                          </Button>
+                        )}
+                      </span>
+                    </div>
+                    <textarea
+                      className="mt-2 w-full rounded-md border border-line bg-paper p-2 text-[13px]"
+                      value={item.body}
+                      onChange={(event) =>
+                        setSlashCommands((current) =>
+                          current.map((commandItem) =>
+                            commandItem.name === item.name
+                              ? { ...commandItem, body: event.target.value }
+                              : commandItem,
+                          ),
+                        )
+                      }
+                    />
+                    <div className="mt-2 flex justify-end">
+                      <Button
+                        className="primary"
+                        onClick={() =>
+                          command("save_slash_command", {
+                            projectId: devinProjectId,
+                            name: item.name,
+                            body: item.body,
+                            kind: item.kind,
+                          }).catch(onError)
+                        }
+                      >
+                        保存
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="mt-4 rounded-lg border border-dashed border-line p-3">
+                <strong>Add Command</strong>
+                <div className="mt-2 grid gap-2">
+                  <input
+                    placeholder="/command"
+                    value={slashCommandName}
+                    onChange={(event) =>
+                      setSlashCommandName(event.target.value)
+                    }
+                  />
+                  <select
+                    value={slashCommandKind}
+                    onChange={(event) =>
+                      setSlashCommandKind(
+                        event.target.value as "system" | "custom",
+                      )
+                    }
+                  >
+                    <option value="custom">Custom</option>
+                    <option value="system">System override</option>
+                  </select>
+                  <textarea
+                    placeholder="命令提示模板"
+                    value={slashCommandBody}
+                    onChange={(event) =>
+                      setSlashCommandBody(event.target.value)
+                    }
+                  />
+                  <Button
+                    className="primary justify-self-end"
+                    onClick={() =>
+                      command("save_slash_command", {
+                        projectId: devinProjectId,
+                        name: slashCommandName,
+                        body: slashCommandBody,
+                        kind: slashCommandKind,
+                      })
+                        .then(() =>
+                          command<SlashCommand[]>("list_slash_commands", {
+                            projectId: devinProjectId,
+                          }),
+                        )
+                        .then((items) => {
+                          setSlashCommands(items);
+                          setSlashCommandName("");
+                          setSlashCommandBody("");
+                        })
+                        .catch(onError)
+                    }
+                  >
+                    Add Command
+                  </Button>
+                </div>
+              </div>
             </div>
           </div>
         )}
@@ -6684,6 +6871,7 @@ function AppContent() {
   const [hosts, setHosts] = useState<Host[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selected, setSelected] = useState<Session | null>(null);
+  const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
   const [transcript, setTranscript] = useState<TranscriptViewItem[]>([]);
   const [surface, setSurface] = useState<
     "session" | "automations" | "manage" | "activity" | "inbox" | "project"
@@ -6746,6 +6934,13 @@ function AppContent() {
   const [homeWorkspace, setHomeWorkspace] = useState("");
   const [secretBackend, setSecretBackend] = useState("");
   const generation = useRef(0);
+  useEffect(() => {
+    void command<SlashCommand[]>("list_slash_commands", {
+      projectId: selected?.project_id || null,
+    })
+      .then(setSlashCommands)
+      .catch(() => undefined);
+  }, [selected?.project_id]);
   useEffect(() => {
     if (
       !(window as Window & { __TAURI_INTERNALS__?: unknown })
@@ -7391,6 +7586,7 @@ function AppContent() {
                   }
                   assets={assets}
                   secrets={secrets}
+                  slashCommands={slashCommands}
                   onUploadFile={uploadTextAttachment}
                   resetKey={selected.id}
                 />

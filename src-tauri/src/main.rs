@@ -1140,6 +1140,14 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                value TEXT NOT NULL,
                updated_at TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS slash_commands (
+               scope TEXT NOT NULL,
+               name TEXT NOT NULL,
+               kind TEXT NOT NULL,
+               body TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               PRIMARY KEY(scope,name)
+             );
              CREATE TABLE IF NOT EXISTS desktop_schema_migrations (
                version TEXT PRIMARY KEY,
                applied_at TEXT NOT NULL
@@ -1302,6 +1310,132 @@ fn computer_use_enabled(state: &DesktopState, project_id: Option<&str>) -> Resul
         .get("computer_use")
         .and_then(Value::as_bool)
         .unwrap_or(true))
+}
+
+fn builtin_slash_commands() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "/implement",
+            "请把当前任务落实为可运行的实现：先检查相关代码和约束，再做最小完整修改，并运行针对性测试。",
+        ),
+        (
+            "/plan",
+            "请先分析目标、现状、依赖和风险，给出分步骤执行计划；未经确认不要修改文件。",
+        ),
+        (
+            "/review",
+            "请以严格代码审查方式检查当前变更，优先找功能缺陷、回归、边界条件和安全问题，并给出证据。",
+        ),
+        (
+            "/test",
+            "请围绕当前任务补充或运行有意义的测试，覆盖成功、失败和边界行为，不要只验证数据存取。",
+        ),
+        (
+            "/think-hard",
+            "请深入推演问题的隐含约束、替代方案和失败模式，再提出经过验证的实现路径。",
+        ),
+        (
+            "/deploy",
+            "请检查发布前置条件、构建产物和部署步骤；只执行仓库允许且明确授权的部署动作。",
+        ),
+        (
+            "/pull-project",
+            "请同步当前项目的仓库状态，核对分支和未提交改动，再继续处理项目任务。",
+        ),
+    ]
+}
+
+fn effective_slash_commands(
+    connection: &Connection,
+    project_id: Option<&str>,
+) -> Result<Vec<Value>, String> {
+    let mut commands = builtin_slash_commands()
+        .into_iter()
+        .map(|(name, body)| {
+            (
+                name.to_owned(),
+                json!({
+                    "name": name,
+                    "kind": "system",
+                    "body": body,
+                    "scope": "global",
+                    "default_body": body
+                }),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut scopes = vec!["global".to_owned()];
+    if let Some(project_id) = project_id {
+        scopes.push(format!("project:{project_id}"));
+    }
+    for scope in scopes {
+        let mut statement = connection
+            .prepare("SELECT name,kind,body FROM slash_commands WHERE scope=?1")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([scope.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            let (name, kind, body) = row.map_err(|error| error.to_string())?;
+            let default_body = builtin_slash_commands()
+                .into_iter()
+                .find(|(builtin, _)| *builtin == name)
+                .map(|(_, body)| body);
+            commands.insert(
+                name.clone(),
+                json!({
+                    "name": name,
+                    "kind": kind,
+                    "body": body,
+                    "scope": scope,
+                    "default_body": default_body
+                }),
+            );
+        }
+    }
+    let mut result = commands.into_values().collect::<Vec<_>>();
+    result.sort_by(|a, b| {
+        a.get("name")
+            .and_then(Value::as_str)
+            .cmp(&b.get("name").and_then(Value::as_str))
+    });
+    Ok(result)
+}
+
+fn expand_slash_command(
+    connection: &Connection,
+    project_id: Option<&str>,
+    text: &str,
+) -> Result<String, String> {
+    let trimmed = text.trim_start();
+    let Some(command_name) = trimmed.split_whitespace().next() else {
+        return Ok(text.to_owned());
+    };
+    if !command_name.starts_with('/') {
+        return Ok(text.to_owned());
+    }
+    let Some(command) = effective_slash_commands(connection, project_id)?
+        .into_iter()
+        .find(|command| command.get("name").and_then(Value::as_str) == Some(command_name))
+    else {
+        return Ok(text.to_owned());
+    };
+    let body = command
+        .get("body")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "slash command body is invalid".to_owned())?;
+    let remainder = trimmed[command_name.len()..].trim();
+    if remainder.is_empty() {
+        Ok(body.to_owned())
+    } else {
+        Ok(format!("{body}\n\n{remainder}"))
+    }
 }
 
 fn migrate_coordination(connection: &Connection) -> Result<(), String> {
@@ -2166,6 +2300,12 @@ fn clear_project_configuration(state: &DesktopState, project_id: &str) -> Result
     connection
         .execute(
             "DELETE FROM devin_settings WHERE scope=?1",
+            [format!("project:{project_id}")],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "DELETE FROM slash_commands WHERE scope=?1",
             [format!("project:{project_id}")],
         )
         .map_err(|error| error.to_string())?;
@@ -4775,8 +4915,16 @@ async fn repo_index_refresh(
 async fn submit_turn(
     app: tauri::AppHandle,
     state: State<'_, DesktopState>,
-    request: SubmitRequest,
+    mut request: SubmitRequest,
 ) -> Result<(), String> {
+    let session = session_for(&state, &request.session_id)?;
+    request.text = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        expand_slash_command(&connection, session.project_id.as_deref(), &request.text)?
+    };
     if session_for(&state, &request.session_id)?.harness == "opencode" {
         return submit_opencode_turn(app, state, request).await;
     }
@@ -10881,6 +11029,127 @@ fn save_devin_settings(
 }
 
 #[tauri::command]
+fn list_slash_commands(
+    state: State<'_, DesktopState>,
+    project_id: Option<String>,
+) -> Result<Vec<Value>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    effective_slash_commands(&connection, project_id.as_deref())
+}
+
+#[tauri::command]
+fn save_slash_command(
+    state: State<'_, DesktopState>,
+    project_id: Option<String>,
+    name: String,
+    body: String,
+    kind: String,
+) -> Result<(), String> {
+    let name = name.trim().to_owned();
+    if !name.starts_with('/') || name.contains(char::is_whitespace) {
+        return Err("command name must start with / and contain no spaces".into());
+    }
+    if body.trim().is_empty() {
+        return Err("command body cannot be empty".into());
+    }
+    if !matches!(kind.as_str(), "system" | "custom") {
+        return Err("command kind must be system or custom".into());
+    }
+    if kind == "system"
+        && !builtin_slash_commands()
+            .iter()
+            .any(|(builtin, _)| *builtin == name)
+    {
+        return Err("only built-in commands can use system kind".into());
+    }
+    let scope = project_id
+        .as_deref()
+        .map(|id| format!("project:{id}"))
+        .unwrap_or_else(|| "global".into());
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    connection
+        .execute(
+            "INSERT INTO slash_commands(scope,name,kind,body,updated_at)
+             VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT(scope,name) DO UPDATE SET kind=excluded.kind,body=excluded.body,updated_at=excluded.updated_at",
+            params![scope, name, kind, body, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_slash_command(
+    state: State<'_, DesktopState>,
+    project_id: Option<String>,
+    name: String,
+) -> Result<(), String> {
+    let scope = project_id
+        .as_deref()
+        .map(|id| format!("project:{id}"))
+        .unwrap_or_else(|| "global".into());
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let kind = connection
+        .query_row(
+            "SELECT kind FROM slash_commands WHERE scope=?1 AND name=?2",
+            params![scope, name],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| "command not found".to_owned())?;
+    if kind != "custom" {
+        return Err("system commands can be reset but not deleted".into());
+    }
+    connection
+        .execute(
+            "DELETE FROM slash_commands WHERE scope=?1 AND name=?2",
+            params![scope, name],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn reset_slash_commands(
+    state: State<'_, DesktopState>,
+    project_id: Option<String>,
+    name: Option<String>,
+) -> Result<(), String> {
+    let scope = project_id
+        .as_deref()
+        .map(|id| format!("project:{id}"))
+        .unwrap_or_else(|| "global".into());
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    if let Some(name) = name {
+        connection
+            .execute(
+                "DELETE FROM slash_commands WHERE scope=?1 AND name=?2 AND kind='system'",
+                params![scope, name],
+            )
+            .map_err(|error| error.to_string())?;
+    } else {
+        connection
+            .execute(
+                "DELETE FROM slash_commands WHERE scope=?1 AND kind='system'",
+                [scope],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn provider_configurations(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
     let connection = state
         .database
@@ -11254,6 +11523,10 @@ fn main() {
             provider_settings,
             devin_settings,
             save_devin_settings,
+            list_slash_commands,
+            save_slash_command,
+            delete_slash_command,
+            reset_slash_commands,
             provider_configurations,
             save_provider_settings,
             save_provider_key,
@@ -11833,5 +12106,73 @@ mod m7_tests {
         assert_eq!(settings["message_usage_limit"], 0);
         assert_eq!(settings["open_prs_as"], "ready");
         assert_eq!(settings["computer_use"], true);
+    }
+
+    #[test]
+    fn slash_command_expansion_uses_project_override_and_arguments() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE slash_commands (
+                    scope TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(scope,name)
+                )",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO slash_commands(scope,name,kind,body,updated_at)
+                 VALUES ('project:p1','/review','system','项目审查模板','now'),
+                        ('global','/custom','custom','自定义模板','now')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            expand_slash_command(&connection, Some("p1"), "/review 查登录流程").unwrap(),
+            "项目审查模板\n\n查登录流程"
+        );
+        assert_eq!(
+            expand_slash_command(&connection, Some("p1"), "/custom").unwrap(),
+            "自定义模板"
+        );
+        assert_eq!(
+            expand_slash_command(&connection, Some("p1"), "普通消息").unwrap(),
+            "普通消息"
+        );
+    }
+
+    #[test]
+    fn builtin_slash_commands_are_available_without_storage_rows() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE slash_commands (
+                    scope TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(scope,name)
+                )",
+                [],
+            )
+            .unwrap();
+        let commands = effective_slash_commands(&connection, None).unwrap();
+        for name in [
+            "/implement",
+            "/plan",
+            "/review",
+            "/test",
+            "/think-hard",
+            "/deploy",
+            "/pull-project",
+        ] {
+            assert!(commands.iter().any(|item| item["name"] == name));
+        }
     }
 }
