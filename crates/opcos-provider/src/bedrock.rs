@@ -94,6 +94,34 @@ impl BedrockProvider {
             }
         }
     }
+
+    pub async fn discover_models(&self) -> Result<Vec<crate::registry::DiscoveredModel>, String> {
+        let client = aws_sdk_bedrock::Client::new(self.config().await);
+        let response = client
+            .list_foundation_models()
+            .send()
+            .await
+            .map_err(|_| "Bedrock model discovery failed.".to_string())?;
+        let models = response
+            .model_summaries()
+            .iter()
+            .filter_map(|summary| {
+                let id = summary.model_id().to_owned();
+                if id.is_empty() {
+                    return None;
+                }
+                let mut model = crate::registry::model_from_id("bedrock", id);
+                if let Some(name) = summary.model_name() {
+                    model.label = name.to_owned();
+                }
+                Some(model)
+            })
+            .collect::<Vec<_>>();
+        if models.is_empty() {
+            return Err("Bedrock returned no foundation models.".into());
+        }
+        Ok(models)
+    }
 }
 
 #[derive(Default)]

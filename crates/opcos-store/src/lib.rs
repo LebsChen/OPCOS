@@ -136,6 +136,27 @@ pub struct LoginStateBackupRecord {
     pub created_at: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ModelDiscoveryRecord {
+    pub provider: String,
+    pub base_url: String,
+    pub models_json: String,
+    pub source: String,
+    pub fallback_reason: Option<String>,
+    pub discovered_at: String,
+}
+
+impl ModelDiscoveryRecord {
+    pub fn is_fresh(&self, now: DateTime<Utc>, ttl_seconds: i64) -> bool {
+        DateTime::parse_from_rfc3339(&self.discovered_at)
+            .map(|time| {
+                let age = (now - time.with_timezone(&Utc)).num_seconds();
+                age >= 0 && age < ttl_seconds
+            })
+            .unwrap_or(false)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct StoredMessage {
     pub session_id: String,
@@ -1479,6 +1500,72 @@ impl SqliteStore {
         )?;
         let rows = statement.query_map([account_id], login_state_backup_from_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn save_model_discovery(
+        &self,
+        provider: &str,
+        base_url: &str,
+        models_json: &str,
+        source: &str,
+        fallback_reason: Option<&str>,
+    ) -> Result<ModelDiscoveryRecord, StoreError> {
+        if provider.trim().is_empty() || base_url.trim().is_empty() {
+            return Err(StoreError::Validation(
+                "provider and base_url are required".into(),
+            ));
+        }
+        let record = ModelDiscoveryRecord {
+            provider: provider.into(),
+            base_url: base_url.into(),
+            models_json: models_json.into(),
+            source: source.into(),
+            fallback_reason: fallback_reason.map(str::to_owned),
+            discovered_at: Utc::now().to_rfc3339(),
+        };
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "INSERT OR REPLACE INTO model_discovery_cache
+                 (provider,base_url,models_json,source,fallback_reason,discovered_at)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                params![
+                    record.provider,
+                    record.base_url,
+                    record.models_json,
+                    record.source,
+                    record.fallback_reason,
+                    record.discovered_at
+                ],
+            )?;
+        Ok(record)
+    }
+
+    pub fn model_discovery(
+        &self,
+        provider: &str,
+        base_url: &str,
+    ) -> Result<Option<ModelDiscoveryRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .query_row(
+                "SELECT provider,base_url,models_json,source,fallback_reason,discovered_at
+                 FROM model_discovery_cache WHERE provider=?1 AND base_url=?2",
+                params![provider, base_url],
+                |row| {
+                    Ok(ModelDiscoveryRecord {
+                        provider: row.get(0)?,
+                        base_url: row.get(1)?,
+                        models_json: row.get(2)?,
+                        source: row.get(3)?,
+                        fallback_reason: row.get(4)?,
+                        discovered_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
     }
 
     pub fn record_login_validation(
@@ -3279,6 +3366,15 @@ impl SqliteStore {
                size INTEGER NOT NULL,
                created_at TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS model_discovery_cache (
+               provider TEXT NOT NULL,
+               base_url TEXT NOT NULL,
+               models_json TEXT NOT NULL,
+               source TEXT NOT NULL,
+               fallback_reason TEXT,
+               discovered_at TEXT NOT NULL,
+               PRIMARY KEY(provider,base_url)
+             );
              CREATE INDEX IF NOT EXISTS idx_login_backups_account
                ON login_state_backups(account_id,created_at DESC);
              CREATE INDEX IF NOT EXISTS idx_action_ledger_created_at
@@ -3581,6 +3677,12 @@ impl SqliteStore {
             if version < 6 {
                 connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (6, ?1)",
+                    [Utc::now().to_rfc3339()],
+                )?;
+            }
+            if version < 7 {
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (7, ?1)",
                     [Utc::now().to_rfc3339()],
                 )?;
             }
@@ -5837,5 +5939,28 @@ mod tests {
                 .record_login_validation("account-a", "unknown", None)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn model_discovery_cache_is_persistent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let saved = store
+            .save_model_discovery(
+                "openai",
+                "https://api.openai.com/v1",
+                r#"[{"id":"gpt-test"}]"#,
+                "live",
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .model_discovery("openai", "https://api.openai.com/v1")
+                .unwrap()
+                .unwrap(),
+            saved
+        );
+        assert!(saved.is_fresh(Utc::now(), 300));
+        assert!(!saved.is_fresh(Utc::now() + chrono::Duration::seconds(301), 300));
     }
 }
