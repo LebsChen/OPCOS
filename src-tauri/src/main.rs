@@ -1412,9 +1412,9 @@ fn seed_builtin_templates(connection: &Connection) -> Result<(), String> {
         "template-blueprint-standard",
         "blueprint",
         "标准 Rust/TypeScript Blueprint",
-        "默认执行格式化、测试和构建检查。",
+        "拉取依赖后构建，并在推送前跑格式化、静态检查和测试。",
         &json!(
-            "clone: []\ninitialize:\n  - cargo build\ndependencies:\n  - cargo test\n  - cargo clippy --workspace --all-targets -- -D warnings\nbuild:\n  - cargo fmt --check\n  - (cd web && npm install && npx tsc --noEmit && npm run build)\n"
+            "dependencies:\n  - cargo fetch\n  - (cd web && npm install)\nbuild:\n  - cargo build\n  - (cd web && npm run build)\npre-push:\n  - cargo fmt --check\n  - cargo clippy --workspace --all-targets -- -D warnings\n  - cargo test\n  - (cd web && npx tsc --noEmit)\n"
         ),
     )?;
     Ok(())
