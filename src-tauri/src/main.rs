@@ -1356,6 +1356,39 @@ fn load_devin_settings(connection: &Connection, project_id: Option<&str>) -> Res
     Ok(result)
 }
 
+fn save_session_via_factory(
+    state: &DesktopState,
+    mut session: SessionRecord,
+    automated: bool,
+) -> Result<(), String> {
+    let settings = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        load_devin_settings(&connection, session.project_id.as_deref())?
+    };
+    let agent = default_agent_for_creation(&settings, automated);
+    session.origin_label = Some(agent);
+    state
+        .store
+        .save_session(&session)
+        .map_err(|error| error.to_string())
+}
+
+fn default_agent_for_creation(settings: &Value, automated: bool) -> String {
+    let setting_name = if automated {
+        "api_default_agent"
+    } else {
+        "default_agent"
+    };
+    settings
+        .get(setting_name)
+        .and_then(Value::as_str)
+        .unwrap_or("Fusion")
+        .to_owned()
+}
+
 fn computer_use_enabled(state: &DesktopState, project_id: Option<&str>) -> Result<bool, String> {
     let connection = state
         .database
@@ -4223,11 +4256,6 @@ fn create_session(
             )
             .unwrap_or_else(|_| "local".into());
     }
-    let default_agent = settings
-        .get("default_agent")
-        .and_then(Value::as_str)
-        .unwrap_or("Fusion")
-        .to_owned();
     let batch_limit = settings
         .get("batch_limit")
         .and_then(Value::as_i64)
@@ -4269,9 +4297,9 @@ fn create_session(
         .ok_or_else(|| "remote host not found; session was not created".to_owned())?;
     drop(connection);
     let now = Utc::now();
-    state
-        .store
-        .save_session(&SessionRecord {
+    save_session_via_factory(
+        &state,
+        SessionRecord {
             session_id: id.clone(),
             workspace: workspace.clone().unwrap_or_default(),
             model: model.clone(),
@@ -4283,7 +4311,7 @@ fn create_session(
             pinned: false,
             archived: false,
             origin: None,
-            origin_label: Some(default_agent),
+            origin_label: None,
             compaction: json!({}),
             host_id: host_id.clone(),
             provider: provider.clone(),
@@ -4294,8 +4322,9 @@ fn create_session(
             updated_at: now,
             project_id: project_id.clone(),
             agent_id: agent_id.clone(),
-        })
-        .map_err(|error| error.to_string())?;
+        },
+        false,
+    )?;
     if let Some(agent) = agent {
         state
             .store
@@ -7996,6 +8025,145 @@ async fn github_json(
     connector_json(request, "GitHub").await
 }
 
+fn github_comment_is_bot(comment: &Value) -> bool {
+    comment
+        .get("user")
+        .and_then(|user| user.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("bot"))
+        || comment
+            .get("user")
+            .and_then(|user| user.get("login"))
+            .and_then(Value::as_str)
+            .is_some_and(|login| login.ends_with("[bot]"))
+}
+
+fn github_comment_allowed(comment: &Value, settings: &Value) -> Result<(), String> {
+    if github_comment_is_bot(comment)
+        && settings
+            .get("responding_to_bots")
+            .and_then(Value::as_str)
+            .unwrap_or("ignore")
+            != "respond"
+    {
+        return Err("bot comment ignored by Responding to bots".into());
+    }
+    if settings
+        .get("require_devin_mention")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let body = comment
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !body.contains("@devin") {
+            return Err("comment does not mention @Devin".into());
+        }
+    }
+    Ok(())
+}
+
+fn github_pr_coordinates(pr_url: &str) -> Result<(String, u64), String> {
+    if !pr_url.starts_with("https://github.com/") || !pr_url.contains("/pull/") {
+        return Err("expected a GitHub pull request URL".into());
+    }
+    let path = pr_url
+        .trim_start_matches("https://github.com/")
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    let parts = path.split('/').collect::<Vec<_>>();
+    if parts.len() < 4 || parts[2] != "pull" {
+        return Err("expected a valid GitHub pull request URL".into());
+    }
+    let repo = format!("{}/{}", parts[0], parts[1]);
+    let number = parts[3]
+        .parse::<u64>()
+        .map_err(|_| "expected a valid pull request number".to_owned())?;
+    Ok((repo, number))
+}
+
+#[tauri::command]
+async fn github_process_pull_request_comments(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    session_id: String,
+    pr_url: String,
+    token_secret: String,
+) -> Result<Value, String> {
+    let session = session_for(&state, &session_id)?;
+    let (repo, number) = github_pr_coordinates(&pr_url)?;
+    let settings = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        load_devin_settings(&connection, session.project_id.as_deref())?
+    };
+    let configured = scoped_secret_get(
+        &state,
+        session.project_id.as_deref(),
+        "asset-secret",
+        &token_secret,
+    )?
+    .or(scoped_secret_get(
+        &state,
+        session.project_id.as_deref(),
+        "connector-token",
+        "github",
+    )?)
+    .ok_or_else(|| "GitHub token is not configured".to_owned())?;
+    let issue_comments = github_json(
+        &configured,
+        reqwest::Method::GET,
+        &format!("https://api.github.com/repos/{repo}/issues/{number}/comments"),
+        None,
+    )
+    .await?;
+    let review_comments = github_json(
+        &configured,
+        reqwest::Method::GET,
+        &format!("https://api.github.com/repos/{repo}/pulls/{number}/comments"),
+        None,
+    )
+    .await?;
+    let mut comments = issue_comments.as_array().cloned().unwrap_or_default();
+    comments.extend(review_comments.as_array().cloned().unwrap_or_default());
+    let mut processed = Vec::new();
+    let mut skipped = Vec::new();
+    for comment in comments {
+        let id = comment.get("id").cloned().unwrap_or(Value::Null);
+        if let Err(reason) = github_comment_allowed(&comment, &settings) {
+            skipped.push(json!({"id": id, "reason": reason}));
+            continue;
+        }
+        let body = comment
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if body.is_empty() {
+            skipped.push(json!({"id": id, "reason": "empty comment"}));
+            continue;
+        }
+        let login = comment
+            .get("user")
+            .and_then(|user| user.get("login"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let prompt = format!("请处理 GitHub PR {pr_url} 上来自 @{login} 的评论：\n\n{body}");
+        let engine = engine_for(&app, &state, &session_id).await?;
+        engine
+            .submit_text(prompt)
+            .await
+            .map_err(engine_error_message)?;
+        processed.push(json!({"id": id, "login": login}));
+    }
+    Ok(json!({"processed": processed, "skipped": skipped}))
+}
+
 async fn execute_connector_tool(
     secrets: &KeyringSecretStore,
     project_id: Option<&str>,
@@ -8287,9 +8455,9 @@ async fn linear_create_session_from_issue(
     let mode = mode.unwrap_or_else(|| "Interactive".into());
     let mode = permission_mode_name(parse_permission_mode(&mode)?).to_owned();
     let now = Utc::now();
-    state
-        .store
-        .save_session(&SessionRecord {
+    save_session_via_factory(
+        &state,
+        SessionRecord {
             session_id: session_id.clone(),
             workspace,
             model: model.unwrap_or_else(|| "auto".into()),
@@ -8313,7 +8481,7 @@ async fn linear_create_session_from_issue(
             pinned: false,
             archived: false,
             origin: Some("linear".into()),
-            origin_label: Some(identifier.clone()),
+            origin_label: None,
             compaction: json!({}),
             host_id,
             provider,
@@ -8324,8 +8492,9 @@ async fn linear_create_session_from_issue(
             updated_at: now,
             project_id: None,
             agent_id: None,
-        })
-        .map_err(|error| error.to_string())?;
+        },
+        true,
+    )?;
     audit(
         &state,
         &session_id,
@@ -10783,10 +10952,7 @@ async fn run_schedule_for_inner(
     triggered.external_session_id = None;
     triggered.run_state = "idle".into();
     triggered.stop_reason = "none".into();
-    state
-        .store
-        .save_session(&triggered)
-        .map_err(|e| e.to_string())?;
+    save_session_via_factory(state, triggered, true)?;
     state
         .store
         .set_unattended(&session_id, true)
@@ -11933,6 +12099,7 @@ fn main() {
             git_branch_name_command,
             git_workflow,
             github_pull_request,
+            github_process_pull_request_comments,
             review_snapshot,
             review_file_diff,
             session_worklog,
@@ -12663,6 +12830,52 @@ mod m7_tests {
         assert_eq!(settings["message_usage_limit"], 0);
         assert_eq!(settings["open_prs_as"], "ready");
         assert_eq!(settings["computer_use"], true);
+    }
+
+    #[test]
+    fn session_factory_separates_interactive_and_api_default_agents() {
+        let settings = json!({
+            "default_agent": "InteractiveAgent",
+            "api_default_agent": "AutomationAgent"
+        });
+        assert_eq!(
+            default_agent_for_creation(&settings, false),
+            "InteractiveAgent"
+        );
+        assert_eq!(
+            default_agent_for_creation(&settings, true),
+            "AutomationAgent"
+        );
+    }
+
+    #[test]
+    fn github_comment_policy_handles_bot_and_mention_combinations() {
+        let human =
+            json!({"id":1,"body":"@Devin please inspect","user":{"type":"User","login":"alice"}});
+        let human_without_mention =
+            json!({"id":2,"body":"please inspect","user":{"type":"User","login":"alice"}});
+        let bot =
+            json!({"id":3,"body":"@Devin generated report","user":{"type":"Bot","login":"ci"}});
+        let bot_suffix = json!({"id":4,"body":"@Devin generated report","user":{"type":"User","login":"renovate[bot]"}});
+        let comments = [&human, &human_without_mention, &bot, &bot_suffix];
+        let cases = [
+            (false, false, vec![1, 2]),
+            (false, true, vec![1, 2, 3, 4]),
+            (true, false, vec![1]),
+            (true, true, vec![1, 3, 4]),
+        ];
+        for (require_mention, respond_to_bots, expected) in cases {
+            let settings = json!({
+                "require_devin_mention": require_mention,
+                "responding_to_bots": if respond_to_bots { "respond" } else { "ignore" }
+            });
+            let accepted = comments
+                .iter()
+                .filter(|comment| github_comment_allowed(comment, &settings).is_ok())
+                .map(|comment| comment["id"].as_i64().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(accepted, expected);
+        }
     }
 
     #[test]

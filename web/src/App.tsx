@@ -2229,6 +2229,7 @@ function GitActions({
   const [value, setValue] = useState("");
   const [repo, setRepo] = useState("");
   const [pr, setPr] = useState("");
+  const [commentPrUrl, setCommentPrUrl] = useState("");
   const [lifecycleResult, setLifecycleResult] = useState<unknown>(null);
   return (
     <div className="git-actions">
@@ -2300,6 +2301,30 @@ function GitActions({
         <p className="muted small">
           The configured GitHub secret is read only by Rust; it is never
           displayed.
+        </p>
+      </details>
+      <details>
+        <summary>处理 GitHub PR 评论</summary>
+        <input
+          value={commentPrUrl}
+          onChange={(event) => setCommentPrUrl(event.target.value)}
+          placeholder="https://github.com/owner/repository/pull/123"
+        />
+        <Button
+          onClick={() =>
+            command("github_process_pull_request_comments", {
+              sessionId: selected.id,
+              prUrl: commentPrUrl,
+              tokenSecret: "github",
+            })
+              .then(setLifecycleResult)
+              .catch(onError)
+          }
+        >
+          拉取并处理评论
+        </Button>
+        <p className="muted small">
+          Bot 评论和未满足 @Devin 策略的评论会被跳过；凭据只在 Rust 后端使用。
         </p>
       </details>
     </div>
