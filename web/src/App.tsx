@@ -1161,7 +1161,13 @@ function ProjectConfigPanel({
   const [assets, setAssets] = useState<Asset[]>([]);
   const [secrets, setSecrets] = useState<SecretMetadata[]>([]);
   const [kind, setKind] = useState<
-    "agents" | "knowledge" | "playbook" | "mcp" | "connectors" | "blueprint"
+    | "agents"
+    | "knowledge"
+    | "playbook"
+    | "mcp"
+    | "acp-agent"
+    | "connectors"
+    | "blueprint"
   >("agents");
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
@@ -1267,6 +1273,7 @@ function ProjectConfigPanel({
             ["knowledge", "Knowledge"],
             ["playbook", "Playbook"],
             ["mcp", "MCP"],
+            ["acp-agent", "ACP agents"],
             ["connectors", "Connectors"],
             ["blueprint", "Blueprint"],
           ].map(([value, label]) => (
