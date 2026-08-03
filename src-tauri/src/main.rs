@@ -2034,6 +2034,9 @@ async fn delete_project_agent(
         .load_project(&agent.project_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "project not found".to_owned())?;
+    if agent.sort_order == 0 {
+        return Err("the Lead member cannot be deleted".to_owned());
+    }
     let host = project_host(&state, &project).await?;
     if !project_host_contains(&host, &project.repo_root)
         || !project_host_contains(&host, &agent.worktree_path)

@@ -17,6 +17,7 @@ import {
   Host,
   Session,
   Project,
+  ProjectAgent,
   SurfaceTab,
   hostFailureMessage,
   hostStatusLabel,
@@ -643,33 +644,429 @@ async function command<T>(
   return invoke<T>(name, args);
 }
 
+type HarnessOption = {
+  id: string;
+  label: string;
+  available: boolean;
+  reason?: string;
+};
+
+function ProjectDialog({
+  hosts,
+  onClose,
+  onSubmit,
+}: {
+  hosts: Host[];
+  onClose: () => void;
+  onSubmit: (values: {
+    name: string;
+    hostId: string;
+    repoUrl: string;
+    repoRoot: string;
+    defaultBranch: string;
+  }) => Promise<void>;
+}) {
+  const [name, setName] = useState("");
+  const [hostId, setHostId] = useState(hosts[0]?.id || "");
+  const [repoUrl, setRepoUrl] = useState("");
+  const [repoRoot, setRepoRoot] = useState("");
+  const [defaultBranch, setDefaultBranch] = useState("main");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!name.trim() || !hostId) {
+      setError("项目名称和主机不能为空");
+      return;
+    }
+    setSaving(true);
+    setError("");
+    try {
+      await onSubmit({
+        name: name.trim(),
+        hostId,
+        repoUrl: repoUrl.trim(),
+        repoRoot: repoRoot.trim(),
+        defaultBranch: defaultBranch.trim() || "main",
+      });
+    } catch (reason) {
+      setError(errorMessage(reason));
+      setSaving(false);
+    }
+  };
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4">
+      <form
+        className="w-full max-w-lg rounded-xl border border-line bg-panel p-6 shadow-xl"
+        onSubmit={submit}
+      >
+        <div className="flex items-center justify-between">
+          <h2 className="text-lg font-semibold text-ink">新建项目</h2>
+          <button type="button" className="btn" onClick={onClose}>
+            关闭
+          </button>
+        </div>
+        <div className="mt-5 grid gap-3">
+          <label className="field-label">
+            名称
+            <input
+              autoFocus
+              className="input"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              placeholder="项目名称"
+            />
+          </label>
+          <label className="field-label">
+            主机
+            <select
+              className="input"
+              value={hostId}
+              onChange={(event) => setHostId(event.target.value)}
+            >
+              {hosts.map((host) => (
+                <option key={host.id} value={host.id}>
+                  {host.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="field-label">
+            仓库 URL（可留空）
+            <input
+              className="input"
+              value={repoUrl}
+              onChange={(event) => setRepoUrl(event.target.value)}
+              placeholder="https://github.com/org/repo.git"
+            />
+          </label>
+          <label className="field-label">
+            仓库路径（可留空）
+            <input
+              className="input"
+              value={repoRoot}
+              onChange={(event) => setRepoRoot(event.target.value)}
+              placeholder="按后端默认路径"
+            />
+          </label>
+          <label className="field-label">
+            默认分支
+            <input
+              className="input"
+              value={defaultBranch}
+              onChange={(event) => setDefaultBranch(event.target.value)}
+            />
+          </label>
+        </div>
+        {error && <p className="mt-3 text-sm text-danger">{error}</p>}
+        <div className="mt-6 flex justify-end gap-2">
+          <button type="button" className="btn" onClick={onClose}>
+            取消
+          </button>
+          <button
+            type="submit"
+            className="btn approval-primary"
+            disabled={saving}
+          >
+            {saving ? "创建中…" : "创建项目"}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function MemberDialog({
+  mode,
+  agent,
+  providers,
+  models,
+  harnessOptions,
+  saving,
+  onClose,
+  onSubmit,
+}: {
+  mode: "add" | "edit";
+  agent?: ProjectAgent;
+  providers: ProviderDescriptor[];
+  models: Array<{ id: string; label: string }>;
+  harnessOptions: HarnessOption[];
+  saving: boolean;
+  onClose: () => void;
+  onSubmit: (values: {
+    name: string;
+    role: string;
+    provider: string;
+    model: string;
+    harness: string;
+    mode: string;
+    branch: string;
+    state: string;
+  }) => Promise<void>;
+}) {
+  const [name, setName] = useState(agent?.name || "");
+  const [role, setRole] = useState(agent?.role || "Code");
+  const [provider, setProvider] = useState(agent?.provider || "");
+  const [model, setModel] = useState(agent?.model || "auto");
+  const [harness, setHarness] = useState(agent?.harness || "builtin");
+  const [sessionMode, setSessionMode] = useState(agent?.mode || "Interactive");
+  const [branch, setBranch] = useState(agent?.branch || "");
+  const [state, setState] = useState(agent?.state || "Active");
+  const [error, setError] = useState("");
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!name.trim() || !role.trim()) {
+      setError("成员名称和角色不能为空");
+      return;
+    }
+    setError("");
+    try {
+      await onSubmit({
+        name: name.trim(),
+        role: role.trim(),
+        provider,
+        model,
+        harness,
+        mode: sessionMode,
+        branch: branch.trim(),
+        state,
+      });
+    } catch (reason) {
+      setError(errorMessage(reason));
+    }
+  };
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4">
+      <form
+        className="w-full max-w-lg rounded-xl border border-line bg-panel p-6 shadow-xl"
+        onSubmit={submit}
+      >
+        <div className="flex items-center justify-between">
+          <h2 className="text-lg font-semibold text-ink">
+            {mode === "add" ? "添加成员" : "编辑成员"}
+          </h2>
+          <button type="button" className="btn" onClick={onClose}>
+            关闭
+          </button>
+        </div>
+        <div className="mt-5 grid gap-3">
+          <label className="field-label">
+            名称
+            <input
+              autoFocus
+              className="input"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+            />
+          </label>
+          <label className="field-label">
+            角色
+            <input
+              className="input"
+              list="project-agent-roles"
+              value={role}
+              onChange={(event) => setRole(event.target.value)}
+            />
+            <datalist id="project-agent-roles">
+              {["Lead", "Code", "Review", "Test", "DevOps"].map((item) => (
+                <option key={item} value={item} />
+              ))}
+            </datalist>
+          </label>
+          {mode === "add" ? (
+            <>
+              <label className="field-label">
+                Provider
+                <select
+                  className="input"
+                  value={provider}
+                  onChange={(event) => setProvider(event.target.value)}
+                >
+                  <option value="">默认</option>
+                  {providers.map((item) => (
+                    <option
+                      key={item.name}
+                      value={item.name}
+                      disabled={item.available === false}
+                    >
+                      {item.title}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="field-label">
+                Model
+                <select
+                  className="input"
+                  value={model}
+                  onChange={(event) => setModel(event.target.value)}
+                >
+                  <option value="auto">Auto</option>
+                  {models.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {item.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="field-label">
+                Harness
+                <select
+                  className="input"
+                  value={harness}
+                  onChange={(event) => setHarness(event.target.value)}
+                >
+                  {(harnessOptions.length
+                    ? harnessOptions
+                    : [{ id: "builtin", label: "Builtin", available: true }]
+                  ).map((item) => (
+                    <option
+                      key={item.id}
+                      value={item.id}
+                      disabled={!item.available}
+                    >
+                      {item.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="field-label">
+                Mode
+                <select
+                  className="input"
+                  value={sessionMode}
+                  onChange={(event) => setSessionMode(event.target.value)}
+                >
+                  <option value="Interactive">Interactive</option>
+                  <option value="Auto">Auto</option>
+                </select>
+              </label>
+              <label className="field-label">
+                分支（可留空）
+                <input
+                  className="input"
+                  value={branch}
+                  onChange={(event) => setBranch(event.target.value)}
+                  placeholder="按角色自动命名"
+                />
+              </label>
+            </>
+          ) : (
+            <label className="field-label">
+              状态
+              <select
+                className="input"
+                value={state}
+                onChange={(event) => setState(event.target.value)}
+              >
+                <option value="Active">Active</option>
+                <option value="Sleep">Sleep</option>
+                <option value="Paused">Paused</option>
+              </select>
+            </label>
+          )}
+        </div>
+        {error && <p className="mt-3 text-sm text-danger">{error}</p>}
+        <div className="mt-6 flex justify-end gap-2">
+          <button type="button" className="btn" onClick={onClose}>
+            取消
+          </button>
+          <button
+            type="submit"
+            className="btn approval-primary"
+            disabled={saving}
+          >
+            {saving ? "保存中…" : "保存"}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
 function ProjectBoard({
   project,
   sessions,
+  providers,
+  models,
+  harnessOptions,
   onRefresh,
   onOpenSession,
   onError,
 }: {
   project: Project;
   sessions: Session[];
+  providers: ProviderDescriptor[];
+  models: Array<{ id: string; label: string }>;
+  harnessOptions: HarnessOption[];
   onRefresh: () => Promise<void>;
   onOpenSession: (id: string) => void;
   onError: (error: unknown) => void;
 }) {
-  const addMember = () => {
-    const name = window.prompt("成员名称");
-    const role = window.prompt("角色", "Code");
-    if (!name || !role) return;
-    void command("create_project_agent", {
-      projectId: project.id,
-      name,
-      role,
-      model: "auto",
-      harness: "builtin",
-      mode: "Interactive",
-    })
-      .then(onRefresh)
-      .catch(onError);
+  const [memberForm, setMemberForm] = useState<{
+    mode: "add" | "edit";
+    agent?: ProjectAgent;
+  } | null>(null);
+  const [deleteError, setDeleteError] = useState<{
+    agentId: string;
+    message: string;
+  } | null>(null);
+  const [memberSaving, setMemberSaving] = useState(false);
+  const submitMember = async (values: {
+    name: string;
+    role: string;
+    provider: string;
+    model: string;
+    harness: string;
+    mode: string;
+    branch: string;
+    state: string;
+  }) => {
+    setMemberSaving(true);
+    try {
+      if (memberForm?.mode === "add") {
+        await command("create_project_agent", {
+          projectId: project.id,
+          name: values.name,
+          role: values.role,
+          provider: values.provider || null,
+          model: values.model || "auto",
+          harness: values.harness || "builtin",
+          mode: values.mode || "Interactive",
+          branch: values.branch || null,
+        });
+      } else if (memberForm?.agent) {
+        await command("update_project_agent", {
+          id: memberForm.agent.id,
+          name: values.name,
+          role: values.role,
+          stateName: values.state,
+        });
+      }
+      setMemberForm(null);
+      await onRefresh();
+    } catch (reason) {
+      onError(reason);
+    } finally {
+      setMemberSaving(false);
+    }
+  };
+  const deleteMember = async (agent: ProjectAgent, force = false) => {
+    if (
+      !force &&
+      !window.confirm(`确定删除成员「${agent.name}」？其 worktree 将被回收。`)
+    )
+      return;
+    try {
+      await command("delete_project_agent", {
+        agentId: agent.id,
+        force,
+      });
+      setDeleteError(null);
+      await onRefresh();
+    } catch (reason) {
+      setDeleteError({ agentId: agent.id, message: errorMessage(reason) });
+    }
   };
   return (
     <main className="flex-1 overflow-y-auto p-8">
@@ -685,7 +1082,14 @@ function ProjectBoard({
               默认分支：{project.default_branch}
             </p>
           </div>
-          <button className="btn approval-primary" onClick={addMember}>
+          <button
+            className="btn approval-primary"
+            onClick={() =>
+              setMemberForm({
+                mode: "add",
+              })
+            }
+          >
             添加成员
           </button>
         </div>
@@ -706,8 +1110,18 @@ function ProjectBoard({
                   <span className="text-xs text-faint">{agent.state}</span>
                 </div>
                 <h2 className="mt-4 font-medium text-ink">{agent.name}</h2>
-                <p className="mt-2 text-xs text-faint truncate">
-                  {agent.branch}
+                <p
+                  className="mt-2 text-xs text-faint truncate"
+                  title={agent.branch}
+                >
+                  分支：{agent.branch}
+                </p>
+                <p
+                  className="mt-1 text-xs text-faint truncate"
+                  title={agent.worktree_path}
+                >
+                  {agent.sort_order === 0 ? "主检出：" : "Worktree："}
+                  {agent.worktree_path}
                 </p>
                 <div className="mt-4 flex items-center gap-2">
                   {session ? (
@@ -725,6 +1139,10 @@ function ProjectBoard({
                           title: agent.name,
                           projectId: project.id,
                           agentId: agent.id,
+                          provider: agent.provider || null,
+                          model: agent.model,
+                          harness: agent.harness,
+                          mode: agent.mode,
                         })
                           .then((next) => {
                             onOpenSession(next.id);
@@ -738,37 +1156,47 @@ function ProjectBoard({
                   )}
                   <button
                     className="btn"
-                    onClick={() => {
-                      const name = window.prompt("成员名称", agent.name);
-                      if (!name) return;
-                      void command("update_project_agent", {
-                        id: agent.id,
-                        name,
-                      })
-                        .then(onRefresh)
-                        .catch(onError);
-                    }}
+                    onClick={() => setMemberForm({ mode: "edit", agent })}
                   >
                     编辑
                   </button>
                   {agent.sort_order !== 0 && (
                     <button
                       className="btn"
-                      onClick={() =>
-                        command("delete_project_agent", { agentId: agent.id })
-                          .then(onRefresh)
-                          .catch(onError)
-                      }
+                      onClick={() => void deleteMember(agent)}
                     >
                       删除
                     </button>
                   )}
                 </div>
+                {deleteError?.agentId === agent.id && (
+                  <div className="mt-3 rounded-lg bg-danger/10 p-2 text-xs text-danger">
+                    <p>{deleteError.message}</p>
+                    <button
+                      className="btn mt-2"
+                      onClick={() => void deleteMember(agent, true)}
+                    >
+                      强制删除
+                    </button>
+                  </div>
+                )}
               </div>
             );
           })}
         </div>
       </div>
+      {memberForm && (
+        <MemberDialog
+          mode={memberForm.mode}
+          agent={memberForm.agent}
+          providers={providers}
+          models={models}
+          harnessOptions={harnessOptions}
+          saving={memberSaving}
+          onClose={() => setMemberForm(null)}
+          onSubmit={submitMember}
+        />
+      )}
     </main>
   );
 }
@@ -5440,6 +5868,7 @@ function AppContent() {
   >("session");
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
+  const [projectDialogOpen, setProjectDialogOpen] = useState(false);
   const [inbox, setInbox] = useState<InboxRecord[]>([]);
   const [unattended, setUnattended] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsSection>("provider");
@@ -5962,21 +6391,7 @@ function AppContent() {
           }
         }}
         onCreateProject={() => {
-          const name = window.prompt("项目名称");
-          const hostId = window.prompt("主机 ID", hosts[0]?.id || "local");
-          if (!name || !hostId) return;
-          void command<Project>("create_project", {
-            name,
-            hostId,
-            repoUrl: window.prompt("仓库 URL（可留空）", "") || null,
-            defaultBranch: "main",
-          })
-            .then((project) => {
-              setProjects((items) => [...items, project]);
-              setSelectedProject(project);
-              setSurface("project");
-            })
-            .catch(onError);
+          setProjectDialogOpen(true);
         }}
         selected={selected}
         query={query}
@@ -6023,6 +6438,9 @@ function AppContent() {
           <ProjectBoard
             project={selectedProject}
             sessions={sessions}
+            providers={providers}
+            models={models}
+            harnessOptions={harnessOptions}
             onRefresh={() => refresh().catch(onError)}
             onOpenSession={(id) => {
               const next = sessions.find((item) => item.id === id);
@@ -6385,6 +6803,25 @@ function AppContent() {
           </div>
         )}
       </main>
+      {projectDialogOpen && (
+        <ProjectDialog
+          hosts={hosts}
+          onClose={() => setProjectDialogOpen(false)}
+          onSubmit={async (values) => {
+            const project = await command<Project>("create_project", {
+              name: values.name,
+              hostId: values.hostId,
+              repoUrl: values.repoUrl || null,
+              repoRoot: values.repoRoot || null,
+              defaultBranch: values.defaultBranch,
+            });
+            setProjects((items) => [...items, project]);
+            setSelectedProject(project);
+            setProjectDialogOpen(false);
+            setSurface("project");
+          }}
+        />
+      )}
       {surface === "session" && selected && (
         <SessionRightPanel
           selected={selected}
