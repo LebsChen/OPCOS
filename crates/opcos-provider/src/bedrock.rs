@@ -102,7 +102,7 @@ impl BedrockProvider {
             .send()
             .await
             .map_err(|_| "Bedrock model discovery failed.".to_string())?;
-        let models = response
+        let mut models = response
             .model_summaries()
             .iter()
             .filter_map(|summary| {
@@ -120,6 +120,7 @@ impl BedrockProvider {
         if models.is_empty() {
             return Err("Bedrock returned no foundation models.".into());
         }
+        crate::registry::sort_discovered_models(&mut models);
         Ok(models)
     }
 }

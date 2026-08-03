@@ -8361,6 +8361,7 @@ struct ModelDescriptor {
     provider: String,
     capabilities: opcos_provider::Caps,
     capabilities_known: bool,
+    likely_non_chat: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -8480,6 +8481,7 @@ async fn provider_models(
                             provider: model.provider.into(),
                             capabilities: model.capabilities.clone(),
                             capabilities_known: true,
+                            likely_non_chat: false,
                         })
                         .collect::<Vec<_>>()
                 })
@@ -8496,6 +8498,7 @@ async fn provider_models(
             provider: model.provider,
             capabilities: model.capabilities,
             capabilities_known: model.capabilities_known,
+            likely_non_chat: model.likely_non_chat,
         })
         .collect::<Vec<_>>();
     let models_json = serde_json::to_string(&models).map_err(|error| error.to_string())?;

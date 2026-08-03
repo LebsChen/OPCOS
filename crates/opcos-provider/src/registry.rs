@@ -33,6 +33,7 @@ pub struct DiscoveredModel {
     pub provider: String,
     pub capabilities: Caps,
     pub capabilities_known: bool,
+    pub likely_non_chat: bool,
 }
 
 impl fmt::Debug for ProviderDescriptor {
@@ -327,45 +328,83 @@ pub(crate) fn model_from_id(provider: &str, id: String) -> DiscoveredModel {
         .into_iter()
         .find(|entry| matrix::canonical_model_id(provider, entry.id) == canonical_id)
     {
+        let likely_non_chat = is_likely_non_chat_model(&canonical_id);
         return DiscoveredModel {
             id: canonical_id,
             label: entry.label.to_owned(),
             provider: provider.to_owned(),
             capabilities: entry.capabilities.clone(),
             capabilities_known: true,
+            likely_non_chat,
         };
     }
+    let likely_non_chat = is_likely_non_chat_model(&canonical_id);
     DiscoveredModel {
         id: canonical_id.clone(),
-        label: canonical_id,
+        label: canonical_id.clone(),
         provider: provider.to_owned(),
         capabilities: Caps::default(),
         capabilities_known: false,
+        likely_non_chat,
     }
 }
 
+fn is_likely_non_chat_model(id: &str) -> bool {
+    let normalized = id.to_ascii_lowercase();
+    [
+        "embedding",
+        "embed-",
+        "whisper",
+        "tts",
+        "dall-e",
+        "dalle",
+        "moderation",
+        "rerank",
+        "reranker",
+    ]
+    .iter()
+    .any(|family| normalized.contains(family))
+}
+
+pub(crate) fn sort_discovered_models(models: &mut [DiscoveredModel]) {
+    models.sort_by_key(|model| {
+        (
+            !model.capabilities_known,
+            model.likely_non_chat,
+            model.id.to_ascii_lowercase(),
+        )
+    });
+}
+
 fn parse_openai_models(provider: &str, body: &serde_json::Value) -> Vec<DiscoveredModel> {
-    body.get("data")
+    let mut models = body
+        .get("data")
         .and_then(|data| data.as_array())
         .into_iter()
         .flatten()
         .filter_map(|model| model.get("id").and_then(|id| id.as_str()))
         .map(|id| model_from_id(provider, id.to_owned()))
-        .collect()
+        .collect::<Vec<_>>();
+    sort_discovered_models(&mut models);
+    models
 }
 
 fn parse_anthropic_models(body: &serde_json::Value) -> Vec<DiscoveredModel> {
-    body.get("data")
+    let mut models = body
+        .get("data")
         .and_then(|data| data.as_array())
         .into_iter()
         .flatten()
         .filter_map(|model| model.get("id").and_then(|id| id.as_str()))
         .map(|id| model_from_id("anthropic", id.to_owned()))
-        .collect()
+        .collect::<Vec<_>>();
+    sort_discovered_models(&mut models);
+    models
 }
 
 fn parse_ollama_models(body: &serde_json::Value) -> Vec<DiscoveredModel> {
-    body.get("models")
+    let mut models = body
+        .get("models")
         .and_then(|models| models.as_array())
         .into_iter()
         .flatten()
@@ -376,7 +415,9 @@ fn parse_ollama_models(body: &serde_json::Value) -> Vec<DiscoveredModel> {
                 .and_then(|id| id.as_str())
         })
         .map(|id| model_from_id("ollama", id.to_owned()))
-        .collect()
+        .collect::<Vec<_>>();
+    sort_discovered_models(&mut models);
+    models
 }
 
 fn models_endpoint(base_url: &str, provider: &str) -> String {
@@ -563,6 +604,43 @@ mod tests {
         assert!(!models[1].capabilities_known);
         assert!(!models[1].capabilities.tools);
         assert!(!models[1].capabilities.vision);
+    }
+
+    #[test]
+    fn sorts_chat_models_first_and_marks_non_chat_families_without_dropping_unknowns() {
+        let models = parse_openai_models(
+            "openai",
+            &serde_json::json!({
+                "data": [
+                    {"id":"text-embedding-3-large"},
+                    {"id":"vendor-new-chat-model"},
+                    {"id":"gpt-4o"},
+                    {"id":"whisper-1"},
+                    {"id":"vendor-embedding-chat"}
+                ]
+            }),
+        );
+        assert_eq!(models[0].id, "gpt-4o");
+        assert!(!models[0].likely_non_chat);
+        assert_eq!(models[1].id, "vendor-new-chat-model");
+        assert!(!models[1].likely_non_chat);
+        let embedding = models
+            .iter()
+            .find(|model| model.id == "text-embedding-3-large")
+            .unwrap();
+        assert!(embedding.likely_non_chat);
+        assert!(
+            models
+                .iter()
+                .any(|model| model.id == "vendor-embedding-chat")
+        );
+        assert!(
+            models
+                .iter()
+                .find(|model| model.id == "vendor-embedding-chat")
+                .unwrap()
+                .likely_non_chat
+        );
     }
 
     #[test]
