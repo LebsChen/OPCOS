@@ -2607,7 +2607,7 @@ fn list_project_configuration_templates(
     let mut statement = connection
         .prepare(
             "SELECT t.id,t.kind,t.name,t.status,t.scope_key,tv.content,tv.content_hash,
-                    p.id,pv.content,pv.content_hash,pv.metadata_json
+                    p.id,p.status,pv.content,pv.content_hash,pv.metadata_json
              FROM config_object t
              JOIN config_object_version tv ON tv.id=t.current_version_id
              LEFT JOIN config_object p
@@ -2621,12 +2621,12 @@ fn list_project_configuration_templates(
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map([project_id], |row| {
-            let project_status: Option<String> = row.get(7)?;
+            let project_status: Option<String> = row.get(8)?;
             let metadata = row
-                .get::<_, Option<String>>(10)?
+                .get::<_, Option<String>>(11)?
                 .and_then(|value| serde_json::from_str::<Value>(&value).ok())
                 .unwrap_or_else(|| json!({}));
-            let project_hash = row.get::<_, Option<String>>(8)?;
+            let project_hash = row.get::<_, Option<String>>(9)?;
             let source_hash = metadata
                 .get("source_content_hash")
                 .and_then(Value::as_str)
@@ -3183,7 +3183,11 @@ async fn create_project_agent(
     } else {
         format!("{}/worktrees/{id}", project.repo_root.trim_end_matches('/'))
     };
-    let branch = branch.unwrap_or_else(|| worktree_branch(&role, sort_order));
+    let branch = if sort_order == 0 {
+        project.default_branch.clone()
+    } else {
+        branch.unwrap_or_else(|| worktree_branch(&role, sort_order))
+    };
     let host = project_host(&state, &project).await?;
     if !project_host_contains(&host, &project.repo_root)
         || !project_host_contains(&host, &worktree_path)
@@ -6980,6 +6984,7 @@ fn repository_template_paths(
     kind: &str,
     name: &str,
     host: &dyn Host,
+    repository_root: &str,
 ) -> Result<(String, String), String> {
     let slug = repository_template_slug(name);
     if slug.is_empty() {
@@ -6998,14 +7003,44 @@ fn repository_template_paths(
             ));
         }
     };
-    let directory_path = host.join(directory).map_err(|error| error.to_string())?;
-    let path = if directory == "." {
-        host.join(&filename)
+    let directory_path = repository_path(host, repository_root, directory)?;
+    let relative_file = if directory == "." {
+        filename.clone()
     } else {
-        host.join(&format!("{directory}/{filename}"))
-    }
-    .map_err(|error| error.to_string())?;
+        format!("{directory}/{filename}")
+    };
+    let path = repository_path(host, repository_root, &relative_file)?;
     Ok((directory_path, path))
+}
+
+fn repository_path(
+    host: &dyn Host,
+    repository_root: &str,
+    relative: &str,
+) -> Result<String, String> {
+    if host.id() == "local" {
+        let path = format!(
+            "{}/{}",
+            repository_root.trim_end_matches(['/', '\\']),
+            relative.trim_start_matches(['/', '\\'])
+        );
+        if !host.contains(repository_root) {
+            return Err("repository path is outside the bound host workspace".into());
+        }
+        return Ok(path);
+    }
+    let workspace = host.join(".").map_err(|error| error.to_string())?;
+    let root = repository_root.trim_end_matches(['/', '\\']);
+    let relative_root = root
+        .strip_prefix(workspace.trim_end_matches(['/', '\\']))
+        .map(|value| value.trim_start_matches(['/', '\\']))
+        .ok_or_else(|| "repository path is outside the bound host workspace".to_owned())?;
+    let child = if relative_root.is_empty() {
+        relative.to_owned()
+    } else {
+        format!("{relative_root}/{relative}")
+    };
+    host.join(&child).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -7028,9 +7063,7 @@ async fn import_repository_templates(
         ("team-template", ".agents/templates/teams"),
     ];
     for (kind, relative_root) in template_roots {
-        let root = host
-            .join(relative_root)
-            .map_err(|error| error.to_string())?;
+        let root = repository_path(host.as_ref(), &project.repo_root, relative_root)?;
         let listing = match host.ls(Some(&root)).await {
             Ok(listing) => listing,
             Err(_) => continue,
@@ -7039,9 +7072,11 @@ async fn import_repository_templates(
             if !item.name.ends_with(".yaml") && !item.name.ends_with(".yml") {
                 continue;
             }
-            let path = host
-                .join(&format!("{relative_root}/{}", item.name))
-                .map_err(|error| error.to_string())?;
+            let path = repository_path(
+                host.as_ref(),
+                &project.repo_root,
+                &format!("{relative_root}/{}", item.name),
+            )?;
             let content = match host.read(&path).await {
                 Ok(content) => content.content,
                 Err(error) => {
@@ -7199,7 +7234,8 @@ async fn export_template_to_repository(
         template_record_content(&connection, &template_id)?
     };
     let host = project_host(&state, &project).await?;
-    let (directory, path) = repository_template_paths(&kind, &name, host.as_ref())?;
+    let (directory, path) =
+        repository_template_paths(&kind, &name, host.as_ref(), &project.repo_root)?;
     let output = if matches!(kind.as_str(), "agent-template" | "team-template") {
         repository_template_yaml(&content)?
     } else {
@@ -7215,7 +7251,7 @@ async fn export_template_to_repository(
             ));
         }
     }
-    if directory != host.join(".").map_err(|error| error.to_string())? {
+    if directory != repository_path(host.as_ref(), &project.repo_root, ".")? {
         let platform = host.health().await.ok().and_then(|health| health.platform);
         ensure_repository_directory(host.as_ref(), platform.as_deref(), &directory).await?;
     }
@@ -7404,10 +7440,29 @@ fn save_project_as_team_template(
         .map_err(|error| error.to_string())?;
     drop(statement);
     for (_source_id, kind, config_name, content, metadata) in configs {
-        let id = format!(
-            "template-custom-{}",
-            content_hash(&format!("{kind}:{config_name}:{content}"))
-        );
+        let content_hash_value = content_hash(&content);
+        let existing_id: Option<String> = transaction
+            .query_row(
+                "SELECT o.id FROM config_object o
+                 JOIN config_object_version v ON v.id=o.current_version_id
+                 WHERE o.scope_kind='template' AND o.status <> 'deleted'
+                   AND o.kind=?1 AND v.content_hash=?2
+                 ORDER BY CASE o.status WHEN 'builtin' THEN 0 ELSE 1 END,o.id
+                 LIMIT 1",
+                params![kind, content_hash_value],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let id = if let Some(id) = existing_id {
+            config_ids.push(id);
+            continue;
+        } else {
+            format!(
+                "template-custom-{}",
+                content_hash(&format!("{kind}:{config_name}:{content}"))
+            )
+        };
         let version_id = format!("{id}:v1");
         transaction
             .execute(
@@ -7433,7 +7488,7 @@ fn save_project_as_team_template(
                     version_id,
                     id,
                     content,
-                    content_hash(&content),
+                    content_hash_value,
                     Utc::now().to_rfc3339(),
                     metadata
                 ],
@@ -13974,6 +14029,34 @@ mod m7_tests {
             )
             .unwrap();
         assert_eq!(versions, 2);
+    }
+
+    #[test]
+    fn repository_paths_are_resolved_from_project_root() {
+        let root = std::env::temp_dir().join(format!(
+            "opcos-repository-path-test-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let host = LocalHost::new(&root).unwrap();
+        let path = repository_path(
+            &host,
+            &root.display().to_string(),
+            ".agents/templates/agents",
+        )
+        .unwrap();
+        assert_eq!(path, format!("{}/.agents/templates/agents", root.display()));
+        let missing = repository_path(
+            &host,
+            &root.display().to_string(),
+            ".agents/templates/teams",
+        )
+        .unwrap();
+        assert_eq!(
+            missing,
+            format!("{}/.agents/templates/teams", root.display())
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
