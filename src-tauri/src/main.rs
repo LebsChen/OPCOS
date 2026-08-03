@@ -44,8 +44,8 @@ use opcos_rvm::{
     WsParams, join_remote_path,
 };
 use opcos_store::{
-    ArtifactRecord, KeyringSecretStore, ProjectAgentRecord, ProjectRecord, SecretStore,
-    SessionRecord, SessionStore, SqliteStore, ToolCallRecord,
+    ActionBeginResult, ArtifactRecord, KeyringSecretStore, ProjectAgentRecord, ProjectRecord,
+    SecretStore, SessionRecord, SessionStore, SqliteStore, ToolCallRecord,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -212,6 +212,8 @@ struct RemoteExecutor {
     host_id: String,
     workspace: String,
     project_id: Option<String>,
+    session_id: String,
+    store: Arc<SqliteStore>,
 }
 
 struct LocalExecutor {
@@ -222,6 +224,7 @@ struct LocalExecutor {
     index_root: PathBuf,
     workspace: String,
     project_id: Option<String>,
+    store: Arc<SqliteStore>,
 }
 
 enum DesktopExecutor {
@@ -362,6 +365,113 @@ async fn execute_index_tool(
     }
 }
 
+fn action_ledger_argument<'a>(arguments: &'a Value, key: &str) -> Result<&'a str, String> {
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("missing string argument: {key}"))
+}
+
+fn execute_action_ledger_tool(
+    store: &SqliteStore,
+    session_id: &str,
+    project_id: Option<&str>,
+    name: &str,
+    arguments: Value,
+) -> Result<Value, String> {
+    match name {
+        "action_ledger_begin" => {
+            let result = store
+                .begin_action(
+                    action_ledger_argument(&arguments, "action_type")?,
+                    action_ledger_argument(&arguments, "platform")?,
+                    action_ledger_argument(&arguments, "account_id")?,
+                    action_ledger_argument(&arguments, "idempotency_key")?,
+                    Some(session_id),
+                    project_id,
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(match result {
+                ActionBeginResult::Fresh(record) => json!({
+                    "status": "fresh",
+                    "action_id": record.action_id,
+                    "attempts": record.attempts,
+                }),
+                ActionBeginResult::AlreadySucceeded {
+                    action_id,
+                    external_id,
+                    result_summary,
+                } => json!({
+                    "status": "already_succeeded",
+                    "action_id": action_id,
+                    "external_id": external_id,
+                    "result_summary": result_summary,
+                }),
+                ActionBeginResult::InFlight {
+                    action_id,
+                    started_at,
+                    attempts,
+                } => json!({
+                    "status": "in_flight",
+                    "action_id": action_id,
+                    "started_at": started_at,
+                    "attempts": attempts,
+                    "requires_reconciliation": true,
+                }),
+                ActionBeginResult::PreviouslyFailed {
+                    action_id,
+                    attempts,
+                } => json!({
+                    "status": "previously_failed",
+                    "action_id": action_id,
+                    "attempts": attempts,
+                }),
+            })
+        }
+        "action_ledger_finish" => {
+            let action_id = action_ledger_argument(&arguments, "action_id")?;
+            let status = action_ledger_argument(&arguments, "status")?;
+            let record = match status {
+                "succeeded" => store
+                    .finish_action_succeeded(
+                        action_id,
+                        arguments.get("external_id").and_then(Value::as_str),
+                        arguments.get("result_summary").and_then(Value::as_str),
+                    )
+                    .map_err(|error| error.to_string())?,
+                "failed" => store
+                    .finish_action_failed(
+                        action_id,
+                        action_ledger_argument(&arguments, "error_summary")?,
+                    )
+                    .map_err(|error| error.to_string())?,
+                _ => return Err("status must be succeeded or failed".into()),
+            };
+            serde_json::to_value(record).map_err(|error| error.to_string())
+        }
+        "action_ledger_list" => {
+            let limit = arguments
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(100)
+                .min(500) as u32;
+            store
+                .load_actions(
+                    arguments.get("platform").and_then(Value::as_str),
+                    arguments.get("account_id").and_then(Value::as_str),
+                    arguments.get("status").and_then(Value::as_str),
+                    limit,
+                )
+                .and_then(|records| {
+                    serde_json::to_value(records).map_err(opcos_store::StoreError::from)
+                })
+                .map_err(|error| error.to_string())
+        }
+        _ => Err(format!("action ledger tool is unavailable: {name}")),
+    }
+}
+
 #[derive(Clone)]
 struct IdeProxyState {
     client: HttpRvmClient,
@@ -371,6 +481,18 @@ struct IdeProxyState {
 #[async_trait]
 impl ToolExecutor for RemoteExecutor {
     async fn execute(&self, name: &str, arguments: Value) -> Result<Value, String> {
+        if matches!(
+            name,
+            "action_ledger_begin" | "action_ledger_finish" | "action_ledger_list"
+        ) {
+            return execute_action_ledger_tool(
+                &self.store,
+                &self.session_id,
+                self.project_id.as_deref(),
+                name,
+                arguments,
+            );
+        }
         let argument = |key: &str| {
             arguments
                 .get(key)
@@ -504,6 +626,18 @@ impl ToolExecutor for DesktopExecutor {
         match self {
             Self::Remote(executor) => executor.execute(name, arguments).await,
             Self::Local(executor) => {
+                if matches!(
+                    name,
+                    "action_ledger_begin" | "action_ledger_finish" | "action_ledger_list"
+                ) {
+                    return execute_action_ledger_tool(
+                        &executor.store,
+                        &executor.session_id,
+                        executor.project_id.as_deref(),
+                        name,
+                        arguments,
+                    );
+                }
                 let argument = |key: &str| {
                     arguments
                         .get(key)
@@ -4638,6 +4772,9 @@ async fn engine_for(
             "repo_index_find_symbol".to_owned(),
             "repo_index_glob".to_owned(),
             "repo_index_search".to_owned(),
+            "action_ledger_begin".to_owned(),
+            "action_ledger_finish".to_owned(),
+            "action_ledger_list".to_owned(),
         ]);
         if linear_tools_enabled {
             allowed_tools.extend([
@@ -4691,6 +4828,7 @@ async fn engine_for(
                 index_root: state.index_root.clone(),
                 workspace: workspace.display().to_string(),
                 project_id: session.project_id.clone(),
+                store: Arc::clone(&state.store),
             })),
             None,
             Some(allowed_tools),
@@ -4724,6 +4862,8 @@ async fn engine_for(
                 host_id: host_id.clone(),
                 workspace: workspace.clone(),
                 project_id: session.project_id.clone(),
+                session_id: session_id.to_owned(),
+                store: Arc::clone(&state.store),
             }))),
             Some(executor_client),
             None,
@@ -13818,6 +13958,31 @@ fn audit_events(
 }
 
 #[tauri::command]
+fn action_ledger_events(
+    state: State<'_, DesktopState>,
+    platform: Option<String>,
+    account_id: Option<String>,
+    status: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<Value>, String> {
+    state
+        .store
+        .load_actions(
+            platform.as_deref(),
+            account_id.as_deref(),
+            status.as_deref(),
+            limit.unwrap_or(100),
+        )
+        .and_then(|records| {
+            records
+                .into_iter()
+                .map(|record| serde_json::to_value(record).map_err(opcos_store::StoreError::from))
+                .collect()
+        })
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn save_secret_metadata(
     state: State<'_, DesktopState>,
     name: String,
@@ -14600,6 +14765,7 @@ fn main() {
             session_insights,
             trigger_http_info,
             audit_events,
+            action_ledger_events,
             save_schedule,
             list_schedules,
             run_schedule,
