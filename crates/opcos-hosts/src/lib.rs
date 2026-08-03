@@ -25,6 +25,17 @@ use tokio::{
 };
 use uuid::Uuid;
 
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+#[cfg(windows)]
+fn configure_no_window(command: &mut Command) {
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn configure_no_window(_command: &mut Command) {}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Capability {
     pub name: String,
@@ -925,12 +936,14 @@ fn shell_command(command: &str, cwd: &Path) -> Command {
     {
         let mut process = Command::new("cmd");
         process.arg("/C").arg(command).current_dir(cwd);
+        configure_no_window(&mut process);
         process
     }
     #[cfg(not(windows))]
     {
         let mut process = Command::new("sh");
         process.arg("-lc").arg(command).current_dir(cwd);
+        configure_no_window(&mut process);
         process
     }
 }
@@ -1129,12 +1142,14 @@ async fn spawn_persistent_shell(cwd: &Path) -> Result<(Child, ChildStdin, ChildS
     let mut process = {
         let mut process = Command::new("cmd");
         process.args(["/Q", "/D", "/V:ON", "/K"]).current_dir(cwd);
+        configure_no_window(&mut process);
         process
     };
     #[cfg(not(windows))]
     let mut process = {
         let mut process = Command::new("sh");
         process.arg("-s").current_dir(cwd);
+        configure_no_window(&mut process);
         process
     };
     let mut child = process

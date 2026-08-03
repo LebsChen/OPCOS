@@ -18,6 +18,16 @@ const SESSION: &str = "opcos-m3-real";
 const MODEL: &str = "deepseek-v4-flash";
 const BASE_URL: &str = "https://ai.yaoshen.de5.net/v1";
 
+#[cfg(windows)]
+fn configure_no_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    command.creation_flags(0x08000000);
+}
+
+#[cfg(not(windows))]
+fn configure_no_window(_command: &mut Command) {}
+
 struct CompleteProvider(OpenAiProvider);
 
 #[async_trait]
@@ -171,7 +181,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client.write(&format!("{root}\\turn.txt"), "M3 initial").await?;
         let executable = env::current_exe()?;
         for phase in ["first", "resume"] {
-            let output = Command::new(&executable)
+            let mut command = Command::new(&executable);
+            configure_no_window(&mut command);
+            let output = command
                 .env("OPCOS_TURN_CHILD", "1")
                 .env("OPCOS_TURN_PHASE", phase)
                 .env("OPCOS_TURN_ROOT", root)

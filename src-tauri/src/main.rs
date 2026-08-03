@@ -66,6 +66,19 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio_tungstenite::accept_async;
 
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+#[cfg(windows)]
+fn configure_no_window(command: &mut ProcessCommand) {
+    use std::os::windows::process::CommandExt;
+
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn configure_no_window(_command: &mut ProcessCommand) {}
+
 const SECRET_SERVICE: &str = "com.opcos.desktop";
 const DEVIN_API_BASE: &str = "https://api.devin.ai";
 const DEVIN_MCP_URL: &str = "https://mcp.devin.ai/mcp";
@@ -7333,7 +7346,9 @@ async fn git_workflow(
         };
         let command = args.join(" ");
         reject_dangerous_git(&command)?;
-        let output = ProcessCommand::new("git")
+        let mut process = ProcessCommand::new("git");
+        configure_no_window(&mut process);
+        let output = process
             .args(&args)
             .current_dir(&cwd)
             .output()
@@ -7503,7 +7518,9 @@ async fn github_pull_request(
 }
 
 fn local_git_command(cwd: &str, args: &[&str]) -> Result<std::process::Output, String> {
-    ProcessCommand::new("git")
+    let mut process = ProcessCommand::new("git");
+    configure_no_window(&mut process);
+    process
         .args(args)
         .current_dir(cwd)
         .output()

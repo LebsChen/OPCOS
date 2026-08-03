@@ -14,6 +14,17 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+#[cfg(windows)]
+fn configure_no_window(command: &mut tokio::process::Command) {
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn configure_no_window(_command: &mut tokio::process::Command) {}
+
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
 pub const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 
@@ -267,6 +278,7 @@ impl StdioClient {
             .as_deref()
             .ok_or(McpClientError::InvalidConfig)?;
         let mut cmd = tokio::process::Command::new(command);
+        configure_no_window(&mut cmd);
         cmd.args(&config.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

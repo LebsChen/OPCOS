@@ -287,8 +287,20 @@ mod tests {
     use super::*;
     use opcos_hosts::LocalHost;
 
+    #[cfg(windows)]
+    fn configure_no_window(command: &mut std::process::Command) {
+        use std::os::windows::process::CommandExt;
+
+        command.creation_flags(0x08000000);
+    }
+
+    #[cfg(not(windows))]
+    fn configure_no_window(_command: &mut std::process::Command) {}
+
     fn local_rg_available() -> bool {
-        std::process::Command::new("sh")
+        let mut command = std::process::Command::new("sh");
+        configure_no_window(&mut command);
+        command
             .args(["-c", "command -v rg"])
             .status()
             .map(|status| status.success())
