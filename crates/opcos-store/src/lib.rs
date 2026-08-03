@@ -146,6 +146,28 @@ pub struct ModelDiscoveryRecord {
     pub discovered_at: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LearnedSkillRecord {
+    pub id: String,
+    pub repository_identity: String,
+    pub project_id: Option<String>,
+    pub title: String,
+    pub summary: String,
+    pub applies_when: String,
+    pub steps: Vec<String>,
+    pub verification: String,
+    pub caveats: String,
+    pub tags: Vec<String>,
+    pub source_commit: String,
+    pub model_asserted_status: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub status: String,
+    pub supersedes_id: Option<String>,
+    pub superseded_by_id: Option<String>,
+    pub conflict_group: String,
+}
+
 impl ModelDiscoveryRecord {
     pub fn is_fresh(&self, now: DateTime<Utc>, ttl_seconds: i64) -> bool {
         DateTime::parse_from_rfc3339(&self.discovered_at)
@@ -1409,6 +1431,29 @@ pub struct SqliteStore {
     connection: Mutex<Connection>,
 }
 
+fn learned_skill_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LearnedSkillRecord> {
+    Ok(LearnedSkillRecord {
+        id: row.get(0)?,
+        repository_identity: row.get(1)?,
+        project_id: row.get(2)?,
+        title: row.get(3)?,
+        summary: row.get(4)?,
+        applies_when: row.get(5)?,
+        steps: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
+        verification: row.get(7)?,
+        caveats: row.get(8)?,
+        tags: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default(),
+        source_commit: row.get(10)?,
+        model_asserted_status: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+        status: row.get(14)?,
+        supersedes_id: row.get(15)?,
+        superseded_by_id: row.get(16)?,
+        conflict_group: row.get(17)?,
+    })
+}
+
 impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
@@ -1425,6 +1470,141 @@ impl SqliteStore {
         };
         store.migrate()?;
         Ok(store)
+    }
+
+    pub fn save_learned_skill(
+        &self,
+        mut record: LearnedSkillRecord,
+    ) -> Result<LearnedSkillRecord, StoreError> {
+        if record.repository_identity.trim().is_empty()
+            || record.title.trim().is_empty()
+            || record.summary.trim().is_empty()
+            || record.applies_when.trim().is_empty()
+            || record.steps.is_empty()
+            || record.source_commit.trim().is_empty()
+        {
+            return Err(StoreError::Validation(
+                "repository_identity, title, summary, applies_when, steps, and source_commit are required"
+                    .into(),
+            ));
+        }
+        if !matches!(
+            record.model_asserted_status.as_str(),
+            "model_asserted_validated" | "model_asserted_observed" | "model_asserted_partial"
+        ) {
+            return Err(StoreError::Validation(
+                "model_asserted_status must be model_asserted_validated, model_asserted_observed, or model_asserted_partial"
+                    .into(),
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
+        if record.id.trim().is_empty() {
+            record.id = format!("learned-skill-{}", uuid::Uuid::new_v4());
+        }
+        record.created_at = if record.created_at.is_empty() {
+            now.clone()
+        } else {
+            record.created_at
+        };
+        record.updated_at = now.clone();
+        record.status = if record.status.is_empty() {
+            "active".into()
+        } else {
+            record.status
+        };
+        if record.conflict_group.is_empty() {
+            record.conflict_group = format!(
+                "{}:{}",
+                record.repository_identity,
+                record.title.to_ascii_lowercase()
+            );
+        }
+        let steps_json = serde_json::to_string(&record.steps)?;
+        let tags_json = serde_json::to_string(&record.tags)?;
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "INSERT INTO learned_skills
+             (id,repository_identity,project_id,title,summary,applies_when,steps_json,
+              verification,caveats,tags_json,source_commit,model_asserted_status,
+              created_at,updated_at,status,supersedes_id,superseded_by_id,conflict_group)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+            params![
+                record.id,
+                record.repository_identity,
+                record.project_id,
+                record.title,
+                record.summary,
+                record.applies_when,
+                steps_json,
+                record.verification,
+                record.caveats,
+                tags_json,
+                record.source_commit,
+                record.model_asserted_status,
+                record.created_at,
+                record.updated_at,
+                record.status,
+                record.supersedes_id,
+                record.superseded_by_id,
+                record.conflict_group
+            ],
+        )?;
+        if let Some(previous) = record.supersedes_id.as_deref() {
+            connection.execute(
+                "UPDATE learned_skills SET superseded_by_id=?1,status='superseded',updated_at=?2
+                 WHERE id=?3",
+                params![record.id, now, previous],
+            )?;
+        }
+        Ok(record)
+    }
+
+    pub fn search_learned_skills(
+        &self,
+        repository_identity: &str,
+        query: &str,
+        current_commit: &str,
+        limit: usize,
+    ) -> Result<Vec<LearnedSkillRecord>, StoreError> {
+        let limit = limit.clamp(1, 5) as i64;
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT id,repository_identity,project_id,title,summary,applies_when,steps_json,
+                    verification,caveats,tags_json,source_commit,model_asserted_status,
+                    created_at,updated_at,status,supersedes_id,superseded_by_id,conflict_group
+             FROM learned_skills
+             WHERE repository_identity=?1 AND status IN ('active','superseded')
+               AND (?2='' OR lower(title||' '||summary||' '||applies_when||' '||tags_json)
+                    LIKE '%'||lower(?2)||'%')
+             ORDER BY CASE WHEN source_commit=?3 THEN 0 ELSE 1 END,
+                      CASE model_asserted_status
+                        WHEN 'model_asserted_validated' THEN 0
+                        WHEN 'model_asserted_observed' THEN 1
+                        ELSE 2 END,
+                      updated_at DESC
+             LIMIT ?4",
+        )?;
+        let rows = statement.query_map(
+            params![repository_identity, query, current_commit, limit],
+            learned_skill_from_row,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn get_learned_skill(&self, id: &str) -> Result<Option<LearnedSkillRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .query_row(
+                "SELECT id,repository_identity,project_id,title,summary,applies_when,steps_json,
+                        verification,caveats,tags_json,source_commit,model_asserted_status,
+                        created_at,updated_at,status,supersedes_id,superseded_by_id,conflict_group
+                 FROM learned_skills WHERE id=?1",
+                [id],
+                learned_skill_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
     }
 
     pub fn bind_account_host(
@@ -3501,6 +3681,28 @@ impl SqliteStore {
                discovered_at TEXT NOT NULL,
                PRIMARY KEY(provider,base_url)
              );
+             CREATE TABLE IF NOT EXISTS learned_skills (
+               id TEXT PRIMARY KEY,
+               repository_identity TEXT NOT NULL,
+               project_id TEXT,
+               title TEXT NOT NULL,
+               summary TEXT NOT NULL,
+               applies_when TEXT NOT NULL,
+               steps_json TEXT NOT NULL,
+               verification TEXT NOT NULL,
+               caveats TEXT NOT NULL,
+               tags_json TEXT NOT NULL,
+               source_commit TEXT NOT NULL,
+               model_asserted_status TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               status TEXT NOT NULL,
+               supersedes_id TEXT,
+               superseded_by_id TEXT,
+               conflict_group TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_learned_skills_search
+               ON learned_skills(repository_identity,status,updated_at DESC);
              CREATE INDEX IF NOT EXISTS idx_login_backups_account
                ON login_state_backups(account_id,created_at DESC);
              CREATE INDEX IF NOT EXISTS idx_action_ledger_created_at
@@ -6359,5 +6561,78 @@ mod tests {
         );
         assert!(saved.is_fresh(Utc::now(), 300));
         assert!(!saved.is_fresh(Utc::now() + chrono::Duration::seconds(301), 300));
+    }
+
+    #[test]
+    fn learned_skills_are_bounded_versioned_and_persistent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let make = |title: &str, commit: &str| LearnedSkillRecord {
+            id: String::new(),
+            repository_identity: "project:test".into(),
+            project_id: Some("test".into()),
+            title: title.into(),
+            summary: "repeatable workflow".into(),
+            applies_when: "when testing".into(),
+            steps: vec!["run tests".into()],
+            verification: "model observed green output".into(),
+            caveats: String::new(),
+            tags: vec!["test".into()],
+            source_commit: commit.into(),
+            model_asserted_status: "model_asserted_validated".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            status: "active".into(),
+            supersedes_id: None,
+            superseded_by_id: None,
+            conflict_group: String::new(),
+        };
+        let first = store.save_learned_skill(make("test", "abc")).unwrap();
+        let mut second = make("test", "def");
+        second.supersedes_id = Some(first.id.clone());
+        let second = store.save_learned_skill(second).unwrap();
+        assert_eq!(
+            store.get_learned_skill(&first.id).unwrap().unwrap().status,
+            "superseded"
+        );
+        assert_eq!(
+            store
+                .get_learned_skill(&first.id)
+                .unwrap()
+                .unwrap()
+                .superseded_by_id
+                .as_deref(),
+            Some(second.id.as_str())
+        );
+        let results = store
+            .search_learned_skills("project:test", "", "def", 99)
+            .unwrap();
+        assert!(results.len() <= 5);
+        assert_eq!(results[0].source_commit, "def");
+    }
+
+    #[test]
+    fn learned_skill_status_must_be_explicitly_model_asserted() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let result = store.save_learned_skill(LearnedSkillRecord {
+            id: String::new(),
+            repository_identity: "project:test".into(),
+            project_id: None,
+            title: "bad".into(),
+            summary: "bad".into(),
+            applies_when: "bad".into(),
+            steps: vec!["bad".into()],
+            verification: String::new(),
+            caveats: String::new(),
+            tags: vec![],
+            source_commit: "abc".into(),
+            model_asserted_status: "validated".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            status: "active".into(),
+            supersedes_id: None,
+            superseded_by_id: None,
+            conflict_group: String::new(),
+        });
+        assert!(result.is_err());
     }
 }
