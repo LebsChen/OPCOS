@@ -33,6 +33,8 @@ pub enum LoginStateError {
     UnsupportedHost,
     #[error("browser process is running; stop the browser before backup or restore")]
     BrowserRunning,
+    #[error("could not determine whether a browser process is running")]
+    BrowserCheckFailed,
     #[error("login-state path is unavailable on the remote host")]
     PathUnavailable,
     #[error("login-state backup integrity check failed")]
@@ -167,7 +169,10 @@ async fn ensure_browser_stopped(host: &dyn Host) -> Result<(), LoginStateError> 
         })
         .await
         .map_err(|_| LoginStateError::HostUnavailable)?;
-    if result.result.exit_code != 0 || !result.result.stdout.trim().is_empty() {
+    if result.result.exit_code != 0 {
+        return Err(LoginStateError::BrowserCheckFailed);
+    }
+    if !result.result.stdout.trim().is_empty() {
         return Err(LoginStateError::BrowserRunning);
     }
     Ok(())
@@ -175,17 +180,17 @@ async fn ensure_browser_stopped(host: &dyn Host) -> Result<(), LoginStateError> 
 
 fn powershell_archive_command(profile_path: &str, backup_path: &str) -> String {
     powershell_path_command(
-        "Compress-Archive -Path $profile -DestinationPath $backup -Force",
+        "New-Item -ItemType Directory -Force -Path (Split-Path -Parent $backupPath) | Out-Null; Compress-Archive -LiteralPath $profilePath -DestinationPath $backupPath -Force",
         profile_path,
         backup_path,
     )
 }
 
 fn powershell_extract_archive_command(backup_path: &str, profile_path: &str) -> String {
-    powershell_path_command(
-        "Expand-Archive -Path $backup -DestinationPath $profile -Force",
-        backup_path,
-        profile_path,
+    let backup_path = BASE64.encode(backup_path.as_bytes());
+    let profile_path = BASE64.encode(profile_path.as_bytes());
+    format!(
+        "powershell -NoProfile -NonInteractive -Command \"$profilePath=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{profile_path}')); $backupPath=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{backup_path}')); $restorePath=\\\"$($profilePath).__opcos_restore_$([Guid]::NewGuid().ToString('N'))\\\"; $previousPath=\\\"$($profilePath).__opcos_previous_$([Guid]::NewGuid().ToString('N'))\\\"; try {{ if (Test-Path -LiteralPath $profilePath) {{ Move-Item -LiteralPath $profilePath -Destination $previousPath -ErrorAction Stop }}; Expand-Archive -LiteralPath $backupPath -DestinationPath $restorePath -Force -ErrorAction Stop; Move-Item -LiteralPath $restorePath -Destination $profilePath -ErrorAction Stop; if (Test-Path -LiteralPath $previousPath) {{ Remove-Item -LiteralPath $previousPath -Recurse -Force -ErrorAction SilentlyContinue }} }} catch {{ if (Test-Path -LiteralPath $restorePath) {{ Remove-Item -LiteralPath $restorePath -Recurse -Force -ErrorAction SilentlyContinue }}; if ((Test-Path -LiteralPath $previousPath) -and -not (Test-Path -LiteralPath $profilePath)) {{ Move-Item -LiteralPath $previousPath -Destination $profilePath -ErrorAction SilentlyContinue }}; exit 1 }}\""
     )
 }
 
@@ -193,7 +198,7 @@ fn powershell_path_command(body: &str, first: &str, second: &str) -> String {
     let first = BASE64.encode(first.as_bytes());
     let second = BASE64.encode(second.as_bytes());
     format!(
-        "powershell -NoProfile -NonInteractive -Command \"$profile=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{first}')); $backup=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{second}')); {body}\""
+        "powershell -NoProfile -NonInteractive -Command \"$profilePath=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{first}')); $backupPath=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{second}')); {body}\""
     )
 }
 
@@ -236,5 +241,18 @@ mod tests {
         let command = powershell_archive_command(profile, backup);
         assert!(!command.contains(profile));
         assert!(!command.contains(backup));
+    }
+
+    #[test]
+    fn restore_command_replaces_profile_from_backup_and_can_roll_back() {
+        let profile = r"C:\Users\Agent\Profile";
+        let backup = r"C:\Users\Agent\OPCOS\backup.zip";
+        let command = powershell_extract_archive_command(backup, profile);
+        assert!(command.contains("Expand-Archive -LiteralPath $backupPath"));
+        assert!(command.contains("-DestinationPath $restorePath"));
+        assert!(command.contains("Move-Item -LiteralPath $profilePath"));
+        assert!(command.contains("$previousPath"));
+        assert!(command.contains("Move-Item -LiteralPath $previousPath -Destination $profilePath"));
+        assert!(!command.contains("Expand-Archive -LiteralPath $profilePath"));
     }
 }
