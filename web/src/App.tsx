@@ -1825,6 +1825,17 @@ function ProjectBoard({
                   >
                     编辑
                   </button>
+                  <button
+                    className="btn"
+                    onClick={() =>
+                      command("save_project_agent_as_template", {
+                        projectId: project.id,
+                        agentId: agent.id,
+                      }).catch(onError)
+                    }
+                  >
+                    另存 Agent
+                  </button>
                   {agent.sort_order !== 0 && (
                     <button
                       className="btn"
@@ -2892,6 +2903,7 @@ function ManageSections({
   const [templateDraftDescription, setTemplateDraftDescription] = useState("");
   const [templateDraftContent, setTemplateDraftContent] = useState("{}");
   const [templateDraftStatus, setTemplateDraftStatus] = useState("");
+  const [marketProjectId, setMarketProjectId] = useState("");
   const [environmentTab, setEnvironmentTab] = useState<
     "blueprints" | "snapshots" | "advanced" | "outposts"
   >("blueprints");
@@ -4492,6 +4504,64 @@ function ManageSections({
         )}
         {tab === "market" && (
           <div className="space-y-4">
+            <div className="flex flex-wrap items-center gap-2 rounded-lg border border-line p-3">
+              <select
+                className="input"
+                value={marketProjectId}
+                onChange={(event) => setMarketProjectId(event.target.value)}
+              >
+                <option value="">选择项目进行仓库同步</option>
+                {projects.map((project) => (
+                  <option key={project.id} value={project.id}>
+                    {project.name}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                className="btn"
+                disabled={!marketProjectId}
+                onClick={() =>
+                  void command("import_repository_templates", {
+                    projectId: marketProjectId,
+                  })
+                    .then((result) =>
+                      setTemplateDraftStatus(
+                        `导入结果：${JSON.stringify(result)}`,
+                      ),
+                    )
+                    .then(() =>
+                      command<MarketTemplate[]>("list_template_market").then(
+                        setMarketTemplates,
+                      ),
+                    )
+                    .catch(onError)
+                }
+              >
+                从仓库导入
+              </button>
+              <button
+                type="button"
+                className="btn"
+                disabled={!marketProjectId}
+                onClick={() =>
+                  void command("save_project_as_team_template", {
+                    projectId: marketProjectId,
+                  })
+                    .then(() =>
+                      setTemplateDraftStatus("项目已另存为 Team 模板"),
+                    )
+                    .then(() =>
+                      command<MarketTemplate[]>("list_template_market").then(
+                        setMarketTemplates,
+                      ),
+                    )
+                    .catch(onError)
+                }
+              >
+                当前项目另存为 Team
+              </button>
+            </div>
             <div className="flex gap-2 border-b border-line pb-2">
               {(
                 [
@@ -4624,6 +4694,48 @@ function ManageSections({
                         </button>
                       </div>
                     )}
+                    {!template.readonly &&
+                      marketProjectId &&
+                      ["agent-template", "team-template"].includes(
+                        template.kind,
+                      ) && (
+                        <button
+                          type="button"
+                          className="btn mt-2"
+                          onClick={() =>
+                            void command("export_template_to_repository", {
+                              templateId: template.id,
+                              projectId: marketProjectId,
+                            })
+                              .then(() =>
+                                setTemplateDraftStatus("已导出到仓库"),
+                              )
+                              .catch((reason) => {
+                                const message = errorMessage(reason);
+                                if (
+                                  message.includes("confirm overwrite") &&
+                                  window.confirm(
+                                    `目标文件已有不同内容，确定覆盖吗？\n${message}`,
+                                  )
+                                ) {
+                                  return command(
+                                    "export_template_to_repository",
+                                    {
+                                      templateId: template.id,
+                                      projectId: marketProjectId,
+                                      overwrite: true,
+                                    },
+                                  ).then(() =>
+                                    setTemplateDraftStatus("已覆盖导出到仓库"),
+                                  );
+                                }
+                                onError(reason);
+                              })
+                          }
+                        >
+                          导出到仓库
+                        </button>
+                      )}
                   </article>
                 ))}
             </div>

@@ -60,7 +60,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 struct HostAssetReader {
-    host: Box<dyn Host>,
+    host: Arc<dyn Host>,
 }
 
 #[async_trait]
@@ -1325,31 +1325,31 @@ fn seed_builtin_templates(connection: &Connection) -> Result<(), String> {
             "template-agent-lead",
             "Lead",
             "负责计划、拆解任务、协调成员和验收交付。",
-            json!({"role":"Lead","provider":"openai","model":"auto","harness":"builtin","mode":"Interactive","system_prompt":"你是项目 Lead。负责理解目标、拆解任务、协调 Worker，并在验收前检查交付质量。"}),
+            json!({"role":"Lead","model":"auto","harness":"builtin","mode":"Interactive","system_prompt":"你是项目 Lead。负责理解目标、拆解任务、协调 Worker，并在验收前检查交付质量。"}),
         ),
         (
             "template-agent-code",
             "Code",
             "负责实现功能、维护代码和提交可审查变更。",
-            json!({"role":"Code","provider":"openai","model":"auto","harness":"builtin","mode":"Interactive","system_prompt":"你是 Code Worker。负责以最小、可验证的改动实现任务，并报告测试证据。"}),
+            json!({"role":"Code","model":"auto","harness":"builtin","mode":"Interactive","system_prompt":"你是 Code Worker。负责以最小、可验证的改动实现任务，并报告测试证据。"}),
         ),
         (
             "template-agent-review",
             "Review",
             "负责审查实现、发现回归和提出可执行修正。",
-            json!({"role":"Review","provider":"openai","model":"auto","harness":"builtin","mode":"Interactive","system_prompt":"你是 Review Worker。重点检查正确性、安全性、边界条件和测试覆盖，不要只给泛泛建议。"}),
+            json!({"role":"Review","model":"auto","harness":"builtin","mode":"Interactive","system_prompt":"你是 Review Worker。重点检查正确性、安全性、边界条件和测试覆盖，不要只给泛泛建议。"}),
         ),
         (
             "template-agent-test",
             "Test",
             "负责设计和运行测试，确认行为符合验收标准。",
-            json!({"role":"Test","provider":"openai","model":"auto","harness":"builtin","mode":"Interactive","system_prompt":"你是 Test Worker。负责补充有意义的测试，运行完整验证并准确报告失败原因。"}),
+            json!({"role":"Test","model":"auto","harness":"builtin","mode":"Interactive","system_prompt":"你是 Test Worker。负责补充有意义的测试，运行完整验证并准确报告失败原因。"}),
         ),
         (
             "template-agent-devops",
             "DevOps",
             "负责构建、环境、发布和持续集成相关工作。",
-            json!({"role":"DevOps","provider":"openai","model":"auto","harness":"builtin","mode":"Interactive","system_prompt":"你是 DevOps Worker。负责构建、环境和发布链路，优先保证可重复和可回滚。"}),
+            json!({"role":"DevOps","model":"auto","harness":"builtin","mode":"Interactive","system_prompt":"你是 DevOps Worker。负责构建、环境和发布链路，优先保证可重复和可回滚。"}),
         ),
     ];
     for (id, name, description, content) in agents {
@@ -1413,7 +1413,9 @@ fn seed_builtin_templates(connection: &Connection) -> Result<(), String> {
         "blueprint",
         "标准 Rust/TypeScript Blueprint",
         "默认执行格式化、测试和构建检查。",
-        &json!({"initialize":["git status"],"dependencies":["cargo check"],"build":["cargo test","npm run build"]}),
+        &json!(
+            "clone: []\ninitialize:\n  - cargo build\ndependencies:\n  - cargo test\n  - cargo clippy --workspace --all-targets -- -D warnings\nbuild:\n  - cargo fmt --check\n  - (cd web && npm install && npx tsc --noEmit && npm run build)\n"
+        ),
     )?;
     Ok(())
 }
@@ -1429,7 +1431,10 @@ fn seed_builtin_template(
     let now = Utc::now().to_rfc3339();
     let metadata = serde_json::to_string(&json!({"description":description}))
         .map_err(|error| error.to_string())?;
-    let body = serde_json::to_string(content).map_err(|error| error.to_string())?;
+    let body = content
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or(serde_json::to_string(content).map_err(|error| error.to_string())?);
     connection
         .execute(
             "INSERT OR IGNORE INTO config_object
@@ -6553,6 +6558,661 @@ fn delete_template(state: State<'_, DesktopState>, id: String) -> Result<(), Str
     Ok(())
 }
 
+fn repository_template_name(value: &Value, fallback: &str) -> Result<String, String> {
+    value
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{fallback}: missing non-empty name"))
+}
+
+fn parse_repository_template(content: &str, path: &str) -> Result<(Value, String), String> {
+    let value = serde_yaml::from_str::<Value>(content)
+        .map_err(|error| format!("{path}: invalid YAML: {error}"))?;
+    let name = repository_template_name(&value, path)?;
+    Ok((value, name))
+}
+
+fn repository_template_yaml(content: &str) -> Result<String, String> {
+    let value: Value = serde_json::from_str(content)
+        .map_err(|error| format!("template content is not valid JSON: {error}"))?;
+    serde_yaml::to_string(&value).map_err(|error| error.to_string())
+}
+
+fn repository_template_slug(name: &str) -> String {
+    let mut slug = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while slug.contains("--") {
+        slug = slug.replace("--", "-");
+    }
+    slug.trim_matches('-').to_owned()
+}
+
+fn insert_repository_template(
+    connection: &Connection,
+    kind: &str,
+    name: &str,
+    description: &str,
+    content: &str,
+    repo_scope: &str,
+    repo_path: &str,
+) -> Result<String, String> {
+    let conflict: Option<(String, String)> = connection
+        .query_row(
+            "SELECT id,status FROM config_object
+             WHERE scope_kind='template' AND status='active' AND name=?1",
+            [name],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if let Some((id, _)) = conflict {
+        return Ok(id);
+    }
+    let id = format!(
+        "template-repo-{}",
+        content_hash(&format!("{kind}:{repo_path}:{content}"))
+    );
+    let version_id = format!("{id}:v1");
+    let now = Utc::now().to_rfc3339();
+    let metadata = serde_json::to_string(&json!({
+        "description": description,
+        "repository_path": repo_path
+    }))
+    .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO config_object
+             (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
+             VALUES (?1,?2,?3,?4,'template',?5,'active',?6,?7)",
+            params![
+                id,
+                kind,
+                name,
+                stable_server_key(&id),
+                repo_scope,
+                now,
+                version_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO config_object_version
+             (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+             VALUES (?1,?2,1,?3,?4,?5,'imported from repository',?6)",
+            params![
+                version_id,
+                id,
+                content,
+                content_hash(content),
+                now,
+                metadata
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(id)
+}
+
+async fn ensure_repository_directory(
+    host: &dyn Host,
+    platform: Option<&str>,
+    path: &str,
+) -> Result<(), String> {
+    let command = if platform.is_some_and(|value| value.eq_ignore_ascii_case("windows")) {
+        format!(
+            "New-Item -ItemType Directory -Force -Path {} | Out-Null",
+            quote_for(platform, path)
+        )
+    } else {
+        format!("mkdir -p {}", quote_for(platform, path))
+    };
+    let result = host
+        .exec(ExecRequest {
+            command,
+            cwd: None,
+            timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+            session: None,
+            env: None,
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    if result.result.exit_code != 0 {
+        return Err(format!(
+            "cannot create repository template directory: {}",
+            result.result.stderr
+        ));
+    }
+    Ok(())
+}
+
+fn repository_template_paths(
+    kind: &str,
+    name: &str,
+    host: &dyn Host,
+) -> Result<(String, String), String> {
+    let slug = repository_template_slug(name);
+    if slug.is_empty() {
+        return Err("template name cannot produce a repository filename".into());
+    }
+    let (directory, filename) = match kind {
+        "agent-template" => (".agents/templates/agents", format!("{slug}.yaml")),
+        "team-template" => (".agents/templates/teams", format!("{slug}.yaml")),
+        "rules" => (".", "AGENTS.md".to_owned()),
+        "knowledge" => (".agents/knowledge", format!("{slug}.md")),
+        "runbook" => (".agents/playbooks", format!("{slug}.md")),
+        "blueprint" => (".devin", "blueprint.yaml".to_owned()),
+        other => {
+            return Err(format!(
+                "repository export is unsupported for template kind '{other}'"
+            ));
+        }
+    };
+    let directory_path = host.join(directory).map_err(|error| error.to_string())?;
+    let path = if directory == "." {
+        host.join(&filename)
+    } else {
+        host.join(&format!("{directory}/{filename}"))
+    }
+    .map_err(|error| error.to_string())?;
+    Ok((directory_path, path))
+}
+
+#[tauri::command]
+async fn import_repository_templates(
+    state: State<'_, DesktopState>,
+    project_id: String,
+) -> Result<Value, String> {
+    let project = state
+        .store
+        .load_project(&project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    let host = project_host(&state, &project).await?;
+    let repo_scope = format!("repo:{}", project.repo_root);
+    let mut imported = Vec::new();
+    let mut rejected = Vec::new();
+    let mut conflicts = Vec::new();
+    let template_roots = [
+        ("agent-template", ".agents/templates/agents"),
+        ("team-template", ".agents/templates/teams"),
+    ];
+    for (kind, relative_root) in template_roots {
+        let root = host
+            .join(relative_root)
+            .map_err(|error| error.to_string())?;
+        let listing = match host.ls(Some(&root)).await {
+            Ok(listing) => listing,
+            Err(_) => continue,
+        };
+        for item in listing.items.into_iter().filter(|item| !item.dir) {
+            if !item.name.ends_with(".yaml") && !item.name.ends_with(".yml") {
+                continue;
+            }
+            let path = host
+                .join(&format!("{relative_root}/{}", item.name))
+                .map_err(|error| error.to_string())?;
+            let content = match host.read(&path).await {
+                Ok(content) => content.content,
+                Err(error) => {
+                    rejected.push(json!({"path":path,"reason":error.to_string()}));
+                    continue;
+                }
+            };
+            let (yaml, name) = match parse_repository_template(&content, &path) {
+                Ok(value) => value,
+                Err(error) => {
+                    rejected.push(json!({"path":path,"reason":error}));
+                    continue;
+                }
+            };
+            let normalized = serde_json::to_string(&yaml).map_err(|error| error.to_string())?;
+            let existing: Option<String> = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?
+                .query_row(
+                    "SELECT status FROM config_object
+                     WHERE scope_kind='template' AND status='active' AND name=?1",
+                    [&name],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if existing.is_some() {
+                conflicts.push(json!({"path":path,"name":name,"reason":"同名自定义模板已存在"}));
+                continue;
+            }
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            insert_repository_template(
+                &connection,
+                kind,
+                &name,
+                yaml.get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                &normalized,
+                &repo_scope,
+                &path,
+            )?;
+            imported.push(json!({"path":path,"name":name,"kind":kind}));
+        }
+    }
+    let bundle = discover_assets(&HostAssetReader { host }, &project.repo_root)
+        .await
+        .map_err(|error| error.to_string())?;
+    for source in bundle.agents {
+        let name = source
+            .path
+            .replace('\\', "/")
+            .rsplit('/')
+            .next()
+            .unwrap_or("AGENTS.md")
+            .to_owned();
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        if connection
+            .query_row::<String, _, _>(
+                "SELECT name FROM config_object WHERE scope_kind='template'
+                 AND status='active' AND name=?1",
+                [&name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            conflicts.push(json!({"path":source.path,"name":name,"reason":"同名自定义模板已存在"}));
+        } else {
+            insert_repository_template(
+                &connection,
+                "rules",
+                &name,
+                "",
+                &source.content,
+                &repo_scope,
+                &source.path,
+            )?;
+            imported.push(json!({"path":source.path,"name":name,"kind":"rules"}));
+        }
+    }
+    for knowledge in bundle.knowledge {
+        let name = knowledge.title;
+        let content = knowledge.body;
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        if connection
+            .query_row::<String, _, _>(
+                "SELECT name FROM config_object WHERE scope_kind='template'
+                 AND status='active' AND name=?1",
+                [&name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            conflicts.push(json!({"name":name,"reason":"同名自定义模板已存在"}));
+        } else {
+            insert_repository_template(
+                &connection,
+                "knowledge",
+                &name,
+                "",
+                &content,
+                &repo_scope,
+                "",
+            )?;
+            imported.push(json!({"name":name,"kind":"knowledge"}));
+        }
+    }
+    if let Some(playbook) = bundle.playbook {
+        let name = playbook.title;
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        if connection
+            .query_row::<String, _, _>(
+                "SELECT name FROM config_object WHERE scope_kind='template'
+                 AND status='active' AND name=?1",
+                [&name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            conflicts.push(json!({"name":name,"reason":"同名自定义模板已存在"}));
+        } else {
+            insert_repository_template(
+                &connection,
+                "runbook",
+                &name,
+                "",
+                &playbook.body,
+                &repo_scope,
+                "",
+            )?;
+            imported.push(json!({"name":name,"kind":"runbook"}));
+        }
+    }
+    Ok(json!({"imported":imported,"rejected":rejected,"conflicts":conflicts}))
+}
+
+fn template_record_content(
+    connection: &Connection,
+    template_id: &str,
+) -> Result<(String, String, String), String> {
+    connection
+        .query_row(
+            "SELECT o.kind,o.name,v.content FROM config_object o
+             JOIN config_object_version v ON v.id=o.current_version_id
+             WHERE o.id=?1 AND o.scope_kind='template' AND o.status <> 'deleted'",
+            [template_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| format!("template not found: {error}"))
+}
+
+#[tauri::command]
+async fn export_template_to_repository(
+    state: State<'_, DesktopState>,
+    template_id: String,
+    project_id: String,
+    overwrite: Option<bool>,
+) -> Result<Value, String> {
+    let project = state
+        .store
+        .load_project(&project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    let (kind, name, content) = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        template_record_content(&connection, &template_id)?
+    };
+    let host = project_host(&state, &project).await?;
+    let (directory, path) = repository_template_paths(&kind, &name, host.as_ref())?;
+    let output = if matches!(kind.as_str(), "agent-template" | "team-template") {
+        repository_template_yaml(&content)?
+    } else {
+        content
+    };
+    if let Ok(existing) = host.read(&path).await {
+        if existing.content == output {
+            return Ok(json!({"path":path,"written":false,"unchanged":true}));
+        }
+        if !overwrite.unwrap_or(false) {
+            return Err(format!(
+                "repository template already exists with different content: {path}; confirm overwrite"
+            ));
+        }
+    }
+    if directory != host.join(".").map_err(|error| error.to_string())? {
+        let platform = host.health().await.ok().and_then(|health| health.platform);
+        ensure_repository_directory(host.as_ref(), platform.as_deref(), &directory).await?;
+    }
+    host.write(&path, &output)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(json!({"path":path,"written":true,"unchanged":false}))
+}
+
+fn insert_custom_template(
+    connection: &Connection,
+    kind: &str,
+    name: &str,
+    description: &str,
+    content: &str,
+    scope_key: &str,
+) -> Result<String, String> {
+    let existing: Option<String> = connection
+        .query_row(
+            "SELECT id FROM config_object WHERE scope_kind='template'
+             AND status='active' AND name=?1",
+            [name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if existing.is_some() {
+        return Err(format!("同名自定义模板已存在: {name}"));
+    }
+    let id = format!(
+        "template-custom-{}",
+        content_hash(&format!("{kind}:{name}:{content}"))
+    );
+    let version_id = format!("{id}:v1");
+    let now = Utc::now().to_rfc3339();
+    let metadata = serde_json::to_string(&json!({"description":description}))
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "INSERT INTO config_object
+             (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
+             VALUES (?1,?2,?3,?4,'template',?5,'active',?6,?7)",
+            params![
+                id,
+                kind,
+                name,
+                stable_server_key(&id),
+                scope_key,
+                now,
+                version_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "INSERT INTO config_object_version
+             (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+             VALUES (?1,?2,1,?3,?4,?5,'saved as template',?6)",
+            params![
+                version_id,
+                id,
+                content,
+                content_hash(content),
+                now,
+                metadata
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(id)
+}
+
+#[tauri::command]
+fn save_project_agent_as_template(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    agent_id: String,
+    name: Option<String>,
+) -> Result<Value, String> {
+    let agent = state
+        .store
+        .load_project_agents(&project_id)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|agent| agent.id == agent_id)
+        .ok_or_else(|| "project agent not found".to_owned())?;
+    let template_name = name.unwrap_or_else(|| format!("{} Agent", agent.name));
+    let content = serde_json::to_string(&json!({
+        "name": agent.name,
+        "role": agent.role,
+        "provider": agent.provider,
+        "model": agent.model,
+        "harness": agent.harness,
+        "mode": agent.mode,
+        "system_prompt": agent.system_prompt
+    }))
+    .map_err(|error| error.to_string())?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let id = insert_custom_template(
+        &connection,
+        "agent-template",
+        &template_name,
+        &format!("从项目成员 {} 另存", agent.name),
+        &content,
+        "global",
+    )?;
+    Ok(json!({"id":id,"name":template_name,"kind":"agent-template"}))
+}
+
+#[tauri::command]
+fn save_project_as_team_template(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    name: Option<String>,
+) -> Result<Value, String> {
+    let project = state
+        .store
+        .load_project(&project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    let agents = state
+        .store
+        .load_project_agents(&project_id)
+        .map_err(|error| error.to_string())?;
+    validate_team_template_members(
+        &agents
+            .iter()
+            .map(|agent| TeamTemplateAgent {
+                template_id: None,
+                name: Some(agent.name.clone()),
+                role: Some(agent.role.clone()),
+                provider: agent.provider.clone(),
+                model: Some(agent.model.clone()),
+                harness: Some(agent.harness.clone()),
+                mode: Some(agent.mode.clone()),
+                system_prompt: Some(agent.system_prompt.clone()),
+                branch: None,
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    let mut config_ids = Vec::new();
+    let mut statement = transaction
+        .prepare(
+            "SELECT o.id,o.kind,o.name,v.content,v.metadata_json
+             FROM config_object o
+             JOIN config_object_version v ON v.id=o.current_version_id
+             WHERE o.scope_kind='project' AND o.scope_key=?1 AND o.status <> 'deleted'",
+        )
+        .map_err(|error| error.to_string())?;
+    let configs = statement
+        .query_map([&project_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(statement);
+    for (_source_id, kind, config_name, content, metadata) in configs {
+        let id = format!(
+            "template-custom-{}",
+            content_hash(&format!("{kind}:{config_name}:{content}"))
+        );
+        let version_id = format!("{id}:v1");
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO config_object
+                 (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
+                 VALUES (?1,?2,?3,?4,'template','global','active',?5,?6)",
+                params![
+                    id,
+                    kind,
+                    config_name,
+                    stable_server_key(&id),
+                    Utc::now().to_rfc3339(),
+                    version_id
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO config_object_version
+                 (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+                 VALUES (?1,?2,1,?3,?4,?5,'saved from project',?6)",
+                params![
+                    version_id,
+                    id,
+                    content,
+                    content_hash(&content),
+                    Utc::now().to_rfc3339(),
+                    metadata
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        config_ids.push(id);
+    }
+    let member_values = agents
+        .iter()
+        .map(|agent| {
+            json!({
+                "name": agent.name,
+                "role": agent.role,
+                "provider": agent.provider,
+                "model": agent.model,
+                "harness": agent.harness,
+                "mode": agent.mode,
+                "system_prompt": agent.system_prompt
+            })
+        })
+        .collect::<Vec<_>>();
+    let content = serde_json::to_string(&json!({
+        "name": name.clone().unwrap_or_else(|| project.name.clone()),
+        "description": format!("从项目 {} 另存", project.name),
+        "workflow": serde_json::from_str::<Value>(&project.workflow_json).unwrap_or_else(|_| json!({})),
+        "agents": member_values,
+        "config_template_ids": config_ids
+    }))
+    .map_err(|error| error.to_string())?;
+    let template_name = name.unwrap_or_else(|| format!("{} Team", project.name));
+    transaction.commit().map_err(|error| error.to_string())?;
+    let id = insert_custom_template(
+        &connection,
+        "team-template",
+        &template_name,
+        &format!("从项目 {} 另存", project.name),
+        &content,
+        "global",
+    )?;
+    Ok(json!({"id":id,"name":template_name,"kind":"team-template"}))
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 fn save_asset(
@@ -7143,7 +7803,7 @@ async fn browse_skill_rules(
             workspace,
         )
     };
-    let bundle = discover_assets(&HostAssetReader { host }, &workspace)
+    let bundle = discover_assets(&HostAssetReader { host: host.into() }, &workspace)
         .await
         .map_err(|error| error.to_string())?;
     Ok(json!({
@@ -12775,6 +13435,10 @@ fn main() {
             list_template_market,
             save_template,
             delete_template,
+            import_repository_templates,
+            export_template_to_repository,
+            save_project_agent_as_template,
+            save_project_as_team_template,
             save_asset,
             delete_asset,
             set_asset_enabled,
@@ -12979,6 +13643,77 @@ mod m7_tests {
             branch: None,
         }];
         assert!(validate_team_template_members(&members).is_err());
+    }
+
+    #[test]
+    fn repository_template_yaml_round_trip_and_invalid_files_are_reported_individually() {
+        let source = r#"
+name: Demo Team
+description: A repository team
+workflow:
+  workflow:
+    - stage: plan
+      roles: [Lead]
+      gate: none
+agents:
+  - name: Lead
+    role: Lead
+"#;
+        let (value, name) = parse_repository_template(source, "teams/demo.yaml").unwrap();
+        assert_eq!(name, "Demo Team");
+        let json_content = serde_json::to_string(&value).unwrap();
+        let exported = repository_template_yaml(&json_content).unwrap();
+        let (_, round_trip_name) = parse_repository_template(&exported, "teams/demo.yaml").unwrap();
+        assert_eq!(round_trip_name, name);
+        let invalid = parse_repository_template("name: [", "teams/bad.yaml").unwrap_err();
+        assert!(invalid.contains("teams/bad.yaml"));
+        assert!(parse_repository_template("description: missing", "teams/missing.yaml").is_err());
+    }
+
+    #[test]
+    fn repository_import_does_not_overwrite_existing_custom_template() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE config_object (
+                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+                   server_key TEXT, scope_kind TEXT NOT NULL, scope_key TEXT,
+                   status TEXT NOT NULL, created_at TEXT NOT NULL,
+                   current_version_id TEXT
+                 );
+                 CREATE TABLE config_object_version (
+                   id TEXT PRIMARY KEY, object_id TEXT NOT NULL, version INTEGER NOT NULL,
+                   content TEXT NOT NULL, content_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+                   note TEXT NOT NULL, metadata_json TEXT NOT NULL,
+                   UNIQUE(object_id,version)
+                 );
+                 INSERT INTO config_object VALUES
+                   ('custom-agent','agent-template','Demo','custom-agent',
+                    'template','custom','active','now','custom-agent:v1');
+                 INSERT INTO config_object_version VALUES
+                   ('custom-agent:v1','custom-agent',1,'{\"role\":\"Custom\"}',
+                    'hash','now','custom','{}');",
+            )
+            .unwrap();
+        let result = insert_repository_template(
+            &connection,
+            "agent-template",
+            "Demo",
+            "",
+            r#"{"role":"Repository"}"#,
+            "repo:/workspace",
+            ".agents/templates/agents/demo.yaml",
+        )
+        .unwrap();
+        assert_eq!(result, "custom-agent");
+        let content: String = connection
+            .query_row(
+                "SELECT content FROM config_object_version WHERE id='custom-agent:v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, r#"{"role":"Custom"}"#);
     }
 
     #[test]
