@@ -235,12 +235,11 @@ pub const BACKGROUND_WRAPPER_VERSION: &str = "powershell-segmented-v1";
 pub fn background_job_wrapper_script() -> &'static str {
     r#"param([string]$Root)
 $ErrorActionPreference = 'Stop'
-$commandPath = Join-Path $Root 'command.txt'
+$commandPath = Join-Path $Root 'command.ps1'
 $statusPath = Join-Path $Root 'status.json'
-$command = Get-Content -Raw $commandPath
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = 'powershell.exe'
-$psi.Arguments = "-NoProfile -NonInteractive -Command $command"
+$psi.Arguments = "-NoProfile -NonInteractive -File `"$commandPath`""
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
 $psi.RedirectStandardOutput = $true
@@ -2763,7 +2762,7 @@ mod tests {
         assert!(wrapper.contains("RedirectStandardError"));
         assert!(wrapper.contains("BeginOutputReadLine"));
         assert!(wrapper.contains("BeginErrorReadLine"));
-        assert!(wrapper.contains("command.txt"));
+        assert!(wrapper.contains("command.ps1"));
         assert!(!wrapper.contains("secret-value"));
         assert!(!wrapper.contains("Authorization"));
     }
