@@ -77,6 +77,8 @@ Cloud-Dev agent 除 health 外由统一 auth middleware 检查 bearer token；�
 
 实现位置为 `core.js:518-757,833-1188,1455-1494,1560-1591`；LSP、DAP 和 browser 也通过 agent MCP tool surface 暴露，参数 schema 来自 `lsp.toolSchema()`、`dap.toolSchema()`［CD码］。
 
+OPCOS 不把 MCP/能力声明当成结构化 LSP transport。LSP 需要双向 stdio、独立 stderr、可靠的 `Content-Length` framing 和真实 process exit；RVM 目前只有 PTY/WebSocket 字节流，因此远程 LSP 必须显式报告不可用，不能用 PTY 输出拼接伪协议。
+
 ## 4.4 OPCOS 实现矩阵
 
 | 能力                           | OPCOS 现状                                  | 目标                               |

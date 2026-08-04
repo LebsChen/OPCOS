@@ -5141,7 +5141,7 @@ fn seed_builtin_templates(connection: &Connection) -> Result<(), String> {
 
 - 所有执行、文件、进程、屏幕和路径操作都经过选定的 `Host`；先检查 `capabilities`，再决定能否调用。
 - LocalHost 明确不支持 VNC、computer use 和 screenshot；这些是不可用能力，不是尚未探测到。LocalHost 也不提供 PTY。
-- RVM 使用远程 PTY/WebSocket process stream，不提供安全的结构化 stdio。因此 ACP 在 RVM 上不可用；RVM 的结构化远程 LSP 通道也当前不支持。
+- RVM 使用远程 PTY/WebSocket process stream，不提供安全的结构化 stdio。因此 ACP 在 RVM 上不可用；RVM 的结构化远程 LSP 通道也当前不支持。LSP 需要独立 stderr、可靠的 Content-Length framing 和真实 process exit；不要用 PTY 字节流拼接伪 LSP，否则可能返回看似合法但已被终端噪声污染的 definition、references 或 diagnostics。
 - 能力缺失和远程 Host 不可达都会返回显式错误。OPCOS 不会为了掩盖失败而把远程操作静默改到 LocalHost。
 - 远程路径必须使用 Host 的远程路径拼接和 workspace containment 检查。不要用本地 `canonicalize` 推断远程路径是否存在或是否安全。
 - 只有明确选择的 Host 才能执行操作；不要自行猜测另一个 Host、伪造能力，或把未声明的能力当作可用。

@@ -1228,18 +1228,8 @@ impl RvmClient for HttpRvmClient {
     }
 
     async fn capabilities(&self) -> Result<Capabilities, RvmError> {
-        #[derive(Deserialize)]
-        struct CapabilityResponse {
-            #[serde(default)]
-            capabilities: Vec<String>,
-        }
-        match self
-            .get_json::<CapabilityResponse>("/api/capabilities", true)
-            .await
-        {
-            Ok(response) => Ok(Capabilities {
-                available: response.capabilities,
-            }),
+        match self.get_json::<Value>("/api/capabilities", true).await {
+            Ok(response) => parse_capabilities_response(&response),
             Err(RvmError::Http { status, .. }) if status == StatusCode::NOT_FOUND => {
                 let health = self.health().await?;
                 Ok(Capabilities {
@@ -1571,10 +1561,89 @@ impl RvmClient for HttpRvmClient {
     }
 }
 
+fn parse_capabilities_response(value: &Value) -> Result<Capabilities, RvmError> {
+    let capability_values = value
+        .as_array()
+        .or_else(|| value.get("capabilities").and_then(Value::as_array));
+    if let Some(values) = capability_values {
+        let available = values
+            .iter()
+            .map(|value| {
+                value.as_str().map(str::to_owned).ok_or_else(|| {
+                    RvmError::InvalidResponse(
+                        "RVM capabilities response contains a non-string capability".into(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(Capabilities { available });
+    }
+    if value.get("capabilities").is_some() {
+        return Err(RvmError::InvalidResponse(
+            "RVM capabilities response has an unsupported capabilities shape".into(),
+        ));
+    }
+
+    let endpoints = value
+        .get("endpoints")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            RvmError::InvalidResponse(
+                "RVM capabilities response is neither a capability array nor an endpoint map"
+                    .into(),
+            )
+        })?;
+    let endpoint_paths = endpoints
+        .values()
+        .map(|group| {
+            group.as_array().ok_or_else(|| {
+                RvmError::InvalidResponse(
+                    "RVM endpoint map contains a non-array endpoint group".into(),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flat_map(|group| group.iter())
+        .map(|endpoint| {
+            endpoint.as_str().map(str::to_owned).ok_or_else(|| {
+                RvmError::InvalidResponse("RVM endpoint map contains a non-string endpoint".into())
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let has = |endpoint: &str| endpoint_paths.iter().any(|path| path == endpoint);
+    let mut available = Vec::new();
+    for (capability, endpoint) in [
+        ("exec", "/api/exec"),
+        ("exec_sync", "/api/exec-sync"),
+        ("read", "/api/read"),
+        ("write", "/api/write"),
+        ("ls", "/api/ls"),
+        ("pty", "/pty-ws"),
+        ("vnc", "/vnc-ws"),
+        ("cdp", "/cdp-ws"),
+        ("screenshot", "/api/screenshot"),
+        ("computer_use", "/api/computer-use"),
+        ("mcp", "/mcp"),
+        ("upload", "/api/storage/upload"),
+        ("download", "/api/storage/download"),
+    ] {
+        if has(endpoint) {
+            available.push(capability.into());
+        }
+    }
+    Ok(Capabilities { available })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Router, body::Body, http::Request, routing::post};
+    use axum::{
+        Router,
+        body::Body,
+        http::Request,
+        routing::{get, post},
+    };
     use std::collections::VecDeque;
     use std::sync::{
         Arc, Mutex,
@@ -1595,6 +1664,85 @@ mod tests {
         };
         assert!(!format!("{config:?}").contains(token));
         assert!(!format!("{request:?}").contains(token));
+    }
+
+    #[test]
+    fn capability_array_response_is_parsed() {
+        let capabilities =
+            parse_capabilities_response(&serde_json::json!({"capabilities": ["exec", "pty"]}))
+                .unwrap();
+        assert_eq!(capabilities.available, ["exec", "pty"]);
+        let capabilities =
+            parse_capabilities_response(&serde_json::json!(["read", "write"])).unwrap();
+        assert_eq!(capabilities.available, ["read", "write"]);
+    }
+
+    #[test]
+    fn endpoint_map_response_derives_only_present_endpoints() {
+        let capabilities = parse_capabilities_response(&serde_json::json!({
+            "version": "1.0.32",
+            "endpoints": {
+                "core": ["/api/exec", "/api/read", "/api/screenshot"],
+                "websocket": ["/pty-ws", "/vnc-ws"]
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            capabilities.available,
+            ["exec", "read", "pty", "vnc", "screenshot"]
+        );
+        assert!(
+            !capabilities
+                .available
+                .iter()
+                .any(|item| item == "exec_sync")
+        );
+        assert!(!capabilities.available.iter().any(|item| item == "lsp"));
+    }
+
+    #[test]
+    fn unsupported_capability_response_shape_is_an_error() {
+        let error = parse_capabilities_response(&serde_json::json!({
+            "version": "1.0.32",
+            "available": ["exec"]
+        }))
+        .unwrap_err();
+        assert!(matches!(error, RvmError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn endpoint_map_takes_precedence_over_health_capabilities() {
+        let app = Router::new()
+            .route(
+                "/api/capabilities",
+                get(|| async {
+                    r#"{"version":"1.0.32","endpoints":{"core":["/api/exec"],"websocket":["/pty-ws"]}}"#
+                }),
+            )
+            .route(
+                "/api/health",
+                get(|| async { r#"{"status":"ok","capabilities":["lsp","stdio"]}"# }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = HttpRvmClient::new(
+            RvmClientConfig::new(
+                Url::parse(&format!("http://{address}/")).unwrap(),
+                "test-token",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let capabilities = client.capabilities().await.unwrap();
+        assert_eq!(capabilities.available, ["exec", "pty"]);
+        assert!(!capabilities.available.iter().any(|item| item == "lsp"));
+        assert!(!capabilities.available.iter().any(|item| item == "stdio"));
+
+        server.abort();
     }
 
     #[test]
