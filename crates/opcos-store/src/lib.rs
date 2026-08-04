@@ -3245,6 +3245,47 @@ impl SqliteStore {
             .map_err(StoreError::from)
     }
 
+    pub fn rebind_work_item_lease(
+        &self,
+        queue_id: &str,
+        current_worker_id: &str,
+        new_worker_id: &str,
+        lease_generation: u64,
+    ) -> Result<(), StoreError> {
+        if current_worker_id.trim().is_empty() || new_worker_id.trim().is_empty() {
+            return Err(StoreError::Validation("worker IDs cannot be empty".into()));
+        }
+        if lease_generation > i64::MAX as u64 {
+            return Err(StoreError::Validation(
+                "lease_generation is out of range".into(),
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
+        let changed = self
+            .connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "UPDATE work_queue SET lease_owner=?,updated_at=?
+             WHERE queue_id=? AND status='running' AND lease_owner=?
+               AND lease_generation=? AND lease_until>?",
+                params![
+                    new_worker_id,
+                    now,
+                    queue_id,
+                    current_worker_id,
+                    lease_generation as i64,
+                    now
+                ],
+            )?;
+        if changed == 0 {
+            return Err(StoreError::Validation(
+                "lease is missing, expired, or owned by another worker".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn save_work_queue_progress(
         &self,
         queue_id: &str,
@@ -3590,6 +3631,18 @@ impl SqliteStore {
         ))?;
         let rows = statement.query_map(params![status, limit], work_queue_from_row)?;
         rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn load_work_item(&self, queue_id: &str) -> Result<Option<WorkQueueItem>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .query_row(
+                &format!("SELECT {WORK_QUEUE_COLUMNS} FROM work_queue WHERE queue_id=?1"),
+                [queue_id],
+                work_queue_from_row,
+            )
+            .optional()
             .map_err(StoreError::from)
     }
 
@@ -7750,6 +7803,47 @@ mod tests {
                 .unwrap()
                 .status,
             "pending_approval"
+        );
+    }
+
+    #[test]
+    fn work_queue_lease_can_be_rebound_only_by_current_owner() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let item = store
+            .enqueue_work_item(
+                "task",
+                &serde_json::json!({}),
+                None,
+                None,
+                3,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let claimed = store.claim_work_item("worker-1", 60).unwrap().unwrap();
+        assert!(
+            store
+                .rebind_work_item_lease(
+                    &item.queue_id,
+                    "worker-2",
+                    "session-1",
+                    claimed.lease_generation
+                )
+                .is_err()
+        );
+        store
+            .rebind_work_item_lease(
+                &item.queue_id,
+                "worker-1",
+                "session-1",
+                claimed.lease_generation,
+            )
+            .unwrap();
+        assert!(
+            store
+                .renew_work_item(&item.queue_id, "session-1", claimed.lease_generation, 60)
+                .is_ok()
         );
     }
 }

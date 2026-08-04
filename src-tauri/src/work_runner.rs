@@ -25,6 +25,18 @@ enum SessionSelection<'a> {
     ProfileRequired,
 }
 
+struct UnattendedRestore {
+    store: Arc<opcos_store::SqliteStore>,
+    session_id: String,
+    previous: bool,
+}
+
+impl Drop for UnattendedRestore {
+    fn drop(&mut self) {
+        let _ = self.store.set_unattended(&self.session_id, self.previous);
+    }
+}
+
 fn select_session<'a>(
     session_id: Option<&'a str>,
     profile: Option<&'a AutonomousRunnerProfile>,
@@ -42,13 +54,24 @@ fn writes_allowed(disposition: &RunDisposition) -> bool {
     !matches!(disposition, RunDisposition::LostLease)
 }
 
+fn disposition_after_turn(status: Option<&str>, pending: bool) -> RunDisposition {
+    if pending {
+        return RunDisposition::PendingApproval;
+    }
+    match status {
+        Some("completed") => RunDisposition::Completed,
+        Some("pending_approval") => RunDisposition::PendingApproval,
+        _ => RunDisposition::Failed,
+    }
+}
+
 pub fn start(
     app: tauri::AppHandle,
     shutdown: watch::Receiver<bool>,
 ) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
         let mut shutdown = shutdown;
-        let mut semaphore = None;
+        let mut semaphore: Option<(u32, Arc<Semaphore>)> = None;
         loop {
             if *shutdown.borrow() {
                 break;
@@ -57,9 +80,14 @@ pub fn start(
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 continue;
             };
-            if semaphore.is_none() {
-                let max = state.store.runner_max_concurrency().unwrap_or(1) as usize;
-                semaphore = Some(Arc::new(Semaphore::new(max)));
+            let configured_max = state.store.runner_max_concurrency().unwrap_or(1);
+            if semaphore.as_ref().is_none_or(|(max, semaphore)| {
+                *max != configured_max && semaphore.available_permits() == *max as usize
+            }) {
+                semaphore = Some((
+                    configured_max,
+                    Arc::new(Semaphore::new(configured_max as usize)),
+                ));
             }
             if !state.store.runner_enabled().unwrap_or(false) {
                 tokio::select! {
@@ -73,6 +101,7 @@ pub fn start(
             let Ok(permit) = semaphore
                 .as_ref()
                 .expect("runner semaphore initialized")
+                .1
                 .clone()
                 .try_acquire_owned()
             else {
@@ -112,10 +141,27 @@ async fn run_item(
     item: WorkQueueItem,
     worker_id: String,
 ) -> Result<RunDisposition, String> {
-    let session_id = match item.session_id.clone() {
-        Some(session_id) => session_id,
+    let (session_id, unattended_restore) = match item.session_id.clone() {
+        Some(session_id) => {
+            let previous = state
+                .store
+                .is_unattended(&session_id)
+                .map_err(|error| error.to_string())?;
+            state
+                .store
+                .set_unattended(&session_id, true)
+                .map_err(|error| error.to_string())?;
+            (
+                session_id.clone(),
+                Some(UnattendedRestore {
+                    store: Arc::clone(&state.store),
+                    session_id,
+                    previous,
+                }),
+            )
+        }
         None => match create_runner_session(&app, &state, item.project_id.as_deref()).await {
-            Ok(session_id) => session_id,
+            Ok(session_id) => (session_id, None),
             Err(error) => {
                 state
                     .store
@@ -138,10 +184,19 @@ async fn run_item(
             }
         },
     };
-    state
-        .store
-        .set_unattended(&session_id, true)
-        .map_err(|error| error.to_string())?;
+    let _unattended_restore = unattended_restore;
+    if worker_id != session_id {
+        state
+            .store
+            .rebind_work_item_lease(
+                &item.queue_id,
+                &worker_id,
+                &session_id,
+                item.lease_generation,
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    let worker_id = session_id.clone();
     let generation = item.lease_generation;
     let before_pending = state
         .store
@@ -154,10 +209,11 @@ async fn run_item(
     let request = SubmitRequest {
         session_id: session_id.clone(),
         text: format!(
-            "Execute durable work item `{}`. Task type: `{}`. Payload: {}",
+            "Execute durable work item `{}`. Task type: `{}`. Payload: {}. You must call work_queue_complete with this queue_id and lease_generation `{}` and an explicit outcome before this turn ends. Never imply success merely because this turn ends.",
             item.queue_id,
             item.task_type,
-            serde_json::to_string(&item.payload).map_err(|error| error.to_string())?
+            serde_json::to_string(&item.payload).map_err(|error| error.to_string())?,
+            item.lease_generation
         ),
     };
     let mut execution = Box::pin(submit_turn_inner(app, &state, request));
@@ -173,7 +229,13 @@ async fn run_item(
                         .map_err(|error| error.to_string())?
                         .into_iter()
                         .any(|item| item.session_id == session_id && !before_pending.contains(&item.call_id));
-                    if pending { RunDisposition::PendingApproval } else { RunDisposition::Completed }
+                    let status = state
+                        .store
+                        .load_work_item(&item.queue_id)
+                        .ok()
+                        .flatten()
+                        .map(|item| item.status);
+                    disposition_after_turn(status.as_deref(), pending)
                 };
                 break disposition;
             }
@@ -188,12 +250,7 @@ async fn run_item(
         return Ok(disposition);
     }
     match disposition {
-        RunDisposition::Completed => {
-            state
-                .store
-                .complete_work_item(&item.queue_id, &worker_id, generation, "succeeded", None)
-                .map_err(|error| error.to_string())?;
-        }
+        RunDisposition::Completed => {}
         RunDisposition::PendingApproval => {
             state
                 .store
@@ -202,13 +259,21 @@ async fn run_item(
         }
         RunDisposition::NeedsHuman => unreachable!("needs human returned after queue write"),
         RunDisposition::Failed => {
-            let _ = state.store.complete_work_item(
-                &item.queue_id,
-                &worker_id,
-                generation,
-                "failed",
-                Some("runner agent turn failed"),
-            );
+            if state
+                .store
+                .load_work_item(&item.queue_id)
+                .ok()
+                .flatten()
+                .is_some_and(|item| item.status == "running")
+            {
+                let _ = state.store.complete_work_item(
+                    &item.queue_id,
+                    &worker_id,
+                    generation,
+                    "failed",
+                    Some("agent turn ended without an explicit work_queue_complete signal"),
+                );
+            }
         }
         RunDisposition::LostLease => unreachable!("lost lease returned before queue write"),
     }
@@ -316,6 +381,37 @@ mod tests {
         assert!(!writes_allowed(&RunDisposition::LostLease));
         assert!(writes_allowed(&RunDisposition::PendingApproval));
         assert!(writes_allowed(&RunDisposition::NeedsHuman));
+    }
+
+    #[test]
+    fn turn_without_explicit_completion_is_not_success() {
+        assert_eq!(
+            disposition_after_turn(Some("running"), false),
+            RunDisposition::Failed
+        );
+        assert_eq!(
+            disposition_after_turn(Some("completed"), false),
+            RunDisposition::Completed
+        );
+        assert_eq!(
+            disposition_after_turn(Some("ready"), false),
+            RunDisposition::Failed
+        );
+    }
+
+    #[test]
+    fn reused_session_unattended_value_is_restored_on_guard_drop() {
+        let store = Arc::new(opcos_store::SqliteStore::open_in_memory().unwrap());
+        store.set_unattended("user-session", false).unwrap();
+        let previous = store.is_unattended("user-session").unwrap();
+        store.set_unattended("user-session", true).unwrap();
+        let guard = UnattendedRestore {
+            store: Arc::clone(&store),
+            session_id: "user-session".into(),
+            previous,
+        };
+        drop(guard);
+        assert!(!store.is_unattended("user-session").unwrap());
     }
 
     #[tokio::test]
