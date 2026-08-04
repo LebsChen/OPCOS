@@ -453,19 +453,42 @@ fn scope_matches(scope: &str, context: KnowledgeContext<'_>) -> bool {
     if scope.eq_ignore_ascii_case("project") {
         return context.project.is_some();
     }
+    if scope
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("repo:"))
+    {
+        let expected = scope[5..].trim();
+        return context.repository.is_some_and(|repository| {
+            let repository = repository.trim().trim_start_matches("repo:");
+            expected == repository
+        });
+    }
+    if scope
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("project:"))
+    {
+        let expected = scope[8..].trim();
+        return context.project.is_some_and(|project| {
+            let project = project.trim().trim_start_matches("project:");
+            expected == project
+        });
+    }
     if let Some(repository) = context.repository {
         let repository = repository.trim().trim_start_matches("repo:");
-        if scope == repository || scope == format!("repo:{repository}") {
+        if scope == repository {
             return true;
         }
     }
     if let Some(project) = context.project {
         let project = project.trim().trim_start_matches("project:");
-        if scope == project || scope == format!("project:{project}") {
+        if scope == project {
             return true;
         }
     }
-    false
+    // Scope was historically metadata only. Keep unknown values fail-open so
+    // existing custom scopes remain injectable; the knowledge count and byte
+    // limits still bound the worst-case context growth.
+    true
 }
 
 fn format_asset_section(header: &str, content: &str) -> String {
@@ -1042,6 +1065,26 @@ mod tests {
             project: Some("project-2"),
         });
         assert!(!project_miss.contains("project knowledge"));
+    }
+
+    #[test]
+    fn knowledge_unknown_scope_fails_open_for_backward_compatibility() {
+        let bundle = AssetBundle {
+            knowledge: vec![KnowledgeEntry {
+                title: "Custom scope".into(),
+                body: "custom scope knowledge".into(),
+                trigger: String::new(),
+                scope: "my-team".into(),
+                enabled: true,
+            }],
+            ..AssetBundle::default()
+        };
+        let rendered = bundle.system_instructions_for(KnowledgeContext {
+            task: "task",
+            repository: None,
+            project: None,
+        });
+        assert!(rendered.contains("custom scope knowledge"));
     }
 
     #[test]
