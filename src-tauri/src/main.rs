@@ -2187,9 +2187,10 @@ async fn execute_index_tool(
     name: &str,
     arguments: Value,
 ) -> Result<Value, String> {
-    let index = repo_index::load(root, host_id, workspace)?.ok_or_else(|| {
-        "repository index is unavailable; run repo_index_refresh first".to_owned()
-    })?;
+    let mut index = match repo_index::load(root, host_id, workspace)? {
+        Some(index) => index,
+        None => repo_index::build(root, host_id, workspace, host).await?,
+    };
     if index.status == "error" {
         return Err(index
             .error
@@ -2208,7 +2209,12 @@ async fn execute_index_tool(
         && result.result.exit_code == 0
         && !result.result.stdout.trim().is_empty()
     {
-        return Err("repository index is stale; run repo_index_refresh before searching".into());
+        index = repo_index::build(root, host_id, workspace, host).await?;
+        if index.status == "error" {
+            return Err(index
+                .error
+                .unwrap_or_else(|| "repository index refresh failed".into()));
+        }
     }
     let limited = |mut results: Vec<Value>| {
         let omitted = results.len().saturating_sub(repo_index::MAX_RESULTS);
@@ -8990,45 +8996,8 @@ async fn engine_for_with_context(
             })
             .collect::<Vec<_>>();
         let mut allowed_tools = allowed_tools;
-        allowed_tools.extend([
-            "propose_plan".to_owned(),
-            "plan_get".to_owned(),
-            "plan_update".to_owned(),
-            "plan_revise".to_owned(),
-            "skill_save_learned".to_owned(),
-            "skill_search_learned".to_owned(),
-            "skill_get_learned".to_owned(),
-            "ask_user".to_owned(),
-        ]);
-        if host_id == "local" {
-            allowed_tools.extend([
-                "lsp_definition".to_owned(),
-                "lsp_references".to_owned(),
-                "lsp_diagnostics".to_owned(),
-            ]);
-        }
-        allowed_tools.extend([
-            "repo_index_find_symbol".to_owned(),
-            "repo_index_glob".to_owned(),
-            "repo_index_search".to_owned(),
-            "background_job_start".to_owned(),
-            "background_job_status".to_owned(),
-            "background_job_output".to_owned(),
-            "background_job_kill".to_owned(),
-            "action_ledger_begin".to_owned(),
-            "action_ledger_finish".to_owned(),
-            "action_ledger_list".to_owned(),
-            "work_queue_enqueue".to_owned(),
-            "work_queue_claim".to_owned(),
-            "work_queue_renew".to_owned(),
-            "work_queue_complete".to_owned(),
-            "work_queue_cancel".to_owned(),
-            "work_queue_requeue".to_owned(),
-            "work_queue_list".to_owned(),
-            "external_ingress_sources".to_owned(),
-            "coordination_dispatch".to_owned(),
-            "coordination_status".to_owned(),
-        ]);
+        let supports_edit_file = allowed_tools.iter().any(|tool| tool == "write_file");
+        allowed_tools.extend(builtin_allowed_tools(true, supports_edit_file));
         if linear_tools_enabled {
             allowed_tools.extend([
                 "linear_get_issue".to_owned(),
@@ -11308,6 +11277,55 @@ pub(crate) async fn submit_turn_inner_with_origin(
     origin: ToolOrigin,
 ) -> Result<(), String> {
     submit_turn_inner_with_context(app, state, request, origin, None).await
+}
+
+fn builtin_allowed_tools(include_local_lsp: bool, include_edit_file: bool) -> Vec<String> {
+    let mut tools = vec![
+        "propose_plan",
+        "plan_get",
+        "plan_update",
+        "plan_revise",
+        "skill_save_learned",
+        "skill_search_learned",
+        "skill_get_learned",
+        "ask_user",
+        "repo_index_find_symbol",
+        "repo_index_glob",
+        "repo_index_search",
+        "background_job_start",
+        "background_job_status",
+        "background_job_output",
+        "background_job_kill",
+        "local_gate_record",
+        "local_gate_status",
+        "action_ledger_begin",
+        "action_ledger_finish",
+        "action_ledger_list",
+        "work_queue_enqueue",
+        "work_queue_claim",
+        "work_queue_renew",
+        "work_queue_complete",
+        "work_queue_cancel",
+        "work_queue_requeue",
+        "work_queue_list",
+        "external_ingress_sources",
+        "coordination_dispatch",
+        "coordination_status",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    if include_local_lsp {
+        tools.extend([
+            "lsp_definition".to_owned(),
+            "lsp_references".to_owned(),
+            "lsp_diagnostics".to_owned(),
+        ]);
+    }
+    if include_edit_file {
+        tools.push("edit_file".to_owned());
+    }
+    tools
 }
 
 pub(crate) async fn submit_turn_inner_with_context(
@@ -21093,6 +21111,35 @@ fn main() {
 #[cfg(test)]
 mod m7_tests {
     use super::*;
+
+    #[test]
+    fn builtin_prompt_tools_are_present_in_local_tool_catalog_and_allowlist() {
+        let allowed = builtin_allowed_tools(true, true)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let catalog = opcos_engine::builtin_tool_names();
+        for name in opcos_assets::BUILTIN_AGENT_TOOL_NAMES {
+            assert!(
+                opcos_assets::BUILTIN_AGENT_INSTRUCTIONS
+                    .contains(name.split('_').next().unwrap_or(name)),
+                "{name} is not represented by the builtin tool guidance"
+            );
+            assert!(
+                catalog.contains(*name),
+                "{name} is missing from tool catalog"
+            );
+            assert!(
+                allowed.contains(*name),
+                "{name} is missing from local allowlist"
+            );
+        }
+        let remote_allowed = builtin_allowed_tools(false, false)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        for name in ["lsp_definition", "lsp_references", "lsp_diagnostics"] {
+            assert!(!remote_allowed.contains(name));
+        }
+    }
 
     #[test]
     fn lifecycle_hook_stdout_invalid_or_oversized_is_ignored() {

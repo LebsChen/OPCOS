@@ -2433,6 +2433,18 @@ fn tool_definitions() -> Vec<Value> {
     tools
 }
 
+pub fn builtin_tool_names() -> HashSet<String> {
+    tool_definitions()
+        .into_iter()
+        .filter_map(|tool| {
+            tool.get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
 pub fn coordination_tool_definitions() -> Vec<Value> {
     vec![
         json!({"type":"function","function":{"name":"coordination_dispatch","description":"Dispatch work asynchronously from the current builtin OPCOS Leader session to an existing Worker role. Only a Leader may call this tool; the caller role is derived from the bound session and cannot be supplied by the model. This never creates sessions or recursively spawns agents. Returns a task id and pending status; Worker reports are not completion evidence.","parameters":{"type":"object","properties":{"task_id":{"type":"string"},"worker_role_id":{"type":"string"},"message":{"type":"string"}},"required":["task_id","worker_role_id","message"]}}}),
