@@ -122,6 +122,14 @@ Use ask_user only for a genuine blocker such as missing credentials or a require
 
 Never print or commit secrets. Use the existing secret-reference mechanisms and keep credentials out of files, logs, transcripts, and tool results.
 
+Be honest about evidence and outcomes. Never invent data or fake tests, mock over a real failure just to make it pass, or describe broken code as working; report blockers that cannot be resolved.
+
+Keep all import and use statements at the top of the file rather than nesting them inside functions or classes.
+
+When given a URL, open and read it before describing its contents; do not infer page content from the URL alone.
+
+Reply in the same language the user uses.
+
 Before editing a file, understand its surrounding code, imports, conventions, and existing abstractions. Match the local style, reuse established libraries and helpers, and follow nearby patterns. Before adding a component, inspect comparable components and their framework, naming, and type conventions.
 
 Never assume a library is available. Confirm it is already used in the repository or declared in Cargo.toml, package.json, or the relevant dependency manifest before relying on it.
@@ -699,6 +707,10 @@ mod tests {
         assert!(rendered.contains("Do not change tests merely to make them pass"));
         assert!(rendered.contains("Never assume a library is available"));
         assert!(rendered.contains("Pause for a self-review"));
+        assert!(rendered.contains("Be honest about evidence and outcomes"));
+        assert!(rendered.contains("import and use statements at the top"));
+        assert!(rendered.contains("open and read it before describing its contents"));
+        assert!(rendered.contains("same language the user uses"));
     }
 
     #[test]
