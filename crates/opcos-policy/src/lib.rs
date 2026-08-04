@@ -31,6 +31,7 @@ pub enum ToolRisk {
 pub struct DurableGrant {
     pub key: String,
     pub target: String,
+    pub expires_at: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,7 +71,21 @@ pub fn decide(
         risk,
         ToolRisk::Write | ToolRisk::Execute | ToolRisk::External
     );
-    if dangerous && grants.iter().any(|grant| grant.target == target) {
+    if dangerous
+        && grants.iter().any(|grant| {
+            (grant.target == target
+                // Preserve grants created before scoped push targets existed.
+                || (target.starts_with("git_push:")
+                    && grant.target == "git_push"))
+                && grant.expires_at.as_deref().is_none_or(|expires_at| {
+                    chrono::DateTime::parse_from_rfc3339(expires_at)
+                        .map(|expires_at| {
+                            expires_at.with_timezone(&chrono::Utc) > chrono::Utc::now()
+                        })
+                        .unwrap_or(false)
+                })
+        })
+    {
         return Decision::Allow;
     }
     if unattended && dangerous {
@@ -225,6 +240,35 @@ mod tests {
                 "mcp:unknown"
             ),
             Decision::Allow
+        );
+    }
+
+    #[test]
+    fn expired_scoped_grants_do_not_authorize_external_operations() {
+        let grants = [DurableGrant {
+            key: "push".into(),
+            target: "git_push:project:owner/repo:feature".into(),
+            expires_at: Some("2000-01-01T00:00:00Z".into()),
+        }];
+        assert_eq!(
+            decide(
+                PermissionMode::Interactive,
+                ToolRisk::External,
+                false,
+                &grants,
+                "git_push:project:owner/repo:feature"
+            ),
+            Decision::NeedsUser
+        );
+        assert_eq!(
+            decide(
+                PermissionMode::Interactive,
+                ToolRisk::External,
+                false,
+                &grants,
+                "git_push:project:owner/repo:other"
+            ),
+            Decision::NeedsUser
         );
     }
 }

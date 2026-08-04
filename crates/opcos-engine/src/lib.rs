@@ -38,6 +38,8 @@ pub enum EngineError {
     Provider(#[from] ProviderError),
     #[error("store: {0}")]
     Store(String),
+    #[error("tool preflight: {0}")]
+    Tool(String),
     #[error("context exhausted: {0}")]
     ContextExhausted(String),
     #[error("engine interrupted")]
@@ -55,6 +57,33 @@ pub enum EngineError {
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
     async fn execute(&self, name: &str, arguments: Value) -> Result<Value, String>;
+
+    async fn preflight(&self, name: &str, arguments: &Value) -> Result<PreflightDecision, String> {
+        let _ = (name, arguments);
+        Ok(PreflightDecision::Allow)
+    }
+
+    fn tool_origin(&self) -> ToolOrigin {
+        ToolOrigin::User
+    }
+
+    fn policy_target(&self, name: &str, arguments: &Value) -> String {
+        let _ = arguments;
+        name.to_owned()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolOrigin {
+    User,
+    RepairLoop,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PreflightDecision {
+    Allow,
+    NeedsUser(String),
+    Deny(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -640,6 +669,7 @@ where
             Err(EngineError::Provider(_)) => ("error", "provider_error"),
             Err(EngineError::ContextExhausted(_)) => ("error", "context_exhausted"),
             Err(EngineError::Store(_)) => ("error", "internal_error"),
+            Err(EngineError::Tool(_)) => ("error", "tool_preflight_error"),
             Err(EngineError::MaxIterations) => ("error", "max_iterations"),
             Err(EngineError::MessageUsageLimitReached) => ("error", "usage_limit"),
             Err(EngineError::ApprovalAlreadyProcessed(_)) => ("idle", "waiting_for_approval"),
@@ -683,12 +713,47 @@ where
         key: impl Into<String>,
         target: impl Into<String>,
     ) -> Result<(), EngineError> {
+        let target = target.into();
+        if target == "git_push" {
+            return Err(EngineError::Store(
+                "new grants must use a scoped git_push target".into(),
+            ));
+        }
         self.store
             .save_grant(&GrantRecord {
                 session_id: self.session_id.clone(),
                 key: key.into(),
-                target: target.into(),
+                target,
+                expires_at: None,
             })
+            .map_err(|error| EngineError::Store(error.to_string()))
+    }
+
+    pub fn save_grant_until(
+        &self,
+        key: impl Into<String>,
+        target: impl Into<String>,
+        expires_at: impl Into<String>,
+    ) -> Result<(), EngineError> {
+        let target = target.into();
+        if target == "git_push" {
+            return Err(EngineError::Store(
+                "new grants must use a scoped git_push target".into(),
+            ));
+        }
+        self.store
+            .save_grant(&GrantRecord {
+                session_id: self.session_id.clone(),
+                key: key.into(),
+                target,
+                expires_at: Some(expires_at.into()),
+            })
+            .map_err(|error| EngineError::Store(error.to_string()))
+    }
+
+    pub fn revoke_grant(&self, key: &str) -> Result<bool, EngineError> {
+        self.store
+            .revoke_grant(&self.session_id, key)
             .map_err(|error| EngineError::Store(error.to_string()))
     }
 
@@ -1150,6 +1215,7 @@ where
             .map(|grant| DurableGrant {
                 key: grant.key,
                 target: grant.target,
+                expires_at: grant.expires_at,
             })
             .collect::<Vec<_>>();
         let unattended = self.unattended.load(Ordering::SeqCst);
@@ -1201,7 +1267,35 @@ where
             }
             let risk = tool_risk(&call.name);
             let mode = *self.mode.lock().await;
-            match decide(mode, risk, unattended, &grants, &call.name) {
+            let target = self.executor.policy_target(&call.name, &call.arguments);
+            let preflight = self
+                .executor
+                .preflight(&call.name, &call.arguments)
+                .await
+                .map_err(EngineError::Tool)?;
+            let mut preflight_reason = None;
+            let decision = match preflight {
+                PreflightDecision::Allow => decide(mode, risk, unattended, &grants, &target),
+                PreflightDecision::NeedsUser(reason) if unattended => {
+                    preflight_reason = Some(reason);
+                    Decision::Deny
+                }
+                PreflightDecision::NeedsUser(reason) => {
+                    preflight_reason = Some(reason);
+                    Decision::NeedsUser
+                }
+                PreflightDecision::Deny(reason) => {
+                    preflight_reason = Some(reason);
+                    Decision::Deny
+                }
+            };
+            if matches!(decision, Decision::Deny) && preflight_reason.is_some() {
+                results[index] = Some(json!({
+                    "error": preflight_reason.as_deref().unwrap_or("tool call denied by preflight")
+                }));
+                continue;
+            };
+            match decision {
                 Decision::Allow
                     if matches!(risk, ToolRisk::Read | ToolRisk::Search | ToolRisk::GitRead) =>
                 {
@@ -1251,7 +1345,10 @@ where
                         call_id: call.id.clone(),
                         tool: call.name.clone(),
                         arguments: call.arguments.clone(),
-                        state: "pending".into(),
+                        state: preflight_reason
+                            .as_deref()
+                            .map(|reason| format!("pending_approval: {reason}"))
+                            .unwrap_or_else(|| "pending".into()),
                     })?;
                     return Err(EngineError::ApprovalPending(call.id.clone()));
                 }
@@ -1481,8 +1578,10 @@ fn tool_risk(name: &str) -> ToolRisk {
         "action_ledger_list" => ToolRisk::Read,
         "action_ledger_begin" | "action_ledger_finish" => ToolRisk::Write,
         "work_queue_list" => ToolRisk::Read,
+        "local_gate_status" => ToolRisk::Read,
         "external_ingress_sources" => ToolRisk::Read,
         "work_queue_enqueue"
+        | "local_gate_record"
         | "work_queue_claim"
         | "work_queue_renew"
         | "work_queue_complete"
@@ -1907,6 +2006,8 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"git_create_branch","description":"Create and switch to a named Git branch. Requires approval.","parameters":{"type":"object","properties":{"cwd":{"type":"string"},"branch":{"type":"string"}},"required":["cwd","branch"]}}}),
         json!({"type":"function","function":{"name":"git_stage_commit","description":"Stage an explicit file list and create a Git commit. Requires approval.","parameters":{"type":"object","properties":{"cwd":{"type":"string"},"files":{"type":"array","items":{"type":"string"}},"message":{"type":"string"}},"required":["cwd","files","message"]}}}),
         json!({"type":"function","function":{"name":"git_push","description":"Push the current Git branch to a configured Git remote using the project's forge credential. The remote must already be configured; requires approval and an external action record.","parameters":{"type":"object","properties":{"cwd":{"type":"string"},"remote":{"type":"string"},"branch":{"type":"string"}},"required":["cwd"]}}}),
+        json!({"type":"function","function":{"name":"local_gate_record","description":"Persist local build, test, and lint gate results for a commit. CI status never substitutes for this record. Output text is intentionally not persisted.","parameters":{"type":"object","properties":{"commit_sha":{"type":"string"},"commands":{"type":"array","items":{"type":"string"}},"results":{"type":"array","items":{"type":"object","properties":{"command":{"type":"string"},"status":{"type":"string"},"exit_code":{"type":"integer"}},"required":["command","status"]}},"all_passed":{"type":"boolean"}},"required":["commit_sha","commands","results","all_passed"]}}}),
+        json!({"type":"function","function":{"name":"local_gate_status","description":"Read the persisted local gate contract for a commit.","parameters":{"type":"object","properties":{"commit_sha":{"type":"string"}},"required":["commit_sha"]}}}),
         json!({"type":"function","function":{"name":"github_create_pull_request","description":"Create or reconcile a GitHub pull request for an existing pushed branch. Requires approval and is idempotent.","parameters":{"type":"object","properties":{"repo":{"type":"string"},"title":{"type":"string"},"head":{"type":"string"},"base":{"type":"string"},"body":{"type":"string"},"token_secret":{"type":"string"}},"required":["repo","title","head","base","body","token_secret"]}}}),
         json!({"type":"function","function":{"name":"github_get_pull_request","description":"Read a GitHub pull request, including issue comments and review comments.","parameters":{"type":"object","properties":{"repo":{"type":"string"},"number":{"type":"integer"},"token_secret":{"type":"string"}},"required":["repo","number","token_secret"]}}}),
         json!({"type":"function","function":{"name":"github_ci_status","description":"Read GitHub Actions checks for the bound project repository by pull request number or commit SHA. Classifies code failures separately from billing, runner, cancellation, timeout, and indeterminate states; this is observational and not a delivery gate.","parameters":{"type":"object","properties":{"repo":{"type":"string"},"pull_request":{"type":"integer"},"commit":{"type":"string"}},"required":["repo"]}}}),

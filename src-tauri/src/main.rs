@@ -23,7 +23,8 @@ use opcos_assets::{
 };
 use opcos_engine::{
     AcpHarness, AcpHarnessConfig, AgentEngine, EngineError, Harness, OpenCodeHarness,
-    OpenCodeHarnessConfig, SessionRecorder, ToolExecutor, TurnEngine,
+    OpenCodeHarnessConfig, PreflightDecision, SessionRecorder, ToolExecutor, ToolOrigin,
+    TurnEngine,
     computer_use::{
         BestEffortScreenshotChangedVerifier, ComputerUseLoopConfig, ComputerUseStep,
         run_computer_use_loop,
@@ -160,6 +161,170 @@ fn reject_dangerous_git(command: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn valid_git_branch(branch: &str) -> bool {
+    !branch.trim().is_empty()
+        && !branch.chars().any(char::is_control)
+        && !branch.chars().any(char::is_whitespace)
+        && !branch.contains("..")
+        && !branch.starts_with('/')
+        && !branch.ends_with('/')
+        && !branch.starts_with('-')
+}
+
+fn forbidden_diff_reasons(paths: &[String], diff: &str) -> Vec<String> {
+    let mut reasons = Vec::new();
+    for path in paths {
+        let normalized = path.replace('\\', "/").to_ascii_lowercase();
+        let file_name = normalized.rsplit('/').next().unwrap_or(&normalized);
+        if normalized.split('/').any(|part| {
+            matches!(
+                part,
+                "test" | "tests" | "__tests__" | "fixtures" | "snapshots"
+            )
+        }) || file_name.ends_with("_test.rs")
+            || file_name.ends_with("_test.go")
+            || file_name.contains(".test.")
+            || file_name.contains(".spec.")
+        {
+            reasons.push(format!("test file: {path}"));
+        }
+        if normalized.starts_with(".github/workflows/")
+            || normalized.starts_with(".circleci/")
+            || normalized.starts_with(".buildkite/")
+            || matches!(
+                file_name,
+                "jenkinsfile"
+                    | "azure-pipelines.yml"
+                    | "azure-pipelines.yaml"
+                    | ".gitlab-ci.yml"
+                    | ".gitlab-ci.yaml"
+            )
+        {
+            reasons.push(format!("CI configuration: {path}"));
+        }
+        if file_name == ".npmrc"
+            || file_name == ".yarnrc"
+            || file_name == ".yarnrc.yml"
+            || file_name == "codeowners"
+            || file_name == "security.md"
+            || normalized.contains("/security/")
+            || normalized.contains("/compliance/")
+            || normalized.contains("/branch-protection/")
+            || normalized.contains("/policy/")
+        {
+            reasons.push(format!("security/compliance configuration: {path}"));
+        }
+    }
+    let lower_diff = diff.to_ascii_lowercase();
+    for (marker, reason) in [
+        ("--no-verify", "skip validation: --no-verify"),
+        ("skip ci", "skip validation: skip CI"),
+        ("skip job", "skip validation: skip job"),
+        ("skip:", "skip validation: skip directive"),
+        ("if: false", "skip validation: disabled condition"),
+        ("if: ${{ false }}", "skip validation: disabled condition"),
+        ("continue-on-error", "skip validation: continue-on-error"),
+        ("allow_failure", "skip validation: allow_failure"),
+        ("eslint-disable", "skip validation: eslint-disable"),
+        ("clippy::allow", "skip validation: clippy allow"),
+        ("#[ignore]", "skip validation: ignored test"),
+        (".skip(", "skip validation: skipped test"),
+        (
+            "minimumreleaseage",
+            "security/compliance relaxation: minimumReleaseAge",
+        ),
+    ] {
+        if lower_diff.contains(marker) {
+            reasons.push(reason.to_owned());
+        }
+    }
+    for line in diff.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('-') && !trimmed.starts_with("---") && trimmed.contains("assert") {
+            reasons.push("skip validation: removed assertion".into());
+        }
+        if trimmed.starts_with('+')
+            && !trimmed.starts_with("+++")
+            && trimmed.contains("//")
+            && trimmed.contains("assert")
+        {
+            reasons.push("skip validation: commented assertion".into());
+        }
+    }
+    reasons.sort();
+    reasons.dedup();
+    reasons
+}
+
+async fn inspect_push_diff(
+    host: &dyn Host,
+    platform: Option<&str>,
+    cwd: &str,
+    default_branch: &str,
+) -> Result<Vec<String>, String> {
+    if !valid_git_branch(default_branch) {
+        return Err("project default branch is invalid".into());
+    }
+    let reference = format!("{}...HEAD", quote_for(platform, default_branch),);
+    let names = host
+        .exec(ExecRequest {
+            command: format!("git diff --name-only {reference} && git diff --name-only && git diff --cached --name-only"),
+            cwd: Some(cwd.to_owned()),
+            timeout_seconds: 30,
+            session: None,
+            env: None,
+        })
+        .await
+        .map_err(|error| format!("unable to inspect push diff: {error}"))?;
+    if names.result.exit_code != 0 {
+        return Err("unable to establish push diff against the project default branch".into());
+    }
+    let diff = host
+        .exec(ExecRequest {
+            command: format!("git diff {reference}; git diff; git diff --cached"),
+            cwd: Some(cwd.to_owned()),
+            timeout_seconds: 30,
+            session: None,
+            env: None,
+        })
+        .await
+        .map_err(|error| format!("unable to inspect push diff content: {error}"))?;
+    if diff.result.exit_code != 0 {
+        return Err("unable to inspect push diff content".into());
+    }
+    let paths = names
+        .result
+        .stdout
+        .lines()
+        .filter(|path| !path.trim().is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let reasons = forbidden_diff_reasons(&paths, &diff.result.stdout);
+    Ok(reasons)
+}
+
+fn git_push_policy_target(
+    store: &SqliteStore,
+    project_id: Option<&str>,
+    arguments: &Value,
+) -> String {
+    let Some(project_id) = project_id.filter(|value| !value.trim().is_empty()) else {
+        return "git_push:invalid".into();
+    };
+    let Some(branch) = arguments.get("branch").and_then(Value::as_str) else {
+        return "git_push:invalid".into();
+    };
+    if !valid_git_branch(branch) {
+        return "git_push:invalid".into();
+    }
+    let Ok(Some(project)) = store.load_project(project_id) else {
+        return "git_push:invalid".into();
+    };
+    let repo = github_repo_from_url(&project.repo_url)
+        .unwrap_or_else(|_| project.repo_url.trim().trim_end_matches(".git").to_owned());
+    format!("git_push:{project_id}:{repo}:{branch}")
 }
 
 struct DesktopState {
@@ -685,6 +850,21 @@ async fn execute_git_write(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("origin");
     if name == "git_push" {
+        let branch = arguments
+            .get("branch")
+            .and_then(Value::as_str)
+            .ok_or("git_push requires a branch")?;
+        if !valid_git_branch(branch) {
+            return Err("git_push branch is not a valid Git ref".into());
+        }
+        if project_id
+            .and_then(|id| store.load_project(id).ok().flatten())
+            .is_none()
+        {
+            return Err("git_push requires a bound project".into());
+        }
+    }
+    if name == "git_push" {
         validate_git_remote_name(remote_name)?;
         let remote_url = read_git_remote_url(host, platform, &cwd, remote_name).await?;
         validate_git_remote_destination(&remote_url, store, project_id)?;
@@ -890,6 +1070,74 @@ async fn execute_git_write(
         }
     }
     Ok(output)
+}
+
+async fn preflight_git_push(
+    host: &dyn Host,
+    platform: Option<&str>,
+    store: &SqliteStore,
+    project_id: Option<&str>,
+    arguments: &Value,
+    origin: ToolOrigin,
+) -> Result<PreflightDecision, String> {
+    let cwd = arguments
+        .get("cwd")
+        .and_then(Value::as_str)
+        .ok_or("git_push requires cwd")?;
+    let Some(project_id) = project_id else {
+        return Ok(match origin {
+            ToolOrigin::User => PreflightDecision::NeedsUser(
+                "push diff inspection unavailable: no bound project".into(),
+            ),
+            ToolOrigin::RepairLoop => PreflightDecision::Deny(
+                "repair-loop push denied: no bound project for diff inspection".into(),
+            ),
+        });
+    };
+    let Some(project) = store
+        .load_project(project_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(match origin {
+            ToolOrigin::User => PreflightDecision::NeedsUser(
+                "push diff inspection unavailable: bound project could not be loaded".into(),
+            ),
+            ToolOrigin::RepairLoop => PreflightDecision::Deny(
+                "repair-loop push denied: bound project could not be loaded".into(),
+            ),
+        });
+    };
+    Ok(push_diff_preflight(
+        origin,
+        inspect_push_diff(host, platform, cwd, &project.default_branch).await,
+    ))
+}
+
+fn push_diff_preflight(
+    origin: ToolOrigin,
+    inspection: Result<Vec<String>, String>,
+) -> PreflightDecision {
+    match inspection {
+        Err(error) => match origin {
+            ToolOrigin::User => {
+                PreflightDecision::NeedsUser(format!("push requires approval: {error}"))
+            }
+            ToolOrigin::RepairLoop => {
+                PreflightDecision::Deny(format!("repair-loop push denied: {error}"))
+            }
+        },
+        Ok(reasons) if reasons.is_empty() => PreflightDecision::Allow,
+        Ok(reasons) => match origin {
+            ToolOrigin::User => PreflightDecision::NeedsUser(format!(
+                "push requires approval: diff enters protected repair boundary ({})",
+                reasons.join("; ")
+            )),
+            ToolOrigin::RepairLoop => PreflightDecision::Deny(format!(
+                "repair-loop push denied: diff enters protected repair boundary ({})",
+                reasons.join("; ")
+            )),
+        },
+    }
 }
 
 async fn execute_local_git_read(
@@ -1234,6 +1482,84 @@ fn configured_github_repo(
     Ok(configured)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CiLogEvidence {
+    job_id: u64,
+    step_located: bool,
+    log_complete: bool,
+    text: String,
+}
+
+fn ci_automation_decision(status: &Value, logs: &[CiLogEvidence]) -> &'static str {
+    let overall = status
+        .get("overall")
+        .and_then(Value::as_str)
+        .unwrap_or("indeterminate");
+    if overall != "code_failure" {
+        return match overall {
+            "mixed" => "mixed",
+            "infrastructure_failure" => "infrastructure_failure",
+            _ => "indeterminate",
+        };
+    }
+    let status_text = serde_json::to_string(status)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if [
+        "billing",
+        "runner",
+        "infrastructure",
+        "resource not accessible",
+        "no available runner",
+        "workflow could not start",
+    ]
+    .iter()
+    .any(|marker| status_text.contains(marker))
+    {
+        return "infrastructure_failure";
+    }
+    let Some(runs) = status.get("runs").and_then(Value::as_array) else {
+        return "missing_log_evidence";
+    };
+    let has_provable_failure = runs.iter().any(|run| {
+        run.get("status").and_then(Value::as_str) == Some("completed")
+            && run
+                .get("conclusion")
+                .and_then(Value::as_str)
+                .is_some_and(|value| matches!(value, "failure" | "error"))
+            && run
+                .get("jobs")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|job| {
+                    let Some(job_id) = job.get("id").and_then(Value::as_u64) else {
+                        return false;
+                    };
+                    let step_failed = job
+                        .get("steps")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .any(|step| {
+                            step.get("conclusion")
+                                .and_then(Value::as_str)
+                                .is_some_and(|value| matches!(value, "failure" | "error"))
+                        });
+                    let log = logs.iter().find(|log| log.job_id == job_id);
+                    step_failed
+                        && log.is_some_and(|log| {
+                            log.step_located && log.log_complete && !log.text.trim().is_empty()
+                        })
+                })
+    });
+    if has_provable_failure {
+        "eligible"
+    } else {
+        "missing_log_evidence"
+    }
+}
+
 fn ci_classification(status: &str, conclusion: Option<&str>, detail: &str) -> &'static str {
     let status = status.to_ascii_lowercase();
     let conclusion = conclusion.unwrap_or_default().to_ascii_lowercase();
@@ -1289,6 +1615,111 @@ fn ci_rate_limit(response: &reqwest::Response) -> Value {
         .filter(|remaining| *remaining <= 10)
         .map(|remaining| format!("GitHub API rate limit is low ({remaining} requests remaining)"));
     json!({"remaining": remaining, "reset_at": reset_at, "warning": warning})
+}
+
+fn save_local_gate_record_tool(
+    store: &SqliteStore,
+    session_id: &str,
+    project_id: Option<&str>,
+    arguments: &Value,
+) -> Result<Value, String> {
+    let commit_sha = arguments
+        .get("commit_sha")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("local gate record requires commit_sha")?;
+    let commands = arguments
+        .get("commands")
+        .and_then(Value::as_array)
+        .ok_or("local gate record requires commands")?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|command| !command.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| "local gate commands must be non-empty strings".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let results = arguments
+        .get("results")
+        .and_then(Value::as_array)
+        .ok_or("local gate record requires results")?
+        .iter()
+        .map(|value| {
+            let command = value
+                .get("command")
+                .and_then(Value::as_str)
+                .filter(|command| !command.trim().is_empty())
+                .ok_or("local gate result requires command")?;
+            let status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .filter(|status| !status.trim().is_empty())
+                .ok_or("local gate result requires status")?;
+            Ok(opcos_store::LocalGateResult {
+                command: command.to_owned(),
+                status: status.to_owned(),
+                exit_code: value.get("exit_code").and_then(Value::as_i64),
+                output: None,
+            })
+        })
+        .collect::<Result<Vec<_>, &str>>()?;
+    if results.len() != commands.len() {
+        return Err("local gate commands and results must have equal length".into());
+    }
+    let all_passed = arguments
+        .get("all_passed")
+        .and_then(Value::as_bool)
+        .ok_or("local gate record requires all_passed")?;
+    let computed_all_passed = results.iter().all(|result| {
+        matches!(
+            result.status.to_ascii_lowercase().as_str(),
+            "passed" | "success"
+        ) && result.exit_code == Some(0)
+    });
+    if all_passed != computed_all_passed {
+        return Err("local gate all_passed does not match individual results".into());
+    }
+    let record = opcos_store::LocalGateRecord {
+        gate_id: format!("gate-{}", uuid::Uuid::new_v4()),
+        session_id: session_id.to_owned(),
+        project_id: project_id.map(str::to_owned),
+        commit_sha: commit_sha.to_owned(),
+        commands,
+        results,
+        all_passed,
+        created_at: Utc::now().to_rfc3339(),
+    };
+    store
+        .save_local_gate_record(&record)
+        .map_err(|error| error.to_string())?;
+    Ok(json!({
+        "status": "recorded",
+        "gate_id": record.gate_id,
+        "commit_sha": record.commit_sha,
+        "all_passed": record.all_passed,
+    }))
+}
+
+fn load_local_gate_record_tool(
+    store: &SqliteStore,
+    session_id: &str,
+    arguments: &Value,
+) -> Result<Value, String> {
+    let commit_sha = arguments
+        .get("commit_sha")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("local gate status requires commit_sha")?;
+    store
+        .load_latest_local_gate_record(session_id, commit_sha)
+        .map(|record| {
+            record
+                .map(|record| json!({"status":"recorded","record":record}))
+                .unwrap_or_else(|| json!({"status":"missing","commit_sha":commit_sha}))
+        })
+        .map_err(|error| error.to_string())
 }
 
 async fn github_ci_json(
@@ -1413,6 +1844,7 @@ async fn execute_github_ci_status(
     )
     .await?;
     let mut entries = Vec::new();
+    let mut workflow_entries = Vec::new();
     if let Some(checks) = checks.get("check_runs").and_then(Value::as_array) {
         for check in checks {
             let status = check.get("status").and_then(Value::as_str).unwrap_or("");
@@ -1436,12 +1868,29 @@ async fn execute_github_ci_status(
                     .and_then(Value::as_str)
                     .unwrap_or("")
             );
+            let annotations = if let Some(check_id) = check.get("id").and_then(Value::as_u64) {
+                github_ci_json(
+                    &http,
+                    &token,
+                    &format!(
+                        "https://api.github.com/repos/{repo}/check-runs/{check_id}/annotations?per_page=100"
+                    ),
+                )
+                .await
+                .ok()
+                .map(|(value, _)| value)
+                .unwrap_or_else(|| json!([]))
+            } else {
+                json!([])
+            };
             entries.push(json!({
                 "name": check.get("name"),
+                "check_run_id": check.get("id"),
                 "status": status,
                 "conclusion": conclusion,
                 "classification": ci_classification(status, conclusion, &detail),
                 "details_url": check.get("details_url"),
+                "annotations": annotations,
             }));
         }
     }
@@ -1459,7 +1908,34 @@ async fn execute_github_ci_status(
                     .and_then(Value::as_str)
                     .unwrap_or("")
             );
-            entries.push(json!({
+            let jobs = if let Some(run_id) = run.get("id").and_then(Value::as_u64) {
+                github_ci_json(
+                    &http,
+                    &token,
+                    &format!(
+                        "https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs?per_page=100"
+                    ),
+                )
+                .await
+                .ok()
+                .and_then(|(value, _)| value.get("jobs").cloned())
+                .unwrap_or_else(|| json!([]))
+            } else {
+                json!([])
+            };
+            let failed_jobs = jobs
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|job| {
+                    matches!(
+                        job.get("conclusion").and_then(Value::as_str),
+                        Some("failure" | "error" | "timed_out" | "cancelled")
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let entry = json!({
                 "name": run.get("name"),
                 "run_id": run.get("id"),
                 "status": status,
@@ -1467,7 +1943,10 @@ async fn execute_github_ci_status(
                 "classification": ci_classification(status, conclusion, &detail),
                 "elapsed_seconds": ci_elapsed_seconds(run.get("run_started_at").and_then(Value::as_str)),
                 "html_url": run.get("html_url"),
-            }));
+                "jobs": failed_jobs,
+            });
+            workflow_entries.push(entry.clone());
+            entries.push(entry);
         }
     }
     let classifications = entries
@@ -1476,6 +1955,10 @@ async fn execute_github_ci_status(
         .collect::<Vec<_>>();
     let overall = if classifications.contains(&"running") {
         "running"
+    } else if classifications.contains(&"code_failure")
+        && classifications.contains(&"infrastructure_failure")
+    {
+        "mixed"
     } else if classifications.contains(&"code_failure") {
         "code_failure"
     } else if classifications.contains(&"infrastructure_failure") {
@@ -1488,15 +1971,21 @@ async fn execute_github_ci_status(
         "not_run"
     };
     let next_query_seconds = (overall == "running").then_some(30);
-    Ok(json!({
+    let mut result = json!({
         "status": "ok",
         "repo": repo,
         "commit": sha.0,
         "overall": overall,
         "checks": entries,
+        "runs": workflow_entries,
         "next_query_after_seconds": next_query_seconds,
         "rate_limit": {"checks": checks_rate, "runs": runs_rate, "pull_request": sha.1},
-    }))
+    });
+    result["automation"] = json!({
+        "decision": ci_automation_decision(&result, &[]),
+        "requires_failure_log_evidence": true,
+    });
+    Ok(result)
 }
 
 async fn execute_github_ci_failure_log(
@@ -3143,6 +3632,15 @@ impl ToolExecutor for RemoteExecutor {
                 )
                 .await
             }
+            "local_gate_record" => save_local_gate_record_tool(
+                &self.store,
+                &self.session_id,
+                self.project_id.as_deref(),
+                &arguments,
+            ),
+            "local_gate_status" => {
+                load_local_gate_record_tool(&self.store, &self.session_id, &arguments)
+            }
             "linear_get_issue"
             | "linear_list_my_issues"
             | "linear_comment_issue"
@@ -3193,6 +3691,14 @@ impl ToolExecutor for RemoteExecutor {
                 .map(|result| redact_approval_value(&result.content))
                 .map_err(|error| error.to_string()),
             _ => Err(format!("remote tool is unavailable: {name}")),
+        }
+    }
+
+    fn policy_target(&self, name: &str, arguments: &Value) -> String {
+        if name == "git_push" {
+            git_push_policy_target(&self.store, self.project_id.as_deref(), arguments)
+        } else {
+            name.to_owned()
         }
     }
 }
@@ -3405,6 +3911,15 @@ impl ToolExecutor for DesktopExecutor {
                         )
                         .await
                     }
+                    "local_gate_record" => save_local_gate_record_tool(
+                        &executor.store,
+                        &executor.session_id,
+                        executor.project_id.as_deref(),
+                        &arguments,
+                    ),
+                    "local_gate_status" => {
+                        load_local_gate_record_tool(&executor.store, &executor.session_id, &arguments)
+                    }
                     "linear_get_issue" | "linear_list_my_issues" | "linear_comment_issue"
                     | "linear_update_issue_status" => {
                         execute_linear_tool(
@@ -3446,6 +3961,64 @@ impl ToolExecutor for DesktopExecutor {
                         .map(|result| redact_approval_value(&result.content))
                         .map_err(|error| error.to_string()),
                     _ => Err(format!("local tool is unavailable: {name}")),
+                }
+            }
+        }
+    }
+
+    async fn preflight(&self, name: &str, arguments: &Value) -> Result<PreflightDecision, String> {
+        if name != "git_push" {
+            return Ok(PreflightDecision::Allow);
+        }
+        match self {
+            Self::Remote(executor) => {
+                let host = RvmHost::new(
+                    executor.host_id.clone(),
+                    executor.workspace.clone(),
+                    executor.client.clone(),
+                );
+                let platform = executor
+                    .client
+                    .health()
+                    .await
+                    .ok()
+                    .and_then(|health| health.platform);
+                preflight_git_push(
+                    &host,
+                    platform.as_deref(),
+                    &executor.store,
+                    executor.project_id.as_deref(),
+                    arguments,
+                    self.tool_origin(),
+                )
+                .await
+            }
+            Self::Local(executor) => {
+                preflight_git_push(
+                    &executor.host,
+                    None,
+                    &executor.store,
+                    executor.project_id.as_deref(),
+                    arguments,
+                    self.tool_origin(),
+                )
+                .await
+            }
+        }
+    }
+
+    fn policy_target(&self, name: &str, arguments: &Value) -> String {
+        match self {
+            Self::Remote(executor) => executor.policy_target(name, arguments),
+            Self::Local(executor) => {
+                if name == "git_push" {
+                    git_push_policy_target(
+                        &executor.store,
+                        executor.project_id.as_deref(),
+                        arguments,
+                    )
+                } else {
+                    name.to_owned()
                 }
             }
         }
@@ -20011,6 +20584,150 @@ mod m7_tests {
         );
         assert_eq!(ci_classification("queued", None, ""), "running");
         assert_eq!(ci_classification("completed", None, ""), "indeterminate");
+    }
+
+    #[test]
+    fn ci_automation_requires_positive_step_and_complete_log_evidence() {
+        let status = json!({
+            "overall": "code_failure",
+            "runs": [{
+                "status": "completed",
+                "conclusion": "failure",
+                "jobs": [{
+                    "id": 7,
+                    "steps": [{"name": "test", "conclusion": "failure"}]
+                }]
+            }]
+        });
+        assert_eq!(
+            ci_automation_decision(
+                &status,
+                &[CiLogEvidence {
+                    job_id: 7,
+                    step_located: true,
+                    log_complete: true,
+                    text: "assertion failed".into(),
+                }]
+            ),
+            "eligible"
+        );
+        assert_eq!(
+            ci_automation_decision(
+                &status,
+                &[CiLogEvidence {
+                    job_id: 7,
+                    step_located: true,
+                    log_complete: false,
+                    text: "assertion failed".into(),
+                }]
+            ),
+            "missing_log_evidence"
+        );
+    }
+
+    #[test]
+    fn ci_automation_rejects_mixed_and_indeterminate_results() {
+        let jobs = json!([{
+            "id": 7,
+            "steps": [{"conclusion": "failure"}]
+        }]);
+        let log = CiLogEvidence {
+            job_id: 7,
+            step_located: true,
+            log_complete: true,
+            text: "test failed".into(),
+        };
+        assert_eq!(
+            ci_automation_decision(
+                &json!({"overall": "mixed", "runs": [{"jobs": jobs.clone()}]}),
+                std::slice::from_ref(&log)
+            ),
+            "mixed"
+        );
+        assert_eq!(
+            ci_automation_decision(
+                &json!({"overall": "indeterminate", "runs": [{"jobs": jobs}]}),
+                &[log]
+            ),
+            "indeterminate"
+        );
+    }
+
+    #[test]
+    fn forbidden_diff_reasons_cover_protected_paths_and_skip_markers() {
+        let paths = vec![
+            ".github/workflows/ci.yml".into(),
+            "src/example_test.rs".into(),
+            ".npmrc".into(),
+        ];
+        let reasons = forbidden_diff_reasons(
+            &paths,
+            "+run: cargo test --no-verify\n+minimumReleaseAge: 3\n",
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("CI configuration"))
+        );
+        assert!(reasons.iter().any(|reason| reason.contains("test file")));
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("security/compliance"))
+        );
+        assert!(reasons.iter().any(|reason| reason.contains("--no-verify")));
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("minimumReleaseAge"))
+        );
+    }
+
+    #[test]
+    fn forbidden_diff_reasons_allow_normal_source_changes() {
+        let paths = vec!["src/main.rs".into()];
+        assert!(forbidden_diff_reasons(&paths, "+fn repair() {}\n").is_empty());
+    }
+
+    #[test]
+    fn user_pushes_with_protected_changes_are_escalated_not_blocked() {
+        let decision = push_diff_preflight(
+            ToolOrigin::User,
+            Ok(vec![
+                "test/unit_test.rs".into(),
+                ".github/workflows/ci.yml".into(),
+            ]),
+        );
+        assert!(
+            matches!(decision, PreflightDecision::NeedsUser(reason) if reason.contains("test/unit_test.rs"))
+        );
+    }
+
+    #[test]
+    fn user_push_with_unavailable_diff_baseline_is_escalated() {
+        let decision = push_diff_preflight(
+            ToolOrigin::User,
+            Err("unable to establish push diff against the project default branch".into()),
+        );
+        assert!(
+            matches!(decision, PreflightDecision::NeedsUser(reason) if reason.contains("establish"))
+        );
+    }
+
+    #[test]
+    fn repair_loop_pushes_with_protected_changes_are_denied() {
+        let decision = push_diff_preflight(ToolOrigin::RepairLoop, Ok(vec!["tests/ci.rs".into()]));
+        assert!(
+            matches!(decision, PreflightDecision::Deny(reason) if reason.contains("repair-loop"))
+        );
+    }
+
+    #[test]
+    fn clean_user_pushes_are_allowed_without_extra_approval() {
+        assert_eq!(
+            push_diff_preflight(ToolOrigin::User, Ok(Vec::new())),
+            PreflightDecision::Allow
+        );
     }
 
     #[test]
