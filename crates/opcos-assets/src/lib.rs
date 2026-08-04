@@ -649,8 +649,7 @@ async fn discover_tree<R: RemoteAssetReader>(
                     enabled: false,
                 });
             } else if (child.replace('\\', "/").contains("/.cursor/rules/")
-                || child.replace('\\', "/").contains("/.agents/rules/"))
-                && name.ends_with(".md")
+                || (child.replace('\\', "/").contains("/.agents/rules/") && name.ends_with(".md")))
                 && let Ok(content) = reader.read(&child).await
             {
                 bundle.agents.push(InstructionSource {
@@ -938,12 +937,14 @@ mod tests {
                 "/repo/.agents/skills/foo/data/docs/a.md" => Ok("# A".into()),
                 "/repo/.agents/skills/foo/data/docs/b.md" => Ok("# B".into()),
                 "/repo/.agents/rules/x.md" => Ok("# Rule".into()),
+                "/repo/.cursor/rules/project.mdc" => Ok("# Cursor rule".into()),
                 _ => Err(AssetError::Invalid("missing".into())),
             }
         }
 
         async fn list(&self, path: Option<&str>) -> Result<Vec<(String, bool)>, AssetError> {
             match path {
+                Some("/repo/.cursor/rules") => Ok(vec![("project.mdc".into(), false)]),
                 Some("/repo/.agents/rules") => Ok(vec![("x.md".into(), false)]),
                 Some("/repo/.agents/skills") => Ok(vec![("foo".into(), true)]),
                 Some("/repo/.agents/skills/foo") => {
@@ -963,11 +964,28 @@ mod tests {
         let bundle = discover(&AssetTreeReader, "/repo").await.unwrap();
         assert_eq!(bundle.skills.len(), 1);
         assert_eq!(bundle.skills[0].path, "/repo/.agents/skills/foo/SKILL.md");
-        assert_eq!(bundle.agents.len(), 1);
-        assert_eq!(bundle.agents[0].path, "/repo/.agents/rules/x.md");
+        assert_eq!(bundle.agents.len(), 2);
+        assert!(
+            bundle
+                .agents
+                .iter()
+                .any(|source| source.path == "/repo/.agents/rules/x.md")
+        );
         assert!(bundle.system_instructions().contains("# Rule"));
         let serialized = serde_json::to_string(&bundle).unwrap();
         assert!(!serialized.contains("data/docs/a.md"));
         assert!(!serialized.contains("data/docs/b.md"));
+    }
+
+    #[tokio::test]
+    async fn discovers_cursor_mdc_rules_as_always_on_instructions() {
+        let bundle = discover(&AssetTreeReader, "/repo").await.unwrap();
+        assert!(
+            bundle
+                .agents
+                .iter()
+                .any(|source| source.path == "/repo/.cursor/rules/project.mdc")
+        );
+        assert!(bundle.system_instructions().contains("# Cursor rule"));
     }
 }
