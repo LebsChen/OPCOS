@@ -4,11 +4,12 @@ use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 pub use opcos_rvm::ExecRequest;
 use opcos_rvm::{
-    Capabilities as RvmCapabilities, CommandResult, DirectoryListing, ExecResult, FileContent,
-    Health, HttpRvmClient, RvmClient, RvmError, RvmWebSocket, WsKind, WsParams,
+    Capabilities as RvmCapabilities, CommandResult, HttpRvmClient, RvmClient, RvmError,
+    RvmWebSocket, WsKind, WsParams,
 };
 pub use opcos_rvm::{ComputerUseAction, ComputerUseResponse, ScreenBounds, Screenshot};
 pub use opcos_rvm::{DEFAULT_EXEC_TIMEOUT_SECONDS, LIFECYCLE_EXEC_TIMEOUT_SECONDS};
+pub use opcos_rvm::{DirectoryListing, ExecResult, FileContent, Health};
 pub use opcos_rvm::{StorageHash, StorageStat};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -69,6 +70,18 @@ pub enum HostError {
     Unsupported(String),
     #[error("invalid host response: {0}")]
     InvalidResponse(String),
+}
+
+/// A single operation against a host-provided language-server service.
+/// Positions use LSP conventions: zero-based line and character.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LspCallRequest {
+    pub operation: String,
+    pub language: String,
+    pub workspace_root: String,
+    pub path: String,
+    pub line: Option<u32>,
+    pub character: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1913,6 +1926,14 @@ pub trait Host: Send + Sync {
             "host lacks computer-use capability".into(),
         ))
     }
+    /// Run a language-server operation on a host that exposes a structured LSP
+    /// service of its own. Hosts without one keep using [`Host::spawn_stdio`].
+    async fn lsp_call(&self, request: LspCallRequest) -> Result<Value, HostError> {
+        let _ = request;
+        Err(HostError::Unsupported(
+            "host lacks a structured LSP service".into(),
+        ))
+    }
     async fn spawn(&self, request: SpawnRequest) -> Result<Box<dyn HostProcess>, HostError>;
     async fn spawn_stdio(
         &self,
@@ -2179,6 +2200,25 @@ impl Host for RvmHost {
             sink,
             events: receiver,
         }))
+    }
+
+    async fn lsp_call(&self, request: LspCallRequest) -> Result<Value, HostError> {
+        let mut arguments = serde_json::json!({
+            "op": request.operation,
+            "language": request.language,
+            "root": request.workspace_root,
+            "path": request.path,
+        });
+        // The RVM `lsp` tool takes one-based positions; OPCOS speaks LSP's
+        // zero-based positions everywhere else.
+        if let Some(line) = request.line {
+            arguments["line"] = (line as u64 + 1).into();
+        }
+        if let Some(character) = request.character {
+            arguments["character"] = (character as u64 + 1).into();
+        }
+        let payload = self.client.mcp_call_tool("lsp", arguments).await?;
+        Ok(lsp_payload_to_zero_based(payload))
     }
 
     async fn spawn_stdio(
@@ -3071,6 +3111,42 @@ async fn spawn_persistent_shell(cwd: &Path) -> Result<(Child, ChildStdin, ChildS
     Ok((child, stdin, stdout))
 }
 
+/// Convert an RVM `lsp` payload into LSP conventions. The RVM tool flattens
+/// locations to one-based `line`/`character`; callers expect zero-based
+/// positions and an LSP `range`. Anything else is passed through untouched.
+fn lsp_payload_to_zero_based(payload: Value) -> Value {
+    match payload {
+        Value::Array(items) => Value::Array(items.into_iter().map(lsp_location_to_range).collect()),
+        other => other,
+    }
+}
+
+fn lsp_location_to_range(item: Value) -> Value {
+    let (Some(line), Some(character)) = (
+        item.get("line").and_then(Value::as_u64),
+        item.get("character").and_then(Value::as_u64),
+    ) else {
+        return item;
+    };
+    if item.get("range").is_some() {
+        return item;
+    }
+    let Value::Object(mut fields) = item else {
+        return item;
+    };
+    let position = serde_json::json!({
+        "line": line.saturating_sub(1),
+        "character": character.saturating_sub(1),
+    });
+    fields.remove("line");
+    fields.remove("character");
+    fields.insert(
+        "range".into(),
+        serde_json::json!({"start": position, "end": position.clone()}),
+    );
+    Value::Object(fields)
+}
+
 fn remote_capabilities(
     capabilities: RvmCapabilities,
     observed_at: DateTime<Utc>,
@@ -3107,7 +3183,6 @@ fn remote_capabilities(
                     capabilities.available.iter().any(|item| item == "lsp")
                 } else {
                     name != "stdio"
-                        && name != "lsp"
                         && (advertised
                             || (name == "process_stream"
                                 && capabilities.available.iter().any(|item| item == "pty")))
@@ -3117,17 +3192,10 @@ fn remote_capabilities(
                     available,
                     source: "remote-probe".into(),
                     observed_at,
-                    reason: if name == "lsp" {
-                        Some(
-                            "disabled: remote host advertises lsp, but OPCOS has no structured remote LSP channel"
-                                .into(),
-                        )
-                    } else if name == "remote_lsp_declared" {
-                        capabilities
-                            .available
-                            .iter()
-                            .any(|item| item == "lsp")
-                            .then(|| "remote host advertised lsp; not usable by OPCOS".into())
+                    reason: if name == "lsp" && available {
+                        Some("uses the remote host's own LSP service over MCP".into())
+                    } else if name == "remote_lsp_declared" && available {
+                        Some("remote host exposes an lsp tool over MCP".into())
                     } else if name == "stdio" {
                         Some(
                             "disabled: RVM only exposes PTY/WebSocket streams, which are unsafe for structured stdio"
@@ -3150,6 +3218,55 @@ fn remote_capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_lsp_locations_become_zero_based_ranges() {
+        let payload = lsp_payload_to_zero_based(serde_json::json!([
+            {"uri": "file:///a.rs", "path": "/a.rs", "line": 12, "character": 5, "text": "run"},
+            {"uri": "file:///b.rs", "range": {"start": {"line": 0, "character": 0}}}
+        ]));
+        assert_eq!(
+            payload[0],
+            serde_json::json!({
+                "uri": "file:///a.rs",
+                "path": "/a.rs",
+                "text": "run",
+                "range": {
+                    "start": {"line": 11, "character": 4},
+                    "end": {"line": 11, "character": 4}
+                }
+            })
+        );
+        assert_eq!(
+            payload[1],
+            serde_json::json!({
+                "uri": "file:///b.rs",
+                "range": {"start": {"line": 0, "character": 0}}
+            })
+        );
+    }
+
+    #[test]
+    fn remote_diagnostics_payloads_pass_through_unchanged() {
+        let payload = serde_json::json!({"uri": "file:///a.rs", "diagnostics": []});
+        assert_eq!(lsp_payload_to_zero_based(payload.clone()), payload);
+    }
+
+    #[test]
+    fn hosts_without_an_lsp_tool_do_not_report_lsp() {
+        let capabilities = remote_capabilities(
+            RvmCapabilities {
+                available: vec!["exec".into(), "mcp".into()],
+            },
+            Utc::now(),
+        );
+        assert!(
+            !capabilities
+                .items
+                .iter()
+                .any(|item| item.name == "lsp" && item.available)
+        );
+    }
 
     #[test]
     fn windows_text_input_uses_encoded_clipboard_command() {
@@ -3209,26 +3326,20 @@ mod tests {
             .iter()
             .find(|item| item.name == "lsp")
             .unwrap();
-        assert!(!lsp.available);
-        assert!(
-            lsp.reason
-                .as_deref()
-                .unwrap()
-                .contains("no structured remote LSP channel")
-        );
+        assert!(lsp.available);
         let declared = capabilities
             .items
             .iter()
             .find(|item| item.name == "remote_lsp_declared")
             .unwrap();
         assert!(declared.available);
-        assert!(
-            declared
-                .reason
-                .as_deref()
-                .unwrap()
-                .contains("remote host advertised lsp")
-        );
+        // A host-side LSP service says nothing about raw stdio, which stays off.
+        let stdio = capabilities
+            .items
+            .iter()
+            .find(|item| item.name == "stdio")
+            .unwrap();
+        assert!(!stdio.available);
     }
     use std::fs;
 

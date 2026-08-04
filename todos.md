@@ -26,6 +26,8 @@
 - [x] background jobs 的 start/status/output/kill，使用 job id 和截断元数据
   表达异步结果（#46）。
 - [x] 本地 LSP definition/references/diagnostics（#50）。
+- [x] 远程 LSP：远程主机在 `/mcp` 上暴露 `lsp` tool 时走主机自带的 LSP 服务，
+  探测不到则不声明能力且不退回本地 language server。
 
 ### 计划、持久化和自治底座
 
@@ -54,8 +56,10 @@
 
 ## 已知限制
 
-- LSP 结构化客户端只对 LocalHost 可用；远程 `lsp` capability 会被明确标记
-  为不可用，因为没有 structured remote LSP channel。
+- 远程 LSP 的 language server 生命周期、文档同步和索引进度属于远程主机，
+  OPCOS 拿不到 document version，也无法把还在索引的结果标为不完整。
+- 远程原始 stdio 通道仍不存在；需要自己持有 language server 的场景（主机
+  未注册的 server、交互式 DAP）不可用。
 - background jobs 依赖 Host 的 `process_stream` 或 `pty`；job/进程生命周期
   没有跨应用重启接管契约，远程 PTY 进程也没有可靠的孤儿恢复语义。
 - `git_push` credential path 只允许 `github.com` 和已登记的 GHES 实例；
@@ -81,11 +85,12 @@
 是 provider/权限/重试/取消语义尚未统一，不能把现有两个 Read tool 写成已完成
 的自治修复能力。
 
-### [ ] 远程结构化 LSP
+### [ ] 远程原始 stdio 通道
 
-远程 Host 只有 capability 声明和 PTY/process stream，没有 OPCOS 可安全复用的
-structured LSP transport。需要先定义远程 stdio 通道和生命周期/退出码协议；在
-此之前远程 LSP 必须保持 unsupported。
+远程 LSP 已经通过主机自带的 `lsp` MCP tool 实现，但还没有原始双向 stdio 通道：
+OPCOS 无法在远程主机上跑主机未注册的 language server，也无法自己持有 LSP/DAP
+客户端。需要主机侧提供白名单 spawn + 持久化字节流 + 生命周期/退出码协议；PTY
+不能代替，因为终端模式会改变字节。
 
 ### [ ] 可恢复的跨重启 background jobs
 

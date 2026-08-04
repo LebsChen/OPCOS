@@ -80,7 +80,8 @@ GitHub 只有一个领域模型，多实例差异体现在「实例身份」上�
 - 文件读写、目录列举、shell 执行；
 - `edit_file` 精确、原子、多替换编辑；
 - repository index 的 symbol/glob/content 查询；
-- 本地 LSP definition、references、diagnostics；
+- LSP definition、references、diagnostics：LocalHost 用本地 stdio language
+  server，远程 Host 用它自己的 LSP 服务；
 - Git status/diff/log/rev-parse、建分支、显式文件 commit、受限 push；
 - GitHub PR 创建、读取、评论、reviewer 操作和交付核验；
 - GitHub CI status 与失败 job log 读取；
@@ -109,8 +110,10 @@ Provider 和 connector catalog 覆盖多种 API/OAuth/IMAP 配置；agent tool �
 
 ## 已知限制
 
-- LSP 只在 LocalHost 上提供结构化客户端；远程主机即使声明 `lsp`，也因没有
-  structured remote LSP channel 而明确不可用。
+- 远程 LSP 依赖远程主机自带的 LSP 服务（RVM 在 `/mcp` 上暴露 `lsp` tool），
+  由主机负责 language server 生命周期和文档同步；OPCOS 只在探测到该 tool 后
+  才启用，探测不到就不声明能力，也不会退回本地 language server。
+- OPCOS 仍然没有远程原始 stdio 通道；远程 `stdio` capability 保持不可用。
 - background job 依赖当前 Host 的进程流/PTY capability；job 状态保存在当前
   adapter/job manager 路径，不能承诺跨应用重启恢复。远程进程受远程 PTY/进程
   流生命周期限制，不能承诺孤儿进程可被重新接管。
