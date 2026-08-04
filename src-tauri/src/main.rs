@@ -9452,6 +9452,34 @@ async fn engine_for_with_context(
             }
         }))
         .await;
+    let hook_permission_rules = match (
+        bundle.project_permissions.as_ref(),
+        bundle.local_permissions.as_ref(),
+    ) {
+        (None, None) => None,
+        (project, local) => {
+            let mut deny = project
+                .into_iter()
+                .flat_map(|rules| rules.deny.iter().cloned())
+                .collect::<Vec<_>>();
+            deny.extend(
+                local
+                    .into_iter()
+                    .flat_map(|rules| rules.deny.iter().cloned()),
+            );
+            Some(opcos_policy::PermissionRules {
+                allow: local
+                    .into_iter()
+                    .flat_map(|rules| rules.allow.iter().cloned())
+                    .collect(),
+                deny,
+            })
+        }
+    };
+    // Project rules may tighten hook execution, but only local rules may loosen it.
+    engine
+        .set_hook_permission_rules(hook_permission_rules)
+        .await;
     engine
         .set_lifecycle_hooks(bundle.hooks.as_ref().map(|config| {
             LifecycleHookConfig {

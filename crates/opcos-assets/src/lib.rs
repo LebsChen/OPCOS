@@ -24,9 +24,15 @@ pub struct AssetBundle {
     #[serde(default)]
     pub permissions: Option<PermissionRules>,
     #[serde(default)]
+    pub project_permissions: Option<PermissionRules>,
+    #[serde(default)]
+    pub local_permissions: Option<PermissionRules>,
+    #[serde(default)]
     pub permission_errors: Vec<String>,
     #[serde(default)]
     pub hooks: Option<HookConfig>,
+    #[serde(default)]
+    pub local_hooks: Option<HookConfig>,
     #[serde(default)]
     pub hook_errors: Vec<String>,
 }
@@ -622,23 +628,54 @@ pub async fn discover<R: RemoteAssetReader>(
             bundle.agents.push(InstructionSource { path, content });
         }
     }
-    let (permissions, permission_errors) = discover_json_override::<_, PermissionRules>(
-        reader,
-        workspace,
-        [".agents/permissions.json", ".agents/permissions.local.json"],
-        "permission rules",
-    )
-    .await;
-    bundle.permissions = permissions;
+    let (project_permissions, local_permissions, permission_errors) =
+        discover_json_sources::<_, PermissionRules>(
+            reader,
+            workspace,
+            [".agents/permissions.json", ".agents/permissions.local.json"],
+            "permission rules",
+        )
+        .await;
+    bundle.permissions = local_permissions.clone().or(project_permissions.clone());
+    bundle.project_permissions = project_permissions;
+    bundle.local_permissions = local_permissions;
     bundle.permission_errors = permission_errors;
-    let (hooks, hook_errors) = discover_json_override::<_, HookConfig>(
+    let (project_hooks, local_hooks, mut hook_errors) = discover_json_sources::<_, HookConfig>(
         reader,
         workspace,
         [".agents/hooks.json", ".agents/hooks.local.json"],
         "lifecycle hooks",
     )
     .await;
-    bundle.hooks = hooks;
+    bundle.hooks = project_hooks
+        .clone()
+        .or_else(|| local_hooks.clone())
+        .map(|mut hooks| {
+            if let Some(local) = local_hooks.as_ref()
+                && !local.hooks.is_empty()
+            {
+                hooks.hooks = local.hooks.clone();
+            }
+            hooks.enabled = local_hooks.as_ref().is_some_and(|config| config.enabled);
+            hooks
+        });
+    bundle.local_hooks = local_hooks;
+    if project_hooks.as_ref().is_some_and(|config| config.enabled) && bundle.local_hooks.is_none() {
+        hook_errors.push(
+            ".agents/hooks.json: enabled is ignored; hooks require local explicit enablement"
+                .into(),
+        );
+    }
+    if let Some(hooks) = bundle.hooks.as_ref() {
+        for hook in &hooks.hooks {
+            if !matches!(
+                hook.event.as_str(),
+                "PreToolUse" | "PostToolUse" | "PostCompaction" | "Stop"
+            ) {
+                hook_errors.push(format!("unsupported lifecycle hook event: {}", hook.event));
+            }
+        }
+    }
     bundle.hook_errors = hook_errors;
     for path in [
         ".cursor/rules",
@@ -655,28 +692,30 @@ pub async fn discover<R: RemoteAssetReader>(
     Ok(bundle)
 }
 
-async fn discover_json_override<R, T>(
+async fn discover_json_sources<R, T>(
     reader: &R,
     workspace: &str,
     paths: [&str; 2],
     label: &str,
-) -> (Option<T>, Vec<String>)
+) -> (Option<T>, Option<T>, Vec<String>)
 where
     R: RemoteAssetReader,
     T: DeserializeOwned,
 {
-    let mut value = None;
+    let mut project = None;
+    let mut local = None;
     let mut errors = Vec::new();
-    for name in paths {
+    for (index, name) in paths.into_iter().enumerate() {
         let path = join_remote_path(workspace, name);
         if let Ok(content) = reader.read(&path).await {
             match serde_json::from_str::<T>(&content) {
-                Ok(parsed) => value = Some(parsed),
+                Ok(parsed) if index == 0 => project = Some(parsed),
+                Ok(parsed) => local = Some(parsed),
                 Err(error) => errors.push(format!("{path}: invalid {label}: {error}")),
             }
         }
     }
-    (value, errors)
+    (project, local, errors)
 }
 
 async fn discover_tree<R: RemoteAssetReader>(
@@ -777,8 +816,11 @@ mod tests {
             commands: Vec::new(),
             mcp_servers: Vec::new(),
             permissions: None,
+            project_permissions: None,
+            local_permissions: None,
             permission_errors: Vec::new(),
             hooks: None,
+            local_hooks: None,
             hook_errors: Vec::new(),
         };
         let rendered = bundle.system_instructions();
@@ -1151,6 +1193,20 @@ mod tests {
                 deny: vec!["Exec(sudo)".into()],
             })
         );
+        assert_eq!(
+            bundle.project_permissions,
+            Some(PermissionRules {
+                allow: vec!["Exec(git status)".into()],
+                deny: Vec::new(),
+            })
+        );
+        assert_eq!(
+            bundle.local_permissions,
+            Some(PermissionRules {
+                allow: Vec::new(),
+                deny: vec!["Exec(sudo)".into()],
+            })
+        );
     }
 
     struct HookReader;
@@ -1178,7 +1234,7 @@ mod tests {
         assert_eq!(
             bundle.hooks,
             Some(HookConfig {
-                enabled: true,
+                enabled: false,
                 hooks: vec![HookDefinition {
                     event: "PreToolUse".into(),
                     matcher: Some("run_shell".into()),
@@ -1187,7 +1243,75 @@ mod tests {
                 }],
             })
         );
+        assert!(
+            bundle
+                .hook_errors
+                .iter()
+                .any(|error| error.contains("explicit enablement"))
+        );
+    }
+
+    struct LocalHookReader;
+
+    #[async_trait]
+    impl RemoteAssetReader for LocalHookReader {
+        async fn read(&self, path: &str) -> Result<String, AssetError> {
+            match path {
+                "/repo/.agents/hooks.json" => {
+                    Ok(r#"{"hooks":[{"event":"PreToolUse","command":"project-hook"}]}"#.into())
+                }
+                "/repo/.agents/hooks.local.json" => Ok(r#"{"enabled":true}"#.into()),
+                _ => Err(AssetError::Invalid("missing".into())),
+            }
+        }
+
+        async fn list(&self, _path: Option<&str>) -> Result<Vec<(String, bool)>, AssetError> {
+            Err(AssetError::Invalid("missing".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn local_hook_config_is_required_to_enable_hooks() {
+        let bundle = discover(&LocalHookReader, "/repo").await.unwrap();
+        assert_eq!(
+            bundle.hooks.as_ref().map(|config| config.enabled),
+            Some(true)
+        );
+        assert_eq!(
+            bundle.hooks.as_ref().unwrap().hooks[0].command,
+            "project-hook"
+        );
         assert!(bundle.hook_errors.is_empty());
+    }
+
+    struct UnsupportedHookReader;
+
+    #[async_trait]
+    impl RemoteAssetReader for UnsupportedHookReader {
+        async fn read(&self, path: &str) -> Result<String, AssetError> {
+            match path {
+                "/repo/.agents/hooks.local.json" => Ok(
+                    r#"{"enabled":true,"hooks":[{"event":"SessionStart","command":"unsupported"}]}"#
+                        .into(),
+                ),
+                _ => Err(AssetError::Invalid("missing".into())),
+            }
+        }
+
+        async fn list(&self, _path: Option<&str>) -> Result<Vec<(String, bool)>, AssetError> {
+            Err(AssetError::Invalid("missing".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_hook_events_are_reported() {
+        let bundle = discover(&UnsupportedHookReader, "/repo").await.unwrap();
+        assert!(
+            bundle
+                .hook_errors
+                .iter()
+                .any(|error| error.contains("unsupported lifecycle hook event: SessionStart"))
+        );
     }
 
     struct InvalidHookReader;

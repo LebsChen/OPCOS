@@ -440,6 +440,7 @@ pub struct TurnEngine<P, S, E> {
     system_instructions: Mutex<Option<String>>,
     runtime_facts: Mutex<Option<String>>,
     permission_rules: Mutex<Option<PermissionRules>>,
+    hook_permission_rules: Mutex<Option<PermissionRules>>,
     lifecycle_hooks: Mutex<Option<LifecycleHookConfig>>,
     hook_context: Mutex<Vec<String>>,
     external_tools: Mutex<Vec<Value>>,
@@ -461,6 +462,7 @@ pub struct TurnEngine<P, S, E> {
 
 type SteeringWaiters = Arc<std::sync::Mutex<Vec<oneshot::Sender<(String, String)>>>>;
 
+// Best-effort input hygiene only; local-only hook enablement is the security boundary.
 fn redact_hook_value(mut value: Value) -> Value {
     fn visit(value: &mut Value) {
         match value {
@@ -570,6 +572,7 @@ where
             system_instructions: Mutex::new(None),
             runtime_facts: Mutex::new(None),
             permission_rules: Mutex::new(None),
+            hook_permission_rules: Mutex::new(None),
             lifecycle_hooks: Mutex::new(None),
             hook_context: Mutex::new(Vec::new()),
             external_tools: Mutex::new(Vec::new()),
@@ -600,6 +603,10 @@ where
 
     pub async fn set_permission_rules(&self, rules: Option<PermissionRules>) {
         *self.permission_rules.lock().await = rules;
+    }
+
+    pub async fn set_hook_permission_rules(&self, rules: Option<PermissionRules>) {
+        *self.hook_permission_rules.lock().await = rules;
     }
 
     pub async fn set_lifecycle_hooks(&self, hooks: Option<LifecycleHookConfig>) {
@@ -663,7 +670,7 @@ where
         if !config.enabled {
             return HookEffects::default();
         }
-        let rules = self.permission_rules.lock().await.clone();
+        let rules = self.hook_permission_rules.lock().await.clone();
         let mode = *self.mode.lock().await;
         let unattended = self.unattended.load(Ordering::SeqCst);
         let mut effects = HookEffects::default();
@@ -2975,6 +2982,96 @@ mod tests {
             })
             .await;
         assert_eq!(result, json!("executed"));
+    }
+
+    #[tokio::test]
+    async fn project_hook_allow_rules_cannot_self_authorize_commands() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(HookTools),
+            "s",
+            "/workspace",
+            PermissionMode::Interactive,
+            "fake",
+        );
+        engine
+            .set_lifecycle_hooks(Some(hook_config("PreToolUse", "context")))
+            .await;
+        // This protects the trust boundary: committed project rules must not
+        // self-authorize commands from committed hook configuration.
+        engine
+            .set_hook_permission_rules(Some(PermissionRules {
+                allow: Vec::new(),
+                deny: Vec::new(),
+            }))
+            .await;
+        assert_eq!(
+            engine
+                .lifecycle_hooks("PreToolUse", Some("run_shell"), json!({}))
+                .await,
+            HookEffects::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_hook_allow_rules_can_authorize_commands() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(HookTools),
+            "s",
+            "/workspace",
+            PermissionMode::Interactive,
+            "fake",
+        );
+        engine
+            .set_lifecycle_hooks(Some(hook_config("PreToolUse", "context")))
+            .await;
+        engine
+            .set_hook_permission_rules(Some(PermissionRules {
+                allow: vec!["Exec(context)".into()],
+                deny: Vec::new(),
+            }))
+            .await;
+        let effects = engine
+            .lifecycle_hooks("PreToolUse", Some("run_shell"), json!({}))
+            .await;
+        assert_eq!(
+            effects.additional_context,
+            vec!["Remember the approved change ticket."]
+        );
+    }
+
+    #[tokio::test]
+    async fn project_hook_deny_rules_block_commands_even_with_local_allow() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(HookTools),
+            "s",
+            "/workspace",
+            PermissionMode::Interactive,
+            "fake",
+        );
+        engine
+            .set_lifecycle_hooks(Some(hook_config("PreToolUse", "context")))
+            .await;
+        engine
+            .set_hook_permission_rules(Some(PermissionRules {
+                allow: vec!["Exec(context)".into()],
+                deny: vec!["Exec(context)".into()],
+            }))
+            .await;
+        assert_eq!(
+            engine
+                .lifecycle_hooks("PreToolUse", Some("run_shell"), json!({}))
+                .await,
+            HookEffects::default()
+        );
     }
 
     #[tokio::test]
