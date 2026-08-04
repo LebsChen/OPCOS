@@ -1471,6 +1471,7 @@ where
                 json!({"role":"system","content":[{"type":"text","text":instructions}]}),
             );
         }
+        messages.insert(0, self.runtime_context_message());
         if let Some(plan) = self
             .store
             .load_plan(&self.session_id)
@@ -1482,6 +1483,18 @@ where
             );
         }
         Ok(messages)
+    }
+
+    fn runtime_context_message(&self) -> Value {
+        let mode = self
+            .mode
+            .try_lock()
+            .map(|mode| format!("{mode:?}"))
+            .unwrap_or_else(|_| "unknown".into());
+        json!({"role":"system","content":[{"type":"text","text":format!(
+            "Runtime context:\n- Workspace: {}\n- Permission mode: {}\n",
+            self.workspace, mode
+        )}]})
     }
 
     fn plan_context_message(&self) -> Result<Option<Value>, EngineError> {
@@ -2436,6 +2449,38 @@ mod tests {
         async fn execute(&self, _: &str, _: Value) -> Result<Value, String> {
             Ok(json!("ok"))
         }
+    }
+
+    #[tokio::test]
+    async fn provider_messages_include_runtime_context_as_system_message() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(FakeTools),
+            "s",
+            "/workspace/project",
+            PermissionMode::Interactive,
+            "fake",
+        );
+        engine
+            .set_system_instructions(Some("built-in and user instructions".into()))
+            .await;
+        let messages = engine.provider_messages().unwrap();
+        assert_eq!(
+            messages[0]
+                .pointer("/content/0/text")
+                .and_then(Value::as_str),
+            Some(
+                "Runtime context:\n- Workspace: /workspace/project\n- Permission mode: Interactive\n"
+            )
+        );
+        assert_eq!(
+            messages[1]
+                .pointer("/content/0/text")
+                .and_then(Value::as_str),
+            Some("built-in and user instructions")
+        );
     }
 
     #[tokio::test]

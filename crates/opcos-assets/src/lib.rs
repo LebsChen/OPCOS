@@ -107,6 +107,20 @@ pub struct McpCatalogEntry {
 
 const MCP_CATALOG_JSON: &str = include_str!("../data/mcp_catalog.json");
 
+pub const BUILTIN_AGENT_INSTRUCTIONS: &str = r#"You are an autonomous software and business agent working in the assigned workspace and host.
+
+For complex tasks, first use propose_plan, then maintain the approved plan with plan_update. The persisted plan is authoritative; do not announce plan status in prose.
+
+After making changes, execute the relevant verification commands and record their evidence with local_gate_record. Do not claim completion without evidence. Read tool errors and repair the cause; never pretend a failed operation succeeded.
+
+Choose tools deliberately: use repo_index_* and lsp_* for repository navigation and symbols; use background_job_* for long-running work; use edit_file for precise edits instead of rewriting whole files; use action_ledger_* for idempotent external side effects.
+
+Use ask_user only for a genuine blocker such as missing credentials or a required human decision. Do not stop merely because work is lengthy or repetitive.
+
+Never print or commit secrets. Use the existing secret-reference mechanisms and keep credentials out of files, logs, transcripts, and tool results.
+
+Completion requires verifiable deliverables such as a branch, commit, pull request, or test output. A self-reported success is not evidence."#;
+
 pub fn builtin_mcp_catalog() -> Result<Vec<McpCatalogEntry>, AssetError> {
     let entries: Vec<McpCatalogEntry> = serde_json::from_str(MCP_CATALOG_JSON)
         .map_err(|error| AssetError::Invalid(format!("MCP catalog: {error}")))?;
@@ -225,7 +239,9 @@ pub fn redact_secret(value: &mut serde_json::Value, secret: &str) {
 
 impl AssetBundle {
     pub fn system_instructions(&self) -> String {
-        let mut sections = Vec::new();
+        let mut sections = vec![format!(
+            "[Built-in Agent Instructions]\n{BUILTIN_AGENT_INSTRUCTIONS}"
+        )];
         if let Some(instructions) = &self.instructions {
             sections.push(format!("[Global Instructions]\n{}", instructions.content));
         }
@@ -561,6 +577,30 @@ mod tests {
         assert!(rendered.find("agents").unwrap() < rendered.find("knowledge").unwrap());
         assert!(rendered.find("knowledge").unwrap() < rendered.find("playbook").unwrap());
         assert!(rendered.find("playbook").unwrap() < rendered.find("skill").unwrap());
+    }
+
+    #[test]
+    fn system_instructions_always_include_builtin_agent_instructions() {
+        let rendered = AssetBundle::default().system_instructions();
+        assert!(!rendered.is_empty());
+        assert!(rendered.contains(BUILTIN_AGENT_INSTRUCTIONS));
+    }
+
+    #[test]
+    fn builtin_instructions_precede_user_assets() {
+        let bundle = AssetBundle {
+            instructions: Some(InstructionSource {
+                path: "global".into(),
+                content: "User-specific instructions".into(),
+            }),
+            ..AssetBundle::default()
+        };
+        let rendered = bundle.system_instructions();
+        assert!(rendered.starts_with("[Built-in Agent Instructions]"));
+        assert!(
+            rendered.find(BUILTIN_AGENT_INSTRUCTIONS).unwrap()
+                < rendered.find("User-specific instructions").unwrap()
+        );
     }
 
     #[test]
