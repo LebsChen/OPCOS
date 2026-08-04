@@ -64,6 +64,16 @@ pub struct StreamChunk {
     pub tool_result: Option<ToolResult>,
     pub usage: Option<TokenUsage>,
     pub turn: Option<AssistantTurn>,
+    pub working_event: Option<WorkingEvent>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WorkingEvent {
+    pub event_type: String,
+    pub category: String,
+    pub direction: String,
+    pub timestamp: String,
+    pub payload: Value,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]

@@ -100,3 +100,35 @@
 - 仍开放的行为差距里，有两条已经在 #77 的提示词里加了指引，但**行为是否真的改变**还需要下一轮真实任务验证。
 - 架构级差距里，几条旧文案需要改写成“部分成立”或“未核实”，不能再机械照抄旧清单。
 - 逆向来源要只吸收行为原则，不吸收不可信项目里的“虚构工具名”或自授权模型。
+
+## 6. Working 过程事件流对齐（当前实现）
+
+### 已实现并已通过本地验证
+
+Builtin engine 现在会把 working 过程作为结构化事件同时写入本地 audit store，
+并通过既有 `opcos://event` 的 `stream` payload 向前端转发。事件具有：
+
+- `event_type`、`category`、`direction`、`timestamp` 和结构化 `payload`；
+- 每轮的 `status_update`、`simple_activity_update`、`context_growth_update`；
+- 每回合聚合后的 provider reasoning 对应一条 `devin_thoughts`（最多 4000 字符）；
+- 工具调用的 `<tool>_started` / `<tool>_completed`，完成事件只带参数 key、
+  结果类型、字节数和成功标记，不复制原始敏感参数；
+- provider usage 存在时的 `iteration_stats`，包括工具数量、耗时和 token 数；
+- 本地 `session_worklog` 现在从 audit store 返回这些事件，沿用现有 Worklog
+  时间线，不新增 UI 布局；Transcript 对 `devin_thoughts` 和
+  `simple_activity_update` 沿用已有 thinking/notice 表面。
+
+真实 Devin 事件样本的字段形状已依据
+`/home/ubuntu/devin_session_events_full.txt` 核对，覆盖 status、shell、file、
+search、mcp、todo、lifecycle、reasoning、iteration 和 context 事件。新增
+engine example 的确定性事件断言、workspace 相关测试和 clippy 已通过；本地浏览器 UI
+构建需要先安装 `web/node_modules`，尚未在当前环境完成。
+
+### 尚未等价或未核实
+
+- 通用 `ToolExecutor` 目前不能提供真正的 shell stdout 增量；completed 事件已
+  结构化，增量 terminal 事件仍取决于具体 executor/harness。
+- MCP、search、git 和 todo 的 category 已按工具名映射，但尚未为每个类别分别
+  跑一套真实端到端任务。
+- 远程 RVM worklog 仍使用远端原生事件；本次改动只补齐本地 builtin engine，
+  没有改变 RVM host。

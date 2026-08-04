@@ -9493,6 +9493,26 @@ async fn engine_for_with_context(
             project: session.project_id.as_deref(),
         })))
         .await;
+    if !bundle.knowledge.is_empty() {
+        let working_event = json!({
+            "event_type":"note_used",
+            "category":"other",
+            "direction":"outgoing",
+            "timestamp":Utc::now().to_rfc3339(),
+            "payload":{
+                "knowledge_count":bundle.knowledge.len(),
+                "skills_count":bundle.skills.len(),
+                "commands_count":bundle.commands.len(),
+            }
+        });
+        audit(state, session_id, "working_event", working_event.clone());
+        emit(
+            app,
+            "stream",
+            Some(session_id),
+            json!({"working_event":working_event}),
+        );
+    }
     engine
         .set_permission_rules(bundle.permissions.as_ref().map(|rules| {
             opcos_policy::PermissionRules {
@@ -17671,7 +17691,23 @@ async fn session_worklog(
 ) -> Result<Value, String> {
     let host_id = session_host_id(&state, &session_id)?;
     if host_id == "local" {
-        return Err("本机 host 不提供远程 worklog".into());
+        let mut events = state
+            .store
+            .load_audit(Some(&session_id))
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(|event| event.kind == "working_event")
+            .map(|event| {
+                let mut payload = event.payload;
+                if let Some(object) = payload.as_object_mut() {
+                    object.insert("sequence".into(), json!(event.sequence));
+                }
+                payload
+            })
+            .collect::<Vec<_>>();
+        events.reverse();
+        let last_id = events.len().to_string();
+        return Ok(json!({"events":events,"last_id":last_id,"window_lost":false}));
     }
     let page = client_for(&state, &host_id)?
         .worklog_query(&after_id, limit.unwrap_or(200))

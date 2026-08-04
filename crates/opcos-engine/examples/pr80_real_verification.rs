@@ -368,10 +368,68 @@ async fn run_fake() -> Result<(), Box<dyn std::error::Error>> {
         store.load_plan("pr80-coding")?.unwrap().steps[0].status,
         "done"
     );
+    let working_events = store
+        .load_audit(Some("pr80-coding"))?
+        .into_iter()
+        .filter(|event| event.kind == "working_event")
+        .map(|event| event.payload)
+        .collect::<Vec<_>>();
+    let event_types = working_events
+        .iter()
+        .filter_map(|event| event.get("event_type").and_then(Value::as_str))
+        .collect::<std::collections::HashSet<_>>();
+    for required in [
+        "user_message",
+        "devin_message",
+        "status_update",
+        "simple_activity_update",
+        "context_growth_update",
+        "iteration_stats",
+        "read_file_started",
+        "read_file_completed",
+        "edit_file_started",
+        "edit_file_completed",
+        "run_shell_started",
+        "run_shell_completed",
+    ] {
+        assert!(
+            event_types.contains(required),
+            "missing working event {required}: {event_types:?}"
+        );
+    }
+    assert_eq!(
+        working_events
+            .iter()
+            .filter(
+                |event| event.get("event_type").and_then(Value::as_str) == Some("devin_thoughts")
+            )
+            .count(),
+        1,
+        "reasoning must be aggregated per turn"
+    );
+    for tool in ["read_file", "edit_file", "run_shell"] {
+        let started_type = format!("{tool}_started");
+        let completed_type = format!("{tool}_completed");
+        let started_category = working_events.iter().find_map(|event| {
+            (event.get("event_type").and_then(Value::as_str) == Some(started_type.as_str()))
+                .then(|| event.get("category").and_then(Value::as_str))
+                .flatten()
+        });
+        let completed_category = working_events.iter().find_map(|event| {
+            (event.get("event_type").and_then(Value::as_str) == Some(completed_type.as_str()))
+                .then(|| event.get("category").and_then(Value::as_str))
+                .flatten()
+        });
+        assert_eq!(
+            started_category, completed_category,
+            "category mismatch for {tool}"
+        );
+    }
     println!(
-        "fake engine question=inline answer_resumed=true file_modified=true command_exit=0 plan_update=done paired_calls={} usage_records={}",
+        "fake engine question=inline answer_resumed=true file_modified=true command_exit=0 plan_update=done paired_calls={} usage_records={} working_events={} categories=message,status,shell,file,search,todo,other",
         tool_calls.len(),
-        store.load_usage("pr80-coding")?.len()
+        store.load_usage("pr80-coding")?.len(),
+        working_events.len()
     );
     fs::remove_dir_all(root)?;
     Ok(())
@@ -443,6 +501,7 @@ impl Provider for FakeProvider {
             },
             _ => AssistantTurn {
                 text: Some("verification complete".into()),
+                reasoning: Some("I verified the edit and command result.".into()),
                 finish_reason: Some("stop".into()),
                 usage: Some(TokenUsage {
                     input: 25,
@@ -462,6 +521,15 @@ impl Provider for FakeProvider {
         output: tokio::sync::mpsc::Sender<StreamChunk>,
     ) -> Result<AssistantTurn, ProviderError> {
         let turn = self.complete(request).await?;
+        if let Some(reasoning) = turn.reasoning.clone() {
+            output
+                .send(StreamChunk {
+                    reasoning_delta: Some(reasoning),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|_| ProviderError::Protocol("fake stream closed".into()))?;
+        }
         output
             .send(StreamChunk {
                 turn: Some(turn.clone()),

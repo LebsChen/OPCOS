@@ -5,7 +5,7 @@ use opcos_policy::{
 };
 use opcos_provider::{
     AssistantTurn, Caps, Provider, ProviderError, ProviderRequest, StreamChunk, TokenUsage,
-    ToolCall, ToolResult,
+    ToolCall, ToolResult, WorkingEvent,
 };
 use opcos_store::{
     CompactionRecord, GrantRecord, NoticeRecord, PendingRecord, SessionStore, StoredMessage,
@@ -784,6 +784,22 @@ where
         self.set_session_status("running", "none");
         let value = json!({"role":"user","content":[{"type":"text","text":text.into()}]});
         let result = async {
+            let event = WorkingEvent {
+                event_type: "user_message".into(),
+                category: "message".into(),
+                direction: "incoming".into(),
+                timestamp: Utc::now().to_rfc3339(),
+                payload: json!({"text":"user message"}),
+            };
+            self.recorder.append_audit(
+                "working_event",
+                &serde_json::to_value(&event)
+                    .map_err(|error| EngineError::Store(error.to_string()))?,
+            )?;
+            let _ = self.events.try_send(StreamChunk {
+                working_event: Some(event),
+                ..StreamChunk::default()
+            });
             self.append("user", value).await?;
             self.run_loop(self.provider_messages()?).await
         }
@@ -1145,18 +1161,15 @@ where
             self.store
                 .complete_tool_call(&self.session_id, message_sequence, &call.id, &result)
                 .map_err(|error| EngineError::Store(error.to_string()))?;
-            let _ = self
-                .events
-                .send(StreamChunk {
-                    tool_result: Some(ToolResult {
-                        call_id: call.id,
-                        name: call.name,
-                        arguments: call.arguments,
-                        result,
-                    }),
-                    ..StreamChunk::default()
-                })
-                .await;
+            let _ = self.events.try_send(StreamChunk {
+                tool_result: Some(ToolResult {
+                    call_id: call.id,
+                    name: call.name,
+                    arguments: call.arguments,
+                    result,
+                }),
+                ..StreamChunk::default()
+            });
         }
         drop(active);
         self.run_loop(self.provider_messages()?).await
@@ -1230,7 +1243,32 @@ where
         let mut usage: Option<TokenUsage> = None;
         let mut stop_vetoes = 0;
         let max_iterations = self.max_iterations.load(Ordering::SeqCst);
-        for _ in 0..max_iterations {
+        for iteration in 0..max_iterations {
+            let _ = self
+                .working_event(
+                    "status_update",
+                    "status",
+                    json!({"enum":"working","message":"Working"}),
+                )
+                .await;
+            let _ = self
+                .working_event(
+                    "simple_activity_update",
+                    "status",
+                    json!({"enum":"deciding_action","iteration":iteration + 1}),
+                )
+                .await;
+            let context_tokens = messages
+                .iter()
+                .map(|message| message.to_string().len() as u64 / 4)
+                .sum::<u64>();
+            let _ = self
+                .working_event(
+                    "context_growth_update",
+                    "other",
+                    json!({"estimated_context_tokens":context_tokens}),
+                )
+                .await;
             if self.interrupted.load(Ordering::SeqCst) {
                 self.notice("interrupted", "Turn interrupted".into())
                     .await?;
@@ -1299,6 +1337,20 @@ where
             let (provider_result, partial) = self.stream_turn(request).await;
             match provider_result {
                 Ok(turn) => {
+                    if let Some(reasoning) =
+                        partial.reasoning.as_deref().or(turn.reasoning.as_deref())
+                    {
+                        let message = reasoning.chars().take(4000).collect::<String>();
+                        if !message.is_empty() {
+                            let _ = self
+                                .working_event(
+                                    "devin_thoughts",
+                                    "other",
+                                    json!({"message":message}),
+                                )
+                                .await;
+                        }
+                    }
                     usage = turn.usage.clone();
                     if let Some(value) = &turn.usage {
                         let limit = self.message_usage_limit.load(Ordering::SeqCst);
@@ -1319,10 +1371,30 @@ where
                                 recorded_at: Utc::now(),
                             })
                             .map_err(|error| EngineError::Store(error.to_string()))?;
+                        let _ = self
+                            .working_event(
+                                "iteration_stats",
+                                "other",
+                                json!({
+                                    "iteration":iteration + 1,
+                                    "num_tool_calls":turn.tool_calls.len(),
+                                    "duration_ms":started.elapsed().as_millis(),
+                                    "input_tokens":value.input,
+                                    "output_tokens":value.output,
+                                }),
+                            )
+                            .await;
                     }
                     let assistant = json!({"role":"assistant","content":turn.text.clone().unwrap_or_default(),
                         "tool_calls":turn.tool_calls,"reasoning":turn.reasoning});
                     self.append("assistant", assistant.clone()).await?;
+                    let _ = self
+                        .working_event(
+                            "devin_message",
+                            "message",
+                            json!({"has_text":turn.text.is_some(),"tool_calls":turn.tool_calls.len()}),
+                        )
+                        .await;
                     let assistant_sequence = *self.sequence.lock().await;
                     messages.push(assistant);
                     if turn.tool_calls.is_empty() {
@@ -1473,9 +1545,7 @@ where
                     if let Some(reasoning) = chunk.reasoning_delta.clone() {
                         partial.reasoning.get_or_insert_with(String::new).push_str(&reasoning);
                     }
-                    if self.events.send(chunk).await.is_err() {
-                        return (Err(ProviderError::Protocol("stream receiver closed".into())), partial);
-                    }
+                    let _ = self.events.try_send(chunk);
                 }
                 _ = self.interrupt_notify.notified() => {
                     return (Err(ProviderError::Protocol("interrupted".into())), partial);
@@ -1552,6 +1622,23 @@ where
                 return Err(EngineError::ApprovalPending(call.id.clone()));
             }
             let risk = tool_risk(&call.name);
+            let argument_keys = call
+                .arguments
+                .as_object()
+                .map(|arguments| arguments.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            let category = tool_event_category(&call.name);
+            let _ = self
+                .working_event(
+                    &format!("{}_started", call.name),
+                    category,
+                    json!({
+                        "call_id":call.id,
+                        "tool":call.name,
+                        "argument_keys":argument_keys,
+                    }),
+                )
+                .await;
             let mode = *self.mode.lock().await;
             let target = self.executor.policy_target(&call.name, &call.arguments);
             let preflight = self
@@ -1709,18 +1796,29 @@ where
             self.store
                 .complete_tool_call(&self.session_id, assistant_sequence, &call.id, &result)
                 .map_err(|error| EngineError::Store(error.to_string()))?;
+            let category = tool_event_category(&call.name);
             let _ = self
-                .events
-                .send(StreamChunk {
-                    tool_result: Some(ToolResult {
-                        call_id: call.id.clone(),
-                        name: call.name.clone(),
-                        arguments: call.arguments.clone(),
-                        result,
+                .working_event(
+                    &format!("{}_completed", call.name),
+                    category,
+                    json!({
+                        "call_id":call.id,
+                        "tool":call.name,
+                        "ok":result.get("error").is_none(),
+                        "result_type":if result.is_object() {"object"} else if result.is_array() {"array"} else {"value"},
+                        "result_bytes":result.to_string().len(),
                     }),
-                    ..StreamChunk::default()
-                })
+                )
                 .await;
+            let _ = self.events.try_send(StreamChunk {
+                tool_result: Some(ToolResult {
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    result,
+                }),
+                ..StreamChunk::default()
+            });
         }
         Ok(())
     }
@@ -2017,6 +2115,30 @@ where
             })
             .map_err(|error| EngineError::Store(error.to_string()))
     }
+
+    async fn working_event(
+        &self,
+        event_type: &str,
+        category: &str,
+        payload: Value,
+    ) -> Result<(), EngineError> {
+        let event = WorkingEvent {
+            event_type: event_type.into(),
+            category: category.into(),
+            direction: "outgoing".into(),
+            timestamp: Utc::now().to_rfc3339(),
+            payload,
+        };
+        self.recorder.append_audit(
+            "working_event",
+            &serde_json::to_value(&event).map_err(|error| EngineError::Store(error.to_string()))?,
+        )?;
+        let _ = self.events.try_send(StreamChunk {
+            working_event: Some(event),
+            ..StreamChunk::default()
+        });
+        Ok(())
+    }
 }
 
 fn tool_risk(name: &str) -> ToolRisk {
@@ -2067,6 +2189,24 @@ fn tool_risk(name: &str) -> ToolRisk {
         "background_job_start" | "background_job_kill" => ToolRisk::Execute,
         "background_job_status" | "background_job_output" => ToolRisk::Read,
         _ => ToolRisk::External,
+    }
+}
+
+fn tool_event_category(name: &str) -> &'static str {
+    if name == "edit_file" {
+        "file"
+    } else if name.starts_with("repo_index_") || name == "list_dir" || name == "read_file" {
+        "search"
+    } else if name.starts_with("git_") {
+        "git"
+    } else if name.starts_with("mcp_") || name.contains("__") {
+        "mcp"
+    } else if name == "run_shell" || name == "background_job_start" {
+        "shell"
+    } else if name.starts_with("plan_") {
+        "todo"
+    } else {
+        "other"
     }
 }
 

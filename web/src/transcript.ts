@@ -336,6 +336,36 @@ export function reduceStreamEvent(
         : item,
     );
   }
+  if (event.kind === "stream") {
+    const working = payloadObject(payload.working_event);
+    if (Object.keys(working).length > 0) {
+      const eventType =
+        typeof working.event_type === "string"
+          ? working.event_type
+          : "working_event";
+      const details = payloadObject(working.payload);
+      if (eventType === "devin_thoughts") {
+        next.push({
+          id: `event:thought:${next.length}`,
+          kind: "thinking",
+          text: typeof details.message === "string" ? details.message : "",
+          reasoning: typeof details.message === "string" ? details.message : "",
+        });
+      } else if (eventType === "simple_activity_update") {
+        next.push({
+          id: `event:activity:${next.length}`,
+          kind: "notice",
+          noticeKind: eventType,
+          text:
+            typeof details.message === "string"
+              ? details.message
+              : typeof details.enum === "string"
+                ? details.enum
+                : "Working",
+        });
+      }
+    }
+  }
   if (event.kind === "notice" || event.kind === "approval_resolved") {
     const noticeKind =
       typeof payload.kind === "string" ? payload.kind : event.kind;
