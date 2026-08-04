@@ -515,12 +515,8 @@ impl BackgroundJobManager {
         } else {
             Some(host.health().await?.platform.unwrap_or_default())
         };
-        if host.id() != "local" && platform.as_deref() != Some("win32") {
-            return Err(HostError::Unsupported(
-                "durable background jobs are currently supported only on Windows RVM hosts".into(),
-            ));
-        }
-        let remote_windows = host.id() != "local";
+        let remote_windows = host.id() != "local" && platform.as_deref() == Some("win32");
+        let remote_posix = host.id() != "local" && !remote_windows;
         let local_posix = host.id() == "local"
             && cfg!(unix)
             && self
@@ -532,6 +528,17 @@ impl BackgroundJobManager {
                 self.start_remote_windows_wrapper(host, &job_id, &request, &launch_nonce)
                     .await?,
             )
+        } else if remote_posix {
+            Some(
+                self.start_remote_posix_wrapper(
+                    host,
+                    &job_id,
+                    &request,
+                    &launch_nonce,
+                    timeout_seconds,
+                )
+                .await?,
+            )
         } else if local_posix {
             Some(
                 self.start_local_posix_wrapper(&job_id, &request, &launch_nonce, timeout_seconds)
@@ -540,7 +547,7 @@ impl BackgroundJobManager {
         } else {
             None
         };
-        let process = if remote_windows || local_posix {
+        let process = if remote_windows || remote_posix || local_posix {
             None
         } else {
             Some(host.spawn(request).await?)
@@ -583,8 +590,8 @@ impl BackgroundJobManager {
             has_partial_line: false,
             segment_index: 0,
             metadata_path: metadata_path.clone(),
-            remote: remote_windows,
-            wrapper: local_posix,
+            remote: remote_windows || remote_posix,
+            wrapper: remote_windows || remote_posix || local_posix,
         }));
         persist_job_metadata(&snapshot, &metadata_path).await?;
         self.jobs
@@ -824,6 +831,75 @@ impl BackgroundJobManager {
         })
     }
 
+    async fn start_remote_posix_wrapper(
+        &self,
+        host: &dyn Host,
+        job_id: &str,
+        request: &SpawnRequest,
+        launch_nonce: &str,
+        timeout_seconds: Option<u64>,
+    ) -> Result<DurableLaunch, HostError> {
+        let job_root = host.join(&format!(".opcos/background-jobs/{job_id}"))?;
+        if !host.contains(&job_root) {
+            return Err(HostError::Path(
+                "remote background-job path is outside the host workspace".into(),
+            ));
+        }
+        let wrapper_path = opcos_rvm::join_remote_path(&job_root, "wrapper.sh");
+        let command_path = opcos_rvm::join_remote_path(&job_root, "command.sh");
+        let identity_path = opcos_rvm::join_remote_path(&job_root, "identity.json");
+        let stdout_path = opcos_rvm::join_remote_path(&job_root, "stdout-000000");
+        host.exec(ExecRequest {
+            command: format!("mkdir -p {}", shell_single_quote(&job_root)),
+            cwd: None,
+            timeout_seconds: 30,
+            session: None,
+            env: None,
+        })
+        .await?;
+        host.write(&wrapper_path, posix_background_job_wrapper_script())
+            .await?;
+        let command = match request.cwd.as_deref() {
+            Some(cwd) => format!(
+                "cd -- {} || exit 126\n{}",
+                shell_single_quote(cwd),
+                request.command
+            ),
+            None => request.command.clone(),
+        };
+        host.write(&command_path, &command).await?;
+        host.write(
+            &identity_path,
+            &serde_json::json!({
+                "launch_nonce": launch_nonce,
+                "timeout_seconds": timeout_seconds.unwrap_or(0),
+            })
+            .to_string(),
+        )
+        .await?;
+        host.exec(ExecRequest {
+            command: format!(
+                "setsid sh {} {} >/dev/null 2>&1 &",
+                shell_single_quote(&wrapper_path),
+                shell_single_quote(&job_root)
+            ),
+            cwd: None,
+            timeout_seconds: 30,
+            session: None,
+            env: None,
+        })
+        .await?;
+        let status_path = remote_sibling_path(&stdout_path, "status.json");
+        let status = read_remote_status(host, &status_path)
+            .await
+            .ok_or_else(|| {
+                HostError::InvalidResponse(
+                    "remote POSIX background wrapper did not publish a status marker".into(),
+                )
+            })?;
+        Ok(durable_launch_from_status(stdout_path, &status))
+    }
+
     #[cfg(unix)]
     async fn start_local_posix_wrapper(
         &self,
@@ -941,7 +1017,7 @@ impl BackgroundJobManager {
             if snapshot.host_id != host.id() {
                 continue;
             }
-            if snapshot.output_path.contains("\\") && host.id() != "local" {
+            if host.id() != "local" {
                 recover_remote_snapshot(host, &mut snapshot).await?;
             } else if snapshot.output_path.ends_with("stdout-000000") && host.id() == "local" {
                 recover_local_snapshot(&mut snapshot).await?;
@@ -1063,8 +1139,14 @@ impl BackgroundJobManager {
                 .unwrap_or(snapshot.retained_start_line);
         }
         let mut bytes = Vec::new();
+        let durable_posix = snapshot.output_path.ends_with("stdout-000000");
         for segment in 0..=JOB_OUTPUT_MAX_SEGMENTS {
-            let path = format!("{parent}\\stdout-{segment:06}.log");
+            let filename = if durable_posix {
+                format!("stdout-{segment:06}")
+            } else {
+                format!("stdout-{segment:06}.log")
+            };
+            let path = opcos_rvm::join_remote_path(parent, &filename);
             match host.read(&path).await {
                 Ok(content) => bytes.extend_from_slice(content.content.as_bytes()),
                 Err(HostError::Rvm(RvmError::Http { status, .. })) if status.as_u16() == 404 => {}
@@ -1295,16 +1377,29 @@ async fn recover_remote_snapshot(
                 snapshot.finished_at = Some(Utc::now());
                 return Ok(());
             };
-            let command = format!(
-                "$w=Get-Process -Id {wrapper_pid} -ErrorAction SilentlyContinue; \
-                 $c=Get-Process -Id {child_pid} -ErrorAction SilentlyContinue; \
-                 [pscustomobject]@{{ \
-                   wrapper=($null -ne $w); \
-                   wrapper_start=if($null -ne $w){{$w.StartTime.ToUniversalTime().ToString('o')}}else{{$null}}; \
-                   child=($null -ne $c); \
-                   child_start=if($null -ne $c){{$c.StartTime.ToUniversalTime().ToString('o')}}else{{$null}} \
-                 }} | ConvertTo-Json -Compress"
-            );
+            let windows = host.health().await?.platform.as_deref() == Some("win32");
+            let command = if windows {
+                format!(
+                    "$w=Get-Process -Id {wrapper_pid} -ErrorAction SilentlyContinue; \
+                     $c=Get-Process -Id {child_pid} -ErrorAction SilentlyContinue; \
+                     [pscustomobject]@{{ \
+                       wrapper=($null -ne $w); \
+                       wrapper_start=if($null -ne $w){{$w.StartTime.ToUniversalTime().ToString('o')}}else{{$null}}; \
+                       child=($null -ne $c); \
+                       child_start=if($null -ne $c){{$c.StartTime.ToUniversalTime().ToString('o')}}else{{$null}} \
+                     }} | ConvertTo-Json -Compress"
+                )
+            } else {
+                format!(
+                    "w=$(ps -o lstart= -p {wrapper_pid} 2>/dev/null | sed 's/^ *//'); \
+                     c=$(ps -o lstart= -p {child_pid} 2>/dev/null | sed 's/^ *//'); \
+                     printf '{{\"wrapper\":%s,\"wrapper_start\":%s,\"child\":%s,\"child_start\":%s}}\\n' \
+                       \"$(if [ -n \"$w\" ]; then printf true; else printf false; fi)\" \
+                       \"$(if [ -n \"$w\" ]; then printf '\"%s\"' \"$w\"; else printf null; fi)\" \
+                       \"$(if [ -n \"$c\" ]; then printf true; else printf false; fi)\" \
+                       \"$(if [ -n \"$c\" ]; then printf '\"%s\"' \"$c\"; else printf null; fi)\""
+                )
+            };
             let result = host
                 .exec(ExecRequest {
                     command,
@@ -1325,14 +1420,16 @@ async fn recover_remote_snapshot(
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             let wrapper_start_matches = wrapper_alive
-                && timestamps_match(
+                && process_start_times_match(
                     snapshot.wrapper_start_time.as_deref(),
                     liveness.get("wrapper_start").and_then(Value::as_str),
+                    windows,
                 );
             let child_start_matches = child_alive
-                && timestamps_match(
+                && process_start_times_match(
                     snapshot.child_start_time.as_deref(),
                     liveness.get("child_start").and_then(Value::as_str),
+                    windows,
                 );
             if wrapper_alive && child_alive {
                 if wrapper_start_matches && child_start_matches {
@@ -1385,6 +1482,21 @@ fn timestamps_match(expected: Option<&str>, observed: Option<&str>) -> bool {
         return false;
     };
     (expected.timestamp_millis() - observed.timestamp_millis()).abs() <= 1_000
+}
+
+fn process_start_times_match(
+    expected: Option<&str>,
+    observed: Option<&str>,
+    windows: bool,
+) -> bool {
+    if windows {
+        timestamps_match(expected, observed)
+    } else {
+        let (Some(expected), Some(observed)) = (expected, observed) else {
+            return false;
+        };
+        expected.trim() == observed.trim()
+    }
 }
 
 async fn read_remote_status(host: &dyn Host, path: &str) -> Option<Value> {
@@ -3689,6 +3801,13 @@ mod tests {
         assert!(wrapper.contains("command.ps1"));
         assert!(!wrapper.contains("secret-value"));
         assert!(!wrapper.contains("Authorization"));
+        let posix_wrapper = posix_background_job_wrapper_script();
+        assert!(posix_wrapper.contains("setsid"));
+        assert!(posix_wrapper.contains("mkfifo"));
+        assert!(posix_wrapper.contains("split"));
+        assert!(posix_wrapper.contains("command.sh"));
+        assert!(!posix_wrapper.contains("secret-value"));
+        assert!(!posix_wrapper.contains("Authorization"));
     }
 
     #[test]
