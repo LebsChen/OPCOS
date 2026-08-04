@@ -4036,6 +4036,7 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
     migrate_mcp_session_tools(&connection)?;
     migrate_config_objects(&mut connection)?;
     migrate_config_scope_model(&connection)?;
+    migrate_removed_organization_presets(&connection)?;
     seed_builtin_templates(&connection)?;
     migrate_coordination(&connection)?;
     Ok(connection)
@@ -4197,6 +4198,80 @@ fn migrate_config_scope_model(connection: &Connection) -> Result<(), String> {
         "INSERT INTO desktop_schema_migrations(version,applied_at)
          VALUES ('p1-2-config-scope-model',?1)",
         [Utc::now().to_rfc3339()],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())
+}
+
+fn migrate_removed_organization_presets(connection: &Connection) -> Result<(), String> {
+    const MIGRATION: &str = "p1-3-remove-organization-presets";
+    const REMOVED_IDS: [&str; 7] = [
+        "template-knowledge-opcos-hosts",
+        "template-knowledge-opcos-windows-ime",
+        "template-knowledge-opcos-local-gates",
+        "template-knowledge-opcos-coordination",
+        "template-runbook-opcos-rvm",
+        "template-runbook-opcos-coordination",
+        "template-runbook-opcos-local-release",
+    ];
+    let migrated: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM desktop_schema_migrations WHERE version=?1
+             )",
+            [MIGRATION],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if migrated {
+        return Ok(());
+    }
+    let tx = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    for id in REMOVED_IDS {
+        let pristine: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1
+                   FROM config_object o
+                   JOIN config_object_version v ON v.id=o.current_version_id
+                   WHERE o.id=?1 AND o.status='builtin'
+                     AND o.current_version_id=?2
+                     AND v.version=1 AND v.note='builtin seed'
+                     AND (SELECT COUNT(*) FROM config_object_version
+                          WHERE object_id=o.id)=1
+                 )",
+                params![id, format!("{id}:v1")],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !pristine {
+            continue;
+        }
+        tx.execute(
+            "DELETE FROM project_config_selection WHERE object_id=?1",
+            [id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "DELETE FROM session_config_versions WHERE object_id=?1",
+            [id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "DELETE FROM session_config_bindings WHERE object_id=?1",
+            [id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute("DELETE FROM config_object_version WHERE object_id=?1", [id])
+            .map_err(|error| error.to_string())?;
+        tx.execute("DELETE FROM config_object WHERE id=?1", [id])
+            .map_err(|error| error.to_string())?;
+    }
+    tx.execute(
+        "INSERT INTO desktop_schema_migrations(version,applied_at) VALUES (?1,?2)",
+        params![MIGRATION, Utc::now().to_rfc3339()],
     )
     .map_err(|error| error.to_string())?;
     tx.commit().map_err(|error| error.to_string())
@@ -19849,6 +19924,7 @@ mod m7_tests {
                 |row| row.get(0),
             )
             .unwrap();
+        // 29 = 22 generic/#34 assets plus 7 sanitized system playbooks.
         assert_eq!(builtin_count, 29);
         for id in [
             "template-runbook-playbook-template",
@@ -19911,6 +19987,114 @@ mod m7_tests {
                 .unwrap();
             assert!(count > 0, "expected builtin preset for {kind}");
         }
+    }
+
+    #[test]
+    fn removed_organization_presets_delete_only_pristine_builtin_rows() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE desktop_schema_migrations (
+                   version TEXT PRIMARY KEY,
+                   applied_at TEXT NOT NULL
+                 );
+                 CREATE TABLE config_object (
+                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+                   server_key TEXT, scope_kind TEXT NOT NULL, scope_key TEXT,
+                   status TEXT NOT NULL, created_at TEXT NOT NULL,
+                   current_version_id TEXT
+                 );
+                 CREATE TABLE config_object_version (
+                   id TEXT PRIMARY KEY, object_id TEXT NOT NULL, version INTEGER NOT NULL,
+                   content TEXT NOT NULL, content_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+                   note TEXT NOT NULL, metadata_json TEXT NOT NULL,
+                   UNIQUE(object_id,version)
+                 );
+                 CREATE TABLE project_config_selection (
+                   project_id TEXT NOT NULL, object_id TEXT NOT NULL, enabled INTEGER NOT NULL,
+                   PRIMARY KEY(project_id,object_id)
+                 );
+                 CREATE TABLE session_config_versions (
+                   session_id TEXT NOT NULL, object_id TEXT NOT NULL, version_id TEXT NOT NULL,
+                   PRIMARY KEY(session_id,object_id)
+                 );
+                 CREATE TABLE session_config_bindings (
+                   session_id TEXT NOT NULL, object_id TEXT NOT NULL,
+                   PRIMARY KEY(session_id,object_id)
+                 );
+                 INSERT INTO config_object
+                   (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
+                 VALUES
+                   ('template-knowledge-opcos-hosts','knowledge','old','key','global',NULL,
+                    'builtin','now','template-knowledge-opcos-hosts:v1'),
+                   ('template-knowledge-opcos-windows-ime','knowledge','edited','key','global',NULL,
+                    'active','now','template-knowledge-opcos-windows-ime:v2');
+                 INSERT INTO config_object_version
+                   (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+                 VALUES
+                   ('template-knowledge-opcos-hosts:v1','template-knowledge-opcos-hosts',1,
+                    'old','hash','now','builtin seed','{}'),
+                   ('template-knowledge-opcos-windows-ime:v1','template-knowledge-opcos-windows-ime',1,
+                    'original','hash','now','builtin seed','{}'),
+                   ('template-knowledge-opcos-windows-ime:v2','template-knowledge-opcos-windows-ime',2,
+                    'edited','hash','now','edited','{}');
+                 INSERT INTO project_config_selection VALUES
+                   ('project-1','template-knowledge-opcos-hosts',1),
+                   ('project-1','template-knowledge-opcos-windows-ime',1);
+                 INSERT INTO session_config_versions VALUES
+                   ('session-1','template-knowledge-opcos-hosts','template-knowledge-opcos-hosts:v1'),
+                   ('session-1','template-knowledge-opcos-windows-ime','template-knowledge-opcos-windows-ime:v2');
+                 INSERT INTO session_config_bindings VALUES
+                   ('session-1','template-knowledge-opcos-hosts'),
+                   ('session-1','template-knowledge-opcos-windows-ime');",
+            )
+            .unwrap();
+
+        migrate_removed_organization_presets(&connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM config_object WHERE id='template-knowledge-opcos-hosts'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status FROM config_object
+                     WHERE id='template-knowledge-opcos-windows-ime'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "active"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM config_object_version
+                     WHERE object_id='template-knowledge-opcos-windows-ime'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        migrate_removed_organization_presets(&connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM desktop_schema_migrations
+                     WHERE version='p1-3-remove-organization-presets'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
