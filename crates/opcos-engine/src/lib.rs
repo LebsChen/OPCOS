@@ -406,6 +406,7 @@ pub struct TurnEngine<P, S, E> {
     interrupt_notify: Arc<tokio::sync::Notify>,
     unattended: AtomicBool,
     system_instructions: Mutex<Option<String>>,
+    runtime_facts: Mutex<Option<String>>,
     external_tools: Mutex<Vec<Value>>,
     allowed_tools: Mutex<Option<HashSet<String>>>,
     linear_tools_enabled: AtomicBool,
@@ -490,6 +491,7 @@ where
             interrupt_notify: Arc::new(tokio::sync::Notify::new()),
             unattended: AtomicBool::new(false),
             system_instructions: Mutex::new(None),
+            runtime_facts: Mutex::new(None),
             external_tools: Mutex::new(Vec::new()),
             allowed_tools: Mutex::new(None),
             linear_tools_enabled: AtomicBool::new(false),
@@ -510,6 +512,10 @@ where
 
     pub async fn set_system_instructions(&self, instructions: Option<String>) {
         *self.system_instructions.lock().await = instructions;
+    }
+
+    pub async fn set_runtime_facts(&self, facts: Option<String>) {
+        *self.runtime_facts.lock().await = facts;
     }
 
     pub async fn set_external_tools(&self, tools: Vec<Value>) {

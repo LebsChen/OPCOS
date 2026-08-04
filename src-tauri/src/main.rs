@@ -8826,6 +8826,7 @@ async fn engine_for_with_context(
             })))
         })
         .unwrap_or_else(|| Arc::clone(&state.mcp));
+    let mut remote_platform = None;
     let (workspace, executor, remote_client, allowed_tools) = if host_id == "local" {
         let workspace = PathBuf::from(resolved_workspace.clone());
         let host = LocalHost::new(&workspace).map_err(|error| error.to_string())?;
@@ -8960,6 +8961,7 @@ async fn engine_for_with_context(
                 .update_session_status(session_id, "error", "host_unavailable");
             format!("remote host unavailable: {error}")
         })?;
+        remote_platform = health.platform.clone();
         let workspace = if session_workspace.is_empty() {
             health.workspace.unwrap_or_else(|| "/workspace".into())
         } else {
@@ -9068,6 +9070,52 @@ async fn engine_for_with_context(
         model,
     ));
     engine.set_linear_tools_enabled(linear_tools_enabled);
+    let host_scope = if host_id == "local" {
+        "local"
+    } else {
+        "remote RVM"
+    };
+    let (platform, architecture) = if host_id == "local" {
+        (
+            std::env::consts::OS.to_owned(),
+            std::env::consts::ARCH.to_owned(),
+        )
+    } else {
+        (
+            remote_platform.unwrap_or_else(|| "unknown".into()),
+            "unknown".into(),
+        )
+    };
+    let home = if host_id == "local" {
+        std::env::var("HOME").unwrap_or_else(|_| "unknown".into())
+    } else {
+        "unknown".into()
+    };
+    let enabled_integrations = [
+        ("github", connector_tools_enabled["github"]),
+        ("linear", linear_tools_enabled),
+        ("slack", connector_tools_enabled["slack"]),
+        ("notion", connector_tools_enabled["notion"]),
+        ("gitlab", connector_tools_enabled["gitlab"]),
+        ("jira", connector_tools_enabled["jira"]),
+        ("stripe", connector_tools_enabled["stripe"]),
+        ("telegram", connector_tools_enabled["telegram"]),
+        ("discord", connector_tools_enabled["discord"]),
+    ]
+    .into_iter()
+    .filter_map(|(name, enabled)| enabled.then_some(name))
+    .collect::<Vec<_>>();
+    engine
+        .set_runtime_facts(Some(format!(
+            "Runtime facts:\n- Execution host: {host_id} ({host_scope})\n- Platform: {platform}\n- Architecture: {architecture}\n- Home directory: {home}\n- Workspace root: {workspace}\n- Current UTC time: {}\n- Current model: {model}\n- Enabled integrations: {}",
+            Utc::now().to_rfc3339(),
+            if enabled_integrations.is_empty() {
+                "none".to_owned()
+            } else {
+                enabled_integrations.join(", ")
+            }
+        )))
+        .await;
     engine.set_message_usage_limit(
         settings
             .get("message_usage_limit")
