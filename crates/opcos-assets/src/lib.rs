@@ -349,8 +349,9 @@ fn apply_system_instruction_budget(sections: Vec<String>) -> String {
             continue;
         }
 
-        let omitted = section_count - index;
-        let marker = OMITTED_SECTIONS_MARKER.replace("{count}", &omitted.to_string());
+        let partially_retained_omitted = section_count - index - 1;
+        let marker =
+            OMITTED_SECTIONS_MARKER.replace("{count}", &partially_retained_omitted.to_string());
         let prefix = if rendered.is_empty() {
             String::new()
         } else {
@@ -368,6 +369,11 @@ fn apply_system_instruction_budget(sections: Vec<String>) -> String {
             )
         } else {
             String::new()
+        };
+        let marker = if truncated.is_empty() {
+            OMITTED_SECTIONS_MARKER.replace("{count}", &(section_count - index).to_string())
+        } else {
+            marker
         };
         let mut output = prefix;
         if !truncated.is_empty() {
@@ -755,8 +761,12 @@ mod tests {
             "later".into(),
         ]);
         assert!(rendered.contains(TRUNCATED_SECTION_MARKER));
-        assert!(rendered.contains("[1 asset sections omitted: system instruction budget exceeded]"));
-        assert!(!rendered.contains("[2 asset sections omitted: system instruction budget exceeded]"));
+        assert!(
+            rendered.contains("[1 asset sections omitted: system instruction budget exceeded]")
+        );
+        assert!(
+            !rendered.contains("[2 asset sections omitted: system instruction budget exceeded]")
+        );
         assert!(rendered.len() <= MAX_SYSTEM_INSTRUCTION_BYTES);
     }
 
