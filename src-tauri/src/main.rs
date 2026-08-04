@@ -394,6 +394,15 @@ struct HarnessAvailability {
     reason: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct RepairLoopContext {
+    loop_id: String,
+    project_id: String,
+    repo: String,
+    branch: String,
+    head_sha: String,
+}
+
 struct RemoteExecutor {
     client: HttpRvmClient,
     shell: AsyncMutex<PersistentShell<HttpRvmClient>>,
@@ -409,6 +418,8 @@ struct RemoteExecutor {
     database: Arc<Mutex<Connection>>,
     engines: Arc<AsyncMutex<HashMap<String, Arc<GuiEngine>>>>,
     coordination: Arc<AsyncMutex<HashMap<String, CoordinationRuntime>>>,
+    origin: ToolOrigin,
+    repair_loop: Option<RepairLoopContext>,
 }
 
 struct LocalExecutor {
@@ -425,6 +436,8 @@ struct LocalExecutor {
     database: Arc<Mutex<Connection>>,
     engines: Arc<AsyncMutex<HashMap<String, Arc<GuiEngine>>>>,
     coordination: Arc<AsyncMutex<HashMap<String, CoordinationRuntime>>>,
+    origin: ToolOrigin,
+    repair_loop: Option<RepairLoopContext>,
 }
 
 enum DesktopExecutor {
@@ -3182,7 +3195,7 @@ async fn run_goal_planner_inner(
         &input_summary["work_queue"],
         &input_summary["events"],
     );
-    let engine = engine_for(app, state, &session_id).await?;
+    let engine = engine_for(app, state, &session_id, ToolOrigin::User).await?;
     let started_at = now.clone();
     let turn = match engine.submit_text(prompt).await {
         Ok(turn) => turn,
@@ -3700,6 +3713,30 @@ impl ToolExecutor for RemoteExecutor {
         }
     }
 
+    fn tool_origin(&self) -> ToolOrigin {
+        self.origin.clone()
+    }
+
+    fn grant_allows(&self, target: &str) -> bool {
+        let Some(context) = &self.repair_loop else {
+            return false;
+        };
+        self.origin == ToolOrigin::RepairLoop
+            && self
+                .store
+                .load_repair_loop_grant(
+                    &context.loop_id,
+                    &context.project_id,
+                    &context.repo,
+                    &context.branch,
+                    &context.head_sha,
+                    target,
+                )
+                .ok()
+                .flatten()
+                .is_some()
+    }
+
     fn policy_target(&self, name: &str, arguments: &Value) -> String {
         if name == "git_push" {
             git_push_policy_target(&self.store, self.project_id.as_deref(), arguments)
@@ -3968,6 +4005,38 @@ impl ToolExecutor for DesktopExecutor {
                         .map_err(|error| error.to_string()),
                     _ => Err(format!("local tool is unavailable: {name}")),
                 }
+            }
+        }
+    }
+
+    fn tool_origin(&self) -> ToolOrigin {
+        match self {
+            Self::Remote(executor) => executor.origin.clone(),
+            Self::Local(executor) => executor.origin.clone(),
+        }
+    }
+
+    fn grant_allows(&self, target: &str) -> bool {
+        match self {
+            Self::Remote(executor) => executor.grant_allows(target),
+            Self::Local(executor) => {
+                let Some(context) = &executor.repair_loop else {
+                    return false;
+                };
+                executor.origin == ToolOrigin::RepairLoop
+                    && executor
+                        .store
+                        .load_repair_loop_grant(
+                            &context.loop_id,
+                            &context.project_id,
+                            &context.repo,
+                            &context.branch,
+                            &context.head_sha,
+                            target,
+                        )
+                        .ok()
+                        .flatten()
+                        .is_some()
             }
         }
     }
@@ -5900,7 +5969,7 @@ async fn execute_control_slash_action(
             if session.harness != "builtin" {
                 return Err("/compact is only available for the Builtin harness".into());
             }
-            let engine = engine_for(app, state, &session.session_id).await?;
+            let engine = engine_for(app, state, &session.session_id, ToolOrigin::User).await?;
             engine.compact_now().await.map_err(engine_error_message)?;
             emit(
                 app,
@@ -8584,8 +8653,19 @@ async fn engine_for(
     app: &tauri::AppHandle,
     state: &DesktopState,
     session_id: &str,
+    origin: ToolOrigin,
 ) -> Result<Arc<GuiEngine>, String> {
-    {
+    engine_for_with_context(app, state, session_id, origin, None).await
+}
+
+async fn engine_for_with_context(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    session_id: &str,
+    origin: ToolOrigin,
+    repair_loop: Option<RepairLoopContext>,
+) -> Result<Arc<GuiEngine>, String> {
+    if origin == ToolOrigin::User {
         let engines = state.engines.lock().await;
         if let Some(engine) = engines.get(session_id) {
             return Ok(Arc::clone(engine));
@@ -8822,6 +8902,8 @@ async fn engine_for(
                 database: Arc::clone(&state.database),
                 engines: Arc::clone(&state.engines),
                 coordination: Arc::clone(&state.coordination),
+                origin: origin.clone(),
+                repair_loop: repair_loop.clone(),
             }))),
             None,
             Some(allowed_tools),
@@ -8861,6 +8943,8 @@ async fn engine_for(
                 database: Arc::clone(&state.database),
                 engines: Arc::clone(&state.engines),
                 coordination: Arc::clone(&state.coordination),
+                origin: origin.clone(),
+                repair_loop: repair_loop.clone(),
             }))),
             Some(executor_client),
             None,
@@ -9145,6 +9229,9 @@ async fn engine_for(
             );
         }
     });
+    if origin == ToolOrigin::RepairLoop {
+        return Ok(engine);
+    }
     let mut engines = state.engines.lock().await;
     let entry = engines
         .entry(session_id.to_owned())
@@ -10916,7 +11003,26 @@ async fn submit_turn(
 async fn submit_turn_inner(
     app: tauri::AppHandle,
     state: &DesktopState,
+    request: SubmitRequest,
+) -> Result<(), String> {
+    submit_turn_inner_with_origin(app, state, request, ToolOrigin::User).await
+}
+
+pub(crate) async fn submit_turn_inner_with_origin(
+    app: tauri::AppHandle,
+    state: &DesktopState,
+    request: SubmitRequest,
+    origin: ToolOrigin,
+) -> Result<(), String> {
+    submit_turn_inner_with_context(app, state, request, origin, None).await
+}
+
+pub(crate) async fn submit_turn_inner_with_context(
+    app: tauri::AppHandle,
+    state: &DesktopState,
     mut request: SubmitRequest,
+    origin: ToolOrigin,
+    repair_loop: Option<RepairLoopContext>,
 ) -> Result<(), String> {
     let session = session_for(state, &request.session_id)?;
     if execute_control_slash_command(&app, state, &session, &request.text).await? {
@@ -10978,7 +11084,8 @@ async fn submit_turn_inner(
         .store
         .max_message_notice_sequence(&request.session_id)
         .map_err(|error| error.to_string())?;
-    let engine = engine_for(&app, state, &request.session_id).await?;
+    let engine =
+        engine_for_with_context(&app, state, &request.session_id, origin, repair_loop).await?;
     emit(
         &app,
         "message",
@@ -11485,7 +11592,7 @@ async fn interrupt(
             .map_err(|error| error.to_string())?;
         return Ok(());
     }
-    let engine = engine_for(&app, &state, &session_id).await?;
+    let engine = engine_for(&app, &state, &session_id, ToolOrigin::User).await?;
     engine.interrupt();
     audit(
         &state,
@@ -11509,7 +11616,7 @@ async fn steering(
     session_id: String,
     text: String,
 ) -> Result<(), String> {
-    let engine = engine_for(&app, &state, &session_id).await?;
+    let engine = engine_for(&app, &state, &session_id, ToolOrigin::User).await?;
     let completion = engine
         .queue_steering(text.clone())
         .await
@@ -11601,7 +11708,7 @@ async fn resolve_approval(
         .store
         .max_message_notice_sequence(&session_id)
         .map_err(|error| error.to_string())?;
-    let engine = engine_for(&app, &state, &session_id).await?;
+    let engine = engine_for(&app, &state, &session_id, ToolOrigin::User).await?;
     let result = engine
         .resolve_approval(
             &call_id,
@@ -11751,7 +11858,7 @@ async fn resolve_inbox(
     if item.state == "resolved" || item.state == "expired" {
         return Ok(());
     }
-    let engine = engine_for(&app, &state, &session_id).await?;
+    let engine = engine_for(&app, &state, &session_id, ToolOrigin::User).await?;
     let result = if item.kind == "approval" {
         engine
             .resolve_approval(
@@ -11810,7 +11917,7 @@ async fn change_model(
     session_id: String,
     model: String,
 ) -> Result<(), String> {
-    let engine = engine_for(&app, &state, &session_id).await?;
+    let engine = engine_for(&app, &state, &session_id, ToolOrigin::User).await?;
     engine
         .change_model(model.clone())
         .await
@@ -15632,7 +15739,7 @@ async fn github_process_pull_request_comments(
             .and_then(Value::as_str)
             .unwrap_or("unknown");
         let prompt = format!("请处理 GitHub PR {pr_url} 上来自 @{login} 的评论：\n\n{body}");
-        let engine = engine_for(&app, &state, &session_id).await?;
+        let engine = engine_for(&app, &state, &session_id, ToolOrigin::User).await?;
         engine
             .submit_text(prompt)
             .await
@@ -18745,7 +18852,7 @@ async fn run_schedule_for_inner(
         )
         .map_err(|error| error.to_string())?;
     let started_at = Utc::now().to_rfc3339();
-    let engine = engine_for(app, state, &session_id).await?;
+    let engine = engine_for(app, state, &session_id, ToolOrigin::User).await?;
     let sequence_before = state
         .store
         .max_message_notice_sequence(&session_id)
@@ -19304,6 +19411,21 @@ fn ci_monitors(
 }
 
 #[tauri::command]
+fn ci_repair_status(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
+    state
+        .store
+        .load_work_queue(None, 100)
+        .map_err(|error| error.to_string())
+        .and_then(|items| {
+            items
+                .into_iter()
+                .filter(|item| item.task_type == "ci_repair_loop")
+                .map(|item| serde_json::to_value(item).map_err(|error| error.to_string()))
+                .collect()
+        })
+}
+
+#[tauri::command]
 fn save_ci_monitor(
     state: State<'_, DesktopState>,
     monitor_id: String,
@@ -19331,23 +19453,62 @@ fn save_ci_monitor(
 }
 
 #[tauri::command]
-fn set_ci_monitor_enabled(
+async fn set_ci_monitor_enabled(
     state: State<'_, DesktopState>,
     monitor_id: String,
     enabled: bool,
 ) -> Result<Value, String> {
+    let monitor = state
+        .store
+        .load_ci_monitor(&monitor_id)
+        .map_err(|error| error.to_string())?
+        .ok_or("CI monitor not found")?;
     state
         .store
         .set_ci_monitor_enabled(&monitor_id, enabled)
         .map_err(|error| error.to_string())?;
-    serde_json::to_value(
+    if !enabled {
         state
             .store
-            .load_ci_monitor(&monitor_id)
-            .map_err(|error| error.to_string())?
-            .ok_or("CI monitor disappeared")?,
-    )
-    .map_err(|error| error.to_string())
+            .revoke_repair_loop_grant(&monitor_id)
+            .map_err(|error| error.to_string())?;
+        return Ok(json!({"enabled": false, "grant_revoked": true}));
+    }
+    let client = reqwest::Client::builder()
+        .user_agent("OPCOS/0.1")
+        .build()
+        .map_err(|error| error.to_string())?;
+    let observed = ci_repair::poll_once(&client, &state.store, &state.secrets, &monitor_id)
+        .await
+        .inspect_err(|_error| {
+            let _ = state.store.set_ci_monitor_enabled(&monitor_id, false);
+        })?;
+    let head_sha = observed
+        .get("head_sha")
+        .and_then(Value::as_str)
+        .ok_or("CI monitor did not return a head SHA")?;
+    let target = git_push_policy_target(
+        &state.store,
+        Some(&monitor.project_id),
+        &json!({"branch": monitor.branch}),
+    );
+    if target == "git_push:invalid" {
+        let _ = state.store.set_ci_monitor_enabled(&monitor_id, false);
+        return Err("cannot enable repair loop: push target is invalid".into());
+    }
+    state
+        .store
+        .save_repair_loop_grant(&opcos_store::RepairLoopGrant {
+            loop_id: monitor.monitor_id.clone(),
+            project_id: monitor.project_id,
+            repo: monitor.repo,
+            branch: monitor.branch,
+            head_sha: head_sha.to_owned(),
+            target,
+            expires_at: (Utc::now() + chrono::Duration::minutes(60)).to_rfc3339(),
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(json!({"enabled": true, "head_sha": head_sha}))
 }
 
 #[tauri::command]
@@ -20430,6 +20591,7 @@ fn main() {
             delete_external_ingress_source,
             poll_external_ingress,
             ci_monitors,
+            ci_repair_status,
             save_ci_monitor,
             set_ci_monitor_enabled,
             poll_ci_monitor,

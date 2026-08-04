@@ -35,6 +35,69 @@ pub struct RepairBudget {
     pub deadline: DateTime<Utc>,
 }
 
+pub fn stop_reason_label(reason: &StopReason) -> &'static str {
+    match reason {
+        StopReason::RepeatedFailureSignature => "same failure signature repeated twice",
+        StopReason::HeadShaChanged => "pull request head SHA changed",
+        StopReason::RepairAttemptsExhausted => "repair attempt budget exhausted",
+        StopReason::DeadlineExceeded => "repair deadline exceeded",
+        StopReason::PollBudgetExhausted => "CI polling budget exhausted",
+        StopReason::MixedOrIndeterminateClassification => {
+            "CI classification is mixed or indeterminate"
+        }
+        StopReason::InfrastructureFailure => "CI failure is infrastructure-related",
+        StopReason::MissingFailureEvidence => "complete failure evidence is unavailable",
+        StopReason::LocalGateNotPassed => "local gate has not fully passed",
+        StopReason::UnrelatedFailure => "failure is unrelated to the repair diff",
+        StopReason::ProductDecisionRequired => "product decision is required",
+        StopReason::ProtectedDiff => "repair diff enters a protected boundary",
+        StopReason::PushReconciliationRequired => "push result requires reconciliation",
+    }
+}
+
+pub fn budget_from_payload(payload: &Value) -> RepairBudget {
+    let now = Utc::now();
+    let deadline = payload
+        .get("deadline")
+        .and_then(Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+        .unwrap_or_else(|| now + Duration::minutes(60));
+    RepairBudget {
+        repair_attempts: payload
+            .get("repair_attempts")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32,
+        max_repair_attempts: payload
+            .get("max_repair_attempts")
+            .and_then(Value::as_u64)
+            .unwrap_or(3) as u32,
+        poll_count: payload
+            .get("poll_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32,
+        max_polls: payload
+            .get("max_polls")
+            .and_then(Value::as_u64)
+            .unwrap_or(20) as u32,
+        deadline,
+    }
+}
+
+pub fn failure_signatures(payload: &Value) -> Vec<String> {
+    payload
+        .get("failure_signatures")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub fn stop_reason(
@@ -142,12 +205,21 @@ pub async fn poll_once(
     secrets: &KeyringSecretStore,
     monitor_id: &str,
 ) -> Result<Value, String> {
+    poll_once_with_base(client, store, secrets, monitor_id, "https://api.github.com").await
+}
+
+pub async fn poll_once_with_base(
+    client: &Client,
+    store: &SqliteStore,
+    secrets: &KeyringSecretStore,
+    monitor_id: &str,
+    api_base: &str,
+) -> Result<Value, String> {
     let monitor = store
         .load_ci_monitor(monitor_id)
         .map_err(|error| error.to_string())?
         .ok_or("CI monitor not found")?;
     let token = project_token(secrets, &monitor.project_id)?;
-    let api_base = "https://api.github.com";
     let pull = github_json(
         client,
         &token,
@@ -185,6 +257,14 @@ pub async fn poll_once(
     let previous = store
         .load_ci_monitor_state(monitor_id, &head_sha)
         .map_err(|error| error.to_string())?;
+    if store
+        .load_ci_monitor_states(monitor_id)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .any(|state| state.initialized && state.head_sha != head_sha)
+    {
+        let _ = store.revoke_repair_loop_grant(monitor_id);
+    }
     let should_publish = should_publish_failure(previous.as_ref(), overall);
     let state = CiMonitorState {
         monitor_id: monitor.monitor_id.clone(),

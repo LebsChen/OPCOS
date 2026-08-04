@@ -2838,10 +2838,23 @@ function CiMonitorPanel({
   const [branch, setBranch] = useState("HEAD");
   const [enabled, setEnabled] = useState(false);
   const [monitor, setMonitor] = useState<unknown>(null);
+  const [repairItems, setRepairItems] = useState<unknown[]>([]);
   const refresh = () => {
     if (!selected.project_id) return;
-    Promise.all([invoke<unknown[]>("ci_monitors", { enabledOnly: false })])
-      .then(([monitors]) => {
+    Promise.all([
+      invoke<unknown[]>("ci_monitors", { enabledOnly: false }),
+      invoke<unknown[]>("ci_repair_status"),
+    ])
+      .then(([monitors, repairs]) => {
+        setRepairItems(
+          repairs.filter(
+            (item) =>
+              typeof item === "object" &&
+              item !== null &&
+              (item as { project_id?: string }).project_id ===
+                selected.project_id,
+          ),
+        );
         const current = monitors.find(
           (item) =>
             typeof item === "object" &&
@@ -2911,11 +2924,15 @@ function CiMonitorPanel({
       ) : null}
       <Button onClick={refresh}>Refresh status</Button>
       <p className="muted small">
-        This only polls GitHub CI and publishes external.github.ci.failed
-        events. It does not automatically repair code or start an agent.
-        Configure an event rule if you want to route the event to a durable work
-        item.
+        Enabling this monitor explicitly authorizes the bounded CI repair loop
+        for this PR. The runner remains separately controlled by the global
+        runner setting. Disable the monitor to revoke its repair authorization.
       </p>
+      {repairItems.length > 0 ? (
+        <pre className="muted small">
+          {JSON.stringify(repairItems, null, 2)}
+        </pre>
+      ) : null}
     </details>
   );
 }

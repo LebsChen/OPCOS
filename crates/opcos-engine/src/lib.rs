@@ -67,6 +67,10 @@ pub trait ToolExecutor: Send + Sync {
         ToolOrigin::User
     }
 
+    fn grant_allows(&self, _target: &str) -> bool {
+        false
+    }
+
     fn policy_target(&self, name: &str, arguments: &Value) -> String {
         let _ = arguments;
         name.to_owned()
@@ -1275,6 +1279,14 @@ where
                 .map_err(EngineError::Tool)?;
             let mut preflight_reason = None;
             let decision = match preflight {
+                PreflightDecision::Allow if self.executor.grant_allows(&target) => {
+                    let repair_grant = [DurableGrant {
+                        key: "repair-loop".into(),
+                        target: target.clone(),
+                        expires_at: None,
+                    }];
+                    decide(mode, risk, unattended, &repair_grant, &target)
+                }
                 PreflightDecision::Allow => decide(mode, risk, unattended, &grants, &target),
                 PreflightDecision::NeedsUser(reason) if unattended => {
                     preflight_reason = Some(reason);
