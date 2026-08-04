@@ -51,6 +51,19 @@ type UiEvent = {
   session_id?: string;
   payload: Record<string, unknown>;
 };
+type ExternalIngressSource = {
+  source_id: string;
+  provider: "github" | "rss" | "atom" | string;
+  config: Record<string, unknown>;
+  enabled: boolean;
+  cursor?: string | null;
+  initialized: boolean;
+  next_attempt_at?: string | null;
+  consecutive_failures: number;
+  circuit_open_until?: string | null;
+  last_success_at?: string | null;
+  last_error?: string | null;
+};
 type ProviderDescriptor = {
   name: string;
   title: string;
@@ -3185,6 +3198,24 @@ function ManageSections({
     Record<string, string>
   >({});
   const [openConnector, setOpenConnector] = useState<string | null>(null);
+  const [ingressSources, setIngressSources] = useState<ExternalIngressSource[]>(
+    [],
+  );
+  const [ingressProvider, setIngressProvider] = useState<"github" | "rss">(
+    "github",
+  );
+  const [ingressTarget, setIngressTarget] = useState("");
+  const [ingressInterval, setIngressInterval] = useState("60");
+  const [editingIngressId, setEditingIngressId] = useState<string | null>(null);
+  const [ingressStatus, setIngressStatus] = useState("");
+  const loadIngress = () =>
+    command<ExternalIngressSource[]>("external_ingress_sources", {
+      enabledOnly: false,
+    }).then(setIngressSources);
+  useEffect(() => {
+    if (tab !== "ingress") return;
+    void loadIngress().catch(onError);
+  }, [tab, onError]);
   const [secretFormOpen, setSecretFormOpen] = useState(false);
   const [secretName, setSecretName] = useState("");
   const [secretScope, setSecretScope] = useState("global");
@@ -3232,6 +3263,10 @@ function ManageSections({
     connectors: [
       "Connectors",
       "Linear is connected locally with a Personal API Key. Other connectors are not integrated.",
+    ],
+    ingress: [
+      "External events",
+      "Poll GitHub and RSS/Atom sources that can wake OPCOS event rules.",
     ],
     index: [
       "Repository index",
@@ -5547,6 +5582,217 @@ function ManageSections({
           </div>
         )}
         {tab === "mcp" && <McpManage selected={selected} onError={onError} />}
+        {tab === "ingress" && (
+          <div className="space-y-5">
+            <div className="rounded-xl2 border border-line bg-panel p-5">
+              <h2 className="text-[15px] font-semibold text-ink">
+                External event sources
+              </h2>
+              <p className="muted mt-1">
+                Sources are disabled when created. Polling never exposes a
+                public listener.
+              </p>
+              <p className="muted mt-1">
+                GitHub repository events are best-effort polling: GitHub
+                documents up to 300 events from the last 30 days and may delay
+                delivery. Pull requests, comments, issues, and check runs are
+                mapped when GitHub includes them in the event stream.
+              </p>
+              <div className="form-grid mt-4">
+                <label className="field-label">
+                  Provider
+                  <select
+                    value={ingressProvider}
+                    onChange={(event) =>
+                      setIngressProvider(event.target.value as "github" | "rss")
+                    }
+                  >
+                    <option value="github">GitHub repository events</option>
+                    <option value="rss">RSS / Atom feed</option>
+                  </select>
+                </label>
+                <label className="field-label">
+                  {ingressProvider === "github" ? "Repository" : "Feed URL"}
+                  <input
+                    value={ingressTarget}
+                    onChange={(event) => setIngressTarget(event.target.value)}
+                    placeholder={
+                      ingressProvider === "github"
+                        ? "owner/repository"
+                        : "https://example.test/feed.xml"
+                    }
+                  />
+                </label>
+                <label className="field-label">
+                  Poll interval
+                  <select
+                    value={ingressInterval}
+                    onChange={(event) => setIngressInterval(event.target.value)}
+                  >
+                    <option value="30">30 seconds</option>
+                    <option value="60">1 minute</option>
+                    <option value="300">5 minutes</option>
+                    <option value="900">15 minutes</option>
+                  </select>
+                </label>
+                <div className="flex items-end gap-2">
+                  <Button
+                    className="primary"
+                    disabled={!ingressTarget.trim()}
+                    onClick={() => {
+                      const target = ingressTarget.trim();
+                      const provider = ingressProvider;
+                      const sourceId =
+                        editingIngressId ||
+                        `${provider}:${target.replace(/[^a-zA-Z0-9._/-]+/g, "-")}`;
+                      const config =
+                        provider === "github"
+                          ? {
+                              repo: target,
+                              poll_interval_seconds: Number(ingressInterval),
+                            }
+                          : {
+                              url: target,
+                              poll_interval_seconds: Number(ingressInterval),
+                            };
+                      void command("save_external_ingress_source", {
+                        sourceId,
+                        provider,
+                        config,
+                      })
+                        .then(loadIngress)
+                        .then(() => {
+                          setIngressTarget("");
+                          setEditingIngressId(null);
+                          setIngressStatus("Source saved disabled by default.");
+                        })
+                        .catch(onError);
+                    }}
+                  >
+                    {editingIngressId ? "Save changes" : "Add source"}
+                  </Button>
+                  {editingIngressId && (
+                    <Button
+                      className="bordered"
+                      onClick={() => {
+                        setEditingIngressId(null);
+                        setIngressTarget("");
+                      }}
+                    >
+                      Cancel
+                    </Button>
+                  )}
+                </div>
+              </div>
+              {ingressStatus && (
+                <small className="success">{ingressStatus}</small>
+              )}
+            </div>
+            <div className="manage-list">
+              {ingressSources.length === 0 && (
+                <div className="manage-card muted">
+                  No external event sources configured.
+                </div>
+              )}
+              {ingressSources.map((source) => {
+                const target = String(
+                  source.config.repo || source.config.url || "not configured",
+                );
+                const circuitOpen =
+                  source.circuit_open_until &&
+                  new Date(source.circuit_open_until).getTime() > Date.now();
+                return (
+                  <div className="manage-row px-4" key={source.source_id}>
+                    <div className="min-w-0 flex-1">
+                      <strong>{source.provider}</strong>
+                      <div className="truncate text-sm text-faint">
+                        {target}
+                      </div>
+                      <small>
+                        {source.enabled ? "Enabled" : "Disabled"} · last success{" "}
+                        {source.last_success_at || "never"} · failures{" "}
+                        {source.consecutive_failures}
+                      </small>
+                      {circuitOpen && (
+                        <div className="failure">
+                          Circuit open until {source.circuit_open_until}
+                        </div>
+                      )}
+                      {source.last_error && (
+                        <div
+                          className="failure truncate"
+                          title={source.last_error}
+                        >
+                          {source.last_error}
+                        </div>
+                      )}
+                    </div>
+                    <div className="flex flex-wrap items-center justify-end gap-2">
+                      <Button
+                        className="bordered"
+                        onClick={() => {
+                          setIngressProvider(
+                            source.provider === "github" ? "github" : "rss",
+                          );
+                          setIngressTarget(target);
+                          setIngressInterval(
+                            String(source.config.poll_interval_seconds || 60),
+                          );
+                          setEditingIngressId(source.source_id);
+                        }}
+                      >
+                        Edit
+                      </Button>
+                      <Button
+                        className="bordered"
+                        onClick={() =>
+                          void command("poll_external_ingress", {
+                            sourceId: source.source_id,
+                          })
+                            .then(loadIngress)
+                            .catch(onError)
+                        }
+                      >
+                        Poll now
+                      </Button>
+                      <Button
+                        className={source.enabled ? "bordered" : "primary"}
+                        onClick={() =>
+                          void command("set_external_ingress_enabled", {
+                            sourceId: source.source_id,
+                            enabled: !source.enabled,
+                          })
+                            .then(loadIngress)
+                            .catch(onError)
+                        }
+                      >
+                        {source.enabled ? "Disable" : "Enable"}
+                      </Button>
+                      <Button
+                        className="bordered"
+                        onClick={() => {
+                          if (
+                            !window.confirm(
+                              "Delete this external event source?",
+                            )
+                          )
+                            return;
+                          void command("delete_external_ingress_source", {
+                            sourceId: source.source_id,
+                          })
+                            .then(loadIngress)
+                            .catch(onError);
+                        }}
+                      >
+                        Delete
+                      </Button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
         {tab === "connectors" && (
           <div className="space-y-5">
             <div className="rounded-xl2 border border-line bg-panel p-5">

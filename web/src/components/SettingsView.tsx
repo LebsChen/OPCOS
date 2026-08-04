@@ -21,6 +21,7 @@ export type SettingsSection =
   | "skill"
   | "mcp"
   | "connectors"
+  | "ingress"
   | "index"
   | "secrets"
   | "blueprint";
@@ -39,6 +40,7 @@ const tabs: Array<{ key: SettingsSection; label: string; icon: IconName }> = [
   { key: "skill", label: "skill", icon: "sparkle" },
   { key: "mcp", label: "mcp", icon: "plug" },
   { key: "connectors", label: "connectors", icon: "globe" },
+  { key: "ingress", label: "external events", icon: "globe" },
   { key: "index", label: "index", icon: "search" },
   { key: "secrets", label: "secrets", icon: "shield" },
   { key: "blueprint", label: "blueprint", icon: "code" },

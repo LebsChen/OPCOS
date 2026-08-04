@@ -76,7 +76,7 @@ async fn poll_source(
                 &source.source_id,
                 cursor.as_deref(),
                 true,
-                Some(&(Utc::now() + Duration::seconds(30)).to_rfc3339()),
+                Some(&(Utc::now() + Duration::seconds(poll_interval_seconds(source))).to_rfc3339()),
                 0,
                 None,
                 Some(&now),
@@ -101,6 +101,15 @@ async fn poll_source(
             );
         }
     }
+}
+
+fn poll_interval_seconds(source: &ExternalIngressSource) -> i64 {
+    source
+        .config
+        .get("poll_interval_seconds")
+        .and_then(Value::as_u64)
+        .map(|value| value.clamp(30, 86_400) as i64)
+        .unwrap_or(30)
 }
 
 pub async fn poll_once(

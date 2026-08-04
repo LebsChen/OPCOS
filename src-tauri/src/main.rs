@@ -2372,6 +2372,28 @@ fn execute_work_queue_tool(
     }
 }
 
+fn execute_external_ingress_tool(
+    store: &SqliteStore,
+    name: &str,
+    _arguments: &Value,
+) -> Result<Value, String> {
+    match name {
+        "external_ingress_sources" => store
+            .load_external_ingress_sources(false)
+            .and_then(|sources| {
+                sources
+                    .into_iter()
+                    .map(|source| {
+                        serde_json::to_value(source).map_err(opcos_store::StoreError::from)
+                    })
+                    .collect()
+            })
+            .map(|sources: Vec<Value>| json!({"sources": sources}))
+            .map_err(|error| error.to_string()),
+        _ => Err(format!("unsupported external ingress tool: {name}")),
+    }
+}
+
 fn execute_plan_tool(
     store: &SqliteStore,
     session_id: &str,
@@ -2916,6 +2938,9 @@ impl ToolExecutor for RemoteExecutor {
                 arguments,
             );
         }
+        if name == "external_ingress_sources" {
+            return execute_external_ingress_tool(&self.store, name, &arguments);
+        }
         if matches!(name, "coordination_dispatch" | "coordination_status") {
             return execute_coordination_tool(
                 &self.store,
@@ -3207,6 +3232,9 @@ impl ToolExecutor for DesktopExecutor {
                         name,
                         arguments,
                     );
+                }
+                if name == "external_ingress_sources" {
+                    return execute_external_ingress_tool(&executor.store, name, &arguments);
                 }
                 if matches!(name, "coordination_dispatch" | "coordination_status") {
                     return execute_coordination_tool(
@@ -8083,6 +8111,7 @@ async fn engine_for(
             "work_queue_cancel".to_owned(),
             "work_queue_requeue".to_owned(),
             "work_queue_list".to_owned(),
+            "external_ingress_sources".to_owned(),
             "coordination_dispatch".to_owned(),
             "coordination_status".to_owned(),
         ]);
@@ -18584,6 +18613,17 @@ fn set_external_ingress_enabled(
 }
 
 #[tauri::command]
+fn delete_external_ingress_source(
+    state: State<'_, DesktopState>,
+    source_id: String,
+) -> Result<(), String> {
+    state
+        .store
+        .delete_external_ingress_source(&source_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn poll_external_ingress(
     state: State<'_, DesktopState>,
     source_id: String,
@@ -19587,6 +19627,7 @@ fn main() {
             save_external_ingress_source,
             external_ingress_sources,
             set_external_ingress_enabled,
+            delete_external_ingress_source,
             poll_external_ingress,
             event_rules,
             create_event_rule,

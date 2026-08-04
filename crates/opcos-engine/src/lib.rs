@@ -1481,6 +1481,7 @@ fn tool_risk(name: &str) -> ToolRisk {
         "action_ledger_list" => ToolRisk::Read,
         "action_ledger_begin" | "action_ledger_finish" => ToolRisk::Write,
         "work_queue_list" => ToolRisk::Read,
+        "external_ingress_sources" => ToolRisk::Read,
         "work_queue_enqueue"
         | "work_queue_claim"
         | "work_queue_renew"
@@ -1943,6 +1944,7 @@ fn tool_definitions() -> Vec<Value> {
     ];
     tools.extend(action_ledger_tool_definitions());
     tools.extend(work_queue_tool_definitions());
+    tools.push(json!({"type":"function","function":{"name":"external_ingress_sources","description":"List configured external event sources and their health state. Read-only; secret values are never returned.","parameters":{"type":"object","properties":{}}}}));
     tools.extend(coordination_tool_definitions());
     tools
 }

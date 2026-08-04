@@ -4233,6 +4233,15 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub fn delete_external_ingress_source(&self, source_id: &str) -> Result<(), StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "DELETE FROM external_ingress_sources WHERE source_id=?1",
+            [source_id],
+        )?;
+        Ok(())
+    }
+
     fn load_external_ingress_source_locked(
         &self,
         connection: &Connection,
