@@ -9988,6 +9988,7 @@ function AppContent() {
                   <QuestionCard
                     question={pendingQuestion}
                     onAnswer={async (answer) => {
+                      setRunning(true);
                       await command("resolve_inbox", {
                         sessionId: selected.id,
                         callId: pendingQuestion.callId,

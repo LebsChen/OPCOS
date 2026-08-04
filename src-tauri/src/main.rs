@@ -11396,59 +11396,6 @@ fn builtin_allowed_tools(include_local_lsp: bool, include_edit_file: bool) -> Ve
     tools
 }
 
-// Keep these explicit dispatch predicates beside the builtin allowlist. Rust cannot
-// enumerate match arms, so every change to the executor dispatch must update these
-// predicates and the coverage test below.
-#[cfg(test)]
-fn local_executor_dispatches_builtin_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "propose_plan"
-            | "plan_get"
-            | "plan_update"
-            | "plan_revise"
-            | "skill_save_learned"
-            | "skill_search_learned"
-            | "skill_get_learned"
-            | "ask_user"
-            | "repo_index_find_symbol"
-            | "repo_index_glob"
-            | "repo_index_search"
-            | "background_job_start"
-            | "background_job_status"
-            | "background_job_output"
-            | "background_job_kill"
-            | "local_gate_record"
-            | "local_gate_status"
-            | "action_ledger_begin"
-            | "action_ledger_finish"
-            | "action_ledger_list"
-            | "work_queue_enqueue"
-            | "work_queue_claim"
-            | "work_queue_renew"
-            | "work_queue_complete"
-            | "work_queue_cancel"
-            | "work_queue_requeue"
-            | "work_queue_list"
-            | "external_ingress_sources"
-            | "coordination_dispatch"
-            | "coordination_status"
-            | "lsp_definition"
-            | "lsp_references"
-            | "lsp_diagnostics"
-            | "edit_file"
-    )
-}
-
-#[cfg(test)]
-fn remote_executor_dispatches_builtin_tool(name: &str) -> bool {
-    local_executor_dispatches_builtin_tool(name)
-        && !matches!(
-            name,
-            "lsp_definition" | "lsp_references" | "lsp_diagnostics"
-        )
-}
-
 pub(crate) async fn submit_turn_inner_with_context(
     app: tauri::AppHandle,
     state: &DesktopState,
@@ -21310,22 +21257,6 @@ mod m7_tests {
     }
 
     #[test]
-    fn builtin_allowlist_is_covered_by_local_and_remote_dispatch() {
-        for name in builtin_allowed_tools(true, true) {
-            assert!(
-                local_executor_dispatches_builtin_tool(&name),
-                "{name} is visible to the local executor but has no dispatch arm"
-            );
-        }
-        for name in builtin_allowed_tools(false, false) {
-            assert!(
-                remote_executor_dispatches_builtin_tool(&name),
-                "{name} is visible to the remote executor but has no dispatch arm"
-            );
-        }
-    }
-
-    #[test]
     fn attended_questions_use_question_event_not_approval_event() {
         assert_eq!(
             attended_pending_event_kind("question"),
@@ -21394,6 +21325,91 @@ mod m7_tests {
             result,
             Err("ask_user must be handled by the engine pending mechanism".into())
         );
+        for name in builtin_allowed_tools(true, true) {
+            match name.as_str() {
+                // Starts a persistent process.
+                "background_job_start" => continue,
+                // Reads process state but requires a real job id.
+                "background_job_status" => continue,
+                // Reads process output but requires a real job id.
+                "background_job_output" => continue,
+                // Terminates a persistent process.
+                "background_job_kill" => continue,
+                _ => {}
+            }
+            let result = executor.execute(&name, json!({})).await;
+            assert!(
+                !matches!(
+                    result,
+                    Err(ref error) if error.starts_with("local tool is unavailable:")
+                ),
+                "{name} fell through local executor dispatch: {result:?}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_executor_builtin_allowlist_does_not_fall_through() {
+        let root = std::env::temp_dir().join(format!("opcos-remote-tools-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let secrets = KeyringSecretStore::new(format!("opcos-test-{}", Uuid::new_v4()));
+        let mcp = Arc::new(McpManager::new(Arc::new(McpCredentialAdapter {
+            store: secrets.clone(),
+            project_id: None,
+        })));
+        let client = HttpRvmClient::new(
+            opcos_rvm::RvmClientConfig::new(
+                url::Url::parse("http://127.0.0.1:9").unwrap(),
+                "test-token",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let executor = DesktopExecutor::Remote(Box::new(RemoteExecutor {
+            shell: AsyncMutex::new(PersistentShell::new(
+                client.clone(),
+                "remote-tool-test",
+                Some(root.display().to_string()),
+            )),
+            client,
+            secrets,
+            mcp,
+            index_root: root.join("indexes"),
+            host_id: "remote".into(),
+            workspace: root.display().to_string(),
+            project_id: None,
+            session_id: "remote-tool-test".into(),
+            store,
+            jobs: Arc::new(BackgroundJobManager::new(root.join("background-jobs"))),
+            database: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            engines: Arc::new(AsyncMutex::new(HashMap::new())),
+            coordination: Arc::new(AsyncMutex::new(HashMap::new())),
+            origin: ToolOrigin::User,
+            repair_loop: None,
+        }));
+        for name in builtin_allowed_tools(false, false) {
+            match name.as_str() {
+                // Starts a persistent remote process.
+                "background_job_start" => continue,
+                // Reads remote process state but requires a real job id.
+                "background_job_status" => continue,
+                // Reads remote process output but requires a real job id.
+                "background_job_output" => continue,
+                // Terminates a persistent remote process.
+                "background_job_kill" => continue,
+                _ => {}
+            }
+            let result = executor.execute(&name, json!({})).await;
+            assert!(
+                !matches!(
+                    result,
+                    Err(ref error) if error.starts_with("remote tool is unavailable:")
+                ),
+                "{name} fell through remote executor dispatch: {result:?}"
+            );
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 
