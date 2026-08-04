@@ -510,8 +510,17 @@ impl BackgroundJobManager {
         let job_id = format!("job-{}", Uuid::new_v4().simple());
         let launch_nonce = Uuid::new_v4().simple().to_string();
         let command_digest = command_digest(&request.command);
-        let remote_windows =
-            host.id() != "local" && host.health().await?.platform.as_deref() == Some("win32");
+        let platform = if host.id() == "local" {
+            None
+        } else {
+            Some(host.health().await?.platform.unwrap_or_default())
+        };
+        if host.id() != "local" && platform.as_deref() != Some("win32") {
+            return Err(HostError::Unsupported(
+                "durable background jobs are currently supported only on Windows RVM hosts".into(),
+            ));
+        }
+        let remote_windows = host.id() != "local";
         let local_posix = host.id() == "local"
             && cfg!(unix)
             && self
@@ -786,7 +795,7 @@ impl BackgroundJobManager {
             env: None,
         })
         .await?;
-        let status_path = format!("{job_root}\\status.json");
+        let status_path = remote_sibling_path(&stdout_path, "status.json");
         let status = read_remote_status(host, &status_path)
             .await
             .ok_or_else(|| {
@@ -1038,7 +1047,12 @@ impl BackgroundJobManager {
             .rsplit_once(['\\', '/'])
             .map(|(parent, _)| parent)
             .ok_or_else(|| HostError::Path("remote job output has no parent".into()))?;
-        if let Some(status) = read_remote_status(host, &format!("{parent}\\status.json")).await {
+        if let Some(status) = read_remote_status(
+            host,
+            &remote_sibling_path(&snapshot.output_path, "status.json"),
+        )
+        .await
+        {
             snapshot.omitted_bytes = status
                 .get("omitted_bytes")
                 .and_then(Value::as_u64)
@@ -1072,11 +1086,7 @@ impl BackgroundJobManager {
         if !state.lock().await.remote {
             return Ok(snapshot);
         }
-        let status_path = snapshot
-            .output_path
-            .rsplit_once(['\\', '/'])
-            .map(|(parent, _)| format!("{parent}\\status.json"))
-            .ok_or_else(|| HostError::Path("remote job status has no parent".into()))?;
+        let status_path = remote_sibling_path(&snapshot.output_path, "status.json");
         let status = read_remote_status(host, &status_path)
             .await
             .ok_or_else(|| {
@@ -1116,14 +1126,20 @@ async fn recover_local_snapshot(snapshot: &mut BackgroundJobSnapshot) -> Result<
         .get("state")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    snapshot.wrapper_pid = status
+    let marker_wrapper_pid = status
         .get("wrapper_pid")
         .and_then(Value::as_u64)
         .map(|pid| pid as u32);
-    snapshot.child_pid = status
+    let marker_child_pid = status
         .get("child_pid")
         .and_then(Value::as_u64)
         .map(|pid| pid as u32);
+    if snapshot.wrapper_pid.is_none() {
+        snapshot.wrapper_pid = marker_wrapper_pid;
+    }
+    if snapshot.child_pid.is_none() {
+        snapshot.child_pid = marker_child_pid;
+    }
     snapshot.omitted_bytes = status
         .get("omitted_bytes")
         .and_then(Value::as_u64)
@@ -1226,53 +1242,34 @@ async fn recover_remote_snapshot(
     host: &dyn Host,
     snapshot: &mut BackgroundJobSnapshot,
 ) -> Result<(), HostError> {
-    let parent = snapshot
-        .output_path
-        .rsplit_once(['\\', '/'])
-        .map(|(parent, _)| parent)
-        .ok_or_else(|| HostError::Path("remote job output has no parent".into()))?;
-    let status_path = format!("{parent}\\status.json");
+    let status_path = remote_sibling_path(&snapshot.output_path, "status.json");
     let Some(status) = read_remote_status(host, &status_path).await else {
         snapshot.status = BackgroundJobStatus::Orphaned;
         snapshot.orphan_reason = Some("remote status marker is unavailable".into());
         snapshot.finished_at = Some(Utc::now());
         return Ok(());
     };
-    snapshot.wrapper_pid = status
+    let marker_wrapper_pid = status
         .get("wrapper_pid")
         .and_then(Value::as_u64)
         .map(|pid| pid as u32);
-    snapshot.child_pid = status
+    let marker_child_pid = status
         .get("child_pid")
         .and_then(Value::as_u64)
         .map(|pid| pid as u32);
-    let observed_wrapper_start_time = status
-        .get("wrapper_start_time")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let observed_child_start_time = status
-        .get("child_start_time")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
+    if snapshot.wrapper_pid.is_none() {
+        snapshot.wrapper_pid = marker_wrapper_pid;
+    }
+    if snapshot.child_pid.is_none() {
+        snapshot.child_pid = marker_child_pid;
+    }
     let nonce_matches = status
         .get("launch_nonce")
         .and_then(Value::as_str)
         .is_some_and(|nonce| nonce == snapshot.launch_nonce);
-    let identity_matches = nonce_matches
-        && timestamps_match(
-            snapshot.wrapper_start_time.as_deref(),
-            observed_wrapper_start_time.as_deref(),
-        )
-        && timestamps_match(
-            snapshot.child_start_time.as_deref(),
-            observed_child_start_time.as_deref(),
-        );
-    snapshot.wrapper_start_time = observed_wrapper_start_time;
-    snapshot.child_start_time = observed_child_start_time;
-    if !identity_matches {
+    if !nonce_matches {
         snapshot.status = BackgroundJobStatus::Orphaned;
-        snapshot.orphan_reason =
-            Some("remote process identity does not match the durable launch marker".into());
+        snapshot.orphan_reason = Some("remote process launch nonce does not match".into());
         snapshot.finished_at = Some(Utc::now());
         return Ok(());
     }
@@ -1301,7 +1298,12 @@ async fn recover_remote_snapshot(
             let command = format!(
                 "$w=Get-Process -Id {wrapper_pid} -ErrorAction SilentlyContinue; \
                  $c=Get-Process -Id {child_pid} -ErrorAction SilentlyContinue; \
-                 [pscustomobject]@{{wrapper=($null -ne $w);child=($null -ne $c)}} | ConvertTo-Json -Compress"
+                 [pscustomobject]@{{ \
+                   wrapper=($null -ne $w); \
+                   wrapper_start=if($null -ne $w){{$w.StartTime.ToUniversalTime().ToString('o')}}else{{$null}}; \
+                   child=($null -ne $c); \
+                   child_start=if($null -ne $c){{$c.StartTime.ToUniversalTime().ToString('o')}}else{{$null}} \
+                 }} | ConvertTo-Json -Compress"
             );
             let result = host
                 .exec(ExecRequest {
@@ -1322,13 +1324,40 @@ async fn recover_remote_snapshot(
                 .get("child")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let wrapper_start_matches = wrapper_alive
+                && timestamps_match(
+                    snapshot.wrapper_start_time.as_deref(),
+                    liveness.get("wrapper_start").and_then(Value::as_str),
+                );
+            let child_start_matches = child_alive
+                && timestamps_match(
+                    snapshot.child_start_time.as_deref(),
+                    liveness.get("child_start").and_then(Value::as_str),
+                );
             if wrapper_alive && child_alive {
-                snapshot.status = BackgroundJobStatus::Running;
-                snapshot.finished_at = None;
+                if wrapper_start_matches && child_start_matches {
+                    snapshot.status = BackgroundJobStatus::Running;
+                    snapshot.finished_at = None;
+                } else {
+                    snapshot.status = BackgroundJobStatus::Orphaned;
+                    snapshot.orphan_reason = Some(
+                        "remote PID exists but process identity does not match; possible PID reuse"
+                            .into(),
+                    );
+                    snapshot.finished_at = Some(Utc::now());
+                }
             } else {
                 snapshot.status = BackgroundJobStatus::Orphaned;
                 snapshot.orphan_reason = Some(if child_alive {
-                    "remote child is still running but wrapper output collection is unavailable"
+                    if !child_start_matches {
+                        "remote PID exists but process identity does not match; possible PID reuse"
+                            .into()
+                    } else {
+                        "remote child is still running but wrapper output collection is unavailable"
+                            .into()
+                    }
+                } else if wrapper_alive && !wrapper_start_matches {
+                    "remote PID exists but process identity does not match; possible PID reuse"
                         .into()
                 } else {
                     "remote wrapper and child processes are no longer observable".into()
@@ -1607,6 +1636,14 @@ fn segment_path(root: &Path, job_id: &str, segment: usize) -> PathBuf {
 
 fn powershell_single_quote(value: &str) -> String {
     value.replace('\'', "''")
+}
+
+fn remote_sibling_path(path: &str, name: &str) -> String {
+    let parent = path
+        .rsplit_once(['\\', '/'])
+        .map(|(parent, _)| parent)
+        .unwrap_or(path);
+    opcos_rvm::join_remote_path(parent, name)
 }
 
 async fn persist_job_metadata(
