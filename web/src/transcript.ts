@@ -33,6 +33,10 @@ type RawItem = { kind: string; payload: Record<string, unknown> };
 
 function textFromContent(value: unknown): string {
   if (typeof value === "string") return value;
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const item = value as Record<string, unknown>;
+    return typeof item.text === "string" ? item.text : "";
+  }
   if (!Array.isArray(value)) return "";
   return value
     .map((part) => {
@@ -43,6 +47,18 @@ function textFromContent(value: unknown): string {
     })
     .filter(Boolean)
     .join("");
+}
+
+export function humanizeActivity(value: string): string {
+  const labels: Record<string, string> = {
+    deciding_action: "Deciding what to do next",
+    working: "Working",
+    executing_tool: "Executing tool",
+    waiting_for_approval: "Waiting for approval",
+    waiting_for_user: "Waiting for your response",
+    compacting_context: "Compacting context",
+  };
+  return labels[value] || value.replace(/[_-]+/g, " ");
 }
 
 function payloadObject(payload: unknown): Record<string, unknown> {
@@ -360,8 +376,21 @@ export function reduceStreamEvent(
             typeof details.message === "string"
               ? details.message
               : typeof details.enum === "string"
-                ? details.enum
+                ? humanizeActivity(details.enum)
                 : "Working",
+        });
+      } else if (eventType === "status_update") {
+        const status =
+          typeof details.message === "string"
+            ? details.message
+            : typeof details.enum === "string"
+              ? humanizeActivity(details.enum)
+              : "Working";
+        next.push({
+          id: `event:status:${next.length}`,
+          kind: "notice",
+          noticeKind: eventType,
+          text: status,
         });
       }
     }
@@ -525,7 +554,16 @@ export function reduceStreamEvent(
     if (typeof turn.reasoning === "string")
       assistant.reasoning = turn.reasoning;
     if (liveIndex >= 0) next.splice(liveIndex, 1, assistant);
-    else next.push(assistant);
+    else if (
+      assistant.text &&
+      next.some(
+        (item) => item.kind === "assistant" && item.text === assistant.text,
+      )
+    ) {
+      // Some providers emit the completed turn and the engine emits a
+      // fallback completion event when the provider omitted one. Keep one
+      // final assistant bubble in either case.
+    } else next.push(assistant);
     calls.forEach((call, index) => {
       const callId =
         typeof call.id === "string" ? call.id : `call-${next.length}-${index}`;

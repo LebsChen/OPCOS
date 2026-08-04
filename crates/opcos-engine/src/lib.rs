@@ -1189,6 +1189,20 @@ where
             self.store
                 .complete_tool_call(&self.session_id, message_sequence, &call.id, &result)
                 .map_err(|error| EngineError::Store(error.to_string()))?;
+            let category = tool_event_category(&call.name);
+            let _ = self
+                .working_event(
+                    &format!("{}_completed", call.name),
+                    category,
+                    json!({
+                        "call_id":call.id,
+                        "tool":call.name,
+                        "ok":result.get("error").is_none(),
+                        "result_type":if result.is_object() {"object"} else if result.is_array() {"array"} else {"value"},
+                        "result_bytes":result.to_string().len(),
+                    }),
+                )
+                .await;
             let _ = self.events.try_send(StreamChunk {
                 tool_result: Some(ToolResult {
                     call_id: call.id,
@@ -1426,6 +1440,12 @@ where
                             json!({"has_text":turn.text.is_some(),"tool_calls":turn.tool_calls.len()}),
                         )
                         .await;
+                    if !partial.turn_emitted {
+                        let _ = self.events.try_send(StreamChunk {
+                            turn: Some(turn.clone()),
+                            ..StreamChunk::default()
+                        });
+                    }
                     let assistant_sequence = *self.sequence.lock().await;
                     messages.push(assistant);
                     if turn.tool_calls.is_empty() {
@@ -1585,6 +1605,9 @@ where
                     }
                     if let Some(reasoning) = chunk.reasoning_delta.clone() {
                         partial.reasoning.get_or_insert_with(String::new).push_str(&reasoning);
+                    }
+                    if chunk.turn.is_some() {
+                        partial.turn_emitted = true;
                     }
                     let _ = self.events.try_send(chunk);
                 }
@@ -2916,6 +2939,7 @@ fn downgrade_images(value: &mut Value) {
 struct PartialOutput {
     text: Option<String>,
     reasoning: Option<String>,
+    turn_emitted: bool,
 }
 
 #[cfg(test)]
@@ -3924,7 +3948,7 @@ mod tests {
             HarnessProvider {
                 calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             },
-            store,
+            store.clone(),
             Arc::new(FakeTools),
             "harness-session",
             "/workspace",
@@ -4026,6 +4050,31 @@ mod tests {
         assert!(read_result < write_call);
         assert!(write_call < write_result);
         assert!(write_result < finished);
+        let working_events = store
+            .load_audit(Some("harness-session"))
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "working_event")
+            .filter_map(|event| {
+                event
+                    .payload
+                    .get("event_type")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            working_events
+                .iter()
+                .any(|event| event == "write_file_started"),
+            "{working_events:?}"
+        );
+        assert!(
+            working_events
+                .iter()
+                .any(|event| event == "write_file_completed"),
+            "{working_events:?}"
+        );
     }
 
     #[tokio::test]
