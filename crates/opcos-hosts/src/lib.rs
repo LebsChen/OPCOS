@@ -640,6 +640,11 @@ impl BackgroundJobManager {
             HostError::InvalidResponse(format!("background job not found: {job_id}"))
         })?;
         let mut current = state.lock().await;
+        if current.snapshot.status == BackgroundJobStatus::Orphaned {
+            return Err(HostError::InvalidResponse(
+                "orphaned background job requires explicit human confirmation before kill".into(),
+            ));
+        }
         if current.snapshot.status == BackgroundJobStatus::Running {
             match current.kill.take() {
                 Some(kill) => {
@@ -658,6 +663,30 @@ impl BackgroundJobManager {
             }
         }
         Ok(current.snapshot.clone())
+    }
+
+    pub async fn confirm_orphaned_killed(
+        &self,
+        job_id: &str,
+    ) -> Result<BackgroundJobSnapshot, HostError> {
+        let state = self.jobs.lock().await.get(job_id).cloned().ok_or_else(|| {
+            HostError::InvalidResponse(format!("background job not found: {job_id}"))
+        })?;
+        let mut current = state.lock().await;
+        if current.snapshot.status != BackgroundJobStatus::Orphaned {
+            return Err(HostError::InvalidResponse(
+                "only orphaned background jobs can be confirmed as killed".into(),
+            ));
+        }
+        current.snapshot.status = BackgroundJobStatus::Killed;
+        current.snapshot.finished_at = Some(Utc::now());
+        current.snapshot.orphan_reason = Some(
+            "human confirmed orphan cleanup; process termination was not independently observable"
+                .into(),
+        );
+        let snapshot = current.snapshot.clone();
+        persist_job_metadata(&snapshot, &current.metadata_path).await?;
+        Ok(snapshot)
     }
 }
 
@@ -2378,6 +2407,13 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("identities"))
         );
+        let error = recovered_manager.kill(&snapshot.job_id).await.unwrap_err();
+        assert!(error.to_string().contains("human confirmation"));
+        let resolved = recovered_manager
+            .confirm_orphaned_killed(&snapshot.job_id)
+            .await
+            .unwrap();
+        assert_eq!(resolved.status, BackgroundJobStatus::Killed);
         manager.kill(&snapshot.job_id).await.unwrap();
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(host_root).unwrap();
