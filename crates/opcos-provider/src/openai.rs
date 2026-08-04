@@ -1,6 +1,7 @@
 use crate::{
     AssistantTurn, Caps, Provider, ProviderConfig, ProviderError, ProviderRequest, StreamChunk,
-    TokenUsage, ToolCall, ToolCallDelta, apply_bearer_headers, classify_context_error, client,
+    TRANSIENT_RETRY_LIMIT, TokenUsage, ToolCall, ToolCallDelta, apply_bearer_headers,
+    classify_context_error, client, is_transient_request_error, is_transient_status, retry_delay,
     sanitize_secret, settings_object, tool_schema,
 };
 use async_trait::async_trait;
@@ -49,37 +50,62 @@ impl OpenAiProvider {
             self.config.base_url.trim_end_matches('/')
         );
         let mut body = body;
-        for _ in 0..2 {
-            let response = apply_bearer_headers(http.post(&url).json(&body), &self.config)
+        let mut parameter_attempts = 0;
+        for transient_attempt in 0..=TRANSIENT_RETRY_LIMIT {
+            let response = match apply_bearer_headers(http.post(&url).json(&body), &self.config)
                 .send()
                 .await
-                .map_err(crate::request_error)?;
+            {
+                Ok(response) => response,
+                Err(error)
+                    if is_transient_request_error(&error)
+                        && transient_attempt < TRANSIENT_RETRY_LIMIT =>
+                {
+                    tokio::time::sleep(retry_delay(transient_attempt, None)).await;
+                    continue;
+                }
+                Err(error) => return Err(crate::request_error(error)),
+            };
             if response.status().is_success() {
                 return Ok(response);
             }
             let status = response.status();
+            let retry_after = response.headers().get(reqwest::header::RETRY_AFTER);
+            let retry_after = retry_after.cloned();
             let text = response.text().await.unwrap_or_default();
             let lower = text.to_ascii_lowercase();
             if let Some(error) = classify_context_error(status, &text) {
                 return Err(error);
             }
-            if lower.contains("reasoning_effort")
+            if is_transient_status(status) && transient_attempt < TRANSIENT_RETRY_LIMIT {
+                tokio::time::sleep(retry_delay(transient_attempt, retry_after.as_ref())).await;
+                continue;
+            }
+            if parameter_attempts < 3
+                && lower.contains("reasoning_effort")
                 && lower.contains("not supported")
                 && body.get("reasoning_effort").is_some()
             {
                 body["reasoning_effort"] = "none".into();
+                parameter_attempts += 1;
                 continue;
             }
-            if lower.contains("max_tokens")
+            if parameter_attempts < 3
+                && lower.contains("max_tokens")
                 && lower.contains("not supported")
                 && let Some(value) = body.get("max_tokens").cloned()
             {
                 body["max_completion_tokens"] = value;
                 body.as_object_mut().unwrap().remove("max_tokens");
+                parameter_attempts += 1;
                 continue;
             }
-            if lower.contains("stream_options") && body.get("stream_options").is_some() {
+            if parameter_attempts < 3
+                && lower.contains("stream_options")
+                && body.get("stream_options").is_some()
+            {
                 body.as_object_mut().unwrap().remove("stream_options");
+                parameter_attempts += 1;
                 continue;
             }
             return Err(ProviderError::Http {
@@ -87,9 +113,7 @@ impl OpenAiProvider {
                 message: sanitize_secret(&text, self.config.api_key.expose()),
             });
         }
-        Err(ProviderError::Protocol(
-            "provider parameter retry exhausted".into(),
-        ))
+        unreachable!("transient retry loop returns on every iteration")
     }
 }
 
@@ -447,6 +471,64 @@ impl Provider for OpenAiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        task::JoinHandle,
+    };
+
+    async fn response_sequence(
+        statuses: Vec<u16>,
+        retry_after: Option<&str>,
+    ) -> (String, Arc<AtomicUsize>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let retry_after = retry_after.map(str::to_owned);
+        let task = tokio::spawn(async move {
+            for status in statuses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                observed.fetch_add(1, Ordering::SeqCst);
+                let (body, content_type) = if status == 200 {
+                    (
+                        r#"{"choices":[{"message":{"content":"ok"}}]}"#,
+                        "application/json",
+                    )
+                } else {
+                    ("rate limited", "text/plain")
+                };
+                let retry_header = retry_after
+                    .as_deref()
+                    .map(|value| format!("Retry-After: {value}\r\n"))
+                    .unwrap_or_default();
+                let response = format!(
+                    "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n{retry_header}\r\n{body}",
+                    if status == 200 { "OK" } else { "Error" },
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (format!("http://{address}"), calls, task)
+    }
 
     #[test]
     fn parses_openai_fixture_and_salvages_tool_text() {
@@ -494,5 +576,43 @@ mod tests {
         });
         assert_eq!(reasoning(&value).as_deref(), Some("private chain"));
         assert_eq!(value["content"].as_str(), Some("visible answer"));
+    }
+
+    #[tokio::test]
+    async fn retries_transient_http_responses_before_success() {
+        let (base_url, calls, task) = response_sequence(vec![429, 500, 200], Some("0")).await;
+        let provider = OpenAiProvider::new(ProviderConfig::new(base_url, "test-key"));
+        let turn = provider
+            .complete(ProviderRequest {
+                model: "test".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(turn.text.as_deref(), Some("ok"));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stops_after_bounded_transient_http_retries() {
+        let (base_url, calls, task) = response_sequence(vec![429, 429, 429, 429], Some("0")).await;
+        let provider = OpenAiProvider::new(ProviderConfig::new(base_url, "test-key"));
+        let error = provider
+            .complete(ProviderRequest {
+                model: "test".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProviderError::Http {
+                status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                ..
+            }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        task.await.unwrap();
     }
 }
