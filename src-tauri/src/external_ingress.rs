@@ -482,4 +482,38 @@ mod tests {
         server.join().unwrap();
         let _ = std::fs::remove_file(secret_path);
     }
+
+    #[tokio::test]
+    async fn feed_failures_backoff_and_open_a_source_circuit_without_secrets() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .save_external_ingress_source(
+                "feed:unavailable",
+                "rss",
+                &json!({"url":"http://127.0.0.1:9/feed.xml?token=secret"}),
+            )
+            .unwrap();
+        store
+            .set_external_ingress_enabled("feed:unavailable", true)
+            .unwrap();
+        let secrets = KeyringSecretStore::with_fallback(
+            "opcos-test",
+            std::env::temp_dir().join(format!("opcos-ingress-{}", uuid::Uuid::new_v4())),
+        );
+        let client = reqwest::Client::new();
+        for _ in 0..5 {
+            let source = store
+                .load_external_ingress_source("feed:unavailable")
+                .unwrap()
+                .unwrap();
+            poll_source(&client, &store, &secrets, &source).await;
+        }
+        let source = store
+            .load_external_ingress_source("feed:unavailable")
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.consecutive_failures, 5);
+        assert!(source.circuit_open_until.is_some());
+        assert!(source.last_error.unwrap_or_default().contains("[redacted]"));
+    }
 }
