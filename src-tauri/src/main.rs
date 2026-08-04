@@ -4483,6 +4483,74 @@ fn seed_builtin_templates(connection: &Connection) -> Result<(), String> {
 - 遇到冲突或失败时保留可复现证据，优先修复根因，并确保回滚路径清楚。
 "#,
         ),
+        (
+            "template-knowledge-opcos-host-boundary",
+            "OPCOS Host 能力边界",
+            "避免把不同 Host 的能力和路径语义混为一谈。",
+            r#"# OPCOS Host 能力边界
+
+这篇用于避免一个常见误判：远程 Host 不等于本地 Host，不能因为某项能力在本地可用就假设远程也可用。
+
+- 所有执行、文件、进程、屏幕和路径操作都经过选定的 `Host`；先检查 `capabilities`，再决定能否调用。
+- LocalHost 明确不支持 VNC、computer use 和 screenshot；这些是不可用能力，不是尚未探测到。LocalHost 也不提供 PTY。
+- RVM 使用远程 PTY/WebSocket process stream，不提供安全的结构化 stdio。因此 ACP 在 RVM 上不可用；RVM 的结构化远程 LSP 通道也当前不支持。
+- 能力缺失和远程 Host 不可达都会返回显式错误。OPCOS 不会为了掩盖失败而把远程操作静默改到 LocalHost。
+- 远程路径必须使用 Host 的远程路径拼接和 workspace containment 检查。不要用本地 `canonicalize` 推断远程路径是否存在或是否安全。
+- 只有明确选择的 Host 才能执行操作；不要自行猜测另一个 Host、伪造能力，或把未声明的能力当作可用。
+"#,
+        ),
+        (
+            "template-knowledge-opcos-config-scopes",
+            "OPCOS 配置作用域",
+            "避免把配置当成单一全局文件，或误以为仓库资产会自动同步。",
+            r#"# OPCOS 配置作用域
+
+这篇用于避免一个常见误判：配置不是一份可以随意覆盖的全局文件，仓库里的 `.agents/*` 也不是自动同步层。
+
+- 配置有五层：`global`、`project`、`repo`、`host`、`session`。相同 kind 和 name 冲突时，越具体的层覆盖越宽的层：global < project < repo < host < session。
+- 项目和 session 还可以禁用选中的资产；最终 bundle 只包含当前上下文实际启用的配置。
+- Session 首次建立时会把有效配置对象及其 version 绑定到 `session_config_bindings` 和 `session_config_versions`。不要把 session 看成每次运行都自动读取最新版本。
+- `.agents/*` 当前提供仓库发现、显式导入和特定类型导出路径：包括 rules、skills、knowledge、playbooks、commands 和 MCP 目录。没有已实现的“所有 `.agents/*` 自动同步到各作用域”机制，不要假设存在这种同步。
+- 内置 knowledge、rules、runbook、skill 等 preset 在启动时通过 builtin seed 写入 global scope。seed 只在同名 active global 对象不存在时创建；已有对象（包括用户改过的内容）不会被启动覆盖。
+- 需要判断配置时，优先使用当前 scope、启用状态和 session 绑定版本，不要只看仓库文件或某个默认 preset。
+"#,
+        ),
+        (
+            "template-knowledge-opcos-autonomy-approval",
+            "OPCOS 自治与审批",
+            "避免把 goal 自治级别、session 权限模式和模型提示词混成同一套控制。",
+            r#"# OPCOS 自治与审批
+
+这篇用于避免一个常见误判：模型说“可以做”不等于策略或持久化状态允许它做。
+
+- autonomous goal 的 `autonomy_level` 是存储字段，当前只有 `propose` 和 `execute`。默认是 `propose`，不要把它和 session 的 `PermissionMode` 混用。
+- `PermissionMode` 是另一层工具调用策略：`Discuss` 拒绝操作；`Plan` 和 `Interactive` 对写入或外部操作需要用户；`Auto` 按策略允许；当前 `Custom` 默认需要用户。
+- 工具风险分为 Read、Search、GitRead、Write、Execute、External。写文件、执行命令、提交、推送和其他外部副作用不能按只读操作处理。
+- dangerous 操作在 unattended 模式下默认拒绝；匹配的 durable grant 只对精确 target 放行，不是全局无限授权。
+- `propose` goal 生成的 ready work item 会在 Store 中转为 `pending_approval`；批准后才回到 `ready`。这是真实的存储状态约束，不是 prompt 自律。
+- 工具审批请求、pending 状态、批准或拒绝结果都持久化，因此重启后可以恢复并继续处理。需要暂停时应等待用户，而不是猜测批准。
+"#,
+        ),
+        (
+            "template-knowledge-opcos-events-queue",
+            "OPCOS 事件与工作队列",
+            "避免把事件、规则触发和队列重试当成一次即时调用，或混淆两种不同的熔断。",
+            r#"# OPCOS 事件与工作队列
+
+这篇用于避免一个常见误判：发布事件不会直接执行任务，事件去重、规则 dispatch 去重和 work item 幂等也不是同一件事。
+
+- 当前内部事件包括 action ledger 的 `action.failed`、work queue 的 `queue.dead_letter` 和 planner 的 `goal.paused`。外部轮询事件使用 `external.<provider>.<event>` 命名空间；不要让外部输入伪装成 `action.*`、`queue.*` 或 `goal.*`。
+- 当前 external ingress provider 是 GitHub Events polling 和 RSS/Atom polling。GitHub polling 当前覆盖 pull request、PR comment 和 issue 事件；不要假设它提供 check-run 状态或 webhook 能力。
+- `publish_event` 将 namespaced event 持久化，并校验 kind、source 和 dedup key。事件层 dedup 防止同一个外部或内部事件重复进入 event store。
+- `event_rules` 按 kind pattern 匹配，支持前缀通配；规则可以 `enqueue_work` 或 `plan_goal`。规则有 `max_triggers`/`window_seconds` 限流、dispatch 去重和连续失败计数。
+- event rule 达到 `failure_limit` 后会被自动 disable。这不是 external ingress 的时间熔断：event rule 没有 `open_until`/half-open 状态；不要把两者混写。
+- work queue 通过 `dedup_key` 防止同一工作项重复入队；`idempotency_key` 是重复尝试外部副作用时的幂等标识，不能替代 event dedup。
+- 队列任务使用 owner、到期时间和递增 `lease_generation` 进行 lease fencing。续租或完成必须匹配 worker、generation 且 lease 未过期，旧 worker 不能更新新一轮 lease。
+- 失败任务按 `max_attempts` 和指数退避重试；达到上限后进入 `dead_letter`，可以显式 requeue。不要把 dead letter 当成成功。
+- event bus 使用持久化 consumer `planner-event-pump`，每轮最多读取 100 个事件；无匹配规则或成功处理后才 ack，失败时保留事件以便后续处理。
+- planner 既可由 event rule 的 `plan_goal` 唤醒，也会由独立的定时循环扫描 active goals。event bus、planner 和 external ingress 是分开的调度路径。
+"#,
+        ),
     ];
     for (id, name, description, content) in knowledge {
         seed_builtin_template(
@@ -20048,8 +20116,8 @@ mod m7_tests {
                 |row| row.get(0),
             )
             .unwrap();
-        // 152 = 29 baseline assets plus 123 verified, disabled MCP catalog entries.
-        assert_eq!(builtin_count, 152);
+        // 156 = 33 baseline assets plus 123 verified, disabled MCP catalog entries.
+        assert_eq!(builtin_count, 156);
         for id in [
             "template-runbook-playbook-template",
             "template-runbook-pr-review",
