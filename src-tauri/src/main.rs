@@ -2359,10 +2359,22 @@ async fn execute_edit_file_tool(host: &dyn Host, arguments: &Value) -> Result<Va
         .get("path")
         .and_then(Value::as_str)
         .ok_or("missing string argument: path")?;
-    let edits = arguments
-        .get("edits")
-        .and_then(Value::as_array)
-        .ok_or("missing array argument: edits")?;
+    let edits = if let Some(edits) = arguments.get("edits").and_then(Value::as_array) {
+        edits.clone()
+    } else if let (Some(old_string), Some(new_string)) = (
+        arguments.get("old_string").and_then(Value::as_str),
+        arguments.get("new_string").and_then(Value::as_str),
+    ) {
+        vec![json!({
+            "old_string": old_string,
+            "new_string": new_string,
+        })]
+    } else {
+        return Err(
+            "missing array argument: edits (expected [{\"old_string\":...,\"new_string\":...}])"
+                .into(),
+        );
+    };
     if edits.is_empty() {
         return Err("edits must contain at least one replacement".into());
     }
@@ -21203,6 +21215,27 @@ mod m7_tests {
                 .unwrap()
                 .iter()
                 .any(|line| line == "changed")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_edit_accepts_single_replacement_compatibility_shape() {
+        let (root, host) = edit_test_host();
+        std::fs::write(root.join("file.txt"), "one\nneedle\nthree\n").unwrap();
+        execute_edit_file_tool(
+            &host,
+            &json!({
+                "path": "file.txt",
+                "old_string": "needle",
+                "new_string": "changed"
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("file.txt")).unwrap(),
+            "one\nchanged\nthree\n"
         );
         std::fs::remove_dir_all(root).unwrap();
     }
