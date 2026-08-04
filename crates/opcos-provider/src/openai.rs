@@ -188,13 +188,14 @@ fn normalize_message(message: &Value) -> Value {
         }).collect();
         normalized.insert("tool_calls".into(), Value::Array(calls));
     }
-    if normalized.get("role").and_then(Value::as_str) == Some("tool")
-        && !normalized.contains_key("tool_call_id")
-        && let Some(id) = normalized
-            .remove("tool_use_id")
-            .or_else(|| nested_tool_use_id.map(Value::String))
-    {
-        normalized.insert("tool_call_id".into(), id);
+    if normalized.get("role").and_then(Value::as_str) == Some("tool") {
+        let top_level_tool_use_id = normalized.remove("tool_use_id");
+        if !normalized.contains_key("tool_call_id")
+            && let Some(id) =
+                top_level_tool_use_id.or_else(|| nested_tool_use_id.map(Value::String))
+        {
+            normalized.insert("tool_call_id".into(), id);
+        }
     }
     Value::Object(normalized)
 }
@@ -602,6 +603,7 @@ mod tests {
             "content": [{"tool_use_id": "nested", "text": "result"}]
         }));
         assert_eq!(existing["tool_call_id"], "existing");
+        assert!(existing.get("tool_use_id").is_none());
     }
 
     #[test]
