@@ -2794,6 +2794,7 @@ function GitActions({
           displayed.
         </p>
       </details>
+      <CiMonitorPanel selected={selected} onError={onError} />
       <details>
         <summary>处理 GitHub PR 评论</summary>
         <input
@@ -2820,6 +2821,101 @@ function GitActions({
         </p>
       </details>
     </div>
+  );
+}
+
+function CiMonitorPanel({
+  selected,
+  onError,
+}: {
+  selected: Session;
+  onError: (error: unknown) => void;
+}) {
+  const [monitorId, setMonitorId] = useState("");
+  const [repo, setRepo] = useState("");
+  const [pullRequest, setPullRequest] = useState("");
+  const [branch, setBranch] = useState("HEAD");
+  const [enabled, setEnabled] = useState(false);
+  const [monitor, setMonitor] = useState<unknown>(null);
+  const refresh = () => {
+    if (!selected.project_id) return;
+    Promise.all([invoke<unknown[]>("ci_monitors", { enabledOnly: false })])
+      .then(([monitors]) => {
+        const current = monitors.find(
+          (item) =>
+            typeof item === "object" &&
+            item !== null &&
+            (item as { project_id?: string }).project_id ===
+              selected.project_id,
+        );
+        if (current) {
+          setMonitor(current);
+          setEnabled(Boolean((current as { enabled?: boolean }).enabled));
+        }
+      })
+      .catch(onError);
+  };
+  useEffect(refresh, [selected.project_id]);
+  const save = () =>
+    invoke("save_ci_monitor", {
+      monitorId,
+      projectId: selected.project_id,
+      repo,
+      pullRequest: Number(pullRequest),
+      branch,
+      pollIntervalSeconds: 30,
+    })
+      .then(setMonitor)
+      .then(refresh)
+      .catch(onError);
+  const toggle = () =>
+    invoke("set_ci_monitor_enabled", {
+      monitorId,
+      enabled: !enabled,
+    })
+      .then((value) => {
+        setMonitor(value);
+        setEnabled(!enabled);
+        refresh();
+      })
+      .catch(onError);
+  return (
+    <details>
+      <summary>GitHub CI failure monitor and event source</summary>
+      <input
+        value={monitorId}
+        onChange={(event) => setMonitorId(event.target.value)}
+        placeholder="monitor id"
+      />
+      <input
+        value={repo}
+        onChange={(event) => setRepo(event.target.value)}
+        placeholder="owner/repository"
+      />
+      <input
+        value={pullRequest}
+        onChange={(event) => setPullRequest(event.target.value)}
+        placeholder="PR number"
+      />
+      <input
+        value={branch}
+        onChange={(event) => setBranch(event.target.value)}
+        placeholder="branch"
+      />
+      <Button onClick={save}>Save monitor</Button>
+      {monitor ? (
+        <Button onClick={toggle}>
+          {enabled ? "Disable monitoring" : "Enable monitoring"}
+        </Button>
+      ) : null}
+      <Button onClick={refresh}>Refresh status</Button>
+      <p className="muted small">
+        This only polls GitHub CI and publishes external.github.ci.failed
+        events. It does not automatically repair code or start an agent.
+        Configure an event rule if you want to route the event to a durable work
+        item.
+      </p>
+    </details>
   );
 }
 

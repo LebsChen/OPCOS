@@ -369,6 +369,39 @@ pub struct ExternalIngressSource {
     pub last_error: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct CiMonitor {
+    pub monitor_id: String,
+    pub project_id: String,
+    pub repo: String,
+    pub pull_request: u64,
+    pub branch: String,
+    pub enabled: bool,
+    pub poll_interval_seconds: u64,
+    pub next_poll_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct CiMonitorState {
+    pub monitor_id: String,
+    pub repo: String,
+    pub pull_request: u64,
+    pub head_sha: String,
+    pub overall: String,
+    pub initialized: bool,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct WorkQueueProgress {
+    pub queue_id: String,
+    pub worker_id: String,
+    pub lease_generation: u64,
+    pub progress: serde_json::Value,
+    pub updated_at: String,
+}
+
 fn external_ingress_source_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<ExternalIngressSource> {
@@ -3200,6 +3233,84 @@ impl SqliteStore {
             .map_err(StoreError::from)
     }
 
+    pub fn save_work_queue_progress(
+        &self,
+        queue_id: &str,
+        worker_id: &str,
+        lease_generation: u64,
+        progress: &serde_json::Value,
+    ) -> Result<WorkQueueProgress, StoreError> {
+        if queue_id.trim().is_empty() || worker_id.trim().is_empty() {
+            return Err(StoreError::Validation(
+                "queue_id and worker_id cannot be empty".into(),
+            ));
+        }
+        if lease_generation > i64::MAX as u64 {
+            return Err(StoreError::Validation(
+                "lease_generation is out of range".into(),
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let changed = connection.execute(
+            "INSERT INTO work_queue_progress(queue_id,worker_id,lease_generation,progress,updated_at)
+             SELECT ?1,?2,?3,?4,?5
+             WHERE EXISTS (
+               SELECT 1 FROM work_queue
+               WHERE queue_id=?1 AND status='running' AND lease_owner=?2
+                 AND lease_generation=?3 AND lease_until>?5
+             )
+             ON CONFLICT(queue_id) DO UPDATE SET
+               worker_id=excluded.worker_id,
+               lease_generation=excluded.lease_generation,
+               progress=excluded.progress,
+               updated_at=excluded.updated_at
+             WHERE work_queue_progress.worker_id=excluded.worker_id
+               AND work_queue_progress.lease_generation=excluded.lease_generation",
+            params![
+                queue_id,
+                worker_id,
+                lease_generation as i64,
+                serde_json::to_string(progress)
+                    .map_err(|error| StoreError::Validation(error.to_string()))?,
+                now
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::Validation(
+                "lease is missing, expired, or owned by another worker".into(),
+            ));
+        }
+        self.load_work_queue_progress(queue_id)?
+            .ok_or_else(|| StoreError::Validation("work queue progress was not saved".into()))
+    }
+
+    pub fn load_work_queue_progress(
+        &self,
+        queue_id: &str,
+    ) -> Result<Option<WorkQueueProgress>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .query_row(
+                "SELECT queue_id,worker_id,lease_generation,progress,updated_at
+                 FROM work_queue_progress WHERE queue_id=?1",
+                [queue_id],
+                |row| {
+                    let progress: String = row.get(3)?;
+                    Ok(WorkQueueProgress {
+                        queue_id: row.get(0)?,
+                        worker_id: row.get(1)?,
+                        lease_generation: u64::try_from(row.get::<_, i64>(2)?).unwrap_or_default(),
+                        progress: serde_json::from_str(&progress)
+                            .unwrap_or_else(|_| serde_json::json!({})),
+                        updated_at: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     pub fn complete_work_item(
         &self,
         queue_id: &str,
@@ -4169,6 +4280,42 @@ impl SqliteStore {
                     [Utc::now().to_rfc3339()],
                 )?;
             }
+            if version < 9 {
+                connection.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS work_queue_progress (
+                       queue_id TEXT PRIMARY KEY,
+                       worker_id TEXT NOT NULL,
+                       lease_generation INTEGER NOT NULL,
+                       progress TEXT NOT NULL,
+                       updated_at TEXT NOT NULL
+                     );
+                     CREATE TABLE IF NOT EXISTS ci_monitors (
+                       monitor_id TEXT PRIMARY KEY,
+                       project_id TEXT NOT NULL,
+                       repo TEXT NOT NULL,
+                       pull_request INTEGER NOT NULL,
+                       branch TEXT NOT NULL,
+                       enabled INTEGER NOT NULL DEFAULT 0,
+                       poll_interval_seconds INTEGER NOT NULL DEFAULT 30,
+                       next_poll_at TEXT,
+                       last_error TEXT
+                     );
+                     CREATE INDEX IF NOT EXISTS idx_ci_monitors_due
+                       ON ci_monitors(enabled,next_poll_at);
+                     CREATE TABLE IF NOT EXISTS ci_monitor_states (
+                       monitor_id TEXT NOT NULL,
+                       repo TEXT NOT NULL,
+                       pull_request INTEGER NOT NULL,
+                       head_sha TEXT NOT NULL,
+                       overall TEXT NOT NULL,
+                       initialized INTEGER NOT NULL DEFAULT 0,
+                       updated_at TEXT NOT NULL,
+                       PRIMARY KEY(monitor_id,head_sha)
+                     );
+                     INSERT INTO schema_migrations(version, applied_at)
+                       VALUES (9, CURRENT_TIMESTAMP);",
+                )?;
+            }
             Ok(())
         })();
         match migration {
@@ -4330,6 +4477,172 @@ impl SqliteStore {
         connection.execute(
             "DELETE FROM external_ingress_sources WHERE source_id=?1",
             [source_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn save_ci_monitor(&self, monitor: &CiMonitor) -> Result<CiMonitor, StoreError> {
+        if monitor.monitor_id.trim().is_empty()
+            || monitor.project_id.trim().is_empty()
+            || monitor.repo.trim().is_empty()
+            || monitor.branch.trim().is_empty()
+            || monitor.pull_request == 0
+        {
+            return Err(StoreError::Validation(
+                "CI monitor identity and pull request are required".into(),
+            ));
+        }
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "INSERT INTO ci_monitors
+             (monitor_id,project_id,repo,pull_request,branch,enabled,poll_interval_seconds,next_poll_at,last_error)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+             ON CONFLICT(monitor_id) DO UPDATE SET
+               project_id=excluded.project_id,repo=excluded.repo,pull_request=excluded.pull_request,
+               branch=excluded.branch,enabled=excluded.enabled,poll_interval_seconds=excluded.poll_interval_seconds,
+               next_poll_at=excluded.next_poll_at,last_error=excluded.last_error",
+            params![
+                monitor.monitor_id,
+                monitor.project_id,
+                monitor.repo,
+                monitor.pull_request as i64,
+                monitor.branch,
+                monitor.enabled,
+                monitor.poll_interval_seconds.clamp(30, 86_400) as i64,
+                monitor.next_poll_at,
+                monitor.last_error
+            ],
+        )?;
+        self.load_ci_monitor(&monitor.monitor_id)?
+            .ok_or_else(|| StoreError::Validation("CI monitor was not saved".into()))
+    }
+
+    pub fn load_ci_monitor(&self, monitor_id: &str) -> Result<Option<CiMonitor>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .query_row(
+                "SELECT monitor_id,project_id,repo,pull_request,branch,enabled,
+                        poll_interval_seconds,next_poll_at,last_error
+                 FROM ci_monitors WHERE monitor_id=?1",
+                [monitor_id],
+                |row| {
+                    Ok(CiMonitor {
+                        monitor_id: row.get(0)?,
+                        project_id: row.get(1)?,
+                        repo: row.get(2)?,
+                        pull_request: u64::try_from(row.get::<_, i64>(3)?).unwrap_or_default(),
+                        branch: row.get(4)?,
+                        enabled: row.get(5)?,
+                        poll_interval_seconds: u64::try_from(row.get::<_, i64>(6)?).unwrap_or(30),
+                        next_poll_at: row.get(7)?,
+                        last_error: row.get(8)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn load_ci_monitors(&self, enabled_only: bool) -> Result<Vec<CiMonitor>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT monitor_id,project_id,repo,pull_request,branch,enabled,
+                    poll_interval_seconds,next_poll_at,last_error
+             FROM ci_monitors WHERE (?1=0 OR enabled=1) ORDER BY monitor_id",
+        )?;
+        statement
+            .query_map([enabled_only], |row| {
+                Ok(CiMonitor {
+                    monitor_id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    repo: row.get(2)?,
+                    pull_request: u64::try_from(row.get::<_, i64>(3)?).unwrap_or_default(),
+                    branch: row.get(4)?,
+                    enabled: row.get(5)?,
+                    poll_interval_seconds: u64::try_from(row.get::<_, i64>(6)?).unwrap_or(30),
+                    next_poll_at: row.get(7)?,
+                    last_error: row.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn set_ci_monitor_enabled(
+        &self,
+        monitor_id: &str,
+        enabled: bool,
+    ) -> Result<(), StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let changed = connection.execute(
+            "UPDATE ci_monitors SET enabled=?1 WHERE monitor_id=?2",
+            params![enabled, monitor_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::Validation("CI monitor not found".into()));
+        }
+        Ok(())
+    }
+
+    pub fn update_ci_monitor_poll(
+        &self,
+        monitor_id: &str,
+        next_poll_at: Option<&str>,
+        last_error: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "UPDATE ci_monitors SET next_poll_at=?1,last_error=?2 WHERE monitor_id=?3",
+                params![next_poll_at, last_error, monitor_id],
+            )?;
+        Ok(())
+    }
+
+    pub fn load_ci_monitor_state(
+        &self,
+        monitor_id: &str,
+        head_sha: &str,
+    ) -> Result<Option<CiMonitorState>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .query_row(
+                "SELECT monitor_id,repo,pull_request,head_sha,overall,initialized,updated_at
+                 FROM ci_monitor_states WHERE monitor_id=?1 AND head_sha=?2",
+                params![monitor_id, head_sha],
+                |row| {
+                    Ok(CiMonitorState {
+                        monitor_id: row.get(0)?,
+                        repo: row.get(1)?,
+                        pull_request: u64::try_from(row.get::<_, i64>(2)?).unwrap_or_default(),
+                        head_sha: row.get(3)?,
+                        overall: row.get(4)?,
+                        initialized: row.get(5)?,
+                        updated_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn save_ci_monitor_state(&self, state: &CiMonitorState) -> Result<(), StoreError> {
+        self.connection.lock().expect("sqlite mutex poisoned").execute(
+            "INSERT INTO ci_monitor_states
+             (monitor_id,repo,pull_request,head_sha,overall,initialized,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(monitor_id,head_sha) DO UPDATE SET
+               overall=excluded.overall,initialized=excluded.initialized,updated_at=excluded.updated_at",
+            params![
+                state.monitor_id,
+                state.repo,
+                state.pull_request as i64,
+                state.head_sha,
+                state.overall,
+                state.initialized,
+                state.updated_at
+            ],
         )?;
         Ok(())
     }
@@ -7142,6 +7455,44 @@ mod tests {
                 .load_latest_local_gate_record("session-1", "def456")
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn work_queue_progress_requires_current_lease_generation() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let item = store
+            .enqueue_work_item(
+                "ci_repair_loop",
+                &serde_json::json!({}),
+                None,
+                None,
+                10,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let claimed = store.claim_work_item("worker-1", 60).unwrap().unwrap();
+        assert_eq!(claimed.queue_id, item.queue_id);
+        let saved = store
+            .save_work_queue_progress(
+                &item.queue_id,
+                "worker-1",
+                claimed.lease_generation,
+                &serde_json::json!({"phase":"diagnosing","repair_attempts":1}),
+            )
+            .unwrap();
+        assert_eq!(saved.progress["phase"], "diagnosing");
+        assert!(
+            store
+                .save_work_queue_progress(
+                    &item.queue_id,
+                    "worker-2",
+                    claimed.lease_generation,
+                    &serde_json::json!({"phase":"stale"}),
+                )
+                .is_err()
         );
     }
 }
