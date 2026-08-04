@@ -107,7 +107,9 @@ impl AnthropicProvider {
                 message: sanitize_secret(&body, self.config.api_key.expose()),
             });
         }
-        unreachable!("transient retry loop returns on every iteration")
+        Err(ProviderError::Protocol(
+            "provider transient retry exhausted".into(),
+        ))
     }
 }
 

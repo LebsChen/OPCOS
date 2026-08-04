@@ -51,7 +51,8 @@ impl OpenAiProvider {
         );
         let mut body = body;
         let mut parameter_attempts = 0;
-        for transient_attempt in 0..=TRANSIENT_RETRY_LIMIT {
+        let mut transient_attempt = 0;
+        loop {
             let response = match apply_bearer_headers(http.post(&url).json(&body), &self.config)
                 .send()
                 .await
@@ -62,6 +63,7 @@ impl OpenAiProvider {
                         && transient_attempt < TRANSIENT_RETRY_LIMIT =>
                 {
                     tokio::time::sleep(retry_delay(transient_attempt, None)).await;
+                    transient_attempt += 1;
                     continue;
                 }
                 Err(error) => return Err(crate::request_error(error)),
@@ -79,6 +81,7 @@ impl OpenAiProvider {
             }
             if is_transient_status(status) && transient_attempt < TRANSIENT_RETRY_LIMIT {
                 tokio::time::sleep(retry_delay(transient_attempt, retry_after.as_ref())).await;
+                transient_attempt += 1;
                 continue;
             }
             if parameter_attempts < 3
@@ -88,6 +91,7 @@ impl OpenAiProvider {
             {
                 body["reasoning_effort"] = "none".into();
                 parameter_attempts += 1;
+                transient_attempt = 0;
                 continue;
             }
             if parameter_attempts < 3
@@ -98,6 +102,7 @@ impl OpenAiProvider {
                 body["max_completion_tokens"] = value;
                 body.as_object_mut().unwrap().remove("max_tokens");
                 parameter_attempts += 1;
+                transient_attempt = 0;
                 continue;
             }
             if parameter_attempts < 3
@@ -106,6 +111,7 @@ impl OpenAiProvider {
             {
                 body.as_object_mut().unwrap().remove("stream_options");
                 parameter_attempts += 1;
+                transient_attempt = 0;
                 continue;
             }
             return Err(ProviderError::Http {
@@ -113,7 +119,6 @@ impl OpenAiProvider {
                 message: sanitize_secret(&text, self.config.api_key.expose()),
             });
         }
-        unreachable!("transient retry loop returns on every iteration")
     }
 }
 
@@ -511,6 +516,11 @@ mod tests {
                         r#"{"choices":[{"message":{"content":"ok"}}]}"#,
                         "application/json",
                     )
+                } else if status == 400 {
+                    (
+                        r#"{"error":"reasoning_effort not supported"}"#,
+                        "application/json",
+                    )
                 } else {
                     ("rate limited", "text/plain")
                 };
@@ -613,6 +623,24 @@ mod tests {
             }
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 4);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn separates_transient_and_parameter_retry_budgets() {
+        let (base_url, calls, task) =
+            response_sequence(vec![429, 429, 429, 400, 200], Some("0")).await;
+        let provider = OpenAiProvider::new(ProviderConfig::new(base_url, "test-key"));
+        let turn = provider
+            .complete(ProviderRequest {
+                model: "gpt-5-test".into(),
+                tools: vec![json!({"type":"function"})],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(turn.text.as_deref(), Some("ok"));
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
         task.await.unwrap();
     }
 }
