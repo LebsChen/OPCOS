@@ -300,7 +300,6 @@ fn github_event_kind(value: &Value) -> Option<(&'static str, String)> {
         "PullRequestEvent" => Some(("pull_request", action)),
         "IssueCommentEvent" => Some(("pull_request_comment", action)),
         "IssuesEvent" => Some(("issue", action)),
-        "CheckRunEvent" => Some(("check_run", action)),
         _ => None,
     }
 }

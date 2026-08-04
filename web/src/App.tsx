@@ -5595,8 +5595,9 @@ function ManageSections({
               <p className="muted mt-1">
                 GitHub repository events are best-effort polling: GitHub
                 documents up to 300 events from the last 30 days and may delay
-                delivery. Pull requests, comments, issues, and check runs are
-                mapped when GitHub includes them in the event stream.
+                delivery. Pull requests, comments, and issues are mapped.
+                Check-run state is not exposed by this Events API source; use
+                the later webhook/Checks integration for CI state triggers.
               </p>
               <div className="form-grid mt-4">
                 <label className="field-label">
