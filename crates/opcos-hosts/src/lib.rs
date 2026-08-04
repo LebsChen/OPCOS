@@ -310,7 +310,15 @@ pub struct BackgroundJobSnapshot {
     pub omitted_bytes: u64,
     #[serde(default)]
     pub command_digest: String,
-    #[serde(skip_serializing)]
+    #[serde(default)]
+    pub host_id: String,
+    #[serde(default)]
+    pub wrapper_pid: Option<u32>,
+    #[serde(default)]
+    pub child_pid: Option<u32>,
+    #[serde(default)]
+    pub orphan_reason: Option<String>,
+    #[serde(default, skip_serializing)]
     pub output_path: String,
 }
 
@@ -376,6 +384,10 @@ impl BackgroundJobManager {
             retained_start_line: 0,
             omitted_bytes: 0,
             command_digest,
+            host_id: host.id().to_owned(),
+            wrapper_pid: None,
+            child_pid: None,
+            orphan_reason: None,
             output_path: output_path.display().to_string(),
         };
         let (kill, killed) = oneshot::channel();
@@ -525,6 +537,53 @@ impl BackgroundJobManager {
             HostError::InvalidResponse(format!("background job not found: {job_id}"))
         })?;
         Ok(state.lock().await.snapshot.clone())
+    }
+
+    pub async fn recover(&self, host: &dyn Host) -> Result<Vec<BackgroundJobSnapshot>, HostError> {
+        fs::create_dir_all(self.root.as_ref()).await?;
+        let mut entries = fs::read_dir(self.root.as_ref()).await?;
+        let mut recovered = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let contents = fs::read_to_string(&path).await?;
+            let metadata: DurableMetadataOwned = serde_json::from_str(&contents)
+                .map_err(|error| HostError::InvalidResponse(error.to_string()))?;
+            let mut snapshot = metadata.snapshot;
+            if snapshot.output_path.is_empty() {
+                snapshot.output_path = metadata.output_path;
+            }
+            if snapshot.host_id != host.id() {
+                continue;
+            }
+            if matches!(
+                snapshot.status,
+                BackgroundJobStatus::Running | BackgroundJobStatus::Terminating
+            ) {
+                snapshot.status = BackgroundJobStatus::Orphaned;
+                snapshot.orphan_reason = Some(
+                    "durable marker exists but wrapper and child process identities are unavailable"
+                        .into(),
+                );
+                snapshot.finished_at = Some(Utc::now());
+                persist_job_metadata(&snapshot, &path).await?;
+            }
+            let state = Arc::new(Mutex::new(BackgroundJobState {
+                snapshot: snapshot.clone(),
+                kill: None,
+                has_partial_line: false,
+                segment_index: 0,
+                metadata_path: path,
+            }));
+            self.jobs
+                .lock()
+                .await
+                .insert(snapshot.job_id.clone(), state);
+            recovered.push(snapshot);
+        }
+        Ok(recovered)
     }
 
     pub async fn output(
@@ -693,6 +752,12 @@ async fn persist_job_metadata(
     fs::write(&temporary, contents).await?;
     fs::rename(temporary, path).await?;
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct DurableMetadataOwned {
+    snapshot: BackgroundJobSnapshot,
+    output_path: String,
 }
 
 fn count_output_lines(output: &str) -> u64 {
@@ -2283,6 +2348,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn background_job_recovery_marks_running_marker_without_identity_as_orphaned() {
+        let root = tempfile_dir();
+        let host_root = tempfile_dir();
+        let host = LocalHost::new(&host_root).unwrap();
+        let manager = BackgroundJobManager::new(root.join("job-logs"));
+        let snapshot = manager
+            .start(
+                &host,
+                SpawnRequest {
+                    command: shell_sleep_command_for_test(5),
+                    cwd: None,
+                    env: None,
+                    cols: 120,
+                    rows: 40,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let recovered_manager = BackgroundJobManager::new(root.join("job-logs"));
+        let recovered = recovered_manager.recover(&host).await.unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].job_id, snapshot.job_id);
+        assert_eq!(recovered[0].status, BackgroundJobStatus::Orphaned);
+        assert!(
+            recovered[0]
+                .orphan_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("identities"))
+        );
+        manager.kill(&snapshot.job_id).await.unwrap();
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(host_root).unwrap();
+    }
+
+    #[tokio::test]
     async fn local_host_structured_stdio_separates_stdout_and_stderr() {
         let host = LocalHost::new(std::env::temp_dir()).unwrap();
         let process = host
@@ -2393,6 +2494,16 @@ mod tests {
     #[cfg(not(windows))]
     fn shell_output_command(value: &str) -> String {
         format!("printf {value}")
+    }
+
+    #[cfg(windows)]
+    fn shell_sleep_command_for_test(seconds: u64) -> String {
+        format!("ping -n {} 127.0.0.1 > NUL", seconds + 1)
+    }
+
+    #[cfg(not(windows))]
+    fn shell_sleep_command_for_test(seconds: u64) -> String {
+        format!("sleep {seconds}")
     }
 
     #[tokio::test]
