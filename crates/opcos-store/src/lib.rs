@@ -295,6 +295,17 @@ pub struct GrantRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RepairLoopGrant {
+    pub loop_id: String,
+    pub project_id: String,
+    pub repo: String,
+    pub branch: String,
+    pub head_sha: String,
+    pub target: String,
+    pub expires_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct LocalGateResult {
     pub command: String,
     pub status: String,
@@ -1363,6 +1374,14 @@ impl KeyringSecretStore {
 
     pub fn with_fallback(service: impl Into<String>, path: impl Into<PathBuf>) -> Self {
         Self::with_optional_fallback(service, Some(path.into()))
+    }
+
+    pub fn with_encrypted_fallback(service: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+        Self {
+            service: service.into(),
+            fallback: Some(Arc::new(EncryptedFileSecretStore::new(path.into()))),
+            keyring_available: false,
+        }
     }
 
     fn with_optional_fallback(service: impl Into<String>, path: Option<PathBuf>) -> Self {
@@ -4443,6 +4462,23 @@ impl SqliteStore {
                        VALUES (10, CURRENT_TIMESTAMP);",
                 )?;
             }
+            if version < 11 {
+                connection.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS repair_loop_grants (
+                       loop_id TEXT PRIMARY KEY,
+                       project_id TEXT NOT NULL,
+                       repo TEXT NOT NULL,
+                       branch TEXT NOT NULL,
+                       head_sha TEXT NOT NULL,
+                       target TEXT NOT NULL,
+                       expires_at TEXT NOT NULL
+                     );
+                     CREATE INDEX IF NOT EXISTS idx_repair_loop_grants_lookup
+                       ON repair_loop_grants(project_id,repo,branch,head_sha,expires_at);
+                     INSERT INTO schema_migrations(version, applied_at)
+                       VALUES (11, CURRENT_TIMESTAMP);",
+                )?;
+            }
             Ok(())
         })();
         match migration {
@@ -4640,8 +4676,86 @@ impl SqliteStore {
                 monitor.last_error
             ],
         )?;
+        drop(connection);
         self.load_ci_monitor(&monitor.monitor_id)?
             .ok_or_else(|| StoreError::Validation("CI monitor was not saved".into()))
+    }
+
+    pub fn save_repair_loop_grant(&self, grant: &RepairLoopGrant) -> Result<(), StoreError> {
+        if grant.loop_id.trim().is_empty()
+            || grant.project_id.trim().is_empty()
+            || grant.repo.trim().is_empty()
+            || grant.branch.trim().is_empty()
+            || grant.head_sha.trim().is_empty()
+            || grant.target.trim().is_empty()
+            || grant.expires_at.trim().is_empty()
+        {
+            return Err(StoreError::Validation(
+                "repair-loop grant fields cannot be empty".into(),
+            ));
+        }
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "INSERT OR REPLACE INTO repair_loop_grants
+                 (loop_id,project_id,repo,branch,head_sha,target,expires_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    grant.loop_id,
+                    grant.project_id,
+                    grant.repo,
+                    grant.branch,
+                    grant.head_sha,
+                    grant.target,
+                    grant.expires_at
+                ],
+            )?;
+        Ok(())
+    }
+
+    pub fn load_repair_loop_grant(
+        &self,
+        loop_id: &str,
+        project_id: &str,
+        repo: &str,
+        branch: &str,
+        head_sha: &str,
+        target: &str,
+    ) -> Result<Option<RepairLoopGrant>, StoreError> {
+        let now = Utc::now().to_rfc3339();
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .query_row(
+                "SELECT loop_id,project_id,repo,branch,head_sha,target,expires_at
+                 FROM repair_loop_grants
+                 WHERE loop_id=?1 AND project_id=?2 AND repo=?3 AND branch=?4
+                   AND head_sha=?5 AND target=?6 AND expires_at>?7",
+                params![loop_id, project_id, repo, branch, head_sha, target, now],
+                |row| {
+                    Ok(RepairLoopGrant {
+                        loop_id: row.get(0)?,
+                        project_id: row.get(1)?,
+                        repo: row.get(2)?,
+                        branch: row.get(3)?,
+                        head_sha: row.get(4)?,
+                        target: row.get(5)?,
+                        expires_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn revoke_repair_loop_grant(&self, loop_id: &str) -> Result<bool, StoreError> {
+        let changed = self
+            .connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute("DELETE FROM repair_loop_grants WHERE loop_id=?1", [loop_id])?;
+        Ok(changed > 0)
     }
 
     pub fn load_ci_monitor(&self, monitor_id: &str) -> Result<Option<CiMonitor>, StoreError> {
@@ -4751,6 +4865,30 @@ impl SqliteStore {
                 },
             )
             .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn load_ci_monitor_states(
+        &self,
+        monitor_id: &str,
+    ) -> Result<Vec<CiMonitorState>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT monitor_id,repo,pull_request,head_sha,overall,initialized,updated_at
+             FROM ci_monitor_states WHERE monitor_id=?1 ORDER BY updated_at DESC",
+        )?;
+        let rows = statement.query_map([monitor_id], |row| {
+            Ok(CiMonitorState {
+                monitor_id: row.get(0)?,
+                repo: row.get(1)?,
+                pull_request: row.get::<_, i64>(2)? as u64,
+                head_sha: row.get(3)?,
+                overall: row.get(4)?,
+                initialized: row.get::<_, i64>(5)? != 0,
+                updated_at: row.get(6)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }
 
@@ -7739,6 +7877,74 @@ mod tests {
                     &serde_json::json!({"phase":"stale"}),
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn repair_loop_grants_match_exact_loop_target_and_head() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let grant = RepairLoopGrant {
+            loop_id: "monitor-1".into(),
+            project_id: "project-1".into(),
+            repo: "owner/repo".into(),
+            branch: "feature".into(),
+            head_sha: "sha-1".into(),
+            target: "git_push:project-1:owner/repo:feature".into(),
+            expires_at: (Utc::now() + chrono::Duration::minutes(5)).to_rfc3339(),
+        };
+        store.save_repair_loop_grant(&grant).unwrap();
+        assert_eq!(
+            store
+                .load_repair_loop_grant(
+                    "monitor-1",
+                    "project-1",
+                    "owner/repo",
+                    "feature",
+                    "sha-1",
+                    &grant.target,
+                )
+                .unwrap(),
+            Some(grant.clone())
+        );
+        assert!(
+            store
+                .load_repair_loop_grant(
+                    "monitor-2",
+                    "project-1",
+                    "owner/repo",
+                    "feature",
+                    "sha-1",
+                    &grant.target,
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .load_repair_loop_grant(
+                    "monitor-1",
+                    "project-1",
+                    "owner/repo",
+                    "feature",
+                    "sha-2",
+                    &grant.target,
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.revoke_repair_loop_grant("monitor-1").unwrap());
+        assert!(
+            store
+                .load_repair_loop_grant(
+                    "monitor-1",
+                    "project-1",
+                    "owner/repo",
+                    "feature",
+                    "sha-1",
+                    &grant.target,
+                )
+                .unwrap()
+                .is_none()
         );
     }
 

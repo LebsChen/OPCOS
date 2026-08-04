@@ -1,11 +1,12 @@
 use chrono::Utc;
 use opcos_store::{AutonomousRunnerProfile, SessionRecord, SessionStore, WorkQueueItem};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::sync::{Semaphore, watch};
 use uuid::Uuid;
 
-use crate::{DesktopState, SubmitRequest, emit, submit_turn_inner};
+use crate::{DesktopState, RepairLoopContext, SubmitRequest, emit, submit_turn_inner_with_context};
+use opcos_engine::ToolOrigin;
 use tauri::Manager;
 
 const LEASE_SECONDS: u32 = 60;
@@ -22,6 +23,7 @@ enum RunDisposition {
 #[derive(Debug, PartialEq, Eq)]
 enum SessionSelection<'a> {
     Existing(&'a str),
+    CreateFromProfile,
     ProfileRequired,
 }
 
@@ -40,18 +42,38 @@ impl Drop for UnattendedRestore {
 fn select_session<'a>(
     session_id: Option<&'a str>,
     profile: Option<&'a AutonomousRunnerProfile>,
-) -> Result<SessionSelection<'a>, &'static str> {
+) -> SessionSelection<'a> {
     if let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) {
-        return Ok(SessionSelection::Existing(session_id));
+        return SessionSelection::Existing(session_id);
     }
     if profile.is_some_and(|profile| profile.enabled) {
-        return Err("profile session creation required");
+        return SessionSelection::CreateFromProfile;
     }
-    Ok(SessionSelection::ProfileRequired)
+    SessionSelection::ProfileRequired
 }
 
 fn writes_allowed(disposition: &RunDisposition) -> bool {
     !matches!(disposition, RunDisposition::LostLease)
+}
+
+fn revoke_repair_grant_if_terminal(
+    state: &tauri::State<'_, DesktopState>,
+    item: &WorkQueueItem,
+    disposition: &RunDisposition,
+) {
+    if item.task_type == "ci_repair_loop"
+        && !matches!(
+            disposition,
+            RunDisposition::LostLease | RunDisposition::PendingApproval
+        )
+    {
+        let loop_id = item
+            .payload
+            .get("monitor_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or(&item.queue_id);
+        let _ = state.store.revoke_repair_loop_grant(loop_id);
+    }
 }
 
 fn disposition_after_turn(status: Option<&str>, pending: bool) -> RunDisposition {
@@ -180,6 +202,14 @@ async fn run_item(
                         item.lease_generation,
                     )
                     .map_err(|error| error.to_string())?;
+                let loop_id = item
+                    .payload
+                    .get("monitor_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(&item.queue_id);
+                if item.task_type == "ci_repair_loop" {
+                    let _ = state.store.revoke_repair_loop_grant(loop_id);
+                }
                 return Ok(RunDisposition::NeedsHuman);
             }
         },
@@ -198,6 +228,111 @@ async fn run_item(
     }
     let worker_id = session_id.clone();
     let generation = item.lease_generation;
+    let ci_budget = (item.task_type == "ci_repair_loop").then(|| {
+        let budget = crate::ci_repair::budget_from_payload(&item.payload);
+        let signatures = crate::ci_repair::failure_signatures(&item.payload);
+        let current_sha = item
+            .payload
+            .get("head_sha")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let expected_sha = item
+            .payload
+            .get("expected_head_sha")
+            .and_then(|value| value.as_str())
+            .unwrap_or(current_sha);
+        let classification = item
+            .payload
+            .get("overall")
+            .and_then(|value| value.as_str())
+            .unwrap_or("indeterminate");
+        let reason = crate::ci_repair::stop_reason(
+            &budget,
+            current_sha,
+            expected_sha,
+            &signatures,
+            classification,
+            item.payload.get("checks").is_some() || item.payload.get("runs").is_some(),
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
+        (budget, signatures, reason)
+    });
+    if let Some((budget, signatures, Some(reason))) = &ci_budget {
+        let message = crate::ci_repair::stop_reason_label(reason);
+        let expected_head_sha = item
+            .payload
+            .get("expected_head_sha")
+            .cloned()
+            .unwrap_or_else(|| item.payload.get("head_sha").cloned().unwrap_or(Value::Null));
+        state
+            .store
+            .save_work_queue_progress(
+                &item.queue_id,
+                &worker_id,
+                generation,
+                &json!({
+                    "loop_id":item.payload.get("loop_id").cloned().unwrap_or_else(|| json!(item.queue_id)),
+                    "phase":"stopped",
+                    "stop_reason":message,
+                    "repair_attempts":budget.repair_attempts,
+                    "max_repair_attempts":budget.max_repair_attempts,
+                    "poll_count":budget.poll_count,
+                    "max_polls":budget.max_polls,
+                    "failure_signatures":signatures,
+                    "expected_head_sha":expected_head_sha,
+                    "head_sha":item.payload.get("head_sha"),
+                    "deadline":item.payload.get("deadline"),
+                    "classification":item.payload.get("classification"),
+                }),
+            )
+            .map_err(|error| error.to_string())?;
+        let _ = state.store.complete_work_item(
+            &item.queue_id,
+            &worker_id,
+            generation,
+            "failed",
+            Some(message),
+        );
+        let loop_id = item
+            .payload
+            .get("monitor_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or(&item.queue_id);
+        let _ = state.store.revoke_repair_loop_grant(loop_id);
+        return Ok(RunDisposition::Failed);
+    }
+    if let Some((budget, signatures, None)) = &ci_budget {
+        let expected_head_sha = item
+            .payload
+            .get("expected_head_sha")
+            .cloned()
+            .unwrap_or_else(|| item.payload.get("head_sha").cloned().unwrap_or(Value::Null));
+        state
+            .store
+            .save_work_queue_progress(
+                &item.queue_id,
+                &worker_id,
+                generation,
+                &json!({
+                    "loop_id":item.payload.get("loop_id").cloned().unwrap_or_else(|| json!(item.queue_id)),
+                    "phase":"diagnosing",
+                    "repair_attempts":budget.repair_attempts + 1,
+                    "max_repair_attempts":budget.max_repair_attempts,
+                    "poll_count":budget.poll_count,
+                    "max_polls":budget.max_polls,
+                    "failure_signatures":signatures,
+                    "head_sha":item.payload.get("head_sha"),
+                    "expected_head_sha":expected_head_sha,
+                    "deadline":item.payload.get("deadline"),
+                    "classification":item.payload.get("classification"),
+                }),
+            )
+            .map_err(|error| error.to_string())?;
+    }
     let before_pending = state
         .store
         .list_inbox()
@@ -209,14 +344,61 @@ async fn run_item(
     let request = SubmitRequest {
         session_id: session_id.clone(),
         text: format!(
-            "Execute durable work item `{}`. Task type: `{}`. Payload: {}. You must call work_queue_complete with this queue_id and lease_generation `{}` and an explicit outcome before this turn ends. Never imply success merely because this turn ends.",
+            "Execute durable work item `{}`. Task type: `{}`. Payload: {}. You must call work_queue_complete with this queue_id and lease_generation `{}` and an explicit outcome before this turn ends. Never imply success merely because this turn ends. For ci_repair_loop, use the supplied CI evidence, obey the repair budgets and stop contract, run the complete local gate on the current commit, and never bypass protected-diff or RepairLoop push policy.",
             item.queue_id,
             item.task_type,
             serde_json::to_string(&item.payload).map_err(|error| error.to_string())?,
             item.lease_generation
         ),
     };
-    let mut execution = Box::pin(submit_turn_inner(app, &state, request));
+    let repair_loop = (item.task_type == "ci_repair_loop").then(|| RepairLoopContext {
+        loop_id: item
+            .payload
+            .get("monitor_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or(&item.queue_id)
+            .to_owned(),
+        project_id: item
+            .project_id
+            .clone()
+            .or_else(|| {
+                item.payload
+                    .get("project_id")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default(),
+        repo: item
+            .payload
+            .get("repo")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_owned(),
+        branch: item
+            .payload
+            .get("branch")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_owned(),
+        head_sha: item
+            .payload
+            .get("head_sha")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_owned(),
+    });
+    let origin = if item.task_type == "ci_repair_loop" {
+        ToolOrigin::RepairLoop
+    } else {
+        ToolOrigin::User
+    };
+    let mut execution = Box::pin(submit_turn_inner_with_context(
+        app,
+        &state,
+        request,
+        origin,
+        repair_loop,
+    ));
     let mut interval =
         tokio::time::interval(std::time::Duration::from_secs(u64::from(LEASE_SECONDS / 3)));
     let disposition = loop {
@@ -235,7 +417,32 @@ async fn run_item(
                         .ok()
                         .flatten()
                         .map(|item| item.status);
-                    disposition_after_turn(status.as_deref(), pending)
+                    let mut disposition = disposition_after_turn(status.as_deref(), pending);
+                    if item.task_type == "ci_repair_loop"
+                        && disposition == RunDisposition::Completed
+                    {
+                        let commit_sha = item
+                            .payload
+                            .get("head_sha")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default();
+                        let gate_passed = state
+                            .store
+                            .load_latest_local_gate_record(&session_id, commit_sha)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|record| record.all_passed);
+                        if !gate_passed {
+                            let _ = state.store.save_work_queue_progress(
+                                &item.queue_id,
+                                &worker_id,
+                                generation,
+                                &json!({"phase":"stopped","stop_reason":"local gate has not fully passed","local_gate_passed":false}),
+                            );
+                            disposition = RunDisposition::Failed;
+                        }
+                    }
+                    disposition
                 };
                 break disposition;
             }
@@ -249,8 +456,42 @@ async fn run_item(
     if !writes_allowed(&disposition) {
         return Ok(disposition);
     }
+    revoke_repair_grant_if_terminal(&state, &item, &disposition);
     match disposition {
-        RunDisposition::Completed => {}
+        RunDisposition::Completed => {
+            if item.task_type == "ci_repair_loop"
+                && let Some(record) = state
+                    .store
+                    .load_latest_local_gate_record(
+                        &session_id,
+                        item.payload
+                            .get("head_sha")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default(),
+                    )
+                    .ok()
+                    .flatten()
+            {
+                let _ = state.store.save_work_queue_progress(
+                    &item.queue_id,
+                    &worker_id,
+                    generation,
+                    &json!({
+                        "loop_id":item.payload.get("loop_id").cloned().unwrap_or_else(|| json!(item.queue_id)),
+                        "phase":"waiting_ci",
+                        "repair_attempts":item.payload.get("repair_attempts").and_then(|value| value.as_u64()).unwrap_or(0) + 1,
+                        "max_repair_attempts":item.payload.get("max_repair_attempts").cloned().unwrap_or_else(|| json!(3)),
+                        "poll_count":item.payload.get("poll_count").cloned().unwrap_or_else(|| json!(0)),
+                        "max_polls":item.payload.get("max_polls").cloned().unwrap_or_else(|| json!(20)),
+                        "failure_signatures":item.payload.get("failure_signatures").cloned().unwrap_or_else(|| json!([])),
+                        "head_sha":item.payload.get("head_sha").cloned().unwrap_or(Value::Null),
+                        "expected_head_sha":record.commit_sha,
+                        "deadline":item.payload.get("deadline").cloned().unwrap_or(Value::Null),
+                        "classification":item.payload.get("classification").cloned().unwrap_or_else(|| json!("indeterminate")),
+                    }),
+                );
+            }
+        }
         RunDisposition::PendingApproval => {
             state
                 .store
@@ -298,7 +539,7 @@ async fn create_runner_session(
         })?;
     if matches!(
         select_session(None, Some(&profile)),
-        Ok(SessionSelection::ProfileRequired)
+        SessionSelection::ProfileRequired
     ) {
         return Err(
             "work item has no session; configure an autonomous runner profile for this project to execute it"
@@ -367,12 +608,28 @@ mod tests {
     #[test]
     fn session_selection_requires_profile_for_sessionless_items() {
         assert_eq!(
-            select_session(Some("session-1"), None).unwrap(),
+            select_session(Some("session-1"), None),
             SessionSelection::Existing("session-1")
         );
         assert_eq!(
-            select_session(None, None).unwrap(),
+            select_session(None, None),
             SessionSelection::ProfileRequired
+        );
+        assert_eq!(
+            select_session(
+                None,
+                Some(&AutonomousRunnerProfile {
+                    project_id: "project".into(),
+                    host_id: "host".into(),
+                    provider: "provider".into(),
+                    model: "model".into(),
+                    workspace: "workspace".into(),
+                    enabled: true,
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                })
+            ),
+            SessionSelection::CreateFromProfile
         );
     }
 
