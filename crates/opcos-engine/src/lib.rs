@@ -1502,7 +1502,7 @@ where
             && let Some(facts) = facts.as_ref()
             && !facts.trim().is_empty()
         {
-            context.push_str("\n");
+            context.push('\n');
             context.push_str(facts.trim());
         }
         context

@@ -9067,7 +9067,7 @@ async fn engine_for_with_context(
         session_id,
         workspace.clone(),
         permission_mode,
-        model,
+        model.clone(),
     ));
     engine.set_linear_tools_enabled(linear_tools_enabled);
     let host_scope = if host_id == "local" {
