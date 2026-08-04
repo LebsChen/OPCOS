@@ -247,8 +247,6 @@ $psi.RedirectStandardError = $true
 $child = New-Object System.Diagnostics.Process
 $child.StartInfo = $psi
 $child.Start() | Out-Null
-[void]$child.BeginOutputReadLine()
-[void]$child.BeginErrorReadLine()
 $state = [hashtable]::Synchronized(@{ stdout = 0; stderr = 0 })
 $append = {
   param($stream, $text)
@@ -270,6 +268,8 @@ $stdoutEvent = Register-ObjectEvent -InputObject $child -EventName OutputDataRec
 $stderrEvent = Register-ObjectEvent -InputObject $child -EventName ErrorDataReceived -Action {
   & $using:append 'stderr' $EventArgs.Data
 }
+[void]$child.BeginOutputReadLine()
+[void]$child.BeginErrorReadLine()
 [pscustomobject]@{ state = 'running'; wrapper_pid = $PID; child_pid = $child.Id } |
   ConvertTo-Json -Compress | Set-Content -Encoding utf8 $statusPath
 $child.WaitForExit()
