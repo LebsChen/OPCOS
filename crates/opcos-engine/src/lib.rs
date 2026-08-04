@@ -1836,14 +1836,21 @@ where
                     && message.get("tool_calls").is_some())
             });
         }
-        let fallback_summary =
-            "Earlier messages compacted; recent complete tool exchanges retained.".to_owned();
-        let summary_text = if discarded.is_empty() {
-            fallback_summary.clone()
+        let (summary_text, summary_issue) = if discarded.is_empty() {
+            (
+                "Earlier messages compacted; recent complete tool exchanges retained.".to_owned(),
+                None,
+            )
         } else {
-            self.compaction_summary(&discarded)
-                .await
-                .unwrap_or(fallback_summary)
+            match self.compaction_summary(&discarded).await {
+                Ok(summary) => (summary, None),
+                Err(reason) => (
+                    format!(
+                        "Compaction summary unavailable ({reason}); recent complete tool exchanges retained."
+                    ),
+                    Some(reason),
+                ),
+            }
         };
         valid.insert(
             0,
@@ -1873,15 +1880,23 @@ where
                 retained_from: retained.len() as i64,
             })
             .map_err(|error| EngineError::Store(error.to_string()))?;
+        if let Some(reason) = summary_issue {
+            self.notice(
+                "compaction_summary_invalid",
+                format!("Compaction summary was not stored as model output: {reason}"),
+            )
+            .await?;
+        }
         self.notice("compacted", "Earlier context compacted".into())
             .await?;
         Ok(valid)
     }
 
-    async fn compaction_summary(&self, discarded: &[Value]) -> Option<String> {
+    async fn compaction_summary(&self, discarded: &[Value]) -> Result<String, String> {
         let mut context = String::new();
         for message in discarded {
-            let mut encoded = serde_json::to_string(message).ok()?;
+            let mut encoded =
+                serde_json::to_string(message).map_err(|_| "context_encoding_failed".to_owned())?;
             if encoded.len() > 4000 {
                 encoded.truncate(4000);
                 encoded.push('…');
@@ -1897,15 +1912,63 @@ where
             .complete(ProviderRequest {
                 model: self.model.lock().await.clone(),
                 messages: vec![
-                    json!({"role":"system","content":"Summarize the prior agent context into concise structured points. Include: original goal; completed actions and results; key discoveries and file paths; unfinished next steps. Do not invent facts."}),
+                    json!({"role":"system","content":"Summarize the prior agent context into concise structured points. Use exactly these sections: Goal; Completed actions and results; Key discoveries and file paths; Unfinished next steps. Do not invent facts, emit tool calls, or include reasoning tags."}),
                     json!({"role":"user","content":context}),
                 ],
                 tools: Vec::new(),
-                settings: json!({}),
+                settings: json!({"max_tokens":8192,"temperature":0.2}),
             })
             .await
-            .ok()?;
-        response.text.filter(|text| !text.trim().is_empty())
+            .map_err(|_| "provider_request_failed".to_owned())?;
+        let text = response.text.ok_or_else(|| "empty_response".to_owned())?;
+        Self::validate_compaction_summary(&text)?;
+        Ok(text.trim().to_owned())
+    }
+
+    fn validate_compaction_summary(text: &str) -> Result<(), String> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Err("empty_response".into());
+        }
+        if trimmed.len() > 12_000 {
+            return Err("response_too_large".into());
+        }
+        if trimmed.starts_with("<think>") || trimmed.starts_with("<analysis>") {
+            return Err("reasoning_prefix".into());
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(trimmed)
+            && (value.is_array() || value.get("tool_calls").is_some())
+        {
+            return Err("tool_calls_payload".into());
+        }
+        let normalized = trimmed.to_ascii_lowercase();
+        for (label, alternatives) in [
+            ("goal", ["goal:", "## goal", "original goal"]),
+            (
+                "completed actions and results",
+                ["completed actions", "completed work", "actions and results"],
+            ),
+            (
+                "key discoveries and file paths",
+                [
+                    "key discoveries",
+                    "discoveries and file paths",
+                    "file paths",
+                ],
+            ),
+            (
+                "unfinished next steps",
+                ["unfinished next steps", "next steps", "remaining work"],
+            ),
+        ] {
+            if !alternatives
+                .iter()
+                .any(|marker| normalized.contains(marker))
+            {
+                return Err(format!("missing_{label}"));
+            }
+        }
+        Ok(())
     }
 
     async fn append(&self, role: &str, content: Value) -> Result<(), EngineError> {
@@ -3119,7 +3182,10 @@ mod tests {
     async fn post_compaction_hook_injects_context_without_duplicate_system_messages() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let engine = TurnEngine::new(
-            SummaryProvider { fail: false },
+            SummaryProvider {
+                fail: false,
+                text: None,
+            },
             store,
             Arc::new(HookTools),
             "s",
@@ -4229,6 +4295,7 @@ mod tests {
     #[derive(Clone)]
     struct SummaryProvider {
         fail: bool,
+        text: Option<String>,
     }
 
     #[async_trait]
@@ -4238,7 +4305,13 @@ mod tests {
                 Err(ProviderError::Request("summary unavailable".into()))
             } else {
                 Ok(AssistantTurn {
-                    text: Some("Goal: inspect the repository.\nNext: verify the change.".into()),
+                    text: Some(self.text.clone().unwrap_or_else(|| {
+                        "Goal: inspect the repository.\n\
+                         Completed actions and results: reviewed the repository.\n\
+                         Key discoveries and file paths: summary code is in crates/opcos-engine/src/lib.rs.\n\
+                         Unfinished next steps: verify the change."
+                            .into()
+                    })),
                     ..Default::default()
                 })
             }
@@ -4261,7 +4334,10 @@ mod tests {
     async fn compaction_keeps_system_instructions_at_the_front() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let engine = TurnEngine::new(
-            SummaryProvider { fail: false },
+            SummaryProvider {
+                fail: false,
+                text: None,
+            },
             store,
             Arc::new(FakeTools),
             "s",
@@ -4311,7 +4387,10 @@ mod tests {
     async fn compaction_persists_provider_summary() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let engine = TurnEngine::new(
-            SummaryProvider { fail: false },
+            SummaryProvider {
+                fail: false,
+                text: None,
+            },
             store.clone(),
             Arc::new(FakeTools),
             "s",
@@ -4334,15 +4413,70 @@ mod tests {
         }));
         assert_eq!(
             store.load_compaction("s").unwrap().unwrap().summary,
-            "Goal: inspect the repository.\nNext: verify the change."
+            "Goal: inspect the repository.\n\
+                 Completed actions and results: reviewed the repository.\n\
+                 Key discoveries and file paths: summary code is in crates/opcos-engine/src/lib.rs.\n\
+                 Unfinished next steps: verify the change."
         );
+    }
+
+    #[test]
+    fn compaction_summary_validation_rejects_untrusted_shapes() {
+        let oversized = "x".repeat(12_001);
+        for (name, text) in [
+            ("reasoning", "<think>internal reasoning</think>"),
+            ("tool_calls", r#"{"tool_calls":[{"name":"read_file"}]}"#),
+            ("oversized", oversized.as_str()),
+            ("missing_sections", "Goal: only the goal is present."),
+            ("empty", "   "),
+        ] {
+            assert!(
+                TurnEngine::<SummaryProvider, SqliteStore, FakeTools>::validate_compaction_summary(
+                    text
+                )
+                .is_err(),
+                "{name} should be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_compaction_summary_uses_visible_fallback() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            SummaryProvider {
+                fail: false,
+                text: Some(r#"{"tool_calls":[{"name":"read_file"}]}"#.into()),
+            },
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let messages = (0..8)
+            .map(|index| json!({"role":"user","content":format!("message-{index}")}))
+            .collect();
+        let compacted = engine.compact_context(messages).await.unwrap();
+        let summary = store.load_compaction("s").unwrap().unwrap().summary;
+        assert!(summary.starts_with("Compaction summary unavailable (tool_calls_payload)"));
+        assert!(compacted.iter().any(|message| {
+            message
+                .pointer("/content/0/text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text == summary)
+        }));
     }
 
     #[tokio::test]
     async fn failed_compaction_summary_falls_back_to_recent_context() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let engine = TurnEngine::new(
-            SummaryProvider { fail: true },
+            SummaryProvider {
+                fail: true,
+                text: None,
+            },
             store.clone(),
             Arc::new(FakeTools),
             "s",
@@ -4358,8 +4492,13 @@ mod tests {
             .collect();
         let compacted = engine.compact_context(messages).await.unwrap();
         assert!(compacted.iter().any(|message| {
-            message.pointer("/content/0/text").and_then(Value::as_str)
-                == Some("Earlier messages compacted; recent complete tool exchanges retained.")
+            message
+                .pointer("/content/0/text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| {
+                    text.contains("Compaction summary unavailable (provider_request_failed)")
+                        && text.contains("recent complete tool exchanges retained.")
+                })
         }));
         assert!(store.load_compaction("s").unwrap().is_some());
     }
