@@ -1,6 +1,6 @@
 use chrono::Utc;
 use opcos_store::{AutonomousRunnerProfile, SessionRecord, SessionStore, WorkQueueItem};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::sync::{Semaphore, watch};
 use uuid::Uuid;
@@ -263,6 +263,11 @@ async fn run_item(
     });
     if let Some((budget, signatures, Some(reason))) = &ci_budget {
         let message = crate::ci_repair::stop_reason_label(reason);
+        let expected_head_sha = item
+            .payload
+            .get("expected_head_sha")
+            .cloned()
+            .unwrap_or_else(|| item.payload.get("head_sha").cloned().unwrap_or(Value::Null));
         state
             .store
             .save_work_queue_progress(
@@ -270,6 +275,7 @@ async fn run_item(
                 &worker_id,
                 generation,
                 &json!({
+                    "loop_id":item.payload.get("loop_id").cloned().unwrap_or_else(|| json!(item.queue_id)),
                     "phase":"stopped",
                     "stop_reason":message,
                     "repair_attempts":budget.repair_attempts,
@@ -277,6 +283,10 @@ async fn run_item(
                     "poll_count":budget.poll_count,
                     "max_polls":budget.max_polls,
                     "failure_signatures":signatures,
+                    "expected_head_sha":expected_head_sha,
+                    "head_sha":item.payload.get("head_sha"),
+                    "deadline":item.payload.get("deadline"),
+                    "classification":item.payload.get("classification"),
                 }),
             )
             .map_err(|error| error.to_string())?;
@@ -296,6 +306,11 @@ async fn run_item(
         return Ok(RunDisposition::Failed);
     }
     if let Some((budget, signatures, None)) = &ci_budget {
+        let expected_head_sha = item
+            .payload
+            .get("expected_head_sha")
+            .cloned()
+            .unwrap_or_else(|| item.payload.get("head_sha").cloned().unwrap_or(Value::Null));
         state
             .store
             .save_work_queue_progress(
@@ -303,6 +318,7 @@ async fn run_item(
                 &worker_id,
                 generation,
                 &json!({
+                    "loop_id":item.payload.get("loop_id").cloned().unwrap_or_else(|| json!(item.queue_id)),
                     "phase":"diagnosing",
                     "repair_attempts":budget.repair_attempts + 1,
                     "max_repair_attempts":budget.max_repair_attempts,
@@ -310,6 +326,9 @@ async fn run_item(
                     "max_polls":budget.max_polls,
                     "failure_signatures":signatures,
                     "head_sha":item.payload.get("head_sha"),
+                    "expected_head_sha":expected_head_sha,
+                    "deadline":item.payload.get("deadline"),
+                    "classification":item.payload.get("classification"),
                 }),
             )
             .map_err(|error| error.to_string())?;
@@ -439,7 +458,40 @@ async fn run_item(
     }
     revoke_repair_grant_if_terminal(&state, &item, &disposition);
     match disposition {
-        RunDisposition::Completed => {}
+        RunDisposition::Completed => {
+            if item.task_type == "ci_repair_loop"
+                && let Some(record) = state
+                    .store
+                    .load_latest_local_gate_record(
+                        &session_id,
+                        item.payload
+                            .get("head_sha")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default(),
+                    )
+                    .ok()
+                    .flatten()
+            {
+                let _ = state.store.save_work_queue_progress(
+                    &item.queue_id,
+                    &worker_id,
+                    generation,
+                    &json!({
+                        "loop_id":item.payload.get("loop_id").cloned().unwrap_or_else(|| json!(item.queue_id)),
+                        "phase":"waiting_ci",
+                        "repair_attempts":item.payload.get("repair_attempts").and_then(|value| value.as_u64()).unwrap_or(0) + 1,
+                        "max_repair_attempts":item.payload.get("max_repair_attempts").cloned().unwrap_or_else(|| json!(3)),
+                        "poll_count":item.payload.get("poll_count").cloned().unwrap_or_else(|| json!(0)),
+                        "max_polls":item.payload.get("max_polls").cloned().unwrap_or_else(|| json!(20)),
+                        "failure_signatures":item.payload.get("failure_signatures").cloned().unwrap_or_else(|| json!([])),
+                        "head_sha":item.payload.get("head_sha").cloned().unwrap_or(Value::Null),
+                        "expected_head_sha":record.commit_sha,
+                        "deadline":item.payload.get("deadline").cloned().unwrap_or(Value::Null),
+                        "classification":item.payload.get("classification").cloned().unwrap_or_else(|| json!("indeterminate")),
+                    }),
+                );
+            }
+        }
         RunDisposition::PendingApproval => {
             state
                 .store

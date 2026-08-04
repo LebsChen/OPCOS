@@ -19420,7 +19420,18 @@ fn ci_repair_status(state: State<'_, DesktopState>) -> Result<Vec<Value>, String
             items
                 .into_iter()
                 .filter(|item| item.task_type == "ci_repair_loop")
-                .map(|item| serde_json::to_value(item).map_err(|error| error.to_string()))
+                .map(|item| {
+                    let mut value =
+                        serde_json::to_value(&item).map_err(|error| error.to_string())?;
+                    if let Some(progress) = state
+                        .store
+                        .load_work_queue_progress(&item.queue_id)
+                        .map_err(|error| error.to_string())?
+                    {
+                        value["progress"] = progress.progress;
+                    }
+                    Ok(value)
+                })
                 .collect()
         })
 }

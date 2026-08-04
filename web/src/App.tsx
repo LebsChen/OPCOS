@@ -2929,9 +2929,59 @@ function CiMonitorPanel({
         runner setting. Disable the monitor to revoke its repair authorization.
       </p>
       {repairItems.length > 0 ? (
-        <pre className="muted small">
-          {JSON.stringify(repairItems, null, 2)}
-        </pre>
+        <div className="stack">
+          {repairItems.map((item) => {
+            const record = item as {
+              queue_id?: string;
+              status?: string;
+              attempts?: number;
+              max_attempts?: number;
+              run_after?: string;
+              updated_at?: string;
+              payload?: {
+                phase?: string;
+                repair_attempts?: number;
+                max_repair_attempts?: number;
+                poll_count?: number;
+                max_polls?: number;
+                deadline?: string;
+                failure_signatures?: string[];
+                stop_reason?: string;
+                head_sha?: string;
+                expected_head_sha?: string;
+              };
+              progress?: Record<string, unknown>;
+            };
+            const payload = record.payload ?? {};
+            const state = {
+              ...payload,
+              ...(record.progress ?? {}),
+            } as typeof payload;
+            const signatures = state.failure_signatures ?? [];
+            return (
+              <article key={record.queue_id ?? JSON.stringify(item)}>
+                <strong>{record.queue_id ?? "ci_repair_loop"}</strong>
+                <div>Status: {record.status ?? "unknown"}</div>
+                <div>Phase: {state.phase ?? "queued"}</div>
+                <div>
+                  Attempts: {state.repair_attempts ?? 0} /{" "}
+                  {state.max_repair_attempts ?? 3}
+                </div>
+                <div>
+                  Polls: {state.poll_count ?? 0} / {state.max_polls ?? 20}
+                </div>
+                <div>Deadline: {state.deadline ?? "not set"}</div>
+                <div>Current SHA: {state.head_sha ?? "not set"}</div>
+                <div>Expected SHA: {state.expected_head_sha ?? "not set"}</div>
+                <div>Stop reason: {state.stop_reason ?? "none"}</div>
+                <div>
+                  Signatures:{" "}
+                  {signatures.length > 0 ? signatures.join(" → ") : "none"}
+                </div>
+              </article>
+            );
+          })}
+        </div>
       ) : null}
     </details>
   );

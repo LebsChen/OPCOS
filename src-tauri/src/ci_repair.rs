@@ -98,6 +98,55 @@ pub fn failure_signatures(payload: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn failure_signature(checks: &Value, runs: &Value, overall: &str) -> String {
+    let mut parts = vec![overall.to_owned()];
+    if let Some(items) = checks.get("check_runs").and_then(Value::as_array) {
+        let mut check_parts = items
+            .iter()
+            .filter_map(|item| {
+                let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                let status = item.get("status").and_then(Value::as_str).unwrap_or("");
+                let conclusion = item.get("conclusion").and_then(Value::as_str).unwrap_or("");
+                (status != "completed" || conclusion != "success")
+                    .then(|| format!("check:{name}:{status}:{conclusion}"))
+            })
+            .collect::<Vec<_>>();
+        check_parts.sort();
+        parts.extend(check_parts);
+    }
+    if let Some(items) = runs.get("workflow_runs").and_then(Value::as_array) {
+        let mut run_parts = items
+            .iter()
+            .filter_map(|item| {
+                let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                let status = item.get("status").and_then(Value::as_str).unwrap_or("");
+                let conclusion = item.get("conclusion").and_then(Value::as_str).unwrap_or("");
+                (status != "completed" || conclusion != "success")
+                    .then(|| format!("run:{name}:{status}:{conclusion}"))
+            })
+            .collect::<Vec<_>>();
+        run_parts.sort();
+        parts.extend(run_parts);
+    }
+    parts.join("|")
+}
+
+fn latest_repair_progress(store: &SqliteStore, monitor_id: &str) -> Option<Value> {
+    store
+        .load_work_queue(None, 500)
+        .ok()?
+        .into_iter()
+        .filter(|item| item.task_type == "ci_repair_loop")
+        .find(|item| item.payload.get("monitor_id").and_then(Value::as_str) == Some(monitor_id))
+        .and_then(|item| {
+            store
+                .load_work_queue_progress(&item.queue_id)
+                .ok()
+                .flatten()
+        })
+        .map(|progress| progress.progress)
+}
+
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub fn stop_reason(
@@ -266,6 +315,86 @@ pub async fn poll_once_with_base(
         let _ = store.revoke_repair_loop_grant(monitor_id);
     }
     let should_publish = should_publish_failure(previous.as_ref(), overall);
+    let progress = latest_repair_progress(store, monitor_id).unwrap_or_else(|| json!({}));
+    let mut signature_history = progress
+        .get("failure_signatures")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    signature_history.push(failure_signature(&checks, &runs, overall));
+    let repair_attempts = progress
+        .get("repair_attempts")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as u32;
+    let poll_count = progress
+        .get("poll_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as u32
+        + 1;
+    let max_repair_attempts = progress
+        .get("max_repair_attempts")
+        .and_then(Value::as_u64)
+        .unwrap_or(3) as u32;
+    let max_polls = progress
+        .get("max_polls")
+        .and_then(Value::as_u64)
+        .unwrap_or(20) as u32;
+    let deadline = progress
+        .get("deadline")
+        .and_then(Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+        .unwrap_or_else(|| Utc::now() + Duration::minutes(60));
+    let expected_head_sha = progress
+        .get("expected_head_sha")
+        .and_then(Value::as_str)
+        .unwrap_or(&head_sha)
+        .to_owned();
+    let classification = progress
+        .get("classification")
+        .and_then(Value::as_str)
+        .unwrap_or(overall);
+    let loop_budget = RepairBudget {
+        repair_attempts,
+        max_repair_attempts,
+        poll_count,
+        max_polls,
+        deadline,
+    };
+    if should_publish
+        && let Some(reason) = stop_reason(
+            &loop_budget,
+            &head_sha,
+            &expected_head_sha,
+            &signature_history,
+            classification,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false,
+        )
+    {
+        let _ = store.set_ci_monitor_enabled(monitor_id, false);
+        return Ok(json!({
+            "monitor_id": monitor_id,
+            "repo": monitor.repo,
+            "pull_request": monitor.pull_request,
+            "head_sha": head_sha,
+            "overall": overall,
+            "baseline": previous.is_none(),
+            "published": false,
+            "stopped": true,
+            "stop_reason": stop_reason_label(&reason),
+        }));
+    }
     let state = CiMonitorState {
         monitor_id: monitor.monitor_id.clone(),
         repo: monitor.repo.clone(),
@@ -296,8 +425,18 @@ pub async fn poll_once_with_base(
             "repo": monitor.repo,
             "pull_request": monitor.pull_request,
             "branch": monitor.branch,
+            "loop_id": monitor.monitor_id,
             "head_sha": head_sha,
+            "expected_head_sha": expected_head_sha,
             "overall": overall,
+            "classification": classification,
+            "repair_attempts": repair_attempts,
+            "max_repair_attempts": max_repair_attempts,
+            "poll_count": poll_count,
+            "max_polls": max_polls,
+            "deadline": deadline.to_rfc3339(),
+            "failure_signatures": signature_history,
+            "phase": progress.get("phase").cloned().unwrap_or_else(|| json!("queued")),
             "checks": checks,
             "runs": runs,
         });

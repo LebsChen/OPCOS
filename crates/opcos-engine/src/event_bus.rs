@@ -238,6 +238,76 @@ mod tests {
     }
 
     #[test]
+    fn ci_repair_reenqueue_preserves_cumulative_budget_payload() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let rule = store
+            .create_event_rule(
+                "external.github.ci.failed",
+                "enqueue_work",
+                &json!({"task_type":"ci_repair_loop","payload":{}}),
+                10,
+                3600,
+                2,
+            )
+            .unwrap();
+        let first = store
+            .publish_event(
+                "external.github.ci.failed",
+                "github:ci:repo:1",
+                &json!({"monitor_id":"loop-1"}),
+                &json!({
+                    "monitor_id":"loop-1",
+                    "loop_id":"loop-1",
+                    "repair_attempts":1,
+                    "max_repair_attempts":3,
+                    "poll_count":4,
+                    "max_polls":20,
+                    "deadline":"2099-01-01T00:00:00Z",
+                    "failure_signatures":["lint:foo"]
+                }),
+                Some("ci-failure-1"),
+                None,
+            )
+            .unwrap();
+        let first_item = match dispatch_event(&store, &first, &rule).unwrap().effect {
+            EventEffect::Enqueue(item) => item,
+            _ => panic!("expected queue item"),
+        };
+        assert_eq!(first_item.payload["repair_attempts"], 1);
+        assert_eq!(first_item.payload["poll_count"], 4);
+
+        let second = store
+            .publish_event(
+                "external.github.ci.failed",
+                "github:ci:repo:1",
+                &json!({"monitor_id":"loop-1"}),
+                &json!({
+                    "monitor_id":"loop-1",
+                    "loop_id":"loop-1",
+                    "repair_attempts":2,
+                    "max_repair_attempts":3,
+                    "poll_count":5,
+                    "max_polls":20,
+                    "deadline":"2099-01-01T00:00:00Z",
+                    "failure_signatures":["lint:foo","lint:bar"]
+                }),
+                Some("ci-failure-2"),
+                None,
+            )
+            .unwrap();
+        let second_item = match dispatch_event(&store, &second, &rule).unwrap().effect {
+            EventEffect::Enqueue(item) => item,
+            _ => panic!("expected queue item"),
+        };
+        assert_eq!(second_item.payload["repair_attempts"], 2);
+        assert_eq!(second_item.payload["poll_count"], 5);
+        assert_eq!(
+            second_item.payload["failure_signatures"],
+            json!(["lint:foo", "lint:bar"])
+        );
+    }
+
+    #[test]
     fn replayed_old_event_still_consumes_the_current_frequency_window() {
         let store = SqliteStore::open_in_memory().unwrap();
         let rule = store
