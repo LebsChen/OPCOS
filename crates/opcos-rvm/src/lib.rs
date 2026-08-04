@@ -579,6 +579,15 @@ pub trait RvmClient: Send + Sync {
     async fn health(&self) -> Result<Health, RvmError>;
     async fn info(&self) -> Result<Info, RvmError>;
     async fn capabilities(&self) -> Result<Capabilities, RvmError>;
+    /// Tool names advertised by the host's MCP endpoint.
+    async fn mcp_tools(&self) -> Result<Vec<String>, RvmError> {
+        Err(RvmError::Unsupported("mcp tool listing".into()))
+    }
+    /// Call an MCP tool and return its decoded payload.
+    async fn mcp_call_tool(&self, name: &str, arguments: Value) -> Result<Value, RvmError> {
+        let _ = (name, arguments);
+        Err(RvmError::Unsupported("mcp tool call".into()))
+    }
     async fn exec_sync(&self, request: ExecRequest) -> Result<ExecResult, RvmError>;
     async fn storage_stat(&self, path: &str) -> Result<StorageStat, RvmError> {
         let _ = path;
@@ -1122,6 +1131,25 @@ impl HttpRvmClient {
             .map_err(|error| RvmError::Path(error.to_string()))
     }
 
+    /// Promote MCP tools the host actually exposes into host capabilities.
+    /// A failed or absent MCP endpoint leaves the capability unadvertised
+    /// rather than surfacing an error, so nothing is claimed without proof.
+    async fn extend_with_mcp_tool_capabilities(&self, capabilities: &mut Capabilities) {
+        if !capabilities.available.iter().any(|item| item == "mcp") {
+            return;
+        }
+        let Ok(tools) = self.mcp_tools().await else {
+            return;
+        };
+        for capability in MCP_TOOL_CAPABILITIES {
+            if tools.iter().any(|tool| tool == capability)
+                && !capabilities.available.iter().any(|item| item == capability)
+            {
+                capabilities.available.push(capability.into());
+            }
+        }
+    }
+
     async fn post_json<T: Serialize, R: DeserializeOwned>(
         &self,
         route: &str,
@@ -1228,16 +1256,35 @@ impl RvmClient for HttpRvmClient {
     }
 
     async fn capabilities(&self) -> Result<Capabilities, RvmError> {
-        match self.get_json::<Value>("/api/capabilities", true).await {
-            Ok(response) => parse_capabilities_response(&response),
-            Err(RvmError::Http { status, .. }) if status == StatusCode::NOT_FOUND => {
-                let health = self.health().await?;
-                Ok(Capabilities {
-                    available: health.capabilities,
-                })
-            }
-            Err(error) => Err(error),
-        }
+        let mut capabilities = match self.get_json::<Value>("/api/capabilities", true).await {
+            Ok(response) => parse_capabilities_response(&response)?,
+            Err(RvmError::Http { status, .. }) if status == StatusCode::NOT_FOUND => Capabilities {
+                available: self.health().await?.capabilities,
+            },
+            Err(error) => return Err(error),
+        };
+        self.extend_with_mcp_tool_capabilities(&mut capabilities)
+            .await;
+        Ok(capabilities)
+    }
+
+    async fn mcp_tools(&self) -> Result<Vec<String>, RvmError> {
+        let response = self
+            .mcp(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+            .await?;
+        parse_mcp_tool_names(&response)
+    }
+
+    async fn mcp_call_tool(&self, name: &str, arguments: Value) -> Result<Value, RvmError> {
+        let response = self
+            .mcp(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            }))
+            .await?;
+        parse_mcp_tool_result(&response)
     }
 
     async fn exec_sync(&self, request: ExecRequest) -> Result<ExecResult, RvmError> {
@@ -1561,6 +1608,63 @@ impl RvmClient for HttpRvmClient {
     }
 }
 
+/// MCP tools the host may expose that map onto OPCOS host capabilities.
+const MCP_TOOL_CAPABILITIES: [&str; 2] = ["lsp", "dap"];
+
+fn parse_mcp_tool_names(value: &Value) -> Result<Vec<String>, RvmError> {
+    let result = mcp_result(value)?;
+    let tools = result
+        .get("tools")
+        .and_then(Value::as_array)
+        .ok_or_else(|| RvmError::InvalidResponse("MCP tools/list has no tool array".into()))?;
+    Ok(tools
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect())
+}
+
+/// Decode an MCP `tools/call` response into the tool's payload. Tool-reported
+/// failures surface as errors instead of being returned as a result.
+fn parse_mcp_tool_result(value: &Value) -> Result<Value, RvmError> {
+    let result = mcp_result(value)?;
+    let text = result
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default();
+    if result.get("isError").and_then(Value::as_bool) == Some(true) {
+        return Err(RvmError::InvalidResponse(format!(
+            "MCP tool reported an error: {text}"
+        )));
+    }
+    if text.is_empty() {
+        return Ok(result.clone());
+    }
+    Ok(serde_json::from_str(&text).unwrap_or(Value::String(text)))
+}
+
+fn mcp_result(value: &Value) -> Result<&Value, RvmError> {
+    if let Some(error) = value.get("error") {
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown MCP error");
+        return Err(RvmError::InvalidResponse(format!(
+            "MCP endpoint returned an error: {message}"
+        )));
+    }
+    value
+        .get("result")
+        .ok_or_else(|| RvmError::InvalidResponse("MCP response has no result".into()))
+}
+
 fn parse_capabilities_response(value: &Value) -> Result<Capabilities, RvmError> {
     let capability_values = value
         .as_array()
@@ -1698,6 +1802,117 @@ mod tests {
                 .any(|item| item == "exec_sync")
         );
         assert!(!capabilities.available.iter().any(|item| item == "lsp"));
+    }
+
+    #[test]
+    fn mcp_tool_names_are_read_from_tools_list() {
+        let names = parse_mcp_tool_names(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "shell_exec"}, {"name": "lsp"}]}
+        }))
+        .unwrap();
+        assert_eq!(names, ["shell_exec", "lsp"]);
+    }
+
+    #[test]
+    fn mcp_tool_result_decodes_json_text_content() {
+        let value = parse_mcp_tool_result(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"content": [{"type": "text", "text": "[{\"uri\":\"file:///a.rs\"}]"}]}
+        }))
+        .unwrap();
+        assert_eq!(value, serde_json::json!([{"uri": "file:///a.rs"}]));
+    }
+
+    #[test]
+    fn mcp_tool_error_is_not_returned_as_a_result() {
+        let error = parse_mcp_tool_result(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"content": [{"type": "text", "text": "no language server"}], "isError": true}
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("no language server"));
+
+        let error = parse_mcp_tool_result(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32602, "message": "Unknown tool: lsp"}
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("Unknown tool: lsp"));
+    }
+
+    #[tokio::test]
+    async fn mcp_lsp_tool_is_promoted_to_a_capability() {
+        let app = Router::new()
+            .route(
+                "/api/capabilities",
+                get(|| async {
+                    r#"{"version":"1.0.32","endpoints":{"core":["/api/exec"],"mcp":["/mcp"]}}"#
+                }),
+            )
+            .route(
+                "/mcp",
+                post(|| async {
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"shell_exec"},{"name":"lsp"}]}}"#
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = HttpRvmClient::new(
+            RvmClientConfig::new(
+                Url::parse(&format!("http://{address}/")).unwrap(),
+                "test-token",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let capabilities = client.capabilities().await.unwrap();
+        assert!(capabilities.available.iter().any(|item| item == "lsp"));
+        assert!(!capabilities.available.iter().any(|item| item == "dap"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_without_an_lsp_tool_leaves_lsp_unadvertised() {
+        let app = Router::new()
+            .route(
+                "/api/capabilities",
+                get(|| async {
+                    r#"{"version":"1.0.32","endpoints":{"core":["/api/exec"],"mcp":["/mcp"]}}"#
+                }),
+            )
+            .route(
+                "/mcp",
+                post(|| async { r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"# }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = HttpRvmClient::new(
+            RvmClientConfig::new(
+                Url::parse(&format!("http://{address}/")).unwrap(),
+                "test-token",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let capabilities = client.capabilities().await.unwrap();
+        assert!(capabilities.available.iter().any(|item| item == "mcp"));
+        assert!(!capabilities.available.iter().any(|item| item == "lsp"));
+
+        server.abort();
     }
 
     #[test]

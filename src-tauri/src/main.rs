@@ -45,7 +45,7 @@ use opcos_hosts::{
     LIFECYCLE_EXEC_TIMEOUT_SECONDS, LifecycleStage, LocalHost, RvmHost, ScreenBounds, SpawnRequest,
     execute_lifecycle_stage,
 };
-use opcos_lsp::LspSession;
+use opcos_lsp::LspClient;
 use opcos_mcp::{
     McpCredentialStore, McpManager, McpServerConfig, qualified_tool_name, stable_server_key,
 };
@@ -433,7 +433,7 @@ struct LocalExecutor {
     project_id: Option<String>,
     store: Arc<SqliteStore>,
     jobs: Arc<BackgroundJobManager>,
-    lsp: Arc<AsyncMutex<HashMap<String, LspSession>>>,
+    lsp: Arc<AsyncMutex<HashMap<String, LspClient>>>,
     database: Arc<Mutex<Connection>>,
     engines: Arc<AsyncMutex<HashMap<String, Arc<GuiEngine>>>>,
     coordination: Arc<AsyncMutex<HashMap<String, CoordinationRuntime>>>,
@@ -3030,7 +3030,7 @@ fn execute_plan_tool(
 
 async fn execute_lsp_tool(
     host: Arc<dyn Host>,
-    sessions: &Arc<AsyncMutex<HashMap<String, LspSession>>>,
+    sessions: &Arc<AsyncMutex<HashMap<String, LspClient>>>,
     root: &str,
     name: &str,
     arguments: &Value,
@@ -3062,7 +3062,7 @@ async fn execute_lsp_tool(
         if let Some(session) = active.get(&key) {
             session.clone()
         } else {
-            let session = LspSession::start(Arc::clone(&host), root.to_owned(), &language)
+            let session = LspClient::start(Arc::clone(&host), root.to_owned(), &language)
                 .await
                 .map_err(|error| error.to_string())?;
             active.insert(key, session.clone());
