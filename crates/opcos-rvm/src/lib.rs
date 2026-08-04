@@ -1745,6 +1745,42 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn missing_capability_endpoint_falls_back_to_health() {
+        let app = Router::new()
+            .route(
+                "/api/capabilities",
+                get(|| async {
+                    (
+                        StatusCode::NOT_FOUND,
+                        r#"{"error":"capabilities endpoint unavailable"}"#,
+                    )
+                }),
+            )
+            .route(
+                "/api/health",
+                get(|| async { r#"{"status":"ok","capabilities":["exec","pty"]}"# }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = HttpRvmClient::new(
+            RvmClientConfig::new(
+                Url::parse(&format!("http://{address}/")).unwrap(),
+                "test-token",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let capabilities = client.capabilities().await.unwrap();
+        assert_eq!(capabilities.available, ["exec", "pty"]);
+
+        server.abort();
+    }
+
     #[test]
     fn exec_request_debug_lists_environment_keys_without_values() {
         let request = ExecRequest {
