@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use opcos_rvm::{RvmClient, RvmError, join_remote_path};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
@@ -25,6 +25,10 @@ pub struct AssetBundle {
     pub permissions: Option<PermissionRules>,
     #[serde(default)]
     pub permission_errors: Vec<String>,
+    #[serde(default)]
+    pub hooks: Option<HookConfig>,
+    #[serde(default)]
+    pub hook_errors: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -33,6 +37,28 @@ pub struct PermissionRules {
     pub allow: Vec<String>,
     #[serde(default)]
     pub deny: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct HookConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub hooks: Vec<HookDefinition>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct HookDefinition {
+    pub event: String,
+    #[serde(default)]
+    pub matcher: Option<String>,
+    #[serde(rename = "type", default = "default_hook_type")]
+    pub hook_type: String,
+    pub command: String,
+}
+
+fn default_hook_type() -> String {
+    "command".into()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -596,17 +622,24 @@ pub async fn discover<R: RemoteAssetReader>(
             bundle.agents.push(InstructionSource { path, content });
         }
     }
-    for name in [".agents/permissions.json", ".agents/permissions.local.json"] {
-        let path = join_remote_path(workspace, name);
-        if let Ok(content) = reader.read(&path).await {
-            match serde_json::from_str::<PermissionRules>(&content) {
-                Ok(rules) => bundle.permissions = Some(rules),
-                Err(error) => bundle
-                    .permission_errors
-                    .push(format!("{path}: invalid permission rules: {error}")),
-            }
-        }
-    }
+    let (permissions, permission_errors) = discover_json_override::<_, PermissionRules>(
+        reader,
+        workspace,
+        [".agents/permissions.json", ".agents/permissions.local.json"],
+        "permission rules",
+    )
+    .await;
+    bundle.permissions = permissions;
+    bundle.permission_errors = permission_errors;
+    let (hooks, hook_errors) = discover_json_override::<_, HookConfig>(
+        reader,
+        workspace,
+        [".agents/hooks.json", ".agents/hooks.local.json"],
+        "lifecycle hooks",
+    )
+    .await;
+    bundle.hooks = hooks;
+    bundle.hook_errors = hook_errors;
     for path in [
         ".cursor/rules",
         ".agents/rules",
@@ -620,6 +653,30 @@ pub async fn discover<R: RemoteAssetReader>(
         let _ = discover_tree(reader, &root, &mut bundle).await;
     }
     Ok(bundle)
+}
+
+async fn discover_json_override<R, T>(
+    reader: &R,
+    workspace: &str,
+    paths: [&str; 2],
+    label: &str,
+) -> (Option<T>, Vec<String>)
+where
+    R: RemoteAssetReader,
+    T: DeserializeOwned,
+{
+    let mut value = None;
+    let mut errors = Vec::new();
+    for name in paths {
+        let path = join_remote_path(workspace, name);
+        if let Ok(content) = reader.read(&path).await {
+            match serde_json::from_str::<T>(&content) {
+                Ok(parsed) => value = Some(parsed),
+                Err(error) => errors.push(format!("{path}: invalid {label}: {error}")),
+            }
+        }
+    }
+    (value, errors)
 }
 
 async fn discover_tree<R: RemoteAssetReader>(
@@ -721,6 +778,8 @@ mod tests {
             mcp_servers: Vec::new(),
             permissions: None,
             permission_errors: Vec::new(),
+            hooks: None,
+            hook_errors: Vec::new(),
         };
         let rendered = bundle.system_instructions();
         assert!(rendered.find("global").unwrap() < rendered.find("agents").unwrap());
@@ -1092,5 +1151,70 @@ mod tests {
                 deny: vec!["Exec(sudo)".into()],
             })
         );
+    }
+
+    struct HookReader;
+
+    #[async_trait]
+    impl RemoteAssetReader for HookReader {
+        async fn read(&self, path: &str) -> Result<String, AssetError> {
+            match path {
+                "/repo/.agents/hooks.json" => Ok(
+                    r#"{"enabled":true,"hooks":[{"event":"PreToolUse","matcher":"run_shell","type":"command","command":"hook-command"}]}"#.into(),
+                ),
+                "/repo/.agents/hooks.local.json" => Err(AssetError::Invalid("missing".into())),
+                _ => Err(AssetError::Invalid("missing".into())),
+            }
+        }
+
+        async fn list(&self, _path: Option<&str>) -> Result<Vec<(String, bool)>, AssetError> {
+            Err(AssetError::Invalid("missing".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn discovers_lifecycle_hooks_with_explicit_enablement() {
+        let bundle = discover(&HookReader, "/repo").await.unwrap();
+        assert_eq!(
+            bundle.hooks,
+            Some(HookConfig {
+                enabled: true,
+                hooks: vec![HookDefinition {
+                    event: "PreToolUse".into(),
+                    matcher: Some("run_shell".into()),
+                    hook_type: "command".into(),
+                    command: "hook-command".into(),
+                }],
+            })
+        );
+        assert!(bundle.hook_errors.is_empty());
+    }
+
+    struct InvalidHookReader;
+
+    #[async_trait]
+    impl RemoteAssetReader for InvalidHookReader {
+        async fn read(&self, path: &str) -> Result<String, AssetError> {
+            match path {
+                "/repo/.agents/hooks.json" => Ok("{not-json".into()),
+                "/repo/.agents/rules/x.md" => Ok("# Rule".into()),
+                _ => Err(AssetError::Invalid("missing".into())),
+            }
+        }
+
+        async fn list(&self, path: Option<&str>) -> Result<Vec<(String, bool)>, AssetError> {
+            match path {
+                Some("/repo/.agents/rules") => Ok(vec![("x.md".into(), false)]),
+                _ => Err(AssetError::Invalid("missing".into())),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_hook_config_is_recorded_without_blocking_assets() {
+        let bundle = discover(&InvalidHookReader, "/repo").await.unwrap();
+        assert!(bundle.hooks.is_none());
+        assert_eq!(bundle.hook_errors.len(), 1);
+        assert_eq!(bundle.agents[0].path, "/repo/.agents/rules/x.md");
     }
 }
