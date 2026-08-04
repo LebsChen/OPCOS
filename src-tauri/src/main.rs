@@ -134,6 +134,7 @@ mod ci_repair;
 mod external_ingress;
 mod repo_index;
 mod scheduler;
+mod work_runner;
 
 fn git_branch_name(slug: &str, timestamp: i64) -> Result<String, String> {
     let slug = slug
@@ -352,6 +353,8 @@ struct DesktopState {
     ingress_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     ci_monitor_shutdown: tokio::sync::watch::Sender<bool>,
     ci_monitor_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    runner_shutdown: tokio::sync::watch::Sender<bool>,
+    runner_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
 }
 
 #[derive(Clone)]
@@ -10905,15 +10908,23 @@ async fn repo_index_refresh(
 async fn submit_turn(
     app: tauri::AppHandle,
     state: State<'_, DesktopState>,
+    request: SubmitRequest,
+) -> Result<(), String> {
+    submit_turn_inner(app, &state, request).await
+}
+
+async fn submit_turn_inner(
+    app: tauri::AppHandle,
+    state: &DesktopState,
     mut request: SubmitRequest,
 ) -> Result<(), String> {
-    let session = session_for(&state, &request.session_id)?;
-    if execute_control_slash_command(&app, &state, &session, &request.text).await? {
+    let session = session_for(state, &request.session_id)?;
+    if execute_control_slash_command(&app, state, &session, &request.text).await? {
         emit(
             &app,
             "turn_done",
             Some(&request.session_id),
-            session_status_payload(&state, &request.session_id),
+            session_status_payload(state, &request.session_id),
         );
         return Ok(());
     }
@@ -10935,14 +10946,14 @@ async fn submit_turn(
         )?
     };
     if session.harness == "opencode" {
-        return submit_opencode_turn(app, state, request).await;
+        return submit_opencode_turn_inner(app, state, request).await;
     }
     if session.harness == "acp" {
-        return submit_acp_turn(app, state, request).await;
+        return submit_acp_turn_inner(app, state, request).await;
     }
-    let host_id = session_host_id(&state, &request.session_id)?;
+    let host_id = session_host_id(state, &request.session_id)?;
     if host_id != "local" {
-        let client = client_for(&state, &host_id)?;
+        let client = client_for(state, &host_id)?;
         if let Err(error) = client.health().await {
             let _ =
                 state
@@ -10958,7 +10969,7 @@ async fn submit_turn(
                 &app,
                 "turn_done",
                 Some(&request.session_id),
-                session_status_payload(&state, &request.session_id),
+                session_status_payload(state, &request.session_id),
             );
             return Err(format!("remote host unavailable: {error}"));
         }
@@ -10967,7 +10978,7 @@ async fn submit_turn(
         .store
         .max_message_notice_sequence(&request.session_id)
         .map_err(|error| error.to_string())?;
-    let engine = engine_for(&app, &state, &request.session_id).await?;
+    let engine = engine_for(&app, state, &request.session_id).await?;
     emit(
         &app,
         "message",
@@ -10976,17 +10987,17 @@ async fn submit_turn(
     );
     match engine.submit_text(request.text).await {
         Ok(_) => {
-            let _ = coordination_ingest_session_inner(&state, &request.session_id, false).await;
+            let _ = coordination_ingest_session_inner(state, &request.session_id, false).await;
             let calls = state
                 .store
                 .load_tool_calls_after(&request.session_id, sequence_before)
                 .map_err(|error| error.to_string())?;
-            record_artifacts_best_effort(&app, &state, &request.session_id, &host_id, calls).await;
+            record_artifacts_best_effort(&app, state, &request.session_id, &host_id, calls).await;
             emit(
                 &app,
                 "turn_done",
                 Some(&request.session_id),
-                session_status_payload(&state, &request.session_id),
+                session_status_payload(state, &request.session_id),
             );
             Ok(())
         }
@@ -11007,7 +11018,7 @@ async fn submit_turn(
                     .set_pending_visibility(&request.session_id, &call_id, "inbox")
                     .map_err(|error| error.to_string())?;
                 audit(
-                    &state,
+                    state,
                     &request.session_id,
                     "pending_item_delivered",
                     json!({"call_id": call_id, "kind": pending_kind, "visibility": "inbox"}),
@@ -11017,7 +11028,7 @@ async fn submit_turn(
                 .store
                 .load_tool_calls_after(&request.session_id, sequence_before)
                 .map_err(|error| error.to_string())?;
-            record_artifacts_best_effort(&app, &state, &request.session_id, &host_id, calls).await;
+            record_artifacts_best_effort(&app, state, &request.session_id, &host_id, calls).await;
             if unattended {
                 emit(
                     &app,
@@ -11038,7 +11049,7 @@ async fn submit_turn(
                     &app,
                     "turn_done",
                     Some(&request.session_id),
-                    session_status_payload(&state, &request.session_id),
+                    session_status_payload(state, &request.session_id),
                 );
                 return Ok(());
             }
@@ -11071,7 +11082,7 @@ async fn submit_turn(
                 &app,
                 "turn_done",
                 Some(&request.session_id),
-                session_status_payload(&state, &request.session_id),
+                session_status_payload(state, &request.session_id),
             );
             Err(message)
         }
@@ -11080,11 +11091,11 @@ async fn submit_turn(
                 .store
                 .load_tool_calls_after(&request.session_id, sequence_before)
                 .map_err(|error| error.to_string())?;
-            record_artifacts_best_effort(&app, &state, &request.session_id, &host_id, calls).await;
+            record_artifacts_best_effort(&app, state, &request.session_id, &host_id, calls).await;
             let message = engine_error_message(error);
             if message.contains("denied") || message.contains("policy") {
                 audit(
-                    &state,
+                    state,
                     &request.session_id,
                     "tool_policy_denied",
                     json!({"message": message}),
@@ -11100,19 +11111,19 @@ async fn submit_turn(
                 &app,
                 "turn_done",
                 Some(&request.session_id),
-                session_status_payload(&state, &request.session_id),
+                session_status_payload(state, &request.session_id),
             );
             Err(message)
         }
     }
 }
 
-async fn submit_opencode_turn(
+async fn submit_opencode_turn_inner(
     app: tauri::AppHandle,
-    state: State<'_, DesktopState>,
+    state: &DesktopState,
     request: SubmitRequest,
 ) -> Result<(), String> {
-    let harness = opencode_for(&state, &request.session_id).await?;
+    let harness = opencode_for(state, &request.session_id).await?;
     let mut start_events = false;
     {
         let mut sessions = state.opencode_event_sessions.lock().await;
@@ -11267,12 +11278,12 @@ async fn submit_opencode_turn(
     Ok(())
 }
 
-async fn submit_acp_turn(
+async fn submit_acp_turn_inner(
     app: tauri::AppHandle,
-    state: State<'_, DesktopState>,
+    state: &DesktopState,
     request: SubmitRequest,
 ) -> Result<(), String> {
-    let harness = match acp_for(&state, &request.session_id).await {
+    let harness = match acp_for(state, &request.session_id).await {
         Ok(harness) => harness,
         Err(error) => {
             emit(
@@ -19349,6 +19360,69 @@ async fn poll_ci_monitor(
 }
 
 #[tauri::command]
+fn runner_profile(state: State<'_, DesktopState>, project_id: String) -> Result<Value, String> {
+    state
+        .store
+        .load_runner_profile(&project_id)
+        .and_then(|profile| serde_json::to_value(profile).map_err(opcos_store::StoreError::from))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn save_runner_profile(
+    state: State<'_, DesktopState>,
+    project_id: String,
+    host_id: String,
+    provider: String,
+    model: String,
+    workspace: String,
+    enabled: Option<bool>,
+) -> Result<Value, String> {
+    let now = Utc::now().to_rfc3339();
+    let profile = state
+        .store
+        .save_runner_profile(&opcos_store::AutonomousRunnerProfile {
+            project_id,
+            host_id,
+            provider,
+            model,
+            workspace,
+            enabled: enabled.unwrap_or(true),
+            created_at: now.clone(),
+            updated_at: now,
+        })
+        .map_err(|error| error.to_string())?;
+    serde_json::to_value(profile).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn runner_settings(state: State<'_, DesktopState>) -> Result<Value, String> {
+    Ok(json!({
+        "enabled": state.store.runner_enabled().map_err(|error| error.to_string())?,
+        "max_concurrency": state.store.runner_max_concurrency().map_err(|error| error.to_string())?,
+    }))
+}
+
+#[tauri::command]
+fn set_runner_settings(
+    state: State<'_, DesktopState>,
+    enabled: bool,
+    max_concurrency: Option<u32>,
+) -> Result<Value, String> {
+    state
+        .store
+        .set_runner_enabled(enabled)
+        .map_err(|error| error.to_string())?;
+    if let Some(max_concurrency) = max_concurrency {
+        state
+            .store
+            .set_runner_max_concurrency(max_concurrency)
+            .map_err(|error| error.to_string())?;
+    }
+    runner_settings(state)
+}
+
+#[tauri::command]
 fn event_rules(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
     state
         .store
@@ -20139,6 +20213,8 @@ fn main() {
             let (ci_monitor_shutdown, ci_monitor_receiver) = tokio::sync::watch::channel(false);
             let ci_monitor_task =
                 ci_repair::start(Arc::clone(&store), secrets.clone(), ci_monitor_receiver);
+            let (runner_shutdown, runner_receiver) = tokio::sync::watch::channel(false);
+            let runner_task = work_runner::start(app.handle().clone(), runner_receiver);
             app.manage(DesktopState {
                 database: Arc::clone(&database),
                 secrets,
@@ -20168,6 +20244,8 @@ fn main() {
                 ingress_task: Mutex::new(Some(ingress_task)),
                 ci_monitor_shutdown,
                 ci_monitor_task: Mutex::new(Some(ci_monitor_task)),
+                runner_shutdown,
+                runner_task: Mutex::new(Some(runner_task)),
             });
             let handle = app.handle().clone();
             let trigger_handle = handle.clone();
@@ -20355,6 +20433,10 @@ fn main() {
             save_ci_monitor,
             set_ci_monitor_enabled,
             poll_ci_monitor,
+            runner_profile,
+            save_runner_profile,
+            runner_settings,
+            set_runner_settings,
             event_rules,
             create_event_rule,
             set_event_rule_enabled,
@@ -20432,6 +20514,12 @@ fn main() {
                 }
                 let _ = state.ci_monitor_shutdown.send(true);
                 if let Ok(mut task) = state.ci_monitor_task.lock()
+                    && let Some(task) = task.take()
+                {
+                    task.abort();
+                }
+                let _ = state.runner_shutdown.send(true);
+                if let Ok(mut task) = state.runner_task.lock()
                     && let Some(task) = task.take()
                 {
                     task.abort();
