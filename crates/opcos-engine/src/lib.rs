@@ -1572,7 +1572,7 @@ where
             let mut encoded = serde_json::to_string(message).ok()?;
             if encoded.len() > 4000 {
                 encoded.truncate(4000);
-                encoded.push_str("…");
+                encoded.push('…');
             }
             if context.len() + encoded.len() + 1 > 24_000 {
                 break;
