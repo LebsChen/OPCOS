@@ -1926,31 +1926,67 @@ where
     }
 
     fn validate_compaction_summary(text: &str) -> Result<(), String> {
-        let trimmed = text.trim();
+        let without_reasoning = strip_reasoning_blocks(text);
+        let trimmed = without_reasoning.trim();
         if trimmed.is_empty() {
             return Err("empty_response".into());
         }
         if trimmed.len() > 12_000 {
             return Err("response_too_large".into());
         }
-        if trimmed.starts_with("<think>") || trimmed.starts_with("<analysis>") {
-            return Err("reasoning_prefix".into());
-        }
         if let Ok(value) = serde_json::from_str::<Value>(trimmed)
             && (value.is_array() || value.get("tool_calls").is_some())
         {
             return Err("tool_calls_payload".into());
         }
+        if trimmed.matches("\"role\":").count() >= 2
+            || trimmed.matches("\"tool_call_id\"").count() >= 2
+            || trimmed.matches("{\"role\"").count() >= 2
+        {
+            return Err("raw_transcript".into());
+        }
+        if trimmed.chars().count() < 40 {
+            return Err("summary_too_short".into());
+        }
         let normalized = trimmed.to_ascii_lowercase();
-        for (label, keywords) in [
-            ("goal", &["goal"][..]),
-            ("completed_actions", &["completed"][..]),
-            ("discoveries_or_paths", &["discover", "file path"][..]),
-            ("next_steps", &["next step", "remaining"][..]),
-        ] {
+        let sections = [
+            ("goal", &["goal", "目标", "任务"][..]),
+            (
+                "completed_actions",
+                &["completed", "已完成", "完成的", "已经完成", "进展"][..],
+            ),
+            (
+                "discoveries_or_paths",
+                &[
+                    "discover",
+                    "file path",
+                    "finding",
+                    "发现",
+                    "文件路径",
+                    "关键",
+                ][..],
+            ),
+            (
+                "next_steps",
+                &[
+                    "next step",
+                    "remaining",
+                    "unfinished",
+                    "下一步",
+                    "未完成",
+                    "待办",
+                    "后续",
+                ][..],
+            ),
+        ];
+        let mut missing = Vec::new();
+        for (label, keywords) in sections {
             if !keywords.iter().any(|keyword| normalized.contains(keyword)) {
-                return Err(format!("missing_{label}"));
+                missing.push(label);
             }
+        }
+        if missing.len() > 1 {
+            return Err(format!("missing_{}", missing.join("_and_")));
         }
         Ok(())
     }
@@ -2503,6 +2539,27 @@ pub fn coordination_tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"coordination_dispatch","description":"Dispatch work asynchronously from the current builtin OPCOS Leader session to an existing Worker role. Only a Leader may call this tool; the caller role is derived from the bound session and cannot be supplied by the model. This never creates sessions or recursively spawns agents. Returns a task id and pending status; Worker reports are not completion evidence.","parameters":{"type":"object","properties":{"task_id":{"type":"string"},"worker_role_id":{"type":"string"},"message":{"type":"string"}},"required":["task_id","worker_role_id","message"]}}}),
         json!({"type":"function","function":{"name":"coordination_status","description":"Read bounded status for an asynchronously dispatched coordination task. Worker self-reports remain worker_reported/awaiting_verification; only verified branch, push, PR, and GitHub API checks can establish delivery. Returns recommended_after_seconds and does not block or encourage tight polling.","parameters":{"type":"object","properties":{"task_id":{"type":"string"},"limit":{"type":"integer"}},"required":["task_id"]}}}),
     ]
+}
+
+fn strip_reasoning_blocks(text: &str) -> String {
+    let mut current = text.to_owned();
+    for (open, close) in [("<think>", "</think>"), ("<analysis>", "</analysis>")] {
+        let mut result = String::new();
+        let mut rest = current.as_str();
+        while let Some(start) = rest.find(open) {
+            result.push_str(&rest[..start]);
+            match rest[start..].find(close) {
+                Some(end) => rest = &rest[start + end + close.len()..],
+                None => {
+                    rest = "";
+                    break;
+                }
+            }
+        }
+        result.push_str(rest);
+        current = result;
+    }
+    current
 }
 
 fn format_plan_context(plan: &opcos_store::PlanRecord) -> String {
@@ -4411,8 +4468,22 @@ mod tests {
             ("reasoning", "<think>internal reasoning</think>"),
             ("tool_calls", r#"{"tool_calls":[{"name":"read_file"}]}"#),
             ("oversized", oversized.as_str()),
-            ("missing_sections", "Goal: only the goal is present."),
+            (
+                "missing_sections",
+                "Goal: only the goal is present, nothing else was recorded here at all.",
+            ),
             ("empty", "   "),
+            (
+                "think_only",
+                "<think>some hidden reasoning about the task</think>",
+            ),
+            (
+                "raw_transcript",
+                r#"{"role":"user","content":"fix the bug"}
+{"role":"assistant","content":"reading files","tool_calls":[]}
+{"role":"tool","tool_call_id":"abc","content":"ok"}"#,
+            ),
+            ("too_short", "目标：修复。"),
         ] {
             assert!(
                 TurnEngine::<SummaryProvider, SqliteStore, FakeTools>::validate_compaction_summary(
@@ -4439,6 +4510,17 @@ mod tests {
              **Completed actions and results**\n已检查 `src/pricing.py`。\n\n\
              **Key discoveries and file paths**\n发现舍入逻辑需要修复。\n\n\
              **Unfinished next steps**\n补充回归测试。",
+            "## 目标\n修复定价模块的舍入问题。\n\n\
+             ## 已完成\n检查了 `src/pricing.py` 并定位问题。\n\n\
+             ## 关键发现\n舍入逻辑在负数场景出错。\n\n\
+             ## 下一步\n补充回归测试并验证。",
+            "<think>internal planning</think>**Goal**\nFix pricing bugs in the module.\n\n\
+             **Completed actions and results**\n- Read `src/pricing.py`.\n\n\
+             **Key discoveries and file paths**\n- Rounding bug found.\n\n\
+             **Unfinished next steps**\n- Add regression coverage.",
+            "Goal: repair the failing pricing pipeline end to end.\n\
+             Completed: reviewed the module and reproduced the failure.\n\
+             Next steps: patch rounding and rerun the suite.",
         ] {
             assert!(
                 TurnEngine::<SummaryProvider, SqliteStore, FakeTools>::validate_compaction_summary(
@@ -4446,6 +4528,32 @@ mod tests {
                 )
                 .is_ok(),
                 "observed summary shape was rejected: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_summary_validation_accepts_real_model_fixtures() {
+        let fixtures =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/compaction");
+        let entries: Vec<_> = std::fs::read_dir(&fixtures)
+            .expect("fixtures/compaction must exist")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "txt"))
+            .collect();
+        assert!(
+            entries.len() >= 4,
+            "expected at least four real-model compaction fixtures"
+        );
+        for entry in entries {
+            let text = std::fs::read_to_string(entry.path()).unwrap();
+            assert!(
+                TurnEngine::<SummaryProvider, SqliteStore, FakeTools>::validate_compaction_summary(
+                    &text
+                )
+                .is_ok(),
+                "real model fixture was rejected: {:?}",
+                entry.path()
             );
         }
     }
