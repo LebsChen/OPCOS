@@ -1497,7 +1497,11 @@ where
         let mut conversational = Vec::new();
         for message in messages {
             if message.get("role").and_then(Value::as_str) == Some("system") {
-                if plan.as_ref() != Some(&message) {
+                let is_plan = message
+                    .pointer("/content/0/text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.starts_with("Persisted execution plan ("));
+                if !is_plan {
                     fixed.push(message);
                 }
             } else {
