@@ -81,6 +81,11 @@ struct HostAssetReader {
     host: Arc<dyn Host>,
 }
 
+enum SessionAssetReader {
+    Host(HostAssetReader),
+    Remote(HttpRvmClient),
+}
+
 #[async_trait]
 impl opcos_assets::RemoteAssetReader for HostAssetReader {
     async fn read(&self, path: &str) -> Result<String, opcos_assets::AssetError> {
@@ -382,6 +387,26 @@ impl McpCredentialStore for McpCredentialAdapter {
                 serde_json::from_str(&value).map_err(|_| opcos_mcp::McpClientError::Transport)
             })
             .transpose()
+    }
+}
+
+#[async_trait]
+impl opcos_assets::RemoteAssetReader for SessionAssetReader {
+    async fn read(&self, path: &str) -> Result<String, opcos_assets::AssetError> {
+        match self {
+            Self::Host(reader) => reader.read(path).await,
+            Self::Remote(reader) => opcos_assets::RemoteAssetReader::read(reader, path).await,
+        }
+    }
+
+    async fn list(
+        &self,
+        path: Option<&str>,
+    ) -> Result<Vec<(String, bool)>, opcos_assets::AssetError> {
+        match self {
+            Self::Host(reader) => reader.list(path).await,
+            Self::Remote(reader) => reader.list(path).await,
+        }
     }
 }
 
@@ -8976,9 +9001,12 @@ async fn engine_for_with_context(
         })
         .unwrap_or_else(|| Arc::clone(&state.mcp));
     let mut remote_platform = None;
-    let (workspace, executor, remote_client, allowed_tools) = if host_id == "local" {
+    let (workspace, executor, remote_client, allowed_tools, asset_reader) = if host_id == "local" {
         let workspace = PathBuf::from(resolved_workspace.clone());
         let host = LocalHost::new(&workspace).map_err(|error| error.to_string())?;
+        let asset_reader = SessionAssetReader::Host(HostAssetReader {
+            host: Arc::new(host.clone()),
+        });
         let _ = host.health().await.map_err(|error| error.to_string())?;
         let capabilities = host
             .capabilities()
@@ -9064,6 +9092,7 @@ async fn engine_for_with_context(
             }))),
             None,
             Some(allowed_tools),
+            asset_reader,
         )
     } else {
         let client = client_for(state, &host_id)?;
@@ -9080,6 +9109,7 @@ async fn engine_for_with_context(
             session_workspace.clone()
         };
         let executor_client = client.clone().with_workspace(workspace.clone());
+        let asset_reader = SessionAssetReader::Remote(executor_client.clone());
         (
             workspace.clone(),
             Arc::new(DesktopExecutor::Remote(Box::new(RemoteExecutor {
@@ -9106,6 +9136,7 @@ async fn engine_for_with_context(
             }))),
             Some(executor_client),
             None,
+            asset_reader,
         )
     };
     let provider: Box<dyn Provider> = match descriptor.name.as_str() {
@@ -9400,13 +9431,9 @@ async fn engine_for_with_context(
     if !independent_tools.is_empty() {
         engine.append_external_tools(independent_tools).await;
     }
-    let mut bundle = if let Some(executor_client) = &remote_client {
-        discover_assets(executor_client, &workspace)
-            .await
-            .unwrap_or_default()
-    } else {
-        AssetBundle::default()
-    };
+    let mut bundle = discover_assets(&asset_reader, &workspace)
+        .await
+        .unwrap_or_default();
     append_session_config_assets(
         &mut bundle,
         load_session_config_assets(state, session_id).unwrap_or_default(),
@@ -21192,6 +21219,29 @@ mod m7_tests {
         for name in ["lsp_definition", "lsp_references", "lsp_diagnostics"] {
             assert!(!remote_allowed.contains(name));
         }
+    }
+
+    #[tokio::test]
+    async fn local_host_discovers_workspace_agent_assets() {
+        let root = std::env::temp_dir().join(format!("opcos-assets-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".agents/knowledge")).unwrap();
+        std::fs::write(
+            root.join(".agents/knowledge/local.md"),
+            "---\ntitle: Local knowledge\ntrigger: \"\"\nscope: global\nenabled: true\n---\n\nlocal asset body\n",
+        )
+        .unwrap();
+        let host = LocalHost::new(&root).unwrap();
+        let reader = HostAssetReader {
+            host: Arc::new(host),
+        };
+        let bundle = discover_assets(&reader, &root.display().to_string())
+            .await
+            .unwrap();
+        assert_eq!(bundle.knowledge.len(), 1);
+        assert_eq!(bundle.knowledge[0].body, "local asset body\n");
+        let rendered = bundle.system_instructions();
+        assert!(rendered.contains("local asset body"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

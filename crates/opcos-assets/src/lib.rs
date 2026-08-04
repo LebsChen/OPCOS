@@ -1088,6 +1088,49 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_filtering_counts_trigger_and_scope_omissions() {
+        let bundle = AssetBundle {
+            knowledge: vec![
+                KnowledgeEntry {
+                    title: "Trigger miss".into(),
+                    body: "trigger miss".into(),
+                    trigger: "build".into(),
+                    scope: String::new(),
+                    enabled: true,
+                },
+                KnowledgeEntry {
+                    title: "Scope miss".into(),
+                    body: "scope miss".into(),
+                    trigger: String::new(),
+                    scope: "repo".into(),
+                    enabled: true,
+                },
+                KnowledgeEntry {
+                    title: "Included".into(),
+                    body: "included".into(),
+                    trigger: String::new(),
+                    scope: String::new(),
+                    enabled: true,
+                },
+            ],
+            ..AssetBundle::default()
+        };
+        let rendered = bundle.system_instructions_for(KnowledgeContext {
+            task: "unrelated task",
+            repository: None,
+            project: None,
+        });
+        assert!(rendered.contains("included"));
+        assert!(!rendered.contains("trigger miss"));
+        assert!(!rendered.contains("scope miss"));
+        assert!(
+            rendered.contains(
+                "[2 knowledge sections omitted: trigger/scope filter or knowledge limit]"
+            )
+        );
+    }
+
+    #[test]
     fn knowledge_filtering_is_bounded_and_marks_omissions() {
         let bundle = AssetBundle {
             knowledge: (0..(MAX_KNOWLEDGE_ENTRIES + 1))
