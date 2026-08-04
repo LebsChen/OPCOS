@@ -1955,7 +1955,8 @@ async fn execute_background_job_tool(
             serde_json::to_value(snapshot).map_err(|error| error.to_string())
         }
         "background_job_status" => jobs
-            .status(
+            .remote_status(
+                host,
                 arguments
                     .get("job_id")
                     .and_then(Value::as_str)
@@ -1965,7 +1966,8 @@ async fn execute_background_job_tool(
             .map(|snapshot| serde_json::to_value(snapshot).unwrap_or(Value::Null))
             .map_err(|error| error.to_string()),
         "background_job_output" => jobs
-            .output(
+            .output_for_host(
+                host,
                 arguments
                     .get("job_id")
                     .and_then(Value::as_str)
