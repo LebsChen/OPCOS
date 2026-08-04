@@ -245,9 +245,6 @@ async fn create_runner_session(
         .load_project(project_id)
         .map_err(|error| error.to_string())?
         .ok_or("runner profile project not found")?;
-    if profile.host_id != project.host_id {
-        return Err("runner profile host does not match the project host".into());
-    }
     let session_id = format!("runner-session-{}", Uuid::new_v4());
     let now = Utc::now();
     state
