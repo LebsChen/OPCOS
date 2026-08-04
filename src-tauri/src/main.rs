@@ -11639,7 +11639,11 @@ pub(crate) async fn submit_turn_inner_with_context(
                 &app,
                 "notice",
                 Some(&request.session_id),
-                json!({"kind":pending_kind,"text":message}),
+                json!({"kind": if pending_kind == "question" {
+                    "question_pending"
+                } else {
+                    "approval_pending"
+                }, "text":message}),
             );
             emit(
                 &app,
