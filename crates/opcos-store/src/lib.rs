@@ -416,6 +416,14 @@ pub struct CiMonitorState {
     pub updated_at: String,
 }
 
+/// A registered GitHub Enterprise Server instance.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GitHubInstanceRecord {
+    pub host: String,
+    pub api_base: String,
+    pub token_secret: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct WorkQueueProgress {
     pub queue_id: String,
@@ -4479,6 +4487,18 @@ impl SqliteStore {
                        VALUES (11, CURRENT_TIMESTAMP);",
                 )?;
             }
+            if version < 12 {
+                connection.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS github_instances (
+                       host TEXT PRIMARY KEY,
+                       api_base TEXT NOT NULL,
+                       token_secret TEXT,
+                       updated_at TEXT NOT NULL
+                     );
+                     INSERT INTO schema_migrations(version, applied_at)
+                       VALUES (12, CURRENT_TIMESTAMP);",
+                )?;
+            }
             Ok(())
         })();
         match migration {
@@ -4491,6 +4511,47 @@ impl SqliteStore {
                 Err(error)
             }
         }
+    }
+
+    /// Registered GitHub Enterprise Server instances. `github.com` is implicit
+    /// and is never stored here.
+    pub fn list_github_instances(&self) -> Result<Vec<GitHubInstanceRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection
+            .prepare("SELECT host,api_base,token_secret FROM github_instances ORDER BY host")?;
+        statement
+            .query_map([], |row| {
+                Ok(GitHubInstanceRecord {
+                    host: row.get(0)?,
+                    api_base: row.get(1)?,
+                    token_secret: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn save_github_instance(
+        &self,
+        host: &str,
+        api_base: &str,
+        token_secret: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "INSERT INTO github_instances(host,api_base,token_secret,updated_at)
+             VALUES (?1,?2,?3,?4)
+             ON CONFLICT(host) DO UPDATE SET api_base=excluded.api_base,
+               token_secret=excluded.token_secret,updated_at=excluded.updated_at",
+            params![host, api_base, token_secret, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_github_instance(&self, host: &str) -> Result<bool, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let deleted = connection.execute("DELETE FROM github_instances WHERE host=?1", [host])?;
+        Ok(deleted > 0)
     }
 
     pub fn save_external_ingress_source(

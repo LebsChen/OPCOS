@@ -20,6 +20,8 @@
 - [x] repository index 的 symbol/glob/search 查询（历史 #38）。
 - [x] Git status/diff/log/rev-parse、建分支、显式文件 commit 和 GitHub-only
   push；GitHub PR 创建/读取/评论/reviewer 和 delivery verification（#45）。
+- [x] GitHub Enterprise Server 实例身份：host 白名单、`/api/v3` 归一化、
+  凭据按实例绑定（`github@<host>`）、canonical push/授权/事件身份带实例。
 - [x] GitHub Actions status 和失败 job log 查询；输出和日志有界返回（#47）。
 - [x] background jobs 的 start/status/output/kill，使用 job id 和截断元数据
   表达异步结果（#46）。
@@ -56,7 +58,8 @@
   为不可用，因为没有 structured remote LSP channel。
 - background jobs 依赖 Host 的 `process_stream` 或 `pty`；job/进程生命周期
   没有跨应用重启接管契约，远程 PTY 进程也没有可靠的孤儿恢复语义。
-- `git_push` credential path 只允许 `github.com` remote；其他 forge 未实现。
+- `git_push` credential path 只允许 `github.com` 和已登记的 GHES 实例；
+  其他 forge 未实现。
 - CI 查询只支持 GitHub Actions；没有通用 CI adapter，也没有自动修复 CI 到
   绿色的循环。
 - ACP harness 不经过 builtin `tool_definitions`/`ToolExecutor`，因此不能使用
@@ -91,9 +94,9 @@ structured LSP transport。需要先定义远程 stdio 通道和生命周期/退
 
 ### [ ] 非 GitHub forge 的安全 push/PR 闭环
 
-push credential validation 明确拒绝非 `github.com` remote，PR/delivery
-verification 也使用 GitHub API。需要各 forge 的凭据、URL 校验、PR 模型和
-审计契约；当前没有实现。
+push credential validation 只接受 `github.com` 和已登记的 GHES 实例，
+PR/delivery verification 也使用 GitHub API。GitLab 等其他 forge 需要各自的
+凭据、URL 校验、PR 模型和审计契约；当前没有实现。
 
 ### [ ] Agent-driven CI repair loop
 

@@ -110,6 +110,11 @@ type SecretMetadata = {
   purpose: string;
   project_id?: string | null;
 };
+type GitHubInstance = {
+  host: string;
+  api_base: string;
+  token_secret?: string | null;
+};
 type ConnectorCatalogEntry = {
   name: string;
   description: string;
@@ -1220,6 +1225,13 @@ function ProjectConfigPanel({
   const [mcpCredential, setMcpCredential] = useState("");
   const [connectorKind, setConnectorKind] = useState("");
   const [connectorToken, setConnectorToken] = useState("");
+  const [githubInstances, setGithubInstances] = useState<GitHubInstance[]>([]);
+  const [githubHost, setGithubHost] = useState("");
+  const [githubApiBase, setGithubApiBase] = useState("");
+  const loadGithubInstances = () =>
+    command<GitHubInstance[]>("list_github_enterprise_instances")
+      .then(setGithubInstances)
+      .catch(onError);
   const load = async () => {
     const [nextAssets, nextSecrets] = await Promise.all([
       command<Asset[]>("list_assets", { projectId: project.id }),
@@ -1237,6 +1249,7 @@ function ProjectConfigPanel({
   };
   useEffect(() => {
     void load().catch(onError);
+    void loadGithubInstances();
   }, [project.id]);
   const reset = () => {
     setTitle("");
@@ -1658,6 +1671,65 @@ function ProjectConfigPanel({
             >
               保存 Connector token
             </button>
+          </div>
+          <div className="grid gap-2 rounded-lg border border-line p-3">
+            <strong className="text-sm text-ink">GitHub Enterprise 实例</strong>
+            <span className="text-xs text-faint">
+              github.com 默认可用。企业实例登记后 API base 归一化为
+              https://&lt;host&gt;/api/v3，凭据使用 connector kind
+              github@&lt;host&gt;。
+            </span>
+            <input
+              value={githubHost}
+              onChange={(event) => setGithubHost(event.target.value)}
+              placeholder="ghe.example.com"
+            />
+            <input
+              value={githubApiBase}
+              onChange={(event) => setGithubApiBase(event.target.value)}
+              placeholder="API base（可选，默认 https://host/api/v3）"
+            />
+            <button
+              className="btn"
+              disabled={!githubHost}
+              onClick={() =>
+                command("save_github_enterprise_instance", {
+                  host: githubHost,
+                  apiBase: githubApiBase || null,
+                })
+                  .then(() => {
+                    setGithubHost("");
+                    setGithubApiBase("");
+                  })
+                  .then(loadGithubInstances)
+                  .catch(onError)
+              }
+            >
+              登记企业实例
+            </button>
+            {githubInstances.map((instance) => (
+              <div
+                className="flex items-center justify-between gap-2 text-xs"
+                key={instance.host}
+              >
+                <span className="min-w-0 break-all">
+                  <strong className="text-ink">{instance.host}</strong>
+                  <span className="ml-2 text-faint">{instance.api_base}</span>
+                </span>
+                <button
+                  className="btn"
+                  onClick={() =>
+                    command("delete_github_enterprise_instance", {
+                      host: instance.host,
+                    })
+                      .then(loadGithubInstances)
+                      .catch(onError)
+                  }
+                >
+                  删除
+                </button>
+              </div>
+            ))}
           </div>
         </div>
       </div>
