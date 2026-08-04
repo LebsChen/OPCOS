@@ -3604,6 +3604,9 @@ impl ToolExecutor for RemoteExecutor {
                     .into(),
             );
         }
+        if name == "ask_user" {
+            return Err("ask_user must be handled by the engine pending mechanism".into());
+        }
         let argument = |key: &str| {
             arguments
                 .get(key)
@@ -3959,6 +3962,9 @@ impl ToolExecutor for DesktopExecutor {
                         name,
                         arguments,
                     );
+                }
+                if name == "ask_user" {
+                    return Err("ask_user must be handled by the engine pending mechanism".into());
                 }
                 if matches!(
                     name,
@@ -4426,6 +4432,14 @@ fn emit(app: &tauri::AppHandle, kind: &str, session_id: Option<&str>, payload: V
 
 fn audit(state: &DesktopState, session_id: &str, kind: &str, payload: Value) {
     let _ = state.store.append_audit(session_id, kind, &payload);
+}
+
+fn attended_pending_event_kind(pending_kind: &str) -> &'static str {
+    if pending_kind == "question" {
+        "question_requested"
+    } else {
+        "approval"
+    }
 }
 
 fn emit_pending_approval(
@@ -9167,7 +9181,7 @@ async fn engine_for_with_context(
         "vertex" => {
             return Err(
                 "Google Vertex AI is not connected yet: service-account authentication is not supported by the current secret store."
-                    .into(),
+                .into(),
             );
         }
         "anthropic" => {
@@ -11382,6 +11396,59 @@ fn builtin_allowed_tools(include_local_lsp: bool, include_edit_file: bool) -> Ve
     tools
 }
 
+// Keep these explicit dispatch predicates beside the builtin allowlist. Rust cannot
+// enumerate match arms, so every change to the executor dispatch must update these
+// predicates and the coverage test below.
+#[cfg(test)]
+fn local_executor_dispatches_builtin_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "propose_plan"
+            | "plan_get"
+            | "plan_update"
+            | "plan_revise"
+            | "skill_save_learned"
+            | "skill_search_learned"
+            | "skill_get_learned"
+            | "ask_user"
+            | "repo_index_find_symbol"
+            | "repo_index_glob"
+            | "repo_index_search"
+            | "background_job_start"
+            | "background_job_status"
+            | "background_job_output"
+            | "background_job_kill"
+            | "local_gate_record"
+            | "local_gate_status"
+            | "action_ledger_begin"
+            | "action_ledger_finish"
+            | "action_ledger_list"
+            | "work_queue_enqueue"
+            | "work_queue_claim"
+            | "work_queue_renew"
+            | "work_queue_complete"
+            | "work_queue_cancel"
+            | "work_queue_requeue"
+            | "work_queue_list"
+            | "external_ingress_sources"
+            | "coordination_dispatch"
+            | "coordination_status"
+            | "lsp_definition"
+            | "lsp_references"
+            | "lsp_diagnostics"
+            | "edit_file"
+    )
+}
+
+#[cfg(test)]
+fn remote_executor_dispatches_builtin_tool(name: &str) -> bool {
+    local_executor_dispatches_builtin_tool(name)
+        && !matches!(
+            name,
+            "lsp_definition" | "lsp_references" | "lsp_diagnostics"
+        )
+}
+
 pub(crate) async fn submit_turn_inner_with_context(
     app: tauri::AppHandle,
     state: &DesktopState,
@@ -11537,25 +11604,42 @@ pub(crate) async fn submit_turn_inner_with_context(
                 .load_pending(&request.session_id)
                 .map(|items| items.into_iter().find(|item| item.call_id == call_id))
             {
-                emit(
-                    &app,
-                    "approval",
-                    Some(&request.session_id),
-                    json!({
-                        "call_id":pending.call_id,
-                        "tool":pending.tool,
-                        "arguments":redact_approval_value(&pending.arguments),
-                        "risk":approval_risk(&pending.tool),
-                        "reason":"Tool action requires approval"
-                    }),
-                );
+                if attended_pending_event_kind(&pending_kind) == "question_requested" {
+                    emit(
+                        &app,
+                        attended_pending_event_kind(&pending_kind),
+                        Some(&request.session_id),
+                        json!({
+                            "call_id": pending.call_id,
+                            "tool": pending.tool,
+                            "arguments": redact_approval_value(&pending.arguments),
+                        }),
+                    );
+                } else {
+                    emit(
+                        &app,
+                        "approval",
+                        Some(&request.session_id),
+                        json!({
+                            "call_id":pending.call_id,
+                            "tool":pending.tool,
+                            "arguments":redact_approval_value(&pending.arguments),
+                            "risk":approval_risk(&pending.tool),
+                            "reason":"Tool action requires approval"
+                        }),
+                    );
+                }
             }
-            let message = "Approval required before this tool can continue".to_owned();
+            let message = if pending_kind == "question" {
+                "Question requires an answer before this tool can continue".to_owned()
+            } else {
+                "Approval required before this tool can continue".to_owned()
+            };
             emit(
                 &app,
                 "notice",
                 Some(&request.session_id),
-                json!({"kind":"approval_pending","text":message}),
+                json!({"kind":pending_kind,"text":message}),
             );
             emit(
                 &app,
@@ -21221,6 +21305,32 @@ mod m7_tests {
         }
     }
 
+    #[test]
+    fn builtin_allowlist_is_covered_by_local_and_remote_dispatch() {
+        for name in builtin_allowed_tools(true, true) {
+            assert!(
+                local_executor_dispatches_builtin_tool(&name),
+                "{name} is visible to the local executor but has no dispatch arm"
+            );
+        }
+        for name in builtin_allowed_tools(false, false) {
+            assert!(
+                remote_executor_dispatches_builtin_tool(&name),
+                "{name} is visible to the remote executor but has no dispatch arm"
+            );
+        }
+    }
+
+    #[test]
+    fn attended_questions_use_question_event_not_approval_event() {
+        assert_eq!(
+            attended_pending_event_kind("question"),
+            "question_requested"
+        );
+        assert_eq!(attended_pending_event_kind("plan"), "approval");
+        assert_eq!(attended_pending_event_kind("approval"), "approval");
+    }
+
     #[tokio::test]
     async fn local_host_discovers_workspace_agent_assets() {
         let root = std::env::temp_dir().join(format!("opcos-assets-{}", Uuid::new_v4()));
@@ -21241,6 +21351,45 @@ mod m7_tests {
         assert_eq!(bundle.knowledge[0].body, "local asset body\n");
         let rendered = bundle.system_instructions();
         assert!(rendered.contains("local asset body"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_executor_ask_user_is_not_unavailable() {
+        let root = std::env::temp_dir().join(format!("opcos-ask-user-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let host = LocalHost::new(&root).unwrap();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let secrets = KeyringSecretStore::new(format!("opcos-test-{}", Uuid::new_v4()));
+        let mcp = Arc::new(McpManager::new(Arc::new(McpCredentialAdapter {
+            store: secrets.clone(),
+            project_id: None,
+        })));
+        let jobs = Arc::new(BackgroundJobManager::new(root.join("background-jobs")));
+        let executor = DesktopExecutor::Local(Box::new(LocalExecutor {
+            host,
+            secrets,
+            session_id: "ask-user-test".into(),
+            mcp,
+            index_root: root.join("indexes"),
+            workspace: root.display().to_string(),
+            project_id: None,
+            store,
+            jobs,
+            lsp: Arc::new(AsyncMutex::new(HashMap::new())),
+            database: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            engines: Arc::new(AsyncMutex::new(HashMap::new())),
+            coordination: Arc::new(AsyncMutex::new(HashMap::new())),
+            origin: ToolOrigin::User,
+            repair_loop: None,
+        }));
+        let result = executor
+            .execute("ask_user", json!({"question": "Which format?"}))
+            .await;
+        assert_eq!(
+            result,
+            Err("ask_user must be handled by the engine pending mechanism".into())
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

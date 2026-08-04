@@ -1107,12 +1107,18 @@ where
         );
         for (index, item) in pending.into_iter().enumerate() {
             let result = if item.call_id == call_id && outcome == ApprovalOutcome::Approve {
-                self.execute_tool(&ToolCall {
-                    id: item.call_id.clone(),
-                    name: item.tool.clone(),
-                    arguments: item.arguments.clone(),
-                })
-                .await
+                if item.tool == "ask_user" {
+                    // Questions remain engine-owned pending input. Never execute one
+                    // synchronously through an approval path or fabricate an answer.
+                    json!({"error":"ask_user must be handled by the engine pending mechanism"})
+                } else {
+                    self.execute_tool(&ToolCall {
+                        id: item.call_id.clone(),
+                        name: item.tool.clone(),
+                        arguments: item.arguments.clone(),
+                    })
+                    .await
+                }
             } else if item.call_id == call_id {
                 json!({"error":"tool call denied by user"})
             } else {
