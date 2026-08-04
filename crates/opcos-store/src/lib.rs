@@ -333,6 +333,54 @@ pub struct EventRule {
     pub trigger_count: u32,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ExternalIngressSource {
+    pub source_id: String,
+    pub provider: String,
+    pub config: serde_json::Value,
+    pub enabled: bool,
+    pub cursor: Option<String>,
+    pub initialized: bool,
+    pub next_attempt_at: Option<String>,
+    pub consecutive_failures: u32,
+    pub circuit_open_until: Option<String>,
+    pub last_success_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
+fn external_ingress_source_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ExternalIngressSource> {
+    Ok(ExternalIngressSource {
+        source_id: row.get(0)?,
+        provider: row.get(1)?,
+        config: serde_json::from_str(&row.get::<_, String>(2)?)
+            .unwrap_or_else(|_| serde_json::json!({})),
+        enabled: row.get(3)?,
+        cursor: row.get(4)?,
+        initialized: row.get(5)?,
+        next_attempt_at: row.get(6)?,
+        consecutive_failures: row.get(7)?,
+        circuit_open_until: row.get(8)?,
+        last_success_at: row.get(9)?,
+        last_error: row.get(10)?,
+    })
+}
+
+fn external_ingress_target(provider: &str, config: &serde_json::Value) -> Option<String> {
+    match provider {
+        "github" => config
+            .get("repo")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        "rss" | "atom" => config
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ActionLedgerRecord {
     pub action_id: String,
@@ -4051,6 +4099,29 @@ impl SqliteStore {
                     [Utc::now().to_rfc3339()],
                 )?;
             }
+            if version < 8 {
+                connection.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS external_ingress_sources (
+                       source_id TEXT PRIMARY KEY,
+                       provider TEXT NOT NULL,
+                       config TEXT NOT NULL,
+                       enabled INTEGER NOT NULL DEFAULT 0,
+                       cursor TEXT,
+                       initialized INTEGER NOT NULL DEFAULT 0,
+                       next_attempt_at TEXT,
+                       consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                       circuit_open_until TEXT,
+                       last_success_at TEXT,
+                       last_error TEXT
+                     );
+                     CREATE INDEX IF NOT EXISTS idx_external_ingress_due
+                       ON external_ingress_sources(enabled, next_attempt_at);",
+                )?;
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (8, ?1)",
+                    [Utc::now().to_rfc3339()],
+                )?;
+            }
             Ok(())
         })();
         match migration {
@@ -4063,6 +4134,173 @@ impl SqliteStore {
                 Err(error)
             }
         }
+    }
+
+    pub fn save_external_ingress_source(
+        &self,
+        source_id: &str,
+        provider: &str,
+        config: &serde_json::Value,
+    ) -> Result<ExternalIngressSource, StoreError> {
+        if source_id.trim().is_empty() || provider.trim().is_empty() {
+            return Err(StoreError::Validation(
+                "external ingress source_id and provider are required".into(),
+            ));
+        }
+        if !matches!(provider, "rss" | "atom" | "github") {
+            return Err(StoreError::Validation(
+                "unsupported external ingress provider".into(),
+            ));
+        }
+        if config.is_null() || !config.is_object() {
+            return Err(StoreError::Validation(
+                "external ingress config must be an object".into(),
+            ));
+        }
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let previous = connection
+            .query_row(
+                "SELECT provider,config FROM external_ingress_sources WHERE source_id=?1",
+                [source_id],
+                |row| {
+                    let provider: String = row.get(0)?;
+                    let config: String = row.get(1)?;
+                    Ok((provider, config))
+                },
+            )
+            .optional()?;
+        let target_changed = previous.is_some_and(|(old_provider, old_config)| {
+            old_provider != provider
+                || external_ingress_target(
+                    &old_provider,
+                    &serde_json::from_str(&old_config).unwrap_or_else(|_| serde_json::json!({})),
+                ) != external_ingress_target(provider, config)
+        });
+        connection.execute(
+            "INSERT INTO external_ingress_sources(source_id,provider,config)
+             VALUES (?1,?2,?3)
+             ON CONFLICT(source_id) DO UPDATE SET
+               provider=excluded.provider,
+               config=excluded.config,
+               cursor=CASE WHEN ?4 THEN NULL ELSE cursor END,
+               initialized=CASE WHEN ?4 THEN 0 ELSE initialized END,
+               next_attempt_at=CASE WHEN ?4 THEN NULL ELSE next_attempt_at END,
+               consecutive_failures=CASE WHEN ?4 THEN 0 ELSE consecutive_failures END,
+               circuit_open_until=CASE WHEN ?4 THEN NULL ELSE circuit_open_until END,
+               last_error=CASE WHEN ?4 THEN NULL ELSE last_error END",
+            params![
+                source_id,
+                provider,
+                serde_json::to_string(config)?,
+                target_changed
+            ],
+        )?;
+        self.load_external_ingress_source_locked(&connection, source_id)
+    }
+
+    pub fn load_external_ingress_source(
+        &self,
+        source_id: &str,
+    ) -> Result<Option<ExternalIngressSource>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        match self.load_external_ingress_source_locked(&connection, source_id) {
+            Ok(source) => Ok(Some(source)),
+            Err(StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn load_external_ingress_sources(
+        &self,
+        enabled_only: bool,
+    ) -> Result<Vec<ExternalIngressSource>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT source_id,provider,config,enabled,cursor,initialized,next_attempt_at,
+                    consecutive_failures,circuit_open_until,last_success_at,last_error
+             FROM external_ingress_sources
+             WHERE (?1=0 OR enabled=1)
+             ORDER BY source_id",
+        )?;
+        statement
+            .query_map([enabled_only], external_ingress_source_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_external_ingress_state(
+        &self,
+        source_id: &str,
+        cursor: Option<&str>,
+        initialized: bool,
+        next_attempt_at: Option<&str>,
+        consecutive_failures: u32,
+        circuit_open_until: Option<&str>,
+        last_success_at: Option<&str>,
+        last_error: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "UPDATE external_ingress_sources
+             SET cursor=?1,initialized=?2,next_attempt_at=?3,consecutive_failures=?4,
+                 circuit_open_until=?5,last_success_at=?6,last_error=?7
+             WHERE source_id=?8",
+            params![
+                cursor,
+                initialized,
+                next_attempt_at,
+                consecutive_failures,
+                circuit_open_until,
+                last_success_at,
+                last_error,
+                source_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_external_ingress_enabled(
+        &self,
+        source_id: &str,
+        enabled: bool,
+    ) -> Result<(), StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let changed = connection.execute(
+            "UPDATE external_ingress_sources SET enabled=?1 WHERE source_id=?2",
+            params![enabled, source_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::Validation(
+                "external ingress source not found".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn delete_external_ingress_source(&self, source_id: &str) -> Result<(), StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "DELETE FROM external_ingress_sources WHERE source_id=?1",
+            [source_id],
+        )?;
+        Ok(())
+    }
+
+    fn load_external_ingress_source_locked(
+        &self,
+        connection: &Connection,
+        source_id: &str,
+    ) -> Result<ExternalIngressSource, StoreError> {
+        connection
+            .query_row(
+                "SELECT source_id,provider,config,enabled,cursor,initialized,next_attempt_at,
+                        consecutive_failures,circuit_open_until,last_success_at,last_error
+                 FROM external_ingress_sources WHERE source_id=?1",
+                [source_id],
+                external_ingress_source_from_row,
+            )
+            .map_err(StoreError::from)
     }
 
     pub fn save_session(&self, session: &SessionRecord) -> Result<(), StoreError> {
@@ -6664,5 +6902,76 @@ mod tests {
             conflict_group: String::new(),
         });
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn external_ingress_sources_are_disabled_and_uninitialized_by_default() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let source = store
+            .save_external_ingress_source(
+                "feed:test",
+                "rss",
+                &serde_json::json!({"url":"http://127.0.0.1/feed.xml"}),
+            )
+            .unwrap();
+        assert!(!source.enabled);
+        assert!(!source.initialized);
+        assert!(source.cursor.is_none());
+        assert_eq!(store.load_external_ingress_sources(true).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn external_ingress_target_changes_reset_cursor_but_interval_changes_do_not() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .save_external_ingress_source(
+                "feed:test",
+                "rss",
+                &serde_json::json!({
+                    "url":"http://127.0.0.1/one.xml",
+                    "poll_interval_seconds":60
+                }),
+            )
+            .unwrap();
+        store
+            .update_external_ingress_state(
+                "feed:test",
+                Some("cursor-1"),
+                true,
+                Some("2026-01-01T00:00:00Z"),
+                2,
+                Some("2026-01-01T00:10:00Z"),
+                Some("2026-01-01T00:00:00Z"),
+                Some("temporary failure"),
+            )
+            .unwrap();
+        let unchanged = store
+            .save_external_ingress_source(
+                "feed:test",
+                "rss",
+                &serde_json::json!({
+                    "url":"http://127.0.0.1/one.xml",
+                    "poll_interval_seconds":300
+                }),
+            )
+            .unwrap();
+        assert_eq!(unchanged.cursor.as_deref(), Some("cursor-1"));
+        assert!(unchanged.initialized);
+        assert_eq!(unchanged.consecutive_failures, 2);
+        let reset = store
+            .save_external_ingress_source(
+                "feed:test",
+                "rss",
+                &serde_json::json!({
+                    "url":"http://127.0.0.1/two.xml",
+                    "poll_interval_seconds":300
+                }),
+            )
+            .unwrap();
+        assert!(reset.cursor.is_none());
+        assert!(!reset.initialized);
+        assert_eq!(reset.consecutive_failures, 0);
+        assert!(reset.circuit_open_until.is_none());
+        assert!(reset.last_error.is_none());
     }
 }

@@ -129,6 +129,7 @@ fn configure_no_window(_command: &mut ProcessCommand) {}
 
 const SECRET_SERVICE: &str = "com.opcos.desktop";
 const ASKPASS_SCRIPT: &str = "if (($args -join ' ') -match 'Username') { $env:OPCOS_GIT_USERNAME } else { $env:OPCOS_GIT_PASSWORD }";
+mod external_ingress;
 mod repo_index;
 mod scheduler;
 
@@ -181,6 +182,8 @@ struct DesktopState {
     index_root: PathBuf,
     mcp: Arc<McpManager<McpCredentialAdapter>>,
     jobs: Arc<BackgroundJobManager>,
+    ingress_shutdown: tokio::sync::watch::Sender<bool>,
+    ingress_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
 }
 
 #[derive(Clone)]
@@ -2369,6 +2372,28 @@ fn execute_work_queue_tool(
     }
 }
 
+fn execute_external_ingress_tool(
+    store: &SqliteStore,
+    name: &str,
+    _arguments: &Value,
+) -> Result<Value, String> {
+    match name {
+        "external_ingress_sources" => store
+            .load_external_ingress_sources(false)
+            .and_then(|sources| {
+                sources
+                    .into_iter()
+                    .map(|source| {
+                        serde_json::to_value(source).map_err(opcos_store::StoreError::from)
+                    })
+                    .collect()
+            })
+            .map(|sources: Vec<Value>| json!({"sources": sources}))
+            .map_err(|error| error.to_string()),
+        _ => Err(format!("unsupported external ingress tool: {name}")),
+    }
+}
+
 fn execute_plan_tool(
     store: &SqliteStore,
     session_id: &str,
@@ -2913,6 +2938,9 @@ impl ToolExecutor for RemoteExecutor {
                 arguments,
             );
         }
+        if name == "external_ingress_sources" {
+            return execute_external_ingress_tool(&self.store, name, &arguments);
+        }
         if matches!(name, "coordination_dispatch" | "coordination_status") {
             return execute_coordination_tool(
                 &self.store,
@@ -3204,6 +3232,9 @@ impl ToolExecutor for DesktopExecutor {
                         name,
                         arguments,
                     );
+                }
+                if name == "external_ingress_sources" {
+                    return execute_external_ingress_tool(&executor.store, name, &arguments);
                 }
                 if matches!(name, "coordination_dispatch" | "coordination_status") {
                     return execute_coordination_tool(
@@ -8080,6 +8111,7 @@ async fn engine_for(
             "work_queue_cancel".to_owned(),
             "work_queue_requeue".to_owned(),
             "work_queue_list".to_owned(),
+            "external_ingress_sources".to_owned(),
             "coordination_dispatch".to_owned(),
             "coordination_status".to_owned(),
         ]);
@@ -18538,6 +18570,68 @@ fn publish_event(state: State<'_, DesktopState>, input: EventInput) -> Result<Va
 }
 
 #[tauri::command]
+fn save_external_ingress_source(
+    state: State<'_, DesktopState>,
+    source_id: String,
+    provider: String,
+    config: Value,
+) -> Result<Value, String> {
+    state
+        .store
+        .save_external_ingress_source(&source_id, &provider, &config)
+        .and_then(|source| serde_json::to_value(source).map_err(opcos_store::StoreError::from))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn external_ingress_sources(
+    state: State<'_, DesktopState>,
+    enabled_only: Option<bool>,
+) -> Result<Vec<Value>, String> {
+    state
+        .store
+        .load_external_ingress_sources(enabled_only.unwrap_or(false))
+        .and_then(|sources| {
+            sources
+                .into_iter()
+                .map(|source| serde_json::to_value(source).map_err(opcos_store::StoreError::from))
+                .collect()
+        })
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn set_external_ingress_enabled(
+    state: State<'_, DesktopState>,
+    source_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    state
+        .store
+        .set_external_ingress_enabled(&source_id, enabled)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn delete_external_ingress_source(
+    state: State<'_, DesktopState>,
+    source_id: String,
+) -> Result<(), String> {
+    state
+        .store
+        .delete_external_ingress_source(&source_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn poll_external_ingress(
+    state: State<'_, DesktopState>,
+    source_id: String,
+) -> Result<(), String> {
+    external_ingress::poll_once(&state.store, &state.secrets, &source_id).await
+}
+
+#[tauri::command]
 fn event_rules(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
     state
         .store
@@ -19322,6 +19416,9 @@ fn main() {
             let database = Arc::new(Mutex::new(database));
             let engines = Arc::new(AsyncMutex::new(HashMap::new()));
             let coordination = Arc::new(AsyncMutex::new(HashMap::new()));
+            let (ingress_shutdown, ingress_receiver) = tokio::sync::watch::channel(false);
+            let ingress_task =
+                external_ingress::start(Arc::clone(&store), secrets.clone(), ingress_receiver);
             app.manage(DesktopState {
                 database: Arc::clone(&database),
                 secrets,
@@ -19347,6 +19444,8 @@ fn main() {
                 trigger_watcher_stop: Mutex::new(None),
                 mcp: Arc::clone(&mcp),
                 jobs,
+                ingress_shutdown,
+                ingress_task: Mutex::new(Some(ingress_task)),
             });
             let handle = app.handle().clone();
             let trigger_handle = handle.clone();
@@ -19525,6 +19624,11 @@ fn main() {
             event_stream,
             acknowledge_event,
             publish_event,
+            save_external_ingress_source,
+            external_ingress_sources,
+            set_external_ingress_enabled,
+            delete_external_ingress_source,
+            poll_external_ingress,
             event_rules,
             create_event_rule,
             set_event_rule_enabled,
@@ -19593,6 +19697,12 @@ fn main() {
                     && let Some(stop) = stop.as_ref()
                 {
                     let _ = stop.send(());
+                }
+                let _ = state.ingress_shutdown.send(true);
+                if let Ok(mut task) = state.ingress_task.lock()
+                    && let Some(task) = task.take()
+                {
+                    task.abort();
                 }
                 let mcp = Arc::clone(&state.mcp);
                 tauri::async_runtime::block_on(async move {
