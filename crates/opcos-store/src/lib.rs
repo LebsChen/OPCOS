@@ -104,6 +104,18 @@ pub struct ProjectAgentRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AutonomousRunnerProfile {
+    pub project_id: String,
+    pub host_id: String,
+    pub provider: String,
+    pub model: String,
+    pub workspace: String,
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AccountHostBinding {
     pub account_id: String,
     pub host_id: String,
@@ -3251,31 +3263,33 @@ impl SqliteStore {
             ));
         }
         let now = Utc::now().to_rfc3339();
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let changed = connection.execute(
-            "INSERT INTO work_queue_progress(queue_id,worker_id,lease_generation,progress,updated_at)
-             SELECT ?1,?2,?3,?4,?5
-             WHERE EXISTS (
-               SELECT 1 FROM work_queue
-               WHERE queue_id=?1 AND status='running' AND lease_owner=?2
-                 AND lease_generation=?3 AND lease_until>?5
-             )
-             ON CONFLICT(queue_id) DO UPDATE SET
-               worker_id=excluded.worker_id,
-               lease_generation=excluded.lease_generation,
-               progress=excluded.progress,
-               updated_at=excluded.updated_at
-             WHERE work_queue_progress.worker_id=excluded.worker_id
-               AND work_queue_progress.lease_generation=excluded.lease_generation",
-            params![
-                queue_id,
-                worker_id,
-                lease_generation as i64,
-                serde_json::to_string(progress)
-                    .map_err(|error| StoreError::Validation(error.to_string()))?,
-                now
-            ],
-        )?;
+        let changed = {
+            let connection = self.connection.lock().expect("sqlite mutex poisoned");
+            connection.execute(
+                "INSERT INTO work_queue_progress(queue_id,worker_id,lease_generation,progress,updated_at)
+                 SELECT ?1,?2,?3,?4,?5
+                 WHERE EXISTS (
+                   SELECT 1 FROM work_queue
+                   WHERE queue_id=?1 AND status='running' AND lease_owner=?2
+                     AND lease_generation=?3 AND lease_until>?5
+                 )
+                 ON CONFLICT(queue_id) DO UPDATE SET
+                   worker_id=excluded.worker_id,
+                   lease_generation=excluded.lease_generation,
+                   progress=excluded.progress,
+                   updated_at=excluded.updated_at
+                 WHERE work_queue_progress.worker_id=excluded.worker_id
+                   AND work_queue_progress.lease_generation=excluded.lease_generation",
+                params![
+                    queue_id,
+                    worker_id,
+                    lease_generation as i64,
+                    serde_json::to_string(progress)
+                        .map_err(|error| StoreError::Validation(error.to_string()))?,
+                    now
+                ],
+            )?
+        };
         if changed == 0 {
             return Err(StoreError::Validation(
                 "lease is missing, expired, or owned by another worker".into(),
@@ -3507,6 +3521,40 @@ impl SqliteStore {
         if changed == 0 {
             return Err(StoreError::Validation(
                 "queue item is missing or not ready".into(),
+            ));
+        }
+        connection
+            .query_row(
+                &format!("SELECT {WORK_QUEUE_COLUMNS} FROM work_queue WHERE queue_id=?1"),
+                [queue_id],
+                work_queue_from_row,
+            )
+            .map_err(StoreError::from)
+    }
+
+    pub fn hold_work_item_for_approval_fenced(
+        &self,
+        queue_id: &str,
+        worker_id: &str,
+        lease_generation: u64,
+    ) -> Result<WorkQueueItem, StoreError> {
+        if lease_generation > i64::MAX as u64 {
+            return Err(StoreError::Validation(
+                "lease_generation is out of range".into(),
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let changed = connection.execute(
+            "UPDATE work_queue SET status='pending_approval',lease_owner=NULL,lease_until=NULL,
+                    updated_at=?1
+             WHERE queue_id=?2 AND status='running' AND lease_owner=?3
+               AND lease_generation=?4 AND lease_until>?1",
+            params![now, queue_id, worker_id, lease_generation as i64],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::Validation(
+                "lease is missing, expired, or owned by another worker".into(),
             ));
         }
         connection
@@ -4316,6 +4364,32 @@ impl SqliteStore {
                        VALUES (9, CURRENT_TIMESTAMP);",
                 )?;
             }
+            if version < 10 {
+                connection.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS autonomous_runner_profiles (
+                       project_id TEXT PRIMARY KEY,
+                       host_id TEXT NOT NULL,
+                       provider TEXT NOT NULL,
+                       model TEXT NOT NULL,
+                       workspace TEXT NOT NULL,
+                       enabled INTEGER NOT NULL DEFAULT 1,
+                       created_at TEXT NOT NULL,
+                       updated_at TEXT NOT NULL
+                     );
+                     CREATE TABLE IF NOT EXISTS runner_settings (
+                       setting_key TEXT PRIMARY KEY,
+                       setting_value TEXT NOT NULL
+                     );
+                     INSERT INTO runner_settings(setting_key,setting_value)
+                       VALUES ('enabled','0')
+                       ON CONFLICT(setting_key) DO NOTHING;
+                     INSERT INTO runner_settings(setting_key,setting_value)
+                       VALUES ('max_concurrency','1')
+                       ON CONFLICT(setting_key) DO NOTHING;
+                     INSERT INTO schema_migrations(version, applied_at)
+                       VALUES (10, CURRENT_TIMESTAMP);",
+                )?;
+            }
             Ok(())
         })();
         match migration {
@@ -4763,6 +4837,125 @@ impl SqliteStore {
             .query_map([], project_from_row)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
+    }
+
+    pub fn save_runner_profile(
+        &self,
+        profile: &AutonomousRunnerProfile,
+    ) -> Result<AutonomousRunnerProfile, StoreError> {
+        if profile.project_id.trim().is_empty()
+            || profile.host_id.trim().is_empty()
+            || profile.provider.trim().is_empty()
+            || profile.model.trim().is_empty()
+            || profile.workspace.trim().is_empty()
+        {
+            return Err(StoreError::Validation(
+                "runner profile requires project, host, provider, model, and workspace".into(),
+            ));
+        }
+        self.connection.lock().expect("sqlite mutex poisoned").execute(
+            "INSERT INTO autonomous_runner_profiles
+             (project_id,host_id,provider,model,workspace,enabled,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(project_id) DO UPDATE SET
+               host_id=excluded.host_id,provider=excluded.provider,model=excluded.model,
+               workspace=excluded.workspace,enabled=excluded.enabled,updated_at=excluded.updated_at",
+            params![
+                profile.project_id,
+                profile.host_id,
+                profile.provider,
+                profile.model,
+                profile.workspace,
+                profile.enabled,
+                profile.created_at,
+                profile.updated_at
+            ],
+        )?;
+        self.load_runner_profile(&profile.project_id)?
+            .ok_or_else(|| StoreError::Validation("runner profile was not saved".into()))
+    }
+
+    pub fn load_runner_profile(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<AutonomousRunnerProfile>, StoreError> {
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .query_row(
+                "SELECT project_id,host_id,provider,model,workspace,enabled,created_at,updated_at
+                 FROM autonomous_runner_profiles WHERE project_id=?1",
+                [project_id],
+                |row| {
+                    Ok(AutonomousRunnerProfile {
+                        project_id: row.get(0)?,
+                        host_id: row.get(1)?,
+                        provider: row.get(2)?,
+                        model: row.get(3)?,
+                        workspace: row.get(4)?,
+                        enabled: row.get(5)?,
+                        created_at: row.get(6)?,
+                        updated_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn runner_enabled(&self) -> Result<bool, StoreError> {
+        let value: String = self
+            .connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .query_row(
+                "SELECT setting_value FROM runner_settings WHERE setting_key='enabled'",
+                [],
+                |row| row.get(0),
+            )?;
+        Ok(value == "1")
+    }
+
+    pub fn set_runner_enabled(&self, enabled: bool) -> Result<(), StoreError> {
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "INSERT INTO runner_settings(setting_key,setting_value) VALUES ('enabled',?1)
+             ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value",
+                [if enabled { "1" } else { "0" }],
+            )?;
+        Ok(())
+    }
+
+    pub fn runner_max_concurrency(&self) -> Result<u32, StoreError> {
+        let value: String = self
+            .connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .query_row(
+                "SELECT setting_value FROM runner_settings WHERE setting_key='max_concurrency'",
+                [],
+                |row| row.get(0),
+            )?;
+        Ok(value.parse().unwrap_or(1).clamp(1, 8))
+    }
+
+    pub fn set_runner_max_concurrency(&self, max: u32) -> Result<(), StoreError> {
+        if !(1..=8).contains(&max) {
+            return Err(StoreError::Validation(
+                "runner max concurrency must be between 1 and 8".into(),
+            ));
+        }
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+            "INSERT INTO runner_settings(setting_key,setting_value) VALUES ('max_concurrency',?1)
+             ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value",
+            [max.to_string()],
+        )?;
+        Ok(())
     }
 
     pub fn delete_project(&self, id: &str) -> Result<(), StoreError> {
@@ -7493,6 +7686,70 @@ mod tests {
                     &serde_json::json!({"phase":"stale"}),
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn autonomous_runner_profile_and_settings_are_persistent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert!(!store.runner_enabled().unwrap());
+        assert_eq!(store.runner_max_concurrency().unwrap(), 1);
+        let profile = AutonomousRunnerProfile {
+            project_id: "project-1".into(),
+            host_id: "local".into(),
+            provider: "openai".into(),
+            model: "gpt-test".into(),
+            workspace: "/tmp/project".into(),
+            enabled: true,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+        assert_eq!(store.save_runner_profile(&profile).unwrap(), profile);
+        store.set_runner_enabled(true).unwrap();
+        store.set_runner_max_concurrency(2).unwrap();
+        assert!(store.runner_enabled().unwrap());
+        assert_eq!(store.runner_max_concurrency().unwrap(), 2);
+        assert_eq!(
+            store.load_runner_profile("project-1").unwrap(),
+            Some(profile)
+        );
+    }
+
+    #[test]
+    fn fenced_approval_hold_cannot_be_done_by_stale_worker() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let item = store
+            .enqueue_work_item(
+                "task",
+                &serde_json::json!({}),
+                None,
+                None,
+                3,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let claimed = store.claim_work_item("worker-1", 60).unwrap().unwrap();
+        assert!(
+            store
+                .hold_work_item_for_approval_fenced(
+                    &item.queue_id,
+                    "worker-2",
+                    claimed.lease_generation
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .hold_work_item_for_approval_fenced(
+                    &item.queue_id,
+                    "worker-1",
+                    claimed.lease_generation
+                )
+                .unwrap()
+                .status,
+            "pending_approval"
         );
     }
 }

@@ -2795,6 +2795,7 @@ function GitActions({
         </p>
       </details>
       <CiMonitorPanel selected={selected} onError={onError} />
+      <RunnerPanel selected={selected} onError={onError} />
       <details>
         <summary>处理 GitHub PR 评论</summary>
         <input
@@ -2915,6 +2916,117 @@ function CiMonitorPanel({
         Configure an event rule if you want to route the event to a durable work
         item.
       </p>
+    </details>
+  );
+}
+
+function RunnerPanel({
+  selected,
+  onError,
+}: {
+  selected: Session;
+  onError: (error: unknown) => void;
+}) {
+  const [enabled, setEnabled] = useState(false);
+  const [hostId, setHostId] = useState("local");
+  const [provider, setProvider] = useState("");
+  const [model, setModel] = useState("");
+  const [workspace, setWorkspace] = useState("");
+  const [runnerEnabled, setRunnerEnabled] = useState(false);
+  const [maxConcurrency, setMaxConcurrency] = useState("1");
+  const refresh = () => {
+    if (!selected.project_id) return;
+    Promise.all([
+      invoke<unknown>("runner_profile", { projectId: selected.project_id }),
+      invoke<{ enabled: boolean; max_concurrency: number }>("runner_settings"),
+    ])
+      .then(([profile, settings]) => {
+        if (profile && typeof profile === "object") {
+          const value = profile as {
+            enabled?: boolean;
+            host_id?: string;
+            provider?: string;
+            model?: string;
+            workspace?: string;
+          };
+          setEnabled(Boolean(value.enabled));
+          setHostId(value.host_id ?? "local");
+          setProvider(value.provider ?? "");
+          setModel(value.model ?? "");
+          setWorkspace(value.workspace ?? "");
+        }
+        setRunnerEnabled(settings.enabled);
+        setMaxConcurrency(String(settings.max_concurrency));
+      })
+      .catch(onError);
+  };
+  useEffect(refresh, [selected.project_id]);
+  const save = () =>
+    invoke("save_runner_profile", {
+      projectId: selected.project_id,
+      hostId,
+      provider,
+      model,
+      workspace,
+      enabled,
+    })
+      .then(refresh)
+      .catch(onError);
+  const toggleRunner = () =>
+    invoke("set_runner_settings", {
+      enabled: !runnerEnabled,
+      maxConcurrency: Number(maxConcurrency),
+    })
+      .then(() => setRunnerEnabled(!runnerEnabled))
+      .catch(onError);
+  return (
+    <details>
+      <summary>Autonomous runner profile</summary>
+      <p className="muted small">
+        The runner is disabled by default. A profile explicitly selects the
+        host, provider, model, and workspace for sessionless work items.
+      </p>
+      <input
+        value={hostId}
+        onChange={(event) => setHostId(event.target.value)}
+        placeholder="host id"
+      />
+      <input
+        value={provider}
+        onChange={(event) => setProvider(event.target.value)}
+        placeholder="provider"
+      />
+      <input
+        value={model}
+        onChange={(event) => setModel(event.target.value)}
+        placeholder="model"
+      />
+      <input
+        value={workspace}
+        onChange={(event) => setWorkspace(event.target.value)}
+        placeholder="workspace"
+      />
+      <Button onClick={save}>Save runner profile</Button>
+      <label>
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(event) => setEnabled(event.target.checked)}
+        />
+        Profile enabled
+      </label>
+      <input
+        value={maxConcurrency}
+        onChange={(event) => setMaxConcurrency(event.target.value)}
+        inputMode="numeric"
+        placeholder="max concurrency"
+      />
+      <Button onClick={toggleRunner}>
+        {runnerEnabled
+          ? "Disable background runner"
+          : "Enable background runner"}
+      </Button>
+      <Button onClick={refresh}>Refresh runner settings</Button>
     </details>
   );
 }
