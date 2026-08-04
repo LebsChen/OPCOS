@@ -646,6 +646,17 @@ where
     }
 
     async fn lifecycle_hooks(&self, event: &str, tool: Option<&str>, input: Value) -> HookEffects {
+        self.lifecycle_hooks_with_timeout(event, tool, input, Duration::from_secs(10))
+            .await
+    }
+
+    async fn lifecycle_hooks_with_timeout(
+        &self,
+        event: &str,
+        tool: Option<&str>,
+        input: Value,
+        timeout: Duration,
+    ) -> HookEffects {
         let Some(config) = self.lifecycle_hooks.lock().await.clone() else {
             return HookEffects::default();
         };
@@ -677,11 +688,11 @@ where
                 continue;
             }
             let output = match tokio::time::timeout(
-                Duration::from_secs(10),
+                timeout,
                 self.executor.run_hook_command(
                     &hook.command,
                     redact_hook_value(input.clone()),
-                    Duration::from_secs(10),
+                    timeout,
                 ),
             )
             .await
@@ -2766,6 +2777,24 @@ mod tests {
         }
     }
 
+    struct HangingHookTools;
+
+    #[async_trait]
+    impl ToolExecutor for HangingHookTools {
+        async fn execute(&self, _: &str, _: Value) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+
+        async fn run_hook_command(
+            &self,
+            _: &str,
+            _: Value,
+            _: Duration,
+        ) -> Result<Option<Value>, String> {
+            std::future::pending().await
+        }
+    }
+
     fn hook_config(event: &str, command: &str) -> LifecycleHookConfig {
         LifecycleHookConfig {
             enabled: true,
@@ -2787,6 +2816,32 @@ mod tests {
         let text = value.to_string();
         assert!(!text.contains("secret-token"));
         assert!(text.contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_hook_timeout_does_not_block_turn() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(HangingHookTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine
+            .set_lifecycle_hooks(Some(hook_config("PreToolUse", "hang")))
+            .await;
+        let effects = engine
+            .lifecycle_hooks_with_timeout(
+                "PreToolUse",
+                Some("run_shell"),
+                json!({"command":"safe"}),
+                Duration::from_millis(1),
+            )
+            .await;
+        assert_eq!(effects, HookEffects::default());
     }
 
     #[tokio::test]
