@@ -1509,7 +1509,10 @@ where
     }
 
     async fn compact_context(&self, messages: Vec<Value>) -> Result<Vec<Value>, EngineError> {
-        let plan = self.plan_context_message()?;
+        let plan = self
+            .store
+            .load_plan(&self.session_id)
+            .map_err(|error| EngineError::Store(error.to_string()))?;
         let mut existing_system_sections = Vec::new();
         let mut conversational = Vec::new();
         for message in messages {
@@ -1568,10 +1571,8 @@ where
             json!({"role":"user","content":[{"type":"text","text":summary_text.clone()}]}),
         );
         let mut system_sections = Vec::new();
-        if let Some(plan) = plan
-            && let Some(text) = plan.pointer("/content/0/text").and_then(Value::as_str)
-        {
-            system_sections.push(text.to_owned());
+        if let Some(plan) = plan.as_ref() {
+            system_sections.push(format_plan_context(plan));
         }
         system_sections.push(self.runtime_context_text());
         if let Ok(instructions) = self.system_instructions.try_lock()
@@ -3523,15 +3524,30 @@ mod tests {
         );
         let compacted = engine.compact_context(messages).await.unwrap();
         assert_eq!(
+            compacted
+                .iter()
+                .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+                .count(),
+            1
+        );
+        assert_eq!(
             compacted[0]
                 .pointer("/content/0/text")
                 .and_then(Value::as_str),
-            Some("Always preserve workspace constraints.")
+            Some(
+                "Runtime context:\n- Workspace: /workspace\n- Permission mode: Auto\n\nAlways preserve workspace constraints."
+            )
         );
         assert_eq!(
             compacted[1].get("role").and_then(Value::as_str),
             Some("user")
         );
+        assert!(compacted.iter().any(|message| {
+            message
+                .pointer("/content/0/text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("Goal: inspect the repository."))
+        }));
     }
 
     #[tokio::test]
