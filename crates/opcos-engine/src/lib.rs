@@ -1492,8 +1492,21 @@ where
     }
 
     async fn compact_context(&self, messages: Vec<Value>) -> Result<Vec<Value>, EngineError> {
-        let retained = messages.into_iter().rev().take(6).collect::<Vec<_>>();
-        let retained = retained.into_iter().rev().collect::<Vec<_>>();
+        let plan = self.plan_context_message()?;
+        let mut fixed = Vec::new();
+        let mut conversational = Vec::new();
+        for message in messages {
+            if message.get("role").and_then(Value::as_str) == Some("system") {
+                if plan.as_ref() != Some(&message) {
+                    fixed.push(message);
+                }
+            } else {
+                conversational.push(message);
+            }
+        }
+        let split_at = conversational.len().saturating_sub(6);
+        let discarded = conversational[..split_at].to_vec();
+        let retained = conversational[split_at..].to_vec();
         let mut valid = Vec::new();
         let mut pending_ids = std::collections::HashSet::new();
         for message in &retained {
@@ -1524,22 +1537,63 @@ where
                     && message.get("tool_calls").is_some())
             });
         }
-        let summary = json!({"role":"user","content":[{"type":"text","text":"[Compacted history: earlier messages were summarized and remain durable in the session store.]"}]});
-        valid.insert(0, summary);
-        if let Some(plan) = self.plan_context_message()? {
+        let fallback_summary =
+            "Earlier messages compacted; recent complete tool exchanges retained.".to_owned();
+        let summary_text = if discarded.is_empty() {
+            fallback_summary.clone()
+        } else {
+            self.compaction_summary(&discarded)
+                .await
+                .unwrap_or(fallback_summary)
+        };
+        valid.insert(
+            0,
+            json!({"role":"user","content":[{"type":"text","text":summary_text.clone()}]}),
+        );
+        valid.splice(0..0, fixed);
+        if let Some(plan) = plan {
             valid.insert(0, plan);
         }
         self.store
             .save_compaction(&CompactionRecord {
                 session_id: self.session_id.clone(),
-                summary: "Earlier messages compacted; recent complete tool exchanges retained."
-                    .into(),
-                retained_from: valid.len() as i64,
+                summary: summary_text,
+                retained_from: retained.len() as i64,
             })
             .map_err(|error| EngineError::Store(error.to_string()))?;
         self.notice("compacted", "Earlier context compacted".into())
             .await?;
         Ok(valid)
+    }
+
+    async fn compaction_summary(&self, discarded: &[Value]) -> Option<String> {
+        let mut context = String::new();
+        for message in discarded {
+            let mut encoded = serde_json::to_string(message).ok()?;
+            if encoded.len() > 4000 {
+                encoded.truncate(4000);
+                encoded.push_str("…");
+            }
+            if context.len() + encoded.len() + 1 > 24_000 {
+                break;
+            }
+            context.push_str(&encoded);
+            context.push('\n');
+        }
+        let response = self
+            .provider
+            .complete(ProviderRequest {
+                model: self.model.lock().await.clone(),
+                messages: vec![
+                    json!({"role":"system","content":"Summarize the prior agent context into concise structured points. Include: original goal; completed actions and results; key discoveries and file paths; unfinished next steps. Do not invent facts."}),
+                    json!({"role":"user","content":context}),
+                ],
+                tools: Vec::new(),
+                settings: json!({}),
+            })
+            .await
+            .ok()?;
+        response.text.filter(|text| !text.trim().is_empty())
     }
 
     async fn append(&self, role: &str, content: Value) -> Result<(), EngineError> {
@@ -2335,7 +2389,10 @@ mod tests {
     #[async_trait]
     impl Provider for FakeProvider {
         async fn complete(&self, _: ProviderRequest) -> Result<AssistantTurn, ProviderError> {
-            unreachable!()
+            Ok(AssistantTurn {
+                text: Some("summary".into()),
+                ..Default::default()
+            })
         }
         async fn stream(
             &self,
@@ -3207,6 +3264,129 @@ mod tests {
         assert!(store.load_compaction("s").unwrap().is_some());
     }
 
+    #[derive(Clone)]
+    struct SummaryProvider {
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl Provider for SummaryProvider {
+        async fn complete(&self, _: ProviderRequest) -> Result<AssistantTurn, ProviderError> {
+            if self.fail {
+                Err(ProviderError::Request("summary unavailable".into()))
+            } else {
+                Ok(AssistantTurn {
+                    text: Some("Goal: inspect the repository.\nNext: verify the change.".into()),
+                    ..Default::default()
+                })
+            }
+        }
+
+        async fn stream(
+            &self,
+            _: ProviderRequest,
+            _: mpsc::Sender<StreamChunk>,
+        ) -> Result<AssistantTurn, ProviderError> {
+            unreachable!()
+        }
+
+        fn capabilities(&self, _: &str) -> Caps {
+            Caps::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_keeps_system_instructions_at_the_front() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            SummaryProvider { fail: false },
+            store,
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine
+            .set_system_instructions(Some("Always preserve workspace constraints.".into()))
+            .await;
+        let mut messages = vec![json!({
+            "role":"system",
+            "content":[{"type":"text","text":"Always preserve workspace constraints."}]
+        })];
+        messages.extend(
+            (0..8).map(|index| json!({"role":"user","content":format!("message-{index}")})),
+        );
+        let compacted = engine.compact_context(messages).await.unwrap();
+        assert_eq!(
+            compacted[0]
+                .pointer("/content/0/text")
+                .and_then(Value::as_str),
+            Some("Always preserve workspace constraints.")
+        );
+        assert_eq!(
+            compacted[1].get("role").and_then(Value::as_str),
+            Some("user")
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_persists_provider_summary() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            SummaryProvider { fail: false },
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine
+            .set_system_instructions(Some("Keep context.".into()))
+            .await;
+        let messages = (0..8)
+            .map(|index| json!({"role":"user","content":format!("message-{index}")}))
+            .collect();
+        let compacted = engine.compact_context(messages).await.unwrap();
+        assert!(compacted.iter().any(|message| {
+            message
+                .pointer("/content/0/text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("Goal: inspect the repository."))
+        }));
+        assert_eq!(
+            store.load_compaction("s").unwrap().unwrap().summary,
+            "Goal: inspect the repository.\nNext: verify the change."
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_compaction_summary_falls_back_to_recent_context() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            SummaryProvider { fail: true },
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine
+            .set_system_instructions(Some("Keep context.".into()))
+            .await;
+        let messages = (0..8)
+            .map(|index| json!({"role":"user","content":format!("message-{index}")}))
+            .collect();
+        let compacted = engine.compact_context(messages).await.unwrap();
+        assert!(compacted.iter().any(|message| {
+            message.pointer("/content/0/text").and_then(Value::as_str)
+                == Some("Earlier messages compacted; recent complete tool exchanges retained.")
+        }));
+        assert!(store.load_compaction("s").unwrap().is_some());
+    }
+
     struct TimingTools {
         events: Arc<Mutex<Vec<String>>>,
     }
@@ -3482,7 +3662,10 @@ mod tests {
     #[async_trait]
     impl Provider for OverflowProvider {
         async fn complete(&self, _: ProviderRequest) -> Result<AssistantTurn, ProviderError> {
-            unreachable!()
+            Ok(AssistantTurn {
+                text: Some("summary".into()),
+                ..Default::default()
+            })
         }
         async fn stream(
             &self,
