@@ -1942,29 +1942,13 @@ where
             return Err("tool_calls_payload".into());
         }
         let normalized = trimmed.to_ascii_lowercase();
-        for (label, alternatives) in [
-            ("goal", ["goal:", "## goal", "original goal"]),
-            (
-                "completed actions and results",
-                ["completed actions", "completed work", "actions and results"],
-            ),
-            (
-                "key discoveries and file paths",
-                [
-                    "key discoveries",
-                    "discoveries and file paths",
-                    "file paths",
-                ],
-            ),
-            (
-                "unfinished next steps",
-                ["unfinished next steps", "next steps", "remaining work"],
-            ),
+        for (label, keywords) in [
+            ("goal", &["goal"][..]),
+            ("completed_actions", &["completed"][..]),
+            ("discoveries_or_paths", &["discover", "file path"][..]),
+            ("next_steps", &["next step", "remaining"][..]),
         ] {
-            if !alternatives
-                .iter()
-                .any(|marker| normalized.contains(marker))
-            {
+            if !keywords.iter().any(|keyword| normalized.contains(keyword)) {
                 return Err(format!("missing_{label}"));
             }
         }
@@ -4436,6 +4420,32 @@ mod tests {
                 )
                 .is_err(),
                 "{name} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_summary_validation_accepts_observed_markdown_shapes() {
+        for text in [
+            "**Goal**\nFix pricing bugs.\n\n\
+             **Completed actions and results**\n- Read `src/pricing.py`.\n\n\
+             **Key discoveries and file paths**\n- `src/pricing.py` contains the rounding bug.\n\n\
+             **Unfinished next steps**\n- Add regression coverage.",
+            "Goal\n修复定价问题。\n\n\
+             Completed actions and results\n已检查 `src/pricing.py`。\n\n\
+             Key discoveries and file paths\n发现舍入逻辑需要修复。\n\n\
+             Unfinished next steps\n补充回归测试。",
+            "**Goal**\n修复定价问题。\n\n\
+             **Completed actions and results**\n已检查 `src/pricing.py`。\n\n\
+             **Key discoveries and file paths**\n发现舍入逻辑需要修复。\n\n\
+             **Unfinished next steps**\n补充回归测试。",
+        ] {
+            assert!(
+                TurnEngine::<SummaryProvider, SqliteStore, FakeTools>::validate_compaction_summary(
+                    text
+                )
+                .is_ok(),
+                "observed summary shape was rejected: {text}"
             );
         }
     }
