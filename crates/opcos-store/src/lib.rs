@@ -367,6 +367,20 @@ fn external_ingress_source_from_row(
     })
 }
 
+fn external_ingress_target(provider: &str, config: &serde_json::Value) -> Option<String> {
+    match provider {
+        "github" => config
+            .get("repo")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        "rss" | "atom" => config
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ActionLedgerRecord {
     pub action_id: String,
@@ -4144,11 +4158,42 @@ impl SqliteStore {
             ));
         }
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let previous = connection
+            .query_row(
+                "SELECT provider,config FROM external_ingress_sources WHERE source_id=?1",
+                [source_id],
+                |row| {
+                    let provider: String = row.get(0)?;
+                    let config: String = row.get(1)?;
+                    Ok((provider, config))
+                },
+            )
+            .optional()?;
+        let target_changed = previous.is_some_and(|(old_provider, old_config)| {
+            old_provider != provider
+                || external_ingress_target(
+                    &old_provider,
+                    &serde_json::from_str(&old_config).unwrap_or_else(|_| serde_json::json!({})),
+                ) != external_ingress_target(provider, config)
+        });
         connection.execute(
             "INSERT INTO external_ingress_sources(source_id,provider,config)
              VALUES (?1,?2,?3)
-             ON CONFLICT(source_id) DO UPDATE SET provider=excluded.provider,config=excluded.config",
-            params![source_id, provider, serde_json::to_string(config)?],
+             ON CONFLICT(source_id) DO UPDATE SET
+               provider=excluded.provider,
+               config=excluded.config,
+               cursor=CASE WHEN ?4 THEN NULL ELSE cursor END,
+               initialized=CASE WHEN ?4 THEN 0 ELSE initialized END,
+               next_attempt_at=CASE WHEN ?4 THEN NULL ELSE next_attempt_at END,
+               consecutive_failures=CASE WHEN ?4 THEN 0 ELSE consecutive_failures END,
+               circuit_open_until=CASE WHEN ?4 THEN NULL ELSE circuit_open_until END,
+               last_error=CASE WHEN ?4 THEN NULL ELSE last_error END",
+            params![
+                source_id,
+                provider,
+                serde_json::to_string(config)?,
+                target_changed
+            ],
         )?;
         self.load_external_ingress_source_locked(&connection, source_id)
     }
@@ -6873,5 +6918,60 @@ mod tests {
         assert!(!source.initialized);
         assert!(source.cursor.is_none());
         assert_eq!(store.load_external_ingress_sources(true).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn external_ingress_target_changes_reset_cursor_but_interval_changes_do_not() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .save_external_ingress_source(
+                "feed:test",
+                "rss",
+                &serde_json::json!({
+                    "url":"http://127.0.0.1/one.xml",
+                    "poll_interval_seconds":60
+                }),
+            )
+            .unwrap();
+        store
+            .update_external_ingress_state(
+                "feed:test",
+                Some("cursor-1"),
+                true,
+                Some("2026-01-01T00:00:00Z"),
+                2,
+                Some("2026-01-01T00:10:00Z"),
+                Some("2026-01-01T00:00:00Z"),
+                Some("temporary failure"),
+            )
+            .unwrap();
+        let unchanged = store
+            .save_external_ingress_source(
+                "feed:test",
+                "rss",
+                &serde_json::json!({
+                    "url":"http://127.0.0.1/one.xml",
+                    "poll_interval_seconds":300
+                }),
+            )
+            .unwrap();
+        assert_eq!(unchanged.cursor.as_deref(), Some("cursor-1"));
+        assert!(unchanged.initialized);
+        assert_eq!(unchanged.consecutive_failures, 2);
+        let reset = store
+            .save_external_ingress_source(
+                "feed:test",
+                "rss",
+                &serde_json::json!({
+                    "url":"http://127.0.0.1/two.xml",
+                    "poll_interval_seconds":300
+                }),
+            )
+            .unwrap();
+        assert!(reset.cursor.is_none());
+        assert!(!reset.initialized);
+        assert_eq!(reset.consecutive_failures, 0);
+        assert!(reset.circuit_open_until.is_none());
+        assert!(reset.last_error.is_none());
     }
 }
