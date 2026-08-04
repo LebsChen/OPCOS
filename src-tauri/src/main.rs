@@ -5010,6 +5010,7 @@ fn default_agent_settings() -> Value {
         "default_platform": "Ubuntu",
         "batch_limit": 50,
         "message_usage_limit": 0,
+        "max_iterations": 256,
         "share_prompts_in_prs": true,
         "require_agent_mention": false,
         "auto_add_reviewer": false,
@@ -9072,6 +9073,12 @@ async fn engine_for_with_context(
             .get("message_usage_limit")
             .and_then(Value::as_u64)
             .unwrap_or(0),
+    );
+    engine.set_max_iterations(
+        settings
+            .get("max_iterations")
+            .and_then(Value::as_u64)
+            .unwrap_or(256),
     );
     for kind in [
         "github", "telegram", "discord", "slack", "notion", "gitlab", "jira", "stripe",
@@ -20158,6 +20165,13 @@ fn save_agent_settings(
         .ok_or_else(|| "message_usage_limit must be an integer".to_owned())?;
     if usage_limit < 0 {
         return Err("message_usage_limit cannot be negative".into());
+    }
+    let max_iterations = object
+        .get("max_iterations")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "max_iterations must be an integer".to_owned())?;
+    if !(1..=4096).contains(&max_iterations) {
+        return Err("max_iterations must be between 1 and 4096".into());
     }
     let open_prs_as = object
         .get("open_prs_as")

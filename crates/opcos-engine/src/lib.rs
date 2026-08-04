@@ -418,6 +418,7 @@ pub struct TurnEngine<P, S, E> {
     jira_tools_enabled: AtomicBool,
     stripe_tools_enabled: AtomicBool,
     message_usage_limit: AtomicU64,
+    max_iterations: AtomicU64,
     active_tool_calls: StdMutex<HashSet<String>>,
     policy_denied: AtomicBool,
 }
@@ -501,6 +502,7 @@ where
             jira_tools_enabled: AtomicBool::new(false),
             stripe_tools_enabled: AtomicBool::new(false),
             message_usage_limit: AtomicU64::new(0),
+            max_iterations: AtomicU64::new(256),
             active_tool_calls: StdMutex::new(HashSet::new()),
             policy_denied: AtomicBool::new(false),
         }
@@ -543,6 +545,10 @@ where
 
     pub fn set_message_usage_limit(&self, limit: u64) {
         self.message_usage_limit.store(limit, Ordering::SeqCst);
+    }
+
+    pub fn set_max_iterations(&self, limit: u64) {
+        self.max_iterations.store(limit.max(1), Ordering::SeqCst);
     }
 
     pub async fn submit_text(&self, text: impl Into<String>) -> Result<AssistantTurn, EngineError> {
@@ -987,7 +993,8 @@ where
 
     async fn run_loop(&self, mut messages: Vec<Value>) -> Result<AssistantTurn, EngineError> {
         let mut usage: Option<TokenUsage> = None;
-        for _ in 0..12 {
+        let max_iterations = self.max_iterations.load(Ordering::SeqCst);
+        for _ in 0..max_iterations {
             if self.interrupted.load(Ordering::SeqCst) {
                 self.notice("interrupted", "Turn interrupted".into())
                     .await?;
@@ -1142,8 +1149,11 @@ where
                 }
             }
         }
-        self.notice("error", "Maximum iterations reached".into())
-            .await?;
+        self.notice(
+            "error",
+            format!("Step safety limit reached ({max_iterations} iterations)"),
+        )
+        .await?;
         Err(EngineError::MaxIterations)
     }
 
@@ -3387,6 +3397,7 @@ mod tests {
     #[derive(Clone)]
     struct LoopProvider {
         calls: Arc<std::sync::atomic::AtomicUsize>,
+        stop_after: Option<usize>,
     }
 
     #[async_trait]
@@ -3399,7 +3410,13 @@ mod tests {
             _: ProviderRequest,
             _: mpsc::Sender<StreamChunk>,
         ) -> Result<AssistantTurn, ProviderError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.stop_after.is_some_and(|limit| call > limit) {
+                return Ok(AssistantTurn {
+                    text: Some("done".into()),
+                    ..Default::default()
+                });
+            }
             Ok(AssistantTurn {
                 tool_calls: vec![ToolCall {
                     id: "loop".into(),
@@ -3415,11 +3432,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loop_stops_at_exactly_twelve_iterations() {
+    async fn loop_stops_at_configured_iteration_limit() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let engine = TurnEngine::new(
             LoopProvider {
                 calls: calls.clone(),
+                stop_after: None,
             },
             Arc::new(SqliteStore::open_in_memory().unwrap()),
             Arc::new(FakeTools),
@@ -3428,11 +3446,32 @@ mod tests {
             PermissionMode::Auto,
             "fake",
         );
+        engine.set_max_iterations(3);
         assert!(matches!(
             engine.submit_text("loop").await,
             Err(EngineError::MaxIterations)
         ));
-        assert_eq!(calls.load(Ordering::SeqCst), 12);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn default_iteration_limit_allows_long_tool_loop() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = TurnEngine::new(
+            LoopProvider {
+                calls: calls.clone(),
+                stop_after: Some(20),
+            },
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let turn = engine.submit_text("loop").await.unwrap();
+        assert_eq!(turn.text.as_deref(), Some("done"));
+        assert_eq!(calls.load(Ordering::SeqCst), 21);
     }
 
     #[derive(Clone)]
@@ -3575,7 +3614,10 @@ mod tests {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let engine = TurnEngine::new(
-            LoopProvider { calls },
+            LoopProvider {
+                calls,
+                stop_after: None,
+            },
             store.clone(),
             Arc::new(FailingRemoteTools),
             "s",
