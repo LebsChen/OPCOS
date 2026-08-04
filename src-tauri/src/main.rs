@@ -18,7 +18,8 @@ use futures_util::{SinkExt, StreamExt};
 use notify::Watcher;
 use opcos_assets::{
     AssetBundle, CommandArgument, CommandEntry, InstructionSource, KnowledgeEntry, Playbook,
-    SkillEntry, discover as discover_assets, expand_command, parse_blueprint, parse_command,
+    SkillEntry, builtin_mcp_catalog, discover as discover_assets, expand_command, parse_blueprint,
+    parse_command,
 };
 use opcos_engine::{
     AcpHarness, AcpHarnessConfig, AgentEngine, EngineError, Harness, OpenCodeHarness,
@@ -4725,6 +4726,17 @@ description: 为新行为和缺陷修复设计覆盖正常、失败及边界条�
     ];
     for (id, name, description, content) in mcp_servers {
         seed_builtin_template(connection, id, "mcp", name, description, &content)?;
+    }
+    for entry in builtin_mcp_catalog().map_err(|error| error.to_string())? {
+        let content = serde_json::to_value(&entry).map_err(|error| error.to_string())?;
+        seed_builtin_template(
+            connection,
+            &format!("template-mcp-catalog-{}", entry.slug),
+            "mcp",
+            &entry.name,
+            &entry.description,
+            &content,
+        )?;
     }
     let connectors = [
         (
@@ -19924,8 +19936,8 @@ mod m7_tests {
                 |row| row.get(0),
             )
             .unwrap();
-        // 29 = 22 generic/#34 assets plus 7 sanitized system playbooks.
-        assert_eq!(builtin_count, 29);
+        // 152 = 29 baseline assets plus 123 verified, disabled MCP catalog entries.
+        assert_eq!(builtin_count, 152);
         for id in [
             "template-runbook-playbook-template",
             "template-runbook-pr-review",
