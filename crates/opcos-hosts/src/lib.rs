@@ -232,12 +232,80 @@ const JOB_OUTPUT_SEGMENT_BYTES: u64 = 1024 * 1024;
 const JOB_OUTPUT_MAX_SEGMENTS: usize = 32;
 pub const BACKGROUND_WRAPPER_VERSION: &str = "powershell-segmented-v1";
 
+pub const POSIX_BACKGROUND_WRAPPER_VERSION: &str = "posix-fifo-segmented-v1";
+
+pub fn posix_background_job_wrapper_script() -> &'static str {
+    r#"#!/bin/sh
+set -eu
+root=$1
+command_path="$root/command.sh"
+identity_path="$root/identity.json"
+status_path="$root/status.json"
+stdout_pipe="$root/stdout.pipe"
+stderr_pipe="$root/stderr.pipe"
+identity=$(cat "$identity_path")
+nonce=$(printf '%s' "$identity" | sed -n 's/.*"launch_nonce"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+timeout_seconds=$(printf '%s' "$identity" | sed -n 's/.*"timeout_seconds"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+rm -f "$stdout_pipe" "$stderr_pipe"
+mkfifo "$stdout_pipe" "$stderr_pipe"
+wrapper_pid=$$
+wrapper_start=$(ps -o lstart= -p "$wrapper_pid" | sed 's/^ *//')
+if [ "${timeout_seconds:-0}" -gt 0 ]; then
+  setsid timeout --signal=TERM "${timeout_seconds}s" /bin/sh "$command_path" >"$stdout_pipe" 2>"$stderr_pipe" &
+else
+  setsid /bin/sh "$command_path" >"$stdout_pipe" 2>"$stderr_pipe" &
+fi
+child_pid=$!
+child_start=$(ps -o lstart= -p "$child_pid" | sed 's/^ *//')
+split -b 1048576 -d -a 6 "$stdout_pipe" "$root/stdout-" >/dev/null 2>&1 &
+stdout_drain=$!
+split -b 1048576 -d -a 6 "$stderr_pipe" "$root/stderr-" >/dev/null 2>&1 &
+stderr_drain=$!
+omitted_bytes=0
+omitted_lines=0
+trim_segments() {
+  prefix=$1
+  while :; do
+    count=$(find "$root" -maxdepth 1 -type f -name "$prefix-[0-9]*" | wc -l)
+    [ "$count" -gt 32 ] || break
+    oldest=$(find "$root" -maxdepth 1 -type f -name "$prefix-[0-9]*" | sort | head -n 1)
+    [ -n "$oldest" ] || break
+    bytes=$(wc -c <"$oldest")
+    lines=$(wc -l <"$oldest")
+    omitted_bytes=$((omitted_bytes + bytes))
+    omitted_lines=$((omitted_lines + lines))
+    rm -f "$oldest"
+  done
+}
+printf '{"state":"running","wrapper_pid":%s,"child_pid":%s,"launch_nonce":"%s","wrapper_start_time":"%s","child_start_time":"%s"}\n' \
+  "$wrapper_pid" "$child_pid" "$nonce" "$wrapper_start" "$child_start" >"$status_path"
+while kill -0 "$child_pid" 2>/dev/null; do
+  trim_segments stdout
+  trim_segments stderr
+  sleep 0.1
+done
+wait "$child_pid" || exit_code=$?
+exit_code=${exit_code:-0}
+wait "$stdout_drain" 2>/dev/null || true
+wait "$stderr_drain" 2>/dev/null || true
+trim_segments stdout
+trim_segments stderr
+rm -f "$stdout_pipe" "$stderr_pipe" "$command_path" "$identity_path"
+state=exited
+if [ "$exit_code" -eq 124 ]; then state=timed_out; fi
+printf '{"state":"%s","wrapper_pid":%s,"child_pid":%s,"launch_nonce":"%s","wrapper_start_time":"%s","child_start_time":"%s","exit_code":%s,"omitted_bytes":%s,"omitted_lines":%s}\n' \
+  "$state" "$wrapper_pid" "$child_pid" "$nonce" "$wrapper_start" "$child_start" "$exit_code" "$omitted_bytes" "$omitted_lines" >"$status_path"
+"#
+}
+
 pub fn background_job_wrapper_script() -> &'static str {
     r#"param([string]$Root)
 $ErrorActionPreference = 'Stop'
 $commandPath = Join-Path $Root 'command.ps1'
+$identityPath = Join-Path $Root 'identity.json'
 $statusPath = Join-Path $Root 'status.json'
 $command = Get-Content -Raw $commandPath
+$identity = Get-Content -Raw $identityPath | ConvertFrom-Json
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = 'powershell.exe'
 $psi.Arguments = '-NoProfile -NonInteractive -Command -'
@@ -250,7 +318,8 @@ $child = New-Object System.Diagnostics.Process
 $child.StartInfo = $psi
 $child.Start() | Out-Null
 Remove-Item -LiteralPath $commandPath -Force -ErrorAction SilentlyContinue
-$state = [hashtable]::Synchronized(@{ stdout = 0; stderr = 0 })
+Remove-Item -LiteralPath $identityPath -Force -ErrorAction SilentlyContinue
+$state = [hashtable]::Synchronized(@{ stdout = 0; stderr = 0; omitted_bytes = 0; omitted_lines = 0 })
 $stdoutEvent = Register-ObjectEvent -InputObject $child -EventName OutputDataReceived -MessageData @{
   Root = $Root
   State = $state
@@ -265,7 +334,13 @@ $stdoutEvent = Register-ObjectEvent -InputObject $child -EventName OutputDataRec
     $context.State[$context.Stream] = $index + 1
     $oldest = $index - 31
     if ($oldest -ge 0) {
-      Remove-Item -LiteralPath (Join-Path $context.Root ("{0}-{1:D6}.log" -f $context.Stream, $oldest)) -Force -ErrorAction SilentlyContinue
+      $oldestPath = Join-Path $context.Root ("{0}-{1:D6}.log" -f $context.Stream, $oldest)
+      if (Test-Path -LiteralPath $oldestPath) {
+        $oldestText = Get-Content -LiteralPath $oldestPath -Raw -ErrorAction SilentlyContinue
+        $context.State['omitted_bytes'] += [int64]((Get-Item -LiteralPath $oldestPath).Length)
+        $context.State['omitted_lines'] += (($oldestText -split "`n").Count - [int](-not $oldestText.EndsWith("`n")))
+      }
+      Remove-Item -LiteralPath $oldestPath -Force -ErrorAction SilentlyContinue
     }
   }
 }
@@ -283,7 +358,13 @@ $stderrEvent = Register-ObjectEvent -InputObject $child -EventName ErrorDataRece
     $context.State[$context.Stream] = $index + 1
     $oldest = $index - 31
     if ($oldest -ge 0) {
-      Remove-Item -LiteralPath (Join-Path $context.Root ("{0}-{1:D6}.log" -f $context.Stream, $oldest)) -Force -ErrorAction SilentlyContinue
+      $oldestPath = Join-Path $context.Root ("{0}-{1:D6}.log" -f $context.Stream, $oldest)
+      if (Test-Path -LiteralPath $oldestPath) {
+        $oldestText = Get-Content -LiteralPath $oldestPath -Raw -ErrorAction SilentlyContinue
+        $context.State['omitted_bytes'] += [int64]((Get-Item -LiteralPath $oldestPath).Length)
+        $context.State['omitted_lines'] += (($oldestText -split "`n").Count - [int](-not $oldestText.EndsWith("`n")))
+      }
+      Remove-Item -LiteralPath $oldestPath -Force -ErrorAction SilentlyContinue
     }
   }
 }
@@ -291,7 +372,16 @@ $stderrEvent = Register-ObjectEvent -InputObject $child -EventName ErrorDataRece
 [void]$child.BeginErrorReadLine()
 $child.StandardInput.Write($command)
 $child.StandardInput.Close()
-[pscustomobject]@{ state = 'running'; wrapper_pid = $PID; child_pid = $child.Id } |
+[pscustomobject]@{
+  state = 'running'
+  wrapper_pid = $PID
+  child_pid = $child.Id
+  launch_nonce = $identity.launch_nonce
+  wrapper_start_time = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
+  child_start_time = $child.StartTime.ToUniversalTime().ToString('o')
+  omitted_bytes = $state['omitted_bytes']
+  omitted_lines = $state['omitted_lines']
+} |
   ConvertTo-Json -Compress | Set-Content -Encoding utf8 $statusPath
 while (-not $child.HasExited) {
   Wait-Event -SourceIdentifier $stdoutEvent.Name -Timeout 0.1 | Out-Null
@@ -301,7 +391,17 @@ $child.WaitForExit()
 [void]$child.WaitForExit()
 Unregister-Event -SourceIdentifier $stdoutEvent.Name -ErrorAction SilentlyContinue
 Unregister-Event -SourceIdentifier $stderrEvent.Name -ErrorAction SilentlyContinue
-[pscustomobject]@{ state = 'exited'; wrapper_pid = $PID; child_pid = $child.Id; exit_code = $child.ExitCode } |
+[pscustomobject]@{
+  state = 'exited'
+  wrapper_pid = $PID
+  child_pid = $child.Id
+  launch_nonce = $identity.launch_nonce
+  wrapper_start_time = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
+  child_start_time = $child.StartTime.ToUniversalTime().ToString('o')
+  omitted_bytes = $state['omitted_bytes']
+  omitted_lines = $state['omitted_lines']
+  exit_code = $child.ExitCode
+} |
   ConvertTo-Json -Compress | Set-Content -Encoding utf8 $statusPath
 "#
 }
@@ -335,11 +435,17 @@ pub struct BackgroundJobSnapshot {
     #[serde(default)]
     pub command_digest: String,
     #[serde(default)]
+    pub launch_nonce: String,
+    #[serde(default)]
     pub host_id: String,
     #[serde(default)]
     pub wrapper_pid: Option<u32>,
     #[serde(default)]
     pub child_pid: Option<u32>,
+    #[serde(default)]
+    pub wrapper_start_time: Option<String>,
+    #[serde(default)]
+    pub child_start_time: Option<String>,
     #[serde(default)]
     pub orphan_reason: Option<String>,
     #[serde(default, skip_serializing)]
@@ -354,6 +460,7 @@ pub struct BackgroundJobOutput {
     pub end_line: u64,
     pub total_lines: u64,
     pub total_bytes: u64,
+    pub oldest_available_offset: u64,
     pub omitted_before: u64,
     pub omitted_after: u64,
     pub truncated: bool,
@@ -368,12 +475,21 @@ struct BackgroundJobState {
     segment_index: usize,
     metadata_path: PathBuf,
     remote: bool,
+    wrapper: bool,
 }
 
 #[derive(Clone)]
 pub struct BackgroundJobManager {
     jobs: Arc<Mutex<HashMap<String, Arc<Mutex<BackgroundJobState>>>>>,
     root: Arc<PathBuf>,
+}
+
+struct DurableLaunch {
+    output_path: String,
+    wrapper_pid: Option<u32>,
+    child_pid: Option<u32>,
+    wrapper_start_time: Option<String>,
+    child_start_time: Option<String>,
 }
 
 impl BackgroundJobManager {
@@ -392,26 +508,38 @@ impl BackgroundJobManager {
     ) -> Result<BackgroundJobSnapshot, HostError> {
         self.cleanup_finished(chrono::Duration::hours(1)).await;
         let job_id = format!("job-{}", Uuid::new_v4().simple());
+        let launch_nonce = Uuid::new_v4().simple().to_string();
         let command_digest = command_digest(&request.command);
         let remote_windows =
             host.id() != "local" && host.health().await?.platform.as_deref() == Some("win32");
-        let remote_output_path = if remote_windows {
+        let local_posix = host.id() == "local"
+            && cfg!(unix)
+            && self
+                .root
+                .components()
+                .any(|component| component.as_os_str() == "background-jobs");
+        let remote_launch = if remote_windows {
             Some(
-                self.start_remote_windows_wrapper(host, &job_id, &request)
+                self.start_remote_windows_wrapper(host, &job_id, &request, &launch_nonce)
+                    .await?,
+            )
+        } else if local_posix {
+            Some(
+                self.start_local_posix_wrapper(&job_id, &request, &launch_nonce, timeout_seconds)
                     .await?,
             )
         } else {
             None
         };
-        let process = if remote_windows {
+        let process = if remote_windows || local_posix {
             None
         } else {
             Some(host.spawn(request).await?)
         };
         fs::create_dir_all(self.root.as_ref()).await?;
-        let output_path = remote_output_path
-            .clone()
-            .map(PathBuf::from)
+        let output_path = remote_launch
+            .as_ref()
+            .map(|launch| PathBuf::from(&launch.output_path))
             .unwrap_or_else(|| segment_path(self.root.as_ref(), &job_id, 0));
         let metadata_path = self.root.join(format!("{job_id}.json"));
         let snapshot = BackgroundJobSnapshot {
@@ -426,9 +554,16 @@ impl BackgroundJobManager {
             retained_start_line: 0,
             omitted_bytes: 0,
             command_digest,
+            launch_nonce: launch_nonce.clone(),
             host_id: host.id().to_owned(),
-            wrapper_pid: None,
-            child_pid: None,
+            wrapper_pid: remote_launch.as_ref().and_then(|launch| launch.wrapper_pid),
+            child_pid: remote_launch.as_ref().and_then(|launch| launch.child_pid),
+            wrapper_start_time: remote_launch
+                .as_ref()
+                .and_then(|launch| launch.wrapper_start_time.clone()),
+            child_start_time: remote_launch
+                .as_ref()
+                .and_then(|launch| launch.child_start_time.clone()),
             orphan_reason: None,
             output_path: output_path.display().to_string(),
         };
@@ -440,12 +575,59 @@ impl BackgroundJobManager {
             segment_index: 0,
             metadata_path: metadata_path.clone(),
             remote: remote_windows,
+            wrapper: local_posix,
         }));
         persist_job_metadata(&snapshot, &metadata_path).await?;
         self.jobs
             .lock()
             .await
             .insert(job_id.clone(), Arc::clone(&state));
+        if local_posix {
+            let monitor_state = Arc::clone(&state);
+            let status_path = output_path
+                .parent()
+                .map(|parent| parent.join("status.json"));
+            tokio::spawn(async move {
+                let Some(status_path) = status_path else {
+                    return;
+                };
+                loop {
+                    if let Some(status) = read_local_status(&status_path).await
+                        && status.get("state").and_then(Value::as_str) == Some("exited")
+                    {
+                        let mut current = monitor_state.lock().await;
+                        current.snapshot.status =
+                            if status.get("state").and_then(Value::as_str) == Some("timed_out") {
+                                BackgroundJobStatus::TimedOut
+                            } else {
+                                BackgroundJobStatus::Exited
+                            };
+                        current.snapshot.exit_code = status
+                            .get("exit_code")
+                            .and_then(Value::as_i64)
+                            .map(|code| code as i32);
+                        current.snapshot.omitted_bytes = status
+                            .get("omitted_bytes")
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default();
+                        current.snapshot.retained_start_line = status
+                            .get("omitted_lines")
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default();
+                        current.snapshot.finished_at = Some(Utc::now());
+                        let _ =
+                            persist_job_metadata(&current.snapshot, &current.metadata_path).await;
+                        break;
+                    }
+                    if monitor_state.lock().await.snapshot.status
+                        == BackgroundJobStatus::Terminating
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            });
+        }
         let output_path_for_task = output_path.clone();
         let Some(process) = process else {
             return Ok(snapshot);
@@ -550,7 +732,8 @@ impl BackgroundJobManager {
         host: &dyn Host,
         job_id: &str,
         request: &SpawnRequest,
-    ) -> Result<String, HostError> {
+        launch_nonce: &str,
+    ) -> Result<DurableLaunch, HostError> {
         let root = host.join(".opcos/background-jobs")?;
         let job_root = host.join(&format!(".opcos/background-jobs/{job_id}"))?;
         if !host.contains(&root) || !host.contains(&job_root) {
@@ -560,6 +743,7 @@ impl BackgroundJobManager {
         }
         let wrapper_path = format!("{job_root}\\wrapper.ps1");
         let command_path = format!("{job_root}\\command.ps1");
+        let identity_path = format!("{job_root}\\identity.json");
         let stdout_path = format!("{job_root}\\stdout-000000.log");
         let mkdir = format!(
             "New-Item -ItemType Directory -Force -Path '{}' | Out-Null",
@@ -575,6 +759,11 @@ impl BackgroundJobManager {
         .await?;
         host.write(&wrapper_path, background_job_wrapper_script())
             .await?;
+        host.write(
+            &identity_path,
+            &serde_json::json!({ "launch_nonce": launch_nonce }).to_string(),
+        )
+        .await?;
         let command = match request.cwd.as_deref() {
             Some(cwd) => format!(
                 "Set-Location -LiteralPath '{}'\n{}",
@@ -598,22 +787,87 @@ impl BackgroundJobManager {
         })
         .await?;
         let status_path = format!("{job_root}\\status.json");
-        let mut started = false;
-        for _ in 0..50 {
-            if let Ok(content) = host.read(&status_path).await
-                && !content.content.trim().is_empty()
-            {
-                started = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-        if !started {
-            return Err(HostError::InvalidResponse(
-                "remote background wrapper did not publish a status marker".into(),
-            ));
-        }
-        Ok(stdout_path)
+        let status = read_remote_status(host, &status_path)
+            .await
+            .ok_or_else(|| {
+                HostError::InvalidResponse(
+                    "remote background wrapper did not publish a status marker".into(),
+                )
+            })?;
+        Ok(DurableLaunch {
+            output_path: stdout_path,
+            wrapper_pid: status
+                .get("wrapper_pid")
+                .and_then(Value::as_u64)
+                .map(|pid| pid as u32),
+            child_pid: status
+                .get("child_pid")
+                .and_then(Value::as_u64)
+                .map(|pid| pid as u32),
+            wrapper_start_time: status
+                .get("wrapper_start_time")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            child_start_time: status
+                .get("child_start_time")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        })
+    }
+
+    #[cfg(unix)]
+    async fn start_local_posix_wrapper(
+        &self,
+        job_id: &str,
+        request: &SpawnRequest,
+        launch_nonce: &str,
+        timeout_seconds: Option<u64>,
+    ) -> Result<DurableLaunch, HostError> {
+        let job_root = self.root.join(job_id);
+        fs::create_dir_all(&job_root).await?;
+        fs::write(
+            job_root.join("wrapper.sh"),
+            posix_background_job_wrapper_script(),
+        )
+        .await?;
+        let command = match request.cwd.as_deref() {
+            Some(cwd) => format!(
+                "cd -- {} || exit 126\n{}",
+                shell_single_quote(cwd),
+                request.command
+            ),
+            None => request.command.clone(),
+        };
+        fs::write(job_root.join("command.sh"), command).await?;
+        fs::write(
+            job_root.join("identity.json"),
+            serde_json::json!({
+                "launch_nonce": launch_nonce,
+                "timeout_seconds": timeout_seconds.unwrap_or(0),
+            })
+            .to_string(),
+        )
+        .await?;
+        let mut child = Command::new("setsid");
+        configure_no_window(&mut child);
+        child
+            .arg("sh")
+            .arg(job_root.join("wrapper.sh"))
+            .arg(&job_root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        child.spawn()?;
+        let status_path = job_root.join("status.json");
+        let status = read_local_status(&status_path).await.ok_or_else(|| {
+            HostError::InvalidResponse(
+                "local background wrapper did not publish a status marker".into(),
+            )
+        })?;
+        Ok(durable_launch_from_status(
+            job_root.join("stdout-000000").display().to_string(),
+            &status,
+        ))
     }
 
     pub async fn cleanup_finished(&self, max_age: chrono::Duration) {
@@ -638,10 +892,13 @@ impl BackgroundJobManager {
             expired
         };
         for (job_id, path) in expired {
-            let root = PathBuf::from(path)
+            let root = PathBuf::from(&path)
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| self.root.as_ref().clone());
+            if PathBuf::from(&path).ends_with("stdout-000000") {
+                let _ = fs::remove_dir_all(&root).await;
+            }
             for segment in 0..=JOB_OUTPUT_MAX_SEGMENTS {
                 let _ = fs::remove_file(segment_path(&root, &job_id, segment)).await;
             }
@@ -677,6 +934,8 @@ impl BackgroundJobManager {
             }
             if snapshot.output_path.contains("\\") && host.id() != "local" {
                 recover_remote_snapshot(host, &mut snapshot).await?;
+            } else if snapshot.output_path.ends_with("stdout-000000") && host.id() == "local" {
+                recover_local_snapshot(&mut snapshot).await?;
             }
             if matches!(
                 snapshot.status,
@@ -698,6 +957,7 @@ impl BackgroundJobManager {
                 segment_index: 0,
                 metadata_path: path,
                 remote: !snapshot.output_path.starts_with('/'),
+                wrapper: snapshot.output_path.ends_with("stdout-000000"),
             }));
             self.jobs
                 .lock()
@@ -718,7 +978,7 @@ impl BackgroundJobManager {
         let state = self.jobs.lock().await.get(job_id).cloned().ok_or_else(|| {
             HostError::InvalidResponse(format!("background job not found: {job_id}"))
         })?;
-        let snapshot = state.lock().await.snapshot.clone();
+        let mut snapshot = state.lock().await.snapshot.clone();
         if state.lock().await.remote {
             return Err(HostError::Unsupported(
                 "remote background job output requires a host-aware read".into(),
@@ -729,8 +989,26 @@ impl BackgroundJobManager {
             .map(Path::to_path_buf)
             .ok_or_else(|| HostError::Path("job output has no parent".into()))?;
         let mut bytes = Vec::new();
+        let durable_wrapper_output = snapshot.output_path.ends_with("stdout-000000");
+        if durable_wrapper_output {
+            let status_path = root.join("status.json");
+            if let Some(status) = read_local_status(&status_path).await {
+                snapshot.omitted_bytes = status
+                    .get("omitted_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(snapshot.omitted_bytes);
+                snapshot.retained_start_line = status
+                    .get("omitted_lines")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(snapshot.retained_start_line);
+            }
+        }
         for segment in 0..=JOB_OUTPUT_MAX_SEGMENTS {
-            let path = segment_path(&root, job_id, segment);
+            let path = if durable_wrapper_output {
+                root.join(format!("stdout-{segment:06}"))
+            } else {
+                segment_path(&root, job_id, segment)
+            };
             match fs::read(path).await {
                 Ok(mut segment) => bytes.append(&mut segment),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -751,7 +1029,7 @@ impl BackgroundJobManager {
         let state = self.jobs.lock().await.get(job_id).cloned().ok_or_else(|| {
             HostError::InvalidResponse(format!("background job not found: {job_id}"))
         })?;
-        let snapshot = state.lock().await.snapshot.clone();
+        let mut snapshot = state.lock().await.snapshot.clone();
         if !state.lock().await.remote {
             return self.output(job_id, offset, limit, tail).await;
         }
@@ -760,6 +1038,16 @@ impl BackgroundJobManager {
             .rsplit_once(['\\', '/'])
             .map(|(parent, _)| parent)
             .ok_or_else(|| HostError::Path("remote job output has no parent".into()))?;
+        if let Some(status) = read_remote_status(host, &format!("{parent}\\status.json")).await {
+            snapshot.omitted_bytes = status
+                .get("omitted_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(snapshot.omitted_bytes);
+            snapshot.retained_start_line = status
+                .get("omitted_lines")
+                .and_then(Value::as_u64)
+                .unwrap_or(snapshot.retained_start_line);
+        }
         let mut bytes = Vec::new();
         for segment in 0..=JOB_OUTPUT_MAX_SEGMENTS {
             let path = format!("{parent}\\stdout-{segment:06}.log");
@@ -812,6 +1100,128 @@ impl BackgroundJobManager {
     }
 }
 
+#[cfg(unix)]
+async fn recover_local_snapshot(snapshot: &mut BackgroundJobSnapshot) -> Result<(), HostError> {
+    let parent = Path::new(&snapshot.output_path)
+        .parent()
+        .ok_or_else(|| HostError::Path("local job output has no parent".into()))?;
+    let status_path = parent.join("status.json");
+    let Some(status) = read_local_status(&status_path).await else {
+        snapshot.status = BackgroundJobStatus::Orphaned;
+        snapshot.orphan_reason = Some("local status marker is unavailable".into());
+        snapshot.finished_at = Some(Utc::now());
+        return Ok(());
+    };
+    let state = status
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    snapshot.wrapper_pid = status
+        .get("wrapper_pid")
+        .and_then(Value::as_u64)
+        .map(|pid| pid as u32);
+    snapshot.child_pid = status
+        .get("child_pid")
+        .and_then(Value::as_u64)
+        .map(|pid| pid as u32);
+    snapshot.omitted_bytes = status
+        .get("omitted_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    snapshot.retained_start_line = status
+        .get("omitted_lines")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    snapshot.wrapper_start_time = status
+        .get("wrapper_start_time")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    snapshot.child_start_time = status
+        .get("child_start_time")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if state == "exited" || state == "timed_out" {
+        snapshot.status = if state == "timed_out" {
+            BackgroundJobStatus::TimedOut
+        } else {
+            BackgroundJobStatus::Exited
+        };
+        snapshot.exit_code = status
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .map(|code| code as i32);
+        snapshot.finished_at = Some(Utc::now());
+        return Ok(());
+    }
+    if status.get("launch_nonce").and_then(Value::as_str) != Some(snapshot.launch_nonce.as_str()) {
+        snapshot.status = BackgroundJobStatus::Orphaned;
+        snapshot.orphan_reason = Some("local process launch nonce does not match".into());
+        snapshot.finished_at = Some(Utc::now());
+        return Ok(());
+    }
+    let wrapper_alive = local_process_alive(snapshot.wrapper_pid).await;
+    let child_alive = local_process_alive(snapshot.child_pid).await;
+    let wrapper_identity = local_process_identity_matches(
+        snapshot.wrapper_pid,
+        snapshot.wrapper_start_time.as_deref(),
+    )
+    .await;
+    let child_identity =
+        local_process_identity_matches(snapshot.child_pid, snapshot.child_start_time.as_deref())
+            .await;
+    if wrapper_alive && child_alive && wrapper_identity && child_identity {
+        snapshot.status = BackgroundJobStatus::Running;
+    } else if child_alive && !wrapper_alive {
+        snapshot.status = BackgroundJobStatus::Orphaned;
+        snapshot.orphan_reason =
+            Some("local process is still running but output collection is unavailable".into());
+        snapshot.finished_at = Some(Utc::now());
+    } else {
+        snapshot.status = BackgroundJobStatus::Orphaned;
+        snapshot.orphan_reason =
+            Some("local durable marker exists but process identity could not be validated".into());
+        snapshot.finished_at = Some(Utc::now());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn recover_local_snapshot(snapshot: &mut BackgroundJobSnapshot) -> Result<(), HostError> {
+    snapshot.status = BackgroundJobStatus::Orphaned;
+    snapshot.orphan_reason =
+        Some("LocalHost durable process identity is unsupported on this platform".into());
+    snapshot.finished_at = Some(Utc::now());
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn local_process_alive(pid: Option<u32>) -> bool {
+    let Some(pid) = pid else {
+        return false;
+    };
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
+}
+
+#[cfg(unix)]
+async fn local_process_identity_matches(pid: Option<u32>, expected: Option<&str>) -> bool {
+    let (Some(pid), Some(expected)) = (pid, expected) else {
+        return false;
+    };
+    let Ok(output) = Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+        .await
+    else {
+        return false;
+    };
+    output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == expected.trim()
+}
+
 async fn recover_remote_snapshot(
     host: &dyn Host,
     snapshot: &mut BackgroundJobSnapshot,
@@ -836,6 +1246,36 @@ async fn recover_remote_snapshot(
         .get("child_pid")
         .and_then(Value::as_u64)
         .map(|pid| pid as u32);
+    let observed_wrapper_start_time = status
+        .get("wrapper_start_time")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let observed_child_start_time = status
+        .get("child_start_time")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let nonce_matches = status
+        .get("launch_nonce")
+        .and_then(Value::as_str)
+        .is_some_and(|nonce| nonce == snapshot.launch_nonce);
+    let identity_matches = nonce_matches
+        && timestamps_match(
+            snapshot.wrapper_start_time.as_deref(),
+            observed_wrapper_start_time.as_deref(),
+        )
+        && timestamps_match(
+            snapshot.child_start_time.as_deref(),
+            observed_child_start_time.as_deref(),
+        );
+    snapshot.wrapper_start_time = observed_wrapper_start_time;
+    snapshot.child_start_time = observed_child_start_time;
+    if !identity_matches {
+        snapshot.status = BackgroundJobStatus::Orphaned;
+        snapshot.orphan_reason =
+            Some("remote process identity does not match the durable launch marker".into());
+        snapshot.finished_at = Some(Utc::now());
+        return Ok(());
+    }
     match status.get("state").and_then(Value::as_str) {
         Some("exited") => {
             snapshot.status = BackgroundJobStatus::Exited;
@@ -905,6 +1345,19 @@ async fn recover_remote_snapshot(
     Ok(())
 }
 
+fn timestamps_match(expected: Option<&str>, observed: Option<&str>) -> bool {
+    let (Some(expected), Some(observed)) = (expected, observed) else {
+        return false;
+    };
+    let Ok(expected) = DateTime::parse_from_rfc3339(expected) else {
+        return false;
+    };
+    let Ok(observed) = DateTime::parse_from_rfc3339(observed) else {
+        return false;
+    };
+    (expected.timestamp_millis() - observed.timestamp_millis()).abs() <= 1_000
+}
+
 async fn read_remote_status(host: &dyn Host, path: &str) -> Option<Value> {
     for _ in 0..30 {
         if let Ok(content) = host.read(path).await {
@@ -918,6 +1371,41 @@ async fn read_remote_status(host: &dyn Host, path: &str) -> Option<Value> {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
     None
+}
+
+async fn read_local_status(path: &Path) -> Option<Value> {
+    for _ in 0..30 {
+        if let Ok(content) = fs::read_to_string(path).await
+            && !content.trim().is_empty()
+            && let Ok(value) = serde_json::from_str::<Value>(content.trim())
+        {
+            return Some(value);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    None
+}
+
+fn durable_launch_from_status(output_path: String, status: &Value) -> DurableLaunch {
+    DurableLaunch {
+        output_path,
+        wrapper_pid: status
+            .get("wrapper_pid")
+            .and_then(Value::as_u64)
+            .map(|pid| pid as u32),
+        child_pid: status
+            .get("child_pid")
+            .and_then(Value::as_u64)
+            .map(|pid| pid as u32),
+        wrapper_start_time: status
+            .get("wrapper_start_time")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        child_start_time: status
+            .get("child_start_time")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    }
 }
 
 fn build_job_output(
@@ -934,10 +1422,14 @@ fn build_job_output(
     let total_lines = snapshot.total_lines.max(count_output_lines(text));
     let total_bytes = snapshot.total_bytes.max(bytes.len() as u64);
     let limit = limit.unwrap_or(200).clamp(1, 1000);
+    let oldest_available_offset = snapshot.retained_start_line;
     let start = if tail {
         lines.len().saturating_sub(limit as usize) as u64
     } else {
-        offset.unwrap_or(0).min(lines.len() as u64)
+        offset
+            .unwrap_or(oldest_available_offset)
+            .saturating_sub(oldest_available_offset)
+            .min(lines.len() as u64)
     };
     let end = (start + limit).min(lines.len() as u64);
     let selected = lines[start as usize..end as usize].join("\n");
@@ -948,6 +1440,7 @@ fn build_job_output(
         end_line: snapshot.retained_start_line + end,
         total_lines,
         total_bytes,
+        oldest_available_offset,
         omitted_before: snapshot.retained_start_line + start,
         omitted_after: total_lines.saturating_sub(snapshot.retained_start_line + end),
         truncated: start > 0 || end < lines.len() as u64 || snapshot.retained_start_line > 0,
@@ -967,6 +1460,35 @@ impl BackgroundJobManager {
             ));
         }
         if current.snapshot.status == BackgroundJobStatus::Running {
+            if current.wrapper && !current.remote {
+                let pid = current.snapshot.child_pid;
+                current.snapshot.status = BackgroundJobStatus::Terminating;
+                current.snapshot.finished_at = None;
+                let state = Arc::clone(&state);
+                let monitor_state = Arc::clone(&state);
+                drop(current);
+                tokio::spawn(async move {
+                    if let Some(pid) = pid {
+                        let _ = Command::new("kill")
+                            .arg("-TERM")
+                            .arg(pid.to_string())
+                            .status()
+                            .await;
+                    }
+                    for _ in 0..50 {
+                        if !local_process_alive(pid).await {
+                            let mut current = monitor_state.lock().await;
+                            current.snapshot.status = BackgroundJobStatus::Killed;
+                            current.snapshot.finished_at = Some(Utc::now());
+                            let _ = persist_job_metadata(&current.snapshot, &current.metadata_path)
+                                .await;
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                });
+                return Ok(state.lock().await.snapshot.clone());
+            }
             match current.kill.take() {
                 Some(kill) => {
                     if kill.send(()).is_ok() {
@@ -2627,6 +3149,45 @@ mod tests {
         assert!(manager.status(&started.job_id).await.is_err());
         assert!(!std::path::Path::new(&started.output_path).exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn background_job_offset_reports_rotation_gap() {
+        let snapshot = BackgroundJobSnapshot {
+            job_id: "job-offset".into(),
+            status: BackgroundJobStatus::Running,
+            exit_code: None,
+            started_at: Utc::now(),
+            finished_at: None,
+            total_bytes: 100,
+            total_lines: 20,
+            retained_bytes: 50,
+            retained_start_line: 10,
+            omitted_bytes: 50,
+            command_digest: "digest".into(),
+            launch_nonce: "nonce".into(),
+            host_id: "local".into(),
+            wrapper_pid: None,
+            child_pid: None,
+            wrapper_start_time: None,
+            child_start_time: None,
+            orphan_reason: None,
+            output_path: "stdout-000000".into(),
+        };
+        let output = build_job_output(
+            &snapshot,
+            &snapshot.job_id,
+            b"line-11\nline-12\nline-13\n".to_vec(),
+            Some(0),
+            Some(2),
+            false,
+        )
+        .unwrap();
+        assert_eq!(output.oldest_available_offset, 10);
+        assert_eq!(output.omitted_before, 10);
+        assert_eq!(output.start_line, 10);
+        assert!(output.truncated);
+        assert_eq!(output.text, "line-11\nline-12");
     }
 
     #[cfg(unix)]
