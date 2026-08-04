@@ -111,6 +111,7 @@ Builtin engine 现在会把 working 过程作为结构化事件同时写入本�
 - `event_type`、`category`、`direction`、`timestamp` 和结构化 `payload`；
 - 每轮的 `status_update`、`simple_activity_update`、`context_growth_update`；
 - 每回合聚合后的 provider reasoning 对应一条 `devin_thoughts`（最多 4000 字符）；
+  payload 同时带 `thinking_duration_ms`；
 - 工具调用的 `<tool>_started` / `<tool>_completed`，完成事件只带参数 key、
   结果类型、字节数和成功标记，不复制原始敏感参数；
 - `ToolExecutor::execute_streaming` 可选流式入口；engine 对输出按每次最多
@@ -121,6 +122,8 @@ Builtin engine 现在会把 working 过程作为结构化事件同时写入本�
 - 本地 `session_worklog` 现在从 audit store 返回这些事件，沿用现有 Worklog
   时间线，不新增 UI 布局；Transcript 对 `devin_thoughts` 和
   `simple_activity_update` 沿用已有 thinking/notice 表面。
+- `plan_update` / `plan_revise` 完成后发 `todo_update`，payload 是完整本地
+  plan snapshot；pending question resolution 后发 `user_question_answered`。
 
 真实 Devin 事件样本的字段形状已依据
 `/home/ubuntu/devin_session_events_full.txt` 核对，覆盖 status、shell、file、
@@ -139,3 +142,5 @@ TypeScript、production build 和 format check 已通过。
   没有改变 RVM host。
 - Devin 的 `one_line_thoughts` 尚未单独生成；当前仅提供聚合的
   `devin_thoughts`。
+- PR 事件（`pr_created`、`pr_comment`、`pr_merge_conflict`）尚未增加专用
+  集成事件；现有 git/PR 工具仍通过工具生命周期事件记录。

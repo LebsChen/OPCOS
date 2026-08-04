@@ -1080,6 +1080,17 @@ where
         self.store
             .complete_tool_call(&self.session_id, message_sequence, call_id, &result)
             .map_err(|error| EngineError::Store(error.to_string()))?;
+        let _ = self
+            .working_event(
+                "user_question_answered",
+                "message",
+                json!({
+                    "call_id":pending.call_id,
+                    "question_type":pending.tool,
+                    "answer_type":if response.is_string() {"text"} else {"structured"},
+                }),
+            )
+            .await;
         self.run_loop(self.provider_messages()?).await
     }
 
@@ -1355,7 +1366,10 @@ where
                                 .working_event(
                                     "devin_thoughts",
                                     "other",
-                                    json!({"message":message}),
+                                    json!({
+                                        "message":message,
+                                        "thinking_duration_ms":started.elapsed().as_millis(),
+                                    }),
                                 )
                                 .await;
                         }
@@ -1839,6 +1853,21 @@ where
                     }),
                 )
                 .await;
+            if (call.name == "plan_update" || call.name == "plan_revise")
+                && let Some(plan) = self
+                    .store
+                    .load_plan(&self.session_id)
+                    .map_err(|error| EngineError::Store(error.to_string()))?
+            {
+                let _ = self
+                    .working_event(
+                        "todo_update",
+                        "todo",
+                        serde_json::to_value(plan)
+                            .map_err(|error| EngineError::Store(error.to_string()))?,
+                    )
+                    .await;
+            }
             let _ = self.events.try_send(StreamChunk {
                 tool_result: Some(ToolResult {
                     call_id: call.id.clone(),

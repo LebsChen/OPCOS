@@ -443,6 +443,8 @@ async fn run_fake() -> Result<(), Box<dyn std::error::Error>> {
         "edit_file_completed",
         "run_shell_started",
         "run_shell_completed",
+        "user_question_answered",
+        "todo_update",
         "git_status_started",
         "git_status_completed",
         "list_dir_started",
@@ -467,6 +469,35 @@ async fn run_fake() -> Result<(), Box<dyn std::error::Error>> {
             .count(),
         1,
         "reasoning must be aggregated per turn"
+    );
+    let thoughts = working_events
+        .iter()
+        .find(|event| event.get("event_type").and_then(Value::as_str) == Some("devin_thoughts"))
+        .and_then(|event| event.get("payload"))
+        .ok_or("devin_thoughts payload missing")?;
+    assert!(
+        thoughts
+            .get("thinking_duration_ms")
+            .and_then(Value::as_u64)
+            .is_some(),
+        "thinking duration missing"
+    );
+    let todo = working_events
+        .iter()
+        .find(|event| event.get("event_type").and_then(Value::as_str) == Some("todo_update"))
+        .and_then(|event| event.get("payload"))
+        .ok_or("todo_update payload missing")?;
+    assert!(todo.get("steps").and_then(Value::as_array).is_some());
+    let answer = working_events
+        .iter()
+        .find(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("user_question_answered")
+        })
+        .and_then(|event| event.get("payload"))
+        .ok_or("user_question_answered payload missing")?;
+    assert_eq!(
+        answer.get("answer_type").and_then(Value::as_str),
+        Some("text")
     );
     for tool in [
         "read_file",
