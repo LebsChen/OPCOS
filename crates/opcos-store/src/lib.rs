@@ -279,6 +279,27 @@ pub struct GrantRecord {
     pub session_id: String,
     pub key: String,
     pub target: String,
+    pub expires_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LocalGateResult {
+    pub command: String,
+    pub status: String,
+    pub exit_code: Option<i64>,
+    pub output: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LocalGateRecord {
+    pub gate_id: String,
+    pub session_id: String,
+    pub project_id: Option<String>,
+    pub commit_sha: String,
+    pub commands: Vec<String>,
+    pub results: Vec<LocalGateResult>,
+    pub all_passed: bool,
+    pub created_at: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1245,6 +1266,13 @@ pub trait SessionStore {
     ) -> Result<PlanRecord, StoreError>;
     fn save_grant(&self, grant: &GrantRecord) -> Result<(), StoreError>;
     fn load_grants(&self, session_id: &str) -> Result<Vec<GrantRecord>, StoreError>;
+    fn revoke_grant(&self, session_id: &str, key: &str) -> Result<bool, StoreError>;
+    fn save_local_gate_record(&self, record: &LocalGateRecord) -> Result<(), StoreError>;
+    fn load_latest_local_gate_record(
+        &self,
+        session_id: &str,
+        commit_sha: &str,
+    ) -> Result<Option<LocalGateRecord>, StoreError>;
     fn append_usage(&self, usage: &UsageRecord) -> Result<(), StoreError>;
     fn load_usage(&self, session_id: &str) -> Result<Vec<UsageRecord>, StoreError>;
     fn upsert_artifact(&self, artifact: &ArtifactRecord) -> Result<(), StoreError>;
@@ -3641,8 +3669,21 @@ impl SqliteStore {
                session_id TEXT NOT NULL,
                grant_key TEXT NOT NULL,
                grant_value TEXT NOT NULL,
+               expires_at TEXT,
                PRIMARY KEY(session_id, grant_key)
              );
+             CREATE TABLE IF NOT EXISTS local_gate_records (
+               gate_id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL,
+               project_id TEXT,
+               commit_sha TEXT NOT NULL,
+               commands_json TEXT NOT NULL,
+               results_json TEXT NOT NULL,
+               all_passed INTEGER NOT NULL,
+               created_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_local_gate_records_lookup
+               ON local_gate_records(session_id, commit_sha, created_at);
              CREATE TABLE IF NOT EXISTS audit_events (
                session_id TEXT NOT NULL,
                sequence INTEGER NOT NULL,
@@ -4037,6 +4078,12 @@ impl SqliteStore {
                         [],
                     )?;
                 }
+            }
+            if !table_columns(&connection, "grants")?
+                .iter()
+                .any(|column| column == "expires_at")
+            {
+                connection.execute("ALTER TABLE grants ADD COLUMN expires_at TEXT", [])?;
             }
             connection.execute(
                 "UPDATE pending SET created_at=?1 WHERE created_at=''",
@@ -5163,8 +5210,9 @@ impl SessionStore for SqliteStore {
             .lock()
             .expect("sqlite mutex poisoned")
             .execute(
-                "INSERT OR REPLACE INTO grants(session_id,grant_key,grant_value) VALUES (?1,?2,?3)",
-                params![grant.session_id, grant.key, grant.target],
+                "INSERT OR REPLACE INTO grants(session_id,grant_key,grant_value,expires_at)
+                 VALUES (?1,?2,?3,?4)",
+                params![grant.session_id, grant.key, grant.target, grant.expires_at],
             )?;
         Ok(())
     }
@@ -5172,16 +5220,97 @@ impl SessionStore for SqliteStore {
     fn load_grants(&self, session_id: &str) -> Result<Vec<GrantRecord>, StoreError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT session_id,grant_key,grant_value FROM grants WHERE session_id=?1 ORDER BY grant_key",
+            "SELECT session_id,grant_key,grant_value,expires_at FROM grants
+             WHERE session_id=?1 AND (expires_at IS NULL OR expires_at>?2)
+             ORDER BY grant_key",
         )?;
-        let rows = statement.query_map([session_id], |row| {
+        let rows = statement.query_map(params![session_id, Utc::now().to_rfc3339()], |row| {
             Ok(GrantRecord {
                 session_id: row.get(0)?,
                 key: row.get(1)?,
                 target: row.get(2)?,
+                expires_at: row.get(3)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn revoke_grant(&self, session_id: &str, key: &str) -> Result<bool, StoreError> {
+        let changed = self
+            .connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "DELETE FROM grants WHERE session_id=?1 AND grant_key=?2",
+                params![session_id, key],
+            )?;
+        Ok(changed > 0)
+    }
+
+    fn save_local_gate_record(&self, record: &LocalGateRecord) -> Result<(), StoreError> {
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "INSERT OR REPLACE INTO local_gate_records
+                 (gate_id,session_id,project_id,commit_sha,commands_json,results_json,all_passed,created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    record.gate_id,
+                    record.session_id,
+                    record.project_id,
+                    record.commit_sha,
+                    serde_json::to_string(&record.commands)?,
+                    serde_json::to_string(&record.results)?,
+                    record.all_passed,
+                    record.created_at,
+                ],
+            )?;
+        Ok(())
+    }
+
+    fn load_latest_local_gate_record(
+        &self,
+        session_id: &str,
+        commit_sha: &str,
+    ) -> Result<Option<LocalGateRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .query_row(
+                "SELECT gate_id,session_id,project_id,commit_sha,commands_json,results_json,all_passed,created_at
+                 FROM local_gate_records
+                 WHERE session_id=?1 AND commit_sha=?2
+                 ORDER BY created_at DESC LIMIT 1",
+                params![session_id, commit_sha],
+                |row| {
+                    let commands: String = row.get(4)?;
+                    let results: String = row.get(5)?;
+                    Ok(LocalGateRecord {
+                        gate_id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        project_id: row.get(2)?,
+                        commit_sha: row.get(3)?,
+                        commands: serde_json::from_str(&commands).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                4,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?,
+                        results: serde_json::from_str(&results).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                5,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?,
+                        all_passed: row.get::<_, i64>(6)? != 0,
+                        created_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
     }
 
     fn append_usage(&self, usage: &UsageRecord) -> Result<(), StoreError> {
@@ -6973,5 +7102,46 @@ mod tests {
         assert_eq!(reset.consecutive_failures, 0);
         assert!(reset.circuit_open_until.is_none());
         assert!(reset.last_error.is_none());
+    }
+
+    #[test]
+    fn local_gate_records_round_trip_by_commit() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let record = LocalGateRecord {
+            gate_id: "gate-1".into(),
+            session_id: "session-1".into(),
+            project_id: Some("project-1".into()),
+            commit_sha: "abc123".into(),
+            commands: vec!["cargo test".into(), "cargo clippy".into()],
+            results: vec![
+                LocalGateResult {
+                    command: "cargo test".into(),
+                    status: "passed".into(),
+                    exit_code: Some(0),
+                    output: None,
+                },
+                LocalGateResult {
+                    command: "cargo clippy".into(),
+                    status: "passed".into(),
+                    exit_code: Some(0),
+                    output: Some("clean".into()),
+                },
+            ],
+            all_passed: true,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        store.save_local_gate_record(&record).unwrap();
+        assert_eq!(
+            store
+                .load_latest_local_gate_record("session-1", "abc123")
+                .unwrap(),
+            Some(record)
+        );
+        assert!(
+            store
+                .load_latest_local_gate_record("session-1", "def456")
+                .unwrap()
+                .is_none()
+        );
     }
 }
