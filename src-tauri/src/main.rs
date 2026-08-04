@@ -42,8 +42,8 @@ use opcos_engine::{
 };
 use opcos_hosts::{
     BackgroundJobManager, ComputerUseAction, DEFAULT_EXEC_TIMEOUT_SECONDS, Host,
-    LIFECYCLE_EXEC_TIMEOUT_SECONDS, LifecycleStage, LocalHost, RvmHost, ScreenBounds, SpawnRequest,
-    execute_lifecycle_stage,
+    LIFECYCLE_EXEC_TIMEOUT_SECONDS, LifecycleStage, LocalHost, ProcessEvent, RvmHost, ScreenBounds,
+    SpawnRequest, execute_lifecycle_stage,
 };
 use opcos_lsp::LspClient;
 use opcos_mcp::{
@@ -4150,6 +4150,88 @@ impl ToolExecutor for DesktopExecutor {
                 }
             }
         }
+    }
+
+    async fn execute_streaming(
+        &self,
+        name: &str,
+        arguments: Value,
+        on_output: &(dyn for<'a> Fn(&'a str) + Send + Sync + '_),
+    ) -> Result<Value, String> {
+        let DesktopExecutor::Local(executor) = self else {
+            return self.execute(name, arguments).await;
+        };
+        if !matches!(name, "run_shell" | "exec") {
+            return self.execute(name, arguments).await;
+        }
+        let command = arguments
+            .get("command")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "missing string argument: command".to_owned())?;
+        let names = arguments
+            .get("secret_names")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        let mut env = serde_json::Map::new();
+        let mut values = Vec::new();
+        for name in names {
+            let value = scoped_secret_get_from_store(
+                &executor.secrets,
+                executor.project_id.as_deref(),
+                "asset-secret",
+                name,
+            )?
+            .ok_or_else(|| format!("secret is not configured: {name}"))?;
+            env.insert(name.to_owned(), Value::String(value.clone()));
+            values.push(value);
+        }
+        let mut process = executor
+            .host
+            .spawn(SpawnRequest {
+                command: command.to_owned(),
+                cwd: arguments
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| Some(executor.workspace.clone())),
+                env: Some(Value::Object(env)),
+                cols: 120,
+                rows: 40,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut output = String::new();
+        let mut exit_code = None;
+        while let Some(event) = process
+            .next_event()
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            match event {
+                ProcessEvent::Output(chunk) => {
+                    on_output(&chunk);
+                    output.push_str(&chunk);
+                }
+                ProcessEvent::Exited(code) => {
+                    exit_code = code;
+                    break;
+                }
+            }
+        }
+        let _ = process.shutdown().await;
+        let mut result = json!({
+            "stdout":output,
+            "stderr":"",
+            "exit_code":exit_code,
+        });
+        bound_shell_output(&mut result);
+        for value in values {
+            redact_json_strings(&mut result, &value);
+        }
+        Ok(result)
     }
 
     fn tool_origin(&self) -> ToolOrigin {

@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::{
     Arc, Mutex as StdMutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -61,6 +61,15 @@ pub enum EngineError {
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
     async fn execute(&self, name: &str, arguments: Value) -> Result<Value, String>;
+
+    async fn execute_streaming(
+        &self,
+        name: &str,
+        arguments: Value,
+        _on_output: &(dyn for<'a> Fn(&'a str) + Send + Sync + '_),
+    ) -> Result<Value, String> {
+        self.execute(name, arguments).await
+    }
 
     async fn run_hook_command(
         &self,
@@ -744,7 +753,7 @@ where
         if let Some(reason) = pre.blocked {
             return json!({"error":reason});
         }
-        let result = self.execute_tool(call).await;
+        let result = self.execute_tool_streaming(call).await;
         let post = self
             .lifecycle_hooks(
                 "PostToolUse",
@@ -1128,7 +1137,7 @@ where
                     // synchronously through an approval path or fabricate an answer.
                     json!({"error":"ask_user must be handled by the engine pending mechanism"})
                 } else {
-                    self.execute_tool(&ToolCall {
+                    self.execute_tool_streaming(&ToolCall {
                         id: item.call_id.clone(),
                         name: item.tool.clone(),
                         arguments: item.arguments.clone(),
@@ -1772,9 +1781,29 @@ where
         Ok(results.into_iter().map(Option::unwrap).collect())
     }
 
-    async fn execute_tool(&self, call: &ToolCall) -> Value {
+    async fn execute_tool_streaming(&self, call: &ToolCall) -> Value {
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let call_id = call.id.clone();
+        let on_output = {
+            let emitted = emitted.clone();
+            let engine = self;
+            move |chunk: &str| {
+                if emitted.fetch_add(1, Ordering::Relaxed) >= 64 {
+                    return;
+                }
+                let chunk = chunk.chars().take(2000).collect::<String>();
+                if chunk.is_empty() {
+                    return;
+                }
+                let _ = engine.record_working_event(
+                    "terminal_update",
+                    "shell",
+                    json!({"call_id":call_id,"chunk":chunk}),
+                );
+            }
+        };
         self.executor
-            .execute(&call.name, call.arguments.clone())
+            .execute_streaming(&call.name, call.arguments.clone(), &on_output)
             .await
             .unwrap_or_else(|error| json!({"error":error}))
     }
@@ -2117,6 +2146,15 @@ where
     }
 
     async fn working_event(
+        &self,
+        event_type: &str,
+        category: &str,
+        payload: Value,
+    ) -> Result<(), EngineError> {
+        self.record_working_event(event_type, category, payload)
+    }
+
+    fn record_working_event(
         &self,
         event_type: &str,
         category: &str,

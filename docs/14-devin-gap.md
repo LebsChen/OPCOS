@@ -113,6 +113,10 @@ Builtin engine 现在会把 working 过程作为结构化事件同时写入本�
 - 每回合聚合后的 provider reasoning 对应一条 `devin_thoughts`（最多 4000 字符）；
 - 工具调用的 `<tool>_started` / `<tool>_completed`，完成事件只带参数 key、
   结果类型、字节数和成功标记，不复制原始敏感参数；
+- `ToolExecutor::execute_streaming` 可选流式入口；engine 对输出按每次最多
+  2000 字符、每次调用最多 64 条做限流，并持久化 `terminal_update`；
+- 本地 Tauri `run_shell` 通过 host process 增量读取输出并转发
+  `terminal_update`；远程 RVM 路径保持远端原生执行，不修改 host；
 - provider usage 存在时的 `iteration_stats`，包括工具数量、耗时和 token 数；
 - 本地 `session_worklog` 现在从 audit store 返回这些事件，沿用现有 Worklog
   时间线，不新增 UI 布局；Transcript 对 `devin_thoughts` 和
@@ -122,13 +126,16 @@ Builtin engine 现在会把 working 过程作为结构化事件同时写入本�
 `/home/ubuntu/devin_session_events_full.txt` 核对，覆盖 status、shell、file、
 search、mcp、todo、lifecycle、reasoning、iteration 和 context 事件。新增
 engine example 的确定性事件断言、workspace 相关测试和 clippy 已通过；本地浏览器 UI
-构建需要先安装 `web/node_modules`，尚未在当前环境完成。
+TypeScript、production build 和 format check 已通过。
 
 ### 尚未等价或未核实
 
-- 通用 `ToolExecutor` 目前不能提供真正的 shell stdout 增量；completed 事件已
-  结构化，增量 terminal 事件仍取决于具体 executor/harness。
-- MCP、search、git 和 todo 的 category 已按工具名映射，但尚未为每个类别分别
-  跑一套真实端到端任务。
+- 通用 executor 的默认 streaming 实现仍回退到 `execute`，因此只有实现该可选
+  入口的 executor 能提供真实增量；本地 DesktopExecutor 已实现，远程 RVM
+  仍使用远端原生 worklog/执行流。
+- MCP、search、git 和 todo 的 category 已在 fake engine/store/executor E2E 中
+  分别覆盖并断言 started/completed 成对；尚未用真实模型分别触发每个类别。
 - 远程 RVM worklog 仍使用远端原生事件；本次改动只补齐本地 builtin engine，
   没有改变 RVM host。
+- Devin 的 `one_line_thoughts` 尚未单独生成；当前仅提供聚合的
+  `devin_thoughts`。

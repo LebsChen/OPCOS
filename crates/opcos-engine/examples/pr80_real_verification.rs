@@ -96,6 +96,33 @@ impl ToolExecutor for LocalExecutor {
                     "exit_code":output.status.code(),
                 }))
             }
+            "git_status" => {
+                let output = Command::new("git")
+                    .args(["status", "--porcelain"])
+                    .current_dir(&self.root)
+                    .output()
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({
+                    "stdout":String::from_utf8_lossy(&output.stdout),
+                    "stderr":String::from_utf8_lossy(&output.stderr),
+                    "exit_code":output.status.code(),
+                }))
+            }
+            "list_dir" => {
+                let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
+                let items = fs::read_dir(self.root.join(path))
+                    .map_err(|e| e.to_string())?
+                    .map(|entry| {
+                        entry
+                            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                            .map_err(|e| e.to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(json!({"items":items}))
+            }
+            name if name.starts_with("repo_index_") || name.contains("__") => {
+                Ok(json!({"ok":true,"tool":name}))
+            }
             "plan_update" => {
                 let step_id = arguments
                     .get("step_id")
@@ -119,6 +146,23 @@ impl ToolExecutor for LocalExecutor {
             "ask_user" => Err("ask_user must remain engine pending".into()),
             _ => Err(format!("unsupported local verification tool: {name}")),
         }
+    }
+
+    async fn execute_streaming(
+        &self,
+        name: &str,
+        arguments: Value,
+        on_output: &(dyn for<'a> Fn(&'a str) + Send + Sync + '_),
+    ) -> Result<Value, String> {
+        let result = self.execute(name, arguments).await?;
+        if matches!(name, "run_shell" | "exec") {
+            for key in ["stdout", "stderr"] {
+                if let Some(output) = result.get(key).and_then(Value::as_str) {
+                    on_output(output);
+                }
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -238,6 +282,10 @@ async fn run_fake() -> Result<(), Box<dyn std::error::Error>> {
     let root = temp_root("fake");
     fs::create_dir_all(&root)?;
     fs::write(root.join("bug.txt"), "return 2;\n")?;
+    let _ = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&root)
+        .status()?;
     fs::create_dir_all(root.join(".agents/knowledge"))?;
     fs::write(
         root.join(".agents/knowledge/included.md"),
@@ -313,6 +361,10 @@ async fn run_fake() -> Result<(), Box<dyn std::error::Error>> {
                 "run_shell",
                 "plan_update",
                 "ask_user",
+                "git_status",
+                "list_dir",
+                "repo_index_files",
+                "demo__ping",
             ]
             .into_iter()
             .map(str::to_owned),
@@ -391,6 +443,15 @@ async fn run_fake() -> Result<(), Box<dyn std::error::Error>> {
         "edit_file_completed",
         "run_shell_started",
         "run_shell_completed",
+        "git_status_started",
+        "git_status_completed",
+        "list_dir_started",
+        "list_dir_completed",
+        "repo_index_files_started",
+        "repo_index_files_completed",
+        "demo__ping_started",
+        "demo__ping_completed",
+        "terminal_update",
     ] {
         assert!(
             event_types.contains(required),
@@ -407,7 +468,15 @@ async fn run_fake() -> Result<(), Box<dyn std::error::Error>> {
         1,
         "reasoning must be aggregated per turn"
     );
-    for tool in ["read_file", "edit_file", "run_shell"] {
+    for tool in [
+        "read_file",
+        "edit_file",
+        "run_shell",
+        "git_status",
+        "list_dir",
+        "repo_index_files",
+        "demo__ping",
+    ] {
         let started_type = format!("{tool}_started");
         let completed_type = format!("{tool}_completed");
         let started_category = working_events.iter().find_map(|event| {
@@ -423,6 +492,25 @@ async fn run_fake() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(
             started_category, completed_category,
             "category mismatch for {tool}"
+        );
+    }
+    let expected_categories = [
+        ("read_file_started", "search"),
+        ("edit_file_started", "file"),
+        ("run_shell_started", "shell"),
+        ("git_status_started", "git"),
+        ("list_dir_started", "search"),
+        ("repo_index_files_started", "search"),
+        ("demo__ping_started", "mcp"),
+        ("plan_update_started", "todo"),
+    ];
+    for (event_type, category) in expected_categories {
+        assert!(
+            working_events.iter().any(|event| {
+                event.get("event_type").and_then(Value::as_str) == Some(event_type)
+                    && event.get("category").and_then(Value::as_str) == Some(category)
+            }),
+            "missing category {category} for {event_type}"
         );
     }
     println!(
@@ -488,7 +576,27 @@ impl Provider for FakeProvider {
                     ToolCall {
                         id: "shell-1".into(),
                         name: "run_shell".into(),
-                        arguments: json!({"command":"test \"$(cat bug.txt)\" = \"return 3;\""}),
+                        arguments: json!({"command":"printf 'verified\\n'; test \"$(cat bug.txt)\" = \"return 3;\""}),
+                    },
+                    ToolCall {
+                        id: "git-1".into(),
+                        name: "git_status".into(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "list-1".into(),
+                        name: "list_dir".into(),
+                        arguments: json!({"path":"."}),
+                    },
+                    ToolCall {
+                        id: "index-1".into(),
+                        name: "repo_index_files".into(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "mcp-1".into(),
+                        name: "demo__ping".into(),
+                        arguments: json!({}),
                     },
                 ],
                 finish_reason: Some("tool_calls".into()),
