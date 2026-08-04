@@ -1376,6 +1376,14 @@ impl KeyringSecretStore {
         Self::with_optional_fallback(service, Some(path.into()))
     }
 
+    pub fn with_encrypted_fallback(service: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+        Self {
+            service: service.into(),
+            fallback: Some(Arc::new(EncryptedFileSecretStore::new(path.into()))),
+            keyring_available: false,
+        }
+    }
+
     fn with_optional_fallback(service: impl Into<String>, path: Option<PathBuf>) -> Self {
         let service = service.into();
         let keyring_available = keyring::Entry::new(&service, "opcos-secret-store-probe")
@@ -4668,6 +4676,7 @@ impl SqliteStore {
                 monitor.last_error
             ],
         )?;
+        drop(connection);
         self.load_ci_monitor(&monitor.monitor_id)?
             .ok_or_else(|| StoreError::Validation("CI monitor was not saved".into()))
     }

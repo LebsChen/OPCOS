@@ -137,13 +137,14 @@ fn latest_repair_progress(store: &SqliteStore, monitor_id: &str) -> Option<Value
         .ok()?
         .into_iter()
         .filter(|item| item.task_type == "ci_repair_loop")
-        .find(|item| item.payload.get("monitor_id").and_then(Value::as_str) == Some(monitor_id))
-        .and_then(|item| {
+        .filter(|item| item.payload.get("monitor_id").and_then(Value::as_str) == Some(monitor_id))
+        .filter_map(|item| {
             store
                 .load_work_queue_progress(&item.queue_id)
                 .ok()
                 .flatten()
         })
+        .max_by(|left, right| left.updated_at.cmp(&right.updated_at))
         .map(|progress| progress.progress)
 }
 
@@ -383,6 +384,7 @@ pub async fn poll_once_with_base(
         )
     {
         let _ = store.set_ci_monitor_enabled(monitor_id, false);
+        let _ = store.revoke_repair_loop_grant(monitor_id);
         return Ok(json!({
             "monitor_id": monitor_id,
             "repo": monitor.repo,
@@ -421,6 +423,7 @@ pub async fn poll_once_with_base(
     if should_publish {
         let event_payload = json!({
             "provider": "github",
+            "monitor_id": monitor.monitor_id,
             "project_id": monitor.project_id,
             "repo": monitor.repo,
             "pull_request": monitor.pull_request,
@@ -570,6 +573,10 @@ fn should_publish_failure(previous: Option<&CiMonitorState>, overall: &str) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opcos_engine::event_bus::{EventEffect, dispatch_event};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
 
     fn budget() -> RepairBudget {
         RepairBudget {
@@ -761,5 +768,250 @@ mod tests {
                 Some(expected)
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mock_http_repair_loop_requeues_then_stops_and_revokes_grant() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut request_index = 0;
+            while request_index < 15 && std::time::Instant::now() < deadline {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                };
+                let mut request = [0_u8; 4096];
+                let size = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..size]);
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer test-token")
+                );
+                let poll = request_index / 3;
+                let body = match (poll, request_index % 3) {
+                    (0, 0) | (1, 0) => r#"{"head":{"sha":"sha-1"}}"#,
+                    (2, 0) | (3, 0) | (4, 0) => r#"{"head":{"sha":"sha-2"}}"#,
+                    (0, 1) | (2, 1) => {
+                        r#"{"check_runs":[{"name":"ci","status":"in_progress","conclusion":null}]}"#
+                    }
+                    (1, 1) => {
+                        r#"{"check_runs":[{"name":"ci","status":"completed","conclusion":"failure"}]}"#
+                    }
+                    (3, 1) => {
+                        r#"{"check_runs":[{"name":"ci-2","status":"completed","conclusion":"failure"}]}"#
+                    }
+                    (4, 1) => {
+                        r#"{"check_runs":[{"name":"ci-3","status":"completed","conclusion":"failure"}]}"#
+                    }
+                    (_, 2) => r#"{"workflow_runs":[]}"#,
+                    _ => unreachable!(),
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+                request_index += 1;
+            }
+            request_index
+        });
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .save_ci_monitor(&CiMonitor {
+                monitor_id: "loop-e2e".into(),
+                project_id: "project-e2e".into(),
+                repo: "owner/repo".into(),
+                pull_request: 7,
+                branch: "feature".into(),
+                enabled: true,
+                poll_interval_seconds: 30,
+                next_poll_at: None,
+                last_error: None,
+            })
+            .unwrap();
+        let secret_path = std::env::temp_dir().join(format!(
+            "opcos-ci-repair-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let secrets =
+            KeyringSecretStore::with_encrypted_fallback("opcos-ci-repair-test", &secret_path);
+        secrets.set("connector-token:github", "test-token").unwrap();
+        let rule = store
+            .create_event_rule(
+                "external.github.ci.failed",
+                "enqueue_work",
+                &json!({"task_type":"ci_repair_loop","payload":{}}),
+                10,
+                3600,
+                3,
+            )
+            .unwrap();
+        let client = Client::new();
+        let base = format!("http://{address}");
+        macro_rules! poll {
+            () => {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    poll_once_with_base(&client, &store, &secrets, "loop-e2e", &base),
+                )
+                .await
+                .expect("mock CI poll timed out")
+                .unwrap()
+            };
+        }
+        poll!();
+        poll!();
+        let first_event = store
+            .load_events_after("repair-loop-e2e", 10)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let first_item = match dispatch_event(&store, &first_event, &rule).unwrap().effect {
+            EventEffect::Enqueue(item) => item,
+            _ => panic!("expected first repair queue item"),
+        };
+        let claimed = store.claim_work_item("runner-e2e", 60).unwrap().unwrap();
+        assert_eq!(claimed.queue_id, first_item.queue_id);
+        store
+            .save_work_queue_progress(
+                &claimed.queue_id,
+                "runner-e2e",
+                claimed.lease_generation,
+                &json!({
+                    "phase":"waiting_ci",
+                    "loop_id":"loop-e2e",
+                    "repair_attempts":1,
+                    "max_repair_attempts":2,
+                    "poll_count":1,
+                    "max_polls":20,
+                    "deadline":"2099-01-01T00:00:00Z",
+                    "failure_signatures":["code_failure|check:ci:completed:failure"],
+                    "expected_head_sha":"sha-2",
+                }),
+            )
+            .unwrap();
+        store
+            .complete_work_item(
+                &claimed.queue_id,
+                "runner-e2e",
+                claimed.lease_generation,
+                "succeeded",
+                None,
+            )
+            .unwrap();
+        poll!();
+        store
+            .save_repair_loop_grant(&opcos_store::RepairLoopGrant {
+                loop_id: "loop-e2e".into(),
+                project_id: "project-e2e".into(),
+                repo: "owner/repo".into(),
+                branch: "feature".into(),
+                head_sha: "sha-2".into(),
+                target: "git_push:project-e2e:owner/repo:feature".into(),
+                expires_at: (Utc::now() + Duration::minutes(60)).to_rfc3339(),
+            })
+            .unwrap();
+        poll!();
+        let events = store.load_events_after("repair-loop-e2e-2", 10).unwrap();
+        let second_event = events
+            .iter()
+            .filter(|event| event.kind == "external.github.ci.failed")
+            .nth(1)
+            .unwrap();
+        let second_item = match dispatch_event(&store, second_event, &rule).unwrap().effect {
+            EventEffect::Enqueue(item) => item,
+            _ => panic!("expected second repair queue item"),
+        };
+        assert_eq!(second_item.payload["repair_attempts"], 1);
+        assert_eq!(second_item.payload["max_repair_attempts"], 2);
+        assert_eq!(second_item.payload["deadline"], "2099-01-01T00:00:00+00:00");
+        assert_eq!(
+            second_item.payload["failure_signatures"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        let second_claimed = store.claim_work_item("runner-e2e-2", 60).unwrap().unwrap();
+        assert_eq!(second_claimed.queue_id, second_item.queue_id);
+        store
+            .save_work_queue_progress(
+                &second_claimed.queue_id,
+                "runner-e2e-2",
+                second_claimed.lease_generation,
+                &json!({
+                    "phase":"waiting_ci",
+                    "loop_id":"loop-e2e",
+                    "repair_attempts":2,
+                    "max_repair_attempts":2,
+                    "poll_count":2,
+                    "max_polls":20,
+                    "deadline":"2099-01-01T00:00:00Z",
+                    "failure_signatures":[
+                        "code_failure|check:ci:completed:failure",
+                        "code_failure|check:ci-2:completed:failure"
+                    ],
+                    "expected_head_sha":"sha-2",
+                }),
+            )
+            .unwrap();
+        store
+            .complete_work_item(
+                &second_claimed.queue_id,
+                "runner-e2e-2",
+                second_claimed.lease_generation,
+                "succeeded",
+                None,
+            )
+            .unwrap();
+        store
+            .save_ci_monitor_state(&CiMonitorState {
+                monitor_id: "loop-e2e".into(),
+                repo: "owner/repo".into(),
+                pull_request: 7,
+                head_sha: "sha-2".into(),
+                overall: "running".into(),
+                initialized: true,
+                updated_at: Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+        store
+            .save_repair_loop_grant(&opcos_store::RepairLoopGrant {
+                loop_id: "loop-e2e".into(),
+                project_id: "project-e2e".into(),
+                repo: "owner/repo".into(),
+                branch: "feature".into(),
+                head_sha: "sha-2".into(),
+                target: "git_push:project-e2e:owner/repo:feature".into(),
+                expires_at: (Utc::now() + Duration::minutes(60)).to_rfc3339(),
+            })
+            .unwrap();
+        poll!();
+        let observed = store.load_ci_monitor("loop-e2e").unwrap().unwrap();
+        assert!(!observed.enabled);
+        assert!(
+            store
+                .load_repair_loop_grant(
+                    "loop-e2e",
+                    "project-e2e",
+                    "owner/repo",
+                    "feature",
+                    "sha-2",
+                    "git_push:project-e2e:owner/repo:feature"
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(server.join().unwrap(), 15);
+        let _ = std::fs::remove_file(secret_path);
     }
 }
