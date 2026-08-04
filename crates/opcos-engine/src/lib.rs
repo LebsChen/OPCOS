@@ -713,11 +713,17 @@ where
         key: impl Into<String>,
         target: impl Into<String>,
     ) -> Result<(), EngineError> {
+        let target = target.into();
+        if target == "git_push" {
+            return Err(EngineError::Store(
+                "new grants must use a scoped git_push target".into(),
+            ));
+        }
         self.store
             .save_grant(&GrantRecord {
                 session_id: self.session_id.clone(),
                 key: key.into(),
-                target: target.into(),
+                target,
                 expires_at: None,
             })
             .map_err(|error| EngineError::Store(error.to_string()))
@@ -729,11 +735,17 @@ where
         target: impl Into<String>,
         expires_at: impl Into<String>,
     ) -> Result<(), EngineError> {
+        let target = target.into();
+        if target == "git_push" {
+            return Err(EngineError::Store(
+                "new grants must use a scoped git_push target".into(),
+            ));
+        }
         self.store
             .save_grant(&GrantRecord {
                 session_id: self.session_id.clone(),
                 key: key.into(),
-                target: target.into(),
+                target,
                 expires_at: Some(expires_at.into()),
             })
             .map_err(|error| EngineError::Store(error.to_string()))
