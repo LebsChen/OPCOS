@@ -8109,7 +8109,7 @@ async fn create_project_agent(
         provider,
         model: model.unwrap_or_else(|| "auto".into()),
         harness: harness.unwrap_or_else(|| "builtin".into()),
-        mode: mode.unwrap_or_else(|| "Interactive".into()),
+        mode: mode.unwrap_or_else(|| "Auto".into()),
         system_prompt: system_prompt.unwrap_or_default(),
         worktree_path,
         branch,
@@ -10537,7 +10537,7 @@ fn create_session(
         Utc::now().timestamp_nanos_opt().unwrap_or_default()
     );
     let model = model.unwrap_or_else(|| "auto".into());
-    let mode = mode.unwrap_or_else(|| "Interactive".into());
+    let mode = mode.unwrap_or_else(|| "Auto".into());
     let mode = permission_mode_name(parse_permission_mode(&mode)?).to_owned();
     let harness = harness.unwrap_or_else(|| "builtin".into());
     if !matches!(harness.as_str(), "builtin" | "opencode" | "acp") {
@@ -16615,7 +16615,7 @@ async fn linear_create_session_from_issue(
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "remote host not found; session was not created".to_owned())?;
     drop(connection);
-    let mode = mode.unwrap_or_else(|| "Interactive".into());
+    let mode = mode.unwrap_or_else(|| "Auto".into());
     let mode = permission_mode_name(parse_permission_mode(&mode)?).to_owned();
     let now = Utc::now();
     save_session_via_factory(

@@ -1018,7 +1018,7 @@ function MemberDialog({
   const [provider, setProvider] = useState(agent?.provider || "");
   const [model, setModel] = useState(agent?.model || "auto");
   const [harness, setHarness] = useState(agent?.harness || "builtin");
-  const [sessionMode, setSessionMode] = useState(agent?.mode || "Interactive");
+  const [sessionMode, setSessionMode] = useState(agent?.mode || "Auto");
   const [branch, setBranch] = useState(agent?.branch || "");
   const [state, setState] = useState(agent?.state || "Active");
   const [error, setError] = useState("");
@@ -9318,7 +9318,7 @@ function AppContent() {
   const [homeHostId, setHomeHostId] = useState("");
   const [homeProvider, setHomeProvider] = useState("");
   const [homeModel, setHomeModel] = useState("auto");
-  const [homeMode, setHomeMode] = useState("Interactive");
+  const [homeMode, setHomeMode] = useState("Auto");
   const [homeHarness, setHomeHarness] = useState("builtin");
   const [homeRole, setHomeRole] = useState("");
   const [homeSystemPrompt, setHomeSystemPrompt] = useState("");
@@ -10192,7 +10192,7 @@ function AppContent() {
                           setHomeProvider(content.provider || "");
                           setHomeModel(content.model || "auto");
                           setHomeHarness(content.harness || "builtin");
-                          setHomeMode(content.mode || "Interactive");
+                          setHomeMode(content.mode || "Auto");
                           setHomeSystemPrompt(content.system_prompt || "");
                         } catch {
                           onError("Agent 模板内容不是有效 JSON");

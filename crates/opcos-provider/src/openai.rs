@@ -230,6 +230,27 @@ fn reasoning(value: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn parse_stream_value(event: &crate::sse::SseEvent) -> Option<Value> {
+    match crate::sse::parse_json(event) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            tracing::warn!(
+                event = %event.event,
+                error = %error,
+                "skipping malformed OpenAI-compatible SSE event"
+            );
+            None
+        }
+    }
+}
+
+fn stream_choice(value: &Value) -> Option<&Value> {
+    value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+}
+
 fn parse_tool_calls(value: Option<&Value>) -> Vec<ToolCall> {
     value
         .and_then(Value::as_array)
@@ -340,142 +361,6 @@ impl Provider for OpenAiProvider {
         })
     }
 
-    async fn stream(
-        &self,
-        request: ProviderRequest,
-        output: Sender<StreamChunk>,
-    ) -> Result<AssistantTurn, ProviderError> {
-        let response = self.send(self.body(&request, true)).await?;
-        let mut decoder = crate::sse::SseDecoder::new();
-        let mut text = String::new();
-        let mut thought = String::new();
-        let mut calls: std::collections::BTreeMap<usize, (String, String, String)> =
-            std::collections::BTreeMap::new();
-        let mut finish = None;
-        let mut final_usage = None;
-        let mut bytes = response.bytes_stream();
-        while let Some(chunk) = bytes.next().await {
-            for event in decoder.push(&chunk.map_err(crate::request_error)?) {
-                if event.data == "[DONE]" {
-                    continue;
-                }
-                let value: Value =
-                    crate::sse::parse_json(&event).map_err(ProviderError::Protocol)?;
-                if let Some(value) = usage(value.get("usage")) {
-                    final_usage = Some(value.clone());
-                    output
-                        .send(StreamChunk {
-                            usage: Some(value),
-                            ..Default::default()
-                        })
-                        .await
-                        .map_err(|_| ProviderError::Protocol("stream receiver closed".into()))?;
-                }
-                let choice = value
-                    .get("choices")
-                    .and_then(Value::as_array)
-                    .and_then(|choices| choices.first());
-                let Some(choice) = choice else { continue };
-                finish = choice
-                    .get("finish_reason")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .or(finish);
-                let delta = choice.get("delta").unwrap_or(choice);
-                if let Some(part) = delta.get("content").and_then(Value::as_str) {
-                    text.push_str(part);
-                    output
-                        .send(StreamChunk {
-                            text_delta: Some(part.into()),
-                            ..Default::default()
-                        })
-                        .await
-                        .map_err(|_| ProviderError::Protocol("stream receiver closed".into()))?;
-                }
-                if let Some(part) = reasoning(delta) {
-                    thought.push_str(&part);
-                    output
-                        .send(StreamChunk {
-                            reasoning_delta: Some(part),
-                            ..Default::default()
-                        })
-                        .await
-                        .map_err(|_| ProviderError::Protocol("stream receiver closed".into()))?;
-                }
-                for call in delta
-                    .get("tool_calls")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                {
-                    let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                    let entry = calls
-                        .entry(index)
-                        .or_insert_with(|| ("".into(), "".into(), "".into()));
-                    if let Some(id) = call.get("id").and_then(Value::as_str) {
-                        entry.0 = id.into();
-                    }
-                    if let Some(function) = call.get("function") {
-                        let name = function
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned);
-                        if let Some(name_value) = &name {
-                            entry.1 = name_value.clone();
-                        }
-                        let args = function
-                            .get("arguments")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned);
-                        if let Some(args_value) = &args {
-                            entry.2.push_str(args_value);
-                        }
-                        if name.is_some() || args.is_some() || call.get("id").is_some() {
-                            output
-                                .send(StreamChunk {
-                                    tool_call_delta: Some(ToolCallDelta {
-                                        index,
-                                        id: call
-                                            .get("id")
-                                            .and_then(Value::as_str)
-                                            .map(str::to_owned),
-                                        name,
-                                        arguments_fragment: args,
-                                    }),
-                                    ..Default::default()
-                                })
-                                .await
-                                .map_err(|_| {
-                                    ProviderError::Protocol("stream receiver closed".into())
-                                })?;
-                        }
-                    }
-                }
-            }
-        }
-        let tool_calls = calls
-            .into_values()
-            .map(|(id, name, args)| ToolCall {
-                id,
-                name,
-                arguments: serde_json::from_str(&args).unwrap_or_else(|_| json!({"_raw":args})),
-            })
-            .collect();
-        let (text, salvaged) = salvage((!text.is_empty()).then_some(text), &request.tools);
-        Ok(AssistantTurn {
-            text,
-            tool_calls: if salvaged.is_empty() {
-                tool_calls
-            } else {
-                salvaged
-            },
-            finish_reason: finish,
-            reasoning: (!thought.is_empty()).then_some(thought),
-            extras: json!({}),
-            usage: final_usage,
-        })
-    }
-
     fn capabilities(&self, _model: &str) -> Caps {
         Caps {
             tools: true,
@@ -486,6 +371,161 @@ impl Provider for OpenAiProvider {
             context_window: None,
         }
     }
+
+    async fn stream(
+        &self,
+        request: ProviderRequest,
+        output: Sender<StreamChunk>,
+    ) -> Result<AssistantTurn, ProviderError> {
+        let mut attempt = 0;
+        loop {
+            match stream_once(self, &request, &output).await {
+                Err(ProviderError::Request(error)) if attempt < TRANSIENT_RETRY_LIMIT => {
+                    tracing::warn!(
+                        attempt,
+                        error = %error,
+                        "transient OpenAI-compatible stream transport error; retrying"
+                    );
+                    tokio::time::sleep(retry_delay(attempt, None)).await;
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
+async fn stream_once(
+    provider: &OpenAiProvider,
+    request: &ProviderRequest,
+    output: &Sender<StreamChunk>,
+) -> Result<AssistantTurn, ProviderError> {
+    let response = provider.send(provider.body(request, true)).await?;
+    let mut decoder = crate::sse::SseDecoder::new();
+    let mut text = String::new();
+    let mut thought = String::new();
+    let mut calls: std::collections::BTreeMap<usize, (String, String, String)> =
+        std::collections::BTreeMap::new();
+    let mut finish = None;
+    let mut final_usage = None;
+    let mut bytes = response.bytes_stream();
+    while let Some(chunk) = bytes.next().await {
+        for event in decoder.push(&chunk.map_err(crate::request_error)?) {
+            if event.data == "[DONE]" {
+                continue;
+            }
+            let Some(value) = parse_stream_value(&event) else {
+                continue;
+            };
+            if let Some(value) = usage(value.get("usage")) {
+                final_usage = Some(value.clone());
+                output
+                    .send(StreamChunk {
+                        usage: Some(value),
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(|_| ProviderError::Protocol("stream receiver closed".into()))?;
+            }
+            let Some(choice) = stream_choice(&value) else {
+                tracing::warn!("skipping OpenAI-compatible SSE event without choices");
+                continue;
+            };
+            finish = choice
+                .get("finish_reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or(finish);
+            let delta = choice.get("delta").unwrap_or(choice);
+            if let Some(part) = delta.get("content").and_then(Value::as_str) {
+                text.push_str(part);
+                output
+                    .send(StreamChunk {
+                        text_delta: Some(part.into()),
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(|_| ProviderError::Protocol("stream receiver closed".into()))?;
+            }
+            if let Some(part) = reasoning(delta) {
+                thought.push_str(&part);
+                output
+                    .send(StreamChunk {
+                        reasoning_delta: Some(part),
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(|_| ProviderError::Protocol("stream receiver closed".into()))?;
+            }
+            for call in delta
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let entry = calls
+                    .entry(index)
+                    .or_insert_with(|| ("".into(), "".into(), "".into()));
+                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                    entry.0 = id.into();
+                }
+                if let Some(function) = call.get("function") {
+                    let name = function
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    if let Some(name_value) = &name {
+                        entry.1 = name_value.clone();
+                    }
+                    let args = function
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    if let Some(args_value) = &args {
+                        entry.2.push_str(args_value);
+                    }
+                    if name.is_some() || args.is_some() || call.get("id").is_some() {
+                        output
+                            .send(StreamChunk {
+                                tool_call_delta: Some(ToolCallDelta {
+                                    index,
+                                    id: call.get("id").and_then(Value::as_str).map(str::to_owned),
+                                    name,
+                                    arguments_fragment: args,
+                                }),
+                                ..Default::default()
+                            })
+                            .await
+                            .map_err(|_| {
+                                ProviderError::Protocol("stream receiver closed".into())
+                            })?;
+                    }
+                }
+            }
+        }
+    }
+    let tool_calls = calls
+        .into_values()
+        .map(|(id, name, args)| ToolCall {
+            id,
+            name,
+            arguments: serde_json::from_str(&args).unwrap_or_else(|_| json!({"_raw":args})),
+        })
+        .collect();
+    let (text, salvaged) = salvage((!text.is_empty()).then_some(text), &request.tools);
+    Ok(AssistantTurn {
+        text,
+        tool_calls: if salvaged.is_empty() {
+            tool_calls
+        } else {
+            salvaged
+        },
+        finish_reason: finish,
+        reasoning: (!thought.is_empty()).then_some(thought),
+        extras: json!({}),
+        usage: final_usage,
+    })
 }
 
 #[cfg(test)]
@@ -636,6 +676,24 @@ mod tests {
         });
         assert_eq!(reasoning(&value).as_deref(), Some("private chain"));
         assert_eq!(value["content"].as_str(), Some("visible answer"));
+    }
+
+    #[test]
+    fn malformed_stream_event_is_skipped_without_protocol_failure() {
+        let event = crate::sse::SseEvent {
+            event: "message".into(),
+            data: "{not-json".into(),
+        };
+        assert!(parse_stream_value(&event).is_none());
+    }
+
+    #[test]
+    fn unexpected_stream_shape_is_skipped_without_choices() {
+        let value = json!({
+            "usage": {"completion_tokens": 4},
+            "choices": "unexpected"
+        });
+        assert!(stream_choice(&value).is_none());
     }
 
     #[tokio::test]
