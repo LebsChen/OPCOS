@@ -168,6 +168,13 @@ pub fn descriptors() -> Vec<ProviderDescriptor> {
             "ZAI_API_KEY",
             true,
         ),
+        descriptor(
+            "agnes",
+            "Agnes AI",
+            "https://apihub.agnes-ai.com/v1",
+            "AGNES_AI_API_KEY",
+            true,
+        ),
         ProviderDescriptor {
             name: "vertex".into(),
             title: "Vertex AI (Google Cloud)".into(),
@@ -574,6 +581,7 @@ mod tests {
             ("fireworks", "https://api.fireworks.ai/inference/v1"),
             ("openrouter", "https://openrouter.ai/api/v1"),
             ("zai", "https://api.z.ai/api/paas/v4"),
+            ("agnes", "https://apihub.agnes-ai.com/v1"),
         ];
         let descriptors = descriptors();
         for (name, base_url) in expected {
@@ -589,6 +597,19 @@ mod tests {
             assert_eq!(descriptor.default_base_url.as_deref(), Some(base_url));
             assert!(descriptor.needs_key, "{name} should require an API key");
         }
+    }
+
+    #[test]
+    fn agnes_recommends_its_own_chat_model() {
+        let descriptor = descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.name == "agnes")
+            .expect("Agnes AI should be registered");
+        assert_eq!(
+            descriptor.recommended_model.as_deref(),
+            Some("agnes-2.5-pro")
+        );
+        assert_eq!(descriptor.env_key.as_deref(), Some("AGNES_AI_API_KEY"));
     }
 
     #[test]

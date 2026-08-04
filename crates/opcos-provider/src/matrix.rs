@@ -152,6 +152,33 @@ pub const MATRIX: &[ModelEntry] = &[
         },
     },
     ModelEntry {
+        id: "agnes:agnes-2.5-pro",
+        provider: "agnes",
+        label: "Agnes 2.5 Pro · Agnes AI",
+        capabilities: Caps {
+            vision: true,
+            ..DEFAULT_CAPS
+        },
+    },
+    ModelEntry {
+        id: "agnes:agnes-2.5-flash",
+        provider: "agnes",
+        label: "Agnes 2.5 Flash · Agnes AI",
+        capabilities: Caps {
+            vision: true,
+            ..DEFAULT_CAPS
+        },
+    },
+    ModelEntry {
+        id: "agnes:agnes-2.0-flash",
+        provider: "agnes",
+        label: "Agnes 2.0 Flash · Agnes AI",
+        capabilities: Caps {
+            vision: true,
+            ..DEFAULT_CAPS
+        },
+    },
+    ModelEntry {
         id: "zai:glm-5.2",
         provider: "zai",
         label: "GLM-5.2 · Z AI",
