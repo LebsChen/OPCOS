@@ -266,12 +266,13 @@ omitted_lines=0
 trim_segments() {
   prefix=$1
   while :; do
-    count=$(find "$root" -maxdepth 1 -type f -name "$prefix-[0-9]*" | wc -l)
+    count=$(find "$root" -maxdepth 1 -type f -name "$prefix-[0-9]*" 2>/dev/null | wc -l) || return 0
     [ "$count" -gt 32 ] || break
-    oldest=$(find "$root" -maxdepth 1 -type f -name "$prefix-[0-9]*" | sort | head -n 1)
+    oldest=$(find "$root" -maxdepth 1 -type f -name "$prefix-[0-9]*" 2>/dev/null | sort | head -n 1) || return 0
     [ -n "$oldest" ] || break
-    bytes=$(wc -c <"$oldest")
-    lines=$(wc -l <"$oldest")
+    [ -f "$oldest" ] || return 0
+    bytes=$(wc -c <"$oldest") || return 0
+    lines=$(wc -l <"$oldest") || return 0
     omitted_bytes=$((omitted_bytes + bytes))
     omitted_lines=$((omitted_lines + lines))
     rm -f "$oldest"
@@ -280,9 +281,9 @@ trim_segments() {
 printf '{"state":"running","wrapper_pid":%s,"child_pid":%s,"launch_nonce":"%s","wrapper_start_time":"%s","child_start_time":"%s"}\n' \
   "$wrapper_pid" "$child_pid" "$nonce" "$wrapper_start" "$child_start" >"$status_path"
 while kill -0 "$child_pid" 2>/dev/null; do
-  trim_segments stdout
-  trim_segments stderr
-  sleep 0.1
+  trim_segments stdout || true
+  trim_segments stderr || true
+  sleep 2
 done
 wait "$child_pid" || exit_code=$?
 exit_code=${exit_code:-0}
@@ -319,7 +320,16 @@ $child.StartInfo = $psi
 $child.Start() | Out-Null
 Remove-Item -LiteralPath $commandPath -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $identityPath -Force -ErrorAction SilentlyContinue
-$state = [hashtable]::Synchronized(@{ stdout = 0; stderr = 0; omitted_bytes = 0; omitted_lines = 0 })
+$state = [hashtable]::Synchronized(@{
+  stdout = 0
+  stderr = 0
+  stdout_buffer = New-Object System.Text.StringBuilder
+  stderr_buffer = New-Object System.Text.StringBuilder
+  total_bytes = 0
+  total_lines = 0
+  omitted_bytes = 0
+  omitted_lines = 0
+})
 $stdoutEvent = Register-ObjectEvent -InputObject $child -EventName OutputDataReceived -MessageData @{
   Root = $Root
   State = $state
@@ -327,18 +337,26 @@ $stdoutEvent = Register-ObjectEvent -InputObject $child -EventName OutputDataRec
 } -Action {
   if ([string]::IsNullOrEmpty($EventArgs.Data)) { return }
   $context = $Event.MessageData
+  $context.State['total_bytes'] = [int64]$context.State['total_bytes'] + [int64]([System.Text.UTF8Encoding]::new($false).GetByteCount($EventArgs.Data + "`n"))
+  $context.State['total_lines'] = [int64]$context.State['total_lines'] + 1
+  $buffer = $context.State['stdout_buffer']
+  [void]$buffer.AppendLine($EventArgs.Data)
+  if ($buffer.Length -lt 65536) { return }
   $index = [int]$context.State[$context.Stream]
   $path = Join-Path $context.Root ("{0}-{1:D6}.log" -f $context.Stream, $index)
-  Add-Content -LiteralPath $path -Value $EventArgs.Data -Encoding utf8
-  if ((Get-Item -LiteralPath $path).Length -ge 1048576) {
+  $text = $buffer.ToString()
+  $buffer.Clear()
+  [System.IO.File]::AppendAllText($path, $text, [System.Text.UTF8Encoding]::new($false))
+  if (([System.IO.FileInfo]$path).Length -ge 1048576) {
     $context.State[$context.Stream] = $index + 1
     $oldest = $index - 31
     if ($oldest -ge 0) {
       $oldestPath = Join-Path $context.Root ("{0}-{1:D6}.log" -f $context.Stream, $oldest)
       if (Test-Path -LiteralPath $oldestPath) {
         $oldestText = Get-Content -LiteralPath $oldestPath -Raw -ErrorAction SilentlyContinue
-        $context.State['omitted_bytes'] += [int64]((Get-Item -LiteralPath $oldestPath).Length)
-        $context.State['omitted_lines'] += (($oldestText -split "`n").Count - [int](-not $oldestText.EndsWith("`n")))
+        $removedBytes = [int64]((Get-Item -LiteralPath $oldestPath).Length)
+        $removedLines = (($oldestText -split "`n").Count - [int](-not $oldestText.EndsWith("`n")))
+        [System.IO.File]::AppendAllText((Join-Path $context.Root 'omitted-counters.log'), "$removedBytes,$removedLines`n")
       }
       Remove-Item -LiteralPath $oldestPath -Force -ErrorAction SilentlyContinue
     }
@@ -351,18 +369,26 @@ $stderrEvent = Register-ObjectEvent -InputObject $child -EventName ErrorDataRece
 } -Action {
   if ([string]::IsNullOrEmpty($EventArgs.Data)) { return }
   $context = $Event.MessageData
+  $context.State['total_bytes'] = [int64]$context.State['total_bytes'] + [int64]([System.Text.UTF8Encoding]::new($false).GetByteCount($EventArgs.Data + "`n"))
+  $context.State['total_lines'] = [int64]$context.State['total_lines'] + 1
+  $buffer = $context.State['stderr_buffer']
+  [void]$buffer.AppendLine($EventArgs.Data)
+  if ($buffer.Length -lt 65536) { return }
   $index = [int]$context.State[$context.Stream]
   $path = Join-Path $context.Root ("{0}-{1:D6}.log" -f $context.Stream, $index)
-  Add-Content -LiteralPath $path -Value $EventArgs.Data -Encoding utf8
-  if ((Get-Item -LiteralPath $path).Length -ge 1048576) {
+  $text = $buffer.ToString()
+  $buffer.Clear()
+  [System.IO.File]::AppendAllText($path, $text, [System.Text.UTF8Encoding]::new($false))
+  if (([System.IO.FileInfo]$path).Length -ge 1048576) {
     $context.State[$context.Stream] = $index + 1
     $oldest = $index - 31
     if ($oldest -ge 0) {
       $oldestPath = Join-Path $context.Root ("{0}-{1:D6}.log" -f $context.Stream, $oldest)
       if (Test-Path -LiteralPath $oldestPath) {
         $oldestText = Get-Content -LiteralPath $oldestPath -Raw -ErrorAction SilentlyContinue
-        $context.State['omitted_bytes'] += [int64]((Get-Item -LiteralPath $oldestPath).Length)
-        $context.State['omitted_lines'] += (($oldestText -split "`n").Count - [int](-not $oldestText.EndsWith("`n")))
+        $removedBytes = [int64]((Get-Item -LiteralPath $oldestPath).Length)
+        $removedLines = (($oldestText -split "`n").Count - [int](-not $oldestText.EndsWith("`n")))
+        [System.IO.File]::AppendAllText((Join-Path $context.Root 'omitted-counters.log'), "$removedBytes,$removedLines`n")
       }
       Remove-Item -LiteralPath $oldestPath -Force -ErrorAction SilentlyContinue
     }
@@ -391,6 +417,36 @@ $child.WaitForExit()
 [void]$child.WaitForExit()
 Unregister-Event -SourceIdentifier $stdoutEvent.Name -ErrorAction SilentlyContinue
 Unregister-Event -SourceIdentifier $stderrEvent.Name -ErrorAction SilentlyContinue
+foreach ($stream in @('stdout', 'stderr')) {
+  $buffer = $state["${stream}_buffer"]
+  if ($buffer.Length -gt 0) {
+    $index = [int]$state[$stream]
+    $path = Join-Path $Root ("{0}-{1:D6}.log" -f $stream, $index)
+    [System.IO.File]::AppendAllText($path, $buffer.ToString(), [System.Text.UTF8Encoding]::new($false))
+    $buffer.Clear()
+  }
+}
+$retainedBytes = [int64]0
+$retainedLines = [int64]0
+Get-ChildItem -LiteralPath $Root -Filter 'stdout-*.log' -File -ErrorAction SilentlyContinue | ForEach-Object {
+  $retainedBytes += [int64]$_.Length
+  $retainedLines += [int64]((Get-Content -LiteralPath $_.FullName | Measure-Object -Line).Lines)
+}
+$state['omitted_bytes'] = [Math]::Max([int64]0, [int64]$state['total_bytes'] - $retainedBytes)
+$state['omitted_lines'] = [Math]::Max([int64]0, [int64]$state['total_lines'] - $retainedLines)
+$counterPath = Join-Path $Root 'omitted-counters.log'
+if (Test-Path -LiteralPath $counterPath) {
+  $state['omitted_bytes'] = [int64]0
+  $state['omitted_lines'] = [int64]0
+  Get-Content -LiteralPath $counterPath | ForEach-Object {
+    $parts = $_ -split ','
+    if ($parts.Count -eq 2) {
+      $state['omitted_bytes'] += [int64]$parts[0]
+      $state['omitted_lines'] += [int64]$parts[1]
+    }
+  }
+  Remove-Item -LiteralPath $counterPath -Force -ErrorAction SilentlyContinue
+}
 [pscustomobject]@{
   state = 'exited'
   wrapper_pid = $PID
@@ -3806,6 +3862,8 @@ mod tests {
         assert!(posix_wrapper.contains("mkfifo"));
         assert!(posix_wrapper.contains("split"));
         assert!(posix_wrapper.contains("command.sh"));
+        assert!(posix_wrapper.contains("sleep 2"));
+        assert!(posix_wrapper.contains("|| return 0"));
         assert!(!posix_wrapper.contains("secret-value"));
         assert!(!posix_wrapper.contains("Authorization"));
     }
