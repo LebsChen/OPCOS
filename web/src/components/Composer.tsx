@@ -129,7 +129,12 @@ interface Props {
   onInterrupt: () => void;
   assets?: Array<{ kind: string; title: string }>;
   secrets?: Array<{ name: string }>;
-  slashCommands?: Array<{ name: string; body: string; kind: string }>;
+  slashCommands?: Array<{
+    name: string;
+    body: string;
+    kind: string;
+    execution?: string;
+  }>;
   onUploadFile?: (file: File) => Promise<string>;
   onModeChange?: (mode: string) => void;
   onHarnessChange?: (harness: string) => void;
@@ -548,7 +553,16 @@ export function Composer(props: Props) {
                     textareaRef.current?.focus();
                   }}
                 >
-                  {command.name}
+                  <span>{command.name}</span>
+                  <span
+                    className={`ml-1 text-[10px] uppercase tracking-wide ${
+                      command.execution === "action"
+                        ? "text-emerald-300"
+                        : "text-sky-300"
+                    }`}
+                  >
+                    {command.execution === "action" ? "action" : "prompt"}
+                  </span>
                 </button>
               ))}
           </div>

@@ -4901,12 +4901,31 @@ fn builtin_slash_commands() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+fn builtin_control_slash_commands() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "/compact",
+            "Compact the current session context immediately.",
+        ),
+        (
+            "/mode",
+            "Change the session permission mode: interactive, discuss, or auto.",
+        ),
+        ("/model", "Change the model used by the current session."),
+        ("/ls", "List persisted OPCOS sessions."),
+        (
+            "/help",
+            "Show the host-executed and prompt-template slash commands.",
+        ),
+    ]
+}
+
 fn effective_slash_commands(
     connection: &Connection,
     project_id: Option<&str>,
     repo_scope: Option<&str>,
 ) -> Result<Vec<Value>, String> {
-    let mut commands = builtin_slash_commands()
+    let mut commands = builtin_control_slash_commands()
         .into_iter()
         .map(|(name, body)| {
             (
@@ -4914,12 +4933,26 @@ fn effective_slash_commands(
                 json!({
                     "name": name,
                     "kind": "system",
+                    "execution": "action",
                     "body": body,
                     "scope": "global",
                     "default_body": body
                 }),
             )
         })
+        .chain(builtin_slash_commands().into_iter().map(|(name, body)| {
+            (
+                name.to_owned(),
+                json!({
+                    "name": name,
+                    "kind": "system",
+                    "execution": "prompt",
+                    "body": body,
+                    "scope": "global",
+                    "default_body": body
+                }),
+            )
+        }))
         .collect::<HashMap<_, _>>();
     let mut scopes = vec!["global".to_owned()];
     if let Some(project_id) = project_id {
@@ -4943,6 +4976,12 @@ fn effective_slash_commands(
             .map_err(|error| error.to_string())?;
         for row in rows {
             let (name, kind, body) = row.map_err(|error| error.to_string())?;
+            if builtin_control_slash_commands()
+                .iter()
+                .any(|(builtin, _)| *builtin == name)
+            {
+                continue;
+            }
             let default_body = builtin_slash_commands()
                 .into_iter()
                 .find(|(builtin, _)| *builtin == name)
@@ -4952,6 +4991,7 @@ fn effective_slash_commands(
                 json!({
                     "name": name,
                     "kind": kind,
+                    "execution": "prompt",
                     "body": body,
                     "scope": scope,
                     "default_body": default_body
@@ -4992,11 +5032,20 @@ fn effective_slash_commands(
                     let content: String = row.get(1)?;
                     let metadata = serde_json::from_str::<Value>(&row.get::<_, String>(2)?)
                         .unwrap_or_else(|_| json!({}));
+                    let execution = if builtin_control_slash_commands()
+                        .iter()
+                        .any(|(builtin, _)| *builtin == name)
+                    {
+                        "action"
+                    } else {
+                        "prompt"
+                    };
                     Ok((
                         name,
                         json!({
                             "name": row.get::<_, String>(0)?,
                             "kind": "command",
+                            "execution": execution,
                             "body": content,
                             "scope": format!("{}:{}", row.get::<_, String>(3)?, row.get::<_, String>(4)?),
                             "description": metadata.get("description").and_then(Value::as_str).unwrap_or(""),
@@ -5008,6 +5057,12 @@ fn effective_slash_commands(
             .map_err(|error| error.to_string())?;
         for row in rows {
             let (name, command) = row.map_err(|error| error.to_string())?;
+            if builtin_control_slash_commands()
+                .iter()
+                .any(|(builtin, _)| *builtin == name)
+            {
+                continue;
+            }
             commands.insert(name, command);
         }
     }
@@ -5018,6 +5073,184 @@ fn effective_slash_commands(
             .cmp(&b.get("name").and_then(Value::as_str))
     });
     Ok(result)
+}
+
+async fn execute_control_slash_command(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    session: &SessionRecord,
+    text: &str,
+) -> Result<bool, String> {
+    let trimmed = text.trim();
+    if !trimmed.starts_with('/') {
+        return Ok(false);
+    }
+    let mut parts = trimmed.split_whitespace();
+    let Some(command_name) = parts.next() else {
+        return Ok(false);
+    };
+    let remainder = trimmed[command_name.len()..].trim();
+    execute_control_slash_action(app, state, session, command_name, remainder).await
+}
+
+async fn execute_control_slash_action(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    session: &SessionRecord,
+    command_name: &str,
+    remainder: &str,
+) -> Result<bool, String> {
+    if !builtin_control_slash_commands()
+        .iter()
+        .any(|(name, _)| *name == command_name)
+    {
+        return Ok(false);
+    }
+    match command_name {
+        "/compact" => {
+            if !remainder.is_empty() {
+                return Err("/compact does not accept arguments".into());
+            }
+            if session.harness != "builtin" {
+                return Err("/compact is only available for the Builtin harness".into());
+            }
+            let engine = engine_for(app, state, &session.session_id).await?;
+            engine.compact_now().await.map_err(engine_error_message)?;
+            emit(
+                app,
+                "notice",
+                Some(&session.session_id),
+                json!({"kind":"compacted","text":"Session context compacted"}),
+            );
+        }
+        "/mode" => {
+            if remainder.is_empty() {
+                emit(
+                    app,
+                    "notice",
+                    Some(&session.session_id),
+                    json!({"kind":"mode_current","text":format!("Current mode: {}", session.mode)}),
+                );
+                return Ok(true);
+            }
+            let mode = parse_permission_mode(remainder)?;
+            let mode_name = permission_mode_name(mode).to_owned();
+            if let Some(engine) = state.engines.lock().await.get(&session.session_id).cloned() {
+                engine.set_mode(mode).await;
+            }
+            state
+                .store
+                .update_session_mode(&session.session_id, &mode_name)
+                .map_err(|error| error.to_string())?;
+            emit(
+                app,
+                "mode_changed",
+                Some(&session.session_id),
+                json!({"mode": mode_name}),
+            );
+        }
+        "/model" => {
+            let model = remainder.trim();
+            if model.is_empty() {
+                emit(
+                    app,
+                    "notice",
+                    Some(&session.session_id),
+                    json!({"kind":"model_current","text":format!("Current model: {}", session.model)}),
+                );
+                return Ok(true);
+            }
+            if model.split_whitespace().count() != 1 {
+                return Err("/model requires exactly one model name".into());
+            }
+            validate_session_model(state, session, model).await?;
+            if let Some(engine) = state.engines.lock().await.get(&session.session_id).cloned() {
+                engine
+                    .change_model(model.to_owned())
+                    .await
+                    .map_err(engine_error_message)?;
+            }
+            state
+                .store
+                .update_session_model(&session.session_id, model)
+                .map_err(|error| error.to_string())?;
+            emit(
+                app,
+                "notice",
+                Some(&session.session_id),
+                json!({"kind":"model_switch","text":format!("Switched to {model}")}),
+            );
+        }
+        "/ls" => {
+            if !remainder.is_empty() {
+                return Err("/ls does not accept arguments".into());
+            }
+            let sessions = state
+                .store
+                .load_sessions()
+                .map_err(|error| error.to_string())?;
+            let mut sessions = sessions
+                .into_iter()
+                .filter(|item| item.project_id.as_deref() == session.project_id.as_deref())
+                .collect::<Vec<_>>();
+            sessions.sort_by_key(|item| std::cmp::Reverse(item.updated_at));
+            let text = if sessions.is_empty() {
+                "No persisted sessions.".to_owned()
+            } else {
+                sessions
+                    .into_iter()
+                    .take(10)
+                    .map(|item| {
+                        let marker = if item.session_id == session.session_id {
+                            "*"
+                        } else {
+                            " "
+                        };
+                        format!("{marker} {} — {}", item.session_id, item.title)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            emit(
+                app,
+                "notice",
+                Some(&session.session_id),
+                json!({"kind":"session_list","text":text}),
+            );
+        }
+        "/help" => {
+            if !remainder.is_empty() {
+                return Err("/help does not accept arguments".into());
+            }
+            let text = format!(
+                "Actions (execute immediately): {}\nPrompt templates (sent to the model): {}",
+                builtin_control_slash_commands()
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                builtin_slash_commands()
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            emit(
+                app,
+                "notice",
+                Some(&session.session_id),
+                json!({"kind":"slash_help","text":text}),
+            );
+        }
+        _ => unreachable!(),
+    }
+    audit(
+        state,
+        &session.session_id,
+        "control_slash_command",
+        json!({"command": command_name}),
+    );
+    Ok(true)
 }
 
 fn expand_slash_command(
@@ -5044,6 +5277,12 @@ fn expand_slash_command(
         .and_then(Value::as_str)
         .ok_or_else(|| "slash command body is invalid".to_owned())?;
     let remainder = trimmed[command_name.len()..].trim();
+    if builtin_control_slash_commands()
+        .iter()
+        .any(|(builtin, _)| *builtin == command_name)
+    {
+        return Ok(text.to_owned());
+    }
     if command.get("kind").and_then(Value::as_str) == Some("command") {
         let arguments = command
             .get("arguments")
@@ -9885,6 +10124,15 @@ async fn submit_turn(
     mut request: SubmitRequest,
 ) -> Result<(), String> {
     let session = session_for(&state, &request.session_id)?;
+    if execute_control_slash_command(&app, &state, &session, &request.text).await? {
+        emit(
+            &app,
+            "turn_done",
+            Some(&request.session_id),
+            session_status_payload(&state, &request.session_id),
+        );
+        return Ok(());
+    }
     let repo_scope = session
         .project_id
         .as_deref()
@@ -10772,6 +11020,10 @@ async fn change_model(
         .change_model(model.clone())
         .await
         .map_err(engine_error_message)?;
+    state
+        .store
+        .update_session_model(&session_id, &model)
+        .map_err(|error| error.to_string())?;
     emit(
         &app,
         "notice",
@@ -10826,9 +11078,8 @@ struct ProviderModelsResponse {
     cache_hit: bool,
 }
 
-#[tauri::command]
-async fn provider_models(
-    state: State<'_, DesktopState>,
+async fn provider_models_for_state(
+    state: &DesktopState,
     provider: String,
     refresh: Option<bool>,
 ) -> Result<ProviderModelsResponse, String> {
@@ -10972,6 +11223,52 @@ async fn provider_models(
         discovered_at: cached.discovered_at,
         cache_hit: false,
     })
+}
+
+#[tauri::command]
+async fn provider_models(
+    state: State<'_, DesktopState>,
+    provider: String,
+    refresh: Option<bool>,
+) -> Result<ProviderModelsResponse, String> {
+    provider_models_for_state(&state, provider, refresh).await
+}
+
+async fn current_session_provider(
+    state: &DesktopState,
+    session: &SessionRecord,
+) -> Result<String, String> {
+    if let Some(provider) = session.provider.clone() {
+        return Ok(provider);
+    }
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    connection
+        .query_row(
+            "SELECT value FROM settings WHERE key='provider.id'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .or_else(|_| Ok::<String, rusqlite::Error>("openai".into()))
+        .map_err(|error| error.to_string())
+}
+
+async fn validate_session_model(
+    state: &DesktopState,
+    session: &SessionRecord,
+    model: &str,
+) -> Result<(), String> {
+    let provider = current_session_provider(state, session).await?;
+    let discovery = provider_models_for_state(state, provider.clone(), Some(false)).await?;
+    if discovery.models.iter().any(|item| item.id == model) {
+        Ok(())
+    } else {
+        Err(format!(
+            "model {model} is not available for provider {provider}"
+        ))
+    }
 }
 
 #[tauri::command]
@@ -18627,12 +18924,18 @@ fn save_slash_command(
     if !matches!(kind.as_str(), "system" | "custom") {
         return Err("command kind must be system or custom".into());
     }
-    if kind == "system"
-        && !builtin_slash_commands()
+    let is_control = builtin_control_slash_commands()
+        .iter()
+        .any(|(builtin, _)| *builtin == name);
+    let is_builtin = is_control
+        || builtin_slash_commands()
             .iter()
-            .any(|(builtin, _)| *builtin == name)
-    {
+            .any(|(builtin, _)| *builtin == name);
+    if kind == "system" && !is_builtin {
         return Err("only built-in commands can use system kind".into());
+    }
+    if kind == "custom" && is_control {
+        return Err("control commands are reserved for system kind".into());
     }
     let scope = project_id
         .as_deref()
@@ -21042,5 +21345,38 @@ agents:
         ] {
             assert!(commands.iter().any(|item| item["name"] == name));
         }
+    }
+
+    #[test]
+    fn control_slash_commands_are_marked_as_actions_and_do_not_expand() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE slash_commands (
+                    scope TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(scope,name)
+                )",
+                [],
+            )
+            .unwrap();
+        let commands = effective_slash_commands(&connection, None, None).unwrap();
+        let compact = commands
+            .iter()
+            .find(|item| item["name"] == "/compact")
+            .expect("/compact should be available");
+        assert_eq!(compact["execution"], "action");
+        let review = commands
+            .iter()
+            .find(|item| item["name"] == "/review")
+            .expect("/review should be available");
+        assert_eq!(review["execution"], "prompt");
+        assert_eq!(
+            expand_slash_command(&connection, None, None, "/compact").unwrap(),
+            "/compact"
+        );
     }
 }

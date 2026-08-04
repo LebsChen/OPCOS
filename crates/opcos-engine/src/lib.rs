@@ -860,6 +860,11 @@ where
             .await
     }
 
+    pub async fn compact_now(&self) -> Result<(), EngineError> {
+        let messages = self.provider_messages()?;
+        self.compact_context(messages).await.map(|_| ())
+    }
+
     pub fn interrupt(&self) {
         self.interrupted.store(true, Ordering::SeqCst);
         self.interrupt_notify.notify_waiters();

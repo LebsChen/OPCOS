@@ -4337,6 +4337,21 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub fn update_session_model(&self, session_id: &str, model: &str) -> Result<(), StoreError> {
+        let changed = self
+            .connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "UPDATE sessions SET model=?1, updated_at=?2 WHERE session_id=?3",
+                params![model, Utc::now().to_rfc3339(), session_id],
+            )?;
+        if changed == 0 {
+            return Err(StoreError::SessionNotFound(session_id.into()));
+        }
+        Ok(())
+    }
+
     pub fn update_session_harness(
         &self,
         session_id: &str,
