@@ -21118,18 +21118,37 @@ mod m7_tests {
             .into_iter()
             .collect::<HashSet<_>>();
         let catalog = opcos_engine::builtin_tool_names();
-        for name in opcos_assets::BUILTIN_AGENT_TOOL_NAMES {
+        let prompt_mentions = [
+            ("propose_plan", "propose_plan"),
+            ("plan_update", "plan_update"),
+            ("repo_index_find_symbol", "repo_index_*"),
+            ("repo_index_glob", "repo_index_*"),
+            ("repo_index_search", "repo_index_*"),
+            ("lsp_definition", "lsp_*"),
+            ("lsp_references", "lsp_*"),
+            ("lsp_diagnostics", "lsp_*"),
+            ("background_job_start", "background_job_*"),
+            ("background_job_status", "background_job_*"),
+            ("background_job_output", "background_job_*"),
+            ("background_job_kill", "background_job_*"),
+            ("edit_file", "edit_file"),
+            ("action_ledger_begin", "action_ledger_*"),
+            ("action_ledger_finish", "action_ledger_*"),
+            ("action_ledger_list", "action_ledger_*"),
+            ("local_gate_record", "local_gate_record"),
+            ("ask_user", "ask_user"),
+        ];
+        for (name, needle) in prompt_mentions {
             assert!(
-                opcos_assets::BUILTIN_AGENT_INSTRUCTIONS
-                    .contains(name.split('_').next().unwrap_or(name)),
+                opcos_assets::BUILTIN_AGENT_INSTRUCTIONS.contains(needle),
                 "{name} is not represented by the builtin tool guidance"
             );
             assert!(
-                catalog.contains(*name),
+                catalog.contains(name),
                 "{name} is missing from tool catalog"
             );
             assert!(
-                allowed.contains(*name),
+                allowed.contains(name),
                 "{name} is missing from local allowlist"
             );
         }
