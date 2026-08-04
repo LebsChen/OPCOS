@@ -12,6 +12,7 @@ pub use opcos_rvm::{DEFAULT_EXEC_TIMEOUT_SECONDS, LIFECYCLE_EXEC_TIMEOUT_SECONDS
 pub use opcos_rvm::{StorageHash, StorageStat};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -227,12 +228,15 @@ pub struct HostProcessSupervisor {
 }
 
 const JOB_OUTPUT_LIMIT_BYTES: u64 = 32 * 1024 * 1024;
+const JOB_OUTPUT_SEGMENT_BYTES: u64 = 1024 * 1024;
+const JOB_OUTPUT_MAX_SEGMENTS: usize = 32;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BackgroundJobStatus {
     Running,
     Terminating,
+    Orphaned,
     Exited,
     Signaled,
     Killed,
@@ -251,6 +255,10 @@ pub struct BackgroundJobSnapshot {
     pub total_lines: u64,
     pub retained_bytes: u64,
     pub retained_start_line: u64,
+    #[serde(default)]
+    pub omitted_bytes: u64,
+    #[serde(default)]
+    pub command_digest: String,
     #[serde(skip_serializing)]
     pub output_path: String,
 }
@@ -272,6 +280,8 @@ struct BackgroundJobState {
     snapshot: BackgroundJobSnapshot,
     kill: Option<oneshot::Sender<()>>,
     has_partial_line: bool,
+    segment_index: usize,
+    metadata_path: PathBuf,
 }
 
 #[derive(Clone)]
@@ -295,10 +305,12 @@ impl BackgroundJobManager {
         timeout_seconds: Option<u64>,
     ) -> Result<BackgroundJobSnapshot, HostError> {
         self.cleanup_finished(chrono::Duration::hours(1)).await;
-        let process = host.spawn(request).await?;
         let job_id = format!("job-{}", Uuid::new_v4().simple());
+        let command_digest = command_digest(&request.command);
+        let process = host.spawn(request).await?;
         fs::create_dir_all(self.root.as_ref()).await?;
-        let output_path = self.root.join(format!("{job_id}.log"));
+        let output_path = segment_path(self.root.as_ref(), &job_id, 0);
+        let metadata_path = self.root.join(format!("{job_id}.json"));
         let snapshot = BackgroundJobSnapshot {
             job_id: job_id.clone(),
             status: BackgroundJobStatus::Running,
@@ -309,6 +321,8 @@ impl BackgroundJobManager {
             total_lines: 0,
             retained_bytes: 0,
             retained_start_line: 0,
+            omitted_bytes: 0,
+            command_digest,
             output_path: output_path.display().to_string(),
         };
         let (kill, killed) = oneshot::channel();
@@ -316,7 +330,10 @@ impl BackgroundJobManager {
             snapshot: snapshot.clone(),
             kill: Some(kill),
             has_partial_line: false,
+            segment_index: 0,
+            metadata_path: metadata_path.clone(),
         }));
+        persist_job_metadata(&snapshot, &metadata_path).await?;
         self.jobs
             .lock()
             .await
@@ -379,6 +396,9 @@ impl BackgroundJobManager {
                             let _ = error;
                             break;
                         }
+                        let current = state.lock().await;
+                        let _ =
+                            persist_job_metadata(&current.snapshot, &current.metadata_path).await;
                     }
                     Ok(Some(ProcessEvent::Exited(code))) => {
                         terminal_status = Some(if code.is_some() {
@@ -408,6 +428,7 @@ impl BackgroundJobManager {
                 current.snapshot.status = terminal_status.unwrap_or(BackgroundJobStatus::Failed);
                 current.snapshot.finished_at = Some(Utc::now());
             }
+            let _ = persist_job_metadata(&current.snapshot, &current.metadata_path).await;
             drop(current);
         });
         Ok(snapshot)
@@ -434,8 +455,15 @@ impl BackgroundJobManager {
             }
             expired
         };
-        for (_, path) in expired {
-            let _ = fs::remove_file(path).await;
+        for (job_id, path) in expired {
+            let root = PathBuf::from(path)
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.root.as_ref().clone());
+            for segment in 0..=JOB_OUTPUT_MAX_SEGMENTS {
+                let _ = fs::remove_file(segment_path(&root, &job_id, segment)).await;
+            }
+            let _ = fs::remove_file(self.root.join(format!("{job_id}.json"))).await;
         }
     }
 
@@ -457,7 +485,19 @@ impl BackgroundJobManager {
             HostError::InvalidResponse(format!("background job not found: {job_id}"))
         })?;
         let snapshot = state.lock().await.snapshot.clone();
-        let bytes = fs::read(&snapshot.output_path).await.unwrap_or_default();
+        let root = PathBuf::from(&snapshot.output_path)
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| HostError::Path("job output has no parent".into()))?;
+        let mut bytes = Vec::new();
+        for segment in 0..=JOB_OUTPUT_MAX_SEGMENTS {
+            let path = segment_path(&root, job_id, segment);
+            match fs::read(path).await {
+                Ok(mut segment) => bytes.append(&mut segment),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(HostError::Io(error)),
+            }
+        }
         let text = String::from_utf8_lossy(&bytes);
         let lines = text.lines().collect::<Vec<_>>();
         let total_lines = snapshot.total_lines;
@@ -510,41 +550,94 @@ impl BackgroundJobManager {
 
 async fn append_job_output(
     state: &Arc<Mutex<BackgroundJobState>>,
-    path: &Path,
+    _path: &Path,
     output: &str,
 ) -> Result<(), HostError> {
+    let mut current = state.lock().await;
+    let active_path = PathBuf::from(&current.snapshot.output_path);
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
+        .open(&active_path)
         .await?;
     file.write_all(output.as_bytes()).await?;
     file.flush().await?;
-    let mut current = state.lock().await;
     current.snapshot.total_bytes += output.len() as u64;
     let newline_count = output.bytes().filter(|byte| *byte == b'\n').count() as u64;
     current.snapshot.total_lines += newline_count
         + u64::from(!output.is_empty() && !output.ends_with('\n') && !current.has_partial_line);
     current.has_partial_line = !output.is_empty() && !output.ends_with('\n');
     current.snapshot.retained_bytes += output.len() as u64;
-    if current.snapshot.retained_bytes > JOB_OUTPUT_LIMIT_BYTES {
-        let keep_from = current.snapshot.retained_bytes - JOB_OUTPUT_LIMIT_BYTES;
-        let mut retained = fs::read(path).await?;
-        let requested = keep_from.min(retained.len() as u64) as usize;
-        let cut = retained
-            .iter()
-            .enumerate()
-            .skip(requested)
-            .find_map(|(index, byte)| (*byte == b'\n').then_some(index + 1))
-            .unwrap_or(requested);
-        retained.drain(..cut);
-        let retained_lines = count_output_lines(&String::from_utf8_lossy(&retained));
-        let retained_bytes = retained.len() as u64;
-        fs::write(path, retained).await?;
-        current.snapshot.retained_start_line =
-            current.snapshot.total_lines.saturating_sub(retained_lines);
-        current.snapshot.retained_bytes = retained_bytes;
+
+    let segment_size = file.metadata().await?.len();
+    if segment_size >= JOB_OUTPUT_SEGMENT_BYTES {
+        current.segment_index += 1;
+        current.snapshot.output_path = segment_path(
+            active_path
+                .parent()
+                .ok_or_else(|| HostError::Path("job output has no parent".into()))?,
+            &current.snapshot.job_id,
+            current.segment_index,
+        )
+        .display()
+        .to_string();
     }
+
+    while current.segment_index >= JOB_OUTPUT_MAX_SEGMENTS {
+        let oldest_index = current.segment_index + 1 - JOB_OUTPUT_MAX_SEGMENTS;
+        let oldest = segment_path(
+            active_path
+                .parent()
+                .ok_or_else(|| HostError::Path("job output has no parent".into()))?,
+            &current.snapshot.job_id,
+            oldest_index,
+        );
+        let bytes = fs::read(&oldest).await.unwrap_or_default();
+        if bytes.is_empty() {
+            break;
+        }
+        current.snapshot.omitted_bytes += bytes.len() as u64;
+        current.snapshot.retained_bytes = current
+            .snapshot
+            .retained_bytes
+            .saturating_sub(bytes.len() as u64);
+        current.snapshot.retained_start_line +=
+            count_output_lines(&String::from_utf8_lossy(&bytes));
+        fs::remove_file(oldest).await?;
+        if current.snapshot.retained_bytes <= JOB_OUTPUT_LIMIT_BYTES {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn command_digest(command: &str) -> String {
+    let digest = Sha256::digest(command.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn segment_path(root: &Path, job_id: &str, segment: usize) -> PathBuf {
+    root.join(format!("{job_id}-{segment:06}.log"))
+}
+
+async fn persist_job_metadata(
+    snapshot: &BackgroundJobSnapshot,
+    path: &Path,
+) -> Result<(), HostError> {
+    #[derive(Serialize)]
+    struct DurableMetadata<'a> {
+        snapshot: &'a BackgroundJobSnapshot,
+        output_path: &'a str,
+    }
+    let temporary = path.with_extension("json.tmp");
+    let metadata = DurableMetadata {
+        snapshot,
+        output_path: &snapshot.output_path,
+    };
+    let contents = serde_json::to_vec_pretty(&metadata)
+        .map_err(|error| HostError::InvalidResponse(error.to_string()))?;
+    fs::write(&temporary, contents).await?;
+    fs::rename(temporary, path).await?;
     Ok(())
 }
 
@@ -2448,6 +2541,18 @@ mod tests {
         assert!(command.contains("(OPCOS_SECRET='value'; export OPCOS_SECRET; eval"));
         #[cfg(windows)]
         assert!(command.contains("setlocal") && command.contains("endlocal"));
+    }
+
+    #[test]
+    fn background_job_command_digest_uses_raw_command() {
+        assert_eq!(
+            command_digest("echo secret-value"),
+            "f00df542bf54ea2c566400bf622655874401e75762429a4e78fa8a3ba3230362"
+        );
+        assert_ne!(
+            command_digest("echo secret-value"),
+            command_digest("echo redacted")
+        );
     }
 
     #[test]
