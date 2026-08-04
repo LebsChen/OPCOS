@@ -213,11 +213,14 @@ async fn poll_github(
         .get("connector-token:github")
         .map_err(|error| error.to_string())?
         .ok_or("GitHub connector credential is not configured")?;
+    let api_base = source
+        .config
+        .get("api_base")
+        .and_then(Value::as_str)
+        .unwrap_or("https://api.github.com");
     let since = source.cursor.as_deref().unwrap_or("");
     let response = client
-        .get(format!(
-            "https://api.github.com/repos/{repo}/events?per_page=100"
-        ))
+        .get(format!("{api_base}/repos/{repo}/events?per_page=100"))
         .bearer_auth(&token)
         .header("Accept", "application/vnd.github+json")
         .send()
@@ -515,5 +518,62 @@ mod tests {
         assert_eq!(source.consecutive_failures, 5);
         assert!(source.circuit_open_until.is_some());
         assert!(source.last_error.unwrap_or_default().contains("[redacted]"));
+    }
+
+    #[tokio::test]
+    async fn github_events_poll_through_a_mock_api_and_use_secret_store_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for sequence in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 2048];
+                let size = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..size]);
+                assert!(request.contains("authorization: Bearer test-token"));
+                let id = if sequence == 0 { "100" } else { "101" };
+                let body = format!(
+                    r#"[{{"id":"{id}","type":"PullRequestEvent","payload":{{"action":"opened","pull_request":{{"title":"PR","html_url":"https://github.test/pr/1"}}}}}}]"#
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .save_external_ingress_source(
+                "github:test",
+                "github",
+                &json!({
+                    "repo":"owner/repo",
+                    "api_base":format!("http://{address}")
+                }),
+            )
+            .unwrap();
+        store
+            .set_external_ingress_enabled("github:test", true)
+            .unwrap();
+        let secret_path =
+            std::env::temp_dir().join(format!("opcos-github-{}", uuid::Uuid::new_v4()));
+        let secrets = KeyringSecretStore::with_fallback("opcos-test", &secret_path);
+        secrets.set("connector-token:github", "test-token").unwrap();
+        poll_once(&store, &secrets, "github:test").await.unwrap();
+        assert!(
+            store
+                .load_events_after("github-test", 10)
+                .unwrap()
+                .is_empty()
+        );
+        poll_once(&store, &secrets, "github:test").await.unwrap();
+        let events = store.load_events_after("github-test", 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "external.github.pull_request.opened");
+        server.join().unwrap();
+        let _ = std::fs::remove_file(secret_path);
     }
 }
