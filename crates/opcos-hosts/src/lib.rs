@@ -230,6 +230,57 @@ pub struct HostProcessSupervisor {
 const JOB_OUTPUT_LIMIT_BYTES: u64 = 32 * 1024 * 1024;
 const JOB_OUTPUT_SEGMENT_BYTES: u64 = 1024 * 1024;
 const JOB_OUTPUT_MAX_SEGMENTS: usize = 32;
+pub const BACKGROUND_WRAPPER_VERSION: &str = "powershell-segmented-v1";
+
+pub fn background_job_wrapper_script() -> &'static str {
+    r#"param([string]$Root)
+$ErrorActionPreference = 'Stop'
+$commandPath = Join-Path $Root 'command.txt'
+$statusPath = Join-Path $Root 'status.json'
+$command = Get-Content -Raw $commandPath
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = 'powershell.exe'
+$psi.Arguments = "-NoProfile -NonInteractive -Command $command"
+$psi.UseShellExecute = $false
+$psi.CreateNoWindow = $true
+$psi.RedirectStandardOutput = $true
+$psi.RedirectStandardError = $true
+$child = New-Object System.Diagnostics.Process
+$child.StartInfo = $psi
+$child.Start() | Out-Null
+[void]$child.BeginOutputReadLine()
+[void]$child.BeginErrorReadLine()
+$state = [hashtable]::Synchronized(@{ stdout = 0; stderr = 0 })
+$append = {
+  param($stream, $text)
+  if ([string]::IsNullOrEmpty($text)) { return }
+  $index = [int]$state[$stream]
+  $path = Join-Path $Root ("{0}-{1:D6}.log" -f $stream, $index)
+  Add-Content -LiteralPath $path -Value $text -Encoding utf8
+  if ((Get-Item -LiteralPath $path).Length -ge 1048576) {
+    $state[$stream] = $index + 1
+    $oldest = $index - 31
+    if ($oldest -ge 0) {
+      Remove-Item -LiteralPath (Join-Path $Root ("{0}-{1:D6}.log" -f $stream, $oldest)) -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
+$stdoutEvent = Register-ObjectEvent -InputObject $child -EventName OutputDataReceived -Action {
+  & $using:append 'stdout' $EventArgs.Data
+}
+$stderrEvent = Register-ObjectEvent -InputObject $child -EventName ErrorDataReceived -Action {
+  & $using:append 'stderr' $EventArgs.Data
+}
+[pscustomobject]@{ state = 'running'; wrapper_pid = $PID; child_pid = $child.Id } |
+  ConvertTo-Json -Compress | Set-Content -Encoding utf8 $statusPath
+$child.WaitForExit()
+[void]$child.WaitForExit()
+Unregister-Event -SourceIdentifier $stdoutEvent.Name -ErrorAction SilentlyContinue
+Unregister-Event -SourceIdentifier $stderrEvent.Name -ErrorAction SilentlyContinue
+[pscustomobject]@{ state = 'exited'; wrapper_pid = $PID; child_pid = $child.Id; exit_code = $child.ExitCode } |
+  ConvertTo-Json -Compress | Set-Content -Encoding utf8 $statusPath
+"#
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -274,6 +325,8 @@ pub struct BackgroundJobOutput {
     pub omitted_before: u64,
     pub omitted_after: u64,
     pub truncated: bool,
+    #[serde(default)]
+    pub stderr_is_powershell_serialized: bool,
 }
 
 struct BackgroundJobState {
@@ -519,6 +572,7 @@ impl BackgroundJobManager {
             omitted_before: snapshot.retained_start_line + start,
             omitted_after: total_lines.saturating_sub(snapshot.retained_start_line + end),
             truncated: start > 0 || end < lines.len() as u64 || snapshot.retained_start_line > 0,
+            stderr_is_powershell_serialized: false,
         })
     }
 
@@ -2553,6 +2607,18 @@ mod tests {
             command_digest("echo secret-value"),
             command_digest("echo redacted")
         );
+    }
+
+    #[test]
+    fn background_wrapper_is_command_free_and_drains_both_streams() {
+        let wrapper = background_job_wrapper_script();
+        assert!(wrapper.contains("RedirectStandardOutput"));
+        assert!(wrapper.contains("RedirectStandardError"));
+        assert!(wrapper.contains("BeginOutputReadLine"));
+        assert!(wrapper.contains("BeginErrorReadLine"));
+        assert!(wrapper.contains("command.txt"));
+        assert!(!wrapper.contains("secret-value"));
+        assert!(!wrapper.contains("Authorization"));
     }
 
     #[test]
