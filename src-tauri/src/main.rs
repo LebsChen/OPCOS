@@ -23,7 +23,8 @@ use opcos_assets::{
 };
 use opcos_engine::{
     AcpHarness, AcpHarnessConfig, AgentEngine, EngineError, Harness, OpenCodeHarness,
-    OpenCodeHarnessConfig, SessionRecorder, ToolExecutor, TurnEngine,
+    OpenCodeHarnessConfig, PreflightDecision, SessionRecorder, ToolExecutor, ToolOrigin,
+    TurnEngine,
     computer_use::{
         BestEffortScreenshotChangedVerifier, ComputerUseLoopConfig, ComputerUseStep,
         run_computer_use_loop,
@@ -257,12 +258,12 @@ fn forbidden_diff_reasons(paths: &[String], diff: &str) -> Vec<String> {
     reasons
 }
 
-async fn validate_push_diff(
+async fn inspect_push_diff(
     host: &dyn Host,
     platform: Option<&str>,
     cwd: &str,
     default_branch: &str,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     if !valid_git_branch(default_branch) {
         return Err("project default branch is invalid".into());
     }
@@ -301,14 +302,7 @@ async fn validate_push_diff(
         .map(str::to_owned)
         .collect::<Vec<_>>();
     let reasons = forbidden_diff_reasons(&paths, &diff.result.stdout);
-    if reasons.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "push stopped: diff enters protected repair boundary ({})",
-            reasons.join("; ")
-        ))
-    }
+    Ok(reasons)
 }
 
 fn git_push_policy_target(
@@ -863,10 +857,12 @@ async fn execute_git_write(
         if !valid_git_branch(branch) {
             return Err("git_push branch is not a valid Git ref".into());
         }
-        let project = project_id
+        if project_id
             .and_then(|id| store.load_project(id).ok().flatten())
-            .ok_or("git_push requires a bound project")?;
-        validate_push_diff(host, platform, &cwd, &project.default_branch).await?;
+            .is_none()
+        {
+            return Err("git_push requires a bound project".into());
+        }
     }
     if name == "git_push" {
         validate_git_remote_name(remote_name)?;
@@ -1074,6 +1070,74 @@ async fn execute_git_write(
         }
     }
     Ok(output)
+}
+
+async fn preflight_git_push(
+    host: &dyn Host,
+    platform: Option<&str>,
+    store: &SqliteStore,
+    project_id: Option<&str>,
+    arguments: &Value,
+    origin: ToolOrigin,
+) -> Result<PreflightDecision, String> {
+    let cwd = arguments
+        .get("cwd")
+        .and_then(Value::as_str)
+        .ok_or("git_push requires cwd")?;
+    let Some(project_id) = project_id else {
+        return Ok(match origin {
+            ToolOrigin::User => PreflightDecision::NeedsUser(
+                "push diff inspection unavailable: no bound project".into(),
+            ),
+            ToolOrigin::RepairLoop => PreflightDecision::Deny(
+                "repair-loop push denied: no bound project for diff inspection".into(),
+            ),
+        });
+    };
+    let Some(project) = store
+        .load_project(project_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(match origin {
+            ToolOrigin::User => PreflightDecision::NeedsUser(
+                "push diff inspection unavailable: bound project could not be loaded".into(),
+            ),
+            ToolOrigin::RepairLoop => PreflightDecision::Deny(
+                "repair-loop push denied: bound project could not be loaded".into(),
+            ),
+        });
+    };
+    Ok(push_diff_preflight(
+        origin,
+        inspect_push_diff(host, platform, cwd, &project.default_branch).await,
+    ))
+}
+
+fn push_diff_preflight(
+    origin: ToolOrigin,
+    inspection: Result<Vec<String>, String>,
+) -> PreflightDecision {
+    match inspection {
+        Err(error) => match origin {
+            ToolOrigin::User => {
+                PreflightDecision::NeedsUser(format!("push requires approval: {error}"))
+            }
+            ToolOrigin::RepairLoop => {
+                PreflightDecision::Deny(format!("repair-loop push denied: {error}"))
+            }
+        },
+        Ok(reasons) if reasons.is_empty() => PreflightDecision::Allow,
+        Ok(reasons) => match origin {
+            ToolOrigin::User => PreflightDecision::NeedsUser(format!(
+                "push requires approval: diff enters protected repair boundary ({})",
+                reasons.join("; ")
+            )),
+            ToolOrigin::RepairLoop => PreflightDecision::Deny(format!(
+                "repair-loop push denied: diff enters protected repair boundary ({})",
+                reasons.join("; ")
+            )),
+        },
+    }
 }
 
 async fn execute_local_git_read(
@@ -3898,6 +3962,47 @@ impl ToolExecutor for DesktopExecutor {
                         .map_err(|error| error.to_string()),
                     _ => Err(format!("local tool is unavailable: {name}")),
                 }
+            }
+        }
+    }
+
+    async fn preflight(&self, name: &str, arguments: &Value) -> Result<PreflightDecision, String> {
+        if name != "git_push" {
+            return Ok(PreflightDecision::Allow);
+        }
+        match self {
+            Self::Remote(executor) => {
+                let host = RvmHost::new(
+                    executor.host_id.clone(),
+                    executor.workspace.clone(),
+                    executor.client.clone(),
+                );
+                let platform = executor
+                    .client
+                    .health()
+                    .await
+                    .ok()
+                    .and_then(|health| health.platform);
+                preflight_git_push(
+                    &host,
+                    platform.as_deref(),
+                    &executor.store,
+                    executor.project_id.as_deref(),
+                    arguments,
+                    self.tool_origin(),
+                )
+                .await
+            }
+            Self::Local(executor) => {
+                preflight_git_push(
+                    &executor.host,
+                    None,
+                    &executor.store,
+                    executor.project_id.as_deref(),
+                    arguments,
+                    self.tool_origin(),
+                )
+                .await
             }
         }
     }
@@ -20582,6 +20687,47 @@ mod m7_tests {
     fn forbidden_diff_reasons_allow_normal_source_changes() {
         let paths = vec!["src/main.rs".into()];
         assert!(forbidden_diff_reasons(&paths, "+fn repair() {}\n").is_empty());
+    }
+
+    #[test]
+    fn user_pushes_with_protected_changes_are_escalated_not_blocked() {
+        let decision = push_diff_preflight(
+            ToolOrigin::User,
+            Ok(vec![
+                "test/unit_test.rs".into(),
+                ".github/workflows/ci.yml".into(),
+            ]),
+        );
+        assert!(
+            matches!(decision, PreflightDecision::NeedsUser(reason) if reason.contains("test/unit_test.rs"))
+        );
+    }
+
+    #[test]
+    fn user_push_with_unavailable_diff_baseline_is_escalated() {
+        let decision = push_diff_preflight(
+            ToolOrigin::User,
+            Err("unable to establish push diff against the project default branch".into()),
+        );
+        assert!(
+            matches!(decision, PreflightDecision::NeedsUser(reason) if reason.contains("establish"))
+        );
+    }
+
+    #[test]
+    fn repair_loop_pushes_with_protected_changes_are_denied() {
+        let decision = push_diff_preflight(ToolOrigin::RepairLoop, Ok(vec!["tests/ci.rs".into()]));
+        assert!(
+            matches!(decision, PreflightDecision::Deny(reason) if reason.contains("repair-loop"))
+        );
+    }
+
+    #[test]
+    fn clean_user_pushes_are_allowed_without_extra_approval() {
+        assert_eq!(
+            push_diff_preflight(ToolOrigin::User, Ok(Vec::new())),
+            PreflightDecision::Allow
+        );
     }
 
     #[test]

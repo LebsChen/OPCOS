@@ -38,6 +38,8 @@ pub enum EngineError {
     Provider(#[from] ProviderError),
     #[error("store: {0}")]
     Store(String),
+    #[error("tool preflight: {0}")]
+    Tool(String),
     #[error("context exhausted: {0}")]
     ContextExhausted(String),
     #[error("engine interrupted")]
@@ -56,10 +58,32 @@ pub enum EngineError {
 pub trait ToolExecutor: Send + Sync {
     async fn execute(&self, name: &str, arguments: Value) -> Result<Value, String>;
 
+    async fn preflight(&self, name: &str, arguments: &Value) -> Result<PreflightDecision, String> {
+        let _ = (name, arguments);
+        Ok(PreflightDecision::Allow)
+    }
+
+    fn tool_origin(&self) -> ToolOrigin {
+        ToolOrigin::User
+    }
+
     fn policy_target(&self, name: &str, arguments: &Value) -> String {
         let _ = arguments;
         name.to_owned()
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolOrigin {
+    User,
+    RepairLoop,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PreflightDecision {
+    Allow,
+    NeedsUser(String),
+    Deny(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -645,6 +669,7 @@ where
             Err(EngineError::Provider(_)) => ("error", "provider_error"),
             Err(EngineError::ContextExhausted(_)) => ("error", "context_exhausted"),
             Err(EngineError::Store(_)) => ("error", "internal_error"),
+            Err(EngineError::Tool(_)) => ("error", "tool_preflight_error"),
             Err(EngineError::MaxIterations) => ("error", "max_iterations"),
             Err(EngineError::MessageUsageLimitReached) => ("error", "usage_limit"),
             Err(EngineError::ApprovalAlreadyProcessed(_)) => ("idle", "waiting_for_approval"),
@@ -1231,7 +1256,34 @@ where
             let risk = tool_risk(&call.name);
             let mode = *self.mode.lock().await;
             let target = self.executor.policy_target(&call.name, &call.arguments);
-            match decide(mode, risk, unattended, &grants, &target) {
+            let preflight = self
+                .executor
+                .preflight(&call.name, &call.arguments)
+                .await
+                .map_err(EngineError::Tool)?;
+            let mut preflight_reason = None;
+            let decision = match preflight {
+                PreflightDecision::Allow => decide(mode, risk, unattended, &grants, &target),
+                PreflightDecision::NeedsUser(reason) if unattended => {
+                    preflight_reason = Some(reason);
+                    Decision::Deny
+                }
+                PreflightDecision::NeedsUser(reason) => {
+                    preflight_reason = Some(reason);
+                    Decision::NeedsUser
+                }
+                PreflightDecision::Deny(reason) => {
+                    preflight_reason = Some(reason);
+                    Decision::Deny
+                }
+            };
+            if matches!(decision, Decision::Deny) && preflight_reason.is_some() {
+                results[index] = Some(json!({
+                    "error": preflight_reason.as_deref().unwrap_or("tool call denied by preflight")
+                }));
+                continue;
+            };
+            match decision {
                 Decision::Allow
                     if matches!(risk, ToolRisk::Read | ToolRisk::Search | ToolRisk::GitRead) =>
                 {
@@ -1281,7 +1333,10 @@ where
                         call_id: call.id.clone(),
                         tool: call.name.clone(),
                         arguments: call.arguments.clone(),
-                        state: "pending".into(),
+                        state: preflight_reason
+                            .as_deref()
+                            .map(|reason| format!("pending_approval: {reason}"))
+                            .unwrap_or_else(|| "pending".into()),
                     })?;
                     return Err(EngineError::ApprovalPending(call.id.clone()));
                 }
