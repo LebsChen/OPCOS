@@ -140,6 +140,46 @@ pub fn builtin_mcp_catalog() -> Result<Vec<McpCatalogEntry>, AssetError> {
                 entry.slug
             )));
         }
+        match entry.transport.as_str() {
+            "streamable-http" => {
+                if entry.command.is_some()
+                    || !entry
+                        .url
+                        .as_deref()
+                        .is_some_and(|url| url.starts_with("https://"))
+                {
+                    return Err(AssetError::Invalid(format!(
+                        "HTTP MCP catalog entry has invalid connection fields: {}",
+                        entry.slug
+                    )));
+                }
+            }
+            "stdio" => {
+                if entry.url.is_some()
+                    || !entry
+                        .command
+                        .as_deref()
+                        .is_some_and(|command| !command.trim().is_empty())
+                {
+                    return Err(AssetError::Invalid(format!(
+                        "stdio MCP catalog entry has invalid connection fields: {}",
+                        entry.slug
+                    )));
+                }
+            }
+            _ => {
+                return Err(AssetError::Invalid(format!(
+                    "MCP catalog entry has unsupported transport: {}",
+                    entry.slug
+                )));
+            }
+        }
+        if !matches!(entry.auth.as_str(), "oauth" | "api_key" | "none") {
+            return Err(AssetError::Invalid(format!(
+                "MCP catalog entry has unsupported auth: {}",
+                entry.slug
+            )));
+        }
     }
     Ok(entries)
 }
