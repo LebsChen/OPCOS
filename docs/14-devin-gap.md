@@ -124,6 +124,13 @@ Builtin engine 现在会把 working 过程作为结构化事件同时写入本�
   `simple_activity_update` 沿用已有 thinking/notice 表面。
 - `plan_update` / `plan_revise` 完成后发 `todo_update`，payload 是完整本地
   plan snapshot；pending question resolution 后发 `user_question_answered`。
+- 本地资产注入保留 `note_used`，并额外为 rules/active skills 发
+  `rules_injected` / `skill_activated`；不复制资产正文。
+- compaction 完成后发本地 `session_snapshot`，正常 turn 收束发
+  `iteration_checkpoint`，pending/restart recovery 发 `resuming_session`。
+- 对照完整 Devin stream，`terminal_update` payload 使用 `contents` 而非
+  `chunk`；OPCOS 保留 `call_id` 作为本地工具关联键，当前没有通用真实
+  `shell_id` 或 gzip transport，因此不伪造这两个字段。
 
 真实 Devin 事件样本的字段形状已依据
 `/home/ubuntu/devin_session_events_full.txt` 核对，覆盖 status、shell、file、
@@ -142,5 +149,8 @@ TypeScript、production build 和 format check 已通过。
   没有改变 RVM host。
 - Devin 的 `one_line_thoughts` 尚未单独生成；当前仅提供聚合的
   `devin_thoughts`。
+- Devin 的 `computer_use`、subagent、test-mode、recording、sidekick、
+  suspend/resume 控制面事件没有对应 OPCOS 子系统；除本地恢复生命周期
+  `resuming_session` 外暂不伪造。
 - PR 事件（`pr_created`、`pr_comment`、`pr_merge_conflict`）尚未增加专用
   集成事件；现有 git/PR 工具仍通过工具生命周期事件记录。

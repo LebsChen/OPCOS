@@ -22,6 +22,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc, oneshot};
+use uuid::Uuid;
 
 mod acp;
 pub mod computer_use;
@@ -829,6 +830,13 @@ where
     pub async fn resume_pending_turn(&self) -> Result<Option<AssistantTurn>, EngineError> {
         self.set_session_status("running", "none");
         self.policy_denied.store(false, Ordering::SeqCst);
+        let _ = self
+            .working_event(
+                "resuming_session",
+                "lifecycle",
+                json!({"resume_reason":"pending_recovery"}),
+            )
+            .await;
         let result = self.resume_pending_turn_inner().await;
         self.finish_turn(&result);
         result
@@ -1421,6 +1429,16 @@ where
                     let assistant_sequence = *self.sequence.lock().await;
                     messages.push(assistant);
                     if turn.tool_calls.is_empty() {
+                        let _ = self
+                            .working_event(
+                                "iteration_checkpoint",
+                                "lifecycle",
+                                json!({
+                                    "iteration":iteration + 1,
+                                    "num_tool_calls":turn.tool_calls.len(),
+                                }),
+                            )
+                            .await;
                         let stop = self
                             .lifecycle_hooks(
                                 "Stop",
@@ -1812,7 +1830,7 @@ where
                 let _ = engine.record_working_event(
                     "terminal_update",
                     "shell",
-                    json!({"call_id":call_id,"chunk":chunk}),
+                    json!({"call_id":call_id,"contents":chunk}),
                 );
             }
         };
@@ -2029,6 +2047,7 @@ where
             }));
         }
         valid.insert(0, system_message(&system_sections));
+        let summary_chars = summary_text.chars().count();
         self.store
             .save_compaction(&CompactionRecord {
                 session_id: self.session_id.clone(),
@@ -2036,6 +2055,17 @@ where
                 retained_from: retained.len() as i64,
             })
             .map_err(|error| EngineError::Store(error.to_string()))?;
+        let _ = self
+            .working_event(
+                "session_snapshot",
+                "lifecycle",
+                json!({
+                    "compaction_id":Uuid::new_v4().to_string(),
+                    "summary_chars":summary_chars,
+                    "retained_messages":retained.len(),
+                }),
+            )
+            .await;
         if let Some(reason) = summary_issue {
             self.notice(
                 "compaction_summary_invalid",

@@ -397,6 +397,8 @@ async fn run_fake() -> Result<(), Box<dyn std::error::Error>> {
         .resolve_pending_input("ask-1", json!("ambiguous fixed"))
         .await?;
     assert_eq!(turn.text.as_deref(), Some("verification complete"));
+    engine.resume_pending_turn().await?;
+    engine.compact_now().await?;
     assert_eq!(fs::read_to_string(root.join("bug.txt"))?, "return 3;\n");
     assert!(
         executor
@@ -445,6 +447,9 @@ async fn run_fake() -> Result<(), Box<dyn std::error::Error>> {
         "run_shell_completed",
         "user_question_answered",
         "todo_update",
+        "iteration_checkpoint",
+        "session_snapshot",
+        "resuming_session",
         "git_status_started",
         "git_status_completed",
         "list_dir_started",

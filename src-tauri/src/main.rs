@@ -9595,6 +9595,38 @@ async fn engine_for_with_context(
             json!({"working_event":working_event}),
         );
     }
+    for rule in &bundle.agents {
+        let working_event = json!({
+            "event_type":"rules_injected",
+            "category":"other",
+            "direction":"outgoing",
+            "timestamp":Utc::now().to_rfc3339(),
+            "payload":{"path":rule.path},
+        });
+        audit(state, session_id, "working_event", working_event.clone());
+        emit(
+            app,
+            "stream",
+            Some(session_id),
+            json!({"working_event":working_event}),
+        );
+    }
+    for skill in bundle.skills.iter().filter(|skill| skill.active) {
+        let working_event = json!({
+            "event_type":"skill_activated",
+            "category":"other",
+            "direction":"outgoing",
+            "timestamp":Utc::now().to_rfc3339(),
+            "payload":{"name":skill.name,"path":skill.path},
+        });
+        audit(state, session_id, "working_event", working_event.clone());
+        emit(
+            app,
+            "stream",
+            Some(session_id),
+            json!({"working_event":working_event}),
+        );
+    }
     engine
         .set_permission_rules(bundle.permissions.as_ref().map(|rules| {
             opcos_policy::PermissionRules {
