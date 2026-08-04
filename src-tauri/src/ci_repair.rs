@@ -1,4 +1,5 @@
 use chrono::{DateTime, Duration, Utc};
+use opcos_engine::github::GitHubInstance;
 use opcos_store::{CiMonitor, CiMonitorState, KeyringSecretStore, SecretStore, SqliteStore};
 use reqwest::Client;
 use serde_json::{Value, json};
@@ -255,9 +256,19 @@ pub async fn poll_once(
     secrets: &KeyringSecretStore,
     monitor_id: &str,
 ) -> Result<Value, String> {
-    poll_once_with_base(client, store, secrets, monitor_id, "https://api.github.com").await
+    // The monitored repository decides the GitHub deployment; there is no
+    // implicit github.com fallback for an Enterprise-bound project.
+    let monitor = store
+        .load_ci_monitor(monitor_id)
+        .map_err(|error| error.to_string())?
+        .ok_or("CI monitor not found")?;
+    let instance = monitor_github_instance(store, &monitor.project_id)?;
+    let api_base = instance.api_base().to_owned();
+    poll_once_with_instance(client, store, secrets, monitor_id, &instance, &api_base).await
 }
 
+/// Test seam: poll a fixture API as if it were github.com.
+#[cfg(test)]
 pub async fn poll_once_with_base(
     client: &Client,
     store: &SqliteStore,
@@ -265,11 +276,46 @@ pub async fn poll_once_with_base(
     monitor_id: &str,
     api_base: &str,
 ) -> Result<Value, String> {
+    poll_once_with_instance(
+        client,
+        store,
+        secrets,
+        monitor_id,
+        &GitHubInstance::dotcom(),
+        api_base,
+    )
+    .await
+}
+
+fn monitor_github_instance(
+    store: &SqliteStore,
+    project_id: &str,
+) -> Result<GitHubInstance, String> {
+    let project = store
+        .load_project(project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or("CI monitor project not found")?;
+    let records = store
+        .list_github_instances()
+        .map_err(|error| error.to_string())?;
+    let instances = opcos_engine::github::instances_from_records(&records)?;
+    opcos_engine::github::resolve_repo_url(&project.repo_url, &instances)
+        .map(|target| target.instance)
+}
+
+async fn poll_once_with_instance(
+    client: &Client,
+    store: &SqliteStore,
+    secrets: &KeyringSecretStore,
+    monitor_id: &str,
+    instance: &GitHubInstance,
+    api_base: &str,
+) -> Result<Value, String> {
     let monitor = store
         .load_ci_monitor(monitor_id)
         .map_err(|error| error.to_string())?
         .ok_or("CI monitor not found")?;
-    let token = project_token(secrets, &monitor.project_id)?;
+    let token = project_token(secrets, &monitor.project_id, instance)?;
     let pull = github_json(
         client,
         &token,
@@ -468,13 +514,28 @@ pub async fn poll_once_with_base(
     }))
 }
 
-fn project_token(secrets: &KeyringSecretStore, project_id: &str) -> Result<String, String> {
-    let project_key = format!("project:{project_id}/connector-token:github");
+fn project_token(
+    secrets: &KeyringSecretStore,
+    project_id: &str,
+    instance: &GitHubInstance,
+) -> Result<String, String> {
+    let secret_name = instance.connector_secret_name();
+    let project_key = format!("project:{project_id}/connector-token:{secret_name}");
     secrets
         .get(&project_key)
         .map_err(|error| error.to_string())?
-        .or_else(|| secrets.get("connector-token:github").ok().flatten())
-        .ok_or("GitHub connector credential is not configured".into())
+        .or_else(|| {
+            secrets
+                .get(&format!("connector-token:{secret_name}"))
+                .ok()
+                .flatten()
+        })
+        .ok_or_else(|| {
+            format!(
+                "GitHub connector credential for {} is not configured",
+                instance.host()
+            )
+        })
 }
 
 async fn github_json(client: &Client, token: &str, url: &str) -> Result<Value, String> {
@@ -768,6 +829,45 @@ mod tests {
                 Some(expected)
             );
         }
+    }
+
+    #[test]
+    fn ci_monitors_resolve_the_bound_github_instance() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .save_github_instance("ghe.example.com", "https://ghe.example.com/api/v3", None)
+            .unwrap();
+        for (id, repo_url) in [
+            ("project-dotcom", "https://github.com/acme/app.git"),
+            ("project-ghes", "https://ghe.example.com/acme/app.git"),
+            ("project-unknown", "https://ghe.unknown.test/acme/app.git"),
+        ] {
+            store
+                .save_project(&opcos_store::ProjectRecord {
+                    id: id.into(),
+                    name: id.into(),
+                    host_id: "local".into(),
+                    repo_url: repo_url.into(),
+                    repo_root: "/workspace".into(),
+                    default_branch: "main".into(),
+                    workflow_json: "{}".into(),
+                    board_id: id.into(),
+                    archived: false,
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            monitor_github_instance(&store, "project-dotcom")
+                .unwrap()
+                .api_base(),
+            "https://api.github.com"
+        );
+        let enterprise = monitor_github_instance(&store, "project-ghes").unwrap();
+        assert_eq!(enterprise.api_base(), "https://ghe.example.com/api/v3");
+        assert_eq!(enterprise.connector_secret_name(), "github@ghe.example.com");
+        assert!(monitor_github_instance(&store, "project-unknown").is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

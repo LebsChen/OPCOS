@@ -30,6 +30,7 @@ use opcos_engine::{
         run_computer_use_loop,
     },
     event_bus::{EventEffect, dispatch_event},
+    github::{GitHubInstance, GitHubRepoRef},
     login_state::{
         LoginStateBackupEvidence, LoginValidationExpectation, LoginValidationStatus,
         backup_login_state as engine_backup_login_state, classify_login_validation,
@@ -321,12 +322,12 @@ fn git_push_policy_target(
     if !valid_git_branch(branch) {
         return "git_push:invalid".into();
     }
-    let Ok(Some(project)) = store.load_project(project_id) else {
+    let Ok(repo) = project_github_repo(store, Some(project_id)) else {
         return "git_push:invalid".into();
     };
-    let repo = github_repo_from_url(&project.repo_url)
-        .unwrap_or_else(|_| project.repo_url.trim().trim_end_matches(".git").to_owned());
-    format!("git_push:{project_id}:{repo}:{branch}")
+    // The authorization target carries the instance host so that the same
+    // owner/repo on two GitHub deployments never shares a grant.
+    format!("git_push:{project_id}:{}:{branch}", repo.canonical())
 }
 
 struct DesktopState {
@@ -795,22 +796,26 @@ fn validate_git_remote_destination(
 ) -> Result<(), String> {
     let host = git_remote_host(remote_url)
         .ok_or("configured git remote destination is not a recognized forge URL")?;
-    if host != "github.com" {
-        return Err("git push credentials are only allowed for github.com remotes".into());
+    let instances = github_instances(store)?;
+    let remote =
+        opcos_engine::github::resolve_repo_url(remote_url, &instances).map_err(|error| {
+            format!("git push credentials are not allowed for this remote: {error}")
+        })?;
+    if remote.instance.host() != host {
+        return Err("configured git remote destination is ambiguous".into());
     }
     if let Ok(parsed) = url::Url::parse(remote_url)
         && (parsed.username() != "" || parsed.password().is_some())
     {
         return Err("configured git remote must not contain embedded credentials".into());
     }
-    if let Some(project_id) = project_id
-        && let Some(project) = store
-            .load_project(project_id)
-            .map_err(|error| error.to_string())?
-        && let Some(expected_host) = git_remote_host(&project.repo_url)
-        && expected_host != host
-    {
-        return Err("git remote destination does not match the project forge host".into());
+    if let Some(project_id) = project_id {
+        let bound = project_github_repo(store, Some(project_id))?;
+        if !same_repo_path(&bound.canonical(), &remote.canonical()) {
+            return Err(
+                "git remote destination does not match the bound project repository".into(),
+            );
+        }
     }
     Ok(())
 }
@@ -962,8 +967,18 @@ async fn execute_git_write(
     let mut env = serde_json::Map::new();
     let mut secret_values = Vec::new();
     let askpass_path = if name == "git_push" {
-        let token = scoped_secret_get_from_store(secrets, project_id, "connector-token", "github")?
-            .ok_or("project GitHub credential is not configured")?;
+        // Credentials are bound to the GitHub instance of the bound repository,
+        // so a token for one deployment is never sent to another.
+        let instance = project_github_repo(store, project_id)?.instance;
+        let secret_name = instance.connector_secret_name();
+        let token =
+            scoped_secret_get_from_store(secrets, project_id, "connector-token", &secret_name)?
+                .ok_or_else(|| {
+                    format!(
+                        "GitHub credential for {} is not configured",
+                        instance.host()
+                    )
+                })?;
         let username = "x-access-token".to_owned();
         let suffix = Uuid::new_v4().simple().to_string();
         let path = if platform == Some("windows") {
@@ -1275,12 +1290,15 @@ async fn execute_github_pull_request_tool(
     name: &str,
     arguments: &Value,
 ) -> Result<Value, String> {
-    let repo = git_string_argument(arguments, "repo")?;
+    let requested = git_string_argument(arguments, "repo")?;
     let token_name = git_string_argument(arguments, "token_secret")?;
+    let target = configured_github_repo(store, project_id, &requested)?;
+    target.instance.authorize_token_secret(&token_name)?;
+    let repo = target.repo.clone();
     let token = scoped_secret_get_from_store(secrets, project_id, "asset-secret", &token_name)?
         .ok_or("GitHub token secret is not configured")?;
     let http = reqwest::Client::new();
-    let endpoint = format!("https://api.github.com/repos/{repo}");
+    let endpoint = target.instance.repo_endpoint(&repo);
     let request = |request: reqwest::RequestBuilder| {
         request
             .header("User-Agent", "OPCOS/0.1")
@@ -1342,12 +1360,13 @@ async fn execute_github_pull_request_tool(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    let key = format!("github-pr:{repo}:{head}:{base}");
+    let canonical = target.canonical();
+    let key = format!("github-pr:{canonical}:{head}:{base}");
     let action_id = match store
         .begin_action(
             "github_create_pull_request",
             "github",
-            &repo,
+            &canonical,
             &key,
             Some(session_id),
             project_id,
@@ -1467,38 +1486,68 @@ async fn execute_github_pull_request_tool(
     )
 }
 
-fn github_repo_from_url(repo_url: &str) -> Result<String, String> {
-    let repo_url = repo_url.trim();
-    let path = if let Some((_, path)) = repo_url.split_once("github.com/") {
-        path
-    } else if let Some((_, path)) = repo_url.split_once("github.com:") {
-        path
-    } else {
-        return Err("bound project repository is not a GitHub repository".into());
-    };
-    let configured = path.trim_end_matches(".git").trim_matches('/');
-    if configured.is_empty() || !configured.contains('/') {
-        return Err("bound project repository has an invalid GitHub path".into());
-    }
-    Ok(configured.to_owned())
+/// Registered GitHub Enterprise Server instances. `github.com` is implicit and
+/// always available; every other host must be registered before OPCOS will talk
+/// to it or send a credential to it.
+fn github_instances(store: &SqliteStore) -> Result<Vec<GitHubInstance>, String> {
+    let records = store
+        .list_github_instances()
+        .map_err(|error| error.to_string())?;
+    opcos_engine::github::instances_from_records(&records)
 }
 
+/// The instance-qualified repository bound to a project.
+fn project_github_repo(
+    store: &SqliteStore,
+    project_id: Option<&str>,
+) -> Result<GitHubRepoRef, String> {
+    let project_id = project_id.ok_or("GitHub tools require a bound project")?;
+    let project = store
+        .load_project(project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or("GitHub tools require a bound project")?;
+    let instances = github_instances(store)?;
+    opcos_engine::github::resolve_repo_url(&project.repo_url, &instances)
+}
+
+/// Read the connector credential bound to a GitHub instance. There is no
+/// fallback to another instance's credential.
+fn github_instance_token(
+    secrets: &KeyringSecretStore,
+    project_id: Option<&str>,
+    instance: &GitHubInstance,
+) -> Result<String, String> {
+    let secret_name = instance.connector_secret_name();
+    scoped_secret_get_from_store(secrets, project_id, "connector-token", &secret_name)?.ok_or_else(
+        || {
+            format!(
+                "GitHub connector credential for {} is not configured",
+                instance.host()
+            )
+        },
+    )
+}
+
+fn same_repo_path(left: &str, right: &str) -> bool {
+    left.trim()
+        .trim_matches('/')
+        .eq_ignore_ascii_case(right.trim().trim_matches('/'))
+}
+
+/// Resolve a requested repository against the bound project repository. The
+/// request may name `owner/repo` or the instance-qualified `host/owner/repo`,
+/// and never resolves to a different instance.
 fn configured_github_repo(
     store: &SqliteStore,
     project_id: Option<&str>,
     requested: &str,
-) -> Result<String, String> {
-    let project_id = project_id.ok_or("GitHub CI tools require a bound project")?;
-    let project = store
-        .load_project(project_id)
-        .map_err(|error| error.to_string())?
-        .ok_or("GitHub CI tools require a bound project")?;
-    let configured = github_repo_from_url(&project.repo_url)?;
+) -> Result<GitHubRepoRef, String> {
+    let bound = project_github_repo(store, project_id)?;
     let requested = requested.trim().trim_matches('/');
-    if requested != configured {
-        return Err("requested repository is outside the bound project repository".into());
+    if same_repo_path(requested, &bound.repo) || same_repo_path(requested, &bound.canonical()) {
+        return Ok(bound);
     }
-    Ok(configured)
+    Err("requested repository is outside the bound project repository".into())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1823,17 +1872,14 @@ async fn execute_github_ci_status(
     arguments: &Value,
 ) -> Result<Value, String> {
     let requested_repo = git_string_argument(arguments, "repo")?;
-    let repo = configured_github_repo(store, project_id, &requested_repo)?;
-    let token = scoped_secret_get_from_store(secrets, project_id, "connector-token", "github")?
-        .ok_or("GitHub connector credential is not configured")?;
+    let target = configured_github_repo(store, project_id, &requested_repo)?;
+    let repo = target.repo.clone();
+    let endpoint = target.instance.repo_endpoint(&repo);
+    let token = github_instance_token(secrets, project_id, &target.instance)?;
     let http = reqwest::Client::new();
     let sha = if let Some(number) = arguments.get("pull_request").and_then(Value::as_u64) {
-        let (pull, rate_limit) = github_ci_json(
-            &http,
-            &token,
-            &format!("https://api.github.com/repos/{repo}/pulls/{number}"),
-        )
-        .await?;
+        let (pull, rate_limit) =
+            github_ci_json(&http, &token, &format!("{endpoint}/pulls/{number}")).await?;
         let sha = pull
             .get("head")
             .and_then(|value| value.get("sha"))
@@ -1847,19 +1893,13 @@ async fn execute_github_ci_status(
     let (checks, checks_rate) = github_ci_json(
         &http,
         &token,
-        &format!(
-            "https://api.github.com/repos/{repo}/commits/{}/check-runs?per_page=100",
-            sha.0
-        ),
+        &format!("{endpoint}/commits/{}/check-runs?per_page=100", sha.0),
     )
     .await?;
     let (runs, runs_rate) = github_ci_json(
         &http,
         &token,
-        &format!(
-            "https://api.github.com/repos/{repo}/actions/runs?head_sha={}&per_page=100",
-            sha.0
-        ),
+        &format!("{endpoint}/actions/runs?head_sha={}&per_page=100", sha.0),
     )
     .await?;
     let mut entries = Vec::new();
@@ -1891,9 +1931,7 @@ async fn execute_github_ci_status(
                 github_ci_json(
                     &http,
                     &token,
-                    &format!(
-                        "https://api.github.com/repos/{repo}/check-runs/{check_id}/annotations?per_page=100"
-                    ),
+                    &format!("{endpoint}/check-runs/{check_id}/annotations?per_page=100"),
                 )
                 .await
                 .ok()
@@ -1931,9 +1969,7 @@ async fn execute_github_ci_status(
                 github_ci_json(
                     &http,
                     &token,
-                    &format!(
-                        "https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs?per_page=100"
-                    ),
+                    &format!("{endpoint}/actions/runs/{run_id}/jobs?per_page=100"),
                 )
                 .await
                 .ok()
@@ -1993,6 +2029,7 @@ async fn execute_github_ci_status(
     let mut result = json!({
         "status": "ok",
         "repo": repo,
+        "repo_canonical": target.canonical(),
         "commit": sha.0,
         "overall": overall,
         "checks": entries,
@@ -2014,9 +2051,10 @@ async fn execute_github_ci_failure_log(
     arguments: &Value,
 ) -> Result<Value, String> {
     let requested_repo = git_string_argument(arguments, "repo")?;
-    let repo = configured_github_repo(store, project_id, &requested_repo)?;
-    let token = scoped_secret_get_from_store(secrets, project_id, "connector-token", "github")?
-        .ok_or("GitHub connector credential is not configured")?;
+    let target = configured_github_repo(store, project_id, &requested_repo)?;
+    let repo = target.repo.clone();
+    let endpoint = target.instance.repo_endpoint(&repo);
+    let token = github_instance_token(secrets, project_id, &target.instance)?;
     let run_id = arguments
         .get("run_id")
         .and_then(Value::as_u64)
@@ -2025,7 +2063,7 @@ async fn execute_github_ci_failure_log(
     let (jobs, _rate_limit) = github_ci_json(
         &http,
         &token,
-        &format!("https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs?per_page=100"),
+        &format!("{endpoint}/actions/runs/{run_id}/jobs?per_page=100"),
     )
     .await?;
     let requested_job = arguments.get("job_id").and_then(Value::as_u64);
@@ -2056,9 +2094,7 @@ async fn execute_github_ci_failure_log(
         .build()
         .map_err(|error| format!("GitHub job log client setup failed: {error}"))?;
     let response = log_http
-        .get(format!(
-            "https://api.github.com/repos/{repo}/actions/jobs/{job_id}/logs"
-        ))
+        .get(format!("{endpoint}/actions/jobs/{job_id}/logs"))
         .header("User-Agent", "OPCOS/0.1")
         .header("Accept", "application/vnd.github+json")
         .bearer_auth(&token)
@@ -3672,8 +3708,14 @@ impl ToolExecutor for RemoteExecutor {
                 || name.starts_with("discord_")
                 || name.starts_with("slack_") =>
             {
-                execute_connector_tool(&self.secrets, self.project_id.as_deref(), name, arguments)
-                    .await
+                execute_connector_tool(
+                    &self.secrets,
+                    self.project_id.as_deref(),
+                    &self.store,
+                    name,
+                    arguments,
+                )
+                .await
             }
             "repo_index_find_symbol" | "repo_index_glob" | "repo_index_search" => {
                 let host = RvmHost::new(
@@ -3981,6 +4023,7 @@ impl ToolExecutor for DesktopExecutor {
                         execute_connector_tool(
                             &executor.secrets,
                             executor.project_id.as_deref(),
+                            &executor.store,
                             name,
                             arguments,
                         )
@@ -14701,10 +14744,17 @@ async fn connector_identity(state: &DesktopState, kind: &str) -> Result<Value, S
         .unwrap_or("");
     let client = reqwest::Client::new();
     match kind {
-        "github" => {
+        kind if kind == "github" || kind.starts_with("github@") => {
+            let instance = match kind.strip_prefix("github@") {
+                Some(host) => {
+                    let instances = github_instances(&state.store)?;
+                    opcos_engine::github::resolve_host(host, &instances)?
+                }
+                None => GitHubInstance::dotcom(),
+            };
             let body = connector_json(
                 client
-                    .get("https://api.github.com/user")
+                    .get(instance.api_endpoint("user"))
                     .bearer_auth(token)
                     .header("User-Agent", "OPCOS"),
                 "GitHub",
@@ -15308,6 +15358,24 @@ async fn connector_identity(state: &DesktopState, kind: &str) -> Result<Value, S
     }
 }
 
+/// A connector kind is supported when it is in the catalog, or when it is a
+/// `github@<host>` credential bound to a registered Enterprise instance.
+fn connector_kind_supported(
+    store: &SqliteStore,
+    supported: &[&str],
+    kind: &str,
+) -> Result<(), String> {
+    if supported.contains(&kind) {
+        return Ok(());
+    }
+    if let Some(host) = kind.strip_prefix("github@") {
+        let instances = github_instances(store)?;
+        opcos_engine::github::resolve_host(host, &instances)?;
+        return Ok(());
+    }
+    Err(format!("unsupported connector: {kind}"))
+}
+
 #[tauri::command]
 async fn connector_save(
     state: State<'_, DesktopState>,
@@ -15346,9 +15414,7 @@ async fn connector_save(
         "whatsapp",
         "email (imap)",
     ];
-    if !SUPPORTED.contains(&kind.as_str()) {
-        return Err(format!("unsupported connector: {kind}"));
-    }
+    connector_kind_supported(&state.store, SUPPORTED, &kind)?;
     let mut credentials =
         config.unwrap_or_else(|| json!({"token": token.clone().unwrap_or_default()}));
     if let Some(value) = token.filter(|value| !value.trim().is_empty()) {
@@ -15540,9 +15606,7 @@ async fn connector_status(state: State<'_, DesktopState>, kind: String) -> Resul
         "dropbox",
         "box",
     ];
-    if !SUPPORTED.contains(&kind.as_str()) {
-        return Err(format!("unsupported connector: {kind}"));
-    }
+    connector_kind_supported(&state.store, SUPPORTED, &kind)?;
     connector_identity(&state, &kind).await
 }
 
@@ -15650,24 +15714,14 @@ fn github_comment_allowed(comment: &Value, settings: &Value) -> Result<(), Strin
     Ok(())
 }
 
-fn github_pr_coordinates(pr_url: &str) -> Result<(String, u64), String> {
-    if !pr_url.starts_with("https://github.com/") || !pr_url.contains("/pull/") {
-        return Err("expected a GitHub pull request URL".into());
-    }
-    let path = pr_url
-        .trim_start_matches("https://github.com/")
-        .split(['?', '#'])
-        .next()
-        .unwrap_or_default();
-    let parts = path.split('/').collect::<Vec<_>>();
-    if parts.len() < 4 || parts[2] != "pull" {
-        return Err("expected a valid GitHub pull request URL".into());
-    }
-    let repo = format!("{}/{}", parts[0], parts[1]);
-    let number = parts[3]
-        .parse::<u64>()
-        .map_err(|_| "expected a valid pull request number".to_owned())?;
-    Ok((repo, number))
+/// Resolve a pull request URL to its GitHub instance. Hosts that are not
+/// github.com must be registered Enterprise instances.
+fn github_pr_coordinates(
+    store: &SqliteStore,
+    pr_url: &str,
+) -> Result<(GitHubRepoRef, u64), String> {
+    let instances = github_instances(store)?;
+    opcos_engine::github::resolve_pull_request_url(pr_url, &instances)
 }
 
 #[tauri::command]
@@ -15679,7 +15733,9 @@ async fn github_process_pull_request_comments(
     token_secret: String,
 ) -> Result<Value, String> {
     let session = session_for(&state, &session_id)?;
-    let (repo, number) = github_pr_coordinates(&pr_url)?;
+    let (target, number) = github_pr_coordinates(&state.store, &pr_url)?;
+    let repo = target.repo.clone();
+    let endpoint = target.instance.repo_endpoint(&repo);
     let settings = {
         let connection = state
             .database
@@ -15687,6 +15743,7 @@ async fn github_process_pull_request_comments(
             .map_err(|_| "database lock poisoned")?;
         load_agent_settings(&connection, session.project_id.as_deref())?
     };
+    target.instance.authorize_token_secret(&token_secret)?;
     let configured = scoped_secret_get(
         &state,
         session.project_id.as_deref(),
@@ -15697,20 +15754,20 @@ async fn github_process_pull_request_comments(
         &state,
         session.project_id.as_deref(),
         "connector-token",
-        "github",
+        &target.instance.connector_secret_name(),
     )?)
     .ok_or_else(|| "GitHub token is not configured".to_owned())?;
     let issue_comments = github_json(
         &configured,
         reqwest::Method::GET,
-        &format!("https://api.github.com/repos/{repo}/issues/{number}/comments"),
+        &format!("{endpoint}/issues/{number}/comments"),
         None,
     )
     .await?;
     let review_comments = github_json(
         &configured,
         reqwest::Method::GET,
-        &format!("https://api.github.com/repos/{repo}/pulls/{number}/comments"),
+        &format!("{endpoint}/pulls/{number}/comments"),
         None,
     )
     .await?;
@@ -15752,6 +15809,7 @@ async fn github_process_pull_request_comments(
 async fn execute_connector_tool(
     secrets: &KeyringSecretStore,
     project_id: Option<&str>,
+    store: &SqliteStore,
     name: &str,
     arguments: Value,
 ) -> Result<Value, String> {
@@ -15762,6 +15820,22 @@ async fn execute_connector_tool(
     } else {
         name.split('_').next().unwrap_or_default()
     };
+    // GitHub connector calls follow the instance bound to the project; an
+    // unbound session keeps the historical github.com behavior.
+    let github_instance = if kind == "github" {
+        match project_github_repo(store, project_id) {
+            Ok(target) => target.instance,
+            Err(_) => GitHubInstance::dotcom(),
+        }
+    } else {
+        GitHubInstance::dotcom()
+    };
+    let kind = if kind == "github" {
+        github_instance.connector_secret_name()
+    } else {
+        kind.to_owned()
+    };
+    let kind = kind.as_str();
     let config = scoped_secret_get_from_store(secrets, project_id, "connector-config", kind)
         .map_err(|error| format!("{kind} credentials unavailable: {error}"))?
         .or_else(|| {
@@ -15780,7 +15854,7 @@ async fn execute_connector_tool(
             github_json(
                 token,
                 reqwest::Method::GET,
-                "https://api.github.com/user/repos?per_page=50&sort=updated",
+                &github_instance.api_endpoint("user/repos?per_page=50&sort=updated"),
                 None,
             )
             .await
@@ -15794,7 +15868,10 @@ async fn execute_connector_tool(
                 .get("repo")
                 .and_then(Value::as_str)
                 .ok_or("missing repo")?;
-            let url = format!("https://api.github.com/repos/{owner}/{repo}/issues?state=all");
+            let url = format!(
+                "{}/issues?state=all",
+                github_instance.repo_endpoint(&format!("{owner}/{repo}"))
+            );
             github_json(token, reqwest::Method::GET, &url, None).await
         }
         "github_create_issue" => {
@@ -15810,7 +15887,10 @@ async fn execute_connector_tool(
                 .get("title")
                 .and_then(Value::as_str)
                 .ok_or("missing title")?;
-            let url = format!("https://api.github.com/repos/{owner}/{repo}/issues");
+            let url = github_instance
+                .repo_endpoint(&format!("{owner}/{repo}"))
+                .to_owned()
+                + "/issues";
             github_json(
                 token,
                 reqwest::Method::POST,
@@ -16945,14 +17025,17 @@ async fn github_pull_request(
     if let Some(session_id) = session_id.as_deref() {
         run_configured_lifecycle_stage(&state, session_id, LifecycleStage::PrePush, None).await?;
     }
+    let target = configured_github_repo(&state.store, project_id.as_deref(), &repo)?;
+    target.instance.authorize_token_secret(&token_secret)?;
+    let repo = target.repo.clone();
+    let endpoint = target.instance.repo_endpoint(&repo);
     let token = state
         .secrets
         .get(&secret_key("asset-secret", &token_secret))
         .map_err(|error| error.to_string())?
         .ok_or("GitHub token is not configured")?;
     let http = reqwest::Client::new();
-    let template_url =
-        format!("https://api.github.com/repos/{repo}/contents/.github/PULL_REQUEST_TEMPLATE.md");
+    let template_url = format!("{endpoint}/contents/.github/PULL_REQUEST_TEMPLATE.md");
     let template = http
         .get(template_url)
         .header("User-Agent", "OPCOS/0.1")
@@ -17014,7 +17097,7 @@ async fn github_pull_request(
         return Err("GitHub credential must not appear in PR fields".into());
     }
     let response: Value = http
-        .post(format!("https://api.github.com/repos/{repo}/pulls"))
+        .post(format!("{endpoint}/pulls"))
         .header("User-Agent", "OPCOS/0.1")
         .bearer_auth(&token)
         .json(&json!({
@@ -17041,9 +17124,7 @@ async fn github_pull_request(
         && let Some(number) = response.get("number").and_then(Value::as_u64)
     {
         let _ = http
-            .post(format!(
-                "https://api.github.com/repos/{repo}/pulls/{number}/requested_reviewers"
-            ))
+            .post(format!("{endpoint}/pulls/{number}/requested_reviewers"))
             .header("User-Agent", "OPCOS/0.1")
             .bearer_auth(token)
             .json(&json!({"reviewers": [reviewer]}))
@@ -18453,32 +18534,13 @@ async fn verify_task_delivery(
         .or(task.verified_pr_url.as_deref())
         .or(task.pr.as_deref())
         .ok_or_else(|| "completion requires a pull request URL".to_owned())?;
-    if !pr_url.starts_with("https://github.com/") || !pr_url.contains("/pull/") {
-        return Err("completion requires a GitHub pull request URL".into());
-    }
-    let path = pr_url
-        .trim_start_matches("https://github.com/")
-        .split(['?', '#'])
-        .next()
-        .unwrap_or_default();
-    let parts = path.split('/').collect::<Vec<_>>();
-    if parts.len() < 4 || parts[2] != "pull" {
-        return Err("completion requires a valid GitHub pull request URL".into());
-    }
-    let pr_repo = format!("{}/{}", parts[0], parts[1]);
-    let pr_number = parts[3]
-        .parse::<u64>()
-        .map_err(|_| "completion requires a valid pull request number".to_owned())?;
-    let repo = project
-        .repo_url
-        .trim_end_matches(".git")
-        .trim_start_matches("https://github.com/")
-        .trim_start_matches("http://github.com/")
-        .trim_start_matches("git@github.com:")
-        .trim_end_matches('/');
-    if !repo.is_empty() && repo != pr_repo {
+    let (pr_target, pr_number) = github_pr_coordinates(&state.store, pr_url)
+        .map_err(|error| format!("completion requires a GitHub pull request URL: {error}"))?;
+    let bound = project_github_repo(&state.store, Some(&project.id))?;
+    if !same_repo_path(&bound.canonical(), &pr_target.canonical()) {
         return Err("pull request repository does not match the project repository".into());
     }
+    let pr_repo = pr_target.repo.clone();
     let host = project_host(state, project).await?;
     let platform = host.health().await.ok().and_then(|health| health.platform);
     for command in [
@@ -18509,20 +18571,26 @@ async fn verify_task_delivery(
             );
         }
     }
-    let configured = scoped_secret_get(state, Some(&project.id), "connector-config", "github")?
-        .or(scoped_secret_get(
-            state,
-            Some(&project.id),
-            "connector-token",
-            "github",
-        )?)
-        .or(scoped_secret_get(
-            state,
-            Some(&project.id),
-            "asset-secret",
-            "github-token",
-        )?)
-        .ok_or_else(|| "GitHub token is not configured for completion verification".to_owned())?;
+    let connector_name = pr_target.instance.connector_secret_name();
+    let configured = scoped_secret_get(
+        state,
+        Some(&project.id),
+        "connector-config",
+        &connector_name,
+    )?
+    .or(scoped_secret_get(
+        state,
+        Some(&project.id),
+        "connector-token",
+        &connector_name,
+    )?)
+    .or(if pr_target.instance.is_dotcom() {
+        scoped_secret_get(state, Some(&project.id), "asset-secret", "github-token")?
+    } else {
+        // Enterprise instances only use the credential bound to their host.
+        None
+    })
+    .ok_or_else(|| "GitHub token is not configured for completion verification".to_owned())?;
     let token = serde_json::from_str::<Value>(&configured)
         .ok()
         .and_then(|value| {
@@ -18532,7 +18600,10 @@ async fn verify_task_delivery(
                 .map(str::to_owned)
         })
         .unwrap_or(configured);
-    let api_url = format!("https://api.github.com/repos/{pr_repo}/pulls/{pr_number}");
+    let api_url = format!(
+        "{}/pulls/{pr_number}",
+        pr_target.instance.repo_endpoint(&pr_repo)
+    );
     let response = github_json(&token, reqwest::Method::GET, &api_url, None).await?;
     if response
         .get("head")
@@ -19461,6 +19532,60 @@ fn save_ci_monitor(
         })
         .map_err(|error| error.to_string())?;
     serde_json::to_value(monitor).map_err(|error| error.to_string())
+}
+
+/// List the registered GitHub Enterprise Server instances. `github.com` is
+/// implicit and is never part of this registry.
+#[tauri::command]
+fn list_github_enterprise_instances(state: State<'_, DesktopState>) -> Result<Value, String> {
+    let records = state
+        .store
+        .list_github_instances()
+        .map_err(|error| error.to_string())?;
+    serde_json::to_value(records).map_err(|error| error.to_string())
+}
+
+/// Register or update a GitHub Enterprise Server instance. The API base is
+/// normalized to `https://<host>/api/v3` unless an explicit HTTPS base on the
+/// same host is supplied.
+#[tauri::command]
+fn save_github_enterprise_instance(
+    state: State<'_, DesktopState>,
+    host: String,
+    api_base: Option<String>,
+    token_secret: Option<String>,
+) -> Result<Value, String> {
+    let instance = GitHubInstance::from_config(&opcos_engine::github::GitHubInstanceConfig {
+        host,
+        api_base,
+        token_secret,
+    })?;
+    state
+        .store
+        .save_github_instance(
+            instance.host(),
+            instance.api_base(),
+            instance.bound_token_secret(),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(json!({
+        "host": instance.host(),
+        "api_base": instance.api_base(),
+        "token_secret": instance.bound_token_secret(),
+        "connector_secret": instance.connector_secret_name(),
+    }))
+}
+
+#[tauri::command]
+fn delete_github_enterprise_instance(
+    state: State<'_, DesktopState>,
+    host: String,
+) -> Result<Value, String> {
+    let removed = state
+        .store
+        .delete_github_instance(host.trim())
+        .map_err(|error| error.to_string())?;
+    Ok(json!({"removed": removed}))
 }
 
 #[tauri::command]
@@ -20605,6 +20730,9 @@ fn main() {
             ci_repair_status,
             save_ci_monitor,
             set_ci_monitor_enabled,
+            list_github_enterprise_instances,
+            save_github_enterprise_instance,
+            delete_github_enterprise_instance,
             poll_ci_monitor,
             runner_profile,
             save_runner_profile,
@@ -21082,17 +21210,171 @@ mod m7_tests {
         );
     }
 
+    fn github_test_store(
+        projects: &[(&str, &str)],
+        instances: &[(&str, Option<&str>)],
+    ) -> SqliteStore {
+        let store = SqliteStore::open_in_memory().unwrap();
+        for (host, token_secret) in instances {
+            store
+                .save_github_instance(host, &format!("https://{host}/api/v3"), *token_secret)
+                .unwrap();
+        }
+        for (id, repo_url) in projects {
+            store
+                .save_project(&opcos_store::ProjectRecord {
+                    id: (*id).into(),
+                    name: (*id).into(),
+                    host_id: "local".into(),
+                    repo_url: (*repo_url).into(),
+                    repo_root: "/workspace".into(),
+                    default_branch: "main".into(),
+                    workflow_json: "{}".into(),
+                    board_id: (*id).into(),
+                    archived: false,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                })
+                .unwrap();
+        }
+        store
+    }
+
     #[test]
     fn ci_repository_scope_accepts_only_the_bound_github_repository() {
+        let store = github_test_store(
+            &[
+                ("dotcom", "https://github.com/LebsChen/OPCOS.git"),
+                ("ghes", "git@ghe.example.com:LebsChen/OPCOS.git"),
+            ],
+            &[("ghe.example.com", Some("ghe-token"))],
+        );
+        let dotcom = configured_github_repo(&store, Some("dotcom"), "LebsChen/OPCOS").unwrap();
+        assert_eq!(dotcom.repo, "LebsChen/OPCOS");
+        assert_eq!(dotcom.instance.api_base(), "https://api.github.com");
+        let enterprise = configured_github_repo(&store, Some("ghes"), "LebsChen/OPCOS").unwrap();
         assert_eq!(
-            github_repo_from_url("https://github.com/LebsChen/OPCOS.git").unwrap(),
-            "LebsChen/OPCOS"
+            enterprise.instance.api_base(),
+            "https://ghe.example.com/api/v3"
         );
         assert_eq!(
-            github_repo_from_url("git@github.com:LebsChen/OPCOS.git").unwrap(),
-            "LebsChen/OPCOS"
+            enterprise.instance.repo_endpoint(&enterprise.repo),
+            "https://ghe.example.com/api/v3/repos/LebsChen/OPCOS"
         );
-        assert!(github_repo_from_url("https://gitlab.com/LebsChen/OPCOS").is_err());
+        // The instance-qualified name of one instance is not accepted by the other.
+        assert!(
+            configured_github_repo(&store, Some("dotcom"), "ghe.example.com/LebsChen/OPCOS")
+                .is_err()
+        );
+        assert!(configured_github_repo(&store, Some("ghes"), "other/repo").is_err());
+    }
+
+    #[test]
+    fn unregistered_enterprise_hosts_are_rejected_instead_of_falling_back() {
+        let store = github_test_store(
+            &[("p", "https://ghe.unknown.test/acme/app.git")],
+            &[("ghe.example.com", None)],
+        );
+        let error = project_github_repo(&store, Some("p")).unwrap_err();
+        assert!(error.contains("not a registered"), "{error}");
+        assert_eq!(
+            git_push_policy_target(&store, Some("p"), &json!({"branch": "feature"})),
+            "git_push:invalid"
+        );
+    }
+
+    #[test]
+    fn push_authorization_targets_and_credentials_are_instance_scoped() {
+        let store = github_test_store(
+            &[
+                ("dotcom", "https://github.com/acme/app.git"),
+                ("ghes", "https://ghe.example.com/acme/app.git"),
+            ],
+            &[("ghe.example.com", Some("ghe-token"))],
+        );
+        let dotcom_target =
+            git_push_policy_target(&store, Some("dotcom"), &json!({"branch": "feature"}));
+        let ghes_target =
+            git_push_policy_target(&store, Some("ghes"), &json!({"branch": "feature"}));
+        assert_eq!(dotcom_target, "git_push:dotcom:github.com/acme/app:feature");
+        assert_eq!(
+            ghes_target,
+            "git_push:ghes:ghe.example.com/acme/app:feature"
+        );
+        assert_ne!(dotcom_target, ghes_target);
+        assert_eq!(
+            project_github_repo(&store, Some("dotcom"))
+                .unwrap()
+                .instance
+                .connector_secret_name(),
+            "github"
+        );
+        assert_eq!(
+            project_github_repo(&store, Some("ghes"))
+                .unwrap()
+                .instance
+                .connector_secret_name(),
+            "github@ghe.example.com"
+        );
+    }
+
+    #[test]
+    fn git_remotes_must_match_the_bound_instance_and_repository() {
+        let store = github_test_store(
+            &[
+                ("dotcom", "https://github.com/acme/app.git"),
+                ("ghes", "https://ghe.example.com/acme/app.git"),
+            ],
+            &[("ghe.example.com", None)],
+        );
+        assert!(
+            validate_git_remote_destination(
+                "https://ghe.example.com/acme/app.git",
+                &store,
+                Some("ghes")
+            )
+            .is_ok()
+        );
+        // Same owner/repo on the other instance must not be accepted.
+        assert!(
+            validate_git_remote_destination(
+                "https://github.com/acme/app.git",
+                &store,
+                Some("ghes")
+            )
+            .is_err()
+        );
+        assert!(
+            validate_git_remote_destination(
+                "https://ghe.example.com/acme/app.git",
+                &store,
+                Some("dotcom")
+            )
+            .is_err()
+        );
+        assert!(
+            validate_git_remote_destination("https://ghe.unknown.test/acme/app.git", &store, None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn pull_request_urls_route_to_the_registered_instance() {
+        let store = github_test_store(&[], &[("ghe.example.com", None)]);
+        let (target, number) =
+            github_pr_coordinates(&store, "https://ghe.example.com/acme/app/pull/7").unwrap();
+        assert_eq!(number, 7);
+        assert_eq!(
+            target.instance.repo_endpoint(&target.repo),
+            "https://ghe.example.com/api/v3/repos/acme/app"
+        );
+        let (dotcom, _) =
+            github_pr_coordinates(&store, "https://github.com/acme/app/pull/7").unwrap();
+        assert_eq!(
+            dotcom.instance.repo_endpoint(&dotcom.repo),
+            "https://api.github.com/repos/acme/app"
+        );
+        assert!(github_pr_coordinates(&store, "https://ghe.unknown.test/a/b/pull/7").is_err());
     }
 
     #[test]

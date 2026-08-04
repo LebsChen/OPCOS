@@ -1,4 +1,5 @@
 use chrono::{DateTime, Duration, Utc};
+use opcos_engine::github::GitHubInstance;
 use opcos_store::{ExternalIngressSource, KeyringSecretStore, SecretStore, SqliteStore};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -218,15 +219,36 @@ async fn poll_github(
         .get("repo")
         .and_then(Value::as_str)
         .ok_or("github repo is required")?;
+    // The source names the GitHub deployment; credentials and API base are
+    // resolved together so a token is never sent to another instance.
+    let instances = opcos_engine::github::instances_from_records(
+        &store
+            .list_github_instances()
+            .map_err(|error| error.to_string())?,
+    )?;
+    let instance = match source.config.get("host").and_then(Value::as_str) {
+        Some(host) => opcos_engine::github::resolve_host(host, &instances)?,
+        None => GitHubInstance::dotcom(),
+    };
+    let secret_name = instance.connector_secret_name();
     let token = secrets
-        .get("connector-token:github")
+        .get(&format!("connector-token:{secret_name}"))
         .map_err(|error| error.to_string())?
-        .ok_or("GitHub connector credential is not configured")?;
+        .ok_or_else(|| {
+            format!(
+                "GitHub connector credential for {} is not configured",
+                instance.host()
+            )
+        })?;
+    #[cfg(test)]
     let api_base = source
         .config
         .get("api_base")
         .and_then(Value::as_str)
-        .unwrap_or("https://api.github.com");
+        .map(str::to_owned)
+        .unwrap_or_else(|| instance.api_base().to_owned());
+    #[cfg(not(test))]
+    let api_base = instance.api_base().to_owned();
     let since = source.cursor.as_deref().unwrap_or("");
     let response = client
         .get(format!("{api_base}/repos/{repo}/events?per_page=100"))
@@ -274,7 +296,7 @@ async fn poll_github(
         store
             .publish_event(
                 &format!("external.github.{resource}.{action}"),
-                &format!("github:repo:{repo}"),
+                &format!("github:repo:{}", instance.canonical_repo(repo)),
                 &json!({"id": id}),
                 &payload,
                 Some(&key),
@@ -526,6 +548,81 @@ mod tests {
         assert_eq!(source.consecutive_failures, 5);
         assert!(source.circuit_open_until.is_some());
         assert!(source.last_error.unwrap_or_default().contains("[redacted]"));
+    }
+
+    #[tokio::test]
+    async fn github_enterprise_sources_use_their_own_credential_and_subject() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let size = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..size]);
+            // The github.com credential must never be sent to an Enterprise host.
+            assert!(request.contains("authorization: Bearer ghes-token"));
+            let body = "[]";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .save_github_instance("ghe.example.com", "https://ghe.example.com/api/v3", None)
+            .unwrap();
+        store
+            .save_external_ingress_source(
+                "github:ghes",
+                "github",
+                &json!({
+                    "repo":"owner/repo",
+                    "host":"ghe.example.com",
+                    "api_base":format!("http://{address}")
+                }),
+            )
+            .unwrap();
+        store
+            .set_external_ingress_enabled("github:ghes", true)
+            .unwrap();
+        let secret_path =
+            std::env::temp_dir().join(format!("opcos-github-ghes-{}", uuid::Uuid::new_v4()));
+        let secrets = KeyringSecretStore::with_fallback("opcos-test", &secret_path);
+        secrets
+            .set("connector-token:github", "dotcom-token")
+            .unwrap();
+        secrets
+            .set("connector-token:github@ghe.example.com", "ghes-token")
+            .unwrap();
+        poll_once(&store, &secrets, "github:ghes").await.unwrap();
+        server.join().unwrap();
+        let _ = std::fs::remove_file(secret_path);
+    }
+
+    #[tokio::test]
+    async fn github_sources_reject_unregistered_hosts() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .save_external_ingress_source(
+                "github:unknown",
+                "github",
+                &json!({"repo":"owner/repo","host":"ghe.unknown.test"}),
+            )
+            .unwrap();
+        store
+            .set_external_ingress_enabled("github:unknown", true)
+            .unwrap();
+        let secret_path =
+            std::env::temp_dir().join(format!("opcos-github-unknown-{}", uuid::Uuid::new_v4()));
+        let secrets = KeyringSecretStore::with_fallback("opcos-test", &secret_path);
+        let error = poll_once(&store, &secrets, "github:unknown")
+            .await
+            .unwrap_err();
+        assert!(error.contains("not a registered"), "{error}");
+        let _ = std::fs::remove_file(secret_path);
     }
 
     #[tokio::test]

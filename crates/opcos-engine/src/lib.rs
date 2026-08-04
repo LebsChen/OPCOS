@@ -24,6 +24,7 @@ mod acp;
 pub mod computer_use;
 pub mod event_bus;
 pub mod git;
+pub mod github;
 pub mod login_state;
 mod opencode;
 pub mod orchestration;

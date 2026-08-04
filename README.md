@@ -13,8 +13,26 @@ Devin 服务。
 - 远端 Host 不可用时返回明确错误，不回退到本机。
 - RVM host 端不在本仓库修改；RVM token 只通过 SecretStore 注入
   `Authorization: Bearer` header。
-- Git push 的凭据路径只允许 `github.com` remote；GitHub API/PR 与 CI 工具也
-  只实现 GitHub 路径。
+- Git push 的凭据路径只允许 `github.com` 和已登记的 GitHub Enterprise Server
+  实例；GitHub API/PR 与 CI 工具也只实现 GitHub 路径，没有其他 forge。
+
+## GitHub 实例（github.com 与 GitHub Enterprise Server）
+
+GitHub 只有一个领域模型，多实例差异体现在「实例身份」上：
+
+- `github.com` 是默认实例，API base 固定为 `https://api.github.com`，行为与
+  以前完全一致，无需任何配置。
+- GHES 实例需要先在 项目配置 → Connectors 面板登记 host（可选显式 API
+  base）。API base 归一化为 `https://<host>/api/v3`；显式 API base 必须是
+  同一 host 的 HTTPS 地址。
+- 未登记的非 `github.com` host 一律报错，不回退到 `github.com`，也不回退到
+  其他实例。
+- 凭据按实例绑定：`github.com` 继续使用 connector kind `github`，GHES 使用
+  `github@<host>`。两个实例上的同名 `owner/repo` 不会互相借用凭据。
+- 仓库身份、push 授权 target、action 幂等键和事件 subject 都带实例，形如
+  `git_push:<project>:<host>/<owner>/<repo>:<branch>`。
+- push、PR 创建/读取/评论/reviewer、checks、CI 失败日志、CI 修复循环、交付
+  核验和事件 ingress 都路由到解析出的实例。
 
 ## Architecture
 
@@ -96,7 +114,8 @@ Provider 和 connector catalog 覆盖多种 API/OAuth/IMAP 配置；agent tool �
 - background job 依赖当前 Host 的进程流/PTY capability；job 状态保存在当前
   adapter/job manager 路径，不能承诺跨应用重启恢复。远程进程受远程 PTY/进程
   流生命周期限制，不能承诺孤儿进程可被重新接管。
-- Git push credential validation 只允许 `github.com`；其他 forge 不可用。
+- Git push credential validation 只允许 `github.com` 和已登记的 GHES 实例；
+  其他 forge 不可用。
 - CI 工具只查询 GitHub Actions；没有通用 CI provider，也没有“CI 挂了自动修
   到绿”的闭环。CI 工具返回状态和有界失败日志，后续修复仍由 agent loop
   再次编辑/验证。
