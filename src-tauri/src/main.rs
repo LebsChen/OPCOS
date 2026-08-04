@@ -59,7 +59,7 @@ use opcos_rvm::{
     RvmClientConfig, WsKind, WsParams, join_remote_path,
 };
 use opcos_store::{
-    ActionBeginResult, ArtifactRecord, KeyringSecretStore, LoginProfileRecord,
+    ActionBeginResult, ArtifactRecord, CiMonitor, KeyringSecretStore, LoginProfileRecord,
     LoginStateBackupRecord, ProjectAgentRecord, ProjectRecord, SecretStore, SessionRecord,
     SessionStore, SqliteStore, ToolCallRecord,
 };
@@ -130,6 +130,7 @@ fn configure_no_window(_command: &mut ProcessCommand) {}
 
 const SECRET_SERVICE: &str = "com.opcos.desktop";
 const ASKPASS_SCRIPT: &str = "if (($args -join ' ') -match 'Username') { $env:OPCOS_GIT_USERNAME } else { $env:OPCOS_GIT_PASSWORD }";
+mod ci_repair;
 mod external_ingress;
 mod repo_index;
 mod scheduler;
@@ -349,6 +350,8 @@ struct DesktopState {
     jobs: Arc<BackgroundJobManager>,
     ingress_shutdown: tokio::sync::watch::Sender<bool>,
     ingress_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    ci_monitor_shutdown: tokio::sync::watch::Sender<bool>,
+    ci_monitor_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
 }
 
 #[derive(Clone)]
@@ -19273,6 +19276,79 @@ async fn poll_external_ingress(
 }
 
 #[tauri::command]
+fn ci_monitors(
+    state: State<'_, DesktopState>,
+    enabled_only: Option<bool>,
+) -> Result<Vec<Value>, String> {
+    state
+        .store
+        .load_ci_monitors(enabled_only.unwrap_or(false))
+        .and_then(|items| {
+            items
+                .into_iter()
+                .map(|item| serde_json::to_value(item).map_err(opcos_store::StoreError::from))
+                .collect()
+        })
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn save_ci_monitor(
+    state: State<'_, DesktopState>,
+    monitor_id: String,
+    project_id: String,
+    repo: String,
+    pull_request: u64,
+    branch: String,
+    poll_interval_seconds: Option<u64>,
+) -> Result<Value, String> {
+    let monitor = state
+        .store
+        .save_ci_monitor(&CiMonitor {
+            monitor_id,
+            project_id,
+            repo,
+            pull_request,
+            branch,
+            enabled: false,
+            poll_interval_seconds: poll_interval_seconds.unwrap_or(30),
+            next_poll_at: None,
+            last_error: None,
+        })
+        .map_err(|error| error.to_string())?;
+    serde_json::to_value(monitor).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn set_ci_monitor_enabled(
+    state: State<'_, DesktopState>,
+    monitor_id: String,
+    enabled: bool,
+) -> Result<Value, String> {
+    state
+        .store
+        .set_ci_monitor_enabled(&monitor_id, enabled)
+        .map_err(|error| error.to_string())?;
+    serde_json::to_value(
+        state
+            .store
+            .load_ci_monitor(&monitor_id)
+            .map_err(|error| error.to_string())?
+            .ok_or("CI monitor disappeared")?,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn poll_ci_monitor(
+    state: State<'_, DesktopState>,
+    monitor_id: String,
+) -> Result<Value, String> {
+    let client = reqwest::Client::new();
+    ci_repair::poll_once(&client, &state.store, &state.secrets, &monitor_id).await
+}
+
+#[tauri::command]
 fn event_rules(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
     state
         .store
@@ -20060,6 +20136,9 @@ fn main() {
             let (ingress_shutdown, ingress_receiver) = tokio::sync::watch::channel(false);
             let ingress_task =
                 external_ingress::start(Arc::clone(&store), secrets.clone(), ingress_receiver);
+            let (ci_monitor_shutdown, ci_monitor_receiver) = tokio::sync::watch::channel(false);
+            let ci_monitor_task =
+                ci_repair::start(Arc::clone(&store), secrets.clone(), ci_monitor_receiver);
             app.manage(DesktopState {
                 database: Arc::clone(&database),
                 secrets,
@@ -20087,6 +20166,8 @@ fn main() {
                 jobs,
                 ingress_shutdown,
                 ingress_task: Mutex::new(Some(ingress_task)),
+                ci_monitor_shutdown,
+                ci_monitor_task: Mutex::new(Some(ci_monitor_task)),
             });
             let handle = app.handle().clone();
             let trigger_handle = handle.clone();
@@ -20270,6 +20351,10 @@ fn main() {
             set_external_ingress_enabled,
             delete_external_ingress_source,
             poll_external_ingress,
+            ci_monitors,
+            save_ci_monitor,
+            set_ci_monitor_enabled,
+            poll_ci_monitor,
             event_rules,
             create_event_rule,
             set_event_rule_enabled,
@@ -20341,6 +20426,12 @@ fn main() {
                 }
                 let _ = state.ingress_shutdown.send(true);
                 if let Ok(mut task) = state.ingress_task.lock()
+                    && let Some(task) = task.take()
+                {
+                    task.abort();
+                }
+                let _ = state.ci_monitor_shutdown.send(true);
+                if let Ok(mut task) = state.ci_monitor_task.lock()
                     && let Some(task) = task.take()
                 {
                     task.abort();

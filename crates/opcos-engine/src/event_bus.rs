@@ -98,6 +98,13 @@ pub fn dispatch_event(
                         rule_id: rule.rule_id.clone(),
                         field: "payload",
                     })?;
+            if task_type == "ci_repair_loop"
+                && let Some(event_payload) = event.payload.as_object()
+            {
+                for (key, value) in event_payload {
+                    payload_object.insert(key.clone(), value.clone());
+                }
+            }
             store.reserve_event_rule_trigger(&rule.rule_id, &reserved_at)?;
             payload_object.insert("event_id".into(), Value::String(event.event_id.clone()));
             if let Some(caused_by) = &event.caused_by {
