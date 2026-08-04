@@ -12,6 +12,7 @@ futures-util.workspace = true
 opcos-policy = { path = "../opcos-policy" }
 opcos-provider = { path = "../opcos-provider" }
 opcos-hosts = { path = "../opcos-hosts" }
+opcos-assets = { path = "../opcos-assets" }
 opcos-store = { path = "../opcos-store" }
 regex.workspace = true
 serde.workspace = true
