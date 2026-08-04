@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use chrono::Utc;
-use opcos_policy::{Decision, DurableGrant, PermissionMode, ToolRisk, decide};
+use opcos_policy::{
+    Decision, DurableGrant, PermissionMode, PermissionRules, ToolRisk, decide_with_rules,
+};
 use opcos_provider::{
     AssistantTurn, Caps, Provider, ProviderError, ProviderRequest, StreamChunk, TokenUsage,
     ToolCall, ToolResult,
@@ -407,6 +409,7 @@ pub struct TurnEngine<P, S, E> {
     unattended: AtomicBool,
     system_instructions: Mutex<Option<String>>,
     runtime_facts: Mutex<Option<String>>,
+    permission_rules: Mutex<Option<PermissionRules>>,
     external_tools: Mutex<Vec<Value>>,
     allowed_tools: Mutex<Option<HashSet<String>>>,
     linear_tools_enabled: AtomicBool,
@@ -492,6 +495,7 @@ where
             unattended: AtomicBool::new(false),
             system_instructions: Mutex::new(None),
             runtime_facts: Mutex::new(None),
+            permission_rules: Mutex::new(None),
             external_tools: Mutex::new(Vec::new()),
             allowed_tools: Mutex::new(None),
             linear_tools_enabled: AtomicBool::new(false),
@@ -516,6 +520,10 @@ where
 
     pub async fn set_runtime_facts(&self, facts: Option<String>) {
         *self.runtime_facts.lock().await = facts;
+    }
+
+    pub async fn set_permission_rules(&self, rules: Option<PermissionRules>) {
+        *self.permission_rules.lock().await = rules;
     }
 
     pub async fn set_external_tools(&self, tools: Vec<Value>) {
@@ -1240,6 +1248,7 @@ where
             })
             .collect::<Vec<_>>();
         let unattended = self.unattended.load(Ordering::SeqCst);
+        let permission_rules = self.permission_rules.lock().await.clone();
         for (index, call) in calls.iter().enumerate() {
             if self.interrupted.load(Ordering::SeqCst) {
                 results[index] = Some(json!({"error":"tool call interrupted"}));
@@ -1302,9 +1311,23 @@ where
                         target: target.clone(),
                         expires_at: None,
                     }];
-                    decide(mode, risk, unattended, &repair_grant, &target)
+                    decide_with_rules(
+                        mode,
+                        risk,
+                        unattended,
+                        &repair_grant,
+                        &target,
+                        permission_rules.as_ref(),
+                    )
                 }
-                PreflightDecision::Allow => decide(mode, risk, unattended, &grants, &target),
+                PreflightDecision::Allow => decide_with_rules(
+                    mode,
+                    risk,
+                    unattended,
+                    &grants,
+                    &target,
+                    permission_rules.as_ref(),
+                ),
                 PreflightDecision::NeedsUser(reason) if unattended => {
                     preflight_reason = Some(reason);
                     Decision::Deny

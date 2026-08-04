@@ -34,6 +34,14 @@ pub struct DurableGrant {
     pub expires_at: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PermissionRules {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApprovalRequest {
     pub tool: String,
@@ -67,6 +75,33 @@ pub fn decide(
     grants: &[DurableGrant],
     target: &str,
 ) -> Decision {
+    decide_with_rules(mode, risk, unattended, grants, target, None)
+}
+
+pub fn decide_with_rules(
+    mode: PermissionMode,
+    risk: ToolRisk,
+    unattended: bool,
+    grants: &[DurableGrant],
+    target: &str,
+    rules: Option<&PermissionRules>,
+) -> Decision {
+    if let Some(rules) = rules {
+        if rules
+            .deny
+            .iter()
+            .any(|rule| rule_matches(rule, risk, target))
+        {
+            return Decision::Deny;
+        }
+        if rules
+            .allow
+            .iter()
+            .any(|rule| rule_matches(rule, risk, target))
+        {
+            return Decision::Allow;
+        }
+    }
     let dangerous = matches!(
         risk,
         ToolRisk::Write | ToolRisk::Execute | ToolRisk::External
@@ -92,6 +127,71 @@ pub fn decide(
         return Decision::Deny;
     }
     classify(mode, dangerous, matches!(risk, ToolRisk::External))
+}
+
+fn rule_matches(rule: &str, risk: ToolRisk, target: &str) -> bool {
+    let Some((kind, pattern)) = rule.trim().split_once('(') else {
+        return false;
+    };
+    let Some(pattern) = pattern.strip_suffix(')') else {
+        return false;
+    };
+    let kind = kind.trim();
+    let kind_matches = match kind {
+        "Read" => matches!(risk, ToolRisk::Read | ToolRisk::Search | ToolRisk::GitRead),
+        "Write" => risk == ToolRisk::Write,
+        "Exec" => risk == ToolRisk::Execute,
+        "External" => risk == ToolRisk::External,
+        "Tool" => true,
+        _ => false,
+    };
+    if !kind_matches {
+        return false;
+    }
+    let pattern = pattern.trim();
+    if kind == "Exec"
+        && !pattern.contains('*')
+        && (target == pattern
+            || target
+                .strip_prefix(pattern)
+                .is_some_and(|suffix| suffix.starts_with(char::is_whitespace)))
+    {
+        return true;
+    }
+    if kind == "Tool"
+        && (target == pattern || target.strip_prefix(&format!("{pattern}:")).is_some())
+    {
+        return true;
+    }
+    glob_matches(pattern, target)
+}
+
+fn glob_matches(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let value = value.as_bytes();
+    if pattern.len() > 4096 || value.len() > 4096 {
+        return false;
+    }
+    let mut next = vec![false; value.len() + 1];
+    next[value.len()] = true;
+    for index in (0..pattern.len()).rev() {
+        let mut current = vec![false; value.len() + 1];
+        for value_index in (0..=value.len()).rev() {
+            current[value_index] = if pattern[index] == b'*' {
+                let recursive = pattern.get(index + 1) == Some(&b'*');
+                next[value_index]
+                    || (value_index < value.len()
+                        && (recursive || value[value_index] != b'/')
+                        && current[value_index + 1])
+            } else {
+                value_index < value.len()
+                    && pattern[index] == value[value_index]
+                    && next[value_index + 1]
+            };
+        }
+        next = current;
+    }
+    next[0]
 }
 
 pub fn validate_remote_path(workspace: &str, path: &str) -> Result<(), PolicyError> {
@@ -270,5 +370,173 @@ mod tests {
             ),
             Decision::NeedsUser
         );
+    }
+
+    #[test]
+    fn empty_rules_preserve_existing_decision_behavior() {
+        let rules = PermissionRules::default();
+        for mode in [
+            PermissionMode::Discuss,
+            PermissionMode::Plan,
+            PermissionMode::Interactive,
+            PermissionMode::Auto,
+            PermissionMode::Custom,
+        ] {
+            for risk in [
+                ToolRisk::Read,
+                ToolRisk::Search,
+                ToolRisk::GitRead,
+                ToolRisk::Write,
+                ToolRisk::Execute,
+                ToolRisk::External,
+            ] {
+                for unattended in [false, true] {
+                    let expected = decide(mode, risk, unattended, &[], "target");
+                    assert_eq!(
+                        decide_with_rules(mode, risk, unattended, &[], "target", Some(&rules)),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deny_rules_override_auto_mode() {
+        let rules = PermissionRules {
+            deny: vec!["Exec(sudo)".into()],
+            ..PermissionRules::default()
+        };
+        assert_eq!(
+            decide_with_rules(
+                PermissionMode::Auto,
+                ToolRisk::Execute,
+                false,
+                &[],
+                "sudo",
+                Some(&rules)
+            ),
+            Decision::Deny
+        );
+    }
+
+    #[test]
+    fn deny_rules_override_matching_grants() {
+        let rules = PermissionRules {
+            deny: vec!["External(git_push:**)".into()],
+            ..PermissionRules::default()
+        };
+        let grants = [DurableGrant {
+            key: "push".into(),
+            target: "git_push:project:owner/repo:feature".into(),
+            expires_at: None,
+        }];
+        assert_eq!(
+            decide_with_rules(
+                PermissionMode::Interactive,
+                ToolRisk::External,
+                false,
+                &grants,
+                "git_push:project:owner/repo:feature",
+                Some(&rules)
+            ),
+            Decision::Deny
+        );
+    }
+
+    #[test]
+    fn deny_rules_override_unattended_mode() {
+        let rules = PermissionRules {
+            deny: vec!["Exec(sudo)".into()],
+            ..PermissionRules::default()
+        };
+        assert_eq!(
+            decide_with_rules(
+                PermissionMode::Auto,
+                ToolRisk::Execute,
+                true,
+                &[],
+                "sudo",
+                Some(&rules)
+            ),
+            Decision::Deny
+        );
+    }
+
+    #[test]
+    fn allow_rules_authorize_calls_that_need_user_approval() {
+        let rules = PermissionRules {
+            allow: vec!["Exec(git status)".into()],
+            ..PermissionRules::default()
+        };
+        assert_eq!(
+            decide_with_rules(
+                PermissionMode::Interactive,
+                ToolRisk::Execute,
+                false,
+                &[],
+                "git status --short",
+                Some(&rules)
+            ),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn permission_globs_distinguish_single_and_recursive_segments() {
+        assert!(rule_matches("Read(*)", ToolRisk::Read, "file.txt"));
+        assert!(!rule_matches(
+            "Read(*)",
+            ToolRisk::Read,
+            "/workspace/src/file.txt"
+        ));
+        assert!(rule_matches(
+            "Read(**)",
+            ToolRisk::Read,
+            "/workspace/src/file.txt"
+        ));
+        assert!(!rule_matches(
+            "Write(**)",
+            ToolRisk::Read,
+            "/workspace/src/file.txt"
+        ));
+    }
+
+    #[test]
+    fn exec_rules_match_command_prefixes_at_word_boundaries() {
+        assert!(rule_matches(
+            "Exec(git status)",
+            ToolRisk::Execute,
+            "git status --short"
+        ));
+        assert!(rule_matches(
+            "Exec(git status)",
+            ToolRisk::Execute,
+            "git status"
+        ));
+        assert!(!rule_matches(
+            "Exec(git status)",
+            ToolRisk::Execute,
+            "git statusfoo"
+        ));
+        assert!(!rule_matches(
+            "Exec(git status)",
+            ToolRisk::Execute,
+            "git stash"
+        ));
+    }
+
+    #[test]
+    fn tool_rules_match_structured_targets_by_tool_prefix() {
+        assert!(rule_matches(
+            "Tool(git_push)",
+            ToolRisk::External,
+            "git_push:project:repo:branch"
+        ));
+        assert!(!rule_matches(
+            "Tool(git_push)",
+            ToolRisk::External,
+            "git_push_extra"
+        ));
     }
 }
