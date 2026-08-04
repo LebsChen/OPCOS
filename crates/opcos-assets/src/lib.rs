@@ -955,6 +955,7 @@ mod tests {
         assert_eq!(bundle.skills[0].path, "/repo/.agents/skills/foo/SKILL.md");
         assert_eq!(bundle.agents.len(), 1);
         assert_eq!(bundle.agents[0].path, "/repo/.agents/rules/x.md");
+        assert!(bundle.system_instructions().contains("# Rule"));
         let serialized = serde_json::to_string(&bundle).unwrap();
         assert!(!serialized.contains("data/docs/a.md"));
         assert!(!serialized.contains("data/docs/b.md"));
