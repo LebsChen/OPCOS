@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use opcos_rvm::{RvmClient, RvmError, join_remote_path};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -77,6 +78,110 @@ pub struct McpServerEntry {
     pub path: String,
     pub content: String,
     pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct McpCatalogEntry {
+    pub slug: String,
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub links: BTreeMap<String, String>,
+    pub enabled: bool,
+    pub requires_approval: bool,
+    pub transport: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    pub auth: String,
+    #[serde(default)]
+    pub required_inputs: Vec<String>,
+    #[serde(default)]
+    pub credential_inputs: Vec<String>,
+}
+
+const MCP_CATALOG_JSON: &str = include_str!("../data/mcp_catalog.json");
+
+pub fn builtin_mcp_catalog() -> Result<Vec<McpCatalogEntry>, AssetError> {
+    let entries: Vec<McpCatalogEntry> = serde_json::from_str(MCP_CATALOG_JSON)
+        .map_err(|error| AssetError::Invalid(format!("MCP catalog: {error}")))?;
+    let mut slugs = std::collections::HashSet::new();
+    for entry in &entries {
+        if entry.slug.trim().is_empty()
+            || entry.name.trim().is_empty()
+            || entry.description.trim().is_empty()
+            || entry.auth.trim().is_empty()
+            || !slugs.insert(entry.slug.clone())
+            || entry.enabled
+        {
+            return Err(AssetError::Invalid(format!(
+                "MCP catalog entry is invalid: {}",
+                entry.slug
+            )));
+        }
+        if entry
+            .links
+            .values()
+            .any(|link| link.to_ascii_lowercase().contains("devin.ai"))
+        {
+            return Err(AssetError::Invalid(format!(
+                "MCP catalog entry contains a Devin link: {}",
+                entry.slug
+            )));
+        }
+        if entry.env.values().any(|value| !value.is_empty()) {
+            return Err(AssetError::Invalid(format!(
+                "MCP catalog entry contains an environment value: {}",
+                entry.slug
+            )));
+        }
+        match entry.transport.as_str() {
+            "streamable-http" => {
+                if entry.command.is_some()
+                    || !entry
+                        .url
+                        .as_deref()
+                        .is_some_and(|url| url.starts_with("https://"))
+                {
+                    return Err(AssetError::Invalid(format!(
+                        "HTTP MCP catalog entry has invalid connection fields: {}",
+                        entry.slug
+                    )));
+                }
+            }
+            "stdio" => {
+                if entry.url.is_some()
+                    || !entry
+                        .command
+                        .as_deref()
+                        .is_some_and(|command| !command.trim().is_empty())
+                {
+                    return Err(AssetError::Invalid(format!(
+                        "stdio MCP catalog entry has invalid connection fields: {}",
+                        entry.slug
+                    )));
+                }
+            }
+            _ => {
+                return Err(AssetError::Invalid(format!(
+                    "MCP catalog entry has unsupported transport: {}",
+                    entry.slug
+                )));
+            }
+        }
+        if !matches!(entry.auth.as_str(), "oauth" | "api_key" | "none") {
+            return Err(AssetError::Invalid(format!(
+                "MCP catalog entry has unsupported auth: {}",
+                entry.slug
+            )));
+        }
+    }
+    Ok(entries)
 }
 
 fn default_argument_type() -> String {
@@ -456,6 +561,23 @@ mod tests {
         assert!(rendered.find("agents").unwrap() < rendered.find("knowledge").unwrap());
         assert!(rendered.find("knowledge").unwrap() < rendered.find("playbook").unwrap());
         assert!(rendered.find("playbook").unwrap() < rendered.find("skill").unwrap());
+    }
+
+    #[test]
+    fn builtin_mcp_catalog_is_disabled_and_excludes_private_builders() {
+        let entries = builtin_mcp_catalog().unwrap();
+        assert_eq!(entries.len(), 123);
+        assert!(entries.iter().any(|entry| entry.slug == "linear"));
+        assert!(entries.iter().any(|entry| entry.slug == "postgres"));
+        assert!(!entries.iter().any(|entry| entry.slug.contains("cognition")));
+        assert!(!entries.iter().any(|entry| entry.slug == "metabase"));
+        assert!(entries.iter().all(|entry| !entry.enabled));
+        let combined = serde_json::to_string(&entries)
+            .unwrap()
+            .to_ascii_lowercase();
+        for marker in ["devin.ai", "api.devin", "cog_"] {
+            assert!(!combined.contains(marker), "catalog contains {marker}");
+        }
     }
 
     #[test]

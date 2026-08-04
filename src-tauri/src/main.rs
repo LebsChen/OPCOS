@@ -18,7 +18,8 @@ use futures_util::{SinkExt, StreamExt};
 use notify::Watcher;
 use opcos_assets::{
     AssetBundle, CommandArgument, CommandEntry, InstructionSource, KnowledgeEntry, Playbook,
-    SkillEntry, discover as discover_assets, expand_command, parse_blueprint, parse_command,
+    SkillEntry, builtin_mcp_catalog, discover as discover_assets, expand_command, parse_blueprint,
+    parse_command,
 };
 use opcos_engine::{
     AcpHarness, AcpHarnessConfig, AgentEngine, EngineError, Harness, OpenCodeHarness,
@@ -4036,6 +4037,7 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
     migrate_mcp_session_tools(&connection)?;
     migrate_config_objects(&mut connection)?;
     migrate_config_scope_model(&connection)?;
+    migrate_removed_organization_presets(&connection)?;
     seed_builtin_templates(&connection)?;
     migrate_coordination(&connection)?;
     Ok(connection)
@@ -4197,6 +4199,80 @@ fn migrate_config_scope_model(connection: &Connection) -> Result<(), String> {
         "INSERT INTO desktop_schema_migrations(version,applied_at)
          VALUES ('p1-2-config-scope-model',?1)",
         [Utc::now().to_rfc3339()],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())
+}
+
+fn migrate_removed_organization_presets(connection: &Connection) -> Result<(), String> {
+    const MIGRATION: &str = "p1-3-remove-organization-presets";
+    const REMOVED_IDS: [&str; 7] = [
+        "template-knowledge-opcos-hosts",
+        "template-knowledge-opcos-windows-ime",
+        "template-knowledge-opcos-local-gates",
+        "template-knowledge-opcos-coordination",
+        "template-runbook-opcos-rvm",
+        "template-runbook-opcos-coordination",
+        "template-runbook-opcos-local-release",
+    ];
+    let migrated: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM desktop_schema_migrations WHERE version=?1
+             )",
+            [MIGRATION],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if migrated {
+        return Ok(());
+    }
+    let tx = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    for id in REMOVED_IDS {
+        let pristine: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1
+                   FROM config_object o
+                   JOIN config_object_version v ON v.id=o.current_version_id
+                   WHERE o.id=?1 AND o.status='builtin'
+                     AND o.current_version_id=?2
+                     AND v.version=1 AND v.note='builtin seed'
+                     AND (SELECT COUNT(*) FROM config_object_version
+                          WHERE object_id=o.id)=1
+                 )",
+                params![id, format!("{id}:v1")],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !pristine {
+            continue;
+        }
+        tx.execute(
+            "DELETE FROM project_config_selection WHERE object_id=?1",
+            [id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "DELETE FROM session_config_versions WHERE object_id=?1",
+            [id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "DELETE FROM session_config_bindings WHERE object_id=?1",
+            [id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute("DELETE FROM config_object_version WHERE object_id=?1", [id])
+            .map_err(|error| error.to_string())?;
+        tx.execute("DELETE FROM config_object WHERE id=?1", [id])
+            .map_err(|error| error.to_string())?;
+    }
+    tx.execute(
+        "INSERT INTO desktop_schema_migrations(version,applied_at) VALUES (?1,?2)",
+        params![MIGRATION, Utc::now().to_rfc3339()],
     )
     .map_err(|error| error.to_string())?;
     tx.commit().map_err(|error| error.to_string())
@@ -4385,71 +4461,6 @@ fn seed_builtin_templates(connection: &Connection) -> Result<(), String> {
             &json!(content),
         )?;
     }
-    let opc_knowledge = [
-        (
-            "template-knowledge-opcos-hosts",
-            "OPCOS Host 使用边界",
-            "LocalHost 与 RVM 的能力边界、路径和失败语义。",
-            r#"# OPCOS Host 使用边界
-
-- LocalHost 负责本机 workspace 的文件、命令、结构化 stdio 和本地进程生命周期。
-- RVM 只通过 Host 抽象访问远端；远端不可用时必须报告明确错误，不能静默改跑本机。
-- 远端路径使用 Host 的路径代数和 containment 检查，不用本机路径规范化猜测远端位置。
-- 凭据只通过 Authorization Bearer header 或 SecretStore 的受控引用传递，不写入 URL、日志、提示词或仓库。
-- MCP server 的仓库声明只表示“已发现”，默认 disabled；启用必须由用户明确选择。
-"#,
-        ),
-        (
-            "template-knowledge-opcos-windows-ime",
-            "Windows 中文输入法空格排查",
-            "Computer Use 在 Windows 中文输入法下输入空格可能被吞掉时的排查办法。",
-            r#"# Windows 中文输入法空格排查
-
-在 Windows 中文输入法处于中文模式时，Computer Use 的空格输入可能被输入法吞掉、转换为候选操作，或没有进入目标控件。
-
-1. 先确认焦点确实在目标编辑控件。
-2. 检查当前输入法中英文状态；需要稳定输入时切换到英文模式再发送文本。
-3. 对包含空格的内容，分段输入并在界面中读取结果确认空格实际存在。
-4. 不要仅凭“按键事件已发送”声称文本正确；应通过读取控件或截图核对。
-5. 若仍失败，明确报告输入法状态和复现步骤，不要静默改写用户文本。
-"#,
-        ),
-        (
-            "template-knowledge-opcos-local-gates",
-            "OPCOS 本地验证优先",
-            "不依赖远端 CI 结论的本地构建、测试和交付原则。",
-            r#"# OPCOS 本地验证优先
-
-- 修改后优先在绑定 Host 上运行仓库规定的格式化、lint、类型检查、构建和测试。
-- 每条门禁都记录实际命令、退出结果和环境限制；未运行不等于通过。
-- GitHub API 可用于读取 PR、分支和 CI 状态，但外部状态不能替代本地可复现验证。
-- 失败应保留证据并修复根因；不要通过跳过门禁、吞掉错误或修改测试来制造绿色结果。
-"#,
-        ),
-        (
-            "template-knowledge-opcos-coordination",
-            "OPCOS 本地协同协议",
-            "OPCOS Leader/Worker 星型协同、消息协议和真实交付判据。",
-            r#"# OPCOS 本地协同协议
-
-- `sort_order == 0` 的角色是 Leader，其余是 Worker；只允许 Leader→Worker 派发、Worker→Leader 回传。
-- 协同消息使用 `[[COORD]]` 结构化信封，Worker 之间不得直接通信。
-- 模型工具只能让当前 builtin Leader 派发给已存在的 builtin Worker，不创建 session，也不递归派生。
-- Worker 自述结果只能是 `worker_reported` 或 `awaiting_verification`，不是完成证据。
-- 真实交付必须由分支、push、PR repository/head 和 GitHub API 核实；验收后才能进入 Done。
-"#,
-        ),
-    ];
-    for (id, name, description, content) in opc_knowledge {
-        seed_builtin_template(
-            connection,
-            id,
-            "knowledge",
-            name,
-            description,
-            &json!(content),
-        )?;
-    }
     let runbooks = [
         (
             "template-runbook-new-feature",
@@ -4490,48 +4501,132 @@ fn seed_builtin_templates(connection: &Connection) -> Result<(), String> {
             &json!(content),
         )?;
     }
-    let opc_runbooks = [
+    let system_playbooks = [
         (
-            "template-runbook-opcos-rvm",
-            "在 OPCOS Host 上执行任务",
-            "选择 LocalHost 或 RVM 并以显式失败语义执行开发任务。",
-            r#"# 在 OPCOS Host 上执行任务
+            "template-runbook-playbook-template",
+            "通用工作流预设模板",
+            "创建不隐含外部执行权限的结构化 OPCOS 工作流预设。",
+            r#"# 通用工作流预设模板
 
-1. 确认 session 绑定的 Host、workspace 和仓库边界。
-2. LocalHost 任务使用本机 Host；RVM 任务使用远端 Host 的路径和能力。
-3. 执行前检查所需 capability；缺失时返回明确错误，不切换到另一台 Host。
-4. 对文件变更、命令结果和进程退出状态保留有界证据。
-5. 完成后运行仓库门禁，并报告实际结果和未解决限制。
+## 目标
+
+用一句话说明工作流要解决的问题和不解决的问题。
+
+## 输入
+
+列出用户必须提供的仓库、范围、约束和验收条件；缺少关键输入时先提问。
+
+## 步骤
+
+按调查、计划、实现、验证和交付顺序列出可检查的步骤。每一步都说明完成证据。
+
+## 输出
+
+说明要返回的摘要、文件位置、验证命令和未解决限制。
+
+## 禁止事项
+
+明确不得执行的副作用、不得猜测的事实和必须保密的数据。
+
+预设正文只描述工作流，不直接执行 shell、Git、MCP 或其他外部动作。
 "#,
         ),
         (
-            "template-runbook-opcos-coordination",
-            "派发并验收 OPCOS 协同任务",
-            "使用本地 Leader/Worker 协同并保留 Worker 自述与客观验证的区别。",
-            r#"# 派发并验收 OPCOS 协同任务
+            "template-runbook-pr-review",
+            "Pull Request 代码审查",
+            "以风险和证据为中心审查当前 GitHub Pull Request。",
+            r#"# Pull Request 代码审查
 
-1. 由当前 builtin Leader 选择已存在的 Worker role；Worker 不得派发子任务。
-2. 使用 `coordination_dispatch` 后立即记录 task id 和 pending 状态，不阻塞等待。
-3. 使用 `coordination_status` 查看有界回报，并尊重建议的下次查询时间。
-4. Worker 回报只作为线索；检查真实 branch、push、PR API、head 和 repository。
-5. 只有验证通过并完成必要验收后，才将协同任务视为 Done。
+1. 确认当前 project/repo、目标分支和 Pull Request 范围；不要审查未指定的仓库。
+2. 阅读需求、变更文件和完整 diff，必要时追踪相关调用链和历史。
+3. 优先检查正确性、权限边界、凭据处理、数据损坏、并发、性能和回归风险。
+4. 每个问题给出文件位置、严重性、触发条件、影响和最小修复建议。
+5. 检查已有验证证据；不要把未运行的测试或未知 CI 状态写成通过。
+6. 输出按严重性排序的问题清单、已检查风险面和一个明确的总体结论。
+
+只提供审查意见，不修改被审查分支，也不擅自合并或创建额外交付物。
 "#,
         ),
         (
-            "template-runbook-opcos-local-release",
-            "OPCOS 本地构建与交付",
-            "从本地门禁到可审查 GitHub 交付的重复流程。",
-            r#"# OPCOS 本地构建与交付
+            "template-runbook-bug-catcher",
+            "代码库 Bug 排查",
+            "从仓库事实、近期变更和可复现证据中定位并修复高价值缺陷。",
+            r#"# 代码库 Bug 排查
 
-1. 从最新目标分支创建任务分支，检查状态和完整 diff。
-2. 在本地 Host 运行 Rust 和前端格式化、lint、类型检查、构建和测试。
-3. 修复失败根因，确认没有凭据、临时文件或无关改动。
-4. 显式暂存相关文件并创建单一目的提交。
-5. 推送分支后核对远端 commit、PR repository/head 和实际 diff。
+1. 使用当前 session 绑定的 project/repo，先了解目录、构建入口、规则文件和测试布局。
+2. 阅读相关近期提交及完整 diff；结合已有 issue、日志和失败测试寻找候选问题。
+3. 选择一个有明确影响且能复现的问题，记录输入、环境、预期和实际结果。
+4. 提出有证据支持的根因假设，补充能捕获原始问题的回归测试。
+5. 以最小改动修复根因，运行相关测试和项目完整门禁。
+6. 报告根因、修改文件、验证命令、实际结果和仍未解决的限制。
+
+如果无法建立可靠复现或证据不足，应报告调查结果并停下，不凭猜测修改代码。
+"#,
+        ),
+        (
+            "template-runbook-visual-qa",
+            "应用视觉质量检查",
+            "在具备桌面和截图能力的 Host 上完成一次有界的视觉 QA。",
+            r#"# 应用视觉质量检查
+
+1. 研究当前 project/repo 的启动方式和目标页面，先在绑定 Host 上尝试本地运行。
+2. 检查 Host 是否声明截图、桌面或浏览器能力；能力缺失时明确报告，不伪造视觉结果。
+3. 只选择一个可复现目标，例如响应式布局、主题切换、核心交互或已报告问题。
+4. 通过真实 UI 操作和截图验证目标；必要时回读界面状态，不只展示空白或登录页。
+5. 输出复现步骤、环境、观察结果、严重性、截图路径和建议修复方向。
+
+不要把截图、视频或“应用已运行”的口头描述当作测试通过证据。
+"#,
+        ),
+        (
+            "template-runbook-readme-generation",
+            "README 与项目文档生成",
+            "从代码事实生成准确、可运行且不虚构能力的 README 和轻量文档。",
+            r#"# README 与项目文档生成
+
+1. 从项目清单、源码、脚本、配置、测试和现有 docs 提取事实；不凭名称猜测能力。
+2. 识别受支持的平台、运行时、安装、构建、运行、测试、配置和已知限制。
+3. 按项目需要组织 Overview、Quickstart、Configuration、Usage、Development、Troubleshooting 和 License。
+4. 所有命令都必须来自仓库事实并在绑定 Host 上验证；无法验证的步骤标为待确认。
+5. 不写入凭据值、个人数据、虚构端点或未实现的集成；把长篇说明放到 docs。
+6. 检查 Markdown 格式、链接、示例和 README 与当前代码的一致性。
+
+交付报告必须列出实际验证命令、结果和未验证事项。
+"#,
+        ),
+        (
+            "template-runbook-pr-documentation",
+            "Pull Request 交付文档",
+            "生成包含范围、风险和验证证据的清晰 GitHub Pull Request 描述。",
+            r#"# Pull Request 交付文档
+
+1. 从实际 diff 和任务要求提取标题、背景、变更范围、非目标和用户影响。
+2. 记录测试、构建、格式检查、截图、日志和已知限制；未运行的检查必须明确标注。
+3. 检查是否需要迁移、回滚、兼容性说明或用户文档更新，不为形式而修改无关文件。
+4. 确认描述不包含凭据、个人数据、未脱敏日志或无法由仓库事实支持的声明。
+5. 使用仓库已有模板和 GitHub 交付约定，核对 source/head/repository 与实际分支一致。
+
+这份预设只生成和校验文档内容；创建、推送或合并 Pull Request 必须由用户授权的普通 Git 工具完成。
+"#,
+        ),
+        (
+            "template-runbook-architecture-diagram",
+            "代码库架构图",
+            "根据当前 project/repo 的代码事实生成可审查的架构图源文件和说明。",
+            r#"# 代码库架构图
+
+1. 分析目录、入口、主要模块、数据存储、外部边界和关键调用关系。
+2. 先探测仓库或 Host 是否有可用的 Mermaid、PlantUML 或其他渲染工具。
+3. 若渲染工具存在，使用仓库已有配置生成图并检查命令退出状态。
+4. 若工具不存在，只输出 Mermaid 源码和组件说明，不执行未经验证的安装命令，也不声称已生成图片。
+5. 图中区分用户、应用边界、模块、持久化层、外部服务和数据流；避免把猜测画成事实。
+6. 输出源文件、渲染结果（若确实生成）、分析范围、验证命令和未解析的边界。
+
+不要依赖隐式公网 include、仓库外凭据或未探测的 CLI；图表必须能由读者复核。
 "#,
         ),
     ];
-    for (id, name, description, content) in opc_runbooks {
+    for (id, name, description, content) in system_playbooks {
         seed_builtin_template(
             connection,
             id,
@@ -4631,6 +4726,17 @@ description: 为新行为和缺陷修复设计覆盖正常、失败及边界条�
     ];
     for (id, name, description, content) in mcp_servers {
         seed_builtin_template(connection, id, "mcp", name, description, &content)?;
+    }
+    for entry in builtin_mcp_catalog().map_err(|error| error.to_string())? {
+        let content = serde_json::to_value(&entry).map_err(|error| error.to_string())?;
+        seed_builtin_template(
+            connection,
+            &format!("template-mcp-catalog-{}", entry.slug),
+            "mcp",
+            &entry.name,
+            &entry.description,
+            &content,
+        )?;
     }
     let connectors = [
         (
@@ -19830,7 +19936,48 @@ mod m7_tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(builtin_count, 29);
+        // 152 = 29 baseline assets plus 123 verified, disabled MCP catalog entries.
+        assert_eq!(builtin_count, 152);
+        for id in [
+            "template-runbook-playbook-template",
+            "template-runbook-pr-review",
+            "template-runbook-bug-catcher",
+            "template-runbook-visual-qa",
+            "template-runbook-readme-generation",
+            "template-runbook-pr-documentation",
+            "template-runbook-architecture-diagram",
+        ] {
+            assert!(
+                connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM config_object WHERE id=?1 AND status='builtin')",
+                        [id],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap(),
+                "expected sanitized system playbook {id}"
+            );
+        }
+        for id in [
+            "template-knowledge-opcos-hosts",
+            "template-knowledge-opcos-windows-ime",
+            "template-knowledge-opcos-local-gates",
+            "template-knowledge-opcos-coordination",
+            "template-runbook-opcos-rvm",
+            "template-runbook-opcos-coordination",
+            "template-runbook-opcos-local-release",
+        ] {
+            assert!(
+                !connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM config_object WHERE id=?1)",
+                        [id],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap(),
+                "organization-private asset {id} must not be seeded"
+            );
+        }
         for kind in [
             "rules",
             "knowledge",
@@ -19852,6 +19999,114 @@ mod m7_tests {
                 .unwrap();
             assert!(count > 0, "expected builtin preset for {kind}");
         }
+    }
+
+    #[test]
+    fn removed_organization_presets_delete_only_pristine_builtin_rows() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE desktop_schema_migrations (
+                   version TEXT PRIMARY KEY,
+                   applied_at TEXT NOT NULL
+                 );
+                 CREATE TABLE config_object (
+                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+                   server_key TEXT, scope_kind TEXT NOT NULL, scope_key TEXT,
+                   status TEXT NOT NULL, created_at TEXT NOT NULL,
+                   current_version_id TEXT
+                 );
+                 CREATE TABLE config_object_version (
+                   id TEXT PRIMARY KEY, object_id TEXT NOT NULL, version INTEGER NOT NULL,
+                   content TEXT NOT NULL, content_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+                   note TEXT NOT NULL, metadata_json TEXT NOT NULL,
+                   UNIQUE(object_id,version)
+                 );
+                 CREATE TABLE project_config_selection (
+                   project_id TEXT NOT NULL, object_id TEXT NOT NULL, enabled INTEGER NOT NULL,
+                   PRIMARY KEY(project_id,object_id)
+                 );
+                 CREATE TABLE session_config_versions (
+                   session_id TEXT NOT NULL, object_id TEXT NOT NULL, version_id TEXT NOT NULL,
+                   PRIMARY KEY(session_id,object_id)
+                 );
+                 CREATE TABLE session_config_bindings (
+                   session_id TEXT NOT NULL, object_id TEXT NOT NULL,
+                   PRIMARY KEY(session_id,object_id)
+                 );
+                 INSERT INTO config_object
+                   (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
+                 VALUES
+                   ('template-knowledge-opcos-hosts','knowledge','old','key','global',NULL,
+                    'builtin','now','template-knowledge-opcos-hosts:v1'),
+                   ('template-knowledge-opcos-windows-ime','knowledge','edited','key','global',NULL,
+                    'active','now','template-knowledge-opcos-windows-ime:v2');
+                 INSERT INTO config_object_version
+                   (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+                 VALUES
+                   ('template-knowledge-opcos-hosts:v1','template-knowledge-opcos-hosts',1,
+                    'old','hash','now','builtin seed','{}'),
+                   ('template-knowledge-opcos-windows-ime:v1','template-knowledge-opcos-windows-ime',1,
+                    'original','hash','now','builtin seed','{}'),
+                   ('template-knowledge-opcos-windows-ime:v2','template-knowledge-opcos-windows-ime',2,
+                    'edited','hash','now','edited','{}');
+                 INSERT INTO project_config_selection VALUES
+                   ('project-1','template-knowledge-opcos-hosts',1),
+                   ('project-1','template-knowledge-opcos-windows-ime',1);
+                 INSERT INTO session_config_versions VALUES
+                   ('session-1','template-knowledge-opcos-hosts','template-knowledge-opcos-hosts:v1'),
+                   ('session-1','template-knowledge-opcos-windows-ime','template-knowledge-opcos-windows-ime:v2');
+                 INSERT INTO session_config_bindings VALUES
+                   ('session-1','template-knowledge-opcos-hosts'),
+                   ('session-1','template-knowledge-opcos-windows-ime');",
+            )
+            .unwrap();
+
+        migrate_removed_organization_presets(&connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM config_object WHERE id='template-knowledge-opcos-hosts'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status FROM config_object
+                     WHERE id='template-knowledge-opcos-windows-ime'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "active"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM config_object_version
+                     WHERE object_id='template-knowledge-opcos-windows-ime'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        migrate_removed_organization_presets(&connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM desktop_schema_migrations
+                     WHERE version='p1-3-remove-organization-presets'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -19896,6 +20151,9 @@ mod m7_tests {
                 "api.devin",
                 "cog_",
                 "cloud-dev",
+                "list_repos",
+                "child devin",
+                "!playbook",
                 "token=",
                 "password=",
                 "secret=",
