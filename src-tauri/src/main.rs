@@ -5124,6 +5124,15 @@ async fn execute_control_slash_action(
             );
         }
         "/mode" => {
+            if remainder.is_empty() {
+                emit(
+                    app,
+                    "notice",
+                    Some(&session.session_id),
+                    json!({"kind":"mode_current","text":format!("Current mode: {}", session.mode)}),
+                );
+                return Ok(true);
+            }
             let mode = parse_permission_mode(remainder)?;
             let mode_name = permission_mode_name(mode).to_owned();
             if let Some(engine) = state.engines.lock().await.get(&session.session_id).cloned() {
@@ -5142,9 +5151,19 @@ async fn execute_control_slash_action(
         }
         "/model" => {
             let model = remainder.trim();
-            if model.is_empty() || model.split_whitespace().count() != 1 {
+            if model.is_empty() {
+                emit(
+                    app,
+                    "notice",
+                    Some(&session.session_id),
+                    json!({"kind":"model_current","text":format!("Current model: {}", session.model)}),
+                );
+                return Ok(true);
+            }
+            if model.split_whitespace().count() != 1 {
                 return Err("/model requires exactly one model name".into());
             }
+            validate_session_model(state, session, model).await?;
             if let Some(engine) = state.engines.lock().await.get(&session.session_id).cloned() {
                 engine
                     .change_model(model.to_owned())
@@ -5170,11 +5189,17 @@ async fn execute_control_slash_action(
                 .store
                 .load_sessions()
                 .map_err(|error| error.to_string())?;
+            let mut sessions = sessions
+                .into_iter()
+                .filter(|item| item.project_id.as_deref() == session.project_id.as_deref())
+                .collect::<Vec<_>>();
+            sessions.sort_by_key(|item| std::cmp::Reverse(item.updated_at));
             let text = if sessions.is_empty() {
                 "No persisted sessions.".to_owned()
             } else {
                 sessions
                     .into_iter()
+                    .take(10)
                     .map(|item| {
                         let marker = if item.session_id == session.session_id {
                             "*"
@@ -5258,9 +5283,7 @@ fn expand_slash_command(
     {
         return Ok(text.to_owned());
     }
-    if command.get("kind").and_then(Value::as_str) == Some("command")
-        || command.get("kind").and_then(Value::as_str) == Some("custom")
-    {
+    if command.get("kind").and_then(Value::as_str) == Some("command") {
         let arguments = command
             .get("arguments")
             .cloned()
@@ -11055,9 +11078,8 @@ struct ProviderModelsResponse {
     cache_hit: bool,
 }
 
-#[tauri::command]
-async fn provider_models(
-    state: State<'_, DesktopState>,
+async fn provider_models_for_state(
+    state: &DesktopState,
     provider: String,
     refresh: Option<bool>,
 ) -> Result<ProviderModelsResponse, String> {
@@ -11201,6 +11223,52 @@ async fn provider_models(
         discovered_at: cached.discovered_at,
         cache_hit: false,
     })
+}
+
+#[tauri::command]
+async fn provider_models(
+    state: State<'_, DesktopState>,
+    provider: String,
+    refresh: Option<bool>,
+) -> Result<ProviderModelsResponse, String> {
+    provider_models_for_state(&state, provider, refresh).await
+}
+
+async fn current_session_provider(
+    state: &DesktopState,
+    session: &SessionRecord,
+) -> Result<String, String> {
+    if let Some(provider) = session.provider.clone() {
+        return Ok(provider);
+    }
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    connection
+        .query_row(
+            "SELECT value FROM settings WHERE key='provider.id'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .or_else(|_| Ok::<String, rusqlite::Error>("openai".into()))
+        .map_err(|error| error.to_string())
+}
+
+async fn validate_session_model(
+    state: &DesktopState,
+    session: &SessionRecord,
+    model: &str,
+) -> Result<(), String> {
+    let provider = current_session_provider(state, session).await?;
+    let discovery = provider_models_for_state(state, provider.clone(), Some(false)).await?;
+    if discovery.models.iter().any(|item| item.id == model) {
+        Ok(())
+    } else {
+        Err(format!(
+            "model {model} is not available for provider {provider}"
+        ))
+    }
 }
 
 #[tauri::command]
