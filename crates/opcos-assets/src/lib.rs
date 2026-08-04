@@ -82,6 +82,13 @@ pub struct KnowledgeEntry {
     pub enabled: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KnowledgeContext<'a> {
+    pub task: &'a str,
+    pub repository: Option<&'a str>,
+    pub project: Option<&'a str>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Playbook {
     pub title: String,
@@ -151,6 +158,8 @@ pub struct McpCatalogEntry {
 
 const MCP_CATALOG_JSON: &str = include_str!("../data/mcp_catalog.json");
 
+pub const MAX_KNOWLEDGE_ENTRIES: usize = 32;
+pub const MAX_KNOWLEDGE_BYTES: usize = 64 * 1024;
 pub const MAX_SYSTEM_INSTRUCTION_BYTES: usize = 256 * 1024;
 pub const MAX_ASSET_FILE_BYTES: usize = 64 * 1024;
 pub const BUILTIN_AGENT_TOOL_NAMES: &[&str] = &[
@@ -330,6 +339,20 @@ pub fn redact_secret(value: &mut serde_json::Value, secret: &str) {
 
 impl AssetBundle {
     pub fn system_instructions(&self) -> String {
+        self.system_instructions_for(KnowledgeContext {
+            task: "",
+            repository: None,
+            project: None,
+        })
+    }
+
+    /// Filters knowledge once using the session's initial task and scope.
+    ///
+    /// An empty trigger is always eligible for backward compatibility. Non-empty
+    /// triggers use a deterministic case-insensitive substring match. Empty or
+    /// `global` scopes are universal; repository/project scopes require the
+    /// corresponding context, and other values must match that context exactly.
+    pub fn system_instructions_for(&self, context: KnowledgeContext<'_>) -> String {
         let mut sections = vec![format!(
             "[Built-in Agent Instructions]\n{BUILTIN_AGENT_INSTRUCTIONS}"
         )];
@@ -345,13 +368,47 @@ impl AssetBundle {
                 &source.content,
             ));
         }
-        for entry in self.knowledge.iter().filter(|entry| entry.enabled) {
-            sections.push(format_asset_section(
+        let mut knowledge = self
+            .knowledge
+            .iter()
+            .filter(|entry| entry.enabled)
+            .collect::<Vec<_>>();
+        knowledge.sort_by(|left, right| {
+            (&left.title, &left.scope, &left.trigger, &left.body).cmp(&(
+                &right.title,
+                &right.scope,
+                &right.trigger,
+                &right.body,
+            ))
+        });
+        let mut knowledge_bytes = 0;
+        let mut knowledge_count = 0;
+        let mut omitted_knowledge = 0;
+        for entry in knowledge {
+            if !knowledge_entry_matches(entry, context) {
+                omitted_knowledge += 1;
+                continue;
+            }
+            let section = format_asset_section(
                 &format!(
                     "[Knowledge: {} | trigger: {} | scope: {}]",
                     entry.title, entry.trigger, entry.scope
                 ),
                 &entry.body,
+            );
+            if knowledge_count >= MAX_KNOWLEDGE_ENTRIES
+                || knowledge_bytes + section.len() > MAX_KNOWLEDGE_BYTES
+            {
+                omitted_knowledge += 1;
+                continue;
+            }
+            knowledge_bytes += section.len();
+            knowledge_count += 1;
+            sections.push(section);
+        }
+        if omitted_knowledge > 0 {
+            sections.push(format!(
+                "[{omitted_knowledge} knowledge sections omitted: trigger/scope filter or knowledge limit]"
             ));
         }
         if let Some(playbook) = &self.playbook {
@@ -375,6 +432,41 @@ const OMITTED_SECTIONS_MARKER: &str =
 const TRUNCATED_SECTION_MARKER: &str =
     "[Asset section truncated: system instruction budget exceeded]";
 const TRUNCATED_FILE_MARKER: &str = "[Asset file truncated: file size limit exceeded]";
+
+fn knowledge_entry_matches(entry: &KnowledgeEntry, context: KnowledgeContext<'_>) -> bool {
+    trigger_matches(&entry.trigger, context.task) && scope_matches(&entry.scope, context)
+}
+
+fn trigger_matches(trigger: &str, task: &str) -> bool {
+    let trigger = trigger.trim();
+    trigger.is_empty() || task.to_lowercase().contains(&trigger.to_lowercase())
+}
+
+fn scope_matches(scope: &str, context: KnowledgeContext<'_>) -> bool {
+    let scope = scope.trim();
+    if scope.is_empty() || scope.eq_ignore_ascii_case("global") {
+        return true;
+    }
+    if scope.eq_ignore_ascii_case("repo") || scope.eq_ignore_ascii_case("repository") {
+        return context.repository.is_some();
+    }
+    if scope.eq_ignore_ascii_case("project") {
+        return context.project.is_some();
+    }
+    if let Some(repository) = context.repository {
+        let repository = repository.trim().trim_start_matches("repo:");
+        if scope == repository || scope == format!("repo:{repository}") {
+            return true;
+        }
+    }
+    if let Some(project) = context.project {
+        let project = project.trim().trim_start_matches("project:");
+        if scope == project || scope == format!("project:{project}") {
+            return true;
+        }
+    }
+    false
+}
 
 fn format_asset_section(header: &str, content: &str) -> String {
     format!("{header}\n{}", truncate_asset_file(content))
@@ -845,11 +937,197 @@ mod tests {
             local_hooks: None,
             hook_errors: Vec::new(),
         };
-        let rendered = bundle.system_instructions();
+        let rendered = bundle.system_instructions_for(KnowledgeContext {
+            task: "task",
+            repository: Some("/workspace"),
+            project: None,
+        });
         assert!(rendered.find("global").unwrap() < rendered.find("agents").unwrap());
         assert!(rendered.find("agents").unwrap() < rendered.find("knowledge").unwrap());
         assert!(rendered.find("knowledge").unwrap() < rendered.find("playbook").unwrap());
         assert!(rendered.find("playbook").unwrap() < rendered.find("skill").unwrap());
+    }
+
+    #[test]
+    fn knowledge_without_trigger_is_always_injected() {
+        let bundle = AssetBundle {
+            knowledge: vec![KnowledgeEntry {
+                title: "Always".into(),
+                body: "legacy knowledge".into(),
+                trigger: String::new(),
+                scope: String::new(),
+                enabled: true,
+            }],
+            ..AssetBundle::default()
+        };
+        let rendered = bundle.system_instructions_for(KnowledgeContext {
+            task: "unrelated task",
+            repository: None,
+            project: None,
+        });
+        assert!(rendered.contains("legacy knowledge"));
+        assert!(!rendered.contains("knowledge sections omitted"));
+    }
+
+    #[test]
+    fn knowledge_trigger_matches_case_insensitive_task_text() {
+        let bundle = AssetBundle {
+            knowledge: vec![KnowledgeEntry {
+                title: "Build".into(),
+                body: "build knowledge".into(),
+                trigger: "build".into(),
+                scope: String::new(),
+                enabled: true,
+            }],
+            ..AssetBundle::default()
+        };
+        let matching = bundle.system_instructions_for(KnowledgeContext {
+            task: "Run the BUILD checks",
+            repository: None,
+            project: None,
+        });
+        let non_matching = bundle.system_instructions_for(KnowledgeContext {
+            task: "Review the documentation",
+            repository: None,
+            project: None,
+        });
+        assert!(matching.contains("build knowledge"));
+        assert!(!non_matching.contains("build knowledge"));
+        assert!(
+            non_matching.contains(
+                "[1 knowledge sections omitted: trigger/scope filter or knowledge limit]"
+            )
+        );
+    }
+
+    #[test]
+    fn knowledge_scope_matches_global_repository_and_project_context() {
+        let bundle = AssetBundle {
+            knowledge: vec![
+                KnowledgeEntry {
+                    title: "Global".into(),
+                    body: "global knowledge".into(),
+                    trigger: String::new(),
+                    scope: "global".into(),
+                    enabled: true,
+                },
+                KnowledgeEntry {
+                    title: "Repository".into(),
+                    body: "repository knowledge".into(),
+                    trigger: String::new(),
+                    scope: "repository".into(),
+                    enabled: true,
+                },
+                KnowledgeEntry {
+                    title: "Project".into(),
+                    body: "project knowledge".into(),
+                    trigger: String::new(),
+                    scope: "project:project-1".into(),
+                    enabled: true,
+                },
+            ],
+            ..AssetBundle::default()
+        };
+        let rendered = bundle.system_instructions_for(KnowledgeContext {
+            task: "task",
+            repository: Some("/workspace"),
+            project: Some("project-1"),
+        });
+        assert!(rendered.contains("global knowledge"));
+        assert!(rendered.contains("repository knowledge"));
+        assert!(rendered.contains("project knowledge"));
+        let project_miss = bundle.system_instructions_for(KnowledgeContext {
+            task: "task",
+            repository: Some("/workspace"),
+            project: Some("project-2"),
+        });
+        assert!(!project_miss.contains("project knowledge"));
+    }
+
+    #[test]
+    fn knowledge_filtering_is_bounded_and_marks_omissions() {
+        let bundle = AssetBundle {
+            knowledge: (0..(MAX_KNOWLEDGE_ENTRIES + 1))
+                .map(|index| KnowledgeEntry {
+                    title: format!("Knowledge {index:02}"),
+                    body: "x".repeat(MAX_KNOWLEDGE_BYTES / 4),
+                    trigger: String::new(),
+                    scope: String::new(),
+                    enabled: true,
+                })
+                .collect(),
+            ..AssetBundle::default()
+        };
+        let rendered = bundle.system_instructions_for(KnowledgeContext {
+            task: "task",
+            repository: None,
+            project: None,
+        });
+        assert!(rendered.contains("knowledge sections omitted"));
+        assert!(rendered.len() <= MAX_SYSTEM_INSTRUCTION_BYTES);
+        assert!(
+            rendered.matches("[Knowledge:").count() <= MAX_KNOWLEDGE_ENTRIES,
+            "knowledge entry count exceeded limit"
+        );
+        let retained_knowledge_bytes = bundle
+            .knowledge
+            .iter()
+            .filter(|entry| {
+                rendered.contains(&format!(
+                    "[Knowledge: {} | trigger: {} | scope: {}]",
+                    entry.title, entry.trigger, entry.scope
+                ))
+            })
+            .map(|entry| {
+                format_asset_section(
+                    &format!(
+                        "[Knowledge: {} | trigger: {} | scope: {}]",
+                        entry.title, entry.trigger, entry.scope
+                    ),
+                    &entry.body,
+                )
+                .len()
+            })
+            .sum::<usize>();
+        assert!(retained_knowledge_bytes <= MAX_KNOWLEDGE_BYTES);
+    }
+
+    #[test]
+    fn knowledge_filtering_order_is_deterministic() {
+        let bundle = AssetBundle {
+            knowledge: vec![
+                KnowledgeEntry {
+                    title: "Z".into(),
+                    body: "z".into(),
+                    trigger: String::new(),
+                    scope: String::new(),
+                    enabled: true,
+                },
+                KnowledgeEntry {
+                    title: "A".into(),
+                    body: "a".into(),
+                    trigger: String::new(),
+                    scope: String::new(),
+                    enabled: true,
+                },
+            ],
+            ..AssetBundle::default()
+        };
+        let context = KnowledgeContext {
+            task: "task",
+            repository: None,
+            project: None,
+        };
+        let reversed = AssetBundle {
+            knowledge: bundle.knowledge.iter().cloned().rev().collect(),
+            ..AssetBundle::default()
+        };
+        assert_eq!(
+            bundle.system_instructions_for(context),
+            reversed.system_instructions_for(context)
+        );
+        let rendered = bundle.system_instructions_for(context);
+        assert!(rendered.find("a").unwrap() < rendered.find("z").unwrap());
     }
 
     #[test]
