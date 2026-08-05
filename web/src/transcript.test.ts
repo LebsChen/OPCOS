@@ -574,4 +574,42 @@ describe("OPCOS transcript folding", () => {
       text: "First thought\n\n---\n\nSecond thought",
     });
   });
+
+  it("merges persisted thoughts across hidden notices", () => {
+    const items = normalizeTranscript([
+      {
+        kind: "assistant",
+        payload: { role: "assistant", reasoning: "First persisted thought" },
+      },
+      {
+        kind: "notice",
+        payload: { kind: "iteration_stats", text: "internal stats" },
+      },
+      {
+        kind: "assistant",
+        payload: { role: "assistant", reasoning: "Second persisted thought" },
+      },
+    ]);
+
+    expect(items.filter((item) => item.kind === "thinking")).toHaveLength(1);
+    expect(items.find((item) => item.kind === "thinking")).toMatchObject({
+      reasoning: "First persisted thought\n\n---\n\nSecond persisted thought",
+    });
+  });
+
+  it("drops exact duplicate live thoughts", () => {
+    const event = {
+      kind: "stream",
+      payload: {
+        working_event: {
+          event_type: "devin_thoughts",
+          payload: { message: "Repeated thought" },
+        },
+      },
+    };
+    let items = reduceStreamEvent([], event);
+    items = reduceStreamEvent(items, event);
+
+    expect(items.filter((item) => item.kind === "thinking")).toHaveLength(1);
+  });
 });

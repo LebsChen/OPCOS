@@ -9786,13 +9786,43 @@ function AppContent() {
     setPendingQuestion(null);
     setRunning(false);
     if (!selected) return;
-    void command<Array<{ kind: string; payload: Record<string, unknown> }>>(
-      "read_transcript",
-      { sessionId: selected.id },
-    )
-      .then((items) => {
-        if (generation.current === currentGeneration)
-          setTranscript(normalizeTranscript(items));
+    void Promise.all([
+      command<Array<{ kind: string; payload: Record<string, unknown> }>>(
+        "read_transcript",
+        { sessionId: selected.id },
+      ),
+      command<InboxRecord[]>("list_inbox"),
+    ])
+      .then(([items, inboxItems]) => {
+        if (generation.current !== currentGeneration) return;
+        const pending = inboxItems.find(
+          (item) =>
+            item.session_id === selected.id &&
+            item.state === "pending" &&
+            (item.kind === "question" || item.tool === "ask_user"),
+        );
+        if (pending) {
+          const question =
+            typeof pending.payload.question === "string"
+              ? pending.payload.question
+              : typeof pending.payload.prompt === "string"
+                ? pending.payload.prompt
+                : "Answer required";
+          setPendingQuestion({ callId: pending.call_id, question });
+        }
+        setTranscript(
+          normalizeTranscript(
+            items.filter(
+              (item) =>
+                !(
+                  item.kind === "approval" &&
+                  (item.payload.tool === "ask_user" ||
+                    item.payload.toolName === "ask_user") &&
+                  item.payload.status === "pending"
+                ),
+            ),
+          ),
+        );
       })
       .catch((reason) => {
         if (generation.current === currentGeneration)
@@ -9869,15 +9899,24 @@ function AppContent() {
           );
         }
       }
-      if (payload.kind === "question_requested") {
+      if (
+        payload.kind === "question_requested" ||
+        payload.kind === "question" ||
+        payload.payload?.kind === "question_requested"
+      ) {
+        const questionPayload =
+          payload.payload?.payload &&
+          typeof payload.payload.payload === "object"
+            ? (payload.payload.payload as Record<string, unknown>)
+            : payload.payload;
         const args =
-          payload.payload.arguments &&
-          typeof payload.payload.arguments === "object"
-            ? (payload.payload.arguments as Record<string, unknown>)
+          questionPayload.arguments &&
+          typeof questionPayload.arguments === "object"
+            ? (questionPayload.arguments as Record<string, unknown>)
             : {};
         const callId =
-          typeof payload.payload.call_id === "string"
-            ? payload.payload.call_id
+          typeof questionPayload.call_id === "string"
+            ? questionPayload.call_id
             : "";
         if (callId) {
           setPendingQuestion({
@@ -10303,13 +10342,19 @@ function AppContent() {
                   <QuestionCard
                     question={pendingQuestion}
                     onAnswer={async (answer) => {
-                      setRunning(true);
-                      await command("resolve_inbox", {
-                        sessionId: selected.id,
-                        callId: pendingQuestion.callId,
-                        resolution: answer,
-                      });
+                      const answeredQuestion = pendingQuestion;
                       setPendingQuestion(null);
+                      setRunning(true);
+                      try {
+                        await command("resolve_inbox", {
+                          sessionId: selected.id,
+                          callId: answeredQuestion.callId,
+                          resolution: answer,
+                        });
+                      } catch (reason) {
+                        setPendingQuestion(answeredQuestion);
+                        throw reason;
+                      }
                     }}
                   />
                 )}

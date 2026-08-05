@@ -29,19 +29,48 @@ export type TranscriptViewItem = {
   resolved?: ApprovalResolution;
 };
 
+export function isVisibleTimelineItem(item: {
+  kind: string;
+  noticeKind?: string;
+  text?: string;
+  reasoning?: string;
+  resolved?: unknown;
+}): boolean {
+  if (item.kind === "notice") {
+    return (
+      Boolean(item.text?.trim()) &&
+      ![
+        "status_update",
+        "simple_activity_update",
+        "context_growth",
+        "iteration_stats",
+        "context_compacted",
+        "iteration_checkpoint",
+      ].includes(item.noticeKind || "")
+    );
+  }
+  if (item.kind === "assistant" || item.kind === "thinking") {
+    return Boolean((item.text || item.reasoning || "").trim());
+  }
+  if (
+    (item.kind === "question" ||
+      item.kind === "dirreq" ||
+      item.kind === "planreq") &&
+    !item.resolved
+  ) {
+    return false;
+  }
+  return true;
+}
+
 export function isHiddenTimelineItem(item: {
   kind: string;
   noticeKind?: string;
+  text?: string;
+  reasoning?: string;
+  resolved?: unknown;
 }): boolean {
-  if (item.kind !== "notice") return false;
-  return (
-    item.noticeKind === "status_update" ||
-    item.noticeKind === "simple_activity_update" ||
-    item.noticeKind === "context_growth" ||
-    item.noticeKind === "iteration_stats" ||
-    item.noticeKind === "context_compacted" ||
-    item.noticeKind === "iteration_checkpoint"
-  );
+  return !isVisibleTimelineItem(item);
 }
 
 type RawItem = { kind: string; payload: Record<string, unknown> };
@@ -349,6 +378,7 @@ export function normalizeTranscript(raw: RawItem[]): TranscriptViewItem[] {
       previous?.kind === "thinking" &&
       item.reasoning
     ) {
+      if (previous.reasoning?.trim() === item.reasoning.trim()) continue;
       previous.reasoning = `${previous.reasoning || ""}\n\n---\n\n${item.reasoning}`;
       previous.text = previous.reasoning;
     } else {
@@ -427,6 +457,15 @@ export function reduceStreamEvent(
         const thought =
           typeof details.message === "string" ? details.message : "";
         if (thought.trim()) {
+          if (
+            next.some(
+              (item) =>
+                item.kind === "thinking" &&
+                (item.reasoning || item.text || "").trim() === thought.trim(),
+            )
+          ) {
+            return next;
+          }
           let previousIndex = next.length - 1;
           while (
             previousIndex >= 0 &&
@@ -436,6 +475,7 @@ export function reduceStreamEvent(
           }
           const previous = next[previousIndex];
           if (previous?.kind === "thinking") {
+            if (previous.reasoning?.trim() === thought.trim()) return next;
             previous.reasoning = `${previous.reasoning || ""}\n\n---\n\n${thought}`;
             previous.text = previous.reasoning;
           } else {

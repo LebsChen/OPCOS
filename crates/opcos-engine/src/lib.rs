@@ -2048,7 +2048,41 @@ where
                 conversational.push(message);
             }
         }
-        let split_at = conversational.len().saturating_sub(6);
+        let target_split = conversational.len().saturating_sub(6);
+        let mut split_at = 0;
+        let mut cursor = 0;
+        while cursor < conversational.len() {
+            let start = cursor;
+            let message = &conversational[cursor];
+            cursor += 1;
+            if message.get("role").and_then(Value::as_str) == Some("assistant") {
+                let call_ids = message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|call| call.get("id").and_then(Value::as_str))
+                    .collect::<std::collections::HashSet<_>>();
+                if !call_ids.is_empty() {
+                    while cursor < conversational.len()
+                        && conversational[cursor].get("role").and_then(Value::as_str)
+                            == Some("tool")
+                        && conversational[cursor]
+                            .pointer("/content/0/tool_use_id")
+                            .or_else(|| conversational[cursor].get("tool_call_id"))
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| call_ids.contains(id))
+                    {
+                        cursor += 1;
+                    }
+                }
+            }
+            if cursor <= target_split {
+                split_at = cursor;
+            } else if start < target_split {
+                break;
+            }
+        }
         let discarded = conversational[..split_at].to_vec();
         let retained = conversational[split_at..].to_vec();
         let mut valid = Vec::new();
@@ -2069,6 +2103,7 @@ where
             if message.get("role").and_then(Value::as_str) == Some("tool")
                 && let Some(id) = message
                     .pointer("/content/0/tool_use_id")
+                    .or_else(|| message.get("tool_call_id"))
                     .and_then(Value::as_str)
             {
                 pending_ids.remove(id);
@@ -2077,9 +2112,59 @@ where
         }
         if !pending_ids.is_empty() {
             valid.retain(|message| {
-                !(message.get("role").and_then(Value::as_str) == Some("assistant")
-                    && message.get("tool_calls").is_some())
+                if message.get("role").and_then(Value::as_str) != Some("assistant") {
+                    return !(message.get("role").and_then(Value::as_str) == Some("tool")
+                        && message
+                            .pointer("/content/0/tool_use_id")
+                            .or_else(|| message.get("tool_call_id"))
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| pending_ids.contains(id)));
+                }
+                let calls = message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|call| call.get("id").and_then(Value::as_str));
+                !calls.clone().any(|id| pending_ids.contains(id))
             });
+        }
+        valid.retain(|message| {
+            let role = message.get("role").and_then(Value::as_str);
+            if !matches!(role, Some("user" | "assistant" | "tool")) {
+                return true;
+            }
+            if role == Some("assistant")
+                && message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|calls| !calls.is_empty())
+            {
+                return true;
+            }
+            match message.get("content") {
+                Some(Value::String(text)) => !text.trim().is_empty(),
+                Some(Value::Array(parts)) => !parts.is_empty(),
+                Some(Value::Object(object)) => !object.is_empty(),
+                _ => false,
+            }
+        });
+        for message in &mut valid {
+            if message.get("role").and_then(Value::as_str) == Some("assistant")
+                && message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|calls| !calls.is_empty())
+                && message.get("content").is_some_and(|content| match content {
+                    Value::String(text) => text.trim().is_empty(),
+                    Value::Array(parts) => parts.is_empty(),
+                    Value::Null => true,
+                    _ => false,
+                })
+                && let Some(object) = message.as_object_mut()
+            {
+                object.remove("content");
+            }
         }
         let (summary_text, summary_issue) = if discarded.is_empty() {
             (
@@ -4732,6 +4817,60 @@ mod tests {
                     .is_none_or(|calls| calls.is_empty())
         }));
         assert!(store.load_compaction("s").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn compaction_moves_boundary_to_keep_tool_exchange_together() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let mut messages = (0..3)
+            .map(|index| json!({"role":"user","content":format!("old-{index}")}))
+            .collect::<Vec<_>>();
+        messages.push(json!({
+            "role":"assistant",
+            "content":"",
+            "tool_calls":[{"id":"call-1","name":"read_file","arguments":{}}]
+        }));
+        messages.push(json!({
+            "role":"tool",
+            "content":[{"type":"tool_result","tool_use_id":"call-1","content":[{"type":"text","text":"ok"}]}]
+        }));
+        messages
+            .extend((0..5).map(|index| json!({"role":"user","content":format!("new-{index}")})));
+
+        let compacted = engine.compact_context(messages).await.unwrap();
+        let assistant = compacted
+            .iter()
+            .find(|message| message.get("role").and_then(Value::as_str) == Some("assistant"));
+        let tool = compacted
+            .iter()
+            .find(|message| message.get("role").and_then(Value::as_str) == Some("tool"));
+        assert!(assistant.is_some());
+        assert_eq!(
+            assistant
+                .and_then(|message| message.pointer("/tool_calls/0/id"))
+                .and_then(Value::as_str),
+            Some("call-1")
+        );
+        assert_eq!(
+            tool.and_then(|message| message.pointer("/content/0/tool_use_id"))
+                .and_then(Value::as_str),
+            Some("call-1")
+        );
+        assert!(compacted.iter().all(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_none_or(|text| !text.trim().is_empty())
+        }));
     }
 
     #[derive(Clone)]
