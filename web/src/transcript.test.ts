@@ -385,4 +385,41 @@ describe("OPCOS transcript folding", () => {
       ),
     ).toBe(false);
   });
+
+  it("deduplicates duplicate user messages from refresh and live merge", () => {
+    const persisted = normalizeTranscript([
+      { kind: "user", payload: { role: "user", text: "Fix the bug." } },
+      { kind: "user", payload: { role: "user", text: "Fix the bug." } },
+    ]);
+    const merged = reduceStreamEvent(persisted, {
+      kind: "message",
+      payload: { text: "Fix the bug." },
+    });
+
+    expect(persisted.filter((item) => item.kind === "user")).toHaveLength(1);
+    expect(merged.filter((item) => item.kind === "user")).toHaveLength(1);
+  });
+
+  it("resets live assistant deltas after a provider stream retry", () => {
+    let items = reduceStreamEvent([], {
+      kind: "stream",
+      payload: { text_delta: "first", reasoning_delta: "thought one" },
+    });
+    items = reduceStreamEvent(items, {
+      kind: "stream",
+      payload: { stream_reset: true },
+    });
+    items = reduceStreamEvent(items, {
+      kind: "stream",
+      payload: { text_delta: "second", reasoning_delta: "thought two" },
+    });
+
+    expect(items).toContainEqual(
+      expect.objectContaining({
+        id: "stream:assistant",
+        text: "second",
+        reasoning: "thought two",
+      }),
+    );
+  });
 });

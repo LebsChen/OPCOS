@@ -83,17 +83,27 @@ function stableId(prefix: string, index: number, value?: string): string {
 export function normalizeTranscript(raw: RawItem[]): TranscriptViewItem[] {
   const output: TranscriptViewItem[] = [];
   const toolIndex = new Map<string, TranscriptViewItem>();
+  const userKeys = new Set<string>();
   raw.forEach((record, index) => {
     const payload = payloadObject(record.payload);
     const role = typeof payload.role === "string" ? payload.role : record.kind;
     if (role === "user") {
+      const text =
+        typeof payload.text === "string"
+          ? payload.text
+          : textFromContent(payload.content);
+      const userKey =
+        typeof payload.id === "string" ? `id:${payload.id}` : `text:${text}`;
+      if (userKeys.has(userKey)) return;
+      userKeys.add(userKey);
       output.push({
-        id: stableId("user", index),
+        id: stableId(
+          "user",
+          index,
+          typeof payload.id === "string" ? payload.id : undefined,
+        ),
         kind: "user",
-        text:
-          typeof payload.text === "string"
-            ? payload.text
-            : textFromContent(payload.content),
+        text,
       });
       return;
     }
@@ -322,13 +332,17 @@ export function reduceStreamEvent(
   const next = items.map((item) => ({ ...item }));
   const payload = payloadObject(event.payload);
   if (event.kind === "message") {
+    const text =
+      typeof payload.text === "string"
+        ? payload.text
+        : textFromContent(payload.content);
+    if (next.some((item) => item.kind === "user" && item.text === text)) {
+      return next;
+    }
     next.push({
       id: `event:message:${String(payload.id || next.length)}`,
       kind: "user",
-      text:
-        typeof payload.text === "string"
-          ? payload.text
-          : textFromContent(payload.content),
+      text,
     });
     return next;
   }
@@ -480,6 +494,11 @@ export function reduceStreamEvent(
     typeof payload.text_delta === "string" ? payload.text_delta : "";
   const reasoningDelta =
     typeof payload.reasoning_delta === "string" ? payload.reasoning_delta : "";
+  if (payload.stream_reset === true) {
+    for (let index = next.length - 1; index >= 0; index -= 1) {
+      if (next[index]?.id === "stream:assistant") next.splice(index, 1);
+    }
+  }
   let live = next.find((item) => item.id === "stream:assistant");
   if ((textDelta || reasoningDelta) && !live) {
     live = {

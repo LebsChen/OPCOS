@@ -58,6 +58,8 @@ pub struct ToolCallDelta {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct StreamChunk {
+    #[serde(default)]
+    pub stream_reset: bool,
     pub text_delta: Option<String>,
     pub reasoning_delta: Option<String>,
     pub tool_call_delta: Option<ToolCallDelta>,
@@ -128,7 +130,10 @@ pub struct ProviderConfig {
     pub base_url: String,
     pub api_key: Secret,
     pub headers: Vec<(String, String)>,
+    /// Total timeout for non-streaming requests, in seconds.
     pub timeout_seconds: u64,
+    /// Maximum idle gap between streaming response chunks, in seconds.
+    pub stream_idle_timeout_seconds: u64,
 }
 
 impl ProviderConfig {
@@ -138,6 +143,7 @@ impl ProviderConfig {
             api_key: Secret::new(api_key),
             headers: Vec::new(),
             timeout_seconds: 60,
+            stream_idle_timeout_seconds: 120,
         }
     }
 }
@@ -156,6 +162,10 @@ impl fmt::Debug for ProviderConfig {
                     .collect::<Vec<_>>(),
             )
             .field("timeout_seconds", &self.timeout_seconds)
+            .field(
+                "stream_idle_timeout_seconds",
+                &self.stream_idle_timeout_seconds,
+            )
             .finish()
     }
 }
@@ -249,6 +259,17 @@ pub(crate) fn client(config: &ProviderConfig) -> Result<Client, ProviderError> {
         .map_err(request_error)
 }
 
+pub(crate) fn stream_client(config: &ProviderConfig) -> Result<Client, ProviderError> {
+    Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(std::time::Duration::from_secs(
+            config.stream_idle_timeout_seconds,
+        ))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(request_error)
+}
+
 pub(crate) fn apply_bearer_headers(
     mut request: reqwest::RequestBuilder,
     config: &ProviderConfig,
@@ -314,6 +335,11 @@ impl<T: Provider + ?Sized> Provider for Box<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     #[test]
     fn secrets_never_appear_in_debug_or_errors() {
@@ -357,5 +383,33 @@ mod tests {
             request.headers().get(header::AUTHORIZATION).unwrap(),
             "Bearer test-key"
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_client_enforces_idle_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nfirst")
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        });
+        let mut config = ProviderConfig::new(format!("http://{address}"), "test-key");
+        config.stream_idle_timeout_seconds = 1;
+        let response = stream_client(&config)
+            .unwrap()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap();
+        let mut body = response.bytes_stream();
+        assert_eq!(body.next().await.unwrap().unwrap().as_ref(), b"first");
+        assert!(body.next().await.unwrap().is_err());
+        task.await.unwrap();
     }
 }

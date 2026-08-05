@@ -2,7 +2,7 @@ use crate::{
     AssistantTurn, Caps, Provider, ProviderConfig, ProviderError, ProviderRequest, StreamChunk,
     TRANSIENT_RETRY_LIMIT, TokenUsage, ToolCall, ToolCallDelta, apply_bearer_headers,
     classify_context_error, client, is_transient_request_error, is_transient_status, retry_delay,
-    sanitize_secret, settings_object, tool_schema,
+    sanitize_secret, settings_object, stream_client, tool_schema,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -43,8 +43,12 @@ impl OpenAiProvider {
         body
     }
 
-    async fn send(&self, body: Value) -> Result<reqwest::Response, ProviderError> {
-        let http = client(&self.config)?;
+    async fn send(&self, body: Value, streaming: bool) -> Result<reqwest::Response, ProviderError> {
+        let http = if streaming {
+            stream_client(&self.config)?
+        } else {
+            client(&self.config)?
+        };
         let url = format!(
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
@@ -319,7 +323,7 @@ fn salvage(text: Option<String>, tools: &[Value]) -> (Option<String>, Vec<ToolCa
 #[async_trait]
 impl Provider for OpenAiProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<AssistantTurn, ProviderError> {
-        let response = self.send(self.body(&request, false)).await?;
+        let response = self.send(self.body(&request, false), false).await?;
         let value = response
             .json::<Value>()
             .await
@@ -386,6 +390,13 @@ impl Provider for OpenAiProvider {
                         error = %error,
                         "transient OpenAI-compatible stream transport error; retrying"
                     );
+                    output
+                        .send(StreamChunk {
+                            stream_reset: true,
+                            ..Default::default()
+                        })
+                        .await
+                        .map_err(|_| ProviderError::Protocol("stream receiver closed".into()))?;
                     tokio::time::sleep(retry_delay(attempt, None)).await;
                     attempt += 1;
                 }
@@ -400,7 +411,7 @@ async fn stream_once(
     request: &ProviderRequest,
     output: &Sender<StreamChunk>,
 ) -> Result<AssistantTurn, ProviderError> {
-    let response = provider.send(provider.body(request, true)).await?;
+    let response = provider.send(provider.body(request, true), true).await?;
     let mut decoder = crate::sse::SseDecoder::new();
     let mut text = String::new();
     let mut thought = String::new();
@@ -731,6 +742,60 @@ mod tests {
             }
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 4);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn streaming_uses_idle_timeout_instead_of_total_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let count = stream.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                      Connection: close\r\n\r\n\
+                      data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            stream
+                .write_all(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\" second\"},\
+                      \"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                )
+                .await
+                .unwrap();
+        });
+        let mut config = ProviderConfig::new(format!("http://{address}"), "test-key");
+        config.timeout_seconds = 1;
+        let provider = OpenAiProvider::new(config);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        let turn = provider
+            .stream(
+                ProviderRequest {
+                    model: "test".into(),
+                    ..Default::default()
+                },
+                sender,
+            )
+            .await
+            .unwrap();
+        assert_eq!(turn.text.as_deref(), Some("first second"));
+        while receiver.recv().await.is_some() {}
         task.await.unwrap();
     }
 

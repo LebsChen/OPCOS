@@ -1600,6 +1600,11 @@ where
                     if self.interrupted.load(Ordering::SeqCst) {
                         return (Err(ProviderError::Protocol("interrupted".into())), partial);
                     }
+                    if chunk.stream_reset {
+                        partial = PartialOutput::default();
+                        let _ = self.events.try_send(chunk);
+                        continue;
+                    }
                     if let Some(text) = chunk.text_delta.clone() {
                         partial.text.get_or_insert_with(String::new).push_str(&text);
                     }
