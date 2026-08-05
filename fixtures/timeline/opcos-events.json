@@ -1,0 +1,124 @@
+[
+  {
+    "type": "user_message",
+    "event_id": "event-opcos-user",
+    "created_at_ms": 1000,
+    "timestamp": "2026-01-01T00:00:01Z",
+    "working_event": {
+      "event_type": "user_message",
+      "category": "message",
+      "direction": "incoming",
+      "timestamp": "2026-01-01T00:00:01Z",
+      "payload": { "message": "Implement the change." }
+    }
+  },
+  {
+    "type": "devin_thoughts",
+    "event_id": "event-opcos-thoughts",
+    "created_at_ms": 2000,
+    "timestamp": "2026-01-01T00:00:02Z",
+    "working_event": {
+      "event_type": "devin_thoughts",
+      "category": "other",
+      "direction": "outgoing",
+      "timestamp": "2026-01-01T00:00:02Z",
+      "payload": {
+        "message": "Inspect the implementation and make the requested change.",
+        "thinking_duration_ms": 5000
+      }
+    }
+  },
+  {
+    "type": "shell_process_started",
+    "event_id": "event-opcos-shell",
+    "created_at_ms": 3000,
+    "timestamp": "2026-01-01T00:00:03Z",
+    "working_event": {
+      "event_type": "shell_process_started",
+      "category": "tool",
+      "direction": "outgoing",
+      "timestamp": "2026-01-01T00:00:03Z",
+      "payload": { "command": "cargo test" }
+    }
+  },
+  {
+    "type": "multi_edit_result",
+    "event_id": "event-opcos-edit",
+    "created_at_ms": 4000,
+    "timestamp": "2026-01-01T00:00:04Z",
+    "working_event": {
+      "event_type": "multi_edit_result",
+      "category": "tool",
+      "direction": "outgoing",
+      "timestamp": "2026-01-01T00:00:04Z",
+      "payload": {
+        "file_updates": [
+          { "action_type": "create", "file_path": "notes.md", "lines_added": 4, "lines_removed": 0 },
+          { "action_type": "edit", "file_path": "src/lib.rs", "lines_added": 2, "lines_removed": 1 }
+        ]
+      }
+    }
+  },
+  {
+    "type": "todo_update",
+    "event_id": "event-opcos-todo-created",
+    "created_at_ms": 5000,
+    "timestamp": "2026-01-01T00:00:05Z",
+    "working_event": {
+      "event_type": "todo_update",
+      "category": "other",
+      "direction": "outgoing",
+      "timestamp": "2026-01-01T00:00:05Z",
+      "payload": {
+        "todos": [
+          { "status": "pending", "content": "Implement the change" },
+          { "status": "pending", "content": "Run tests" }
+        ]
+      }
+    }
+  },
+  {
+    "type": "todo_update",
+    "event_id": "event-opcos-todo-progress",
+    "created_at_ms": 6000,
+    "timestamp": "2026-01-01T00:00:06Z",
+    "working_event": {
+      "event_type": "todo_update",
+      "category": "other",
+      "direction": "outgoing",
+      "timestamp": "2026-01-01T00:00:06Z",
+      "payload": {
+        "todos": [
+          { "status": "completed", "content": "Implement the change" },
+          { "status": "pending", "content": "Run tests" }
+        ]
+      }
+    }
+  },
+  {
+    "type": "compacted",
+    "event_id": "event-opcos-compacted",
+    "created_at_ms": 7000,
+    "timestamp": "2026-01-01T00:00:07Z",
+    "working_event": {
+      "event_type": "compacted",
+      "category": "notice",
+      "direction": "outgoing",
+      "timestamp": "2026-01-01T00:00:07Z",
+      "payload": { "message": "Earlier context compacted" }
+    }
+  },
+  {
+    "type": "devin_message",
+    "event_id": "event-opcos-message",
+    "created_at_ms": 8000,
+    "timestamp": "2026-01-01T00:00:08Z",
+    "working_event": {
+      "event_type": "devin_message",
+      "category": "message",
+      "direction": "outgoing",
+      "timestamp": "2026-01-01T00:00:08Z",
+      "payload": { "message": "The requested change is complete." }
+    }
+  }
+]

@@ -1476,7 +1476,7 @@ where
                         partial.reasoning.as_deref().or(turn.reasoning.as_deref())
                     {
                         let message = reasoning.chars().take(4000).collect::<String>();
-                        if !message.is_empty() {
+                        if !message.trim().is_empty() {
                             let _ = self
                                 .working_event(
                                     "devin_thoughts",
@@ -2767,7 +2767,15 @@ where
             serde_json::to_value(&event).map_err(|error| EngineError::Store(error.to_string()))?;
         self.secret_scrubber.scrub(&mut event_value);
         self.recorder.append_audit("working_event", &event_value)?;
-        self.persist_event_value(event_value)
+        let event = serde_json::from_value(event_value)
+            .map_err(|error| EngineError::Store(error.to_string()))?;
+        self.emit_event(
+            event_type,
+            StreamChunk {
+                working_event: Some(event),
+                ..StreamChunk::default()
+            },
+        )
     }
 
     fn emit_event(&self, event_type: &str, mut chunk: StreamChunk) -> Result<(), EngineError> {
@@ -5217,6 +5225,170 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results, vec![json!("ok")]);
+    }
+
+    #[tokio::test]
+    async fn working_events_use_canonical_envelopes_for_persistence_and_live_delivery() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "envelope-session",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let mut receiver = engine.events_receiver().await.unwrap();
+
+        engine.submit_text("run the turn").await.unwrap();
+
+        let persisted = store
+            .load_session_events("envelope-session")
+            .unwrap()
+            .into_iter()
+            .map(|record| record.event)
+            .collect::<Vec<_>>();
+        assert!(!persisted.is_empty());
+        let ids = persisted
+            .iter()
+            .map(|event| event["event_id"].as_str().unwrap_or_default())
+            .collect::<HashSet<_>>();
+        assert_eq!(ids.len(), persisted.len());
+        assert!(persisted.iter().all(|event| {
+            event["type"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+                && event["event_id"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
+                && event["created_at_ms"].as_i64().is_some()
+        }));
+        assert!(persisted.windows(2).all(|events| {
+            events[0]["created_at_ms"].as_i64().unwrap()
+                <= events[1]["created_at_ms"].as_i64().unwrap()
+        }));
+        for event_type in ["user_message", "status_update", "devin_message"] {
+            assert!(persisted.iter().any(|event| event["type"] == event_type));
+        }
+
+        let mut live = Vec::new();
+        while let Ok(chunk) = receiver.try_recv() {
+            live.push(serde_json::to_value(chunk).unwrap());
+        }
+        for event in persisted {
+            let event_type = event["type"].as_str().unwrap();
+            if event_type == "user_message" || event_type == "devin_message" {
+                let live_event = live
+                    .iter()
+                    .find(|candidate| candidate["type"] == event_type)
+                    .expect("working event delivered live");
+                assert_eq!(live_event["event_id"], event["event_id"]);
+                assert_eq!(live_event["type"], event["type"]);
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct ReasoningProvider {
+        reasoning: Option<String>,
+    }
+
+    #[async_trait]
+    impl Provider for ReasoningProvider {
+        async fn complete(&self, _: ProviderRequest) -> Result<AssistantTurn, ProviderError> {
+            Ok(AssistantTurn {
+                text: Some("done".into()),
+                reasoning: self.reasoning.clone(),
+                ..Default::default()
+            })
+        }
+
+        async fn stream(
+            &self,
+            _: ProviderRequest,
+            output: mpsc::Sender<StreamChunk>,
+        ) -> Result<AssistantTurn, ProviderError> {
+            if let Some(reasoning) = &self.reasoning {
+                output
+                    .send(StreamChunk {
+                        reasoning_delta: Some(reasoning.clone()),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+            }
+            output
+                .send(StreamChunk {
+                    text_delta: Some("done".into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            Ok(AssistantTurn {
+                text: Some("done".into()),
+                reasoning: self.reasoning.clone(),
+                ..Default::default()
+            })
+        }
+
+        fn capabilities(&self, _: &str) -> Caps {
+            Caps::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn reasoning_is_persisted_as_nonempty_thoughts_only() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            ReasoningProvider {
+                reasoning: Some("Inspect the workspace before making changes.".into()),
+            },
+            store.clone(),
+            Arc::new(FakeTools),
+            "reasoning-session",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine.submit_text("inspect").await.unwrap();
+        let thoughts = store
+            .load_session_events("reasoning-session")
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event["type"] == "devin_thoughts")
+            .collect::<Vec<_>>();
+        assert_eq!(thoughts.len(), 1);
+        assert_eq!(
+            thoughts[0].event["working_event"]["payload"]["message"],
+            "Inspect the workspace before making changes."
+        );
+        assert!(
+            thoughts[0].event["working_event"]["payload"]["thinking_duration_ms"]
+                .as_u64()
+                .is_some()
+        );
+
+        let empty_store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let empty_engine = TurnEngine::new(
+            ReasoningProvider {
+                reasoning: Some(" \n\t".into()),
+            },
+            empty_store.clone(),
+            Arc::new(FakeTools),
+            "empty-reasoning-session",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        empty_engine.submit_text("inspect").await.unwrap();
+        assert!(
+            !empty_store
+                .load_session_events("empty-reasoning-session")
+                .unwrap()
+                .into_iter()
+                .any(|event| event.event["type"] == "devin_thoughts")
+        );
     }
 
     #[tokio::test]

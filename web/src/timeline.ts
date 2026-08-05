@@ -80,8 +80,8 @@ export function mergeEvents(
       )
     )
       return false;
-    if (seen.has(event.event_id)) return false;
-    seen.add(event.event_id);
+    if (event.event_id && seen.has(event.event_id)) return false;
+    if (event.event_id) seen.add(event.event_id);
     return true;
   });
   return unique
@@ -159,8 +159,25 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
       workStarted = 0;
       workEnded = 0;
       previousTodos = [];
+    } else if (type === "compacted") {
+      if (!work)
+        work = {
+          kind: "work",
+          label: "Worked for 0s",
+          rows: [],
+          additions: 0,
+          deletions: 0,
+        };
+      if (!workStarted) workStarted = event.created_at_ms;
+      workEnded = event.created_at_ms;
+      work.rows.push({ label: "Earlier context compacted" });
     } else if (
-      ["error", "interrupted", "provider_error", "compacted"].includes(type)
+      [
+        "error",
+        "interrupted",
+        "provider_error",
+        "compaction_summary_invalid",
+      ].includes(type)
     ) {
       flush(event.created_at_ms);
       nodes.push({
@@ -179,6 +196,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
         "iteration_checkpoint",
         "status_update",
         "turn",
+        "tool_result",
         ...TRANSIENT_TIMELINE_EVENT_TYPES,
         "stream_reset",
       ].includes(type)

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import liveEnvelopes from "../../fixtures/timeline/live-events.json";
+import opcosEvents from "../../fixtures/timeline/opcos-events.json";
 import persisted from "../../fixtures/timeline/persisted-events.json";
 import {
   buildTimeline,
@@ -10,6 +11,7 @@ import {
 
 const live = liveEnvelopes.map((entry) => entry.payload as TimelineEvent);
 const saved = persisted as TimelineEvent[];
+const opcos = opcosEvents as TimelineEvent[];
 
 describe("single event-log timeline", () => {
   it("renders live and reloaded events identically", () => {
@@ -60,5 +62,34 @@ describe("single event-log timeline", () => {
     );
     expect(work.reduce((sum, node) => sum + node.additions, 0)).toBe(70);
     expect(work.reduce((sum, node) => sum + node.deletions, 0)).toBe(0);
+  });
+  it("renders OPCOS-native persisted events as one work group", () => {
+    const nodes = buildTimeline(opcos);
+    expect(nodes).toContainEqual({
+      kind: "user",
+      text: "Implement the change.",
+      ts: 1767225601,
+      attachments: undefined,
+    });
+    expect(nodes).toContainEqual({
+      kind: "assistant",
+      text: "The requested change is complete.",
+      ts: 1767225608,
+    });
+    const work = nodes.find((node) => node.kind === "work");
+    expect(work).toMatchObject({
+      label: "Worked for 6s",
+      additions: 6,
+      deletions: 1,
+    });
+    expect(work?.rows.map((row) => row.label)).toEqual([
+      "Thought for 5s",
+      "cargo test",
+      "Created notes.md +4",
+      "Edited lib.rs +2 −1",
+      "Created 2 Tasks",
+      "1/2#1 Implement the change",
+      "Earlier context compacted",
+    ]);
   });
 });
