@@ -70,9 +70,60 @@
       "direction": "outgoing",
       "timestamp": "2026-01-01T00:00:05Z",
       "payload": {
-        "todos": [
-          { "status": "pending", "content": "Implement the change" },
-          { "status": "pending", "content": "Run tests" }
+        "plan_id": "plan-captured-opcos",
+        "session_id": "session-captured-opcos",
+        "project_id": null,
+        "title": "Implement the change",
+        "summary": "Implement and verify the requested change.",
+        "status": "active",
+        "revision": 1,
+        "created_at": "2026-01-01T00:00:05Z",
+        "updated_at": "2026-01-01T00:00:05Z",
+        "steps": [
+          {
+            "step_id": "step-1",
+            "plan_id": "plan-captured-opcos",
+            "position": 0,
+            "description": "Implement the change",
+            "status": "in_progress",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-01-01T00:00:05Z",
+            "updated_at": "2026-01-01T00:00:05Z"
+          },
+          {
+            "step_id": "step-2",
+            "plan_id": "plan-captured-opcos",
+            "position": 1,
+            "description": "Update the tests",
+            "status": "not_started",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-01-01T00:00:05Z",
+            "updated_at": "2026-01-01T00:00:05Z"
+          },
+          {
+            "step_id": "step-3",
+            "plan_id": "plan-captured-opcos",
+            "position": 2,
+            "description": "Run the verification suite",
+            "status": "not_started",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-01-01T00:00:05Z",
+            "updated_at": "2026-01-01T00:00:05Z"
+          },
+          {
+            "step_id": "step-4",
+            "plan_id": "plan-captured-opcos",
+            "position": 3,
+            "description": "Report the result",
+            "status": "not_started",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-01-01T00:00:05Z",
+            "updated_at": "2026-01-01T00:00:05Z"
+          }
         ]
       }
     }
@@ -88,9 +139,60 @@
       "direction": "outgoing",
       "timestamp": "2026-01-01T00:00:06Z",
       "payload": {
-        "todos": [
-          { "status": "completed", "content": "Implement the change" },
-          { "status": "pending", "content": "Run tests" }
+        "plan_id": "plan-captured-opcos",
+        "session_id": "session-captured-opcos",
+        "project_id": null,
+        "title": "Implement the change",
+        "summary": "Implement and verify the requested change.",
+        "status": "active",
+        "revision": 2,
+        "created_at": "2026-01-01T00:00:05Z",
+        "updated_at": "2026-01-01T00:00:06Z",
+        "steps": [
+          {
+            "step_id": "step-1",
+            "plan_id": "plan-captured-opcos",
+            "position": 0,
+            "description": "Implement the change",
+            "status": "done",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-01-01T00:00:05Z",
+            "updated_at": "2026-01-01T00:00:06Z"
+          },
+          {
+            "step_id": "step-2",
+            "plan_id": "plan-captured-opcos",
+            "position": 1,
+            "description": "Update the tests",
+            "status": "not_started",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-01-01T00:00:05Z",
+            "updated_at": "2026-01-01T00:00:06Z"
+          },
+          {
+            "step_id": "step-3",
+            "plan_id": "plan-captured-opcos",
+            "position": 2,
+            "description": "Run the verification suite",
+            "status": "not_started",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-01-01T00:00:05Z",
+            "updated_at": "2026-01-01T00:00:06Z"
+          },
+          {
+            "step_id": "step-4",
+            "plan_id": "plan-captured-opcos",
+            "position": 3,
+            "description": "Report the result",
+            "status": "not_started",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-01-01T00:00:05Z",
+            "updated_at": "2026-01-01T00:00:06Z"
+          }
         ]
       }
     }

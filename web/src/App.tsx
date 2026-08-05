@@ -9636,6 +9636,10 @@ function AppContent() {
   const [error, setError] = useState("");
   const errorTimer = useRef<number | undefined>(undefined);
   const [running, setRunning] = useState(false);
+  const selectedIdRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    selectedIdRef.current = selected?.id;
+  }, [selected?.id]);
   const effectiveRunning = effectiveRunningState(
     pendingQuestion !== null,
     selected?.run_state,
@@ -9939,7 +9943,8 @@ function AppContent() {
       ) {
         setSecretBackend(payload.payload.secret_backend);
       }
-      if (payload.session_id && payload.session_id !== selected?.id) return;
+      if (payload.session_id && payload.session_id !== selectedIdRef.current)
+        return;
       if (payload.kind === "stream") {
         const streamPayload = payload.payload;
         const hasStreamingContent =
@@ -10070,7 +10075,7 @@ function AppContent() {
       active = false;
       void subscription.then((unlisten) => unlisten());
     };
-  }, [selected?.id]);
+  }, []);
   const onError = (reason: unknown) => {
     showErrorToast(reason);
   };

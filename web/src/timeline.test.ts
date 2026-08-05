@@ -87,8 +87,8 @@ describe("single event-log timeline", () => {
       "cargo test",
       "Created notes.md +4",
       "Edited lib.rs +2 −1",
-      "Created 2 Tasks",
-      "1/2#1 Implement the change",
+      "Created 4 Tasks",
+      "1/4#1 Implement the change",
       "Earlier context compacted",
     ]);
   });

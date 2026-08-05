@@ -41,6 +41,7 @@ const totalTokens = (value: SessionUsage) =>
 import type { Option } from "./Dropdown";
 import { Icon } from "./Icon";
 import { Toggle } from "./Toggle";
+import { expandSlashCommandValue } from "../slashCommands";
 type DictationStatus = {
   recording?: boolean;
   supported?: boolean;
@@ -352,13 +353,7 @@ export function Composer(props: Props) {
   };
 
   const expandSlashCommand = (value: string) => {
-    const match = value.trimStart().match(/^(\/\S+)(?:\s+([\s\S]*))?$/);
-    if (!match) return value;
-    const command = props.slashCommands?.find((item) => item.name === match[1]);
-    if (!command) return value;
-    return match[2]?.trim()
-      ? `${command.body}\n\n${match[2].trim()}`
-      : command.body;
+    return expandSlashCommandValue(value, props.slashCommands ?? []);
   };
 
   const uploadFile = async (file: File) => {

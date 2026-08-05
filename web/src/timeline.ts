@@ -245,11 +245,17 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
           });
         }
       } else if (type === "todo_update") {
-        const todos = Array.isArray(data.todos)
-          ? data.todos.filter(
-              (todo): todo is Record<string, unknown> =>
-                !!todo && typeof todo === "object",
-            )
+        const source = Array.isArray(data.steps) ? data.steps : data.todos;
+        const todos: Record<string, unknown>[] = Array.isArray(source)
+          ? source
+              .filter(
+                (todo): todo is Record<string, unknown> =>
+                  !!todo && typeof todo === "object",
+              )
+              .map((todo): Record<string, unknown> => ({
+                ...todo,
+                content: todo.content ?? todo.description,
+              }))
           : [];
         const completed = todos.filter((todo) =>
           ["done", "completed"].includes(String(todo.status)),
@@ -290,7 +296,16 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
               : "Listed directory",
         });
       } else if (type.endsWith("_started")) {
-        if (type !== "write_file_started" && type !== "edit_file_started") {
+        if (
+          ![
+            "propose_plan_started",
+            "plan_update_started",
+            "plan_get_started",
+            "plan_revise_started",
+          ].includes(type) &&
+          type !== "write_file_started" &&
+          type !== "edit_file_started"
+        ) {
           work.rows.push({ label: String(data.command ?? data.tool ?? type) });
         }
       }
