@@ -140,15 +140,12 @@ export function Transcript({
             </div>
           );
         return (
-          <details
-            className="work-segment rounded-lg border border-line/70 mb-2"
-            key={index}
-          >
-            <summary className="cursor-pointer px-3 py-2 text-xs text-muted">
+          <details className="work-segment flex flex-col gap-2" key={index}>
+            <summary className="cursor-pointer text-muted">
               {node.label} {node.additions ? `+${node.additions}` : ""}{" "}
               {node.deletions ? `−${node.deletions}` : ""}
             </summary>
-            <div className="px-2 pb-2">
+            <div className="flex flex-col gap-2 text-ink">
               {node.rows.map((row, rowIndex) => (
                 <div className="transcript-item" key={rowIndex}>
                   {row.label}

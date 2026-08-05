@@ -534,6 +534,9 @@ h3 {
 .transcript-item {
   margin: 0 0 18px;
 }
+.work-segment .transcript-item {
+  margin: 0;
+}
 .who {
   margin: 0 0 5px;
   color: var(--color-faint);
