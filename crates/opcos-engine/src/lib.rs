@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use opcos_policy::{
-    Decision, DurableGrant, PermissionMode, PermissionRules, ToolRisk, browser_navigation_target,
-    decide_with_rules, mutating_http_target,
+    Decision, DurableGrant, PermissionMode, PermissionRules, ToolRisk, browser_click_target,
+    browser_navigation_target, decide_with_rules, mutating_http_target,
 };
 use opcos_provider::{
     AssistantTurn, Caps, Provider, ProviderError, ProviderRequest, StreamChunk, TokenUsage,
@@ -1877,10 +1877,7 @@ where
             };
             let mut target = mutating_api_target.as_deref().unwrap_or(&target);
             let click_origin = if call.name == "browser_click" {
-                match call.arguments.get("origin").and_then(Value::as_str) {
-                    Some(origin) => Some(origin.to_owned()),
-                    None => self.executor.browser_origin().await,
-                }
+                self.executor.browser_origin().await
             } else {
                 None
             };
@@ -1891,22 +1888,11 @@ where
                     } else {
                         click_origin.as_deref()
                     };
-                    origin
-                        .and_then(browser_navigation_target)
-                        .map(|(target, local)| {
-                            (
-                                target.replacen(
-                                    "browser_navigate:",
-                                    if call.name == "browser_navigate" {
-                                        "browser_navigate:"
-                                    } else {
-                                        "browser_click:"
-                                    },
-                                    1,
-                                ),
-                                local,
-                            )
-                        })
+                    if call.name == "browser_navigate" {
+                        origin.and_then(browser_navigation_target)
+                    } else {
+                        origin.and_then(browser_click_target)
+                    }
                 } else {
                     None
                 };
@@ -3352,9 +3338,9 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"edit_file","description":"Apply one or more exact replacements to a remote UTF-8 text file. The required edits argument is an array of objects, each with old_string and new_string strings. Example: {\"path\":\"src/lib.rs\",\"edits\":[{\"old_string\":\"old code\",\"new_string\":\"new code\"}]}. Every old_string must match exactly once in the original file; ambiguous or missing matches fail with diagnostics. The whole call is atomic and preserves line endings. Prefer this over rewriting an existing file.","parameters":{"type":"object","examples":[{"path":"src/lib.rs","edits":[{"old_string":"old code","new_string":"new code"}]}],"properties":{"path":{"type":"string","description":"Remote workspace-relative file path."},"edits":{"type":"array","description":"One or more exact replacements, applied atomically.","minItems":1,"items":{"type":"object","properties":{"old_string":{"type":"string","description":"Exact existing text to replace, including whitespace and line breaks."},"new_string":{"type":"string","description":"Replacement text."}},"required":["old_string","new_string"],"additionalProperties":false}}},"required":["path","edits"],"additionalProperties":false}}}),
         json!({"type":"function","function":{"name":"run_shell","description":"Run a shell command. Use cwd to select the workspace directory. Credentials are available only by naming configured secret_names; injected values are redacted from output.","parameters":{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"},"secret_names":{"type":"array","items":{"type":"string"},"description":"Configured secret names to inject into the child environment. This is the only supported credential path; values are redacted from output."}},"required":["command"]}}}),
         json!({"type":"function","function":{"name":"browser_status","description":"Check whether an isolated local Chrome/Chromium CDP session is available. Read-only.","parameters":{"type":"object","properties":{}}}}),
-        json!({"type":"function","function":{"name":"browser_navigate","description":"Navigate the isolated local browser to an HTTP(S) URL. Loopback origins are local execution; remote origins use a host-scoped external policy target.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}}),
-        json!({"type":"function","function":{"name":"browser_set_viewport","description":"Set the isolated browser viewport size for responsive verification. This changes only local browser state.","parameters":{"type":"object","properties":{"width":{"type":"integer"},"height":{"type":"integer"}},"required":["width","height"]}}}),
-        json!({"type":"function","function":{"name":"browser_click","description":"Click an element by CSS selector, ARIA role, or exact visible text in the isolated local browser. Include the current HTTP(S) origin when known so policy can scope the interaction.","parameters":{"type":"object","properties":{"selector":{"type":"string"},"role":{"type":"string"},"text":{"type":"string"},"origin":{"type":"string"}}}}}),
+        json!({"type":"function","function":{"name":"browser_navigate","description":"Navigate the isolated local browser to an HTTP(S) URL. Loopback targets do not require external approval; remote origins use a host-scoped external policy target.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}}),
+        json!({"type":"function","function":{"name":"browser_set_viewport","description":"Set the isolated browser viewport size for responsive verification. This changes only local browser state and is a read-level operation.","parameters":{"type":"object","properties":{"width":{"type":"integer"},"height":{"type":"integer"}},"required":["width","height"]}}}),
+        json!({"type":"function","function":{"name":"browser_click","description":"Click an element by CSS selector, ARIA role, or exact visible text in the isolated local browser. Policy uses the browser's tracked current origin, not model-supplied origin data.","parameters":{"type":"object","properties":{"selector":{"type":"string"},"role":{"type":"string"},"text":{"type":"string"}}}}}),
         json!({"type":"function","function":{"name":"browser_read","description":"Read text and HTML from a CSS selector in the isolated local browser. Read-only.","parameters":{"type":"object","properties":{"selector":{"type":"string"}}}}}),
         json!({"type":"function","function":{"name":"browser_measure","description":"Return an element's bounding box and selected computed layout values. Read-only.","parameters":{"type":"object","properties":{"selector":{"type":"string"}},"required":["selector"]}}}),
         json!({"type":"function","function":{"name":"browser_assert_geometry","description":"Check element geometry, including container overflow and overlap between two elements. Read-only.","parameters":{"type":"object","properties":{"first":{"type":"string"},"second":{"type":"string"},"container":{"type":"string"}},"required":["first"]}}}),

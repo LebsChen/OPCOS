@@ -159,6 +159,15 @@ pub fn browser_navigation_target(url: &str) -> Option<(String, bool)> {
     ))
 }
 
+pub fn browser_click_target(origin: &str) -> Option<(String, bool)> {
+    browser_navigation_target(origin).map(|(target, local)| {
+        (
+            target.replacen("browser_navigate:", "browser_click:", 1),
+            local,
+        )
+    })
+}
+
 fn is_loopback_browser_target(target: &str) -> bool {
     target
         .strip_prefix("browser_navigate:")
@@ -477,6 +486,35 @@ mod tests {
             Some(("browser_navigate:trycloudflare.com".into(), false))
         );
         assert_eq!(browser_navigation_target("file:///tmp/store.html"), None);
+        assert_eq!(
+            browser_click_target("https://shop.example.test/cart"),
+            Some(("browser_click:shop.example.test".into(), false))
+        );
+        assert_eq!(
+            browser_click_target("http://localhost:8080/cart"),
+            Some(("browser_click:localhost".into(), true))
+        );
+        assert_eq!(browser_click_target("about:blank"), None);
+        assert_eq!(
+            decide(
+                PermissionMode::Auto,
+                ToolRisk::External,
+                true,
+                &[],
+                "browser_click:shop.example.test"
+            ),
+            Decision::Deny
+        );
+        assert_eq!(
+            decide(
+                PermissionMode::Auto,
+                ToolRisk::Execute,
+                true,
+                &[],
+                "browser_click:localhost"
+            ),
+            Decision::Allow
+        );
         assert_eq!(
             decide(
                 PermissionMode::Auto,
