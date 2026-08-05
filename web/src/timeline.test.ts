@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import liveEnvelopes from "../../fixtures/timeline/live-events.json";
 import opcosEvents from "../../fixtures/timeline/opcos-events.json";
 import planIterations from "../../fixtures/timeline/opcos-plan-iterations.json";
+import toolCallOnlyIteration from "../../fixtures/timeline/tool-call-only-iteration.json";
 import persisted from "../../fixtures/timeline/persisted-events.json";
 import {
   buildTimeline,
@@ -149,5 +150,9 @@ describe("single event-log timeline", () => {
       }),
     );
     expect(nodes).not.toContainEqual(expect.objectContaining({ text: "" }));
+  });
+  it("skips empty tool-call-only assistant iterations", () => {
+    const nodes = buildTimeline(toolCallOnlyIteration as TimelineEvent[]);
+    expect(nodes).toEqual([]);
   });
 });

@@ -9993,6 +9993,9 @@ function AppContent() {
               ? { ...item, run_state: runState, stop_reason: stopReason }
               : item,
           );
+          if (runState !== "running") {
+            void refresh().catch(onError);
+          }
         }
       }
       const approvalTool =

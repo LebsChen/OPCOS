@@ -101,6 +101,10 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
   const planSteps = new Map<string, Array<Record<string, unknown>>>();
   const flush = (endedAt = workEnded) => {
     if (!work) return;
+    if (work.rows.length === 0) {
+      work = null;
+      return;
+    }
     const seconds = Math.max(0, Math.round((endedAt - workStarted) / 1000));
     work.label = `Worked for ${seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`}`;
     nodes.push(work);
@@ -126,13 +130,16 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
       workEnded = 0;
     } else if (type === "devin_message") {
       flush(event.created_at_ms);
-      nodes.push({
-        kind: "assistant",
-        text: String(data.message ?? ""),
-        ts: Number.isFinite(Date.parse(String(event.timestamp)))
-          ? Date.parse(String(event.timestamp)) / 1000
-          : undefined,
-      });
+      const text = String(data.message ?? "").trim();
+      if (text) {
+        nodes.push({
+          kind: "assistant",
+          text,
+          ts: Number.isFinite(Date.parse(String(event.timestamp)))
+            ? Date.parse(String(event.timestamp)) / 1000
+            : undefined,
+        });
+      }
       workStarted = 0;
       workEnded = 0;
     } else if (type === "approval_pending" || type === "ask_user_pending") {

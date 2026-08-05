@@ -1565,18 +1565,20 @@ where
                             .await;
                     }
                     let assistant = json!({"role":"assistant","content":turn.text.clone().unwrap_or_default(),
-                        "tool_calls":turn.tool_calls,"reasoning":turn.reasoning});
+            "tool_calls":turn.tool_calls,"reasoning":turn.reasoning});
                     self.append("assistant", assistant.clone()).await?;
-                    let _ = self
-                        .working_event(
-                            "devin_message",
-                            "message",
-                            json!({
-                                "message": turn.text.clone().unwrap_or_default(),
-                                "tool_calls": turn.tool_calls.len()
-                            }),
-                        )
-                        .await;
+                    if !turn.text.as_deref().unwrap_or_default().trim().is_empty() {
+                        let _ = self
+                            .working_event(
+                                "devin_message",
+                                "message",
+                                json!({
+                                    "message": turn.text.clone().unwrap_or_default(),
+                                    "tool_calls": turn.tool_calls.len()
+                                }),
+                            )
+                            .await;
+                    }
                     if !partial.turn_emitted {
                         let _ = self.emit_event(
                             "turn",

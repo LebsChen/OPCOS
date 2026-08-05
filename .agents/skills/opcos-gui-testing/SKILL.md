@@ -361,8 +361,153 @@ in the report — it is the host's UI, not something OPCOS leaks.
   `worktree has uncommitted changes…` with a 强制删除 button, and force must remove the directory
   from disk, not just the card.
 
+## Testing the working-event timeline (`buildTimeline`)
+
+The React timeline is built by `web/src/timeline.ts::buildTimeline` from persisted `session_events`.
+Its unit fixtures were originally captured from **Devin's** event stream, not OPCOS', so green unit
+tests prove nothing about the real app. Always drive a real session.
+
+### Replay `buildTimeline` over real events instead of counting rows by eye
+
+This is the single highest-value technique for this surface — it gives an exact, complete row list
+including things that are invisible in the UI (empty bubbles, zero-row groups):
+
+```bash
+# 1. dump the session's persisted events (after a clean shutdown; copy the WAL, see below)
+python3 -c "
+import sqlite3,json
+c=sqlite3.connect('/tmp/snapshot.db')
+rows=[json.loads(r[0]) for r in c.execute(
+  'select event_json from session_events where session_id=? order by created_at_ms,sequence',(SID,))]
+open('/tmp/ev.json','w').write(json.dumps(rows))"
+# 2. replay the real implementation
+cat > /tmp/replay.ts <<'EOF'
+import { readFileSync } from "node:fs";
+import { buildTimeline } from "/home/ubuntu/repos/OPCOS/web/src/timeline";
+const nodes = buildTimeline(JSON.parse(readFileSync("/tmp/ev.json","utf8")) as any);
+nodes.forEach((n: any, i: number) => {
+  if (n.kind === "work") { console.log(`[${i}] WORK ${n.label} rows=${n.rows.length}`);
+    n.rows.forEach((r: any) => console.log(`        - ${r.label}`)); }
+  else console.log(`[${i}] ${n.kind.toUpperCase()} ${JSON.stringify(n.text ?? "").slice(0,70)}`);
+});
+EOF
+(cd /home/ubuntu/repos/OPCOS/web && npx tsx /tmp/replay.ts)
+```
+
+Flag as **empty artifacts**: any `work` node with `rows.length === 0`, any `assistant`/`notice` node
+whose text is empty/whitespace. The engine emits `devin_message` with `message: ""` on tool-call-only
+iterations, which currently produces blank assistant bubbles and a `Worked for 0s` zero-row group.
+
+### Force all row families in one prompt
+
+> Plan this out as a task list first, then do it. In this workspace: 1) create `X.py` with two
+> functions; 2) create `README_X.md` documenting them; 3) run `python3 X.py`; 4) add a `--flag` and
+> re-run. Update the task list as you finish each step.
+
+Step 4 is what produces an **edit** (`action_type:"edit"`); a task the model gets right first time
+only ever yields `create` rows. Cross-check the numbers: sum
+`multi_edit_result.file_updates[].lines_added - lines_removed` per file and compare with `wc -l` —
+they have matched exactly every round, so drift is a real bug.
+
+### Task rows: `steps`, not `todos`; and watch the reset scope
+
+`todo_update` payloads are serialized `PlanRecord`s: `{plan_id, title, status, revision,
+steps:[{step_id, position, description, status}]}`. There is **no `todos` key**.
+
+Plan state must be keyed by `plan_id`, not reset at every work-group flush — when it was
+work-group-scoped, the interleaved `devin_message` per iteration reset it and you got
+`Created N Tasks` repeated once per group with **zero** `k/n#i` rows. Correct output looks like
+`Created 5 Tasks` once followed by `0/5#1 …`, `1/5#1 …`, `1/5#2 …` … `5/5#5 …` (two rows per
+`plan_update` is normal: "previous step done" + "next step in progress").
+
+### Slash commands: action vs prompt
+
+`builtin_control_slash_commands()` (`/compact`, `/mode`, `/model`, `/ls`, `/help`) are
+`execution:"action"`; `builtin_slash_commands()` (`/implement`, `/plan`, `/review`, `/test`,
+`/think-hard`, `/deploy`, `/pull-project`) are `execution:"prompt"`. The composer autocomplete labels
+them `ACTION` / `PROMPT` — use that as the quick visual check. Test both kinds every round: an action
+must produce **no user prose bubble** plus a backend effect and a rendered notice
+(`session_list`, `mode_current`, `mode_changed`, `model_current`, `model_switch`, `slash_help`);
+a prompt must expand into its body text in the user bubble.
+
+**Composer click-target trap:** the slash autocomplete popup sits directly under the textarea and
+shifts the layout, so clicking where the textarea "usually" is often hits the popup and silently
+drops your typing. Screenshot first, click the `Ask OPCOS…` placeholder line specifically, and press
+`Escape` to dismiss the popup before clicking send.
+
+### Compaction
+
+`/compact` on the Builtin harness calls `engine.compact_now()`. Expect exactly one persisted
+`compacted` event, `Earlier context compacted` as a **row inside** a `Worked for …` group (not a
+standalone notice), and a real non-empty summary in the `compaction_state` table:
+
+```sql
+select state from compaction_state where session_id=?;   -- JSON with a "summary" field
+```
+
+Assert `len(summary) > 0` — a `compaction_summary_invalid` event means the model's summary was
+rejected (`response_too_large`) and compaction was lossy. Note the summary length varies a lot run to
+run (1.9k–14k chars observed), so if you are testing a size cap, check the actual length before
+claiming the cap was exercised.
+
+### Stuck `Running` header
+
+The header can stay `Running`/`Working` indefinitely while `sessions.run_state` is already `idle` —
+**always cross-check the DB before believing the UI**:
+
+```sql
+select run_state, updated_at from sessions where session_id=?;
+```
+
+Two causes have been fixed (listener re-subscription on `selected?.id`; missing terminal event after
+`/compact` itself), but as of `95fce9b` the **turn that follows a `/compact`** still hangs the header,
+and `⏹ Stop` does *not* clear an already-stuck header — only navigating away and back does.
+`⏹ Stop` during a genuinely streaming turn does work. Test all three situations separately.
+
+### Parity recipe: live == in-app re-read == cold restart
+
+1. Capture the ordered row labels while the turn streams (expand every `<details>` group).
+2. **`Ctrl+R` does not reload the Tauri webview.** Navigate to another view and back into the session
+   to force a `read_transcript`.
+3. `pkill -f target/debug/opcos`, relaunch, reopen the session.
+
+Expand groups by clicking their summary rows **bottom-up** — expanding a group pushes everything
+below it down, so top-down clicking hits the wrong targets.
+
+### Context window resolution
+
+The nextapi gateway reports no `context_length` for `glm-5.2` (`capabilities_known=false` in
+`model_discovery_cache`), so a `context_growth_update` with `resolved_context_window=1000000` and
+`context_window_source='matrix'` proves the matrix fallback rather than a gateway value. Assert over
+**every** such event. "No auto-compaction" alone is weak evidence — a short run stays under the old
+24k threshold anyway.
+
+### Envelope integrity one-liner
+
+After a clean shutdown, assert on every persisted event: non-empty `type`, non-empty `event_id`,
+integer `created_at_ms`, unique ids, monotonic `created_at_ms`; plus zero empty `devin_thoughts`
+bodies and no two consecutive identical thoughts.
+
+### Provider bring-up on a gateway
+
+Settings → Provider → OpenAI: base URL, paste key into the password field, Validate, pick the model.
+After first configuring a provider the **home composer's model list stays on the built-in matrix
+models until a full app restart** — restart before concluding the model is unavailable. Once
+restarted the picker opens in <1 s; a multi-second `Loading models…` means something is probing every
+model.
+
+### Known-failing unit test (not a headless artifact)
+
+`opcos-hosts::local_desktop::tests::x11_capture_and_input_are_real_when_display_is_available` fails
+**even with `DISPLAY=:0` on a real X server that has XTEST**. The screenshot half passes; only
+`Enigo::new()` / `computer_use(MouseMove …)` fails with
+`local input unavailable: could not initialize the X11 input backend`. Treat it as an enigo backend /
+feature-flag gap, not a headless artifact, and do not "fix" it by re-running with a display.
+
 ## Devin secrets needed
 
 - `RVM_WIN_TOKEN` — valid for DevBox `https://devbox.windevos.com` only (Antec `win.windevos.com`
   answers 401 for everything except `/api/health`).
 - `OPCOS_PROVIDER_KEY` — OpenAI-compatible gateway `https://ai.yaoshen.de5.net/v1`.
+- `nextapi_token` — OpenAI-compatible gateway `https://api.nextapi.store/v1` (serves `glm-5.2`;
+  reports no context length, which is what makes it useful for testing matrix fallback).
