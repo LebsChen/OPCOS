@@ -29,8 +29,10 @@ import {
 } from "./gui";
 import {
   TranscriptViewItem,
+  isErrorNotice,
   normalizeTranscript,
   normalizeViewItems,
+  providerErrorPresentation,
   reduceStreamEvent,
 } from "./transcript";
 import { Sidebar } from "./components/Sidebar";
@@ -9635,6 +9637,7 @@ function AppContent() {
   const [settingsTab, setSettingsTab] = useState<SettingsSection>("provider");
   const [query, setQuery] = useState("");
   const [error, setError] = useState("");
+  const errorTimer = useRef<number | undefined>(undefined);
   const [running, setRunning] = useState(false);
   const [drawerCollapsed, setDrawerCollapsed] = useState(false);
   const [rightPanelWidth, setRightPanelWidth] = useState(() =>
@@ -9690,6 +9693,40 @@ function AppContent() {
   const [homeWorkspace, setHomeWorkspace] = useState("");
   const [secretBackend, setSecretBackend] = useState("");
   const generation = useRef(0);
+  const showErrorToast = (reason: unknown) => {
+    const runtime = (window as Window & { __TAURI_INTERNALS__?: unknown })
+      .__TAURI_INTERNALS__;
+    const message = errorMessage(reason);
+    if (
+      message.includes("Approval required before this tool can continue") ||
+      message.includes(
+        "Question requires an answer before this tool can continue",
+      )
+    )
+      return;
+    if (!runtime && /invoke|tauri/i.test(message)) return;
+    const providerLike =
+      /provider|HTTP\s+\d{3}|bad_response|overloaded|request failed/i.test(
+        message,
+      );
+    const toast = providerLike
+      ? providerErrorPresentation(redactApproval(message)).toast
+      : redactApproval(message);
+    setError(toast);
+    if (errorTimer.current !== undefined)
+      window.clearTimeout(errorTimer.current);
+    errorTimer.current = window.setTimeout(() => {
+      setError("");
+      errorTimer.current = undefined;
+    }, 6000);
+  };
+  useEffect(
+    () => () => {
+      if (errorTimer.current !== undefined)
+        window.clearTimeout(errorTimer.current);
+    },
+    [],
+  );
   useEffect(() => {
     void command<SlashCommand[]>("list_slash_commands", {
       projectId: selected?.project_id || null,
@@ -9984,6 +10021,22 @@ function AppContent() {
         )
       )
         setRunning(false);
+      if (payload.kind === "notice") {
+        const noticeText =
+          typeof payload.payload?.text === "string"
+            ? payload.payload.text
+            : typeof payload.payload?.message === "string"
+              ? payload.payload.message
+              : "";
+        if (
+          isErrorNotice({
+            kind: "notice",
+            noticeKind: String(payload.payload?.kind || ""),
+            text: noticeText,
+          })
+        )
+          showErrorToast(noticeText);
+      }
       setTranscript((items) =>
         reduceStreamEvent(items, {
           kind: payload.kind,
@@ -9997,18 +10050,7 @@ function AppContent() {
     };
   }, [selected?.id]);
   const onError = (reason: unknown) => {
-    const runtime = (window as Window & { __TAURI_INTERNALS__?: unknown })
-      .__TAURI_INTERNALS__;
-    const message = errorMessage(reason);
-    if (
-      message.includes("Approval required before this tool can continue") ||
-      message.includes(
-        "Question requires an answer before this tool can continue",
-      )
-    )
-      return;
-    if (!runtime && /invoke|tauri/i.test(message)) return;
-    setError(redactApproval(message));
+    showErrorToast(reason);
   };
   const addHost = async (event: FormEvent) => {
     event.preventDefault();
@@ -10753,9 +10795,19 @@ function AppContent() {
           </div>
         )}
         {error && (
-          <div className="error-banner">
+          <div className="error-toast" role="alert" data-testid="error-toast">
             {error}
-            <button onClick={() => setError("")}>×</button>
+            <button
+              aria-label="Dismiss notification"
+              onClick={() => {
+                setError("");
+                if (errorTimer.current !== undefined)
+                  window.clearTimeout(errorTimer.current);
+                errorTimer.current = undefined;
+              }}
+            >
+              ×
+            </button>
           </div>
         )}
       </main>

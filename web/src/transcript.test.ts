@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { humanizeTool } from "./humanize";
 import {
   classifyStepStatus,
+  providerErrorPresentation,
   normalizeTranscript,
   normalizeViewItems,
   reduceStreamEvent,
@@ -9,6 +10,18 @@ import {
 import { groupWorkSegments } from "./workSegments";
 
 describe("OPCOS transcript folding", () => {
+  it("shortens provider JSON errors while retaining expandable details", () => {
+    const error = providerErrorPresentation(
+      '{"status_code":503,"error":{"message":"system_cpu_overloaded","request_id":"secret"}}',
+    );
+    expect(error.summary).toBe(
+      "Provider request failed — HTTP 503 Service Unavailable",
+    );
+    expect(error.toast).toBe("system cpu overloaded");
+    expect(error.detail).toContain("system_cpu_overloaded");
+    expect(error.summary).not.toContain("{");
+  });
+
   it("summarizes common tool actions as compact step lines", () => {
     expect(humanizeTool("run_shell", { command: "pytest -q" })).toMatchObject({
       pre: "Ran ",
@@ -613,6 +626,38 @@ describe("OPCOS transcript folding", () => {
     items = reduceStreamEvent(items, event);
 
     expect(items.filter((item) => item.kind === "thinking")).toHaveLength(1);
+  });
+
+  it("deduplicates thoughts replayed after a provider stream reset", () => {
+    let items = reduceStreamEvent([], {
+      kind: "stream",
+      payload: {
+        working_event: {
+          event_type: "devin_thoughts",
+          payload: { message: "Retry the provider request." },
+        },
+      },
+    });
+    items = reduceStreamEvent(items, {
+      kind: "stream",
+      payload: { stream_reset: true },
+    });
+    items = reduceStreamEvent(items, {
+      kind: "stream",
+      payload: {
+        reasoning_delta: "Retry the provider request.",
+      },
+    });
+
+    const rendered = normalizeViewItems(items);
+    const thoughts = rendered.filter(
+      (item) =>
+        (item.kind === "thinking" ||
+          (item.kind === "assistant" && !item.text?.trim())) &&
+        (item.reasoning || item.text || "").trim() ===
+          "Retry the provider request.",
+    );
+    expect(thoughts).toHaveLength(1);
   });
 
   it("normalizes live rendering to the persisted timeline shape", () => {

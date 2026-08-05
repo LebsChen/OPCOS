@@ -1,7 +1,12 @@
 import { useEffect, useState } from "react";
 import { translate } from "../i18n";
 import type { ApprovalDecision, Item } from "../types";
-import { classifyStepStatus, isHiddenTimelineItem } from "../transcript";
+import {
+  classifyStepStatus,
+  isErrorNotice,
+  isHiddenTimelineItem,
+  providerErrorPresentation,
+} from "../transcript";
 import { shortArgs } from "./ApprovalCard";
 import { ApprovalCard } from "./ApprovalCard";
 import { humanizeAsk, humanizeTool, type HumanLine } from "../humanize";
@@ -663,6 +668,33 @@ export function Transcript({
             );
           case "notice":
             if (isHiddenTimelineItem(item)) return null;
+            if (isErrorNotice(item)) {
+              const error = providerErrorPresentation(item.text || "");
+              return (
+                <details
+                  className={"notice " + (item.tone === "warn" ? "warn" : "")}
+                  key={bi}
+                  data-testid="error-notice"
+                >
+                  <summary className="cursor-pointer">{error.summary}</summary>
+                  <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap text-xs opacity-80">
+                    {error.detail}
+                  </pre>
+                  {item.retriable &&
+                    !running &&
+                    onRetry &&
+                    block.i === retryAnchor(items) && (
+                      <button
+                        className="btn ml-2 mt-2"
+                        data-testid="notice-retry"
+                        onClick={onRetry}
+                      >
+                        Retry
+                      </button>
+                    )}
+                </details>
+              );
+            }
             return (
               <div
                 className={"notice " + (item.tone === "warn" ? "warn" : "")}

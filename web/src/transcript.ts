@@ -31,6 +31,108 @@ export type TranscriptViewItem = {
   diff?: { additions?: number; deletions?: number };
 };
 
+export type ErrorPresentation = {
+  summary: string;
+  toast: string;
+  detail: string;
+};
+
+function parseErrorValue(text: string): unknown {
+  let value: unknown = text;
+  for (let index = 0; index < 3 && typeof value === "string"; index += 1) {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      break;
+    }
+  }
+  return value;
+}
+
+function findErrorField(value: unknown, keys: string[]): string | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const object = value as Record<string, unknown>;
+  for (const key of keys) {
+    const candidate = object[key];
+    if (typeof candidate === "string" && candidate.trim()) return candidate;
+  }
+  for (const candidate of Object.values(object)) {
+    const found = findErrorField(candidate, keys);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function findErrorNumber(value: unknown, keys: string[]): number | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const object = value as Record<string, unknown>;
+  for (const key of keys) {
+    const candidate = object[key];
+    if (typeof candidate === "number" && Number.isFinite(candidate))
+      return candidate;
+  }
+  for (const candidate of Object.values(object)) {
+    const found = findErrorNumber(candidate, keys);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
+
+function friendlyErrorText(value: string): string {
+  return value
+    .replace(/^["']|["']$/g, "")
+    .replace(/\\(["'])/g, "$1")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 180);
+}
+
+export function providerErrorPresentation(text: string): ErrorPresentation {
+  const parsed = parseErrorValue(text);
+  const statusText = findErrorField(parsed, [
+    "status_code",
+    "status",
+    "http_status",
+  ]);
+  const status =
+    findErrorNumber(parsed, ["status_code", "status", "http_status"]) ||
+    (statusText ? Number.parseInt(statusText, 10) : undefined) ||
+    Number.parseInt(text.match(/\bHTTP\s+(\d{3})\b/i)?.[1] || "", 10) ||
+    undefined;
+  const rawMessage =
+    findErrorField(parsed, ["message", "detail", "error", "code"]) ||
+    text.replace(/^provider request failed[:\s-]*/i, "");
+  const message = friendlyErrorText(rawMessage);
+  const statusLabel =
+    status === 503
+      ? "HTTP 503 Service Unavailable"
+      : status
+        ? `HTTP ${status}`
+        : "";
+  const summary = statusLabel
+    ? `Provider request failed — ${statusLabel}`
+    : `Provider request failed — ${message || "request failed"}`;
+  return {
+    summary,
+    toast: message || summary,
+    detail: text,
+  };
+}
+
+export function isErrorNotice(item: {
+  kind: string;
+  noticeKind?: string;
+  text?: string;
+}): boolean {
+  return (
+    ["error", "interrupted"].includes(item.noticeKind || "") ||
+    /\b(provider|HTTP\s+\d{3}|bad_response|overloaded|request failed)\b/i.test(
+      item.text || "",
+    )
+  );
+}
+
 function timestampValue(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value !== "string") return undefined;
@@ -125,8 +227,13 @@ export function normalizeViewItems(
   const thoughtTexts = new Set<string>();
   for (const source of items) {
     const item = { ...source };
-    if (item.kind === "thinking") {
-      const thought = (item.reasoning || item.text || "").trim();
+    const thought =
+      item.kind === "thinking"
+        ? (item.reasoning || item.text || "").trim()
+        : item.kind === "assistant" && !item.text?.trim()
+          ? (item.reasoning || "").trim()
+          : "";
+    if (thought) {
       if (!thought || thoughtTexts.has(thought)) continue;
       thoughtTexts.add(thought);
       let previousIndex = merged.length - 1;
@@ -137,7 +244,13 @@ export function normalizeViewItems(
         previousIndex -= 1;
       }
       const previous = merged[previousIndex];
-      if (previous?.kind === "thinking") {
+      const previousThought =
+        previous?.kind === "thinking"
+          ? (previous.reasoning || previous.text || "").trim()
+          : previous?.kind === "assistant" && !previous.text?.trim()
+            ? (previous.reasoning || "").trim()
+            : "";
+      if (previousThought) {
         previous.reasoning = `${previous.reasoning || ""}\n\n---\n\n${thought}`;
         previous.text = previous.reasoning;
         continue;
@@ -536,7 +649,8 @@ export function reduceStreamEvent(
           if (
             next.some(
               (item) =>
-                item.kind === "thinking" &&
+                (item.kind === "thinking" ||
+                  (item.kind === "assistant" && !item.text?.trim())) &&
                 (item.reasoning || item.text || "").trim() === thought.trim(),
             )
           ) {

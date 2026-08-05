@@ -4335,6 +4335,42 @@ html[data-theme="dark"] .hiw-sticky {
   }
 }
 
+.error-toast {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: min(460px, calc(100vw - 40px));
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--line));
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--danger);
+  box-shadow: 0 12px 30px rgb(0 0 0 / 18%);
+  animation: error-toast-in 0.2s ease-out;
+}
+
+.error-toast button {
+  flex: 0 0 auto;
+  color: inherit;
+  font-size: 18px;
+  line-height: 1;
+}
+
+@keyframes error-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 /* ============ Windows (WebView2) polish ============ */
 /* Classic Windows scrollbars consume ~17px of layout width that macOS's overlay
    scrollbars don't — panels tuned on Mac ended up cramped/misaligned (caught
