@@ -125,6 +125,21 @@ export function effectiveRunningState(
   return backendRunState ? backendRunState === "running" : localRunning;
 }
 
+export function selectedSessionFromList(
+  sessions: Session[],
+  selectedId: string | null | undefined,
+): Session | null {
+  return sessions.find((session) => session.id === selectedId) ?? null;
+}
+
+export function submissionRoute(
+  running: boolean,
+  canSteer: boolean,
+): "send" | "steer" | "blocked" {
+  if (!running) return "send";
+  return canSteer ? "steer" : "blocked";
+}
+
 export function hostStatusLabel(host: Host): string {
   if (host.online === true) return "Online";
   if (host.online === false) return "Offline";

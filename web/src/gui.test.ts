@@ -11,6 +11,7 @@ import {
   pendingQuestionFromPayload,
   reconcileRunningState,
   effectiveRunningState,
+  selectedSessionFromList,
 } from "./gui";
 
 describe("GUI boundary behavior", () => {
@@ -120,6 +121,27 @@ describe("GUI boundary behavior", () => {
 
   it("keeps the composer enabled while a question awaits an answer", () => {
     expect(effectiveRunningState(true, "running", true)).toBe(false);
+  });
+
+  it("lets the authoritative idle state clear a stale local running flag", () => {
+    expect(effectiveRunningState(false, "idle", true)).toBe(false);
+  });
+
+  it("derives every selected surface from the refreshed session list", () => {
+    const running = {
+      id: "s",
+      title: "task",
+      host_id: "h",
+      host_name: "host",
+      model: "model",
+      mode: "Auto",
+      harness: "builtin",
+      run_state: "running",
+      stop_reason: "none",
+    };
+    expect(selectedSessionFromList([running], "s")?.run_state).toBe("running");
+    const idle = { ...running, run_state: "idle" };
+    expect(selectedSessionFromList([idle], "s")?.run_state).toBe("idle");
   });
 
   it("does not contain the retired private gateway address", () => {

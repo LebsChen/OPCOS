@@ -42,6 +42,7 @@ import type { Option } from "./Dropdown";
 import { Icon } from "./Icon";
 import { Toggle } from "./Toggle";
 import { expandSlashCommandValue } from "../slashCommands";
+import { submissionRoute } from "../gui";
 type DictationStatus = {
   recording?: boolean;
   supported?: boolean;
@@ -391,8 +392,16 @@ export function Composer(props: Props) {
       dictationBusy
     )
       return;
-    if (props.running) {
-      props.onSteer?.(t, attachments);
+    const route = submissionRoute(props.running, Boolean(props.onSteer));
+    if (route === "blocked") {
+      showAttachNotice(
+        "The session is still running; your message was not sent.",
+      );
+      return;
+    }
+    if (route === "steer") {
+      props.onSteer!(t, attachments);
+      setSlashQuery(null);
       setText("");
       setAttachments([]);
       return;
@@ -403,6 +412,7 @@ export function Composer(props: Props) {
       return;
     }
     props.onSend(expandSlashCommand(t), attachments);
+    setSlashQuery(null);
     setText("");
     setAttachments([]);
   };

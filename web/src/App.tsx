@@ -26,6 +26,7 @@ import {
   pendingQuestionFromPayload,
   reconcileRunningState,
   redactApproval,
+  selectedSessionFromList,
   submitFailureMessage,
   type PendingQuestionData,
 } from "./gui";
@@ -9618,7 +9619,29 @@ function AppContent() {
   const [windowMaximized, setWindowMaximized] = useState(false);
   const [hosts, setHosts] = useState<Host[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
-  const [selected, setSelected] = useState<Session | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const selected = useMemo(
+    () => selectedSessionFromList(sessions, selectedId),
+    [sessions, selectedId],
+  );
+  const setSelected = (
+    next: Session | null | ((current: Session | null) => Session | null),
+  ) => {
+    const resolved = typeof next === "function" ? next(selected) : next;
+    if (!resolved) {
+      setSelectedId(null);
+      return;
+    }
+    setSelectedId(resolved.id);
+    setSessions((items) => {
+      const exists = items.some((item) => item.id === resolved.id);
+      return exists
+        ? items.map((item) =>
+            item.id === resolved.id ? { ...item, ...resolved } : item,
+          )
+        : [...items, resolved];
+    });
+  };
   const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
   const [transcript, setTranscript] = useState<TimelineEvent[]>([]);
   const [pendingQuestion, setPendingQuestion] =
@@ -9792,10 +9815,6 @@ function AppContent() {
       setSelectedProject(
         nextProjects.find((item) => item.id === selectedProject.id) || null,
       );
-    }
-    if (selected) {
-      const current = nextSessions.find((item) => item.id === selected.id);
-      if (current) setSelected(current);
     }
   };
   useEffect(() => {
@@ -10231,6 +10250,17 @@ function AppContent() {
     if (!selected) return;
     void command("steering", { sessionId: selected.id, text }).catch(onError);
   };
+  const interrupt = async () => {
+    if (!selected) return;
+    try {
+      await command("interrupt", { sessionId: selected.id });
+    } catch (reason) {
+      onError(reason);
+    } finally {
+      setRunning(false);
+      void refresh().catch(onError);
+    }
+  };
   return (
     <div
       className={`app ${surface === "session" && selected ? "session-layout" : "surface-layout"}${surface === "session" && selected && drawerCollapsed ? " session-drawer-collapsed" : ""}${navCollapsed ? " nav-collapsed" : ""}${windowMaximized ? " window-maximized" : ""}`}
@@ -10470,11 +10500,7 @@ function AppContent() {
                       .then(() => setSelected({ ...selected, model }))
                       .catch(onError);
                   }}
-                  onInterrupt={() =>
-                    command("interrupt", { sessionId: selected.id }).catch(
-                      onError,
-                    )
-                  }
+                  onInterrupt={interrupt}
                   assets={assets}
                   secrets={secrets}
                   slashCommands={slashCommands}

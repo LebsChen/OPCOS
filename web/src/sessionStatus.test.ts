@@ -17,4 +17,8 @@ describe("session status labels", () => {
   it("safely degrades unknown values", () => {
     expect(sessionStatusLabel("future", "future_reason")).toBe("状态未知");
   });
+
+  it("shows idle after a terminal event clears the run state", () => {
+    expect(sessionStatusLabel("idle", "none")).toBe("空闲");
+  });
 });

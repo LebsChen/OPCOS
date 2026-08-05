@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { expandSlashCommandValue } from "./slashCommands";
+import { submissionRoute } from "./gui";
 
 describe("slash command expansion", () => {
   const commands = [
@@ -18,5 +19,11 @@ describe("slash command expansion", () => {
     expect(expandSlashCommandValue("/review focus on tests", commands)).toBe(
       "Review the change.\n\nfocus on tests",
     );
+  });
+
+  it("never drops a submission when the running surface has no steer path", () => {
+    expect(submissionRoute(false, false)).toBe("send");
+    expect(submissionRoute(true, true)).toBe("steer");
+    expect(submissionRoute(true, false)).toBe("blocked");
   });
 });
