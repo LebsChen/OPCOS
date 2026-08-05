@@ -27,7 +27,52 @@ export type TranscriptViewItem = {
   noticeKind?: string;
   approval?: boolean;
   resolved?: ApprovalResolution;
+  timestamp?: number;
+  diff?: { additions?: number; deletions?: number };
 };
+
+function timestampValue(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string") return undefined;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed / 1000 : undefined;
+}
+
+function diffStats(
+  value: unknown,
+): { additions?: number; deletions?: number } | undefined {
+  const object = payloadObject(value);
+  const nested = payloadObject(object.diff);
+  const additions =
+    typeof object.additions === "number"
+      ? object.additions
+      : typeof object.insertions === "number"
+        ? object.insertions
+        : typeof nested.additions === "number"
+          ? nested.additions
+          : undefined;
+  const deletions =
+    typeof object.deletions === "number"
+      ? object.deletions
+      : typeof object.removals === "number"
+        ? object.removals
+        : typeof nested.deletions === "number"
+          ? nested.deletions
+          : undefined;
+  if (additions !== undefined || deletions !== undefined)
+    return { additions, deletions };
+  const oldValue =
+    typeof object.old_string === "string" ? object.old_string : undefined;
+  const newValue =
+    typeof object.new_string === "string" ? object.new_string : undefined;
+  if (oldValue !== undefined && newValue !== undefined) {
+    return {
+      additions: newValue ? newValue.split(/\r?\n/).length : 0,
+      deletions: oldValue ? oldValue.split(/\r?\n/).length : 0,
+    };
+  }
+  return undefined;
+}
 
 export function isVisibleTimelineItem(item: {
   kind: string;
@@ -71,6 +116,36 @@ export function isHiddenTimelineItem(item: {
   resolved?: unknown;
 }): boolean {
   return !isVisibleTimelineItem(item);
+}
+
+export function normalizeViewItems(
+  items: TranscriptViewItem[],
+): TranscriptViewItem[] {
+  const merged: TranscriptViewItem[] = [];
+  const thoughtTexts = new Set<string>();
+  for (const source of items) {
+    const item = { ...source };
+    if (item.kind === "thinking") {
+      const thought = (item.reasoning || item.text || "").trim();
+      if (!thought || thoughtTexts.has(thought)) continue;
+      thoughtTexts.add(thought);
+      let previousIndex = merged.length - 1;
+      while (
+        previousIndex >= 0 &&
+        isHiddenTimelineItem(merged[previousIndex])
+      ) {
+        previousIndex -= 1;
+      }
+      const previous = merged[previousIndex];
+      if (previous?.kind === "thinking") {
+        previous.reasoning = `${previous.reasoning || ""}\n\n---\n\n${thought}`;
+        previous.text = previous.reasoning;
+        continue;
+      }
+    }
+    merged.push(item);
+  }
+  return merged;
 }
 
 type RawItem = { kind: string; payload: Record<string, unknown> };
@@ -148,6 +223,7 @@ export function normalizeTranscript(raw: RawItem[]): TranscriptViewItem[] {
         ),
         kind: "user",
         text,
+        timestamp: timestampValue(payload.timestamp),
       });
       return;
     }
@@ -178,6 +254,7 @@ export function normalizeTranscript(raw: RawItem[]): TranscriptViewItem[] {
         noticeKind:
           typeof payload.kind === "string" ? payload.kind : record.kind,
         text: noticeText,
+        timestamp: timestampValue(payload.timestamp),
       });
       return;
     }
@@ -206,11 +283,14 @@ export function normalizeTranscript(raw: RawItem[]): TranscriptViewItem[] {
               : existing.toolName;
         existing.arguments = payload.arguments ?? existing.arguments;
         existing.result = payload.result ?? existing.result;
+        existing.diff ??=
+          diffStats(payload.result) || diffStats(payload.arguments);
         existing.status =
           typeof payload.status === "string"
             ? (payload.status as ToolState)
             : existing.status;
         existing.approval = false;
+        existing.timestamp ??= timestampValue(payload.timestamp);
       } else {
         output.push({
           id: stableId("tool", index, callId),
@@ -229,6 +309,8 @@ export function normalizeTranscript(raw: RawItem[]): TranscriptViewItem[] {
               ? (payload.status as ToolState)
               : "interrupted",
           approval: false,
+          timestamp: timestampValue(payload.timestamp),
+          diff: diffStats(payload.result) || diffStats(payload.arguments),
         });
       }
       return;
@@ -256,6 +338,8 @@ export function normalizeTranscript(raw: RawItem[]): TranscriptViewItem[] {
           arguments: payload.arguments,
           status: "pending",
           approval: true,
+          timestamp: timestampValue(payload.timestamp),
+          diff: diffStats(payload.arguments),
         });
       }
       return;
@@ -267,6 +351,7 @@ export function normalizeTranscript(raw: RawItem[]): TranscriptViewItem[] {
           id: stableId("thinking", index),
           kind: "thinking",
           reasoning: String(payload.reasoning),
+          timestamp: timestampValue(payload.timestamp),
         });
       }
       const assistantText =
@@ -284,6 +369,7 @@ export function normalizeTranscript(raw: RawItem[]): TranscriptViewItem[] {
             assistantText.trim().toLowerCase() === "pending"
               ? ""
               : assistantText,
+          timestamp: timestampValue(payload.timestamp),
         });
       }
       calls.forEach((call, callIndex) => {
@@ -297,6 +383,8 @@ export function normalizeTranscript(raw: RawItem[]): TranscriptViewItem[] {
           arguments: call.arguments,
           status: "pending",
           approval: true,
+          timestamp: timestampValue(payload.timestamp),
+          diff: diffStats(call.arguments),
         };
         toolIndex.set(callId, item);
         output.push(item);
@@ -342,6 +430,7 @@ export function normalizeTranscript(raw: RawItem[]): TranscriptViewItem[] {
           result: textFromContent(resultPart.content) || resultPart.content,
           status: "ok",
           approval: false,
+          timestamp: timestampValue(payload.timestamp),
         });
       }
     }
@@ -371,26 +460,7 @@ export function normalizeTranscript(raw: RawItem[]): TranscriptViewItem[] {
           : item.status || existing.status;
     existing.approval = item.approval || existing.approval;
   }
-  const merged: TranscriptViewItem[] = [];
-  for (const item of deduped) {
-    let previousIndex = merged.length - 1;
-    while (previousIndex >= 0 && isHiddenTimelineItem(merged[previousIndex])) {
-      previousIndex -= 1;
-    }
-    const previous = merged[previousIndex];
-    if (
-      item.kind === "thinking" &&
-      previous?.kind === "thinking" &&
-      item.reasoning
-    ) {
-      if (previous.reasoning?.trim() === item.reasoning.trim()) continue;
-      previous.reasoning = `${previous.reasoning || ""}\n\n---\n\n${item.reasoning}`;
-      previous.text = previous.reasoning;
-    } else {
-      merged.push(item);
-    }
-  }
-  return merged;
+  return normalizeViewItems(deduped);
 }
 
 export function reduceStreamEvent(
@@ -442,6 +512,7 @@ export function reduceStreamEvent(
           ? working.event_type
           : "working_event";
       const details = payloadObject(working.payload);
+      const workingTimestamp = timestampValue(working.timestamp);
       const replaceActivity = (text: string) => {
         const existingIndex = next.findIndex(
           (item) =>
@@ -489,6 +560,7 @@ export function reduceStreamEvent(
               kind: "thinking",
               text: thought,
               reasoning: thought,
+              timestamp: workingTimestamp,
             });
           }
         }
@@ -651,6 +723,7 @@ export function reduceStreamEvent(
         toolName: "tool",
         arguments: "",
         status: "running",
+        timestamp: timestampValue(payload.timestamp),
       };
       next.push(tool);
     }
@@ -682,6 +755,8 @@ export function reduceStreamEvent(
       id: `event:assistant:${next.length}`,
       kind: "assistant",
       text: typeof turn.text === "string" ? turn.text : live?.text || "",
+      timestamp:
+        timestampValue(turn.timestamp) || timestampValue(payload.timestamp),
     };
     if (typeof turn.reasoning === "string")
       assistant.reasoning = turn.reasoning;

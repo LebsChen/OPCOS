@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { translate } from "../i18n";
 import type { ApprovalDecision, Item } from "../types";
 import { classifyStepStatus, isHiddenTimelineItem } from "../transcript";
@@ -7,6 +7,7 @@ import { ApprovalCard } from "./ApprovalCard";
 import { humanizeAsk, humanizeTool, type HumanLine } from "../humanize";
 import { Markdown } from "./Markdown";
 import { Icon } from "./Icon";
+import { workSegmentDiff, workSegmentDuration } from "../workSegments";
 
 // Visual source: OpenWorker surfaces/gui/src/components/Transcript.tsx:1-465.
 // OPCOS keeps that structure/classes and adapts only transcript item types, approval
@@ -351,6 +352,90 @@ function TurnGroup({
   );
 }
 
+function formatWorkDuration(seconds: number | undefined): string {
+  if (seconds === undefined) return "";
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}m ${seconds % 60}s`;
+}
+
+function WorkSegment({
+  items,
+  live,
+  streamingText,
+}: {
+  items: TurnItem[];
+  live?: boolean;
+  streamingText?: string;
+}) {
+  const [open, setOpen] = useState(Boolean(live));
+  useEffect(() => {
+    setOpen(Boolean(live));
+  }, [live]);
+  const thoughts = items.filter(
+    (item): item is AssistantItem =>
+      item.kind === "assistant" && Boolean(item.reasoning?.trim()),
+  );
+  const actionItems = items.filter(
+    (item) =>
+      item.kind !== "assistant" ||
+      Boolean(item.text?.trim()) ||
+      !item.reasoning?.trim(),
+  );
+  const duration = formatWorkDuration(workSegmentDuration(items));
+  const diff = workSegmentDiff(items);
+  const diffText =
+    diff.additions !== undefined || diff.deletions !== undefined
+      ? [
+          diff.additions !== undefined ? `+${diff.additions}` : "",
+          diff.deletions !== undefined ? `-${diff.deletions}` : "",
+        ]
+          .filter(Boolean)
+          .join(" ")
+      : "";
+  const suffix = [duration, diffText].filter(Boolean).join(" ");
+  return (
+    <div className="work-segment rounded-lg border border-line/70 mb-2">
+      <button
+        className="w-full flex items-center gap-2 px-3 py-2 text-left text-xs text-muted hover:text-ink"
+        aria-expanded={open}
+        data-testid="work-segment-toggle"
+        onClick={() => setOpen((value) => !value)}
+      >
+        <span className="text-[10px]">{open ? "⌄" : "›"}</span>
+        <span className="font-medium">
+          {live ? "Working" : "Worked"}
+          {suffix ? ` for ${suffix}` : ""}
+        </span>
+      </button>
+      {open && (
+        <div className="px-2 pb-2">
+          {thoughts.length > 0 && (
+            <details className="mb-1" open={false}>
+              <summary className="cursor-pointer px-2 py-1 text-xs text-muted">
+                Thoughts &gt;
+              </summary>
+              <div className="pl-2">
+                {thoughts.map((thought, index) => (
+                  <ThinkingBlock
+                    key={`${thought.ts || "thought"}-${index}`}
+                    text={thought.reasoning || ""}
+                  />
+                ))}
+              </div>
+            </details>
+          )}
+          <TurnGroup
+            items={actionItems}
+            live={live}
+            streamingText={streamingText}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
 interface Props {
   items: Item[];
   onApprove?: (
@@ -413,6 +498,7 @@ export function Transcript({
     answers.forEach((a) => blocks.push({ item: a, i: -1 }));
   };
   items.forEach((item, i) => {
+    if (item.kind === "notice" && isHiddenTimelineItem(item)) return;
     if (
       item.kind === "tool" ||
       item.kind === "assistant" ||
@@ -458,7 +544,7 @@ export function Transcript({
       {blocks.map((block, bi) => {
         if ("turn" in block)
           return (
-            <TurnGroup
+            <WorkSegment
               items={block.turn}
               live={block.live}
               streamingText={

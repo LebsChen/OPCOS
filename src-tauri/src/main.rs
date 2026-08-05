@@ -4536,25 +4536,42 @@ fn emit_pending_approval(
     let Some(pending) = pending.into_iter().next() else {
         return Ok(false);
     };
+    let is_question = pending.tool == "ask_user";
     emit(
         app,
-        "approval",
+        if is_question {
+            "question_requested"
+        } else {
+            "approval"
+        },
         Some(session_id),
-        json!({
-            "call_id": pending.call_id,
-            "tool": pending.tool,
-            "arguments": redact_approval_value(&pending.arguments),
-            "risk": approval_risk(&pending.tool),
-            "reason": "Tool action requires approval",
-        }),
+        if is_question {
+            json!({
+                "call_id": pending.call_id,
+                "tool": pending.tool,
+                "arguments": redact_approval_value(&pending.arguments),
+            })
+        } else {
+            json!({
+                "call_id": pending.call_id,
+                "tool": pending.tool,
+                "arguments": redact_approval_value(&pending.arguments),
+                "risk": approval_risk(&pending.tool),
+                "reason": "Tool action requires approval",
+            })
+        },
     );
     emit(
         app,
         "notice",
         Some(session_id),
         json!({
-            "kind": "approval_pending",
-            "text": "Approval required before this tool can continue"
+            "kind": if is_question { "question_pending" } else { "approval_pending" },
+            "text": if is_question {
+                "Question requires an answer before this tool can continue"
+            } else {
+                "Approval required before this tool can continue"
+            }
         }),
     );
     Ok(true)

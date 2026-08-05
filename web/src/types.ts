@@ -150,6 +150,8 @@ export type Item =
       status: string;
       resolved?: "allow" | "deny";
       preview?: string;
+      ts?: number;
+      diff?: { additions?: number; deletions?: number };
       hidden?: number;
       standingRule?: string;
     }

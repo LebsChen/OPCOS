@@ -22,12 +22,15 @@ import {
   hostFailureMessage,
   hostStatusLabel,
   errorMessage,
+  pendingQuestionFromPayload,
   redactApproval,
   submitFailureMessage,
+  type PendingQuestionData,
 } from "./gui";
 import {
   TranscriptViewItem,
   normalizeTranscript,
+  normalizeViewItems,
   reduceStreamEvent,
 } from "./transcript";
 import { Sidebar } from "./components/Sidebar";
@@ -405,10 +408,7 @@ type InboxRecord = {
   created_at: string;
   resolution?: string | null;
 };
-type PendingQuestion = {
-  callId: string;
-  question: string;
-};
+type PendingQuestion = PendingQuestionData;
 
 const OPENWORKER_CONNECTORS: ConnectorCatalogEntry[] = [
   { name: "Telegram", description: "Two-way messaging with a Telegram bot." },
@@ -9544,11 +9544,55 @@ function QuestionCard({
   onAnswer: (answer: string) => Promise<void>;
 }) {
   const [answer, setAnswer] = useState("");
+  const [selectedOptions, setSelectedOptions] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
+  const options = question.options ?? [];
+  const submit = (value: string) => {
+    if (!value.trim() || submitting) return;
+    setSubmitting(true);
+    void onAnswer(value.trim()).catch(() => setSubmitting(false));
+  };
   return (
     <div className="approval rounded-xl border border-line p-3 mb-4">
       <strong>Question</strong>
       <div className="approval-with mt-3">{question.question}</div>
+      {options.length > 0 && (
+        <div className="approval-btns mt-3 flex-wrap">
+          {options.map((option) => {
+            const selected = selectedOptions.includes(option);
+            return (
+              <button
+                key={option}
+                className={`btn ${selected ? "approval-primary" : ""}`}
+                disabled={submitting}
+                aria-pressed={selected}
+                onClick={() => {
+                  if (question.allowMultiple) {
+                    setSelectedOptions((current) =>
+                      selected
+                        ? current.filter((item) => item !== option)
+                        : [...current, option],
+                    );
+                  } else {
+                    submit(option);
+                  }
+                }}
+              >
+                {option}
+              </button>
+            );
+          })}
+          {question.allowMultiple && (
+            <button
+              className="btn approval-primary"
+              disabled={submitting || selectedOptions.length === 0}
+              onClick={() => submit(JSON.stringify(selectedOptions))}
+            >
+              {submitting ? "Sending…" : "Submit selection"}
+            </button>
+          )}
+        </div>
+      )}
       <div className="approval-btns mt-3">
         <input
           className="ob-input flex-1"
@@ -9561,10 +9605,7 @@ function QuestionCard({
         <button
           className="btn approval-primary"
           disabled={submitting || !answer.trim()}
-          onClick={() => {
-            setSubmitting(true);
-            void onAnswer(answer.trim()).catch(() => setSubmitting(false));
-          }}
+          onClick={() => submit(answer)}
         >
           {submitting ? "Sending…" : "Answer"}
         </button>
@@ -9802,13 +9843,9 @@ function AppContent() {
             (item.kind === "question" || item.tool === "ask_user"),
         );
         if (pending) {
-          const question =
-            typeof pending.payload.question === "string"
-              ? pending.payload.question
-              : typeof pending.payload.prompt === "string"
-                ? pending.payload.prompt
-                : "Answer required";
-          setPendingQuestion({ callId: pending.call_id, question });
+          setPendingQuestion(
+            pendingQuestionFromPayload(pending.call_id, pending.payload),
+          );
         }
         setTranscript(
           normalizeTranscript(
@@ -9899,10 +9936,19 @@ function AppContent() {
           );
         }
       }
+      const approvalTool =
+        typeof payload.payload?.tool === "string"
+          ? payload.payload.tool
+          : typeof payload.payload?.toolName === "string"
+            ? payload.payload.toolName
+            : "";
+      const isAskUserApproval =
+        payload.kind === "approval" && approvalTool === "ask_user";
       if (
         payload.kind === "question_requested" ||
         payload.kind === "question" ||
-        payload.payload?.kind === "question_requested"
+        payload.payload?.kind === "question_requested" ||
+        isAskUserApproval
       ) {
         const questionPayload =
           payload.payload?.payload &&
@@ -9920,13 +9966,7 @@ function AppContent() {
             : "";
         if (callId) {
           setPendingQuestion({
-            callId,
-            question:
-              typeof args.question === "string"
-                ? args.question
-                : typeof args.prompt === "string"
-                  ? args.prompt
-                  : "Answer required",
+            ...pendingQuestionFromPayload(callId, args),
           });
           setRunning(false);
         }
@@ -10068,7 +10108,10 @@ function AppContent() {
       onError(submitFailureMessage(reason));
     }
   };
-  const activeItems = useMemo(() => transcript, [transcript]);
+  const activeItems = useMemo(
+    () => normalizeViewItems(transcript),
+    [transcript],
+  );
   const transcriptItems = useMemo<Item[]>(() => {
     const output: Item[] = [];
     activeItems.forEach((item) => {
@@ -10078,12 +10121,14 @@ function AppContent() {
         output.push({
           kind: "assistant",
           text: item.text || "",
+          ts: item.timestamp,
           reasoning: item.reasoning,
         });
       if (item.kind === "thinking")
         output.push({
           kind: "assistant",
           text: "",
+          ts: item.timestamp,
           reasoning: item.reasoning || item.text || "",
         });
       if (item.kind === "tool" && (item.approval || item.resolved))
@@ -10103,6 +10148,8 @@ function AppContent() {
           args: item.arguments,
           status: item.status || "ok",
           preview: item.result ? String(item.result) : undefined,
+          ts: item.timestamp,
+          diff: item.diff,
         });
       if (item.kind === "approval")
         output.push({

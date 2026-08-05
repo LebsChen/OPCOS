@@ -83,7 +83,10 @@ impl OpenAiProvider {
             if let Some(error) = classify_context_error(status, &text) {
                 return Err(error);
             }
-            if is_transient_status(status) && transient_attempt < TRANSIENT_RETRY_LIMIT {
+            if !streaming
+                && is_transient_status(status)
+                && transient_attempt < TRANSIENT_RETRY_LIMIT
+            {
                 tokio::time::sleep(retry_delay(transient_attempt, retry_after.as_ref())).await;
                 transient_attempt += 1;
                 continue;
@@ -390,7 +393,14 @@ impl Provider for OpenAiProvider {
         let mut attempt = 0;
         loop {
             match stream_once(self, &request, &output).await {
-                Err(ProviderError::Request(error)) if attempt < TRANSIENT_RETRY_LIMIT => {
+                Err(error)
+                    if (matches!(&error, ProviderError::Request(_))
+                        || matches!(
+                            &error,
+                            ProviderError::Http { status, .. } if is_transient_status(*status)
+                        ))
+                        && attempt < TRANSIENT_RETRY_LIMIT =>
+                {
                     tracing::warn!(
                         attempt,
                         error = %error,
@@ -555,6 +565,7 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
+        sync::mpsc,
         task::JoinHandle,
     };
 
@@ -740,6 +751,79 @@ mod tests {
             .unwrap();
         assert_eq!(turn.text.as_deref(), Some("ok"));
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retries_gateway_overload_statuses_before_success() {
+        let (base_url, calls, task) = response_sequence(vec![503, 529, 200], Some("0")).await;
+        let provider = OpenAiProvider::new(ProviderConfig::new(base_url, "test-key"));
+        let turn = provider
+            .complete(ProviderRequest {
+                model: "test".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(turn.text.as_deref(), Some("ok"));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn streaming_overload_retry_emits_stream_reset() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            for (status, body) in [
+                (503_u16, "system_cpu_overloaded"),
+                (
+                    200_u16,
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n\
+                     data: [DONE]\n\n",
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 {status} Error\r\nContent-Type: text/event-stream\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let provider =
+            OpenAiProvider::new(ProviderConfig::new(format!("http://{address}"), "test-key"));
+        let (output, mut chunks) = mpsc::channel(8);
+        let turn_task = tokio::spawn(async move {
+            provider
+                .stream(
+                    ProviderRequest {
+                        model: "test".into(),
+                        ..Default::default()
+                    },
+                    output,
+                )
+                .await
+        });
+        let first = chunks.recv().await.expect("stream reset chunk");
+        assert!(first.stream_reset);
+        assert_eq!(
+            turn_task.await.unwrap().unwrap().text.as_deref(),
+            Some("ok")
+        );
         task.await.unwrap();
     }
 

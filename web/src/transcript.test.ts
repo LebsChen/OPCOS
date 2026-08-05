@@ -3,8 +3,10 @@ import { humanizeTool } from "./humanize";
 import {
   classifyStepStatus,
   normalizeTranscript,
+  normalizeViewItems,
   reduceStreamEvent,
 } from "./transcript";
+import { groupWorkSegments } from "./workSegments";
 
 describe("OPCOS transcript folding", () => {
   it("summarizes common tool actions as compact step lines", () => {
@@ -611,6 +613,129 @@ describe("OPCOS transcript folding", () => {
     items = reduceStreamEvent(items, event);
 
     expect(items.filter((item) => item.kind === "thinking")).toHaveLength(1);
+  });
+
+  it("normalizes live rendering to the persisted timeline shape", () => {
+    let live = reduceStreamEvent([], {
+      kind: "stream",
+      payload: {
+        working_event: {
+          event_type: "devin_thoughts",
+          payload: { message: "Inspect the repository." },
+        },
+      },
+    });
+    live = reduceStreamEvent(live, {
+      kind: "stream",
+      payload: {
+        working_event: {
+          event_type: "status_update",
+          payload: { enum: "working" },
+        },
+      },
+    });
+    live = reduceStreamEvent(live, {
+      kind: "stream",
+      payload: {
+        working_event: {
+          event_type: "devin_thoughts",
+          payload: { message: "Inspect the repository." },
+        },
+      },
+    });
+    live = reduceStreamEvent(live, {
+      kind: "stream",
+      payload: {
+        working_event: {
+          event_type: "devin_thoughts",
+          payload: { message: "Trace the shared helper." },
+        },
+      },
+    });
+    live = reduceStreamEvent(live, {
+      kind: "stream",
+      payload: {
+        tool_call_delta: {
+          index: 0,
+          id: "call-1",
+          name: "read_file",
+          arguments_fragment: '{"path":"README.md"}',
+        },
+      },
+    });
+
+    const persisted = normalizeTranscript([
+      {
+        kind: "assistant",
+        payload: { role: "assistant", reasoning: "Inspect the repository." },
+      },
+      {
+        kind: "notice",
+        payload: { kind: "status_update", text: "Working" },
+      },
+      {
+        kind: "assistant",
+        payload: { role: "assistant", reasoning: "Trace the shared helper." },
+      },
+      {
+        kind: "assistant",
+        payload: {
+          role: "assistant",
+          tool_calls: [
+            {
+              id: "call-1",
+              name: "read_file",
+              arguments: '{"path":"README.md"}',
+            },
+          ],
+        },
+      },
+    ]);
+    const shape = (items: typeof persisted) =>
+      items.map(
+        ({ id: _id, status: _status, approval: _approval, ...item }) => item,
+      );
+    expect(shape(normalizeViewItems(live))).toEqual(shape(persisted));
+  });
+
+  it("groups work items at user and final-answer boundaries", () => {
+    const groups = groupWorkSegments(
+      [
+        { kind: "user", text: "Fix the bug." },
+        {
+          kind: "tool",
+          id: "tool-1",
+          name: "run_shell",
+          args: { command: "sed -n '1,20p' README.md" },
+          status: "ok",
+        },
+        {
+          kind: "assistant",
+          text: "The fix is complete.",
+        },
+        { kind: "user", text: "Run the tests too." },
+        {
+          kind: "tool",
+          id: "tool-2",
+          name: "run_shell",
+          args: { command: "cargo test" },
+          status: "ok",
+        },
+      ],
+      false,
+    );
+    expect(groups).toHaveLength(5);
+    expect(groups[1]).toMatchObject({
+      items: [{ kind: "tool", name: "run_shell" }],
+      active: false,
+    });
+    expect(groups[2]).toEqual({
+      item: { kind: "assistant", text: "The fix is complete." },
+    });
+    expect(groups[4]).toMatchObject({
+      items: [{ kind: "tool", name: "run_shell" }],
+      active: false,
+    });
   });
 
   it("does not retain a resolved ask_user placeholder notice", () => {

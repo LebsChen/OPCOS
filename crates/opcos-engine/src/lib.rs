@@ -1687,6 +1687,31 @@ where
             if call.name == "ask_user"
                 || (call.name == "propose_plan" && mode != PermissionMode::Auto)
             {
+                if call.name == "ask_user" {
+                    let options = call
+                        .arguments
+                        .get("options")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let allow_multiple = call
+                        .arguments
+                        .get("allow_multiple")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let _ = self
+                        .working_event(
+                            "ask_user_pending",
+                            "message",
+                            json!({
+                                "call_id": call.id,
+                                "tool": "ask_user",
+                                "options": options,
+                                "allow_multiple": allow_multiple,
+                            }),
+                        )
+                        .await;
+                }
                 self.save_pending(&PendingRecord {
                     session_id: self.session_id.clone(),
                     call_id: call.id.clone(),
@@ -2985,7 +3010,7 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"skill_save_learned","description":"Persist a reusable workflow explicitly described by the model. Nothing is auto-captured. The verification field is only a model assertion, never an OPCOS verification; credentials or secret-like values are rejected. Learned skills never modify user-authored skills.","parameters":{"type":"object","properties":{"title":{"type":"string"},"summary":{"type":"string"},"applies_when":{"type":"string"},"steps":{"type":"array","items":{"type":"string"}},"verification":{"type":"string"},"caveats":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}},"source_commit":{"type":"string"},"model_asserted_status":{"type":"string","enum":["model_asserted_validated","model_asserted_observed","model_asserted_partial"]},"supersedes_id":{"type":"string"}},"required":["title","summary","applies_when","steps","verification","source_commit","model_asserted_status"]}}}),
         json!({"type":"function","function":{"name":"skill_search_learned","description":"Search explicitly saved learned workflows for the current repository. Results are bounded to at most five and prominently mark source-commit mismatches as STALE CANDIDATE; model-asserted verification is not an objective fact.","parameters":{"type":"object","properties":{"query":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}}}}}}),
         json!({"type":"function","function":{"name":"skill_get_learned","description":"Read one explicitly saved learned workflow. The result includes its source commit, model-asserted verification status, version links, and stale/conflict warnings.","parameters":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}}),
-        json!({"type":"function","function":{"name":"ask_user","description":"Ask the user a question and wait for an answer.","parameters":{"type":"object","properties":{"question":{"type":"string"}},"required":["question"]}}}),
+        json!({"type":"function","function":{"name":"ask_user","description":"Ask the user a question and wait for an answer. When the user must choose from discrete answers, provide options; set allow_multiple to true when more than one option may be selected.","parameters":{"type":"object","properties":{"question":{"type":"string"},"options":{"type":"array","items":{"type":"string"},"description":"Optional discrete answer choices. Omit for an open-ended question."},"allow_multiple":{"type":"boolean","description":"Allow selecting more than one option from options."}},"required":["question"]}}}),
         json!({"type":"function","function":{"name":"linear_get_issue","description":"Read a Linear issue by identifier. Read-only.","parameters":{"type":"object","properties":{"identifier":{"type":"string"}},"required":["identifier"]}}}),
         json!({"type":"function","function":{"name":"linear_list_my_issues","description":"List Linear issues assigned to the current user. Read-only.","parameters":{"type":"object","properties":{"limit":{"type":"integer"}}}}}),
         json!({"type":"function","function":{"name":"linear_comment_issue","description":"Add a comment to a Linear issue. Requires approval.","parameters":{"type":"object","properties":{"issue_id":{"type":"string"},"body":{"type":"string"}},"required":["issue_id","body"]}}}),
@@ -4720,6 +4745,73 @@ mod tests {
                 .any(|event| event == "propose_plan_completed")
         );
         assert!(event_types.iter().any(|event| event == "todo_update"));
+    }
+
+    #[tokio::test]
+    async fn ask_user_options_are_persisted_and_emitted_without_approval() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let ask = ToolCall {
+            id: "ask-options".into(),
+            name: "ask_user".into(),
+            arguments: json!({
+                "question": "Choose a delivery format",
+                "options": ["A", "B", "C"],
+                "allow_multiple": false,
+            }),
+        };
+        store
+            .append_tool_call(&opcos_store::ToolCallRecord {
+                session_id: "s".into(),
+                message_sequence: 1,
+                call_id: ask.id.clone(),
+                name: ask.name.clone(),
+                arguments: ask.arguments.clone(),
+                result: None,
+            })
+            .unwrap();
+
+        let result = engine.execute_tools(1, &[ask]).await;
+        assert!(matches!(
+            result,
+            Err(EngineError::ApprovalPending(call_id)) if call_id == "ask-options"
+        ));
+        let pending = store.load_pending("s").unwrap();
+        assert_eq!(pending[0].arguments["options"], json!(["A", "B", "C"]));
+        assert_eq!(pending[0].arguments["allow_multiple"], false);
+        let event = store
+            .load_audit(Some("s"))
+            .unwrap()
+            .into_iter()
+            .find(|event| {
+                event.kind == "working_event" && event.payload["event_type"] == "ask_user_pending"
+            })
+            .expect("ask_user pending working event");
+        assert_eq!(event.payload["payload"]["options"], json!(["A", "B", "C"]));
+        assert_eq!(event.payload["payload"]["allow_multiple"], false);
+    }
+
+    #[test]
+    fn ask_user_tool_schema_supports_discrete_options() {
+        let definition = tool_definitions()
+            .into_iter()
+            .find(|tool| tool["function"]["name"] == "ask_user")
+            .expect("ask_user tool definition");
+        let parameters = &definition["function"]["parameters"];
+        assert_eq!(parameters["properties"]["options"]["type"], "array");
+        assert_eq!(
+            parameters["properties"]["allow_multiple"]["type"],
+            "boolean"
+        );
+        assert_eq!(parameters["required"], json!(["question"]));
     }
 
     #[test]
