@@ -97,31 +97,38 @@ fn command_tokens_mutate(command: &str) -> bool {
         {
             return true;
         }
-        let method = lower
-            .strip_prefix("-x")
-            .or_else(|| lower.strip_prefix("--request="))
+        let short_method = token.strip_prefix("-X");
+        let long_method = lower
+            .strip_prefix("--request=")
             .or_else(|| lower.strip_prefix("--method="));
-        if method.is_some_and(|method| matches!(method, "post" | "put" | "patch" | "delete"))
-            || matches!(lower.as_str(), "-x" | "--request" | "--method")
-                && tokens.get(index + 1).is_some_and(|method| {
-                    matches!(
-                        method.to_ascii_lowercase().as_str(),
-                        "post" | "put" | "patch" | "delete"
-                    )
-                })
+        if short_method.or(long_method).is_some_and(|method| {
+            matches!(
+                method.to_ascii_lowercase().as_str(),
+                "post" | "put" | "patch" | "delete"
+            )
+        }) || matches!(*token, "-X" | "--request" | "--method")
+            && tokens.get(index + 1).is_some_and(|method| {
+                matches!(
+                    method.to_ascii_lowercase().as_str(),
+                    "post" | "put" | "patch" | "delete"
+                )
+            })
         {
             return true;
         }
         if matches!(
-            lower.as_str(),
-            "-d" | "--data"
+            *token,
+            "-d" | "-F"
+                | "-T"
+                | "--data"
                 | "--data-raw"
                 | "--data-binary"
                 | "--data-urlencode"
                 | "--upload-file"
-                | "-t"
-                | "-f"
-        ) || lower.starts_with("--data=")
+        ) || token.starts_with("-d")
+            || token.starts_with("-F")
+            || token.starts_with("-T")
+            || lower.starts_with("--data=")
             || lower.starts_with("--upload-file=")
         {
             return true;
@@ -400,6 +407,30 @@ mod tests {
         assert_eq!(
             mutating_http_target("curl 'https://api.cloudflare.com/client/v4/zones'"),
             None
+        );
+        assert_eq!(
+            mutating_http_target("curl -f https://api.example.com/thing"),
+            None
+        );
+        assert_eq!(
+            mutating_http_target("wget -t 3 https://example.com/file"),
+            None
+        );
+        assert_eq!(
+            mutating_http_target("curl -D headers.txt https://example.com/file"),
+            None
+        );
+        assert_eq!(
+            mutating_http_target("curl -F field=value https://example.com/upload"),
+            Some("mutating_http:example.com".into())
+        );
+        assert_eq!(
+            mutating_http_target("curl -T payload.txt https://example.com/upload"),
+            Some("mutating_http:example.com".into())
+        );
+        assert_eq!(
+            mutating_http_target("curl -d payload https://example.com/upload"),
+            Some("mutating_http:example.com".into())
         );
         assert_eq!(
             mutating_http_target("curl -X POST http://127.0.0.1:3000/api"),
