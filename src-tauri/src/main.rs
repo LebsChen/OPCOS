@@ -75,7 +75,7 @@ use std::path::{Path as FsPath, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 mod browser;
@@ -6317,21 +6317,16 @@ async fn execute_control_slash_action(
             }
             let engine = engine_for(app, state, &session.session_id, ToolOrigin::User).await?;
             engine.compact_now().await.map_err(engine_error_message)?;
-            emit(
-                app,
-                "notice",
-                Some(&session.session_id),
-                json!({"kind":"compacted","text":"Session context compacted"}),
-            );
         }
         "/mode" => {
             if remainder.is_empty() {
-                emit(
+                emit_control_timeline_notice(
                     app,
-                    "notice",
-                    Some(&session.session_id),
-                    json!({"kind":"mode_current","text":format!("Current mode: {}", session.mode)}),
-                );
+                    state,
+                    &session.session_id,
+                    "mode_current",
+                    json!({"text":format!("Current mode: {}", session.mode)}),
+                )?;
                 return Ok(true);
             }
             let mode = parse_permission_mode(remainder)?;
@@ -6343,22 +6338,24 @@ async fn execute_control_slash_action(
                 .store
                 .update_session_mode(&session.session_id, &mode_name)
                 .map_err(|error| error.to_string())?;
-            emit(
+            emit_control_timeline_notice(
                 app,
+                state,
+                &session.session_id,
                 "mode_changed",
-                Some(&session.session_id),
-                json!({"mode": mode_name}),
-            );
+                json!({"mode": mode_name, "text":format!("Mode changed to {mode_name}")}),
+            )?;
         }
         "/model" => {
             let model = remainder.trim();
             if model.is_empty() {
-                emit(
+                emit_control_timeline_notice(
                     app,
-                    "notice",
-                    Some(&session.session_id),
-                    json!({"kind":"model_current","text":format!("Current model: {}", session.model)}),
-                );
+                    state,
+                    &session.session_id,
+                    "model_current",
+                    json!({"text":format!("Current model: {}", session.model)}),
+                )?;
                 return Ok(true);
             }
             if model.split_whitespace().count() != 1 {
@@ -6376,12 +6373,13 @@ async fn execute_control_slash_action(
                 .update_session_model(&session.session_id, model)
                 .map_err(|error| error.to_string())?;
             state.engines.lock().await.remove(&session.session_id);
-            emit(
+            emit_control_timeline_notice(
                 app,
-                "notice",
-                Some(&session.session_id),
-                json!({"kind":"model_switch","text":format!("Switched to {model}")}),
-            );
+                state,
+                &session.session_id,
+                "model_switch",
+                json!({"text":format!("Switched to {model}")}),
+            )?;
         }
         "/ls" => {
             if !remainder.is_empty() {
@@ -6413,12 +6411,13 @@ async fn execute_control_slash_action(
                     .collect::<Vec<_>>()
                     .join("\n")
             };
-            emit(
+            emit_control_timeline_notice(
                 app,
-                "notice",
-                Some(&session.session_id),
-                json!({"kind":"session_list","text":text}),
-            );
+                state,
+                &session.session_id,
+                "session_list",
+                json!({"text":text}),
+            )?;
         }
         "/help" => {
             if !remainder.is_empty() {
@@ -6437,12 +6436,13 @@ async fn execute_control_slash_action(
                     .collect::<Vec<_>>()
                     .join(", ")
             );
-            emit(
+            emit_control_timeline_notice(
                 app,
-                "notice",
-                Some(&session.session_id),
-                json!({"kind":"slash_help","text":text}),
-            );
+                state,
+                &session.session_id,
+                "slash_help",
+                json!({"text":text}),
+            )?;
         }
         _ => unreachable!(),
     }
@@ -6453,6 +6453,38 @@ async fn execute_control_slash_action(
         json!({"command": command_name}),
     );
     Ok(true)
+}
+
+fn emit_control_timeline_notice(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    session_id: &str,
+    event_type: &str,
+    payload: Value,
+) -> Result<(), String> {
+    let created_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_millis() as i64;
+    let event = json!({
+        "type": event_type,
+        "event_id": format!("event-{}", uuid::Uuid::new_v4()),
+        "created_at_ms": created_at_ms,
+        "timestamp": Utc::now().to_rfc3339(),
+        "working_event": {
+            "event_type": event_type,
+            "category": "notice",
+            "direction": "outgoing",
+            "timestamp": Utc::now().to_rfc3339(),
+            "payload": payload,
+        },
+    });
+    state
+        .store
+        .append_session_event(session_id, &event)
+        .map_err(|error| error.to_string())?;
+    emit(app, "stream", Some(session_id), event);
+    Ok(())
 }
 
 fn expand_slash_command(

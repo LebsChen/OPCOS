@@ -98,7 +98,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
   let work: Extract<TimelineNode, { kind: "work" }> | null = null;
   let workStarted = 0;
   let workEnded = 0;
-  let previousTodos: Array<Record<string, unknown>> = [];
+  const planSteps = new Map<string, Array<Record<string, unknown>>>();
   const flush = (endedAt = workEnded) => {
     if (!work) return;
     const seconds = Math.max(0, Math.round((endedAt - workStarted) / 1000));
@@ -124,7 +124,6 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
       });
       workStarted = 0;
       workEnded = 0;
-      previousTodos = [];
     } else if (type === "devin_message") {
       flush(event.created_at_ms);
       nodes.push({
@@ -136,7 +135,6 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
       });
       workStarted = 0;
       workEnded = 0;
-      previousTodos = [];
     } else if (type === "approval_pending" || type === "ask_user_pending") {
       flush(event.created_at_ms);
       const callId = String(data.call_id ?? "");
@@ -159,7 +157,6 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
       }
       workStarted = 0;
       workEnded = 0;
-      previousTodos = [];
     } else if (type === "compacted") {
       if (!work)
         work = {
@@ -178,15 +175,32 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
         "interrupted",
         "provider_error",
         "compaction_summary_invalid",
+        "mode_current",
+        "mode_changed",
+        "model_current",
+        "model_switch",
+        "session_list",
+        "slash_help",
       ].includes(type)
     ) {
       flush(event.created_at_ms);
-      nodes.push({
-        kind: "notice",
-        text: String(data.message ?? data.text ?? ""),
-        noticeKind: type,
-        retriable: type === "error" || type === "provider_error",
-      });
+      const nested = data.payload;
+      const text = String(
+        data.message ??
+          data.text ??
+          (nested && typeof nested === "object"
+            ? ((nested as Record<string, unknown>).message ??
+              (nested as Record<string, unknown>).text)
+            : ""),
+      ).trim();
+      if (text) {
+        nodes.push({
+          kind: "notice",
+          text,
+          noticeKind: type,
+          retriable: type === "error" || type === "provider_error",
+        });
+      }
     } else if (
       [
         "iteration_stats",
@@ -257,26 +271,30 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
                 content: todo.content ?? todo.description,
               }))
           : [];
+        const planId = String(data.plan_id ?? "__legacy_plan__");
+        const previousTodos = planSteps.get(planId);
         const completed = todos.filter((todo) =>
           ["done", "completed"].includes(String(todo.status)),
         ).length;
-        if (todos.length > previousTodos.length && work) {
+        if ((!previousTodos || todos.length > previousTodos.length) && work) {
           work.rows.push({ label: `Created ${todos.length} Tasks` });
-        } else if (work) {
-          const changedIndex = todos.findIndex((todo, index) => {
+        } else if (work && previousTodos) {
+          const currentWork = work;
+          todos.forEach((item, index) => {
             const previous = previousTodos[index];
-            return (
-              !previous || JSON.stringify(previous) !== JSON.stringify(todo)
-            );
-          });
-          if (changedIndex >= 0) {
-            const item = todos[changedIndex];
-            work.rows.push({
-              label: `${completed}/${todos.length}#${changedIndex + 1} ${String(item.content ?? item.title ?? "")}`,
+            if (
+              previous &&
+              previous.step_id === item.step_id &&
+              previous.status === item.status &&
+              previous.description === item.description
+            )
+              return;
+            currentWork.rows.push({
+              label: `${completed}/${todos.length}#${index + 1} ${String(item.content ?? item.title ?? "")}`,
             });
-          }
+          });
         }
-        previousTodos = todos;
+        planSteps.set(planId, todos);
       } else if (
         type === "shell_process_completed" ||
         type === "read_file_started" ||

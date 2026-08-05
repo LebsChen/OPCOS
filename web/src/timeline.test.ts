@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import liveEnvelopes from "../../fixtures/timeline/live-events.json";
 import opcosEvents from "../../fixtures/timeline/opcos-events.json";
+import planIterations from "../../fixtures/timeline/opcos-plan-iterations.json";
 import persisted from "../../fixtures/timeline/persisted-events.json";
 import {
   buildTimeline,
@@ -107,5 +108,46 @@ describe("single event-log timeline", () => {
     ).not.toContainEqual(
       expect.objectContaining({ kind: "work", label: "Worked for 0s" }),
     );
+  });
+  it("keeps plan progress across iteration messages", () => {
+    const nodes = buildTimeline(planIterations as TimelineEvent[]);
+    const rows = nodes
+      .filter((node) => node.kind === "work")
+      .flatMap((node) => node.rows.map((row) => row.label));
+    expect(rows.filter((label) => label === "Created 5 Tasks")).toHaveLength(1);
+    expect(rows).toContain("1/5#1 Create files");
+    expect(rows).toContain("2/5#2 Run tests");
+  });
+  it("renders control-action notices and skips empty notices", () => {
+    const nodes = buildTimeline([
+      {
+        type: "mode_changed",
+        event_id: "notice-mode",
+        created_at_ms: 1,
+        text: "Mode changed to Auto",
+      },
+      {
+        type: "slash_help",
+        event_id: "notice-help",
+        created_at_ms: 2,
+        payload: { text: "Actions: /compact, /help" },
+      },
+      {
+        type: "compaction_summary_invalid",
+        event_id: "notice-empty",
+        created_at_ms: 3,
+        payload: {},
+      },
+    ] as unknown as TimelineEvent[]);
+    expect(nodes).toContainEqual(
+      expect.objectContaining({ kind: "notice", text: "Mode changed to Auto" }),
+    );
+    expect(nodes).toContainEqual(
+      expect.objectContaining({
+        kind: "notice",
+        text: "Actions: /compact, /help",
+      }),
+    );
+    expect(nodes).not.toContainEqual(expect.objectContaining({ text: "" }));
   });
 });

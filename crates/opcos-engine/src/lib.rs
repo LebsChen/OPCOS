@@ -2599,24 +2599,18 @@ where
             )
             .await;
         if let Some(rejection) = summary_issue {
-            self.notice(
+            self.notice_with_payload(
                 "compaction_summary_invalid",
                 format!(
                     "Compaction summary was not stored as model output: {}",
                     rejection.reason
                 ),
+                json!({
+                    "reason": rejection.reason,
+                    "diagnostics": rejection.diagnostics,
+                }),
             )
             .await?;
-            let _ = self
-                .working_event(
-                    "compaction_summary_invalid",
-                    "lifecycle",
-                    json!({
-                        "reason": rejection.reason,
-                        "diagnostics": rejection.diagnostics,
-                    }),
-                )
-                .await;
         }
         self.notice("compacted", "Earlier context compacted".into())
             .await?;
@@ -2663,9 +2657,16 @@ where
             .or(response.reasoning)
             .filter(|text| !text.trim().is_empty())
             .ok_or_else(|| CompactionSummaryRejection::without_text("empty_response"))?;
-        Self::validate_compaction_summary(&text).map_err(|reason| CompactionSummaryRejection {
-            reason,
-            diagnostics: Self::compaction_summary_diagnostics(&text),
+        let max_chars = self
+            .resolved_caps_for_model()
+            .max_output_tokens
+            .saturating_mul(4)
+            .max(12_000) as usize;
+        Self::validate_compaction_summary(&text, max_chars).map_err(|reason| {
+            CompactionSummaryRejection {
+                reason,
+                diagnostics: Self::compaction_summary_diagnostics(&text),
+            }
         })?;
         Ok(text.trim().to_owned())
     }
@@ -2720,13 +2721,13 @@ where
         })
     }
 
-    fn validate_compaction_summary(text: &str) -> Result<(), String> {
+    fn validate_compaction_summary(text: &str, max_chars: usize) -> Result<(), String> {
         let without_reasoning = strip_reasoning_blocks(text);
         let trimmed = without_reasoning.trim();
         if trimmed.is_empty() {
             return Err("empty_response".into());
         }
-        if trimmed.len() > 12_000 {
+        if trimmed.chars().count() > max_chars {
             return Err("response_too_large".into());
         }
         if let Ok(value) = serde_json::from_str::<Value>(trimmed)
@@ -2803,6 +2804,15 @@ where
     }
 
     async fn notice(&self, kind: &str, content: String) -> Result<(), EngineError> {
+        self.notice_with_payload(kind, content, json!({})).await
+    }
+
+    async fn notice_with_payload(
+        &self,
+        kind: &str,
+        content: String,
+        extra_payload: Value,
+    ) -> Result<(), EngineError> {
         let mut safe_content = Value::String(content);
         self.secret_scrubber.scrub(&mut safe_content);
         let content = safe_content.as_str().unwrap_or_default().to_owned();
@@ -2821,7 +2831,14 @@ where
             category: "notice".into(),
             direction: "outgoing".into(),
             timestamp: Utc::now().to_rfc3339(),
-            payload: json!({"message": content}),
+            payload: {
+                let mut payload =
+                    serde_json::Map::from_iter([("message".to_owned(), Value::String(content))]);
+                if let Value::Object(extra) = extra_payload {
+                    payload.extend(extra);
+                }
+                Value::Object(payload)
+            },
         };
         self.emit_event(
             kind,
@@ -6199,7 +6216,7 @@ mod tests {
         ] {
             assert!(
                 TurnEngine::<SummaryProvider, SqliteStore, FakeTools>::validate_compaction_summary(
-                    text
+                    text, 12_000
                 )
                 .is_err(),
                 "{name} should be rejected"
@@ -6236,7 +6253,7 @@ mod tests {
         ] {
             assert!(
                 TurnEngine::<SummaryProvider, SqliteStore, FakeTools>::validate_compaction_summary(
-                    text
+                    text, 12_000
                 )
                 .is_ok(),
                 "observed summary shape was rejected: {text}"
@@ -6261,13 +6278,33 @@ mod tests {
             let text = std::fs::read_to_string(entry.path()).unwrap();
             assert!(
                 TurnEngine::<SummaryProvider, SqliteStore, FakeTools>::validate_compaction_summary(
-                    &text
+                    &text, 12_000
                 )
                 .is_ok(),
                 "real model fixture was rejected: {:?}",
                 entry.path()
             );
         }
+    }
+
+    #[test]
+    fn compaction_summary_limit_tracks_output_budget() {
+        let text = format!(
+            "Goal\nCompleted actions and results\nKey discoveries and file paths\nUnfinished next steps\n{}",
+            "x".repeat(13_000)
+        );
+        assert!(
+            TurnEngine::<SummaryProvider, SqliteStore, FakeTools>::validate_compaction_summary(
+                &text, 16_384
+            )
+            .is_ok()
+        );
+        assert!(
+            TurnEngine::<SummaryProvider, SqliteStore, FakeTools>::validate_compaction_summary(
+                &text, 12_000
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -6314,6 +6351,18 @@ mod tests {
                 .and_then(Value::as_str)
                 .is_some_and(|text| text == summary)
         }));
+        let invalid_events = store
+            .load_session_events("s")
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event["type"] == "compaction_summary_invalid")
+            .collect::<Vec<_>>();
+        assert_eq!(invalid_events.len(), 1);
+        assert!(
+            invalid_events[0].event["working_event"]["payload"]["message"]
+                .as_str()
+                .is_some_and(|message| !message.trim().is_empty())
+        );
     }
 
     #[tokio::test]
