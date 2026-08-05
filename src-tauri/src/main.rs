@@ -9157,6 +9157,17 @@ async fn engine_for(
     engine_for_with_context(app, state, session_id, origin, None, None).await
 }
 
+fn limit_source_value(
+    caps: &opcos_provider::Caps,
+    source: &str,
+    value: fn(&opcos_provider::Caps) -> Option<u64>,
+    source_of: fn(&opcos_provider::Caps) -> Option<&str>,
+) -> Option<u64> {
+    (source_of(caps) == Some(source))
+        .then(|| value(caps))
+        .flatten()
+}
+
 async fn engine_for_with_context(
     app: &tauri::AppHandle,
     state: &DesktopState,
@@ -9520,20 +9531,42 @@ async fn engine_for_with_context(
         .learned_model_limits(&provider_id, &base_url, &model)
         .map_err(|error| error.to_string())?
         .unwrap_or((None, None));
-    let source_value = |caps: &opcos_provider::Caps,
-                        source: &str,
-                        field: fn(&opcos_provider::Caps) -> Option<u64>| {
-        (caps.context_window_source.as_deref() == Some(source)
-            || caps.max_output_tokens_source.as_deref() == Some(source))
-        .then(|| field(caps))
-        .flatten()
-    };
-    let gateway_window = source_value(&discovered_caps, "gateway", |caps| caps.context_window);
-    let matrix_window = source_value(&matrix_caps, "matrix", |caps| caps.context_window);
-    let probe_window = source_value(&discovered_caps, "probe", |caps| caps.context_window);
-    let gateway_output = source_value(&discovered_caps, "gateway", |caps| caps.max_output_tokens);
-    let matrix_output = source_value(&matrix_caps, "matrix", |caps| caps.max_output_tokens);
-    let probe_output = source_value(&discovered_caps, "probe", |caps| caps.max_output_tokens);
+    let gateway_window = limit_source_value(
+        &discovered_caps,
+        "gateway",
+        |caps| caps.context_window,
+        |caps| caps.context_window_source.as_deref(),
+    );
+    let matrix_window = limit_source_value(
+        &matrix_caps,
+        "matrix",
+        |caps| caps.context_window,
+        |caps| caps.context_window_source.as_deref(),
+    );
+    let probe_window = limit_source_value(
+        &discovered_caps,
+        "probe",
+        |caps| caps.context_window,
+        |caps| caps.context_window_source.as_deref(),
+    );
+    let gateway_output = limit_source_value(
+        &discovered_caps,
+        "gateway",
+        |caps| caps.max_output_tokens,
+        |caps| caps.max_output_tokens_source.as_deref(),
+    );
+    let matrix_output = limit_source_value(
+        &matrix_caps,
+        "matrix",
+        |caps| caps.max_output_tokens,
+        |caps| caps.max_output_tokens_source.as_deref(),
+    );
+    let probe_output = limit_source_value(
+        &discovered_caps,
+        "probe",
+        |caps| caps.max_output_tokens,
+        |caps| caps.max_output_tokens_source.as_deref(),
+    );
     let user_window = settings.get("context_window").and_then(Value::as_u64);
     let user_output = settings.get("max_output_tokens").and_then(Value::as_u64);
     let (window, window_source) = opcos_provider::registry::resolve_limit(
@@ -24685,6 +24718,44 @@ agents:
         assert_eq!(
             expand_slash_command(&connection, None, None, "/compact").unwrap(),
             "/compact"
+        );
+    }
+
+    #[test]
+    fn mixed_limit_sources_use_their_own_field_sources() {
+        let caps = opcos_provider::Caps {
+            context_window: Some(1_000_000),
+            context_window_source: Some("gateway".into()),
+            max_output_tokens: Some(65_536),
+            max_output_tokens_source: Some("probe".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            limit_source_value(
+                &caps,
+                "gateway",
+                |caps| caps.context_window,
+                |caps| caps.context_window_source.as_deref()
+            ),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            limit_source_value(
+                &caps,
+                "probe",
+                |caps| caps.max_output_tokens,
+                |caps| caps.max_output_tokens_source.as_deref()
+            ),
+            Some(65_536)
+        );
+        assert_eq!(
+            limit_source_value(
+                &caps,
+                "gateway",
+                |caps| caps.max_output_tokens,
+                |caps| caps.max_output_tokens_source.as_deref()
+            ),
+            None
         );
     }
 }
