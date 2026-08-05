@@ -3376,14 +3376,14 @@ fn remote_capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard};
+    static ENV_TEST_LOCK: std::sync::OnceLock<&'static tokio::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
 
-    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn env_test_guard() -> MutexGuard<'static, ()> {
+    async fn env_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
         ENV_TEST_LOCK
+            .get_or_init(|| Box::leak(Box::new(tokio::sync::Mutex::new(()))))
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .await
     }
 
     #[test]
@@ -4176,9 +4176,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sanitized_environment_ignores_short_secret_values() {
-        let _guard = env_test_guard();
+    #[tokio::test]
+    async fn sanitized_environment_ignores_short_secret_values() {
+        let _guard = env_test_guard().await;
         let name = format!("OPCOS_TEST_SHORT_VALUE_{}", std::process::id());
         unsafe {
             std::env::set_var(&name, "short");
@@ -4191,9 +4191,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn local_exec_and_spawn_scrub_inherited_names_and_values() {
-        let _guard = env_test_guard();
+        let _guard = env_test_guard().await;
         let sensitive_name = format!("OPCOS_TEST_FAKE_CF_TOKEN_{}", std::process::id());
         let sensitive_value = "known-secret-value-123";
         unsafe {
