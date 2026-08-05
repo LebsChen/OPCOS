@@ -539,4 +539,39 @@ describe("OPCOS transcript folding", () => {
       text: "First thought\n\n---\n\nSecond thought",
     });
   });
+
+  it("merges thoughts separated by hidden activity notices", () => {
+    let items = reduceStreamEvent([], {
+      kind: "stream",
+      payload: {
+        working_event: {
+          event_type: "devin_thoughts",
+          payload: { message: "First thought" },
+        },
+      },
+    });
+    items = reduceStreamEvent(items, {
+      kind: "stream",
+      payload: {
+        working_event: {
+          event_type: "status_update",
+          payload: { enum: "working" },
+        },
+      },
+    });
+    items = reduceStreamEvent(items, {
+      kind: "stream",
+      payload: {
+        working_event: {
+          event_type: "devin_thoughts",
+          payload: { message: "Second thought" },
+        },
+      },
+    });
+
+    expect(items.filter((item) => item.kind === "thinking")).toHaveLength(1);
+    expect(items.find((item) => item.kind === "thinking")).toMatchObject({
+      text: "First thought\n\n---\n\nSecond thought",
+    });
+  });
 });

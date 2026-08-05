@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { translate } from "../i18n";
 import type { ApprovalDecision, Item } from "../types";
-import { classifyStepStatus } from "../transcript";
+import { classifyStepStatus, isHiddenTimelineItem } from "../transcript";
 import { shortArgs } from "./ApprovalCard";
 import { ApprovalCard } from "./ApprovalCard";
 import { humanizeAsk, humanizeTool, type HumanLine } from "../humanize";
@@ -576,11 +576,7 @@ export function Transcript({
               </div>
             );
           case "notice":
-            if (
-              item.noticeKind === "status_update" ||
-              item.noticeKind === "simple_activity_update"
-            )
-              return null;
+            if (isHiddenTimelineItem(item)) return null;
             return (
               <div
                 className={"notice " + (item.tone === "warn" ? "warn" : "")}

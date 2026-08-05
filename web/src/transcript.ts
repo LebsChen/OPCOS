@@ -29,6 +29,21 @@ export type TranscriptViewItem = {
   resolved?: ApprovalResolution;
 };
 
+export function isHiddenTimelineItem(item: {
+  kind: string;
+  noticeKind?: string;
+}): boolean {
+  if (item.kind !== "notice") return false;
+  return (
+    item.noticeKind === "status_update" ||
+    item.noticeKind === "simple_activity_update" ||
+    item.noticeKind === "context_growth" ||
+    item.noticeKind === "iteration_stats" ||
+    item.noticeKind === "context_compacted" ||
+    item.noticeKind === "iteration_checkpoint"
+  );
+}
+
 type RawItem = { kind: string; payload: Record<string, unknown> };
 
 function textFromContent(value: unknown): string {
@@ -324,7 +339,11 @@ export function normalizeTranscript(raw: RawItem[]): TranscriptViewItem[] {
   }
   const merged: TranscriptViewItem[] = [];
   for (const item of deduped) {
-    const previous = merged[merged.length - 1];
+    let previousIndex = merged.length - 1;
+    while (previousIndex >= 0 && isHiddenTimelineItem(merged[previousIndex])) {
+      previousIndex -= 1;
+    }
+    const previous = merged[previousIndex];
     if (
       item.kind === "thinking" &&
       previous?.kind === "thinking" &&
@@ -408,7 +427,14 @@ export function reduceStreamEvent(
         const thought =
           typeof details.message === "string" ? details.message : "";
         if (thought.trim()) {
-          const previous = next[next.length - 1];
+          let previousIndex = next.length - 1;
+          while (
+            previousIndex >= 0 &&
+            isHiddenTimelineItem(next[previousIndex])
+          ) {
+            previousIndex -= 1;
+          }
+          const previous = next[previousIndex];
           if (previous?.kind === "thinking") {
             previous.reasoning = `${previous.reasoning || ""}\n\n---\n\n${thought}`;
             previous.text = previous.reasoning;
