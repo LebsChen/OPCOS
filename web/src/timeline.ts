@@ -261,7 +261,9 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
               : "Listed directory",
         });
       } else if (type.endsWith("_started")) {
-        work.rows.push({ label: String(data.command ?? data.tool ?? type) });
+        if (type !== "write_file_started" && type !== "edit_file_started") {
+          work.rows.push({ label: String(data.command ?? data.tool ?? type) });
+        }
       }
     }
   }

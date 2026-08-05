@@ -30,6 +30,8 @@ describe("single event-log timeline", () => {
     expect(rows.some((label) => /^Thought for \d+s$/.test(label))).toBe(true);
     expect(rows).toContain("Edited alpha.txt +1 −0");
     expect(rows).toContain("Created notes.md +69");
+    expect(rows).not.toContain("write_file");
+    expect(rows).not.toContain("edit_file");
     expect(work.some((node) => /^Worked for \d+s$/.test(node.label))).toBe(
       true,
     );
