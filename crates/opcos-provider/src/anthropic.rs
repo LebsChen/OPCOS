@@ -1,4 +1,4 @@
-use crate::matrix::capabilities_for_model;
+use crate::matrix::limit_caps_for_model;
 use crate::{
     AssistantTurn, Caps, Provider, ProviderConfig, ProviderError, ProviderRequest, StreamChunk,
     TRANSIENT_RETRY_LIMIT, TokenUsage, ToolCall, ToolCallDelta, classify_context_error, client,
@@ -32,7 +32,7 @@ impl AnthropicProvider {
                 .get("max_tokens")
                 .and_then(Value::as_u64)
                 .or_else(|| {
-                    capabilities_for_model("anthropic", &request.model)
+                    limit_caps_for_model("anthropic", &request.model)
                         .and_then(|caps| caps.max_output_tokens)
                 })
                 .unwrap_or(ASSUMED_OUTPUT_TOKENS),
@@ -277,7 +277,7 @@ impl Provider for AnthropicProvider {
     }
 
     fn capabilities(&self, model: &str) -> Caps {
-        capabilities_for_model("anthropic", model).unwrap_or(Caps {
+        let mut capabilities = Caps {
             tools: true,
             vision: true,
             pdf: true,
@@ -287,7 +287,14 @@ impl Provider for AnthropicProvider {
             max_output_tokens: None,
             context_window_source: None,
             max_output_tokens_source: None,
-        })
+        };
+        if let Some(limits) = limit_caps_for_model("anthropic", model) {
+            capabilities.context_window = limits.context_window;
+            capabilities.max_output_tokens = limits.max_output_tokens;
+            capabilities.context_window_source = limits.context_window_source;
+            capabilities.max_output_tokens_source = limits.max_output_tokens_source;
+        }
+        capabilities
     }
 }
 

@@ -533,6 +533,17 @@ pub fn capabilities_for_model(provider: &str, model: &str) -> Option<Caps> {
     Some(capabilities)
 }
 
+pub fn limit_caps_for_model(provider: &str, model: &str) -> Option<Caps> {
+    let capabilities = capabilities_for_model(provider, model)?;
+    Some(Caps {
+        context_window: capabilities.context_window,
+        max_output_tokens: capabilities.max_output_tokens,
+        context_window_source: capabilities.context_window_source,
+        max_output_tokens_source: capabilities.max_output_tokens_source,
+        ..Default::default()
+    })
+}
+
 pub fn models_for_provider(provider: &str) -> Vec<&'static ModelEntry> {
     MATRIX
         .iter()

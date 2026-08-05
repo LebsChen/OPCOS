@@ -43,6 +43,25 @@ pub struct ProbedLimits {
     pub max_output_tokens: Option<u64>,
 }
 
+pub fn resolve_limit(
+    gateway: Option<u64>,
+    matrix: Option<u64>,
+    probe: Option<u64>,
+    learned: Option<u64>,
+    user: Option<u64>,
+) -> (Option<u64>, Option<&'static str>) {
+    [
+        (gateway, "gateway"),
+        (matrix, "matrix"),
+        (probe, "probe"),
+        (learned, "learned"),
+        (user, "user"),
+    ]
+    .into_iter()
+    .find_map(|(value, source)| value.map(|value| (Some(value), Some(source))))
+    .unwrap_or((None, None))
+}
+
 pub fn parse_limit_error(text: &str) -> ProbedLimits {
     fn number_after(text: &str, markers: &[&str]) -> Option<u64> {
         let lower = text.to_ascii_lowercase();
@@ -775,6 +794,30 @@ mod tests {
         assert_eq!(
             openrouter[0].capabilities.context_window_source.as_deref(),
             Some("gateway")
+        );
+    }
+
+    #[test]
+    fn resolves_limits_in_declared_source_order() {
+        assert_eq!(
+            resolve_limit(Some(1), Some(2), Some(3), Some(4), Some(5)),
+            (Some(1), Some("gateway"))
+        );
+        assert_eq!(
+            resolve_limit(None, Some(2), Some(3), Some(4), Some(5)),
+            (Some(2), Some("matrix"))
+        );
+        assert_eq!(
+            resolve_limit(None, None, Some(3), Some(4), Some(5)),
+            (Some(3), Some("probe"))
+        );
+        assert_eq!(
+            resolve_limit(None, None, None, Some(4), Some(5)),
+            (Some(4), Some("learned"))
+        );
+        assert_eq!(
+            resolve_limit(None, None, None, None, Some(5)),
+            (Some(5), Some("user"))
         );
     }
 

@@ -6375,6 +6375,7 @@ async fn execute_control_slash_action(
                 .store
                 .update_session_model(&session.session_id, model)
                 .map_err(|error| error.to_string())?;
+            state.engines.lock().await.remove(&session.session_id);
             emit(
                 app,
                 "notice",
@@ -9463,7 +9464,7 @@ async fn engine_for_with_context(
             .ok_or_else(|| {
                 "provider key is not configured; open Provider settings first".to_owned()
             })?;
-            Box::new(AnthropicProvider::new(ProviderConfig::new(base_url, key)))
+            Box::new(AnthropicProvider::new(ProviderConfig::new(&base_url, key)))
         }
         _name if descriptor.openai_compatible => {
             let stored_key = scoped_secret_get(
@@ -9481,10 +9482,11 @@ async fn engine_for_with_context(
                 }
                 None => String::new(),
             };
-            Box::new(OpenAiProvider::new(ProviderConfig::new(base_url, key)))
+            Box::new(OpenAiProvider::new(ProviderConfig::new(&base_url, key)))
         }
         name => return Err(format!("provider {name} is not supported for sessions")),
     };
+    let provider_defaults = provider.capabilities(&model);
     let permission_mode = parse_permission_mode(&mode).unwrap_or(PermissionMode::Interactive);
     let mut engine = TurnEngine::new(
         provider,
@@ -9495,40 +9497,68 @@ async fn engine_for_with_context(
         permission_mode,
         model.clone(),
     );
-    let discovered_caps = provider_models_for_state(state, provider_id.clone(), Some(false))
-        .await
-        .ok()
-        .and_then(|discovery| {
-            discovery
-                .models
-                .into_iter()
-                .find(|entry| entry.id.eq_ignore_ascii_case(&model))
-                .map(|entry| entry.capabilities)
-        })
-        .unwrap_or_default();
-    let mut resolved_caps =
-        opcos_provider::matrix::capabilities_for_model(&provider_id, &model).unwrap_or_default();
-    if discovered_caps.context_window.is_some() {
-        resolved_caps.context_window = discovered_caps.context_window;
-        resolved_caps.context_window_source = discovered_caps.context_window_source;
-    }
-    if discovered_caps.max_output_tokens.is_some() {
-        resolved_caps.max_output_tokens = discovered_caps.max_output_tokens;
-        resolved_caps.max_output_tokens_source = discovered_caps.max_output_tokens_source;
-    }
-    if resolved_caps.context_window.is_none()
-        && let Some(value) = settings.get("context_window").and_then(Value::as_u64)
-    {
-        resolved_caps.context_window = Some(value);
-        resolved_caps.context_window_source = Some("user".into());
-    }
-    if resolved_caps.max_output_tokens.is_none()
-        && let Some(value) = settings.get("max_output_tokens").and_then(Value::as_u64)
-    {
-        resolved_caps.max_output_tokens = Some(value);
-        resolved_caps.max_output_tokens_source = Some("user".into());
-    }
+    let discovered_caps = provider_models_for_state(
+        state,
+        provider_id.clone(),
+        Some(false),
+        Some(model.as_str()),
+    )
+    .await
+    .ok()
+    .and_then(|discovery| {
+        discovery
+            .models
+            .into_iter()
+            .find(|entry| entry.id.eq_ignore_ascii_case(&model))
+            .map(|entry| entry.capabilities)
+    })
+    .unwrap_or_default();
+    let matrix_caps =
+        opcos_provider::matrix::limit_caps_for_model(&provider_id, &model).unwrap_or_default();
+    let learned_limits = state
+        .store
+        .learned_model_limits(&provider_id, &base_url, &model)
+        .map_err(|error| error.to_string())?
+        .unwrap_or((None, None));
+    let source_value = |caps: &opcos_provider::Caps,
+                        source: &str,
+                        field: fn(&opcos_provider::Caps) -> Option<u64>| {
+        (caps.context_window_source.as_deref() == Some(source)
+            || caps.max_output_tokens_source.as_deref() == Some(source))
+        .then(|| field(caps))
+        .flatten()
+    };
+    let gateway_window = source_value(&discovered_caps, "gateway", |caps| caps.context_window);
+    let matrix_window = source_value(&matrix_caps, "matrix", |caps| caps.context_window);
+    let probe_window = source_value(&discovered_caps, "probe", |caps| caps.context_window);
+    let gateway_output = source_value(&discovered_caps, "gateway", |caps| caps.max_output_tokens);
+    let matrix_output = source_value(&matrix_caps, "matrix", |caps| caps.max_output_tokens);
+    let probe_output = source_value(&discovered_caps, "probe", |caps| caps.max_output_tokens);
+    let user_window = settings.get("context_window").and_then(Value::as_u64);
+    let user_output = settings.get("max_output_tokens").and_then(Value::as_u64);
+    let (window, window_source) = opcos_provider::registry::resolve_limit(
+        gateway_window,
+        matrix_window,
+        probe_window,
+        learned_limits.0,
+        user_window,
+    );
+    let (output, output_source) = opcos_provider::registry::resolve_limit(
+        gateway_output,
+        matrix_output,
+        probe_output,
+        learned_limits.1,
+        user_output,
+    );
+    let mut resolved_caps = provider_defaults;
+    resolved_caps.context_window = window;
+    resolved_caps.context_window_source = window_source.map(str::to_owned);
+    resolved_caps.max_output_tokens = output;
+    resolved_caps.max_output_tokens_source = output_source.map(str::to_owned);
     engine.set_resolved_capabilities(resolved_caps).await;
+    engine
+        .set_limit_identity(provider_id.clone(), base_url.clone())
+        .await;
     engine.set_secret_scrubber(Arc::new(KnownSecretScrubber {
         values: Arc::clone(&state.secret_values),
     }));
@@ -12802,6 +12832,7 @@ async fn change_model(
         .store
         .update_session_model(&session_id, &model)
         .map_err(|error| error.to_string())?;
+    state.engines.lock().await.remove(&session_id);
     emit(
         &app,
         "notice",
@@ -12860,6 +12891,7 @@ async fn provider_models_for_state(
     state: &DesktopState,
     provider: String,
     refresh: Option<bool>,
+    target_model: Option<&str>,
 ) -> Result<ProviderModelsResponse, String> {
     const CACHE_TTL_SECONDS: i64 = 300;
     let descriptor = registry::descriptors()
@@ -12911,6 +12943,19 @@ async fn provider_models_for_state(
             .model_discovery(&provider, &cache_base_url)
             .map_err(|error| error.to_string())?
         && cached.is_fresh(chrono::Utc::now(), CACHE_TTL_SECONDS)
+        && (target_model.is_none() || {
+            serde_json::from_str::<Vec<ModelDescriptor>>(&cached.models_json)
+                .ok()
+                .and_then(|models| {
+                    models.into_iter().find(|model| {
+                        target_model.is_some_and(|target| model.id.eq_ignore_ascii_case(target))
+                    })
+                })
+                .is_some_and(|model| {
+                    model.capabilities.context_window_source.is_some()
+                        && model.capabilities.max_output_tokens_source.is_some()
+                })
+        })
     {
         let models = serde_json::from_str(&cached.models_json)
             .map_err(|_| "cached model discovery is invalid".to_owned())?;
@@ -12947,30 +12992,29 @@ async fn provider_models_for_state(
     };
     let (models, source, fallback_reason) = match discovered {
         Ok(mut models) => {
-            if descriptor.openai_compatible {
+            if descriptor.openai_compatible
+                && let Some(target_model) = target_model
+            {
                 let client = reqwest::Client::new();
-                for model in models.iter_mut().take(16) {
-                    if model.capabilities.context_window.is_some()
-                        && model.capabilities.max_output_tokens.is_some()
-                    {
-                        continue;
-                    }
-                    let Ok((limits, _raw)) = opcos_provider::registry::probe_model_limits(
+                if let Some(model) = models
+                    .iter_mut()
+                    .find(|model| model.id.eq_ignore_ascii_case(target_model))
+                    && (model.capabilities.context_window_source.is_none()
+                        || model.capabilities.max_output_tokens_source.is_none())
+                    && let Ok((limits, _raw)) = opcos_provider::registry::probe_model_limits(
                         &client,
                         &base_url,
                         key.as_deref().unwrap_or_default(),
                         &model.id,
                     )
                     .await
-                    else {
-                        continue;
-                    };
-                    if let Some(value) = limits.context_window {
-                        model.capabilities.context_window = Some(value);
+                {
+                    if model.capabilities.context_window_source.is_none() {
+                        model.capabilities.context_window = limits.context_window;
                         model.capabilities.context_window_source = Some("probe".into());
                     }
-                    if let Some(value) = limits.max_output_tokens {
-                        model.capabilities.max_output_tokens = Some(value);
+                    if model.capabilities.max_output_tokens_source.is_none() {
+                        model.capabilities.max_output_tokens = limits.max_output_tokens;
                         model.capabilities.max_output_tokens_source = Some("probe".into());
                     }
                     if limits.context_window.is_some() || limits.max_output_tokens.is_some() {
@@ -13042,7 +13086,7 @@ async fn provider_models(
     provider: String,
     refresh: Option<bool>,
 ) -> Result<ProviderModelsResponse, String> {
-    provider_models_for_state(&state, provider, refresh).await
+    provider_models_for_state(&state, provider, refresh, None).await
 }
 
 async fn current_session_provider(
@@ -13072,7 +13116,7 @@ async fn validate_session_model(
     model: &str,
 ) -> Result<(), String> {
     let provider = current_session_provider(state, session).await?;
-    let discovery = provider_models_for_state(state, provider.clone(), Some(false)).await?;
+    let discovery = provider_models_for_state(state, provider.clone(), Some(false), None).await?;
     if discovery.models.iter().any(|item| item.id == model) {
         Ok(())
     } else {

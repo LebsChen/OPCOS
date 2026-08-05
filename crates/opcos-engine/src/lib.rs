@@ -448,6 +448,7 @@ pub struct TurnEngine<P, S, E> {
     mode: Mutex<PermissionMode>,
     model: Mutex<String>,
     resolved_caps: Mutex<Option<Caps>>,
+    limit_identity: Mutex<Option<(String, String, String)>>,
     interrupted: AtomicBool,
     steering: Mutex<Vec<String>>,
     steering_waiters: SteeringWaiters,
@@ -479,6 +480,13 @@ pub struct TurnEngine<P, S, E> {
     policy_denied: AtomicBool,
     mutating_api_gate_enabled: AtomicBool,
     secret_scrubber: Arc<dyn SecretScrubber>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResolvedLimits {
+    context_window: u64,
+    context_window_source: &'static str,
+    max_output_tokens: u64,
 }
 
 pub trait SecretScrubber: Send + Sync {
@@ -593,6 +601,7 @@ where
             mode: Mutex::new(mode),
             model: Mutex::new(model.into()),
             resolved_caps: Mutex::new(None),
+            limit_identity: Mutex::new(None),
             interrupted: AtomicBool::new(false),
             steering: Mutex::new(Vec::new()),
             steering_waiters: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1318,6 +1327,10 @@ where
     pub async fn change_model(&self, model: impl Into<String>) -> Result<(), EngineError> {
         let model = model.into();
         *self.model.lock().await = model.clone();
+        *self.resolved_caps.lock().await = None;
+        if let Some(identity) = self.limit_identity.lock().await.as_mut() {
+            identity.2 = model.clone();
+        }
         self.notice("model_switch", format!("Switched to model {model}"))
             .await
     }
@@ -1358,6 +1371,15 @@ where
 
     pub async fn set_resolved_capabilities(&self, caps: Caps) {
         *self.resolved_caps.lock().await = Some(caps);
+    }
+
+    pub async fn set_limit_identity(
+        &self,
+        provider: impl Into<String>,
+        base_url: impl Into<String>,
+    ) {
+        let model = self.model.lock().await.clone();
+        *self.limit_identity.lock().await = Some((provider.into(), base_url.into(), model));
     }
     pub fn workspace(&self) -> &str {
         &self.workspace
@@ -1411,14 +1433,15 @@ where
                 .iter()
                 .map(|message| message.to_string().len() as u64 / 4)
                 .sum::<u64>();
+            let limits = self.resolved_caps_for_model();
             let _ = self
                 .working_event(
                     "context_growth_update",
                     "other",
                     json!({
                         "estimated_context_tokens":context_tokens,
-                        "resolved_context_window": self.resolved_caps_for_model().0,
-                        "context_window_source": self.resolved_caps_for_model().1,
+                        "resolved_context_window": limits.context_window,
+                        "context_window_source": limits.context_window_source,
                     }),
                 )
                 .await;
@@ -1666,6 +1689,17 @@ where
                             caps.context_window = Some(*limit);
                             caps.context_window_source = Some("learned".into());
                             *self.resolved_caps.lock().await = Some(caps);
+                            if let Some((provider, base_url, model)) =
+                                self.limit_identity.lock().await.clone()
+                            {
+                                let _ = self.recorder.store().save_learned_model_limits(
+                                    &provider,
+                                    &base_url,
+                                    &model,
+                                    Some(*limit),
+                                    None,
+                                );
+                            }
                         }
                         context_overflow_retries += 1;
                         messages = self
@@ -1688,7 +1722,11 @@ where
     }
 
     fn should_compact(&self, messages: &[Value], usage: Option<&TokenUsage>) -> bool {
-        let budget = self.resolved_caps_for_model().0.saturating_mul(3) / 4;
+        let budget = self
+            .resolved_caps_for_model()
+            .context_window
+            .saturating_mul(3)
+            / 4;
         let estimated = usage.map(TokenUsage::context_tokens).unwrap_or_else(|| {
             serde_json::to_string(messages)
                 .map(|value| value.len() as u64 / 4)
@@ -1697,7 +1735,7 @@ where
         estimated >= budget
     }
 
-    fn resolved_caps_for_model(&self) -> (u64, &'static str, u64) {
+    fn resolved_caps_for_model(&self) -> ResolvedLimits {
         let model = self.model.try_lock().ok();
         let caps = self
             .resolved_caps
@@ -1710,9 +1748,9 @@ where
                     .map(|model| self.provider.capabilities(model))
             })
             .unwrap_or_default();
-        (
-            caps.context_window.unwrap_or(ASSUMED_CONTEXT_WINDOW),
-            match caps.context_window_source.as_deref() {
+        ResolvedLimits {
+            context_window: caps.context_window.unwrap_or(ASSUMED_CONTEXT_WINDOW),
+            context_window_source: match caps.context_window_source.as_deref() {
                 Some("gateway") => "gateway",
                 Some("matrix") => "matrix",
                 Some("probe") => "probe",
@@ -1720,8 +1758,8 @@ where
                 Some("user") => "user",
                 _ => "assumed",
             },
-            caps.max_output_tokens.unwrap_or(ASSUMED_OUTPUT_TOKENS),
-        )
+            max_output_tokens: caps.max_output_tokens.unwrap_or(ASSUMED_OUTPUT_TOKENS),
+        }
     }
 
     async fn stream_turn(
@@ -2613,7 +2651,7 @@ where
                 ],
                 tools: Vec::new(),
                 settings: json!({
-                    "max_tokens": self.resolved_caps_for_model().2,
+                    "max_tokens": self.resolved_caps_for_model().max_output_tokens,
                     "temperature": 0.2
                 }),
             })
@@ -5739,6 +5777,31 @@ mod tests {
                 cache_write: 0,
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn changing_model_clears_resolved_capabilities() {
+        let engine = TurnEngine::new(
+            FakeProvider,
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "glm-5.2",
+        );
+        engine
+            .set_resolved_capabilities(Caps {
+                context_window: Some(1_000_000),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(
+            engine.capabilities("glm-5.2").context_window,
+            Some(1_000_000)
+        );
+        engine.change_model("smaller-model").await.unwrap();
+        assert_eq!(engine.capabilities("smaller-model").context_window, None);
     }
 
     #[tokio::test]

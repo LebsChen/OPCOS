@@ -1,4 +1,4 @@
-use crate::matrix::capabilities_for_model;
+use crate::matrix::limit_caps_for_model;
 use crate::{
     AssistantTurn, Caps, Provider, ProviderConfig, ProviderError, ProviderRequest, StreamChunk,
     TRANSIENT_RETRY_LIMIT, TokenUsage, ToolCall, ToolCallDelta, apply_bearer_headers,
@@ -376,7 +376,7 @@ impl Provider for OpenAiProvider {
     }
 
     fn capabilities(&self, model: &str) -> Caps {
-        capabilities_for_model("", model).unwrap_or(Caps {
+        let mut capabilities = Caps {
             tools: true,
             vision: true,
             pdf: false,
@@ -386,7 +386,14 @@ impl Provider for OpenAiProvider {
             max_output_tokens: None,
             context_window_source: None,
             max_output_tokens_source: None,
-        })
+        };
+        if let Some(limits) = limit_caps_for_model("", model) {
+            capabilities.context_window = limits.context_window;
+            capabilities.max_output_tokens = limits.max_output_tokens;
+            capabilities.context_window_source = limits.context_window_source;
+            capabilities.max_output_tokens_source = limits.max_output_tokens_source;
+        }
+        capabilities
     }
 
     async fn stream(
