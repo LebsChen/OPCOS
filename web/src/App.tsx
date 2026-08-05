@@ -22,6 +22,7 @@ import {
   hostFailureMessage,
   hostStatusLabel,
   errorMessage,
+  effectiveRunningState,
   pendingQuestionFromPayload,
   reconcileRunningState,
   redactApproval,
@@ -9635,12 +9636,11 @@ function AppContent() {
   const [error, setError] = useState("");
   const errorTimer = useRef<number | undefined>(undefined);
   const [running, setRunning] = useState(false);
-  const effectiveRunning =
-    pendingQuestion !== null
-      ? false
-      : selected?.run_state
-        ? selected.run_state === "running"
-        : running;
+  const effectiveRunning = effectiveRunningState(
+    pendingQuestion !== null,
+    selected?.run_state,
+    running,
+  );
   const [drawerCollapsed, setDrawerCollapsed] = useState(false);
   const [rightPanelWidth, setRightPanelWidth] = useState(() =>
     Math.min(Math.round(window.innerWidth * 0.3), 460),
@@ -9969,8 +9969,8 @@ function AppContent() {
           typeof payload.payload.stop_reason === "string"
             ? payload.payload.stop_reason
             : undefined;
-        setRunning(
-          reconcileRunningState(running, { kind: "turn_done", runState }),
+        setRunning((previous) =>
+          reconcileRunningState(previous, { kind: "turn_done", runState }),
         );
         if (runState || stopReason) {
           setSessions((items) =>
@@ -10019,8 +10019,10 @@ function AppContent() {
           setPendingQuestion({
             ...pendingQuestionFromPayload(callId, args),
           });
-          setRunning(
-            reconcileRunningState(running, { kind: "question_requested" }),
+          setRunning((previous) =>
+            reconcileRunningState(previous, {
+              kind: "question_requested",
+            }),
           );
         }
       }

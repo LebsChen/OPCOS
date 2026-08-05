@@ -116,11 +116,13 @@ export function reconcileRunningState(
   return current;
 }
 
-export function composerIsEnabled(
-  running: boolean,
+export function effectiveRunningState(
   hasPendingQuestion: boolean,
+  backendRunState: string | undefined,
+  localRunning: boolean,
 ): boolean {
-  return hasPendingQuestion || !running;
+  if (hasPendingQuestion) return false;
+  return backendRunState ? backendRunState === "running" : localRunning;
 }
 
 export function hostStatusLabel(host: Host): string {

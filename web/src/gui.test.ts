@@ -10,7 +10,7 @@ import {
   providerBaseUrlError,
   pendingQuestionFromPayload,
   reconcileRunningState,
-  composerIsEnabled,
+  effectiveRunningState,
 } from "./gui";
 
 describe("GUI boundary behavior", () => {
@@ -119,7 +119,7 @@ describe("GUI boundary behavior", () => {
   });
 
   it("keeps the composer enabled while a question awaits an answer", () => {
-    expect(composerIsEnabled(true, true)).toBe(true);
+    expect(effectiveRunningState(true, "running", true)).toBe(false);
   });
 
   it("does not contain the retired private gateway address", () => {

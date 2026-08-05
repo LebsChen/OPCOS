@@ -8340,9 +8340,13 @@ fn permission_mode_name(mode: PermissionMode) -> &'static str {
     }
 }
 
-fn local_workspace_path(session_id: &str) -> Result<String, String> {
+fn local_workspace_root() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or_else(|| "home directory unavailable".to_owned())?;
-    let workspace = home.join("OPCOS").join("workspaces").join(session_id);
+    Ok(home.join("OPCOS").join("workspaces"))
+}
+
+fn local_workspace_path(session_id: &str) -> Result<String, String> {
+    let workspace = local_workspace_root()?.join(session_id);
     std::fs::create_dir_all(&workspace)
         .map_err(|error| format!("local workspace unavailable: {error}"))?;
     let workspace = workspace
@@ -21393,7 +21397,14 @@ fn main() {
                 runner_task: Mutex::new(Some(runner_task)),
             });
             tauri::async_runtime::spawn(async move {
-                let Ok(local_host) = LocalHost::with_secret_snapshot("/", recovery_secret_values)
+                let Ok(recovery_root) = local_workspace_root() else {
+                    return;
+                };
+                if std::fs::create_dir_all(&recovery_root).is_err() {
+                    return;
+                }
+                let Ok(local_host) =
+                    LocalHost::with_secret_snapshot(recovery_root, recovery_secret_values)
                 else {
                     return;
                 };
