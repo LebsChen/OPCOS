@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use opcos_policy::{
-    Decision, DurableGrant, PermissionMode, PermissionRules, ToolRisk, decide_with_rules,
-    mutating_http_target,
+    Decision, DurableGrant, PermissionMode, PermissionRules, ToolRisk, browser_navigation_target,
+    decide_with_rules, mutating_http_target,
 };
 use opcos_provider::{
     AssistantTurn, Caps, Provider, ProviderError, ProviderRequest, StreamChunk, TokenUsage,
@@ -1826,7 +1826,7 @@ where
                 }
                 return Err(EngineError::ApprovalPending(call.id.clone()));
             }
-            let risk = tool_risk(&call.name);
+            let mut risk = tool_risk(&call.name);
             let argument_keys = call
                 .arguments
                 .as_object()
@@ -1871,7 +1871,39 @@ where
             } else {
                 None
             };
-            let target = mutating_api_target.as_deref().unwrap_or(&target);
+            let mut target = mutating_api_target.as_deref().unwrap_or(&target);
+            let browser_target =
+                if matches!(call.name.as_str(), "browser_navigate" | "browser_click") {
+                    let origin = if call.name == "browser_navigate" {
+                        call.arguments.get("url").and_then(Value::as_str)
+                    } else {
+                        call.arguments.get("origin").and_then(Value::as_str)
+                    };
+                    origin
+                        .and_then(browser_navigation_target)
+                        .map(|(target, local)| {
+                            (
+                                target.replacen(
+                                    "browser_navigate:",
+                                    if call.name == "browser_navigate" {
+                                        "browser_navigate:"
+                                    } else {
+                                        "browser_click:"
+                                    },
+                                    1,
+                                ),
+                                local,
+                            )
+                        })
+                } else {
+                    None
+                };
+            if let Some((browser_target, is_loopback)) = &browser_target {
+                target = browser_target;
+                if *is_loopback {
+                    risk = ToolRisk::Execute;
+                }
+            }
             let preflight = self
                 .executor
                 .preflight(&call.name, &call.arguments)
@@ -2810,8 +2842,9 @@ fn tool_risk(name: &str) -> ToolRisk {
         | "browser_read"
         | "browser_measure"
         | "browser_assert_geometry"
-        | "browser_screenshot" => ToolRisk::Read,
-        "browser_navigate" | "browser_set_viewport" | "browser_click" => ToolRisk::External,
+        | "browser_screenshot"
+        | "browser_set_viewport" => ToolRisk::Read,
+        "browser_navigate" | "browser_click" => ToolRisk::External,
         "background_job_start" | "background_job_kill" => ToolRisk::Execute,
         "background_job_status" | "background_job_output" => ToolRisk::Read,
         _ => ToolRisk::External,
@@ -3309,7 +3342,7 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"browser_status","description":"Check whether an isolated local Chrome/Chromium CDP session is available. Read-only.","parameters":{"type":"object","properties":{}}}}),
         json!({"type":"function","function":{"name":"browser_navigate","description":"Navigate the isolated local browser to an HTTP(S) URL. Requires external-action approval.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}}),
         json!({"type":"function","function":{"name":"browser_set_viewport","description":"Set the isolated browser viewport size for responsive verification. Requires external-action approval.","parameters":{"type":"object","properties":{"width":{"type":"integer"},"height":{"type":"integer"}},"required":["width","height"]}}}),
-        json!({"type":"function","function":{"name":"browser_click","description":"Click an element by CSS selector, ARIA role, or exact visible text in the isolated local browser. Requires external-action approval.","parameters":{"type":"object","properties":{"selector":{"type":"string"},"role":{"type":"string"},"text":{"type":"string"}}}}}),
+        json!({"type":"function","function":{"name":"browser_click","description":"Click an element by CSS selector, ARIA role, or exact visible text in the isolated local browser. Include the current HTTP(S) origin when known so policy can scope the interaction.","parameters":{"type":"object","properties":{"selector":{"type":"string"},"role":{"type":"string"},"text":{"type":"string"},"origin":{"type":"string"}}}}}),
         json!({"type":"function","function":{"name":"browser_read","description":"Read text and HTML from a CSS selector in the isolated local browser. Read-only.","parameters":{"type":"object","properties":{"selector":{"type":"string"}}}}}),
         json!({"type":"function","function":{"name":"browser_measure","description":"Return an element's bounding box and selected computed layout values. Read-only.","parameters":{"type":"object","properties":{"selector":{"type":"string"}},"required":["selector"]}}}),
         json!({"type":"function","function":{"name":"browser_assert_geometry","description":"Check element geometry, including container overflow and overlap between two elements. Read-only.","parameters":{"type":"object","properties":{"first":{"type":"string"},"second":{"type":"string"},"container":{"type":"string"}},"required":["first"]}}}),
@@ -3622,8 +3655,7 @@ mod tests {
         assert_eq!(tool_risk("browser_measure"), ToolRisk::Read);
         assert_eq!(tool_risk("browser_assert_geometry"), ToolRisk::Read);
         assert_eq!(tool_risk("browser_screenshot"), ToolRisk::Read);
-        assert_eq!(tool_risk("browser_navigate"), ToolRisk::External);
-        assert_eq!(tool_risk("browser_set_viewport"), ToolRisk::External);
+        assert_eq!(tool_risk("browser_set_viewport"), ToolRisk::Read);
         assert_eq!(tool_risk("browser_click"), ToolRisk::External);
     }
 

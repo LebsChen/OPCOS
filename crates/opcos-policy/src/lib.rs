@@ -137,7 +137,7 @@ fn command_tokens_mutate(command: &str) -> bool {
     false
 }
 
-fn is_local_http_host(host: &str) -> bool {
+pub fn is_local_http_host(host: &str) -> bool {
     host == "localhost"
         || host == "::1"
         || host == "0:0:0:0:0:0:0:1"
@@ -145,6 +145,25 @@ fn is_local_http_host(host: &str) -> bool {
         || host == "::"
         || host == "127.0.0.1"
         || host.starts_with("127.")
+}
+
+pub fn browser_navigation_target(url: &str) -> Option<(String, bool)> {
+    let parsed = url::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    Some((
+        format!("browser_navigate:{host}"),
+        is_local_http_host(&host),
+    ))
+}
+
+fn is_loopback_browser_target(target: &str) -> bool {
+    target
+        .strip_prefix("browser_navigate:")
+        .or_else(|| target.strip_prefix("browser_click:"))
+        .is_some_and(is_local_http_host)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -228,7 +247,8 @@ pub fn decide_with_rules(
     {
         return Decision::Allow;
     }
-    if unattended && dangerous {
+    if unattended && dangerous && !(risk == ToolRisk::Execute && is_loopback_browser_target(target))
+    {
         return Decision::Deny;
     }
     classify(mode, dangerous, matches!(risk, ToolRisk::External))
@@ -443,6 +463,49 @@ mod tests {
         assert_eq!(
             mutating_http_target("http DELETE https://example.com/resource"),
             Some("mutating_http:example.com".into())
+        );
+    }
+
+    #[test]
+    fn browser_navigation_targets_scope_remote_hosts_and_allow_loopback() {
+        assert_eq!(
+            browser_navigation_target("http://localhost:8080/cart"),
+            Some(("browser_navigate:localhost".into(), true))
+        );
+        assert_eq!(
+            browser_navigation_target("https://TryCloudflare.COM/store"),
+            Some(("browser_navigate:trycloudflare.com".into(), false))
+        );
+        assert_eq!(browser_navigation_target("file:///tmp/store.html"), None);
+        assert_eq!(
+            decide(
+                PermissionMode::Auto,
+                ToolRisk::Execute,
+                true,
+                &[],
+                "browser_navigate:localhost"
+            ),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(
+                PermissionMode::Auto,
+                ToolRisk::External,
+                true,
+                &[],
+                "browser_navigate:trycloudflare.com"
+            ),
+            Decision::Deny
+        );
+        assert_eq!(
+            decide(
+                PermissionMode::Auto,
+                ToolRisk::Read,
+                true,
+                &[],
+                "browser_set_viewport"
+            ),
+            Decision::Allow
         );
     }
 
