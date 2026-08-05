@@ -9495,7 +9495,7 @@ async fn engine_for_with_context(
         permission_mode,
         model.clone(),
     );
-    let mut resolved_caps = provider_models_for_state(state, provider_id.clone(), Some(false))
+    let discovered_caps = provider_models_for_state(state, provider_id.clone(), Some(false))
         .await
         .ok()
         .and_then(|discovery| {
@@ -9505,8 +9505,17 @@ async fn engine_for_with_context(
                 .find(|entry| entry.id.eq_ignore_ascii_case(&model))
                 .map(|entry| entry.capabilities)
         })
-        .or_else(|| opcos_provider::matrix::capabilities_for_model(&provider_id, &model))
         .unwrap_or_default();
+    let mut resolved_caps =
+        opcos_provider::matrix::capabilities_for_model(&provider_id, &model).unwrap_or_default();
+    if discovered_caps.context_window.is_some() {
+        resolved_caps.context_window = discovered_caps.context_window;
+        resolved_caps.context_window_source = discovered_caps.context_window_source;
+    }
+    if discovered_caps.max_output_tokens.is_some() {
+        resolved_caps.max_output_tokens = discovered_caps.max_output_tokens;
+        resolved_caps.max_output_tokens_source = discovered_caps.max_output_tokens_source;
+    }
     if resolved_caps.context_window.is_none()
         && let Some(value) = settings.get("context_window").and_then(Value::as_u64)
     {
