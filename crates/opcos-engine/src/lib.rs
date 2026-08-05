@@ -769,6 +769,40 @@ where
         result
     }
 
+    fn execute_proposed_plan(&self, arguments: &Value) -> Value {
+        let object = arguments.as_object();
+        let title = object
+            .and_then(|value| value.get("title"))
+            .and_then(Value::as_str)
+            .unwrap_or("Implementation plan");
+        let summary = object
+            .and_then(|value| value.get("summary"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let steps = object
+            .and_then(|value| value.get("steps"))
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        match self
+            .store
+            .create_plan(&self.session_id, None, title, summary, &steps)
+        {
+            Ok(plan) => json!({
+                "status": "created",
+                "plan_id": plan.plan_id,
+                "steps": plan.steps.len(),
+            }),
+            Err(error) => json!({"error": error.to_string()}),
+        }
+    }
+
     async fn apply_post_compaction_hook(&self, messages: &mut Vec<Value>) {
         let effects = self
             .lifecycle_hooks(
@@ -1649,7 +1683,10 @@ where
                 results[index] = Some(json!({"error":"tool call interrupted"}));
                 continue;
             }
-            if matches!(call.name.as_str(), "propose_plan" | "ask_user") {
+            let mode = *self.mode.lock().await;
+            if call.name == "ask_user"
+                || (call.name == "propose_plan" && mode != PermissionMode::Auto)
+            {
                 self.save_pending(&PendingRecord {
                     session_id: self.session_id.clone(),
                     call_id: call.id.clone(),
@@ -1766,7 +1803,11 @@ where
                     readonly.push((index, call));
                 }
                 Decision::Allow => {
-                    results[index] = Some(self.execute_tool_with_hooks(call).await);
+                    results[index] = Some(if call.name == "propose_plan" {
+                        self.execute_proposed_plan(&call.arguments)
+                    } else {
+                        self.execute_tool_with_hooks(call).await
+                    });
                 }
                 Decision::Deny => {
                     self.policy_denied.store(true, Ordering::SeqCst);
@@ -1899,7 +1940,9 @@ where
                     }),
                 )
                 .await;
-            if (call.name == "plan_update" || call.name == "plan_revise")
+            if (call.name == "propose_plan"
+                || call.name == "plan_update"
+                || call.name == "plan_revise")
                 && let Some(plan) = self
                     .store
                     .load_plan(&self.session_id)
@@ -2328,7 +2371,7 @@ fn tool_event_category(name: &str) -> &'static str {
         "mcp"
     } else if name == "run_shell" || name == "background_job_start" {
         "shell"
-    } else if name.starts_with("plan_") {
+    } else if name == "propose_plan" || name.starts_with("plan_") {
         "todo"
     } else {
         "other"
@@ -4376,7 +4419,7 @@ mod tests {
             Arc::new(FakeTools),
             "s",
             "/workspace",
-            PermissionMode::Auto,
+            PermissionMode::Interactive,
             "fake",
         );
         engine.set_unattended(true);
@@ -4426,6 +4469,73 @@ mod tests {
         assert!(matches!(pending, Err(EngineError::ApprovalPending(id)) if id == "ask-1"));
         assert_eq!(store.load_pending("s").unwrap()[0].state, "ask_user");
         assert_eq!(store.list_inbox().unwrap()[0].kind, "question");
+    }
+
+    #[tokio::test]
+    async fn auto_mode_executes_propose_plan_and_emits_snapshot() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let plan_call = ToolCall {
+            id: "plan-auto".into(),
+            name: "propose_plan".into(),
+            arguments: json!({
+                "title": "Fix the bug",
+                "summary": "Implement and verify the fix",
+                "steps": ["Inspect the code", "Run the tests"],
+            }),
+        };
+        store
+            .append_tool_call(&opcos_store::ToolCallRecord {
+                session_id: "s".into(),
+                message_sequence: 1,
+                call_id: plan_call.id.clone(),
+                name: plan_call.name.clone(),
+                arguments: plan_call.arguments.clone(),
+                result: None,
+            })
+            .unwrap();
+
+        let result = engine.execute_tools(1, &[plan_call]).await.unwrap();
+        assert_eq!(
+            result[0].get("status").and_then(Value::as_str),
+            Some("created")
+        );
+        assert!(store.load_pending("s").unwrap().is_empty());
+        let plan = store.load_plan("s").unwrap().expect("plan persisted");
+        assert_eq!(plan.title, "Fix the bug");
+        assert_eq!(plan.steps.len(), 2);
+        let event_types = store
+            .load_audit(Some("s"))
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "working_event")
+            .filter_map(|event| {
+                event
+                    .payload
+                    .get("event_type")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            event_types
+                .iter()
+                .any(|event| event == "propose_plan_started")
+        );
+        assert!(
+            event_types
+                .iter()
+                .any(|event| event == "propose_plan_completed")
+        );
+        assert!(event_types.iter().any(|event| event == "todo_update"));
     }
 
     #[test]
