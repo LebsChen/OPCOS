@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 import liveEnvelopes from "../../fixtures/timeline/live-events.json";
 import persisted from "../../fixtures/timeline/persisted-events.json";
-import { buildTimeline, mergeEvents, type TimelineEvent } from "./timeline";
+import {
+  buildTimeline,
+  mergeEvents,
+  TRANSIENT_TIMELINE_EVENT_TYPES,
+  type TimelineEvent,
+} from "./timeline";
 
 const live = liveEnvelopes.map((entry) => entry.payload as TimelineEvent);
 const saved = persisted as TimelineEvent[];
@@ -26,8 +31,8 @@ describe("single event-log timeline", () => {
   it("produces the same timeline when token deltas are omitted from persistence", () => {
     const persistedWithoutDeltas = live.filter(
       (event) =>
-        !["assistant_delta", "reasoning_delta", "tool_call_delta"].includes(
-          event.type ?? "",
+        !TRANSIENT_TIMELINE_EVENT_TYPES.includes(
+          event.type as (typeof TRANSIENT_TIMELINE_EVENT_TYPES)[number],
         ),
     );
     expect(buildTimeline(mergeEvents([], live))).toEqual(
@@ -35,8 +40,8 @@ describe("single event-log timeline", () => {
     );
     expect(
       mergeEvents([], live).some((event) =>
-        ["assistant_delta", "reasoning_delta", "tool_call_delta"].includes(
-          event.type ?? "",
+        TRANSIENT_TIMELINE_EVENT_TYPES.includes(
+          event.type as (typeof TRANSIENT_TIMELINE_EVENT_TYPES)[number],
         ),
       ),
     ).toBe(false);

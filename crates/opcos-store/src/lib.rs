@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
+pub const TRANSIENT_SESSION_EVENT_TYPES: &[&str] =
+    &["assistant_delta", "reasoning_delta", "tool_call_delta"];
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("sqlite error: {0}")]
@@ -2121,14 +2124,19 @@ impl SqliteStore {
         session_id: &str,
     ) -> Result<Vec<SessionEventRecord>, StoreError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let mut statement = connection.prepare(
+        let transient_types = TRANSIENT_SESSION_EVENT_TYPES
+            .iter()
+            .map(|event_type| format!("'{event_type}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
             "SELECT session_id,event_id,event_json,created_at_ms,sequence
              FROM session_events
              WHERE session_id=?1
-               AND COALESCE(json_extract(event_json, '$.type'), '') NOT IN
-                   ('assistant_delta', 'reasoning_delta', 'tool_call_delta')
-             ORDER BY created_at_ms,sequence",
-        )?;
+               AND COALESCE(json_extract(event_json, '$.type'), '') NOT IN ({transient_types})
+             ORDER BY created_at_ms,sequence"
+        );
+        let mut statement = connection.prepare(&query)?;
         statement
             .query_map([session_id], |row| {
                 let event_json: String = row.get(2)?;
