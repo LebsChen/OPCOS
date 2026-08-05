@@ -234,6 +234,15 @@ fn reasoning(value: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn completion_text(value: &Value) -> Option<String> {
+    value
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| reasoning(value))
+}
+
 fn parse_stream_value(event: &crate::sse::SseEvent) -> Option<Value> {
     match crate::sse::parse_json(event) {
         Ok(value) => Some(value),
@@ -343,10 +352,7 @@ impl Provider for OpenAiProvider {
         } else {
             return Err(ProviderError::Protocol("missing choices".into()));
         };
-        let text = message
-            .get("content")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let text = completion_text(message);
         let mut calls = parse_tool_calls(message.get("tool_calls"));
         let (text, salvaged) = salvage(text, &request.tools);
         if calls.is_empty() {
@@ -687,6 +693,20 @@ mod tests {
         });
         assert_eq!(reasoning(&value).as_deref(), Some("private chain"));
         assert_eq!(value["content"].as_str(), Some("visible answer"));
+    }
+
+    #[test]
+    fn completion_uses_reasoning_content_when_content_is_empty() {
+        let value = json!({
+            "content": "",
+            "reasoning_content": "Goal\nCompleted actions and results\nKey discoveries and file paths\nUnfinished next steps"
+        });
+        assert_eq!(
+            completion_text(&value).as_deref(),
+            Some(
+                "Goal\nCompleted actions and results\nKey discoveries and file paths\nUnfinished next steps"
+            )
+        );
     }
 
     #[test]

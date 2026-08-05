@@ -2174,11 +2174,12 @@ where
         } else {
             match self.compaction_summary(&discarded).await {
                 Ok(summary) => (summary, None),
-                Err(reason) => (
+                Err(rejection) => (
                     format!(
-                        "Compaction summary unavailable ({reason}); recent complete tool exchanges retained."
+                        "Compaction summary unavailable ({}); recent complete tool exchanges retained.",
+                        rejection.reason
                     ),
-                    Some(reason),
+                    Some(rejection),
                 ),
             }
         };
@@ -2222,23 +2223,39 @@ where
                 }),
             )
             .await;
-        if let Some(reason) = summary_issue {
+        if let Some(rejection) = summary_issue {
             self.notice(
                 "compaction_summary_invalid",
-                format!("Compaction summary was not stored as model output: {reason}"),
+                format!(
+                    "Compaction summary was not stored as model output: {}",
+                    rejection.reason
+                ),
             )
             .await?;
+            let _ = self
+                .working_event(
+                    "compaction_summary_invalid",
+                    "lifecycle",
+                    json!({
+                        "reason": rejection.reason,
+                        "diagnostics": rejection.diagnostics,
+                    }),
+                )
+                .await;
         }
         self.notice("compacted", "Earlier context compacted".into())
             .await?;
         Ok(valid)
     }
 
-    async fn compaction_summary(&self, discarded: &[Value]) -> Result<String, String> {
+    async fn compaction_summary(
+        &self,
+        discarded: &[Value],
+    ) -> Result<String, CompactionSummaryRejection> {
         let mut context = String::new();
         for message in discarded {
-            let mut encoded =
-                serde_json::to_string(message).map_err(|_| "context_encoding_failed".to_owned())?;
+            let mut encoded = serde_json::to_string(message)
+                .map_err(|_| CompactionSummaryRejection::without_text("context_encoding_failed"))?;
             if encoded.len() > 4000 {
                 encoded.truncate(4000);
                 encoded.push('…');
@@ -2261,10 +2278,68 @@ where
                 settings: json!({"max_tokens":8192,"temperature":0.2}),
             })
             .await
-            .map_err(|_| "provider_request_failed".to_owned())?;
-        let text = response.text.ok_or_else(|| "empty_response".to_owned())?;
-        Self::validate_compaction_summary(&text)?;
+            .map_err(|_| CompactionSummaryRejection::without_text("provider_request_failed"))?;
+        let text = response
+            .text
+            .filter(|text| !text.trim().is_empty())
+            .or(response.reasoning)
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| CompactionSummaryRejection::without_text("empty_response"))?;
+        Self::validate_compaction_summary(&text).map_err(|reason| CompactionSummaryRejection {
+            reason,
+            diagnostics: Self::compaction_summary_diagnostics(&text),
+        })?;
         Ok(text.trim().to_owned())
+    }
+
+    fn compaction_summary_diagnostics(text: &str) -> Value {
+        let without_reasoning = strip_reasoning_blocks(text);
+        let normalized = without_reasoning.trim().to_ascii_lowercase();
+        let has_cjk = without_reasoning.chars().any(|character| {
+            ('\u{3040}'..='\u{30ff}').contains(&character)
+                || ('\u{3400}'..='\u{4dbf}').contains(&character)
+                || ('\u{4e00}'..='\u{9fff}').contains(&character)
+        });
+        let has_latin = without_reasoning
+            .chars()
+            .any(|character| character.is_ascii_alphabetic());
+        let goal = ["goal", "目标", "任务"]
+            .iter()
+            .any(|keyword| normalized.contains(keyword));
+        let completed_actions = ["completed", "已完成", "完成的", "已经完成", "进展"]
+            .iter()
+            .any(|keyword| normalized.contains(keyword));
+        let discoveries_or_paths = [
+            "discover",
+            "file path",
+            "finding",
+            "发现",
+            "文件路径",
+            "关键",
+        ]
+        .iter()
+        .any(|keyword| normalized.contains(keyword));
+        let next_steps = [
+            "next step",
+            "remaining",
+            "unfinished",
+            "下一步",
+            "未完成",
+            "待办",
+            "后续",
+        ]
+        .iter()
+        .any(|keyword| normalized.contains(keyword));
+        json!({
+            "summary_chars": without_reasoning.chars().count(),
+            "sections": {
+                "goal": goal,
+                "completed_actions": completed_actions,
+                "discoveries_or_paths": discoveries_or_paths,
+                "next_steps": next_steps,
+            },
+            "language_hint": if has_cjk && has_latin { "mixed" } else if has_cjk { "zh" } else if has_latin { "en" } else { "unknown" },
+        })
     }
 
     fn validate_compaction_summary(text: &str) -> Result<(), String> {
@@ -2498,6 +2573,29 @@ pub struct BuiltinHarness<P, S, E> {
     next_turn_id: AtomicU64,
     turns: Arc<Mutex<HashMap<String, TurnState>>>,
     pending_turns: Arc<Mutex<HashMap<String, String>>>,
+}
+
+struct CompactionSummaryRejection {
+    reason: String,
+    diagnostics: Value,
+}
+
+impl CompactionSummaryRejection {
+    fn without_text(reason: &str) -> Self {
+        Self {
+            reason: reason.to_owned(),
+            diagnostics: json!({
+                "summary_chars": 0,
+                "sections": {
+                    "goal": false,
+                    "completed_actions": false,
+                    "discoveries_or_paths": false,
+                    "next_steps": false,
+                },
+                "language_hint": "unknown",
+            }),
+        }
+    }
 }
 
 struct TurnState {
@@ -3620,6 +3718,7 @@ mod tests {
             SummaryProvider {
                 fail: false,
                 text: None,
+                reasoning: None,
             },
             store,
             Arc::new(HookTools),
@@ -4877,6 +4976,7 @@ mod tests {
     struct SummaryProvider {
         fail: bool,
         text: Option<String>,
+        reasoning: Option<String>,
     }
 
     #[async_trait]
@@ -4893,6 +4993,7 @@ mod tests {
                          Unfinished next steps: verify the change."
                             .into()
                     })),
+                    reasoning: self.reasoning.clone(),
                     ..Default::default()
                 })
             }
@@ -4918,6 +5019,7 @@ mod tests {
             SummaryProvider {
                 fail: false,
                 text: None,
+                reasoning: None,
             },
             store,
             Arc::new(FakeTools),
@@ -4971,6 +5073,7 @@ mod tests {
             SummaryProvider {
                 fail: false,
                 text: None,
+                reasoning: None,
             },
             store.clone(),
             Arc::new(FakeTools),
@@ -4998,6 +5101,39 @@ mod tests {
                  Completed actions and results: reviewed the repository.\n\
                  Key discoveries and file paths: summary code is in crates/opcos-engine/src/lib.rs.\n\
                  Unfinished next steps: verify the change."
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_uses_reasoning_when_provider_content_is_empty() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let reasoning = "Goal: inspect the repository.\n\
+            Completed actions and results: reviewed the repository.\n\
+            Key discoveries and file paths: summary code is in crates/opcos-engine/src/lib.rs.\n\
+            Unfinished next steps: verify the change."
+            .to_owned();
+        let engine = TurnEngine::new(
+            SummaryProvider {
+                fail: false,
+                text: Some("   ".into()),
+                reasoning: Some(reasoning.clone()),
+            },
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let messages = (0..8)
+            .map(|index| json!({"role":"user","content":format!("message-{index}")}))
+            .collect();
+
+        engine.compact_context(messages).await.unwrap();
+
+        assert_eq!(
+            store.load_compaction("s").unwrap().unwrap().summary,
+            reasoning
         );
     }
 
@@ -5098,6 +5234,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn compaction_summary_diagnostics_report_sections_without_text() {
+        let diagnostics =
+            TurnEngine::<SummaryProvider, SqliteStore, FakeTools>::compaction_summary_diagnostics(
+                "Goal\nFix it.\n\nCompleted actions and results\nRead files.\n\n\
+                 Key discoveries and file paths\nsrc/lib.rs.\n\nUnfinished next steps\nRun tests.",
+            );
+        assert_eq!(diagnostics["summary_chars"], 133);
+        assert_eq!(diagnostics["language_hint"], "en");
+        assert_eq!(diagnostics["sections"]["goal"], true);
+        assert_eq!(diagnostics["sections"]["completed_actions"], true);
+        assert_eq!(diagnostics["sections"]["discoveries_or_paths"], true);
+        assert_eq!(diagnostics["sections"]["next_steps"], true);
+        assert!(diagnostics.get("text").is_none());
+    }
+
     #[tokio::test]
     async fn invalid_compaction_summary_uses_visible_fallback() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
@@ -5105,6 +5257,7 @@ mod tests {
             SummaryProvider {
                 fail: false,
                 text: Some(r#"{"tool_calls":[{"name":"read_file"}]}"#.into()),
+                reasoning: None,
             },
             store.clone(),
             Arc::new(FakeTools),
@@ -5134,6 +5287,7 @@ mod tests {
             SummaryProvider {
                 fail: true,
                 text: None,
+                reasoning: None,
             },
             store.clone(),
             Arc::new(FakeTools),
