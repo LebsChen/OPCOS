@@ -1,7 +1,6 @@
 use async_trait::async_trait;
-use opcos_hosts::{
-    ComputerUseAction, ComputerUseResponse, Host, HostError, ScreenBounds, Screenshot,
-};
+use opcos_computer_use::{ComputerUseAction, ComputerUseResponse, ScreenBounds, Screenshot};
+use opcos_hosts::{Host, HostError};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 

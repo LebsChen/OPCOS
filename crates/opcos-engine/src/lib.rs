@@ -1876,6 +1876,20 @@ where
                 None
             };
             let mut target = mutating_api_target.as_deref().unwrap_or(&target);
+            if call.name == "computer_use" {
+                let action = call
+                    .arguments
+                    .get("action")
+                    .and_then(|value| value.get("action"))
+                    .and_then(Value::as_str);
+                if action == Some("screenshot") {
+                    target = "computer_use_screenshot:local";
+                    risk = ToolRisk::External;
+                } else {
+                    target = "computer_use_input:local";
+                    risk = ToolRisk::Execute;
+                }
+            }
             let click_origin = if call.name == "browser_click" {
                 self.executor.browser_origin().await
             } else {
@@ -2842,7 +2856,7 @@ fn tool_risk(name: &str) -> ToolRisk {
         | "browser_assert_geometry"
         | "browser_screenshot"
         | "browser_set_viewport" => ToolRisk::Read,
-        "browser_navigate" | "browser_click" => ToolRisk::External,
+        "browser_navigate" | "browser_click" | "computer_use" => ToolRisk::External,
         "background_job_start" | "background_job_kill" => ToolRisk::Execute,
         "background_job_status" | "background_job_output" => ToolRisk::Read,
         _ => ToolRisk::External,
@@ -3345,6 +3359,7 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"browser_measure","description":"Return an element's bounding box and selected computed layout values. Read-only.","parameters":{"type":"object","properties":{"selector":{"type":"string"}},"required":["selector"]}}}),
         json!({"type":"function","function":{"name":"browser_assert_geometry","description":"Check element geometry, including container overflow and overlap between two elements. Read-only.","parameters":{"type":"object","properties":{"first":{"type":"string"},"second":{"type":"string"},"container":{"type":"string"}},"required":["first"]}}}),
         json!({"type":"function","function":{"name":"browser_screenshot","description":"Capture a PNG screenshot from the isolated local browser. Read-only.","parameters":{"type":"object","properties":{}}}}),
+        json!({"type":"function","function":{"name":"computer_use","description":"Perform one validated screenshot or desktop computer-use action on the selected host. Full-desktop screenshots and input actions are policy-controlled.","parameters":{"type":"object","properties":{"action":{"type":"object"},"screen_width":{"type":"integer"},"screen_height":{"type":"integer"}},"required":["action","screen_width","screen_height"]}}}),
         json!({"type":"function","function":{"name":"secrets_list","description":"List configured credential names available to the current session. Returns names and non-sensitive metadata only; secret values, prefixes, suffixes, and lengths are never returned. Use a returned name with secret_names for credential injection.","parameters":{"type":"object","properties":{}}}}),
         json!({"type":"function","function":{"name":"background_job_start","description":"Start a long-running shell command in the background and return a job id. Output is retained with bounded storage. Use secret_names for the only supported credential injection path; injected values are redacted.","parameters":{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"},"timeout_seconds":{"type":"integer"},"secret_names":{"type":"array","items":{"type":"string"},"description":"Configured secret names to inject into the child environment."}},"required":["command"]}}}),
         json!({"type":"function","function":{"name":"background_job_status","description":"Read a background job status, exit code, and output counters.","parameters":{"type":"object","properties":{"job_id":{"type":"string"}},"required":["job_id"]}}}),

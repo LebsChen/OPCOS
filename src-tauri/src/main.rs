@@ -3524,6 +3524,15 @@ impl ToolExecutor for RemoteExecutor {
     }
 
     async fn execute(&self, name: &str, arguments: Value) -> Result<Value, String> {
+        if name == "computer_use" {
+            let (action, bounds) = parse_computer_use_arguments(&arguments)?;
+            let host = RvmHost::new(
+                self.host_id.clone(),
+                self.workspace.clone(),
+                self.client.clone(),
+            );
+            return execute_computer_use_action(&host, action, bounds).await;
+        }
         if name == "secrets_list" {
             return list_resolvable_secret_metadata(
                 &self.database,
@@ -3930,6 +3939,10 @@ impl ToolExecutor for DesktopExecutor {
         match self {
             Self::Remote(executor) => executor.execute(name, arguments).await,
             Self::Local(executor) => {
+                if name == "computer_use" {
+                    let (action, bounds) = parse_computer_use_arguments(&arguments)?;
+                    return execute_computer_use_action(&executor.host, action, bounds).await;
+                }
                 if name.starts_with("browser_") {
                     return executor
                         .browser
@@ -10039,10 +10052,9 @@ fn bind_account_host(
     account_id: String,
     host_id: String,
 ) -> Result<opcos_store::AccountHostBinding, String> {
-    if host_id == "local" {
-        return Err("computer-use accounts cannot bind to LocalHost".into());
+    if host_id != "local" {
+        client_for(&state, &host_id)?;
     }
-    client_for(&state, &host_id)?;
     state
         .store
         .bind_account_host(&account_id, &host_id)
@@ -10404,17 +10416,27 @@ async fn run_computer_use(
         .store
         .account_host_binding(&request.account_id)
         .map_err(|error| error.to_string())?
-        .ok_or_else(|| "account has no bound remote host".to_owned())?;
-    if binding.host_id == "local" {
-        return Err("computer use cannot run on LocalHost".into());
-    }
-    let client = client_for(&state, &binding.host_id)?;
-    let host = RvmHost::new(binding.host_id.clone(), "/", client);
+        .ok_or_else(|| "account has no bound host".to_owned())?;
+    let local_host;
+    let remote_host;
+    let host: &dyn Host = if binding.host_id == "local" {
+        let root = dirs::home_dir().ok_or_else(|| "home directory is unavailable".to_owned())?;
+        local_host = LocalHost::new(root).map_err(|error| error.to_string())?;
+        &local_host
+    } else {
+        let client = client_for(&state, &binding.host_id)?;
+        remote_host = RvmHost::new(binding.host_id.clone(), "/", client);
+        &remote_host
+    };
     let action = state
         .store
         .begin_action(
             "computer_use",
-            "remote_host",
+            if binding.host_id == "local" {
+                "local_desktop"
+            } else {
+                "remote_host"
+            },
             &request.account_id,
             &request.idempotency_key,
             None,
@@ -10454,7 +10476,7 @@ async fn run_computer_use(
             retryable: false,
         })
         .collect::<Vec<_>>();
-    match run_computer_use_loop(&host, &steps, config, &BestEffortScreenshotChangedVerifier).await {
+    match run_computer_use_loop(host, &steps, config, &BestEffortScreenshotChangedVerifier).await {
         Ok(results) => {
             let summary = format!("completed {} computer-use steps", results.len());
             state
@@ -10474,6 +10496,49 @@ async fn run_computer_use(
             Err(reason)
         }
     }
+}
+
+fn parse_computer_use_arguments(
+    arguments: &Value,
+) -> Result<(ComputerUseAction, ScreenBounds), String> {
+    let action = arguments
+        .get("action")
+        .cloned()
+        .ok_or_else(|| "computer_use action is required".to_owned())
+        .and_then(|value| serde_json::from_value(value).map_err(|error| error.to_string()))?;
+    let width = arguments
+        .get("screen_width")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "computer_use screen_width is required".to_owned())?;
+    let height = arguments
+        .get("screen_height")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "computer_use screen_height is required".to_owned())?;
+    Ok((
+        action,
+        ScreenBounds {
+            width: u32::try_from(width).map_err(|_| "screen_width is too large".to_owned())?,
+            height: u32::try_from(height).map_err(|_| "screen_height is too large".to_owned())?,
+        },
+    ))
+}
+
+async fn execute_computer_use_action(
+    host: &dyn Host,
+    action: ComputerUseAction,
+    bounds: ScreenBounds,
+) -> Result<Value, String> {
+    action.validate(bounds).map_err(|error| error.to_string())?;
+    if matches!(action, ComputerUseAction::Screenshot) {
+        return serde_json::to_value(host.screenshot().await.map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string());
+    }
+    serde_json::to_value(
+        host.computer_use(action, bounds)
+            .await
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -11691,6 +11756,7 @@ fn builtin_allowed_tools(include_local_lsp: bool, include_edit_file: bool) -> Ve
         "external_ingress_sources",
         "coordination_dispatch",
         "coordination_status",
+        "computer_use",
     ]
     .into_iter()
     .map(str::to_owned)
