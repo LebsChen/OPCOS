@@ -461,6 +461,72 @@ body {
 .current-activity .spinner {
   flex: none;
 }
+
+.rail-event-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.rail-event-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 8px;
+  background: var(--paper);
+}
+
+.rail-event-head {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  text-align: left;
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.rail-event-head code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rail-event-meta,
+.rail-event-summary {
+  color: var(--muted);
+  font-size: 11px;
+  margin-top: 4px;
+}
+
+.rail-event-output,
+.rail-git-diff pre {
+  max-height: 240px;
+  overflow: auto;
+  margin-top: 7px;
+  padding: 7px;
+  border-radius: 5px;
+  background: var(--canvas);
+  color: var(--ink);
+  font:
+    11px/1.45 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.rail-ok {
+  color: var(--ok);
+}
+
+.rail-git-diff {
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
 .bubble-assistant {
   font-size: 15px;
   line-height: 1.55;

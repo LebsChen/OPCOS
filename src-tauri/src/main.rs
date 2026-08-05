@@ -17833,6 +17833,164 @@ async fn session_worklog(
     Ok(json!({"events":page.events,"last_id":page.last_id,"window_lost":reset}))
 }
 
+#[tauri::command]
+fn session_shell_history(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Vec<Value>, String> {
+    let calls = state
+        .store
+        .load_tool_calls(&session_id)
+        .map_err(|error| error.to_string())?;
+    let terminal_updates = state
+        .store
+        .load_audit(Some(&session_id))
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|event| event.kind == "working_event")
+        .filter_map(|event| {
+            (event.payload.get("event_type").and_then(Value::as_str) == Some("terminal_update"))
+                .then_some(event.payload)
+        })
+        .filter_map(|payload| {
+            let call_id = payload.get("payload")?.get("call_id")?.as_str()?;
+            let contents = payload
+                .get("payload")?
+                .get("contents")?
+                .as_str()
+                .unwrap_or_default();
+            Some((call_id.to_owned(), contents.to_owned()))
+        })
+        .fold(
+            std::collections::HashMap::<String, String>::new(),
+            |mut output, (call_id, contents)| {
+                output.entry(call_id).or_default().push_str(&contents);
+                output
+            },
+        );
+    let mut history = calls
+        .into_iter()
+        .filter(|call| call.name == "run_shell")
+        .map(|call| {
+            let command = call
+                .arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let result = call.result.unwrap_or(Value::Null);
+            let output = terminal_updates
+                .get(&call.call_id)
+                .cloned()
+                .or_else(|| {
+                    result
+                        .get("stdout")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default();
+            let exit_code = result
+                .get("exit_code")
+                .or_else(|| result.get("code"))
+                .and_then(Value::as_i64);
+            json!({
+                "call_id": call.call_id,
+                "command": command,
+                "exit_code": exit_code,
+                "duration_ms": result.get("duration_ms").and_then(Value::as_u64),
+                "output": output,
+                "result": result,
+                "message_sequence": call.message_sequence,
+            })
+        })
+        .collect::<Vec<_>>();
+    history.reverse();
+    Ok(history)
+}
+
+#[tauri::command]
+fn session_file_changes(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Vec<Value>, String> {
+    let calls = state
+        .store
+        .load_tool_calls(&session_id)
+        .map_err(|error| error.to_string())?;
+    let mut files = std::collections::BTreeMap::<String, Vec<Value>>::new();
+    for call in calls.into_iter().filter(|call| {
+        matches!(
+            call.name.as_str(),
+            "edit_file"
+                | "write_file"
+                | "replace_in_file"
+                | "apply_patch"
+                | "apply_unified_diff"
+                | "multi_edit"
+        )
+    }) {
+        let result = call.result.unwrap_or(Value::Null);
+        let edits = call
+            .arguments
+            .get("edits")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_else(|| vec![call.arguments.clone()]);
+        for edit in edits {
+            let path = edit
+                .get("path")
+                .or_else(|| edit.get("file_path"))
+                .and_then(Value::as_str)
+                .or_else(|| call.arguments.get("path").and_then(Value::as_str))
+                .unwrap_or("(unknown file)")
+                .to_owned();
+            files.entry(path).or_default().push(json!({
+                "call_id": call.call_id,
+                "tool": call.name,
+                "old_string": edit.get("old_string").or_else(|| edit.get("old")),
+                "new_string": edit.get("new_string").or_else(|| edit.get("new")),
+                "result": result,
+                "message_sequence": call.message_sequence,
+            }));
+        }
+    }
+    Ok(files
+        .into_iter()
+        .rev()
+        .map(|(path, edits)| json!({"path":path,"edit_count":edits.len(),"edits":edits}))
+        .collect())
+}
+
+#[tauri::command]
+fn session_progress(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    category: Option<String>,
+) -> Result<Vec<Value>, String> {
+    let mut events = state
+        .store
+        .load_audit(Some(&session_id))
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|event| event.kind == "working_event")
+        .filter(|event| {
+            category.as_deref().is_none_or(|wanted| {
+                event.payload.get("category").and_then(Value::as_str) == Some(wanted)
+            })
+        })
+        .map(|event| {
+            json!({
+                "sequence": event.sequence,
+                "event_type": event.payload.get("event_type"),
+                "category": event.payload.get("category"),
+                "timestamp": event.payload.get("timestamp"),
+                "payload": event.payload.get("payload"),
+            })
+        })
+        .collect::<Vec<_>>();
+    events.reverse();
+    Ok(events)
+}
+
 #[derive(Debug, Deserialize)]
 struct ScheduleInput {
     id: Option<String>,
@@ -21234,6 +21392,9 @@ fn main() {
             review_snapshot,
             review_file_diff,
             session_worklog,
+            session_shell_history,
+            session_file_changes,
+            session_progress,
             session_insights,
             trigger_http_info,
             audit_events,

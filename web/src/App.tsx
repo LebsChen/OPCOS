@@ -604,6 +604,10 @@ type RailIconName =
   | "sparkle"
   | "diff"
   | "terminal"
+  | "shell"
+  | "changes"
+  | "progress"
+  | "agents"
   | "monitor"
   | "code"
   | "grid"
@@ -8459,6 +8463,10 @@ type PanelTab =
   | "artifacts"
   | "pr"
   | "terminal"
+  | "shell"
+  | "changes"
+  | "progress"
+  | "agents"
   | "desktop"
   | "ide"
   | "review"
@@ -8478,6 +8486,10 @@ function paneRoute(): PaneRoute | null {
     "artifacts",
     "pr",
     "terminal",
+    "shell",
+    "changes",
+    "progress",
+    "agents",
     "desktop",
     "ide",
     "review",
@@ -8748,6 +8760,252 @@ function ArtifactsPane({ selected }: { selected: Session }) {
   );
 }
 
+type ShellHistoryItem = {
+  call_id: string;
+  command: string;
+  exit_code?: number | null;
+  duration_ms?: number | null;
+  output: string;
+};
+
+function ShellHistoryPane({ selected }: { selected: Session }) {
+  const [items, setItems] = useState<ShellHistoryItem[]>([]);
+  const [error, setError] = useState("");
+  const [open, setOpen] = useState<string | null>(null);
+  const refresh = () =>
+    void command<ShellHistoryItem[]>("session_shell_history", {
+      sessionId: selected.id,
+    })
+      .then(setItems)
+      .catch((reason) => setError(errorMessage(reason)));
+  useEffect(() => {
+    refresh();
+  }, [selected.id]);
+  return (
+    <section className="rail-section">
+      <div className="rail-section-head">
+        <strong>Shell</strong>
+        <button
+          className="rail-mini-btn"
+          onClick={refresh}
+          title="Refresh shell history"
+        >
+          <RailIcon name="refresh" size={16} />
+        </button>
+      </div>
+      <div className="rail-section-body">
+        {error ? (
+          <div className="rail-error">{error}</div>
+        ) : items.length === 0 ? (
+          <div className="rail-muted">No shell commands recorded yet.</div>
+        ) : (
+          <div className="rail-event-list">
+            {items.map((item) => (
+              <div className="rail-event-card" key={item.call_id}>
+                <button
+                  className="rail-event-head"
+                  onClick={() =>
+                    setOpen(open === item.call_id ? null : item.call_id)
+                  }
+                >
+                  <code>{item.command || "(empty command)"}</code>
+                  <span
+                    className={item.exit_code === 0 ? "rail-ok" : "rail-muted"}
+                  >
+                    {item.exit_code == null
+                      ? "running"
+                      : `exit ${item.exit_code}`}
+                  </span>
+                </button>
+                <div className="rail-event-meta">
+                  {item.duration_ms == null ? "" : `${item.duration_ms} ms`}
+                </div>
+                {open === item.call_id && item.output && (
+                  <pre className="rail-event-output">{item.output}</pre>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+type FileChange = {
+  path: string;
+  edit_count: number;
+  edits: Array<Record<string, unknown>>;
+};
+
+function ChangesPane({ selected }: { selected: Session }) {
+  const [items, setItems] = useState<FileChange[]>([]);
+  const [gitDiff, setGitDiff] = useState<Record<string, unknown> | null>(null);
+  const [error, setError] = useState("");
+  const [open, setOpen] = useState<string | null>(null);
+  const refresh = () => {
+    setError("");
+    void Promise.all([
+      command<FileChange[]>("session_file_changes", { sessionId: selected.id }),
+      selected.workspace
+        ? command<Record<string, unknown>>("review_snapshot", {
+            sessionId: selected.id,
+            cwd: selected.workspace,
+            base: "HEAD",
+          })
+        : Promise.resolve(null),
+    ])
+      .then(([changes, snapshot]) => {
+        setItems(changes);
+        setGitDiff(snapshot);
+      })
+      .catch((reason) => setError(errorMessage(reason)));
+  };
+  useEffect(() => {
+    refresh();
+  }, [selected.id, selected.workspace]);
+  const changes = (gitDiff?.changes as Record<string, unknown> | undefined)
+    ?.files;
+  return (
+    <section className="rail-section">
+      <div className="rail-section-head">
+        <strong>Changes</strong>
+        <button
+          className="rail-mini-btn"
+          onClick={refresh}
+          title="Refresh changes"
+        >
+          <RailIcon name="refresh" size={16} />
+        </button>
+      </div>
+      <div className="rail-section-body">
+        {error && <div className="rail-error">{error}</div>}
+        {items.length === 0 ? (
+          <div className="rail-muted">No file edits recorded yet.</div>
+        ) : (
+          <div className="rail-event-list">
+            {items.map((item) => (
+              <div className="rail-event-card" key={item.path}>
+                <button
+                  className="rail-event-head"
+                  onClick={() => setOpen(open === item.path ? null : item.path)}
+                >
+                  <code>{item.path}</code>
+                  <span className="rail-muted">{item.edit_count} edits</span>
+                </button>
+                {open === item.path &&
+                  item.edits.map((edit, index) => (
+                    <pre className="rail-event-output" key={index}>
+                      {JSON.stringify(edit, null, 2)}
+                    </pre>
+                  ))}
+              </div>
+            ))}
+          </div>
+        )}
+        {Array.isArray(changes) && changes.length > 0 && (
+          <details className="rail-git-diff">
+            <summary>Current git diff</summary>
+            <pre>{JSON.stringify(changes, null, 2)}</pre>
+          </details>
+        )}
+        {!gitDiff && selected.workspace && (
+          <div className="rail-muted">
+            Git diff unavailable for this host/workspace.
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+type ProgressEvent = {
+  sequence: number;
+  event_type?: string;
+  category?: string;
+  timestamp?: string;
+  payload?: Record<string, unknown>;
+};
+
+function ProgressPane({ selected }: { selected: Session }) {
+  const [events, setEvents] = useState<ProgressEvent[]>([]);
+  const [category, setCategory] = useState("");
+  const [error, setError] = useState("");
+  const refresh = () =>
+    void command<ProgressEvent[]>("session_progress", {
+      sessionId: selected.id,
+      category: category || null,
+    })
+      .then(setEvents)
+      .catch((reason) => setError(errorMessage(reason)));
+  useEffect(() => {
+    refresh();
+  }, [selected.id, category]);
+  const categories = [
+    ...new Set(events.map((event) => event.category).filter(Boolean)),
+  ];
+  return (
+    <section className="rail-section">
+      <div className="rail-section-head">
+        <strong>Progress</strong>
+        <select
+          value={category}
+          onChange={(event) => setCategory(event.target.value)}
+        >
+          <option value="">All</option>
+          {categories.map((item) => (
+            <option key={item} value={item}>
+              {item}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div className="rail-section-body">
+        {error ? (
+          <div className="rail-error">{error}</div>
+        ) : events.length === 0 ? (
+          <div className="rail-muted">No progress events recorded yet.</div>
+        ) : (
+          <div className="rail-event-list">
+            {events.map((event) => (
+              <div
+                className="rail-event-card"
+                key={`${event.sequence}-${event.event_type}`}
+              >
+                <div className="rail-event-head">
+                  <strong>{event.event_type || "working_event"}</strong>
+                  <span className="rail-muted">{event.category}</span>
+                </div>
+                <div className="rail-event-meta">
+                  {event.timestamp
+                    ? new Date(event.timestamp).toLocaleString()
+                    : ""}
+                </div>
+                <div className="rail-event-summary">
+                  {JSON.stringify(event.payload || {})}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function PlannedPane({ title, children }: { title: string; children: string }) {
+  return (
+    <section className="rail-section">
+      <div className="rail-section-head">
+        <strong>{title}</strong>
+      </div>
+      <div className="rail-section-body">
+        <div className="rail-muted">{children}</div>
+      </div>
+    </section>
+  );
+}
+
 function SessionRightPanel({
   selected,
   onError,
@@ -8788,6 +9046,10 @@ function SessionRightPanel({
     icon: RailIconName;
   }> = [
     { id: "info", label: "Info", icon: "info" },
+    { id: "shell", label: "Shell", icon: "terminal" },
+    { id: "changes", label: "Changes", icon: "diff" },
+    { id: "progress", label: "Progress", icon: "list" },
+    { id: "agents", label: "Agents", icon: "list" },
     { id: "artifacts", label: "Artifacts", icon: "file" },
     { id: "pr", label: "PR", icon: "branch" },
     { id: "insights", label: "Insights", icon: "sparkle" },
@@ -8808,15 +9070,22 @@ function SessionRightPanel({
     id: typeof panelTab;
     label: string;
     icon: RailIconName;
-  }> =
-    selected.host_id === "local"
+  }> = [
+    { id: "desktop", label: "Desktop", icon: "monitor" },
+    { id: "ide", label: "Editor", icon: "code" },
+    ...(selected.host_id === "local"
       ? []
       : [
-          { id: "terminal", label: "Shell", icon: "terminal" },
-          { id: "desktop", label: "Desktop", icon: "monitor" },
-          { id: "ide", label: "Web IDE", icon: "code" },
-          { id: "browser", label: "Browser", icon: "grid" },
-        ];
+          {
+            id: "terminal" as const,
+            label: "Terminal",
+            icon: "terminal" as const,
+          },
+        ]),
+    ...(selected.host_id === "local"
+      ? []
+      : [{ id: "browser" as const, label: "Browser", icon: "grid" as const }]),
+  ];
   const tabs = [...informationTabs, ...workspaceTabs, ...remoteTabs];
   const workspaceTabIds: PanelTab[] = [
     "review",
@@ -8974,11 +9243,56 @@ function SessionRightPanel({
                 <ArtifactsPane selected={selected} />
               </div>
             )}
+            {opened.includes("shell") && panelTab === "shell" && (
+              <div className="session-pane">
+                <ShellHistoryPane selected={selected} />
+              </div>
+            )}
+            {opened.includes("changes") && panelTab === "changes" && (
+              <div className="session-pane">
+                <ChangesPane selected={selected} />
+              </div>
+            )}
+            {opened.includes("progress") && panelTab === "progress" && (
+              <div className="session-pane">
+                <ProgressPane selected={selected} />
+              </div>
+            )}
+            {opened.includes("agents") && panelTab === "agents" && (
+              <div className="session-pane">
+                <PlannedPane title="Agents">
+                  Agents and child-session management are planned for the
+                  project_agents/sub-session integration.
+                </PlannedPane>
+              </div>
+            )}
+            {opened.includes("desktop") && panelTab === "desktop" && (
+              <div className="session-pane">
+                <PlannedPane title="Desktop">
+                  Desktop viewing and control is planned for the local VNC
+                  bridge and remote RVM /vnc-ws integration.
+                </PlannedPane>
+              </div>
+            )}
+            {opened.includes("ide") && panelTab === "ide" && (
+              <div className="session-pane">
+                <PlannedPane title="Editor">
+                  Full machine editor control is planned for the host editor
+                  integration.
+                </PlannedPane>
+              </div>
+            )}
             {tabs
               .filter(
                 (item) =>
                   item.id !== "info" &&
                   item.id !== "artifacts" &&
+                  item.id !== "shell" &&
+                  item.id !== "changes" &&
+                  item.id !== "progress" &&
+                  item.id !== "agents" &&
+                  item.id !== "desktop" &&
+                  item.id !== "ide" &&
                   opened.includes(item.id),
               )
               .map((item) => (
