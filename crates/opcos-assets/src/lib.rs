@@ -175,6 +175,7 @@ pub const BUILTIN_AGENT_TOOL_NAMES: &[&str] = &[
     "background_job_status",
     "background_job_output",
     "background_job_kill",
+    "secrets_list",
     "edit_file",
     "action_ledger_begin",
     "action_ledger_finish",
@@ -196,6 +197,10 @@ Before writing a test for a behavior, smoke-run the behavior once and base the a
 Use ask_user only for a genuine blocker such as missing credentials or a required human decision. Do not stop merely because work is lengthy or repetitive.
 
 Never print or commit secrets. Use the existing secret-reference mechanisms and keep credentials out of files, logs, transcripts, and tool results.
+
+Use secrets_list to discover configured credential names before attempting secret_names injection; it returns names and safe metadata, never values.
+
+Do not silently truncate structured output with head -c or head -n; page it or filter it with a structured tool such as jq, because partial JSON can create false premises.
 
 Be honest about evidence and outcomes. Never invent data or fake tests, mock over a real failure just to make it pass, or describe broken code as working; report blockers that cannot be resolved.
 
