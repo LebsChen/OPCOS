@@ -612,4 +612,41 @@ describe("OPCOS transcript folding", () => {
 
     expect(items.filter((item) => item.kind === "thinking")).toHaveLength(1);
   });
+
+  it("does not retain a resolved ask_user placeholder notice", () => {
+    const items = normalizeTranscript([
+      {
+        kind: "tool",
+        payload: {
+          role: "tool",
+          tool: "ask_user",
+          call_id: "ask-1",
+          result: { answer: "Use JSON" },
+        },
+      },
+      {
+        kind: "notice",
+        payload: {
+          kind: "question_pending",
+          text: "Question requires an answer before this tool can continue",
+        },
+      },
+    ]);
+
+    expect(items.some((item) => item.kind === "notice")).toBe(false);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ kind: "tool", toolName: "ask_user" });
+  });
+
+  it("skips question pending notices in the live timeline", () => {
+    const items = reduceStreamEvent([], {
+      kind: "notice",
+      payload: {
+        kind: "question_pending",
+        text: "Question requires an answer before this tool can continue",
+      },
+    });
+
+    expect(items).toHaveLength(0);
+  });
 });

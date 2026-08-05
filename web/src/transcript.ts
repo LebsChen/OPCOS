@@ -164,7 +164,12 @@ export function normalizeTranscript(raw: RawItem[]): TranscriptViewItem[] {
             ? payload.message
             : textFromContent(payload.content);
       if (
-        noticeText.includes("Approval required before this tool can continue")
+        noticeText.includes(
+          "Approval required before this tool can continue",
+        ) ||
+        noticeText.includes(
+          "Question requires an answer before this tool can continue",
+        )
       )
         return;
       output.push({
@@ -517,8 +522,12 @@ export function reduceStreamEvent(
             !(
               item.kind === "notice" &&
               (item.noticeKind === "approval_pending" ||
+                item.noticeKind === "question_pending" ||
                 item.text?.includes(
                   "Approval required before this tool can continue",
+                ) ||
+                item.text?.includes(
+                  "Question requires an answer before this tool can continue",
                 ))
             ),
         )
@@ -541,6 +550,13 @@ export function reduceStreamEvent(
         seen.add(callId);
         return true;
       });
+    }
+    if (
+      noticeKind === "question_pending" ||
+      payload.text ===
+        "Question requires an answer before this tool can continue"
+    ) {
+      return next;
     }
     next.push({
       id: `event:notice:${next.length}`,
