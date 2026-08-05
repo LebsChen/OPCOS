@@ -64,6 +64,10 @@ pub enum EngineError {
 pub trait ToolExecutor: Send + Sync {
     async fn execute(&self, name: &str, arguments: Value) -> Result<Value, String>;
 
+    async fn browser_origin(&self) -> Option<String> {
+        None
+    }
+
     async fn execute_streaming(
         &self,
         name: &str,
@@ -1872,12 +1876,20 @@ where
                 None
             };
             let mut target = mutating_api_target.as_deref().unwrap_or(&target);
+            let click_origin = if call.name == "browser_click" {
+                match call.arguments.get("origin").and_then(Value::as_str) {
+                    Some(origin) => Some(origin.to_owned()),
+                    None => self.executor.browser_origin().await,
+                }
+            } else {
+                None
+            };
             let browser_target =
                 if matches!(call.name.as_str(), "browser_navigate" | "browser_click") {
                     let origin = if call.name == "browser_navigate" {
                         call.arguments.get("url").and_then(Value::as_str)
                     } else {
-                        call.arguments.get("origin").and_then(Value::as_str)
+                        click_origin.as_deref()
                     };
                     origin
                         .and_then(browser_navigation_target)

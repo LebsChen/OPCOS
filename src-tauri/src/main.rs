@@ -3897,6 +3897,13 @@ impl ToolExecutor for RemoteExecutor {
 
 #[async_trait]
 impl ToolExecutor for DesktopExecutor {
+    async fn browser_origin(&self) -> Option<String> {
+        match self {
+            Self::Remote(_) => None,
+            Self::Local(executor) => executor.browser.current_origin().await,
+        }
+    }
+
     async fn run_hook_command(
         &self,
         command: &str,

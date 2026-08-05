@@ -18,6 +18,7 @@ struct BrowserSession {
     _profile: TempDir,
     ws_url: String,
     next_id: u64,
+    current_url: String,
 }
 
 pub struct LocalBrowser {
@@ -196,6 +197,7 @@ impl LocalBrowser {
             _profile: profile,
             ws_url: target_ws.to_owned(),
             next_id: 0,
+            current_url: "about:blank".into(),
         });
         let _ = ws_url;
         Ok(())
@@ -280,6 +282,9 @@ impl LocalBrowser {
                 Self::safe_url(url)?;
                 self.command("Page.navigate", json!({"url": url})).await?;
                 sleep(Duration::from_millis(250)).await;
+                if let Some(session) = self.session.lock().await.as_mut() {
+                    session.current_url = url.to_owned();
+                }
                 Ok(json!({"url": url}))
             }
             "set_viewport" => {
@@ -405,6 +410,15 @@ impl Drop for LocalBrowser {
 impl BrowserController for LocalBrowser {
     async fn execute(&self, request: BrowserRequest) -> Result<Value, HostError> {
         self.operation(request).await
+    }
+
+    async fn current_origin(&self) -> Option<String> {
+        let guard = self.session.lock().await;
+        let url = Url::parse(&guard.as_ref()?.current_url).ok()?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return None;
+        }
+        Some(url.origin().ascii_serialization())
     }
 }
 

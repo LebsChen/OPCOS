@@ -2065,6 +2065,10 @@ pub struct BrowserRequest {
 #[async_trait]
 pub trait BrowserController: Send + Sync {
     async fn execute(&self, request: BrowserRequest) -> Result<Value, HostError>;
+
+    async fn current_origin(&self) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
