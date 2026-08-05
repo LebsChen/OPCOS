@@ -112,6 +112,9 @@ pub struct Caps {
     pub parallel_tool_calls: bool,
     pub streaming: bool,
     pub context_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub context_window_source: Option<String>,
+    pub max_output_tokens_source: Option<String>,
 }
 
 #[derive(Clone)]
@@ -187,7 +190,7 @@ pub enum ProviderError {
     #[error("provider response was invalid: {0}")]
     Protocol(String),
     #[error("provider context window exceeded")]
-    ContextOverflow,
+    ContextOverflow { limit: Option<u64> },
     #[error("provider capability is unavailable: {0}")]
     Unsupported(String),
 }
@@ -253,10 +256,32 @@ pub(crate) fn classify_context_error(status: StatusCode, message: &str) -> Optio
                 .iter()
                 .any(|marker| lower.contains(marker)))
     {
-        Some(ProviderError::ContextOverflow)
+        Some(ProviderError::ContextOverflow {
+            limit: extract_context_limit(message),
+        })
     } else {
         None
     }
+}
+
+fn extract_context_limit(message: &str) -> Option<u64> {
+    let lower = message.to_ascii_lowercase();
+    [
+        "maximum context length is",
+        "max_model_len",
+        "max context length",
+        "context_length",
+    ]
+    .iter()
+    .find_map(|marker| {
+        let start = lower.find(marker)? + marker.len();
+        let digits = lower[start..]
+            .chars()
+            .skip_while(|ch| !ch.is_ascii_digit())
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>();
+        digits.parse().ok()
+    })
 }
 
 pub(crate) fn client(config: &ProviderConfig) -> Result<Client, ProviderError> {

@@ -9495,6 +9495,31 @@ async fn engine_for_with_context(
         permission_mode,
         model.clone(),
     );
+    let mut resolved_caps = provider_models_for_state(state, provider_id.clone(), Some(false))
+        .await
+        .ok()
+        .and_then(|discovery| {
+            discovery
+                .models
+                .into_iter()
+                .find(|entry| entry.id.eq_ignore_ascii_case(&model))
+                .map(|entry| entry.capabilities)
+        })
+        .or_else(|| opcos_provider::matrix::capabilities_for_model(&provider_id, &model))
+        .unwrap_or_default();
+    if resolved_caps.context_window.is_none()
+        && let Some(value) = settings.get("context_window").and_then(Value::as_u64)
+    {
+        resolved_caps.context_window = Some(value);
+        resolved_caps.context_window_source = Some("user".into());
+    }
+    if resolved_caps.max_output_tokens.is_none()
+        && let Some(value) = settings.get("max_output_tokens").and_then(Value::as_u64)
+    {
+        resolved_caps.max_output_tokens = Some(value);
+        resolved_caps.max_output_tokens_source = Some("user".into());
+    }
+    engine.set_resolved_capabilities(resolved_caps).await;
     engine.set_secret_scrubber(Arc::new(KnownSecretScrubber {
         values: Arc::clone(&state.secret_values),
     }));
@@ -12912,7 +12937,40 @@ async fn provider_models_for_state(
         .await
     };
     let (models, source, fallback_reason) = match discovered {
-        Ok(models) => (models, "live".to_owned(), None),
+        Ok(mut models) => {
+            if descriptor.openai_compatible {
+                let client = reqwest::Client::new();
+                for model in models.iter_mut().take(16) {
+                    if model.capabilities.context_window.is_some()
+                        && model.capabilities.max_output_tokens.is_some()
+                    {
+                        continue;
+                    }
+                    let Ok((limits, _raw)) = opcos_provider::registry::probe_model_limits(
+                        &client,
+                        &base_url,
+                        key.as_deref().unwrap_or_default(),
+                        &model.id,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    if let Some(value) = limits.context_window {
+                        model.capabilities.context_window = Some(value);
+                        model.capabilities.context_window_source = Some("probe".into());
+                    }
+                    if let Some(value) = limits.max_output_tokens {
+                        model.capabilities.max_output_tokens = Some(value);
+                        model.capabilities.max_output_tokens_source = Some("probe".into());
+                    }
+                    if limits.context_window.is_some() || limits.max_output_tokens.is_some() {
+                        model.capabilities_known = true;
+                    }
+                }
+            }
+            (models, "live".to_owned(), None)
+        }
         Err(error) => (
             registry::descriptors()
                 .into_iter()

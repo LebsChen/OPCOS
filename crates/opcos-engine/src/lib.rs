@@ -38,6 +38,9 @@ pub mod planner;
 pub use acp::{AcpHarness, AcpHarnessConfig};
 pub use opencode::{OpenCodeHarness, OpenCodeHarnessConfig};
 
+const ASSUMED_CONTEXT_WINDOW: u64 = 128_000;
+const ASSUMED_OUTPUT_TOKENS: u64 = 4096;
+
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error("provider: {0}")]
@@ -444,6 +447,7 @@ pub struct TurnEngine<P, S, E> {
     workspace: String,
     mode: Mutex<PermissionMode>,
     model: Mutex<String>,
+    resolved_caps: Mutex<Option<Caps>>,
     interrupted: AtomicBool,
     steering: Mutex<Vec<String>>,
     steering_waiters: SteeringWaiters,
@@ -588,6 +592,7 @@ where
             workspace: workspace.into(),
             mode: Mutex::new(mode),
             model: Mutex::new(model.into()),
+            resolved_caps: Mutex::new(None),
             interrupted: AtomicBool::new(false),
             steering: Mutex::new(Vec::new()),
             steering_waiters: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1344,7 +1349,15 @@ where
         )
     }
     pub fn capabilities(&self, model: &str) -> Caps {
-        self.provider.capabilities(model)
+        self.resolved_caps
+            .try_lock()
+            .ok()
+            .and_then(|caps| caps.clone())
+            .unwrap_or_else(|| self.provider.capabilities(model))
+    }
+
+    pub async fn set_resolved_capabilities(&self, caps: Caps) {
+        *self.resolved_caps.lock().await = Some(caps);
     }
     pub fn workspace(&self) -> &str {
         &self.workspace
@@ -1376,6 +1389,7 @@ where
 
     async fn run_loop(&self, mut messages: Vec<Value>) -> Result<AssistantTurn, EngineError> {
         let mut usage: Option<TokenUsage> = None;
+        let mut context_overflow_retries = 0;
         let mut stop_vetoes = 0;
         let max_iterations = self.max_iterations.load(Ordering::SeqCst);
         for iteration in 0..max_iterations {
@@ -1401,7 +1415,11 @@ where
                 .working_event(
                     "context_growth_update",
                     "other",
-                    json!({"estimated_context_tokens":context_tokens}),
+                    json!({
+                        "estimated_context_tokens":context_tokens,
+                        "resolved_context_window": self.resolved_caps_for_model().0,
+                        "context_window_source": self.resolved_caps_for_model().1,
+                    }),
                 )
                 .await;
             if self.interrupted.load(Ordering::SeqCst) {
@@ -1639,7 +1657,17 @@ where
                     }
                     self.notice("error", "Provider request failed".into())
                         .await?;
-                    if matches!(error, ProviderError::ContextOverflow) {
+                    if matches!(error, ProviderError::ContextOverflow { .. })
+                        && context_overflow_retries == 0
+                    {
+                        if let ProviderError::ContextOverflow { limit: Some(limit) } = &error {
+                            let mut caps =
+                                self.resolved_caps.lock().await.clone().unwrap_or_default();
+                            caps.context_window = Some(*limit);
+                            caps.context_window_source = Some("learned".into());
+                            *self.resolved_caps.lock().await = Some(caps);
+                        }
+                        context_overflow_retries += 1;
                         messages = self
                             .compact_context(messages)
                             .await
@@ -1660,18 +1688,40 @@ where
     }
 
     fn should_compact(&self, messages: &[Value], usage: Option<&TokenUsage>) -> bool {
-        let model = self.model.try_lock().ok();
-        let caps = model
-            .as_deref()
-            .map(|model| self.provider.capabilities(model))
-            .unwrap_or_default();
-        let budget = caps.context_window.unwrap_or(32_000).saturating_mul(3) / 4;
+        let budget = self.resolved_caps_for_model().0.saturating_mul(3) / 4;
         let estimated = usage.map(TokenUsage::context_tokens).unwrap_or_else(|| {
             serde_json::to_string(messages)
                 .map(|value| value.len() as u64 / 4)
                 .unwrap_or(u64::MAX)
         });
         estimated >= budget
+    }
+
+    fn resolved_caps_for_model(&self) -> (u64, &'static str, u64) {
+        let model = self.model.try_lock().ok();
+        let caps = self
+            .resolved_caps
+            .try_lock()
+            .ok()
+            .and_then(|caps| caps.clone())
+            .or_else(|| {
+                model
+                    .as_deref()
+                    .map(|model| self.provider.capabilities(model))
+            })
+            .unwrap_or_default();
+        (
+            caps.context_window.unwrap_or(ASSUMED_CONTEXT_WINDOW),
+            match caps.context_window_source.as_deref() {
+                Some("gateway") => "gateway",
+                Some("matrix") => "matrix",
+                Some("probe") => "probe",
+                Some("learned") => "learned",
+                Some("user") => "user",
+                _ => "assumed",
+            },
+            caps.max_output_tokens.unwrap_or(ASSUMED_OUTPUT_TOKENS),
+        )
     }
 
     async fn stream_turn(
@@ -2562,7 +2612,10 @@ where
                     json!({"role":"user","content":context}),
                 ],
                 tools: Vec::new(),
-                settings: json!({"max_tokens":8192,"temperature":0.2}),
+                settings: json!({
+                    "max_tokens": self.resolved_caps_for_model().2,
+                    "temperature": 0.2
+                }),
             })
             .await
             .map_err(|_| CompactionSummaryRejection::without_text("provider_request_failed"))?;
@@ -5640,10 +5693,50 @@ mod tests {
         assert!(engine.should_compact(
             &small,
             Some(&TokenUsage {
-                input: 30_000,
+                input: 96_000,
                 output: 0,
                 cache_read: 0,
                 cache_write: 0
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn compaction_uses_resolved_million_token_window() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "glm-5.2",
+        );
+        engine
+            .set_resolved_capabilities(Caps {
+                context_window: Some(1_000_000),
+                context_window_source: Some("matrix".into()),
+                ..Default::default()
+            })
+            .await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        assert!(!engine.should_compact(
+            &messages,
+            Some(&TokenUsage {
+                input: 24_000,
+                output: 0,
+                cache_read: 0,
+                cache_write: 0,
+            })
+        ));
+        assert!(engine.should_compact(
+            &messages,
+            Some(&TokenUsage {
+                input: 750_000,
+                output: 0,
+                cache_read: 0,
+                cache_write: 0,
             })
         ));
     }
@@ -6555,7 +6648,9 @@ mod tests {
             _: mpsc::Sender<StreamChunk>,
         ) -> Result<AssistantTurn, ProviderError> {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                Err(ProviderError::ContextOverflow)
+                Err(ProviderError::ContextOverflow {
+                    limit: Some(131_072),
+                })
             } else {
                 Ok(AssistantTurn {
                     text: Some("retried".into()),
@@ -6600,6 +6695,17 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(store.load_compaction("s").unwrap().is_some());
+        assert!(
+            store
+                .load_session_events("s")
+                .unwrap()
+                .into_iter()
+                .any(|event| {
+                    event.event["type"] == "context_growth_update"
+                        && event.event["working_event"]["payload"]["context_window_source"]
+                            == "learned"
+                })
+        );
     }
 
     struct InterruptProvider {

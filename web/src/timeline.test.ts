@@ -92,4 +92,20 @@ describe("single event-log timeline", () => {
       "Earlier context compacted",
     ]);
   });
+  it("skips legacy bare working-event rows without a resolvable type", () => {
+    expect(
+      buildTimeline([
+        {
+          event_type: "shell_process_started",
+          category: "tool",
+          direction: "outgoing",
+          timestamp: "2026-01-01T00:00:01Z",
+          payload: { command: "legacy command" },
+        } as unknown as TimelineEvent,
+        ...opcos,
+      ]),
+    ).not.toContainEqual(
+      expect.objectContaining({ kind: "work", label: "Worked for 0s" }),
+    );
+  });
 });

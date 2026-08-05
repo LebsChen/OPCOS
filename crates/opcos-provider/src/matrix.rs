@@ -15,6 +15,9 @@ const DEFAULT_CAPS: Caps = Caps {
     parallel_tool_calls: true,
     streaming: true,
     context_window: None,
+    max_output_tokens: None,
+    context_window_source: None,
+    max_output_tokens_source: None,
 };
 
 pub const MATRIX: &[ModelEntry] = &[
@@ -183,7 +186,7 @@ pub const MATRIX: &[ModelEntry] = &[
         provider: "zai",
         label: "GLM-5.2 · Z AI",
         capabilities: Caps {
-            context_window: Some(128_000),
+            context_window: Some(1_000_000),
             ..DEFAULT_CAPS
         },
     },
@@ -258,7 +261,7 @@ pub const MATRIX: &[ModelEntry] = &[
         provider: "together",
         label: "GLM-5.2 · via Together",
         capabilities: Caps {
-            context_window: Some(128_000),
+            context_window: Some(1_000_000),
             ..DEFAULT_CAPS
         },
     },
@@ -303,7 +306,7 @@ pub const MATRIX: &[ModelEntry] = &[
         provider: "fireworks",
         label: "GLM-5.2 · via Fireworks",
         capabilities: Caps {
-            context_window: Some(128_000),
+            context_window: Some(1_000_000),
             ..DEFAULT_CAPS
         },
     },
@@ -339,7 +342,7 @@ pub const MATRIX: &[ModelEntry] = &[
         provider: "openrouter",
         label: "GLM-5.2 · via OpenRouter",
         capabilities: Caps {
-            context_window: Some(128_000),
+            context_window: Some(1_000_000),
             ..DEFAULT_CAPS
         },
     },
@@ -502,6 +505,34 @@ pub fn entry_for(model: &str) -> Option<&'static ModelEntry> {
     MATRIX.iter().find(|entry| entry.id == model)
 }
 
+pub fn capabilities_for_model(provider: &str, model: &str) -> Option<Caps> {
+    let model = model.trim();
+    let canonical = canonical_model_id(provider, model);
+    let suffix = |value: &str| {
+        value
+            .rsplit_once([':', '/'])
+            .map_or(value, |(_, suffix)| suffix)
+            .to_ascii_lowercase()
+    };
+    let exact = MATRIX
+        .iter()
+        .find(|entry| entry.id.eq_ignore_ascii_case(model))
+        .or_else(|| {
+            MATRIX.iter().find(|entry| {
+                entry.provider.eq_ignore_ascii_case(provider)
+                    && canonical_model_id(provider, entry.id).eq_ignore_ascii_case(&canonical)
+            })
+        })
+        .or_else(|| {
+            let wanted = suffix(&canonical);
+            MATRIX.iter().find(|entry| suffix(entry.id) == wanted)
+        })?;
+    let mut capabilities = exact.capabilities.clone();
+    capabilities.context_window_source = capabilities.context_window.map(|_| "matrix".into());
+    capabilities.max_output_tokens_source = capabilities.max_output_tokens.map(|_| "matrix".into());
+    Some(capabilities)
+}
+
 pub fn models_for_provider(provider: &str) -> Vec<&'static ModelEntry> {
     MATRIX
         .iter()
@@ -541,5 +572,13 @@ mod tests {
                 .streaming
         );
         assert!(models_for_provider("anthropic").len() >= 4);
+    }
+
+    #[test]
+    fn bare_glm_model_resolves_to_one_million_context_window() {
+        assert_eq!(
+            capabilities_for_model("openai", "glm-5.2").and_then(|caps| caps.context_window),
+            Some(1_000_000)
+        );
     }
 }

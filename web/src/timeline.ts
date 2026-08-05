@@ -108,6 +108,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
   };
   for (const event of events) {
     const type = eventType(event);
+    if (!type) continue;
     const data = payload(event);
     if (type === "user_message" || type === "initial_user_message") {
       flush(event.created_at_ms);
