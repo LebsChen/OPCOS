@@ -3788,6 +3788,45 @@ mod tests {
         fs::remove_dir_all(host_root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_job_recovery_reattaches_running_local_wrapper() {
+        let root = tempfile_dir();
+        let host_root = tempfile_dir();
+        let host = LocalHost::new(&host_root).unwrap();
+        let manager = BackgroundJobManager::new(root.join("background-jobs"));
+        let snapshot = manager
+            .start(
+                &host,
+                SpawnRequest {
+                    command: shell_sleep_command_for_test(10),
+                    cwd: None,
+                    env: None,
+                    cols: 120,
+                    rows: 40,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        drop(manager);
+        let recovered_manager = BackgroundJobManager::new(root.join("background-jobs"));
+        let recovered = recovered_manager.recover(&host).await.unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].job_id, snapshot.job_id);
+        assert_eq!(
+            recovered_manager
+                .status(&snapshot.job_id)
+                .await
+                .unwrap()
+                .status,
+            BackgroundJobStatus::Running
+        );
+        recovered_manager.kill(&snapshot.job_id).await.unwrap();
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(host_root).unwrap();
+    }
+
     #[tokio::test]
     async fn local_host_structured_stdio_separates_stdout_and_stderr() {
         let host = LocalHost::new(std::env::temp_dir()).unwrap();

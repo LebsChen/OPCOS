@@ -104,6 +104,25 @@ export function pendingQuestionFromPayload(
   };
 }
 
+export function reconcileRunningState(
+  current: boolean,
+  event: {
+    kind: string;
+    runState?: string;
+  },
+): boolean {
+  if (event.kind === "turn_done") return event.runState === "running";
+  if (event.kind === "question_requested") return false;
+  return current;
+}
+
+export function composerIsEnabled(
+  running: boolean,
+  hasPendingQuestion: boolean,
+): boolean {
+  return hasPendingQuestion || !running;
+}
+
 export function hostStatusLabel(host: Host): string {
   if (host.online === true) return "Online";
   if (host.online === false) return "Offline";

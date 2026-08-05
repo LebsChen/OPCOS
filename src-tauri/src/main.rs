@@ -12452,6 +12452,26 @@ fn list_inbox(state: State<'_, DesktopState>) -> Result<Vec<opcos_store::InboxRe
 }
 
 #[tauri::command]
+fn list_pending(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Vec<opcos_store::PendingRecord>, String> {
+    state
+        .store
+        .load_pending(&session_id)
+        .map(|items| {
+            items
+                .into_iter()
+                .map(|mut item| {
+                    item.arguments = redact_approval_value(&item.arguments);
+                    item
+                })
+                .collect()
+        })
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn get_unattended(state: State<'_, DesktopState>, session_id: String) -> Result<bool, String> {
     state
         .store
@@ -21337,6 +21357,8 @@ fn main() {
                 ci_repair::start(Arc::clone(&store), secrets.clone(), ci_monitor_receiver);
             let (runner_shutdown, runner_receiver) = tokio::sync::watch::channel(false);
             let runner_task = work_runner::start(app.handle().clone(), runner_receiver);
+            let recovery_jobs = Arc::clone(&jobs);
+            let recovery_secret_values = Arc::clone(&secret_values);
             app.manage(DesktopState {
                 database: Arc::clone(&database),
                 secrets,
@@ -21369,6 +21391,13 @@ fn main() {
                 ci_monitor_task: Mutex::new(Some(ci_monitor_task)),
                 runner_shutdown,
                 runner_task: Mutex::new(Some(runner_task)),
+            });
+            tauri::async_runtime::spawn(async move {
+                let Ok(local_host) = LocalHost::with_secret_snapshot("/", recovery_secret_values)
+                else {
+                    return;
+                };
+                let _ = recovery_jobs.recover(&local_host).await;
             });
             let handle = app.handle().clone();
             let trigger_handle = handle.clone();
@@ -21488,6 +21517,7 @@ fn main() {
             steering,
             resolve_approval,
             list_inbox,
+            list_pending,
             get_unattended,
             set_unattended,
             change_mode,
