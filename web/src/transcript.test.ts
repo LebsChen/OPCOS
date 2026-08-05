@@ -436,6 +436,41 @@ describe("OPCOS transcript folding", () => {
     expect(merged.filter((item) => item.kind === "user")).toHaveLength(1);
   });
 
+  it("renders assistant deltas, reasoning events, and the final turn live", () => {
+    let items = reduceStreamEvent([], {
+      kind: "message",
+      payload: { role: "assistant", text: "I'll add the new function..." },
+    });
+    items = reduceStreamEvent(items, {
+      kind: "thinking",
+      payload: { text: "Inspect shipping.py first." },
+    });
+    items = reduceStreamEvent(items, {
+      kind: "turn_done",
+      payload: {
+        turn: {
+          text: "All 14 tests pass.",
+          reasoning: null,
+          tool_calls: [],
+        },
+      },
+    });
+
+    expect(items).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "thinking",
+          text: "Inspect shipping.py first.",
+        }),
+        expect.objectContaining({
+          kind: "assistant",
+          text: "All 14 tests pass.",
+        }),
+      ]),
+    );
+    expect(items.some((item) => item.kind === "user")).toBe(false);
+  });
+
   it("resets live assistant deltas after a provider stream retry", () => {
     let items = reduceStreamEvent([], {
       kind: "stream",
@@ -503,6 +538,30 @@ describe("OPCOS transcript folding", () => {
       },
     });
     expect(items).toHaveLength(0);
+  });
+
+  it("removes empty live thought shells during final render normalization", () => {
+    const items = normalizeViewItems([
+      {
+        id: "empty-thinking",
+        kind: "thinking",
+        text: "",
+        reasoning: "",
+      },
+      {
+        id: "empty-reasoning",
+        kind: "assistant",
+        text: "",
+        reasoning: "   ",
+      },
+      {
+        id: "visible",
+        kind: "thinking",
+        text: "Visible thought",
+        reasoning: "Visible thought",
+      },
+    ]);
+    expect(items.map((item) => item.id)).toEqual(["visible"]);
   });
 
   it("merges adjacent persisted thought items in chronological order", () => {

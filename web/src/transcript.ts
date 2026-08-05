@@ -233,6 +233,12 @@ export function normalizeViewItems(
         : item.kind === "assistant" && !item.text?.trim()
           ? (item.reasoning || "").trim()
           : "";
+    if (
+      (item.kind === "thinking" ||
+        (item.kind === "assistant" && !item.text?.trim())) &&
+      !thought
+    )
+      continue;
     if (thought) {
       if (!thought || thoughtTexts.has(thought)) continue;
       thoughtTexts.add(thought);
@@ -587,6 +593,21 @@ export function reduceStreamEvent(
       typeof payload.text === "string"
         ? payload.text
         : textFromContent(payload.content);
+    if (payload.role === "assistant") {
+      if (!text) return next;
+      const existing = next.find((item) => item.id === "stream:assistant");
+      if (existing?.kind === "assistant") {
+        existing.text = `${existing.text || ""}${text}`;
+      } else {
+        next.push({
+          id: "stream:assistant",
+          kind: "assistant",
+          text,
+          reasoning: "",
+        });
+      }
+      return next;
+    }
     if (next.some((item) => item.kind === "user" && item.text === text)) {
       return next;
     }
@@ -595,6 +616,28 @@ export function reduceStreamEvent(
       kind: "user",
       text,
     });
+    return next;
+  }
+  if (event.kind === "thinking") {
+    const text =
+      typeof payload.text === "string"
+        ? payload.text
+        : typeof payload.reasoning === "string"
+          ? payload.reasoning
+          : "";
+    if (!text) return next;
+    const existing = next.find((item) => item.id === "stream:thinking");
+    if (existing?.kind === "thinking") {
+      existing.reasoning = `${existing.reasoning || ""}${text}`;
+      existing.text = existing.reasoning;
+    } else {
+      next.push({
+        id: "stream:thinking",
+        kind: "thinking",
+        text,
+        reasoning: text,
+      });
+    }
     return next;
   }
   if (event.kind === "steering") {
@@ -611,11 +654,18 @@ export function reduceStreamEvent(
     return next;
   }
   if (event.kind === "turn_done") {
-    return next.map((item) =>
+    const finalized = next.map((item) =>
       item.kind === "tool" && item.status === "running" && !item.approval
-        ? { ...item, status: "ok" }
+        ? { ...item, status: "ok" as const }
         : item,
     );
+    if (payload.turn && typeof payload.turn === "object") {
+      return reduceStreamEvent(finalized, {
+        kind: "stream",
+        payload: { turn: payload.turn },
+      });
+    }
+    return finalized;
   }
   if (event.kind === "stream") {
     const working = payloadObject(payload.working_event);
@@ -795,7 +845,11 @@ export function reduceStreamEvent(
     typeof payload.reasoning_delta === "string" ? payload.reasoning_delta : "";
   if (payload.stream_reset === true) {
     for (let index = next.length - 1; index >= 0; index -= 1) {
-      if (next[index]?.id === "stream:assistant") next.splice(index, 1);
+      if (
+        next[index]?.id === "stream:assistant" ||
+        next[index]?.id === "stream:thinking"
+      )
+        next.splice(index, 1);
     }
   }
   let live = next.find((item) => item.id === "stream:assistant");
