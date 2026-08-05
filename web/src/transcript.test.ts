@@ -489,4 +489,54 @@ describe("OPCOS transcript folding", () => {
     });
     expect(items).toHaveLength(0);
   });
+
+  it("merges adjacent persisted thought items in chronological order", () => {
+    const items = normalizeTranscript([
+      {
+        kind: "assistant",
+        payload: { role: "assistant", reasoning: "Inspect the input." },
+      },
+      {
+        kind: "assistant",
+        payload: { role: "assistant", reasoning: "Trace the shared helper." },
+      },
+      {
+        kind: "assistant",
+        payload: { role: "assistant", content: "The fix is complete." },
+      },
+    ]);
+
+    const thoughts = items.filter((item) => item.kind === "thinking");
+    expect(thoughts).toHaveLength(1);
+    expect(thoughts[0]).toMatchObject({
+      reasoning: "Inspect the input.\n\n---\n\nTrace the shared helper.",
+    });
+  });
+
+  it("merges adjacent live thought events into one block", () => {
+    let items = reduceStreamEvent([], {
+      kind: "stream",
+      payload: {
+        working_event: {
+          event_type: "devin_thoughts",
+          payload: { message: "First thought" },
+        },
+      },
+    });
+    items = reduceStreamEvent(items, {
+      kind: "stream",
+      payload: {
+        working_event: {
+          event_type: "devin_thoughts",
+          payload: { message: "Second thought" },
+        },
+      },
+    });
+
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      kind: "thinking",
+      text: "First thought\n\n---\n\nSecond thought",
+    });
+  });
 });

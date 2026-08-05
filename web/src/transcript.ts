@@ -225,8 +225,8 @@ export function normalizeTranscript(raw: RawItem[]): TranscriptViewItem[] {
           ? payload.content
           : textFromContent(payload.content);
       if (
-        assistantText.trim().toLowerCase() !== "pending" ||
-        calls.length > 0
+        assistantText.trim() &&
+        (assistantText.trim().toLowerCase() !== "pending" || calls.length > 0)
       ) {
         output.push({
           id: stableId("assistant", index),
@@ -322,7 +322,21 @@ export function normalizeTranscript(raw: RawItem[]): TranscriptViewItem[] {
           : item.status || existing.status;
     existing.approval = item.approval || existing.approval;
   }
-  return deduped;
+  const merged: TranscriptViewItem[] = [];
+  for (const item of deduped) {
+    const previous = merged[merged.length - 1];
+    if (
+      item.kind === "thinking" &&
+      previous?.kind === "thinking" &&
+      item.reasoning
+    ) {
+      previous.reasoning = `${previous.reasoning || ""}\n\n---\n\n${item.reasoning}`;
+      previous.text = previous.reasoning;
+    } else {
+      merged.push(item);
+    }
+  }
+  return merged;
 }
 
 export function reduceStreamEvent(
@@ -394,12 +408,18 @@ export function reduceStreamEvent(
         const thought =
           typeof details.message === "string" ? details.message : "";
         if (thought.trim()) {
-          next.push({
-            id: `event:thought:${next.length}`,
-            kind: "thinking",
-            text: thought,
-            reasoning: thought,
-          });
+          const previous = next[next.length - 1];
+          if (previous?.kind === "thinking") {
+            previous.reasoning = `${previous.reasoning || ""}\n\n---\n\n${thought}`;
+            previous.text = previous.reasoning;
+          } else {
+            next.push({
+              id: `event:thought:${next.length}`,
+              kind: "thinking",
+              text: thought,
+              reasoning: thought,
+            });
+          }
         }
       } else if (eventType === "simple_activity_update") {
         replaceActivity(
