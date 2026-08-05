@@ -2707,11 +2707,17 @@ where
     }
 
     fn persist_event_value(&self, event: Value) -> Result<(), EngineError> {
-        self.store
-            .append_session_event(&self.session_id, &event)
+        let chunk: StreamChunk = serde_json::from_value(event.clone())
             .map_err(|error| EngineError::Store(error.to_string()))?;
-        let chunk =
-            serde_json::from_value(event).map_err(|error| EngineError::Store(error.to_string()))?;
+        let transient = matches!(
+            chunk.event_type.as_deref(),
+            Some("assistant_delta" | "reasoning_delta" | "tool_call_delta")
+        );
+        if !transient {
+            self.store
+                .append_session_event(&self.session_id, &event)
+                .map_err(|error| EngineError::Store(error.to_string()))?;
+        }
         let _ = self.events.try_send(chunk);
         Ok(())
     }

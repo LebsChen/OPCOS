@@ -23,6 +23,24 @@ describe("single event-log timeline", () => {
     for (const event of live) events = mergeEvents(events, event);
     expect(buildTimeline(events)).toEqual(buildTimeline(live));
   });
+  it("produces the same timeline when token deltas are omitted from persistence", () => {
+    const persistedWithoutDeltas = live.filter(
+      (event) =>
+        !["assistant_delta", "reasoning_delta", "tool_call_delta"].includes(
+          event.type ?? "",
+        ),
+    );
+    expect(buildTimeline(mergeEvents([], live))).toEqual(
+      buildTimeline(persistedWithoutDeltas),
+    );
+    expect(
+      mergeEvents([], live).some((event) =>
+        ["assistant_delta", "reasoning_delta", "tool_call_delta"].includes(
+          event.type ?? "",
+        ),
+      ),
+    ).toBe(false);
+  });
   it("uses Devin wording for fixture-derived rows", () => {
     const nodes = buildTimeline(live);
     const work = nodes.filter((node) => node.kind === "work");

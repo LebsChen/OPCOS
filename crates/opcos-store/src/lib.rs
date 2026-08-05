@@ -2123,7 +2123,11 @@ impl SqliteStore {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = connection.prepare(
             "SELECT session_id,event_id,event_json,created_at_ms,sequence
-             FROM session_events WHERE session_id=?1 ORDER BY created_at_ms,sequence",
+             FROM session_events
+             WHERE session_id=?1
+               AND COALESCE(json_extract(event_json, '$.type'), '') NOT IN
+                   ('assistant_delta', 'reasoning_delta', 'tool_call_delta')
+             ORDER BY created_at_ms,sequence",
         )?;
         statement
             .query_map([session_id], |row| {
@@ -6617,6 +6621,31 @@ mod tests {
         assert!(path.exists());
         drop(store);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn loading_session_events_excludes_persisted_token_deltas() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        for (event_id, event_type) in [
+            ("assistant", "assistant_delta"),
+            ("reasoning", "reasoning_delta"),
+            ("tool", "tool_call_delta"),
+            ("message", "devin_message"),
+        ] {
+            store
+                .append_session_event(
+                    "session",
+                    &serde_json::json!({
+                        "event_id": event_id,
+                        "created_at_ms": 1,
+                        "type": event_type,
+                    }),
+                )
+                .unwrap();
+        }
+        let events = store.load_session_events("session").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event["type"], "devin_message");
     }
 
     #[test]

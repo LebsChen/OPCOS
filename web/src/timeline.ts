@@ -68,6 +68,12 @@ export function mergeEvents(
   ];
   const seen = new Set<string>();
   const unique = all.filter((event) => {
+    if (
+      ["assistant_delta", "reasoning_delta", "tool_call_delta"].includes(
+        eventType(event),
+      )
+    )
+      return false;
     if (seen.has(event.event_id)) return false;
     seen.add(event.event_id);
     return true;
