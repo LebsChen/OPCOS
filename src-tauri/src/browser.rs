@@ -303,14 +303,30 @@ impl LocalBrowser {
                 Ok(json!({"width": width, "height": height}))
             }
             "click" => {
-                let selector = request
-                    .arguments
-                    .get("selector")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| HostError::InvalidResponse("missing selector".into()))?;
+                let selector = request.arguments.get("selector").and_then(Value::as_str);
+                let role = request.arguments.get("role").and_then(Value::as_str);
+                let text = request.arguments.get("text").and_then(Value::as_str);
+                if selector.is_none() && role.is_none() && text.is_none() {
+                    return Err(HostError::InvalidResponse(
+                        "click requires selector, role, or text".into(),
+                    ));
+                }
                 let expression = format!(
-                    "(() => {{ const n=document.querySelector({}); if(!n) return false; n.click(); return true; }})()",
-                    serde_json::to_string(selector).unwrap_or_default()
+                    "(() => {{ const nodes=[...document.querySelectorAll('*')]; const n={}; if(!n) return false; n.click(); return true; }})()",
+                    selector
+                        .map(|value| format!(
+                            "document.querySelector({})",
+                            serde_json::to_string(value).unwrap_or_default()
+                        ))
+                        .or_else(|| role.map(|value| format!(
+                            "nodes.find(n=>n.getAttribute('role')==={})",
+                            serde_json::to_string(value).unwrap_or_default()
+                        )))
+                        .or_else(|| text.map(|value| format!(
+                            "nodes.find(n=>n.innerText?.trim()==={})",
+                            serde_json::to_string(value).unwrap_or_default()
+                        )))
+                        .unwrap_or_else(|| "null".into())
                 );
                 Ok(json!({"clicked": self.evaluate(&expression).await?}))
             }
