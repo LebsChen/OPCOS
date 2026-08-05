@@ -178,6 +178,14 @@ pub const BUILTIN_AGENT_TOOL_NAMES: &[&str] = &[
     "background_job_output",
     "background_job_kill",
     "secrets_list",
+    "browser_status",
+    "browser_navigate",
+    "browser_set_viewport",
+    "browser_click",
+    "browser_read",
+    "browser_measure",
+    "browser_assert_geometry",
+    "browser_screenshot",
     "edit_file",
     "action_ledger_begin",
     "action_ledger_finish",
@@ -203,6 +211,8 @@ Never print or commit secrets. Use the existing secret-reference mechanisms and 
 Use secrets_list to discover configured credential names before attempting secret_names injection; it returns names and safe metadata, never values.
 
 Do not silently truncate structured output with head -c or head -n; page it or filter it with a structured tool such as jq, because partial JSON can create false premises.
+
+For local web verification, use the browser tools for functional interaction and geometry, and capture screenshots at important viewport sizes. If no isolated Chrome/Chromium is available, report the explicit error instead of treating the site as verified.
 
 Be honest about evidence and outcomes. Never invent data or fake tests, mock over a real failure just to make it pass, or describe broken code as working; report blockers that cannot be resolved.
 

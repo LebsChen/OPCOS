@@ -25,6 +25,7 @@ tokio-tungstenite.workspace = true
 notify.workspace = true
 getrandom.workspace = true
 subtle.workspace = true
+tempfile.workspace = true
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 opcos-engine = { path = "../crates/opcos-engine" }

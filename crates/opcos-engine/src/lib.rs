@@ -2806,6 +2806,12 @@ fn tool_risk(name: &str) -> ToolRisk {
         "github_get_pull_request" | "github_ci_status" | "github_ci_failure_log" => ToolRisk::Read,
         "run_shell" => ToolRisk::Execute,
         "secrets_list" => ToolRisk::Read,
+        "browser_status"
+        | "browser_read"
+        | "browser_measure"
+        | "browser_assert_geometry"
+        | "browser_screenshot" => ToolRisk::Read,
+        "browser_navigate" | "browser_set_viewport" | "browser_click" => ToolRisk::External,
         "background_job_start" | "background_job_kill" => ToolRisk::Execute,
         "background_job_status" | "background_job_output" => ToolRisk::Read,
         _ => ToolRisk::External,
@@ -3300,6 +3306,14 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"write_file","description":"Write a remote file. For changes to an existing file, prefer edit_file so unrelated content is preserved.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
         json!({"type":"function","function":{"name":"edit_file","description":"Apply one or more exact replacements to a remote UTF-8 text file. The required edits argument is an array of objects, each with old_string and new_string strings. Example: {\"path\":\"src/lib.rs\",\"edits\":[{\"old_string\":\"old code\",\"new_string\":\"new code\"}]}. Every old_string must match exactly once in the original file; ambiguous or missing matches fail with diagnostics. The whole call is atomic and preserves line endings. Prefer this over rewriting an existing file.","parameters":{"type":"object","examples":[{"path":"src/lib.rs","edits":[{"old_string":"old code","new_string":"new code"}]}],"properties":{"path":{"type":"string","description":"Remote workspace-relative file path."},"edits":{"type":"array","description":"One or more exact replacements, applied atomically.","minItems":1,"items":{"type":"object","properties":{"old_string":{"type":"string","description":"Exact existing text to replace, including whitespace and line breaks."},"new_string":{"type":"string","description":"Replacement text."}},"required":["old_string","new_string"],"additionalProperties":false}}},"required":["path","edits"],"additionalProperties":false}}}),
         json!({"type":"function","function":{"name":"run_shell","description":"Run a shell command. Use cwd to select the workspace directory. Credentials are available only by naming configured secret_names; injected values are redacted from output.","parameters":{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"},"secret_names":{"type":"array","items":{"type":"string"},"description":"Configured secret names to inject into the child environment. This is the only supported credential path; values are redacted from output."}},"required":["command"]}}}),
+        json!({"type":"function","function":{"name":"browser_status","description":"Check whether an isolated local Chrome/Chromium CDP session is available. Read-only.","parameters":{"type":"object","properties":{}}}}),
+        json!({"type":"function","function":{"name":"browser_navigate","description":"Navigate the isolated local browser to an HTTP(S) URL. Requires external-action approval.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}}),
+        json!({"type":"function","function":{"name":"browser_set_viewport","description":"Set the isolated browser viewport size for responsive verification. Requires external-action approval.","parameters":{"type":"object","properties":{"width":{"type":"integer"},"height":{"type":"integer"}},"required":["width","height"]}}}),
+        json!({"type":"function","function":{"name":"browser_click","description":"Click a CSS selector in the isolated local browser. Requires external-action approval.","parameters":{"type":"object","properties":{"selector":{"type":"string"}},"required":["selector"]}}}),
+        json!({"type":"function","function":{"name":"browser_read","description":"Read text and HTML from a CSS selector in the isolated local browser. Read-only.","parameters":{"type":"object","properties":{"selector":{"type":"string"}}}}}),
+        json!({"type":"function","function":{"name":"browser_measure","description":"Return an element's bounding box and selected computed layout values. Read-only.","parameters":{"type":"object","properties":{"selector":{"type":"string"}},"required":["selector"]}}}),
+        json!({"type":"function","function":{"name":"browser_assert_geometry","description":"Check element geometry, including container overflow and overlap between two elements. Read-only.","parameters":{"type":"object","properties":{"first":{"type":"string"},"second":{"type":"string"},"container":{"type":"string"}},"required":["first"]}}}),
+        json!({"type":"function","function":{"name":"browser_screenshot","description":"Capture a PNG screenshot from the isolated local browser. Read-only.","parameters":{"type":"object","properties":{}}}}),
         json!({"type":"function","function":{"name":"secrets_list","description":"List configured credential names available to the current session. Returns names and non-sensitive metadata only; secret values, prefixes, suffixes, and lengths are never returned. Use a returned name with secret_names for credential injection.","parameters":{"type":"object","properties":{}}}}),
         json!({"type":"function","function":{"name":"background_job_start","description":"Start a long-running shell command in the background and return a job id. Output is retained with bounded storage. Use secret_names for the only supported credential injection path; injected values are redacted.","parameters":{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"},"timeout_seconds":{"type":"integer"},"secret_names":{"type":"array","items":{"type":"string"},"description":"Configured secret names to inject into the child environment."}},"required":["command"]}}}),
         json!({"type":"function","function":{"name":"background_job_status","description":"Read a background job status, exit code, and output counters.","parameters":{"type":"object","properties":{"job_id":{"type":"string"}},"required":["job_id"]}}}),
@@ -3599,6 +3613,18 @@ mod tests {
         assert_eq!(tool_risk("linear_list_my_issues"), ToolRisk::Read);
         assert_eq!(tool_risk("linear_comment_issue"), ToolRisk::External);
         assert_eq!(tool_risk("linear_update_issue_status"), ToolRisk::External);
+    }
+
+    #[test]
+    fn browser_verification_tools_have_explicit_risk_boundaries() {
+        assert_eq!(tool_risk("browser_status"), ToolRisk::Read);
+        assert_eq!(tool_risk("browser_read"), ToolRisk::Read);
+        assert_eq!(tool_risk("browser_measure"), ToolRisk::Read);
+        assert_eq!(tool_risk("browser_assert_geometry"), ToolRisk::Read);
+        assert_eq!(tool_risk("browser_screenshot"), ToolRisk::Read);
+        assert_eq!(tool_risk("browser_navigate"), ToolRisk::External);
+        assert_eq!(tool_risk("browser_set_viewport"), ToolRisk::External);
+        assert_eq!(tool_risk("browser_click"), ToolRisk::External);
     }
 
     #[test]
