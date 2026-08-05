@@ -9770,6 +9770,7 @@ async fn engine_for_with_context(
             opcos_policy::PermissionRules {
                 allow: rules.allow.clone(),
                 deny: rules.deny.clone(),
+                mutating_api_gate: rules.mutating_api_gate,
             }
         }))
         .await;
@@ -9794,6 +9795,10 @@ async fn engine_for_with_context(
                     .flat_map(|rules| rules.allow.iter().cloned())
                     .collect(),
                 deny,
+                mutating_api_gate: project
+                    .into_iter()
+                    .chain(local)
+                    .find_map(|rules| rules.mutating_api_gate),
             })
         }
     };

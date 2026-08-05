@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use opcos_policy::{
     Decision, DurableGrant, PermissionMode, PermissionRules, ToolRisk, decide_with_rules,
+    mutating_http_target,
 };
 use opcos_provider::{
     AssistantTurn, Caps, Provider, ProviderError, ProviderRequest, StreamChunk, TokenUsage,
@@ -468,6 +469,7 @@ pub struct TurnEngine<P, S, E> {
     max_iterations: AtomicU64,
     active_tool_calls: StdMutex<HashSet<String>>,
     policy_denied: AtomicBool,
+    mutating_api_gate_enabled: AtomicBool,
     secret_scrubber: Arc<dyn SecretScrubber>,
 }
 
@@ -611,6 +613,7 @@ where
             max_iterations: AtomicU64::new(256),
             active_tool_calls: StdMutex::new(HashSet::new()),
             policy_denied: AtomicBool::new(false),
+            mutating_api_gate_enabled: AtomicBool::new(true),
             secret_scrubber: Arc::new(NoopSecretScrubber),
         }
     }
@@ -628,6 +631,13 @@ where
     }
 
     pub async fn set_permission_rules(&self, rules: Option<PermissionRules>) {
+        self.mutating_api_gate_enabled.store(
+            rules
+                .as_ref()
+                .and_then(|rules| rules.mutating_api_gate)
+                .unwrap_or(true),
+            Ordering::SeqCst,
+        );
         *self.permission_rules.lock().await = rules;
     }
 
@@ -1851,6 +1861,17 @@ where
             }
             let mode = *self.mode.lock().await;
             let target = self.executor.policy_target(&call.name, &call.arguments);
+            let mutating_api_target = if self.mutating_api_gate_enabled.load(Ordering::SeqCst)
+                && matches!(call.name.as_str(), "run_shell" | "exec")
+            {
+                call.arguments
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .and_then(mutating_http_target)
+            } else {
+                None
+            };
+            let target = mutating_api_target.as_deref().unwrap_or(&target);
             let preflight = self
                 .executor
                 .preflight(&call.name, &call.arguments)
@@ -1858,10 +1879,10 @@ where
                 .map_err(EngineError::Tool)?;
             let mut preflight_reason = None;
             let decision = match preflight {
-                PreflightDecision::Allow if self.executor.grant_allows(&target) => {
+                PreflightDecision::Allow if self.executor.grant_allows(target) => {
                     let repair_grant = [DurableGrant {
                         key: "repair-loop".into(),
-                        target: target.clone(),
+                        target: target.to_owned(),
                         expires_at: None,
                     }];
                     decide_with_rules(
@@ -1869,7 +1890,7 @@ where
                         risk,
                         unattended,
                         &repair_grant,
-                        &target,
+                        target,
                         permission_rules.as_ref(),
                     )
                 }
@@ -1878,7 +1899,7 @@ where
                     risk,
                     unattended,
                     &grants,
-                    &target,
+                    target,
                     permission_rules.as_ref(),
                 ),
                 PreflightDecision::NeedsUser(reason) if unattended => {
@@ -1893,6 +1914,22 @@ where
                     preflight_reason = Some(reason);
                     Decision::Deny
                 }
+            };
+            let decision = if mutating_api_target.is_some() {
+                if mode == PermissionMode::Discuss || unattended {
+                    Decision::Deny
+                } else {
+                    decide_with_rules(
+                        PermissionMode::Interactive,
+                        ToolRisk::External,
+                        unattended,
+                        &grants,
+                        target,
+                        permission_rules.as_ref(),
+                    )
+                }
+            } else {
+                decision
             };
             if matches!(decision, Decision::Deny) && preflight_reason.is_some() {
                 results[index] = Some(json!({
@@ -3997,6 +4034,7 @@ mod tests {
             .set_hook_permission_rules(Some(PermissionRules {
                 allow: Vec::new(),
                 deny: Vec::new(),
+                mutating_api_gate: None,
             }))
             .await;
         assert_eq!(
@@ -4026,6 +4064,7 @@ mod tests {
             .set_hook_permission_rules(Some(PermissionRules {
                 allow: vec!["Exec(context)".into()],
                 deny: Vec::new(),
+                mutating_api_gate: None,
             }))
             .await;
         let effects = engine
@@ -4056,6 +4095,7 @@ mod tests {
             .set_hook_permission_rules(Some(PermissionRules {
                 allow: vec!["Exec(context)".into()],
                 deny: vec!["Exec(context)".into()],
+                mutating_api_gate: None,
             }))
             .await;
         assert_eq!(
@@ -5917,6 +5957,80 @@ mod tests {
                     .iter()
                     .position(|item| item == "start:run_shell")
                     .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn mutating_external_http_shell_calls_require_approval_but_gets_do_not() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let mutating = ToolCall {
+            id: "mutating-http".into(),
+            name: "run_shell".into(),
+            arguments: json!({
+                "command": "curl -X PUT https://api.cloudflare.com/client/v4/accounts/id/cfd_tunnel/tunnel/configurations"
+            }),
+        };
+        assert!(matches!(
+            engine.execute_tools(1, std::slice::from_ref(&mutating)).await,
+            Err(EngineError::ApprovalPending(call_id)) if call_id == mutating.id
+        ));
+        assert_eq!(store.load_pending("s").unwrap()[0].call_id, "mutating-http");
+
+        let get_engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(FakeTools),
+            "get-session",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let result = get_engine
+            .execute_tools(
+                1,
+                &[ToolCall {
+                    id: "read-http".into(),
+                    name: "run_shell".into(),
+                    arguments: json!({
+                        "command": "curl https://api.cloudflare.com/client/v4/zones"
+                    }),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, vec![json!("ok")]);
+
+        let disabled = TurnEngine::new(
+            FakeProvider,
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+            Arc::new(FakeTools),
+            "disabled-session",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        disabled
+            .set_permission_rules(Some(PermissionRules {
+                allow: Vec::new(),
+                deny: Vec::new(),
+                mutating_api_gate: Some(false),
+            }))
+            .await;
+        assert_eq!(
+            disabled
+                .execute_tools(1, std::slice::from_ref(&mutating))
+                .await
+                .unwrap(),
+            vec![json!("ok")]
         );
     }
 

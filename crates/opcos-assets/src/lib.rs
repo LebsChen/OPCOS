@@ -43,6 +43,8 @@ pub struct PermissionRules {
     pub allow: Vec<String>,
     #[serde(default)]
     pub deny: Vec<String>,
+    #[serde(default)]
+    pub mutating_api_gate: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -1517,6 +1519,7 @@ mod tests {
             Some(PermissionRules {
                 allow: vec!["Exec(git status)".into()],
                 deny: vec!["Exec(sudo)".into()],
+                mutating_api_gate: None,
             })
         );
         assert!(bundle.permission_errors.is_empty());
@@ -1582,6 +1585,7 @@ mod tests {
             Some(PermissionRules {
                 allow: Vec::new(),
                 deny: vec!["Exec(sudo)".into()],
+                mutating_api_gate: None,
             })
         );
         assert_eq!(
@@ -1589,6 +1593,7 @@ mod tests {
             Some(PermissionRules {
                 allow: vec!["Exec(git status)".into()],
                 deny: Vec::new(),
+                mutating_api_gate: None,
             })
         );
         assert_eq!(
@@ -1596,6 +1601,7 @@ mod tests {
             Some(PermissionRules {
                 allow: Vec::new(),
                 deny: vec!["Exec(sudo)".into()],
+                mutating_api_gate: None,
             })
         );
     }
