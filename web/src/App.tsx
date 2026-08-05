@@ -9947,6 +9947,9 @@ function AppContent() {
         return;
       if (payload.kind === "stream") {
         const streamPayload = payload.payload;
+        if (streamPayload.type === "compacted") {
+          setRunning(false);
+        }
         const hasStreamingContent =
           typeof streamPayload.text_delta === "string" ||
           typeof streamPayload.reasoning_delta === "string" ||
