@@ -26,7 +26,7 @@ impl LocalDesktop {
             let reason: String = "Wayland session detected; local screenshot/input requires an XDG Desktop Portal Remote Desktop session, which is not configured".into();
             return (Some(reason.clone()), Some(reason));
         }
-        let screenshot = match self.capture_bounds() {
+        let screenshot = match self.capture_probe() {
             Ok(_) => None,
             Err(error) => Some(format!("local screen capture unavailable: {error}")),
         };
@@ -68,6 +68,7 @@ impl LocalDesktop {
         if wayland_session() {
             return Err("Wayland input injection is unavailable; authorize an XDG Desktop Portal Remote Desktop session".into());
         }
+        let origin = self.screen_origin()?;
         let mut input = self
             .input
             .lock()
@@ -100,9 +101,7 @@ impl LocalDesktop {
                     .map_err(|error| error.to_string())?;
             }
             ComputerUseAction::MouseMove { coordinate } => {
-                input
-                    .move_mouse(coordinate[0], coordinate[1], Coordinate::Abs)
-                    .map_err(|error| error.to_string())?;
+                move_mouse(input, coordinate, origin)?;
             }
             ComputerUseAction::Scroll {
                 direction, amount, ..
@@ -126,9 +125,7 @@ impl LocalDesktop {
             | ComputerUseAction::MiddleClick { coordinate }
             | ComputerUseAction::DoubleClick { coordinate }
             | ComputerUseAction::TripleClick { coordinate } => {
-                input
-                    .move_mouse(coordinate[0], coordinate[1], Coordinate::Abs)
-                    .map_err(|error| error.to_string())?;
+                move_mouse(input, coordinate, origin)?;
                 let button = match action {
                     ComputerUseAction::RightClick { .. } => Button::Right,
                     ComputerUseAction::MiddleClick { .. } => Button::Middle,
@@ -149,31 +146,23 @@ impl LocalDesktop {
                 coordinate,
                 coordinate_end,
             } => {
-                input
-                    .move_mouse(coordinate[0], coordinate[1], Coordinate::Abs)
-                    .map_err(|error| error.to_string())?;
+                move_mouse(input, coordinate, origin)?;
                 input
                     .button(Button::Left, Direction::Press)
                     .map_err(|error| error.to_string())?;
-                input
-                    .move_mouse(coordinate_end[0], coordinate_end[1], Coordinate::Abs)
-                    .map_err(|error| error.to_string())?;
+                move_mouse(input, coordinate_end, origin)?;
                 input
                     .button(Button::Left, Direction::Release)
                     .map_err(|error| error.to_string())?;
             }
             ComputerUseAction::LeftMouseDown { coordinate } => {
-                input
-                    .move_mouse(coordinate[0], coordinate[1], Coordinate::Abs)
-                    .map_err(|error| error.to_string())?;
+                move_mouse(input, coordinate, origin)?;
                 input
                     .button(Button::Left, Direction::Press)
                     .map_err(|error| error.to_string())?;
             }
             ComputerUseAction::LeftMouseUp { coordinate } => {
-                input
-                    .move_mouse(coordinate[0], coordinate[1], Coordinate::Abs)
-                    .map_err(|error| error.to_string())?;
+                move_mouse(input, coordinate, origin)?;
                 input
                     .button(Button::Left, Direction::Release)
                     .map_err(|error| error.to_string())?;
@@ -188,15 +177,38 @@ impl LocalDesktop {
         })
     }
 
+    fn capture_probe(&self) -> Result<(), String> {
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        {
+            self.capture_rgba().map(|_| ())
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.capture_bounds().map(|_| ())
+        }
+    }
+
+    fn screen_origin(&self) -> Result<(i32, i32), String> {
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        {
+            let monitor = primary_monitor()?;
+            return Ok((
+                monitor.x().map_err(|error| error.to_string())?,
+                monitor.y().map_err(|error| error.to_string())?,
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            return Ok((0, 0));
+        }
+        #[allow(unreachable_code)]
+        Err("screen input is unavailable on this platform".into())
+    }
+
     fn capture_bounds(&self) -> Result<(u32, u32), String> {
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
-            let monitor = Monitor::all()
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .find(|monitor| monitor.is_primary().unwrap_or(false))
-                .or_else(|| Monitor::all().ok().and_then(|mut monitors| monitors.pop()))
-                .ok_or_else(|| "no local display monitor was detected".to_owned())?;
+            let monitor = primary_monitor()?;
             return Ok((
                 monitor.width().map_err(|error| error.to_string())?,
                 monitor.height().map_err(|error| error.to_string())?,
@@ -216,14 +228,7 @@ impl LocalDesktop {
     fn capture_rgba(&self) -> Result<(u32, u32, Vec<u8>), String> {
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
-            let monitor = Monitor::all()
-                .map_err(|error| capture_error(error.to_string()))?
-                .into_iter()
-                .find(|monitor| monitor.is_primary().unwrap_or(false))
-                .or_else(|| Monitor::all().ok().and_then(|mut monitors| monitors.pop()))
-                .ok_or_else(|| {
-                    "local screen capture unavailable: no monitor detected".to_owned()
-                })?;
+            let monitor = primary_monitor().map_err(capture_error)?;
             let image = monitor
                 .capture_image()
                 .map_err(|error| capture_error(error.to_string()))?;
@@ -253,15 +258,45 @@ impl LocalDesktop {
                 .reply()
                 .map_err(|error| error.to_string())?
                 .data;
-            let pixels = data
-                .chunks_exact(4)
-                .flat_map(|pixel| [pixel[2], pixel[1], pixel[0], 255])
-                .collect();
+            if data.len() % 4 != 0 {
+                return Err("X11 screenshot returned an unsupported pixel stride".into());
+            }
+            let pixels = match connection.setup().image_byte_order {
+                x11rb::protocol::xproto::ImageOrder::LSB_FIRST => data
+                    .chunks_exact(4)
+                    .flat_map(|pixel| [pixel[2], pixel[1], pixel[0], 255])
+                    .collect(),
+                x11rb::protocol::xproto::ImageOrder::MSB_FIRST => data
+                    .chunks_exact(4)
+                    .flat_map(|pixel| [pixel[1], pixel[2], pixel[3], 255])
+                    .collect(),
+                _ => return Err("X11 screenshot returned an unknown byte order".into()),
+            };
             return Ok((width, height, pixels));
         }
         #[allow(unreachable_code)]
         Err("screen capture is unavailable on this platform".into())
     }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn primary_monitor() -> Result<Monitor, String> {
+    Monitor::all()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|monitor| monitor.is_primary().unwrap_or(false))
+        .or_else(|| Monitor::all().ok().and_then(|mut monitors| monitors.pop()))
+        .ok_or_else(|| "no local display monitor was detected".to_owned())
+}
+
+fn move_mouse(input: &mut Enigo, coordinate: [i32; 2], origin: (i32, i32)) -> Result<(), String> {
+    input
+        .move_mouse(
+            coordinate[0] + origin.0,
+            coordinate[1] + origin.1,
+            Coordinate::Abs,
+        )
+        .map_err(|error| error.to_string())
 }
 
 fn wayland_session() -> bool {
@@ -299,6 +334,7 @@ fn parse_key(value: &str) -> Result<Key, String> {
         "tab" => Ok(Key::Tab),
         "escape" | "esc" => Ok(Key::Escape),
         "backspace" => Ok(Key::Backspace),
+        "delete" | "del" => Ok(Key::Delete),
         "space" => Ok(Key::Space),
         "shift" => Ok(Key::Shift),
         "control" | "ctrl" => Ok(Key::Control),
@@ -308,6 +344,34 @@ fn parse_key(value: &str) -> Result<Key, String> {
         "down" => Ok(Key::DownArrow),
         "left" => Ok(Key::LeftArrow),
         "right" => Ok(Key::RightArrow),
+        "home" => Ok(Key::Home),
+        "end" => Ok(Key::End),
+        "page_up" | "pageup" => Ok(Key::PageUp),
+        "page_down" | "pagedown" => Ok(Key::PageDown),
+        "f1" => Ok(Key::F1),
+        "f2" => Ok(Key::F2),
+        "f3" => Ok(Key::F3),
+        "f4" => Ok(Key::F4),
+        "f5" => Ok(Key::F5),
+        "f6" => Ok(Key::F6),
+        "f7" => Ok(Key::F7),
+        "f8" => Ok(Key::F8),
+        "f9" => Ok(Key::F9),
+        "f10" => Ok(Key::F10),
+        "f11" => Ok(Key::F11),
+        "f12" => Ok(Key::F12),
+        "f13" => Ok(Key::F13),
+        "f14" => Ok(Key::F14),
+        "f15" => Ok(Key::F15),
+        "f16" => Ok(Key::F16),
+        "f17" => Ok(Key::F17),
+        "f18" => Ok(Key::F18),
+        "f19" => Ok(Key::F19),
+        "f20" => Ok(Key::F20),
+        "f21" => Ok(Key::F21),
+        "f22" => Ok(Key::F22),
+        "f23" => Ok(Key::F23),
+        "f24" => Ok(Key::F24),
         _ => Err(format!("unsupported key name: {value}")),
     }
 }

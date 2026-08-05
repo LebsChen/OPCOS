@@ -338,6 +338,20 @@ fn git_push_policy_target(
     format!("git_push:{project_id}:{}:{branch}", repo.canonical())
 }
 
+fn computer_use_policy_target(host_id: &str, arguments: &Value) -> String {
+    let kind = if arguments
+        .get("action")
+        .and_then(|value| value.get("action"))
+        .and_then(Value::as_str)
+        == Some("screenshot")
+    {
+        "screenshot"
+    } else {
+        "input"
+    };
+    format!("computer_use_{kind}:{host_id}")
+}
+
 struct DesktopState {
     database: Arc<Mutex<Connection>>,
     secrets: KeyringSecretStore,
@@ -3890,7 +3904,9 @@ impl ToolExecutor for RemoteExecutor {
     }
 
     fn policy_target(&self, name: &str, arguments: &Value) -> String {
-        if name == "git_push" {
+        if name == "computer_use" {
+            computer_use_policy_target(&self.host_id, arguments)
+        } else if name == "git_push" {
             git_push_policy_target(&self.store, self.project_id.as_deref(), arguments)
         } else if matches!(name, "run_shell" | "exec") {
             arguments
@@ -4382,7 +4398,9 @@ impl ToolExecutor for DesktopExecutor {
         match self {
             Self::Remote(executor) => executor.policy_target(name, arguments),
             Self::Local(executor) => {
-                if name == "git_push" {
+                if name == "computer_use" {
+                    computer_use_policy_target(executor.host.id(), arguments)
+                } else if name == "git_push" {
                     git_push_policy_target(
                         &executor.store,
                         executor.project_id.as_deref(),
@@ -10500,34 +10518,41 @@ async fn run_computer_use(
 
 fn parse_computer_use_arguments(
     arguments: &Value,
-) -> Result<(ComputerUseAction, ScreenBounds), String> {
+) -> Result<(ComputerUseAction, Option<ScreenBounds>), String> {
     let action = arguments
         .get("action")
         .cloned()
         .ok_or_else(|| "computer_use action is required".to_owned())
         .and_then(|value| serde_json::from_value(value).map_err(|error| error.to_string()))?;
-    let width = arguments
-        .get("screen_width")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| "computer_use screen_width is required".to_owned())?;
-    let height = arguments
-        .get("screen_height")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| "computer_use screen_height is required".to_owned())?;
-    Ok((
-        action,
-        ScreenBounds {
+    let width = arguments.get("screen_width").and_then(Value::as_u64);
+    let height = arguments.get("screen_height").and_then(Value::as_u64);
+    let bounds = match (width, height) {
+        (None, None) => None,
+        (Some(width), Some(height)) => Some(ScreenBounds {
             width: u32::try_from(width).map_err(|_| "screen_width is too large".to_owned())?,
             height: u32::try_from(height).map_err(|_| "screen_height is too large".to_owned())?,
-        },
-    ))
+        }),
+        _ => return Err("screen_width and screen_height must be supplied together".into()),
+    };
+    Ok((action, bounds))
 }
 
 async fn execute_computer_use_action(
     host: &dyn Host,
     action: ComputerUseAction,
-    bounds: ScreenBounds,
+    bounds: Option<ScreenBounds>,
 ) -> Result<Value, String> {
+    let bounds = match bounds {
+        Some(bounds) => bounds,
+        None => {
+            host.screenshot()
+                .await
+                .map_err(|error| error.to_string())?
+                .decoded_rgba()
+                .map_err(|error| error.to_string())?
+                .0
+        }
+    };
     action.validate(bounds).map_err(|error| error.to_string())?;
     if matches!(action, ComputerUseAction::Screenshot) {
         return serde_json::to_value(host.screenshot().await.map_err(|error| error.to_string())?)
