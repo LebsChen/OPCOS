@@ -190,5 +190,6 @@ export type Item =
       kind: "notice";
       tone: "info" | "warn";
       text: string;
+      noticeKind?: string;
       retriable?: boolean;
     };

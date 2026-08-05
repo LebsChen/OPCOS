@@ -374,25 +374,41 @@ export function reduceStreamEvent(
           ? working.event_type
           : "working_event";
       const details = payloadObject(working.payload);
-      if (eventType === "devin_thoughts") {
-        next.push({
-          id: `event:thought:${next.length}`,
-          kind: "thinking",
-          text: typeof details.message === "string" ? details.message : "",
-          reasoning: typeof details.message === "string" ? details.message : "",
-        });
-      } else if (eventType === "simple_activity_update") {
-        next.push({
-          id: `event:activity:${next.length}`,
+      const replaceActivity = (text: string) => {
+        const existingIndex = next.findIndex(
+          (item) =>
+            item.kind === "notice" &&
+            (item.noticeKind === "simple_activity_update" ||
+              item.noticeKind === "status_update"),
+        );
+        const activity: TranscriptViewItem = {
+          id: "event:activity",
           kind: "notice",
           noticeKind: eventType,
-          text:
-            typeof details.message === "string"
-              ? details.message
-              : typeof details.enum === "string"
-                ? humanizeActivity(details.enum)
-                : "Working",
-        });
+          text,
+        };
+        if (existingIndex >= 0) next.splice(existingIndex, 1, activity);
+        else next.push(activity);
+      };
+      if (eventType === "devin_thoughts") {
+        const thought =
+          typeof details.message === "string" ? details.message : "";
+        if (thought.trim()) {
+          next.push({
+            id: `event:thought:${next.length}`,
+            kind: "thinking",
+            text: thought,
+            reasoning: thought,
+          });
+        }
+      } else if (eventType === "simple_activity_update") {
+        replaceActivity(
+          typeof details.message === "string"
+            ? details.message
+            : typeof details.enum === "string"
+              ? humanizeActivity(details.enum)
+              : "Working",
+        );
       } else if (eventType === "status_update") {
         const status =
           typeof details.message === "string"
@@ -400,12 +416,7 @@ export function reduceStreamEvent(
             : typeof details.enum === "string"
               ? humanizeActivity(details.enum)
               : "Working";
-        next.push({
-          id: `event:status:${next.length}`,
-          kind: "notice",
-          noticeKind: eventType,
-          text: status,
-        });
+        replaceActivity(status);
       }
     }
   }

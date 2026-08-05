@@ -9765,6 +9765,7 @@ function AppContent() {
           kind: "notice",
           tone: item.noticeKind === "error" ? "warn" : "info",
           text: item.text || "",
+          noticeKind: item.noticeKind,
         });
     });
     return output;

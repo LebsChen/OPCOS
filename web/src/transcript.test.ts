@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { humanizeTool } from "./humanize";
 import {
   classifyStepStatus,
   normalizeTranscript,
@@ -6,6 +7,26 @@ import {
 } from "./transcript";
 
 describe("OPCOS transcript folding", () => {
+  it("summarizes common tool actions as compact step lines", () => {
+    expect(humanizeTool("run_shell", { command: "pytest -q" })).toMatchObject({
+      pre: "Ran ",
+      obj: "pytest -q",
+    });
+    expect(humanizeTool("edit_file", { path: "temperature.py" })).toMatchObject(
+      {
+        pre: "Edited ",
+        obj: "temperature.py",
+      },
+    );
+    expect(humanizeTool("read_file", { path: "src/orders.py" })).toMatchObject({
+      pre: "Read ",
+      obj: "orders.py",
+    });
+    expect(humanizeTool("propose_plan", { steps: [1, 2] })).toMatchObject({
+      pre: "Proposed a plan (2 steps)",
+    });
+  });
+
   it.each([
     ["running", "running"],
     ["…", "running"],
@@ -421,5 +442,51 @@ describe("OPCOS transcript folding", () => {
         reasoning: "thought two",
       }),
     );
+  });
+
+  it("keeps one current activity instead of accumulating status rows", () => {
+    let items = reduceStreamEvent([], {
+      kind: "stream",
+      payload: {
+        working_event: {
+          event_type: "status_update",
+          payload: { enum: "working" },
+        },
+      },
+    });
+    items = reduceStreamEvent(items, {
+      kind: "stream",
+      payload: {
+        working_event: {
+          event_type: "simple_activity_update",
+          payload: { enum: "deciding_action" },
+        },
+      },
+    });
+
+    expect(
+      items.filter(
+        (item) =>
+          item.kind === "notice" &&
+          (item.noticeKind === "status_update" ||
+            item.noticeKind === "simple_activity_update"),
+      ),
+    ).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      text: "Deciding what to do next",
+    });
+  });
+
+  it("does not create an empty thought item", () => {
+    const items = reduceStreamEvent([], {
+      kind: "stream",
+      payload: {
+        working_event: {
+          event_type: "devin_thoughts",
+          payload: { message: "" },
+        },
+      },
+    });
+    expect(items).toHaveLength(0);
   });
 });

@@ -449,6 +449,18 @@ body {
   flex-direction: column;
   gap: 20px;
 }
+.current-activity {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 8px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.current-activity .spinner {
+  flex: none;
+}
 .bubble-assistant {
   font-size: 15px;
   line-height: 1.55;

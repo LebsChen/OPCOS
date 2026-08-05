@@ -78,6 +78,7 @@ export function ThinkingBlock({
   live?: boolean;
 }) {
   const [open, setOpen] = useState(false);
+  if (!text.trim()) return null;
   return (
     <div className="thinking">
       <button
@@ -213,19 +214,34 @@ function StepRow({
   return (
     <div>
       <div
-        className="group flex items-baseline gap-2 px-2 py-0.5 rounded-lg hover:bg-paper"
+        className="group flex items-center gap-2 px-2 py-1 rounded-lg hover:bg-paper"
         data-testid="turn-step"
       >
         <span
           className={
-            "w-3.5 text-center text-[10px] shrink-0 " +
+            "w-4 text-center text-[10px] shrink-0 " +
             (failed ? "text-danger" : running ? "text-accent" : "text-ok")
           }
         >
           {running ? (
             <span className="spinner" data-testid="step-running" />
           ) : (
-            "●"
+            <Icon
+              name={
+                tool.name === "run_shell"
+                  ? "terminal"
+                  : tool.name === "grep" || tool.name === "search"
+                    ? "search"
+                    : tool.name === "read_file" ||
+                        tool.name === "write_file" ||
+                        tool.name.includes("file")
+                      ? "file"
+                      : tool.name.includes("todo") || tool.name.includes("plan")
+                        ? "board"
+                        : "wrench"
+              }
+              size={13}
+            />
           )}
         </span>
         <LineText line={humanizeTool(tool.name, tool.args)} />
@@ -260,7 +276,7 @@ function StepRow({
             className="ml-auto shrink-0 text-[11px] text-faint opacity-0 group-hover:opacity-100 cursor-pointer"
             onClick={() => setRaw((v) => !v)}
           >
-            raw
+            {raw ? "hide" : "details"}
           </button>
         )}
       </div>
@@ -287,129 +303,51 @@ function TurnGroup({
   // the header as the live line; expanded → the small quiet line under the steps.
   streamingText?: string;
 }) {
-  // Turns start COLLAPSED, running or not (owner call 2026-07-14) — the header's live
-  // line is the pulse; expanding is opt-in.
   const rows = buildRows(items);
-  const tools = items.filter((it): it is ToolItem => it.kind === "tool");
-  const deniedCalls = new Set(
-    items
-      .filter(
-        (it): it is ApprovalItem =>
-          it.kind === "approval" && it.resolved === "deny",
-      )
-      .map((it) => it.callId),
-  );
-  const running =
-    live ||
-    (tools.some((t) => classifyStepStatus(t.status) === "running") &&
-      !deniedCalls.size);
-  const [userToggle, setUserToggle] = useState<boolean | null>(null);
-  const open = userToggle ?? false;
-  const lastNarr = [...items]
-    .reverse()
-    .find((it): it is AssistantItem => it.kind === "assistant");
-  const liveLine = streamingText || lastNarr?.text || "";
-
-  const nSteps = rows.filter((r) => r.type !== "narr").length;
-  const declined = items.filter(
-    (it) => it.kind === "approval" && it.resolved === "deny",
-  ).length;
-  const hiddenTotal = tools.reduce((n, t) => n + (t.hidden || 0), 0);
-  const stepsLabel = `${nSteps} step${nSteps === 1 ? "" : "s"}`;
-
   return (
-    <details className="stepgroup" open={open}>
-      <summary
-        className="stepgroup-head flex items-center gap-2 py-0.5 cursor-pointer select-none text-[12.5px] text-faint hover:text-muted"
-        onClick={(e) => {
-          e.preventDefault(); // drive open/closed from state, not the native toggle
-          setUserToggle(!open);
-        }}
-      >
-        <span
-          className={
-            "chev inline-block transition-transform" +
-            (open ? " rotate-90" : "")
-          }
-        >
-          ›
-        </span>
-        <span>
-          <span>{running ? `Running ${stepsLabel}…` : stepsLabel}</span>
-          {declined > 0 && (
-            <>
-              {" · "}
-              <span className="text-danger" data-testid="stepgroup-declined">
-                {declined} declined
-              </span>
-            </>
-          )}
-          {hiddenTotal > 0 && (
-            <>
-              {" · "}
-              <span className="text-warnInk" data-testid="stepgroup-hidden">
-                {hiddenTotal} hidden by your filters
-              </span>
-            </>
-          )}
-        </span>
-        {running && !open && liveLine && (
-          <span
-            className="min-w-0 flex-1 truncate"
-            data-testid="turn-live-line"
+    <div className="stepgroup flex flex-col gap-0.5">
+      {rows.map((row, i) =>
+        row.type === "narr" ? (
+          <div
+            className="turn-narr px-2 py-1 text-[13px] text-muted max-w-[60ch]"
+            key={i}
+            data-testid="turn-narration"
           >
-            · {liveLine}
-          </span>
-        )}
-      </summary>
-      {open && (
-        <div className="ml-1.5 mt-1 pl-2 border-l-2 border-line flex flex-col gap-0.5">
-          {rows.map((row, i) =>
-            row.type === "narr" ? (
-              <div
-                className="turn-narr px-2 py-1 text-[13px] text-muted max-w-[60ch]"
-                key={i}
-                data-testid="turn-narration"
-              >
-                <Markdown text={row.text} />
-              </div>
-            ) : row.type === "ask" ? (
-              <div
-                className="flex items-baseline gap-2 px-2 py-0.5"
-                key={i}
-                data-testid="turn-ask"
-              >
-                <span
-                  className={
-                    "w-3.5 text-center text-[10px] shrink-0 " +
-                    (row.approval.resolved === "deny"
-                      ? "text-danger"
-                      : "text-ok")
-                  }
-                >
-                  ●
-                </span>
-                <LineText
-                  line={humanizeAsk(row.approval.name, row.approval.args)}
-                />
-                {approvalChip(row.approval.resolved)}
-              </div>
-            ) : (
-              <StepRow tool={row.tool} approval={row.approval} key={i} />
-            ),
-          )}
-          {streamingText && (
-            <div
-              className="turn-narr px-2 py-1 text-[13px] text-muted max-w-[60ch]"
-              data-testid="turn-live-stream"
+            <Markdown text={row.text} />
+          </div>
+        ) : row.type === "ask" ? (
+          <div
+            className="flex items-baseline gap-2 px-2 py-1"
+            key={i}
+            data-testid="turn-ask"
+          >
+            <span
+              className={
+                "w-4 text-center text-[10px] shrink-0 " +
+                (row.approval.resolved === "deny" ? "text-danger" : "text-ok")
+              }
             >
-              <Markdown text={streamingText} />
-              <span className="stream-cursor">▍</span>
-            </div>
-          )}
+              ●
+            </span>
+            <LineText
+              line={humanizeAsk(row.approval.name, row.approval.args)}
+            />
+            {approvalChip(row.approval.resolved)}
+          </div>
+        ) : (
+          <StepRow tool={row.tool} approval={row.approval} key={i} />
+        ),
+      )}
+      {streamingText && (
+        <div
+          className="turn-narr px-2 py-1 text-[13px] text-muted max-w-[60ch]"
+          data-testid="turn-live-stream"
+        >
+          <Markdown text={streamingText} />
+          <span className="stream-cursor">▍</span>
         </div>
       )}
-    </details>
+    </div>
   );
 }
 
@@ -507,6 +445,14 @@ export function Transcript({
     (acc, b, i) => ("turn" in b ? i : acc),
     -1,
   );
+  const currentActivity = [...items]
+    .reverse()
+    .find(
+      (item): item is Extract<Item, { kind: "notice" }> =>
+        item.kind === "notice" &&
+        (item.noticeKind === "status_update" ||
+          item.noticeKind === "simple_activity_update"),
+    );
   return (
     <div className="transcript">
       {blocks.map((block, bi) => {
@@ -579,9 +525,9 @@ export function Transcript({
                   <ThinkingBlock text={item.reasoning} />
                 </div>
               );
+            if (!item.text) return null;
             return (
               <div className="group bubble-assistant" key={bi}>
-                <div className="who">{translate("assistant")}</div>
                 {item.reasoning && <ThinkingBlock text={item.reasoning} />}
                 <Markdown text={item.text} />
                 <BubbleMeta text={item.text} ts={item.ts} align="left" />
@@ -630,6 +576,11 @@ export function Transcript({
               </div>
             );
           case "notice":
+            if (
+              item.noticeKind === "status_update" ||
+              item.noticeKind === "simple_activity_update"
+            )
+              return null;
             return (
               <div
                 className={"notice " + (item.tone === "warn" ? "warn" : "")}
@@ -654,6 +605,12 @@ export function Transcript({
             return null;
         }
       })}
+      {running && (
+        <div className="current-activity" data-testid="current-activity">
+          <span className="spinner" />
+          <span>{currentActivity?.text || "Working"}</span>
+        </div>
+      )}
     </div>
   );
 }
