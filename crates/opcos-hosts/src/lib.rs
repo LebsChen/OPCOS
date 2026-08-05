@@ -1024,6 +1024,19 @@ impl BackgroundJobManager {
         ))
     }
 
+    #[cfg(not(unix))]
+    async fn start_local_posix_wrapper(
+        &self,
+        _job_id: &str,
+        _request: &SpawnRequest,
+        _launch_nonce: &str,
+        _timeout_seconds: Option<u64>,
+    ) -> Result<DurableLaunch, HostError> {
+        Err(HostError::Unsupported(
+            "local POSIX background jobs are unsupported on this platform".into(),
+        ))
+    }
+
     pub async fn cleanup_finished(&self, max_age: chrono::Duration) {
         let cutoff = Utc::now() - max_age;
         let expired = {
@@ -1372,6 +1385,11 @@ async fn local_process_alive(pid: Option<u32>) -> bool {
         .output()
         .await
         .is_ok_and(|output| output.status.success())
+}
+
+#[cfg(not(unix))]
+async fn local_process_alive(_pid: Option<u32>) -> bool {
+    false
 }
 
 #[cfg(unix)]
