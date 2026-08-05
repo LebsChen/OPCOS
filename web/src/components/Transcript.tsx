@@ -1,41 +1,12 @@
-import { useEffect, useState } from "react";
-import { translate } from "../i18n";
-import type { ApprovalDecision, Item } from "../types";
-import {
-  classifyStepStatus,
-  isErrorNotice,
-  isHiddenTimelineItem,
-  providerErrorPresentation,
-} from "../transcript";
-import { shortArgs } from "./ApprovalCard";
+import { useState } from "react";
+import { type ApprovalDecision, type Item } from "../types";
+import { buildTimeline, type TimelineEvent } from "../timeline";
 import { ApprovalCard } from "./ApprovalCard";
-import { humanizeAsk, humanizeTool, type HumanLine } from "../humanize";
 import { Markdown } from "./Markdown";
-import { Icon } from "./Icon";
-import { workSegmentDiff, workSegmentDuration } from "../workSegments";
 
-// Visual source: OpenWorker surfaces/gui/src/components/Transcript.tsx:1-465.
-// OPCOS keeps that structure/classes and adapts only transcript item types, approval
-// resolution, connector omission, and invoke-backed retry behavior.
-
-// Hover affordances for a message bubble (FB-005): copy the raw text + the message's time.
-// Lives in a ZERO-HEIGHT strip under the bubble (absolute, inside the transcript's 20px gap)
-// so revealing it on group-hover never shifts the layout. `ts` is unix seconds — canonical
-// messages carry it, pre-stamp history doesn't, so the time simply omits itself when absent.
-function BubbleMeta({
-  text,
-  ts,
-  align,
-}: {
-  text: string;
-  ts?: number;
-  align: "left" | "right";
-}) {
+function BubbleMeta({ text, ts }: { text: string; ts?: number }) {
   const [copied, setCopied] = useState(false);
-  const when = typeof ts === "number" ? new Date(ts * 1000) : null;
   const copy = () => {
-    // "Copied" only after the write actually lands — WebKit can reject outside a
-    // trusted gesture, and claiming success on a silent no-op would gaslight the user.
     navigator.clipboard
       ?.writeText(text)
       .then(() => {
@@ -46,23 +17,13 @@ function BubbleMeta({
   };
   return (
     <div className="relative h-0 select-none">
-      <div
-        className={
-          "absolute top-1 flex items-center gap-1.5 text-[10.5px] leading-none text-faint whitespace-nowrap opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity " +
-          (align === "right" ? "right-0" : "left-0")
-        }
-      >
-        <button
-          className="flex items-center cursor-pointer hover:text-muted"
-          data-testid="bubble-copy"
-          title={translate("Copy message")}
-          onClick={copy}
-        >
-          {copied ? "Copied" : <Icon name="copy" size={11} />}
+      <div className="absolute top-1 left-0 flex items-center gap-1.5 text-[10.5px] text-faint opacity-0 group-hover:opacity-100">
+        <button onClick={copy} data-testid="bubble-copy">
+          {copied ? "Copied" : "Copy"}
         </button>
-        {when && (
-          <span data-testid="bubble-ts" title={when.toLocaleString()}>
-            {when.toLocaleTimeString([], {
+        {typeof ts === "number" && (
+          <span data-testid="bubble-ts">
+            {new Date(ts * 1000).toLocaleTimeString([], {
               hour: "numeric",
               minute: "2-digit",
             })}
@@ -73,656 +34,135 @@ function BubbleMeta({
   );
 }
 
-// Reasoning-model thinking text (model-layer roadmap item 4): a quiet disclosure —
-// collapsed by default, the trace one click away. `live` = still streaming (pulsing label);
-// App renders that variant above the transcript, this one rides a finalized assistant item.
-export function ThinkingBlock({
-  text,
-  live,
+function Thought({ text }: { text: string }) {
+  return (
+    <details>
+      <summary className="cursor-pointer text-xs text-muted">
+        Thought details
+      </summary>
+      <div className="whitespace-pre-wrap">{text}</div>
+    </details>
+  );
+}
+
+export function Transcript({
+  events,
+  running,
+  onApprove,
+  onRetry,
 }: {
-  text: string;
-  live?: boolean;
-}) {
-  const [open, setOpen] = useState(false);
-  if (!text.trim()) return null;
-  return (
-    <div className="thinking">
-      <button
-        className="thinking-head"
-        onClick={() => setOpen((v) => !v)}
-        data-testid="thinking-toggle"
-      >
-        <Icon
-          name="chevronDown"
-          size={12}
-          className={"thinking-caret" + (open ? " open" : "")}
-        />
-        <span className={live ? "thinking-live" : undefined}>
-          {live ? "Thinking…" : "Thought process"}
-        </span>
-      </button>
-      {open && (
-        <div className="thinking-body" data-testid="thinking-body">
-          {text}
-        </div>
-      )}
-    </div>
-  );
-}
-
-type ToolItem = Extract<Item, { kind: "tool" }>;
-type ApprovalItem = Extract<Item, { kind: "approval" }>;
-type AssistantItem = Extract<Item, { kind: "assistant" }>;
-type TurnItem = ToolItem | ApprovalItem | AssistantItem;
-
-// TurnGroup (§33, absorbs §7's StepGroup): the whole user-message → final-answer span collapses
-// as ONE disclosure — "N steps" — with the agent's narration (assistant text followed by more
-// activity in the same turn) and humanized one-line steps interleaved inside. The final assistant
-// text renders as a normal bubble OUTSIDE the group (see the flush logic in Transcript below).
-// Approvals fold into their tool's row as a chip; an approval with no executed call (typically
-// declined) keeps its own "Wanted to …" row. Raw args+result stay one click away per row.
-
-type TurnRow =
-  | { type: "narr"; text: string }
-  | { type: "step"; tool: ToolItem; approval?: ApprovalItem }
-  | { type: "ask"; approval: ApprovalItem };
-
-function buildRows(items: TurnItem[]): TurnRow[] {
-  // First pass: tool rows in order; then pair each resolved approval with the nearest
-  // same-name tool that doesn't have one yet (approvals may stream before or after their call).
-  const rows: TurnRow[] = items
-    .filter((it): it is ToolItem | AssistantItem => it.kind !== "approval")
-    // Thinking-only assistant items (no text) carry nothing narratable — skip the row.
-    .filter((it) => it.kind !== "assistant" || it.text)
-    .map((it) =>
-      it.kind === "assistant"
-        ? { type: "narr" as const, text: it.text }
-        : { type: "step" as const, tool: it },
-    );
-  const approvals = items.filter(
-    (it): it is ApprovalItem => it.kind === "approval",
-  );
-  for (const ap of approvals) {
-    const at = items.indexOf(ap);
-    let bestRow: Extract<TurnRow, { type: "step" }> | null = null;
-    let bestDist = Infinity;
-    for (let i = 0; i < items.length; i++) {
-      const it = items[i];
-      if (it.kind !== "tool" || it.name !== ap.name) continue;
-      const row = rows.find((r) => r.type === "step" && r.tool === it) as
-        Extract<TurnRow, { type: "step" }> | undefined;
-      if (!row || row.approval) continue;
-      const dist = Math.abs(i - at);
-      if (dist < bestDist) {
-        bestRow = row;
-        bestDist = dist;
-      }
-    }
-    if (bestRow) bestRow.approval = ap;
-    else {
-      // No executed call to attach to (or it was declined) — the ask keeps its own row,
-      // placed where the approval sat in the stream.
-      const after = items
-        .slice(0, at)
-        .filter((it) => it.kind !== "approval").length;
-      rows.splice(after, 0, { type: "ask", approval: ap });
-    }
-  }
-  return rows;
-}
-
-function approvalChip(resolved: ApprovalDecision | undefined) {
-  if (resolved === "deny")
-    return (
-      <span className="text-[10.5px] px-1.5 rounded-full bg-dangerSoft text-danger shrink-0">
-        ✕ declined
-      </span>
-    );
-  return (
-    <span
-      className="text-[10.5px] px-1.5 rounded-full bg-okSoft text-ok shrink-0"
-      title={
-        resolved ? `approved · ${resolved.replace(/_/g, " ")}` : "approved"
-      }
-    >
-      ✓ approved
-    </span>
-  );
-}
-
-function LineText({ line }: { line: HumanLine }) {
-  return (
-    <span className="min-w-0 text-[13px] leading-relaxed">
-      <span className="text-muted">{line.pre}</span>
-      {line.obj && <span className="text-ink">{line.obj}</span>}
-      {line.post && <span className="text-muted">{line.post}</span>}
-    </span>
-  );
-}
-
-function StepRow({
-  tool,
-  approval,
-}: {
-  tool: ToolItem;
-  approval?: ApprovalItem;
-}) {
-  const [raw, setRaw] = useState(false);
-  const resolution = approval?.resolved ?? tool.resolved;
-  const statusKind = classifyStepStatus(tool.status);
-  const running =
-    statusKind === "running" && resolution !== "deny" && resolution !== "allow";
-  const failed =
-    statusKind === "failed" &&
-    !running &&
-    resolution !== "deny" &&
-    resolution !== "allow";
-  return (
-    <div>
-      <div
-        className="group flex items-center gap-2 px-2 py-1 rounded-lg hover:bg-paper"
-        data-testid="turn-step"
-      >
-        <span
-          className={
-            "w-4 text-center text-[10px] shrink-0 " +
-            (failed ? "text-danger" : running ? "text-accent" : "text-ok")
-          }
-        >
-          {running ? (
-            <span className="spinner" data-testid="step-running" />
-          ) : (
-            <Icon
-              name={
-                tool.name === "run_shell"
-                  ? "terminal"
-                  : tool.name === "grep" || tool.name === "search"
-                    ? "search"
-                    : tool.name === "read_file" ||
-                        tool.name === "write_file" ||
-                        tool.name.includes("file")
-                      ? "file"
-                      : tool.name.includes("todo") || tool.name.includes("plan")
-                        ? "board"
-                        : "wrench"
-              }
-              size={13}
-            />
-          )}
-        </span>
-        <LineText line={humanizeTool(tool.name, tool.args)} />
-        {resolution && approvalChip(resolution)}
-        {!!tool.standingRule && (
-          <span
-            className="text-[10.5px] px-1.5 rounded-full bg-tealSoft text-tealInk shrink-0"
-            data-testid="tool-standing-rule"
-            title={`Auto-allowed by this automation's standing approval: ${tool.standingRule}. Revoke on its Automations page.`}
-          >
-            auto-allowed
-          </span>
-        )}
-        {!!tool.hidden && (
-          <span
-            className="text-[11px] text-warnInk shrink-0"
-            data-testid="tool-hidden-count"
-            title={translate(
-              "Removed by your privacy filters before the agent saw the results \u2014 agents get no trace of these.",
-            )}
-          >
-            {tool.hidden} hidden
-          </span>
-        )}
-        {failed && (
-          <span className="text-[11px] text-danger shrink-0">
-            {tool.status}
-          </span>
-        )}
-        {!running && (
-          <button
-            className="ml-auto shrink-0 text-[11px] text-faint opacity-0 group-hover:opacity-100 cursor-pointer"
-            onClick={() => setRaw((v) => !v)}
-          >
-            {raw ? "hide" : "details"}
-          </button>
-        )}
-      </div>
-      {raw && (
-        <pre className="ml-8 mr-2 my-1 px-2.5 py-1.5 rounded-lg border border-line bg-paper font-mono text-[11.5px] leading-relaxed text-muted whitespace-pre-wrap break-words max-h-56 overflow-auto">
-          {`${tool.name}  ${shortArgs(tool.args)}`}
-          {tool.preview
-            ? `\n→ ${tool.preview.length > 1500 ? tool.preview.slice(0, 1500) + "\n…" : tool.preview}`
-            : ""}
-        </pre>
-      )}
-    </div>
-  );
-}
-
-function TurnGroup({
-  items,
-  live,
-  streamingText,
-}: {
-  items: TurnItem[];
-  live?: boolean;
-  // Sub-threshold streamed text belongs to THIS group (§33 ref #3): collapsed → it rides
-  // the header as the live line; expanded → the small quiet line under the steps.
-  streamingText?: string;
-}) {
-  const rows = buildRows(items);
-  return (
-    <div className="stepgroup flex flex-col gap-0.5">
-      {rows.map((row, i) =>
-        row.type === "narr" ? (
-          <div
-            className="turn-narr px-2 py-1 text-[13px] text-muted max-w-[60ch]"
-            key={i}
-            data-testid="turn-narration"
-          >
-            <Markdown text={row.text} />
-          </div>
-        ) : row.type === "ask" ? (
-          <div
-            className="flex items-baseline gap-2 px-2 py-1"
-            key={i}
-            data-testid="turn-ask"
-          >
-            <span
-              className={
-                "w-4 text-center text-[10px] shrink-0 " +
-                (row.approval.resolved === "deny" ? "text-danger" : "text-ok")
-              }
-            >
-              ●
-            </span>
-            <LineText
-              line={humanizeAsk(row.approval.name, row.approval.args)}
-            />
-            {approvalChip(row.approval.resolved)}
-          </div>
-        ) : (
-          <StepRow tool={row.tool} approval={row.approval} key={i} />
-        ),
-      )}
-      {streamingText && (
-        <div
-          className="turn-narr px-2 py-1 text-[13px] text-muted max-w-[60ch]"
-          data-testid="turn-live-stream"
-        >
-          <Markdown text={streamingText} />
-          <span className="stream-cursor">▍</span>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function formatWorkDuration(seconds: number | undefined): string {
-  if (seconds === undefined) return "";
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  return `${minutes}m ${seconds % 60}s`;
-}
-
-function WorkSegment({
-  items,
-  live,
-  streamingText,
-}: {
-  items: TurnItem[];
-  live?: boolean;
-  streamingText?: string;
-}) {
-  const [open, setOpen] = useState(Boolean(live));
-  useEffect(() => {
-    setOpen(Boolean(live));
-  }, [live]);
-  const thoughts = items.filter(
-    (item): item is AssistantItem =>
-      item.kind === "assistant" && Boolean(item.reasoning?.trim()),
-  );
-  const actionItems = items.filter(
-    (item) =>
-      item.kind !== "assistant" ||
-      Boolean(item.text?.trim()) ||
-      !item.reasoning?.trim(),
-  );
-  const duration = formatWorkDuration(workSegmentDuration(items));
-  const diff = workSegmentDiff(items);
-  const diffText =
-    diff.additions !== undefined || diff.deletions !== undefined
-      ? [
-          diff.additions !== undefined ? `+${diff.additions}` : "",
-          diff.deletions !== undefined ? `-${diff.deletions}` : "",
-        ]
-          .filter(Boolean)
-          .join(" ")
-      : "";
-  const suffix = [duration, diffText].filter(Boolean).join(" ");
-  return (
-    <div className="work-segment rounded-lg border border-line/70 mb-2">
-      <button
-        className="w-full flex items-center gap-2 px-3 py-2 text-left text-xs text-muted hover:text-ink"
-        aria-expanded={open}
-        data-testid="work-segment-toggle"
-        onClick={() => setOpen((value) => !value)}
-      >
-        <span className="text-[10px]">{open ? "⌄" : "›"}</span>
-        <span className="font-medium">
-          {live ? "Working" : "Worked"}
-          {suffix ? ` for ${suffix}` : ""}
-        </span>
-      </button>
-      {open && (
-        <div className="px-2 pb-2">
-          {thoughts.length > 0 && (
-            <details className="mb-1" open={false}>
-              <summary className="cursor-pointer px-2 py-1 text-xs text-muted">
-                Thoughts &gt;
-              </summary>
-              <div className="pl-2">
-                {thoughts.map((thought, index) => (
-                  <ThinkingBlock
-                    key={`${thought.ts || "thought"}-${index}`}
-                    text={thought.reasoning || ""}
-                  />
-                ))}
-              </div>
-            </details>
-          )}
-          <TurnGroup
-            items={actionItems}
-            live={live}
-            streamingText={streamingText}
-          />
-        </div>
-      )}
-    </div>
-  );
-}
-
-interface Props {
-  items: Item[];
+  events: TimelineEvent[];
+  running?: boolean;
   onApprove?: (
     item: Extract<Item, { kind: "approval" }>,
     decision: ApprovalDecision,
   ) => void;
-  // The session's live flag. While true, the FINAL run's trailing assistant text is still
-  // narration (status), not the answer — promoting it early made each line flash as a full
-  // ASSISTANT bubble and then vanish into the group when the next tool call arrived
-  // (owner report 2026-07-13). The answer bubble appears once, when the turn ends.
-  running?: boolean;
-  // Sub-threshold streamed text (streamGate mode "quiet") — handed to the live turn group.
-  streamingText?: string;
-  // Re-run the failed turn (no new user message). Offered only on a retriable notice that
-  // is the transcript tail of an idle session — anywhere else the error is history.
   onRetry?: () => void;
-}
-
-// The transcript index whose notice gets the Retry button: the tail error notice, looking
-// through info notices after it (model switches must not consume the retry — switching
-// models and THEN retrying is the intended recovery path). -1 when the tail is anything else.
-export function retryAnchor(items: Item[]): number {
-  for (let i = items.length - 1; i >= 0; i--) {
-    const it = items[i];
-    if (it.kind !== "notice") return -1;
-    if (it.retriable) return i;
-    if (it.tone !== "info") return -1;
-  }
-  return -1;
-}
-
-export function Transcript({
-  items,
-  running,
-  streamingText,
-  onRetry,
-  onApprove,
-}: Props) {
-  // §33 grouping: a turn = the maximal run of assistant/tool/resolved-approval items between
-  // breakers (user, connector, notices, plan/dir requests…). Trailing assistant texts are the
-  // ANSWER and render as bubbles after the group; interior assistant texts are narration and
-  // stay inside. A run with no activity at all is just bubbles (unchanged chat behavior).
-  const blocks: Array<
-    { turn: TurnItem[]; live?: boolean } | { item: Item; i: number }
-  > = [];
-  let run: TurnItem[] = [];
-  const flush = (live = false) => {
-    if (!run.length) return;
-    const turn = [...run];
-    run = [];
-    const answers: AssistantItem[] = [];
-    // A live run with tool activity keeps its trailing text inside as the status line;
-    // a live run with NO activity is a plain streaming reply — bubbles, as ever.
-    const keepTrailing = live && turn.some((it) => it.kind !== "assistant");
-    if (!keepTrailing)
-      while (turn.length && turn[turn.length - 1].kind === "assistant")
-        answers.unshift(turn.pop() as AssistantItem);
-    if (turn.some((it) => it.kind !== "assistant")) blocks.push({ turn, live });
-    else turn.forEach((t) => blocks.push({ item: t, i: -1 }));
-    answers.forEach((a) => blocks.push({ item: a, i: -1 }));
-  };
-  items.forEach((item, i) => {
-    if (item.kind === "notice" && isHiddenTimelineItem(item)) return;
-    if (
-      item.kind === "tool" ||
-      item.kind === "assistant" ||
-      (item.kind === "approval" && item.resolved)
-    )
-      run.push(item);
-    else if (
-      // PENDING interactive items render elsewhere (approval/question → composer head) and
-      // nothing here — if they broke the run, the trailing narration would flash into an
-      // answer bubble exactly while the user is being asked to decide.
-      (item.kind === "approval" ||
-        item.kind === "dirreq" ||
-        item.kind === "planreq" ||
-        item.kind === "question") &&
-      !item.resolved
-    ) {
-      if (item.kind === "approval") {
-        flush();
-        blocks.push({ item, i });
-      }
-      return;
-    } else {
-      flush();
-      blocks.push({ item, i });
-    }
-  });
-  flush(!!running);
-
-  const lastTurnIndex = blocks.reduce(
-    (acc, b, i) => ("turn" in b ? i : acc),
-    -1,
-  );
-  const currentActivity = [...items]
-    .reverse()
-    .find(
-      (item): item is Extract<Item, { kind: "notice" }> =>
-        item.kind === "notice" &&
-        (item.noticeKind === "status_update" ||
-          item.noticeKind === "simple_activity_update"),
-    );
+}) {
+  const nodes = buildTimeline(events);
   return (
     <div className="transcript">
-      {blocks.map((block, bi) => {
-        if ("turn" in block)
+      {nodes.map((node, index) => {
+        if (node.kind === "user")
           return (
-            <WorkSegment
-              items={block.turn}
-              live={block.live}
-              streamingText={
-                block.live && bi === lastTurnIndex ? streamingText : undefined
+            <div
+              className="group self-end max-w-[78%] flex flex-col items-end"
+              key={index}
+            >
+              <div className="bubble-user px-3.5 py-2.5 rounded-[14px_14px_4px_14px] bg-solid text-onSolid text-[14.5px] leading-relaxed whitespace-pre-wrap">
+                {node.attachments?.map((attachment) =>
+                  attachment.kind === "image" ? (
+                    <img
+                      key={attachment.name}
+                      className="msg-img"
+                      src={attachment.data_url}
+                      alt={attachment.name}
+                    />
+                  ) : (
+                    <span key={attachment.name} className="msg-file">
+                      📄 {attachment.name}
+                    </span>
+                  ),
+                )}
+                {node.text}
+              </div>
+              <BubbleMeta text={node.text} ts={node.ts} />
+            </div>
+          );
+        if (node.kind === "assistant")
+          return (
+            <div className="group bubble-assistant" key={index}>
+              <Markdown text={node.text} />
+              <BubbleMeta text={node.text} ts={node.ts} />
+            </div>
+          );
+        if (node.kind === "approval")
+          return (
+            <ApprovalCard
+              key={index}
+              item={{
+                kind: "approval",
+                callId: node.callId,
+                name: node.name,
+                args: node.args,
+                reason: "Tool action requires approval",
+              }}
+              compact
+              onApprove={(decision) =>
+                onApprove?.(
+                  {
+                    kind: "approval",
+                    callId: node.callId,
+                    name: node.name,
+                    args: node.args,
+                    reason: "Tool action requires approval",
+                  },
+                  decision,
+                )
               }
-              key={bi}
             />
           );
-        const { item } = block;
-        switch (item.kind) {
-          case "user":
-            return (
-              <div
-                className="group self-end max-w-[78%] flex flex-col items-end"
-                key={bi}
-              >
-                <div className="bubble-user px-3.5 py-2.5 rounded-[14px_14px_4px_14px] bg-solid text-onSolid text-[14.5px] leading-relaxed whitespace-pre-wrap">
-                  {item.attachments && item.attachments.length > 0 && (
-                    <div className="bubble-attachments">
-                      {item.attachments.map((a, i) =>
-                        a.kind === "image" ? (
-                          <img
-                            key={i}
-                            className="msg-img"
-                            src={a.data_url}
-                            alt={a.name}
-                          />
-                        ) : (
-                          <span key={i} className="msg-file">
-                            📄 {a.name}
-                          </span>
-                        ),
-                      )}
-                    </div>
-                  )}
-                  {item.text}
+        if (node.kind === "question")
+          return (
+            <div className="notice" key={index}>
+              {node.text}
+            </div>
+          );
+        if (node.kind === "notice")
+          return (
+            <div className="notice warn" key={index}>
+              {node.text}
+              {node.retriable && onRetry && !running && (
+                <button className="btn ml-2" onClick={onRetry}>
+                  Retry
+                </button>
+              )}
+            </div>
+          );
+        return (
+          <details
+            className="work-segment rounded-lg border border-line/70 mb-2"
+            key={index}
+          >
+            <summary className="cursor-pointer px-3 py-2 text-xs text-muted">
+              {node.label} {node.additions ? `+${node.additions}` : ""}{" "}
+              {node.deletions ? `−${node.deletions}` : ""}
+            </summary>
+            <div className="px-2 pb-2">
+              {node.rows.map((row, rowIndex) => (
+                <div className="transcript-item" key={rowIndex}>
+                  {row.label}
+                  {row.detail && <Thought text={row.detail} />}
                 </div>
-                <BubbleMeta text={item.text} ts={item.ts} align="right" />
-              </div>
-            );
-          case "approval":
-            if (item.resolved) {
-              return (
-                <div className="transcript-item approval" key={bi}>
-                  <span className="status">
-                    {item.resolved === "deny" ? "✕ declined" : "✓ approved"}
-                  </span>
-                </div>
-              );
-            }
-            return (
-              <ApprovalCard
-                key={bi}
-                item={item}
-                compact
-                onApprove={(decision) => onApprove?.(item, decision)}
-              />
-            );
-          case "assistant":
-            // Thinking-only item (stopped mid-reasoning): just the disclosure, no bubble.
-            if (!item.text && item.reasoning)
-              return (
-                <div key={bi}>
-                  <ThinkingBlock text={item.reasoning} />
-                </div>
-              );
-            if (!item.text) return null;
-            return (
-              <div className="group bubble-assistant" key={bi}>
-                {item.reasoning && <ThinkingBlock text={item.reasoning} />}
-                <Markdown text={item.text} />
-                <BubbleMeta text={item.text} ts={item.ts} align="left" />
-              </div>
-            );
-          case "dirreq":
-            if (!item.resolved) return null;
-            return (
-              <div className="approval-inline" key={bi}>
-                <span
-                  className={
-                    "status " + (item.resolved === "granted" ? "ok" : "denied")
-                  }
-                >
-                  {item.resolved === "granted" ? "✓" : "✕"}
-                </span>
-                <span>
-                  {item.resolved === "granted"
-                    ? "Granted folder access"
-                    : "Declined folder access"}
-                </span>
-                {item.path && <span className="dim">{item.path}</span>}
-              </div>
-            );
-          case "planreq":
-            if (!item.resolved) return null; // pending plan renders in the composer head
-            return (
-              <div className="bubble-assistant" key={bi}>
-                <div className="who">{translate("proposed plan")}</div>
-                <Markdown text={item.plan} />
-                <div className="approval-inline">
-                  <span
-                    className={
-                      "status " +
-                      (item.resolved === "approved" ? "ok" : "denied")
-                    }
-                  >
-                    {item.resolved === "approved" ? "✓" : "✕"}
-                  </span>
-                  <span>
-                    {item.resolved === "approved"
-                      ? "Plan approved"
-                      : "Sent back with feedback"}
-                  </span>
-                </div>
-              </div>
-            );
-          case "notice":
-            if (isHiddenTimelineItem(item)) return null;
-            if (isErrorNotice(item)) {
-              const error = providerErrorPresentation(item.text || "");
-              return (
-                <details
-                  className={"notice " + (item.tone === "warn" ? "warn" : "")}
-                  key={bi}
-                  data-testid="error-notice"
-                >
-                  <summary className="cursor-pointer">{error.summary}</summary>
-                  <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap text-xs opacity-80">
-                    {error.detail}
-                  </pre>
-                  {item.retriable &&
-                    !running &&
-                    onRetry &&
-                    block.i === retryAnchor(items) && (
-                      <button
-                        className="btn ml-2 mt-2"
-                        data-testid="notice-retry"
-                        onClick={onRetry}
-                      >
-                        Retry
-                      </button>
-                    )}
-                </details>
-              );
-            }
-            return (
-              <div
-                className={"notice " + (item.tone === "warn" ? "warn" : "")}
-                key={bi}
-              >
-                {item.text}
-                {item.retriable &&
-                  !running &&
-                  onRetry &&
-                  block.i === retryAnchor(items) && (
-                    <button
-                      className="btn ml-2"
-                      data-testid="notice-retry"
-                      onClick={onRetry}
-                    >
-                      Retry
-                    </button>
-                  )}
-              </div>
-            );
-          default:
-            return null;
-        }
+              ))}
+            </div>
+          </details>
+        );
       })}
       {running && (
         <div className="current-activity" data-testid="current-activity">
           <span className="spinner" />
-          <span>{currentActivity?.text || "Working"}</span>
+          <span>Working</span>
         </div>
       )}
     </div>

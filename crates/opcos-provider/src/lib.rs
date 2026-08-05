@@ -58,6 +58,14 @@ pub struct ToolCallDelta {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct StreamChunk {
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub event_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
     #[serde(default)]
     pub stream_reset: bool,
     pub text_delta: Option<String>,

@@ -343,6 +343,15 @@ pub struct AuditEvent {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SessionEventRecord {
+    pub session_id: String,
+    pub event_id: String,
+    pub event: serde_json::Value,
+    pub created_at_ms: i64,
+    pub sequence: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct EventRecord {
     pub event_id: String,
     pub kind: String,
@@ -1264,6 +1273,12 @@ fn migrate_legacy_transcript(connection: &Connection) -> Result<(), StoreError> 
 }
 
 pub trait SessionStore {
+    fn append_session_event(
+        &self,
+        session_id: &str,
+        event: &serde_json::Value,
+    ) -> Result<(), StoreError>;
+    fn load_session_events(&self, session_id: &str) -> Result<Vec<SessionEventRecord>, StoreError>;
     fn append_message(&self, message: &StoredMessage) -> Result<(), StoreError>;
     fn load_messages(&self, session_id: &str) -> Result<Vec<StoredMessage>, StoreError>;
     fn append_notice(&self, notice: &NoticeRecord) -> Result<(), StoreError>;
@@ -2064,6 +2079,71 @@ impl SqliteStore {
             params![session_id, sequence, kind, serde_json::to_string(payload)?],
         )?;
         Ok(())
+    }
+
+    pub fn append_session_event(
+        &self,
+        session_id: &str,
+        event: &serde_json::Value,
+    ) -> Result<(), StoreError> {
+        let event_id = event
+            .get("event_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| StoreError::Validation("session event_id is required".into()))?;
+        let created_at_ms = event
+            .get("created_at_ms")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| {
+                StoreError::Validation("session event created_at_ms is required".into())
+            })?;
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let sequence: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM session_events WHERE session_id=?1",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        connection.execute(
+            "INSERT OR IGNORE INTO session_events(session_id,event_id,event_json,created_at_ms,sequence)
+             VALUES (?1,?2,?3,?4,?5)",
+            params![
+                session_id,
+                event_id,
+                serde_json::to_string(event)?,
+                created_at_ms,
+                sequence
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_session_events(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<SessionEventRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT session_id,event_id,event_json,created_at_ms,sequence
+             FROM session_events WHERE session_id=?1 ORDER BY created_at_ms,sequence",
+        )?;
+        statement
+            .query_map([session_id], |row| {
+                let event_json: String = row.get(2)?;
+                Ok(SessionEventRecord {
+                    session_id: row.get(0)?,
+                    event_id: row.get(1)?,
+                    event: serde_json::from_str(&event_json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    created_at_ms: row.get(3)?,
+                    sequence: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     pub fn load_audit(&self, session_id: Option<&str>) -> Result<Vec<AuditEvent>, StoreError> {
@@ -3930,6 +4010,17 @@ impl SqliteStore {
                payload TEXT NOT NULL,
                PRIMARY KEY(session_id, sequence)
              );
+             CREATE TABLE IF NOT EXISTS session_events (
+               session_id TEXT NOT NULL,
+               event_id TEXT NOT NULL,
+               event_json TEXT NOT NULL,
+               created_at_ms INTEGER NOT NULL,
+               sequence INTEGER NOT NULL,
+               PRIMARY KEY(session_id, event_id),
+               UNIQUE(session_id, sequence)
+             );
+             CREATE INDEX IF NOT EXISTS idx_session_events_order
+               ON session_events(session_id, created_at_ms, sequence);
              CREATE TABLE IF NOT EXISTS compaction_state (
                session_id TEXT PRIMARY KEY,
                state TEXT NOT NULL
@@ -5428,6 +5519,18 @@ impl SqliteStore {
 }
 
 impl SessionStore for SqliteStore {
+    fn append_session_event(
+        &self,
+        session_id: &str,
+        event: &serde_json::Value,
+    ) -> Result<(), StoreError> {
+        SqliteStore::append_session_event(self, session_id, event)
+    }
+
+    fn load_session_events(&self, session_id: &str) -> Result<Vec<SessionEventRecord>, StoreError> {
+        SqliteStore::load_session_events(self, session_id)
+    }
+
     fn update_session_status(
         &self,
         session_id: &str,

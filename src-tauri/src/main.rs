@@ -11020,6 +11020,18 @@ async fn read_transcript(
         })
 }
 
+#[tauri::command]
+fn read_session_events(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Vec<Value>, String> {
+    state
+        .store
+        .load_session_events(&session_id)
+        .map_err(|error| error.to_string())
+        .map(|events| events.into_iter().map(|record| record.event).collect())
+}
+
 fn artifact_kind(path: &str) -> (&'static str, Option<&'static str>) {
     match path
         .rsplit('.')
@@ -21346,6 +21358,7 @@ fn main() {
             harness_options,
             change_harness,
             list_sessions,
+            read_session_events,
             read_transcript,
             submit_turn,
             list_artifacts,

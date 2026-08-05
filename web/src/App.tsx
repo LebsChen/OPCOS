@@ -27,14 +27,8 @@ import {
   submitFailureMessage,
   type PendingQuestionData,
 } from "./gui";
-import {
-  TranscriptViewItem,
-  isErrorNotice,
-  normalizeTranscript,
-  normalizeViewItems,
-  providerErrorPresentation,
-  reduceStreamEvent,
-} from "./transcript";
+import { isErrorNotice, providerErrorPresentation } from "./transcript";
+import { buildTimeline, mergeEvents, type TimelineEvent } from "./timeline";
 import { Sidebar } from "./components/Sidebar";
 import { sessionStatusLabel } from "./sessionStatus";
 import { Transcript } from "./components/Transcript";
@@ -43,7 +37,6 @@ import { Composer, PlusMenu, SendButton } from "./components/Composer";
 import { SelectMenu as OpenWorkerSelectMenu } from "./components/SelectMenu";
 import { SettingsView, type SettingsSection } from "./components/SettingsView";
 import { Icon } from "./components/Icon";
-import type { Item } from "./types";
 import { CollectionPage } from "./components/CollectionPage";
 import { IntegrationCard } from "./components/IntegrationCard";
 import { getLocale, setLocale, subscribeLocale, translate } from "./i18n";
@@ -9623,7 +9616,7 @@ function AppContent() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selected, setSelected] = useState<Session | null>(null);
   const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
-  const [transcript, setTranscript] = useState<TranscriptViewItem[]>([]);
+  const [transcript, setTranscript] = useState<TimelineEvent[]>([]);
   const [pendingQuestion, setPendingQuestion] =
     useState<PendingQuestion | null>(null);
   const [surface, setSurface] = useState<
@@ -9865,10 +9858,9 @@ function AppContent() {
     setRunning(false);
     if (!selected) return;
     void Promise.all([
-      command<Array<{ kind: string; payload: Record<string, unknown> }>>(
-        "read_transcript",
-        { sessionId: selected.id },
-      ),
+      command<TimelineEvent[]>("read_session_events", {
+        sessionId: selected.id,
+      }),
       command<InboxRecord[]>("list_inbox"),
     ])
       .then(([items, inboxItems]) => {
@@ -9884,19 +9876,7 @@ function AppContent() {
             pendingQuestionFromPayload(pending.call_id, pending.payload),
           );
         }
-        setTranscript(
-          normalizeTranscript(
-            items.filter(
-              (item) =>
-                !(
-                  item.kind === "approval" &&
-                  (item.payload.tool === "ask_user" ||
-                    item.payload.toolName === "ask_user") &&
-                  item.payload.status === "pending"
-                ),
-            ),
-          ),
-        );
+        setTranscript(mergeEvents([], items));
       })
       .catch((reason) => {
         if (generation.current === currentGeneration)
@@ -10037,12 +10017,16 @@ function AppContent() {
         )
           showErrorToast(noticeText);
       }
-      setTranscript((items) =>
-        reduceStreamEvent(items, {
-          kind: payload.kind,
-          payload: payload.payload,
-        }),
-      );
+      if (
+        payload.kind === "stream" &&
+        typeof payload.payload.event_id === "string" &&
+        typeof payload.payload.created_at_ms === "number" &&
+        typeof payload.payload.type === "string"
+      ) {
+        setTranscript((items) =>
+          mergeEvents(items, payload.payload as unknown as TimelineEvent),
+        );
+      }
     });
     return () => {
       active = false;
@@ -10150,71 +10134,9 @@ function AppContent() {
       onError(submitFailureMessage(reason));
     }
   };
-  const activeItems = useMemo(
-    () => normalizeViewItems(transcript),
+  const approvalPending = useMemo(
+    () => buildTimeline(transcript).some((item) => item.kind === "approval"),
     [transcript],
-  );
-  const transcriptItems = useMemo<Item[]>(() => {
-    const output: Item[] = [];
-    activeItems.forEach((item) => {
-      if (item.kind === "user")
-        output.push({ kind: "user", text: item.text || "" });
-      if (item.kind === "assistant")
-        output.push({
-          kind: "assistant",
-          text: item.text || "",
-          ts: item.timestamp,
-          reasoning: item.reasoning,
-        });
-      if (item.kind === "thinking")
-        output.push({
-          kind: "assistant",
-          text: "",
-          ts: item.timestamp,
-          reasoning: item.reasoning || item.text || "",
-        });
-      if (item.kind === "tool" && (item.approval || item.resolved))
-        output.push({
-          kind: "approval",
-          callId: item.callId,
-          name: item.toolName || "approval",
-          args: item.arguments,
-          reason: item.text || "Tool action requires approval",
-          resolved: item.resolved,
-        });
-      else if (item.kind === "tool")
-        output.push({
-          kind: "tool",
-          id: item.id,
-          name: item.toolName || "tool",
-          args: item.arguments,
-          status: item.status || "ok",
-          preview: item.result ? String(item.result) : undefined,
-          ts: item.timestamp,
-          diff: item.diff,
-        });
-      if (item.kind === "approval")
-        output.push({
-          kind: "approval",
-          callId: item.callId,
-          name: item.toolName || "approval",
-          args: item.arguments,
-          reason: item.text || "",
-          resolved: item.status === "ok" ? "allow" : undefined,
-        });
-      if (item.kind === "notice")
-        output.push({
-          kind: "notice",
-          tone: item.noticeKind === "error" ? "warn" : "info",
-          text: item.text || "",
-          noticeKind: item.noticeKind,
-        });
-    });
-    return output;
-  }, [activeItems]);
-  const approvalPending = activeItems.some(
-    (item) =>
-      item.kind === "tool" && item.approval && item.status === "pending",
   );
   const toggleAsset = (asset: Asset) => {
     if (!selected) return;
@@ -10415,7 +10337,7 @@ function AppContent() {
               <div className="main-chat">
                 <div className="main-scroll">
                   <Transcript
-                    items={transcriptItems}
+                    events={transcript}
                     running={running}
                     onApprove={(item, decision) => {
                       if (!item.callId) return;
@@ -10423,6 +10345,11 @@ function AppContent() {
                         sessionId: selected.id,
                         callId: item.callId,
                         approve: decision === "allow",
+                      }).catch(onError);
+                    }}
+                    onRetry={() => {
+                      void command("submit_turn", {
+                        request: { session_id: selected.id, text: "" },
                       }).catch(onError);
                     }}
                   />

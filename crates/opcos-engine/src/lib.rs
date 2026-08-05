@@ -19,7 +19,7 @@ use std::sync::{
     Arc, Mutex as StdMutex,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
@@ -828,22 +828,28 @@ where
         self.set_session_status("running", "none");
         let value = json!({"role":"user","content":[{"type":"text","text":text.into()}]});
         let result = async {
+            let text = value
+                .get("content")
+                .and_then(Value::as_array)
+                .and_then(|parts| parts.first())
+                .and_then(|part| part.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
             let event = WorkingEvent {
                 event_type: "user_message".into(),
                 category: "message".into(),
                 direction: "incoming".into(),
                 timestamp: Utc::now().to_rfc3339(),
-                payload: json!({"text":"user message"}),
+                payload: json!({"message":text}),
             };
-            self.recorder.append_audit(
-                "working_event",
-                &serde_json::to_value(&event)
-                    .map_err(|error| EngineError::Store(error.to_string()))?,
+            self.emit_event(
+                "user_message",
+                StreamChunk {
+                    working_event: Some(event),
+                    ..StreamChunk::default()
+                },
             )?;
-            let _ = self.events.try_send(StreamChunk {
-                working_event: Some(event),
-                ..StreamChunk::default()
-            });
             self.append("user", value).await?;
             self.run_loop(self.provider_messages()?).await
         }
@@ -1224,28 +1230,51 @@ where
                 .complete_tool_call(&self.session_id, message_sequence, &call.id, &result)
                 .map_err(|error| EngineError::Store(error.to_string()))?;
             let category = tool_event_category(&call.name);
-            let _ = self
-                .working_event(
-                    &format!("{}_completed", call.name),
-                    category,
-                    json!({
-                        "call_id":call.id,
-                        "tool":call.name,
-                        "ok":result.get("error").is_none(),
-                        "result_type":if result.is_object() {"object"} else if result.is_array() {"array"} else {"value"},
-                        "result_bytes":result.to_string().len(),
+            if call.name == "run_shell" {
+                let output = result
+                    .get("output")
+                    .or_else(|| result.get("stdout"))
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| result.to_string());
+                let _ = self
+                    .working_event(
+                        "shell_process_completed",
+                        "shell",
+                        json!({
+                            "process_id": call.id,
+                            "exit_code": result.get("exit_code").and_then(Value::as_i64).unwrap_or_else(|| if result.get("error").is_some() { 1 } else { 0 }),
+                            "output_trunc": output.chars().take(4000).collect::<String>(),
+                        }),
+                    )
+                    .await;
+            } else {
+                let _ = self
+                    .working_event(
+                        &format!("{}_completed", call.name),
+                        category,
+                        json!({
+                            "call_id":call.id,
+                            "tool":call.name,
+                            "path": call.arguments.get("path").or_else(|| call.arguments.get("target")),
+                            "ok":result.get("error").is_none(),
+                            "result_type":if result.is_object() {"object"} else if result.is_array() {"array"} else {"value"},
+                            "result_bytes":result.to_string().len(),
+                        }),
+                    )
+                    .await;
+            }
+            let _ = self.emit_event(
+                "tool_result",
+                StreamChunk {
+                    tool_result: Some(ToolResult {
+                        call_id: call.id,
+                        name: call.name,
+                        arguments: call.arguments,
+                        result,
                     }),
-                )
-                .await;
-            let _ = self.events.try_send(StreamChunk {
-                tool_result: Some(ToolResult {
-                    call_id: call.id,
-                    name: call.name,
-                    arguments: call.arguments,
-                    result,
-                }),
-                ..StreamChunk::default()
-            });
+                    ..StreamChunk::default()
+                },
+            );
         }
         drop(active);
         self.run_loop(self.provider_messages()?).await
@@ -1471,14 +1500,20 @@ where
                         .working_event(
                             "devin_message",
                             "message",
-                            json!({"has_text":turn.text.is_some(),"tool_calls":turn.tool_calls.len()}),
+                            json!({
+                                "message": turn.text.clone().unwrap_or_default(),
+                                "tool_calls": turn.tool_calls.len()
+                            }),
                         )
                         .await;
                     if !partial.turn_emitted {
-                        let _ = self.events.try_send(StreamChunk {
-                            turn: Some(turn.clone()),
-                            ..StreamChunk::default()
-                        });
+                        let _ = self.emit_event(
+                            "turn",
+                            StreamChunk {
+                                turn: Some(turn.clone()),
+                                ..StreamChunk::default()
+                            },
+                        );
                     }
                     let assistant_sequence = *self.sequence.lock().await;
                     messages.push(assistant);
@@ -1636,7 +1671,7 @@ where
                     }
                     if chunk.stream_reset {
                         partial = PartialOutput::default();
-                        let _ = self.events.try_send(chunk);
+                        let _ = self.emit_event("stream_reset", chunk);
                         continue;
                     }
                     if let Some(text) = chunk.text_delta.clone() {
@@ -1648,7 +1683,20 @@ where
                     if chunk.turn.is_some() {
                         partial.turn_emitted = true;
                     }
-                    let _ = self.events.try_send(chunk);
+                    let event_type = if chunk.text_delta.is_some() {
+                        "assistant_delta"
+                    } else if chunk.reasoning_delta.is_some() {
+                        "reasoning_delta"
+                    } else if chunk.tool_call_delta.is_some() {
+                        "tool_call_delta"
+                    } else if chunk.tool_result.is_some() {
+                        "tool_result"
+                    } else if chunk.turn.is_some() {
+                        "turn"
+                    } else {
+                        "stream"
+                    };
+                    let _ = self.emit_event(event_type, chunk);
                 }
                 _ = self.interrupt_notify.notified() => {
                     return (Err(ProviderError::Protocol("interrupted".into())), partial);
@@ -1759,17 +1807,32 @@ where
                 .map(|arguments| arguments.keys().cloned().collect::<Vec<_>>())
                 .unwrap_or_default();
             let category = tool_event_category(&call.name);
-            let _ = self
-                .working_event(
-                    &format!("{}_started", call.name),
-                    category,
-                    json!({
-                        "call_id":call.id,
-                        "tool":call.name,
-                        "argument_keys":argument_keys,
-                    }),
-                )
-                .await;
+            if call.name == "run_shell" {
+                let _ = self
+                    .working_event(
+                        "shell_process_started",
+                        "shell",
+                        json!({
+                            "command": call.arguments.get("command").and_then(Value::as_str).unwrap_or_default(),
+                            "shell_id": call.id,
+                            "process_id": call.id,
+                            "starting_dir": self.workspace.clone(),
+                        }),
+                    )
+                    .await;
+            } else {
+                let _ = self
+                    .working_event(
+                        &format!("{}_started", call.name),
+                        category,
+                        json!({
+                            "call_id":call.id,
+                            "tool":call.name,
+                            "argument_keys":argument_keys,
+                        }),
+                    )
+                    .await;
+            }
             let mode = *self.mode.lock().await;
             let target = self.executor.policy_target(&call.name, &call.arguments);
             let preflight = self
@@ -1828,17 +1891,44 @@ where
                     readonly.push((index, call));
                 }
                 Decision::Allow => {
-                    results[index] = Some(if call.name == "propose_plan" {
+                    let previous = if matches!(call.name.as_str(), "write_file" | "edit_file") {
+                        self.executor
+                            .execute(
+                                "read_file",
+                                json!({"path": call.arguments.get("path").and_then(Value::as_str).unwrap_or_default()}),
+                            )
+                            .await
+                            .ok()
+                            .and_then(|value| value.get("content").and_then(Value::as_str).map(str::to_owned))
+                    } else {
+                        None
+                    };
+                    let result = if call.name == "propose_plan" {
                         self.execute_proposed_plan(&call.arguments)
                     } else {
                         self.execute_tool_with_hooks(call).await
-                    });
+                    };
+                    if matches!(call.name.as_str(), "write_file" | "edit_file") {
+                        self.emit_file_change(call, previous.as_deref()).await;
+                    }
+                    results[index] = Some(result);
                 }
                 Decision::Deny => {
                     self.policy_denied.store(true, Ordering::SeqCst);
                     results[index] = Some(json!({"error":"tool call denied by policy"}))
                 }
                 Decision::NeedsUser => {
+                    let _ = self
+                        .working_event(
+                            "approval_pending",
+                            "message",
+                            json!({
+                                "call_id": call.id,
+                                "tool": call.name,
+                                "arguments": call.arguments,
+                            }),
+                        )
+                        .await;
                     let completed_reads = futures_util::future::join_all(readonly.drain(..).map(
                         |(read_index, read_call): (usize, &ToolCall)| async move {
                             let result = self.execute_tool_with_hooks(read_call).await;
@@ -1934,6 +2024,59 @@ where
             .unwrap_or_else(|error| json!({"error":error}))
     }
 
+    async fn emit_file_change(&self, call: &ToolCall, previous: Option<&str>) {
+        let path = call
+            .arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let old = previous.unwrap_or_default();
+        let new = if call.name == "write_file" {
+            call.arguments
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        } else {
+            let mut content = old.to_owned();
+            for edit in call
+                .arguments
+                .get("edits")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let old_string = edit
+                    .get("old_string")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let new_string = edit
+                    .get("new_string")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                content = content.replacen(old_string, new_string, 1);
+            }
+            content
+        };
+        let (lines_added, lines_removed) = line_diff_counts(old, &new);
+        let _ = self
+            .working_event(
+                "multi_edit_result",
+                "file",
+                json!({
+                    "file_updates": [{
+                        "file_path": path,
+                        "action_type": if call.name == "write_file" && previous.is_none() { "create" } else { "edit" },
+                        "start_line": 1,
+                        "end_line": new.lines().count().max(1),
+                        "lines_added": lines_added,
+                        "lines_removed": lines_removed,
+                    }]
+                }),
+            )
+            .await;
+    }
+
     async fn persist_tool_results(
         &self,
         assistant_sequence: i64,
@@ -1952,19 +2095,38 @@ where
                 .complete_tool_call(&self.session_id, assistant_sequence, &call.id, &result)
                 .map_err(|error| EngineError::Store(error.to_string()))?;
             let category = tool_event_category(&call.name);
-            let _ = self
-                .working_event(
-                    &format!("{}_completed", call.name),
-                    category,
-                    json!({
-                        "call_id":call.id,
-                        "tool":call.name,
-                        "ok":result.get("error").is_none(),
-                        "result_type":if result.is_object() {"object"} else if result.is_array() {"array"} else {"value"},
-                        "result_bytes":result.to_string().len(),
-                    }),
-                )
-                .await;
+            if call.name != "run_shell" {
+                let _ = self
+                    .working_event(
+                        &format!("{}_completed", call.name),
+                        category,
+                        json!({
+                            "call_id":call.id,
+                            "tool":call.name,
+                            "ok":result.get("error").is_none(),
+                            "result_type":if result.is_object() {"object"} else if result.is_array() {"array"} else {"value"},
+                            "result_bytes":result.to_string().len(),
+                        }),
+                    )
+                    .await;
+            } else {
+                let output = result
+                    .get("output")
+                    .or_else(|| result.get("stdout"))
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| result.to_string());
+                let _ = self
+                    .working_event(
+                        "shell_process_completed",
+                        "shell",
+                        json!({
+                            "process_id": call.id,
+                            "exit_code": result.get("exit_code").and_then(Value::as_i64).unwrap_or_else(|| if result.get("error").is_some() { 1 } else { 0 }),
+                            "output_trunc": output.chars().take(4000).collect::<String>(),
+                        }),
+                    )
+                    .await;
+            }
             if (call.name == "propose_plan"
                 || call.name == "plan_update"
                 || call.name == "plan_revise")
@@ -1982,15 +2144,18 @@ where
                     )
                     .await;
             }
-            let _ = self.events.try_send(StreamChunk {
-                tool_result: Some(ToolResult {
-                    call_id: call.id.clone(),
-                    name: call.name.clone(),
-                    arguments: call.arguments.clone(),
-                    result,
-                }),
-                ..StreamChunk::default()
-            });
+            let _ = self.emit_event(
+                "tool_result",
+                StreamChunk {
+                    tool_result: Some(ToolResult {
+                        call_id: call.id.clone(),
+                        name: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                        result,
+                    }),
+                    ..StreamChunk::default()
+                },
+            );
         }
         Ok(())
     }
@@ -2441,7 +2606,7 @@ where
                 session_id: self.session_id.clone(),
                 sequence: *sequence,
                 role: role.into(),
-                content,
+                content: content.clone(),
                 display_only: false,
             })
             .map_err(|error| EngineError::Store(error.to_string()))
@@ -2455,9 +2620,23 @@ where
                 session_id: self.session_id.clone(),
                 sequence: *sequence,
                 kind: kind.into(),
-                content,
+                content: content.clone(),
             })
-            .map_err(|error| EngineError::Store(error.to_string()))
+            .map_err(|error| EngineError::Store(error.to_string()))?;
+        let event = WorkingEvent {
+            event_type: kind.into(),
+            category: "notice".into(),
+            direction: "outgoing".into(),
+            timestamp: Utc::now().to_rfc3339(),
+            payload: json!({"message": content}),
+        };
+        self.emit_event(
+            kind,
+            StreamChunk {
+                working_event: Some(event),
+                ..StreamChunk::default()
+            },
+        )
     }
 
     async fn working_event(
@@ -2486,10 +2665,30 @@ where
             "working_event",
             &serde_json::to_value(&event).map_err(|error| EngineError::Store(error.to_string()))?,
         )?;
-        let _ = self.events.try_send(StreamChunk {
-            working_event: Some(event),
-            ..StreamChunk::default()
-        });
+        self.emit_event(
+            event_type,
+            StreamChunk {
+                working_event: Some(event),
+                ..StreamChunk::default()
+            },
+        )
+    }
+
+    fn emit_event(&self, event_type: &str, mut chunk: StreamChunk) -> Result<(), EngineError> {
+        let created_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| EngineError::Store(error.to_string()))?
+            .as_millis() as i64;
+        chunk.event_type = Some(event_type.to_owned());
+        chunk.event_id = Some(format!("event-{}", uuid::Uuid::new_v4()));
+        chunk.created_at_ms = Some(created_at_ms);
+        chunk.timestamp = Some(Utc::now().to_rfc3339());
+        let event =
+            serde_json::to_value(&chunk).map_err(|error| EngineError::Store(error.to_string()))?;
+        self.store
+            .append_session_event(&self.session_id, &event)
+            .map_err(|error| EngineError::Store(error.to_string()))?;
+        let _ = self.events.try_send(chunk);
         Ok(())
     }
 }
@@ -2560,6 +2759,57 @@ fn tool_event_category(name: &str) -> &'static str {
         "todo"
     } else {
         "other"
+    }
+}
+
+fn line_diff_counts(old: &str, new: &str) -> (usize, usize) {
+    let old_lines = old.lines().collect::<Vec<_>>();
+    let new_lines = new.lines().collect::<Vec<_>>();
+    const EXACT_LINE_LIMIT: usize = 5_000;
+    if old_lines.len() > EXACT_LINE_LIMIT || new_lines.len() > EXACT_LINE_LIMIT {
+        let mut old_counts = HashMap::<&str, usize>::new();
+        let mut new_counts = HashMap::<&str, usize>::new();
+        for line in old_lines {
+            *old_counts.entry(line).or_default() += 1;
+        }
+        for line in new_lines {
+            *new_counts.entry(line).or_default() += 1;
+        }
+        let common = old_counts
+            .iter()
+            .map(|(line, count)| (*count).min(*new_counts.get(line).unwrap_or(&0)))
+            .sum::<usize>();
+        return (
+            new_counts.values().sum::<usize>() - common,
+            old_counts.values().sum::<usize>() - common,
+        );
+    }
+
+    let (shorter, longer, swapped) = if old_lines.len() <= new_lines.len() {
+        (&old_lines, &new_lines, false)
+    } else {
+        (&new_lines, &old_lines, true)
+    };
+    let mut previous = vec![0usize; shorter.len() + 1];
+    let mut current = vec![0usize; shorter.len() + 1];
+    for long_line in longer {
+        for (index, short_line) in shorter.iter().enumerate() {
+            current[index + 1] = if long_line == short_line {
+                previous[index] + 1
+            } else {
+                previous[index + 1].max(current[index])
+            };
+        }
+        std::mem::swap(&mut previous, &mut current);
+        current.fill(0);
+    }
+    let common = previous[shorter.len()];
+    let additions = new_lines.len() - common;
+    let deletions = old_lines.len() - common;
+    if swapped {
+        (deletions, additions)
+    } else {
+        (additions, deletions)
     }
 }
 
@@ -3204,6 +3454,51 @@ mod tests {
     use async_trait::async_trait;
     use opcos_provider::ToolCallDelta;
     use opcos_store::{SessionRecord, SessionStore, SqliteStore};
+
+    #[test]
+    fn file_change_counts_use_real_line_content() {
+        assert_eq!(line_diff_counts("one\ntwo\n", "one\nthree\nfour\n"), (2, 1));
+    }
+
+    #[test]
+    fn large_file_change_counts_use_bounded_fallback() {
+        let old = (0..6_001)
+            .map(|index| {
+                if index == 3_000 {
+                    "old-line".to_owned()
+                } else {
+                    format!("line-{index}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new = old.replacen("old-line", "new-line", 1);
+        assert_eq!(line_diff_counts(&old, &new), (1, 1));
+    }
+
+    #[test]
+    fn session_event_round_trip_preserves_streamed_object() {
+        let path =
+            std::env::temp_dir().join(format!("opcos-events-{}.sqlite", uuid::Uuid::new_v4()));
+        let store = SqliteStore::open(&path).unwrap();
+        let event = json!({
+            "type": "devin_message",
+            "event_id": "event-test",
+            "created_at_ms": 42,
+            "timestamp": "2025-01-01T00:00:00Z",
+            "message": "The work is complete."
+        });
+        store.append_session_event("session", &event).unwrap();
+        assert_eq!(
+            store.load_session_events("session").unwrap()[0].event,
+            event
+        );
+        assert_eq!(
+            store.load_session_events("session").unwrap()[0].event["message"],
+            "The work is complete."
+        );
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn host_capability_filter_removes_unsupported_tools() {
