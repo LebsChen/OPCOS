@@ -228,9 +228,9 @@ search、mcp、todo、lifecycle、reasoning、iteration 和 context 事件。下
 - PR 事件（`pr_created`、`pr_comment`、`pr_merge_conflict`）尚未增加专用
   集成事件；现有 git/PR 工具仍通过工具生命周期事件记录。
 
-## 4. Devin event stream 对照（本地代码证据版）
+## 5. Devin event stream 对照（本地代码证据版）
 
-### 4.1 OPCOS 实际发出的 working-event vocabulary
+### 5.1 OPCOS 实际发出的 working-event vocabulary
 
 working event 的共同 envelope 在 `crates/opcos-engine/src/lib.rs:3103-3138`
 创建，字段为 `event_type`、`category`、`direction`、`timestamp`、`payload`。
@@ -275,7 +275,7 @@ work-queue tool；具体目录见 `crates/opcos-engine/src/lib.rs:3847-4055`。`
 `mode_current`、`mode_changed`、`model_current`、`session_list`、`slash_help` 等
 notice 类型；它们共用 `message`/可选 `payload`，不是 Devin 的 shell/file vocabulary。
 
-### 4.2 OPCOS 实际消费与渲染的类型
+### 5.2 OPCOS 实际消费与渲染的类型
 
 `web/src/timeline.ts:235-250` 明确丢弃
 `iteration_stats`、`context_growth_update`、`simple_activity_update`、
@@ -302,7 +302,7 @@ notice 类型；它们共用 `message`/可选 `payload`，不是 Devin 的 shell
   (`web/src/App.tsx:3237-3343`) 则把所有 working payload 当作通用字段表，不理解
   Devin 的类型语义。
 
-### 4.3 Devin 类型 → OPCOS 类型映射
+### 5.3 Devin 类型 → OPCOS 类型映射
 
 | Devin type | OPCOS type / verdict | 结论 |
 |---|---|---|
@@ -339,7 +339,7 @@ notice 类型；它们共用 `message`/可选 `payload`，不是 Devin 的 shell
 | `auto_route_decision` | 无 | **缺失**：模型/provider routing 选择不进 working event。 |
 | `acu_consumption_at_last_user_interaction` | 无 | **缺失**：OPCOS 没有 ACU 字段或计量事件。 |
 
-### 4.4 按用户可见影响排序的 gap backlog
+### 5.4 按用户可见影响排序的 gap backlog
 
 | 优先级 / gap | 证据（Devin 字段 + OPCOS 代码路径） | 用户可见影响 | 努力 |
 |---|---|---|---|
