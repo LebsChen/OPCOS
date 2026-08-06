@@ -9112,6 +9112,7 @@ function SessionRightPanel({
   onCollapsedChange,
   width,
   onWidthChange,
+  eventRefreshKey,
 }: {
   selected: Session;
   onError: (error: unknown) => void;
@@ -9122,6 +9123,7 @@ function SessionRightPanel({
   onCollapsedChange?: (collapsed: boolean) => void;
   width: number;
   onWidthChange: (width: number) => void;
+  eventRefreshKey: string;
 }) {
   const [panelTab, setPanelTab] = useState<PanelTab>("info");
   const [opened, setOpened] = useState<PanelTab[]>(["info"]);
@@ -9143,7 +9145,7 @@ function SessionRightPanel({
     })
       .then(setIterationEvents)
       .catch(onError);
-  }, [selected.id]);
+  }, [selected.id, eventRefreshKey, running]);
   const informationTabs: Array<{
     id: typeof panelTab;
     label: string;
@@ -10999,6 +11001,7 @@ function AppContent() {
         <SessionRightPanel
           selected={selected}
           running={effectiveRunning}
+          eventRefreshKey={`${transcript.length}:${transcript.at(-1)?.event_id ?? ""}`}
           collapsed={drawerCollapsed}
           providers={providers}
           onProviderChange={(provider) =>

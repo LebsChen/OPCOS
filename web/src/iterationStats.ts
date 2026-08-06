@@ -76,8 +76,7 @@ export function summarizeIterationStats(
         retryCount: numberOrNull(data.retry_count),
         compactionCount: numberOrNull(data.compaction_count),
       };
-    })
-    .sort((a, b) => a.iteration - b.iteration);
+    });
   const compactions = events
     .filter((event) => eventType(event) === "compacted")
     .map((event) => String(payload(event).source ?? "automatic"));

@@ -45,20 +45,25 @@ describe("iteration stats", () => {
   });
 
   it("assigns stable unique detail indexes when iteration numbers repeat", () => {
-    const first = JSON.parse(JSON.stringify(fixture[1])) as TimelineEvent;
+    const first = JSON.parse(JSON.stringify(fixture[3])) as TimelineEvent;
     const second = JSON.parse(JSON.stringify(fixture[1])) as TimelineEvent;
-    (second.working_event as Record<string, unknown>).payload = {
-      ...((second.working_event as Record<string, unknown>).payload as Record<
+    const third = JSON.parse(JSON.stringify(fixture[1])) as TimelineEvent;
+    (third.working_event as Record<string, unknown>).payload = {
+      ...((third.working_event as Record<string, unknown>).payload as Record<
         string,
         unknown
       >),
       iteration: 1,
     };
-    const summary = summarizeIterationStats([first, second]);
-    expect(summary.iterations.map((item) => item.detailIndex)).toEqual([1, 2]);
-    expect(summary.iterations.map((item) => item.iteration)).toEqual([1, 1]);
+    const summary = summarizeIterationStats([first, second, third]);
+    expect(summary.iterations.map((item) => item.detailIndex)).toEqual([
+      1, 2, 3,
+    ]);
+    expect(summary.iterations.map((item) => item.iteration)).toEqual([2, 1, 1]);
     expect(
-      summarizeIterationStats(JSON.parse(JSON.stringify([first, second]))),
+      summarizeIterationStats(
+        JSON.parse(JSON.stringify([first, second, third])),
+      ),
     ).toEqual(summary);
   });
 });
