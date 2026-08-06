@@ -3509,7 +3509,6 @@ fn windows_persistent_command(
     cwd: &Path,
     change_cwd: bool,
 ) -> Result<String, HostError> {
-    let prefix = powershell_env_prefix(env)?.unwrap_or_default();
     let (env_setup, env_restore) = powershell_env_scope(env)?;
     let directory = if change_cwd {
         format!(
@@ -3529,7 +3528,7 @@ fn windows_persistent_command(
          $ProgressPreference='SilentlyContinue'; \
          $global:LASTEXITCODE=0; $opcos_exit=0; \
          try {{ \
-             {env_setup}{directory}{prefix}$null | & {{ Invoke-Expression ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{payload}'))) }} > '{output_path}' 2>&1; \
+             {env_setup}{directory}$null | & {{ Invoke-Expression ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{payload}'))) }} > '{output_path}' 2>&1; \
              $opcos_exit=if ($?) {{ if ($null -eq $LASTEXITCODE) {{ 0 }} else {{ $LASTEXITCODE }} }} else {{ 1 }} \
          }} catch {{ \
              $opcos_exit=1; ($_ | Out-String) | Out-File -LiteralPath '{output_path}' -Append -Encoding utf8 \
@@ -3557,7 +3556,6 @@ fn windows_persistent_streaming_command(
     cwd: &Path,
     change_cwd: bool,
 ) -> Result<String, HostError> {
-    let prefix = powershell_env_prefix(env)?.unwrap_or_default();
     let (env_setup, env_restore) = powershell_env_scope(env)?;
     let directory = if change_cwd {
         format!(
@@ -3581,7 +3579,7 @@ fn windows_persistent_streaming_command(
          Remove-Item -LiteralPath '{staging_path}' -Force -ErrorAction SilentlyContinue; \
          $global:LASTEXITCODE=0; $opcos_exit=0; \
          try {{ \
-             {env_setup}{directory}{prefix}$null | & {{ Invoke-Expression ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{payload}'))) }} > '{staging_path}' 2>&1; \
+             {env_setup}{directory}$null | & {{ Invoke-Expression ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{payload}'))) }} > '{staging_path}' 2>&1; \
              $opcos_exit=if ($?) {{ if ($null -eq $LASTEXITCODE) {{ 0 }} else {{ $LASTEXITCODE }} }} else {{ 1 }} \
          }} catch {{ \
              $opcos_exit=1; ($_ | Out-String) | Out-File -LiteralPath '{staging_path}' -Append -Encoding utf8 \
@@ -3659,7 +3657,8 @@ fn powershell_env_scope(env: Option<&Value>) -> Result<(String, String), HostErr
     }
 }
 
-fn powershell_env_prefix(env: Option<&Value>) -> Result<Option<String>, HostError> {
+#[cfg(not(windows))]
+fn persistent_env_prefix(env: Option<&Value>) -> Result<Option<String>, HostError> {
     let Some(Value::Object(values)) = env else {
         return Ok(None);
     };
@@ -3667,64 +3666,18 @@ fn powershell_env_prefix(env: Option<&Value>) -> Result<Option<String>, HostErro
         .iter()
         .filter_map(|(key, value)| value.as_str().map(|value| (key, value)))
         .map(|(key, value)| {
-            if !is_shell_identifier(key) {
-                return Err(HostError::InvalidResponse(
-                    "process environment contains an invalid variable name".into(),
-                ));
-            }
-            Ok(format!("$env:{key}='{}'; ", powershell_single_quote(value)))
+            format!(
+                "{}='{}'; export {}; ",
+                key,
+                value.replace('\'', "'\\''"),
+                key
+            )
         })
-        .collect::<Result<String, _>>()?;
-    Ok((!prefix.is_empty()).then_some(prefix))
-}
-
-#[cfg_attr(windows, allow(dead_code))]
-fn persistent_env_prefix(env: Option<&Value>) -> Result<Option<String>, HostError> {
-    let Some(Value::Object(values)) = env else {
-        #[cfg(windows)]
-        {
-            return Ok(None);
-        }
-        #[cfg(not(windows))]
-        {
-            return Ok(None);
-        }
-    };
-    let prefix = values
-        .iter()
-        .filter_map(|(key, value)| value.as_str().map(|value| (key, value)))
-        .map(|(key, value)| -> Result<String, HostError> {
-            #[cfg(windows)]
-            {
-                if !is_shell_identifier(key) {
-                    return Err(HostError::InvalidResponse(
-                        "process environment contains an invalid variable name".into(),
-                    ));
-                }
-                Ok(format!("$env:{key}='{}'; ", powershell_single_quote(value)))
-            }
-            #[cfg(not(windows))]
-            {
-                Ok(format!(
-                    "{}='{}'; export {}; ",
-                    key,
-                    value.replace('\'', "'\\''"),
-                    key
-                ))
-            }
-        })
-        .collect::<Result<String, _>>()?;
-    #[cfg(windows)]
-    {
-        Ok((!prefix.is_empty()).then_some(prefix))
-    }
-    #[cfg(not(windows))]
-    {
-        if prefix.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(prefix))
-        }
+        .collect::<String>();
+    if prefix.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(prefix))
     }
 }
 
@@ -3737,22 +3690,13 @@ async fn spawn_persistent_shell(
     secret_values: &SecretValues,
 ) -> Result<(Child, ChildStdin, ChildStdout, String), HostError> {
     #[cfg(windows)]
-    let (mut process, interpreter) = {
-        let (executable, interpreter) = if std::process::Command::new("pwsh.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", "exit 0"])
-            .status()
-            .is_ok()
-        {
-            ("pwsh.exe", "pwsh")
-        } else {
-            ("powershell.exe", "powershell")
-        };
-        let mut process = Command::new(executable);
+    let (mut process, mut interpreter) = {
+        let mut process = Command::new("pwsh.exe");
         process
             .args(["-NoProfile", "-NonInteractive", "-Command", "-"])
             .current_dir(cwd);
         configure_no_window(&mut process);
-        (process, interpreter.to_owned())
+        (process, "pwsh".to_owned())
     };
     #[cfg(not(windows))]
     let (mut process, mut interpreter) = {
@@ -3789,7 +3733,23 @@ async fn spawn_persistent_shell(
             child
         }
         #[cfg(windows)]
-        Err(error) => return Err(HostError::Io(error)),
+        Err(_) => {
+            let mut fallback = Command::new("powershell.exe");
+            fallback
+                .args(["-NoProfile", "-NonInteractive", "-Command", "-"])
+                .current_dir(cwd);
+            configure_no_window(&mut fallback);
+            let child = fallback
+                .env_clear()
+                .envs(&environment)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(HostError::Io)?;
+            interpreter = "powershell".to_owned();
+            child
+        }
     };
     let stdin = child
         .stdin
@@ -5181,6 +5141,7 @@ mod tests {
         )
         .unwrap();
         assert!(with_env.contains("$env:OPCOS_TEST='value'; "));
+        assert_eq!(with_env.matches("$env:OPCOS_TEST='value';").count(), 1);
         assert!(with_env.contains("$opcos_env_present['OPCOS_TEST']"));
         assert!(with_env.contains("[Environment]::SetEnvironmentVariable"));
         assert!(with_env.contains("Remove-Item -LiteralPath 'Env:OPCOS_TEST'"));
