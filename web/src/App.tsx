@@ -22,7 +22,9 @@ import {
   hostFailureMessage,
   hostStatusLabel,
   errorMessage,
+  effectiveRunningState,
   pendingQuestionFromPayload,
+  reconcileRunningState,
   redactApproval,
   submitFailureMessage,
   type PendingQuestionData,
@@ -847,7 +849,7 @@ function ProjectDialog({
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4">
       <form
-        className="w-full max-w-lg rounded-xl border border-line bg-panel p-6 shadow-xl"
+        className="flex max-h-[90vh] w-full max-w-lg flex-col rounded-xl border border-line bg-panel p-6 shadow-xl"
         onSubmit={submit}
       >
         <div className="flex items-center justify-between">
@@ -856,118 +858,120 @@ function ProjectDialog({
             关闭
           </button>
         </div>
-        <div className="mt-5 grid gap-3">
-          <label className="field-label">
-            名称
-            <input
-              autoFocus
-              className="input"
-              value={name}
-              onChange={(event) => setName(event.target.value)}
-              placeholder="项目名称"
-            />
-          </label>
-          <label className="field-label">
-            主机
-            <select
-              className="input"
-              value={hostId}
-              onChange={(event) => setHostId(event.target.value)}
-            >
-              {hosts.map((host) => (
-                <option key={host.id} value={host.id}>
-                  {host.name}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="field-label">
-            仓库 URL（可留空）
-            <input
-              className="input"
-              value={repoUrl}
-              onChange={(event) => setRepoUrl(event.target.value)}
-              placeholder="https://github.com/org/repo.git"
-            />
-          </label>
-          <label className="field-label">
-            仓库路径（可留空）
-            <input
-              className="input"
-              value={repoRoot}
-              onChange={(event) => setRepoRoot(event.target.value)}
-              placeholder="按后端默认路径"
-            />
-          </label>
-          <label className="field-label">
-            默认分支
-            <input
-              className="input"
-              value={defaultBranch}
-              onChange={(event) => setDefaultBranch(event.target.value)}
-            />
-          </label>
-          <label className="field-label">
-            从 Team 模板创建（可选）
-            <select
-              className="input"
-              value={teamTemplateId}
-              onChange={(event) => setTeamTemplateId(event.target.value)}
-            >
-              <option value="">不使用 Team 模板</option>
-              {teamTemplates.map((template) => (
-                <option key={template.id} value={template.id}>
-                  {template.name} ·{" "}
-                  {template.status === "builtin" ? "内置" : "自定义"}
-                </option>
-              ))}
-            </select>
-          </label>
-          {selectedTeamContent && (
-            <div className="rounded-lg border border-line p-3 text-sm">
-              <strong>将创建的成员</strong>
-              <div className="mt-1">
-                {(selectedTeamContent.agents || [])
-                  .map(
-                    (agent) =>
-                      `${agent.name || "成员"}（${agent.role || "Worker"}）`,
-                  )
-                  .join("、")}
+        <div className="mt-5 min-h-0 flex-1 overflow-y-auto pr-1">
+          <div className="grid gap-3">
+            <label className="field-label">
+              名称
+              <input
+                autoFocus
+                className="input"
+                value={name}
+                onChange={(event) => setName(event.target.value)}
+                placeholder="项目名称"
+              />
+            </label>
+            <label className="field-label">
+              主机
+              <select
+                className="input"
+                value={hostId}
+                onChange={(event) => setHostId(event.target.value)}
+              >
+                {hosts.map((host) => (
+                  <option key={host.id} value={host.id}>
+                    {host.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="field-label">
+              仓库 URL（可留空）
+              <input
+                className="input"
+                value={repoUrl}
+                onChange={(event) => setRepoUrl(event.target.value)}
+                placeholder="https://github.com/org/repo.git"
+              />
+            </label>
+            <label className="field-label">
+              仓库路径（可留空）
+              <input
+                className="input"
+                value={repoRoot}
+                onChange={(event) => setRepoRoot(event.target.value)}
+                placeholder="按后端默认路径"
+              />
+            </label>
+            <label className="field-label">
+              默认分支
+              <input
+                className="input"
+                value={defaultBranch}
+                onChange={(event) => setDefaultBranch(event.target.value)}
+              />
+            </label>
+            <label className="field-label">
+              从 Team 模板创建（可选）
+              <select
+                className="input"
+                value={teamTemplateId}
+                onChange={(event) => setTeamTemplateId(event.target.value)}
+              >
+                <option value="">不使用 Team 模板</option>
+                {teamTemplates.map((template) => (
+                  <option key={template.id} value={template.id}>
+                    {template.name} ·{" "}
+                    {template.status === "builtin" ? "内置" : "自定义"}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {selectedTeamContent && (
+              <div className="rounded-lg border border-line p-3 text-sm">
+                <strong>将创建的成员</strong>
+                <div className="mt-1">
+                  {(selectedTeamContent.agents || [])
+                    .map(
+                      (agent) =>
+                        `${agent.name || "成员"}（${agent.role || "Worker"}）`,
+                    )
+                    .join("、")}
+                </div>
+                <small className="text-muted">
+                  Workflow：{JSON.stringify(selectedTeamContent.workflow)}
+                </small>
               </div>
-              <small className="text-muted">
-                Workflow：{JSON.stringify(selectedTeamContent.workflow)}
-              </small>
-            </div>
-          )}
-          {configTemplates.length > 0 && (
-            <fieldset className="rounded-lg border border-line p-3">
-              <legend className="px-1 text-sm font-medium">
-                配置模板（可勾选）
-              </legend>
-              {configTemplates.map((template) => (
-                <label
-                  key={template.id}
-                  className="flex items-center gap-2 text-sm"
-                >
-                  <input
-                    type="checkbox"
-                    checked={configTemplateIds.includes(template.id)}
-                    onChange={(event) =>
-                      setConfigTemplateIds((ids) =>
-                        event.target.checked
-                          ? [...ids, template.id]
-                          : ids.filter((id) => id !== template.id),
-                      )
-                    }
-                  />
-                  {template.name} · {template.kind}
-                </label>
-              ))}
-            </fieldset>
-          )}
+            )}
+            {configTemplates.length > 0 && (
+              <fieldset className="rounded-lg border border-line p-3">
+                <legend className="px-1 text-sm font-medium">
+                  配置模板（可勾选）
+                </legend>
+                {configTemplates.map((template) => (
+                  <label
+                    key={template.id}
+                    className="flex items-center gap-2 text-sm"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={configTemplateIds.includes(template.id)}
+                      onChange={(event) =>
+                        setConfigTemplateIds((ids) =>
+                          event.target.checked
+                            ? [...ids, template.id]
+                            : ids.filter((id) => id !== template.id),
+                        )
+                      }
+                    />
+                    {template.name} · {template.kind}
+                  </label>
+                ))}
+              </fieldset>
+            )}
+          </div>
         </div>
         {error && <p className="mt-3 text-sm text-danger">{error}</p>}
-        <div className="mt-6 flex justify-end gap-2">
+        <div className="sticky bottom-0 mt-6 flex justify-end gap-2 bg-panel pt-1">
           <button type="button" className="btn" onClick={onClose}>
             取消
           </button>
@@ -9632,6 +9636,11 @@ function AppContent() {
   const [error, setError] = useState("");
   const errorTimer = useRef<number | undefined>(undefined);
   const [running, setRunning] = useState(false);
+  const effectiveRunning = effectiveRunningState(
+    pendingQuestion !== null,
+    selected?.run_state,
+    running,
+  );
   const [drawerCollapsed, setDrawerCollapsed] = useState(false);
   const [rightPanelWidth, setRightPanelWidth] = useState(() =>
     Math.min(Math.round(window.innerWidth * 0.3), 460),
@@ -9862,10 +9871,22 @@ function AppContent() {
         sessionId: selected.id,
       }),
       command<InboxRecord[]>("list_inbox"),
+      command<
+        Array<{
+          session_id: string;
+          call_id: string;
+          tool: string;
+          arguments: Record<string, unknown>;
+          state: string;
+        }>
+      >("list_pending", { sessionId: selected.id }),
     ])
-      .then(([items, inboxItems]) => {
+      .then(([items, inboxItems, pendingItems]) => {
         if (generation.current !== currentGeneration) return;
-        const pending = inboxItems.find(
+        const pending = pendingItems.find(
+          (item) => item.tool === "ask_user" && item.state !== "resolved",
+        );
+        const inboxPending = inboxItems.find(
           (item) =>
             item.session_id === selected.id &&
             item.state === "pending" &&
@@ -9873,7 +9894,14 @@ function AppContent() {
         );
         if (pending) {
           setPendingQuestion(
-            pendingQuestionFromPayload(pending.call_id, pending.payload),
+            pendingQuestionFromPayload(pending.call_id, pending.arguments),
+          );
+        } else if (inboxPending) {
+          setPendingQuestion(
+            pendingQuestionFromPayload(
+              inboxPending.call_id,
+              inboxPending.payload,
+            ),
           );
         }
         setTranscript(mergeEvents([], items));
@@ -9894,7 +9922,6 @@ function AppContent() {
   }, [selected?.id]);
   useEffect(() => {
     let active = true;
-    const currentGeneration = generation.current;
     if (
       !(window as Window & { __TAURI_INTERNALS__?: unknown })
         .__TAURI_INTERNALS__
@@ -9905,7 +9932,7 @@ function AppContent() {
     }
     const subscription = listen<UiEvent>("opcos://event", (event) => {
       const payload = event.payload;
-      if (!active || currentGeneration !== generation.current) return;
+      if (!active) return;
       if (
         payload.kind === "system" &&
         typeof payload.payload.secret_backend === "string"
@@ -9925,11 +9952,15 @@ function AppContent() {
             Object.keys(streamPayload.turn).length > 0);
         if (hasStreamingContent) {
           setRunning(true);
+          setSelected((item) =>
+            item && item.id === payload.session_id
+              ? { ...item, run_state: "running", stop_reason: "none" }
+              : item,
+          );
           if (streamPayload.turn) setRunning(false);
         }
       }
       if (payload.kind === "turn_done") {
-        setRunning(false);
         const runState =
           typeof payload.payload.run_state === "string"
             ? payload.payload.run_state
@@ -9938,6 +9969,9 @@ function AppContent() {
           typeof payload.payload.stop_reason === "string"
             ? payload.payload.stop_reason
             : undefined;
+        setRunning((previous) =>
+          reconcileRunningState(previous, { kind: "turn_done", runState }),
+        );
         if (runState || stopReason) {
           setSessions((items) =>
             items.map((item) =>
@@ -9985,7 +10019,11 @@ function AppContent() {
           setPendingQuestion({
             ...pendingQuestionFromPayload(callId, args),
           });
-          setRunning(false);
+          setRunning((previous) =>
+            reconcileRunningState(previous, {
+              kind: "question_requested",
+            }),
+          );
         }
       }
       if (
@@ -10338,7 +10376,7 @@ function AppContent() {
                 <div className="main-scroll">
                   <Transcript
                     events={transcript}
-                    running={running}
+                    running={effectiveRunning}
                     onApprove={(item, decision) => {
                       if (!item.callId) return;
                       void command("resolve_approval", {
@@ -10384,7 +10422,7 @@ function AppContent() {
                     models.map((item) => [item.id, item.label]),
                   )}
                   connected={Boolean(selected)}
-                  running={running}
+                  running={effectiveRunning}
                   workspace={selected.workspace}
                   onModeChange={(mode) => {
                     void command("change_mode", {
@@ -10686,7 +10724,7 @@ function AppContent() {
                     />
                     <span className="spacer" />
                     <SendButton
-                      running={running}
+                      running={effectiveRunning}
                       disabled={!homeInput.trim() || !homeHostId}
                       onSend={() => void submitHome()}
                       onInterrupt={() => undefined}
@@ -10770,7 +10808,7 @@ function AppContent() {
       {surface === "session" && selected && (
         <SessionRightPanel
           selected={selected}
-          running={running}
+          running={effectiveRunning}
           collapsed={drawerCollapsed}
           providers={providers}
           onProviderChange={(provider) =>

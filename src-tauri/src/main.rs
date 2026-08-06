@@ -8340,9 +8340,13 @@ fn permission_mode_name(mode: PermissionMode) -> &'static str {
     }
 }
 
-fn local_workspace_path(session_id: &str) -> Result<String, String> {
+fn local_workspace_root() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or_else(|| "home directory unavailable".to_owned())?;
-    let workspace = home.join("OPCOS").join("workspaces").join(session_id);
+    Ok(home.join("OPCOS").join("workspaces"))
+}
+
+fn local_workspace_path(session_id: &str) -> Result<String, String> {
+    let workspace = local_workspace_root()?.join(session_id);
     std::fs::create_dir_all(&workspace)
         .map_err(|error| format!("local workspace unavailable: {error}"))?;
     let workspace = workspace
@@ -12444,6 +12448,26 @@ fn list_inbox(state: State<'_, DesktopState>) -> Result<Vec<opcos_store::InboxRe
                 .into_iter()
                 .map(|mut item| {
                     item.payload = redact_approval_value(&item.payload);
+                    item
+                })
+                .collect()
+        })
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn list_pending(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Vec<opcos_store::PendingRecord>, String> {
+    state
+        .store
+        .load_pending(&session_id)
+        .map(|items| {
+            items
+                .into_iter()
+                .map(|mut item| {
+                    item.arguments = redact_approval_value(&item.arguments);
                     item
                 })
                 .collect()
@@ -21337,6 +21361,8 @@ fn main() {
                 ci_repair::start(Arc::clone(&store), secrets.clone(), ci_monitor_receiver);
             let (runner_shutdown, runner_receiver) = tokio::sync::watch::channel(false);
             let runner_task = work_runner::start(app.handle().clone(), runner_receiver);
+            let recovery_jobs = Arc::clone(&jobs);
+            let recovery_secret_values = Arc::clone(&secret_values);
             app.manage(DesktopState {
                 database: Arc::clone(&database),
                 secrets,
@@ -21369,6 +21395,20 @@ fn main() {
                 ci_monitor_task: Mutex::new(Some(ci_monitor_task)),
                 runner_shutdown,
                 runner_task: Mutex::new(Some(runner_task)),
+            });
+            tauri::async_runtime::spawn(async move {
+                let Ok(recovery_root) = local_workspace_root() else {
+                    return;
+                };
+                if std::fs::create_dir_all(&recovery_root).is_err() {
+                    return;
+                }
+                let Ok(local_host) =
+                    LocalHost::with_secret_snapshot(recovery_root, recovery_secret_values)
+                else {
+                    return;
+                };
+                let _ = recovery_jobs.recover(&local_host).await;
             });
             let handle = app.handle().clone();
             let trigger_handle = handle.clone();
@@ -21488,6 +21528,7 @@ fn main() {
             steering,
             resolve_approval,
             list_inbox,
+            list_pending,
             get_unattended,
             set_unattended,
             change_mode,

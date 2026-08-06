@@ -9,6 +9,8 @@ import {
   submitFailureMessage,
   providerBaseUrlError,
   pendingQuestionFromPayload,
+  reconcileRunningState,
+  effectiveRunningState,
 } from "./gui";
 
 describe("GUI boundary behavior", () => {
@@ -105,6 +107,19 @@ describe("GUI boundary behavior", () => {
       options: ["A", "B"],
       allowMultiple: true,
     });
+  });
+
+  it("clears running when turn_done arrives after a session switch", () => {
+    expect(
+      reconcileRunningState(true, {
+        kind: "turn_done",
+        runState: "idle",
+      }),
+    ).toBe(false);
+  });
+
+  it("keeps the composer enabled while a question awaits an answer", () => {
+    expect(effectiveRunningState(true, "running", true)).toBe(false);
   });
 
   it("does not contain the retired private gateway address", () => {
