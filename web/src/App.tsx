@@ -5,6 +5,7 @@ import {
   FormEvent,
   ReactNode,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -35,7 +36,12 @@ import {
   updateSessionRunState,
 } from "./gui";
 import { isErrorNotice, providerErrorPresentation } from "./transcript";
-import { buildTimeline, mergeEvents, type TimelineEvent } from "./timeline";
+import {
+  buildTimeline,
+  latestPlan,
+  mergeEvents,
+  type TimelineEvent,
+} from "./timeline";
 import { summarizeIterationStats } from "./iterationStats";
 import { Sidebar } from "./components/Sidebar";
 import { sessionStatusLabel } from "./sessionStatus";
@@ -616,6 +622,7 @@ type RailIconName =
   | "shell"
   | "changes"
   | "progress"
+  | "tasks"
   | "agents"
   | "monitor"
   | "code"
@@ -3453,6 +3460,7 @@ function ManageSections({
       provider: string;
       base_url?: string;
       account_id?: string;
+      model?: string;
       configured: boolean;
     }>
   >([]);
@@ -4773,6 +4781,7 @@ function ManageSections({
                           provider: descriptor.name,
                           baseUrl: currentUrl || null,
                           accountId: config?.account_id || null,
+                          model: providerModels[descriptor.name] || null,
                         })
                           .then(() =>
                             providerKeys[descriptor.name]
@@ -8841,6 +8850,7 @@ type PanelTab =
   | "shell"
   | "changes"
   | "progress"
+  | "tasks"
   | "agents"
   | "desktop"
   | "ide"
@@ -8864,6 +8874,7 @@ function paneRoute(): PaneRoute | null {
     "shell",
     "changes",
     "progress",
+    "tasks",
     "agents",
     "desktop",
     "ide",
@@ -9472,6 +9483,47 @@ function PlannedPane({ title, children }: { title: string; children: string }) {
   );
 }
 
+function TasksPane({ events }: { events: TimelineEvent[] }) {
+  const steps = latestPlan(events);
+  if (!steps?.length) {
+    return (
+      <section className="tasks-pane">
+        <div className="tasks-empty">No tasks yet.</div>
+      </section>
+    );
+  }
+  const completed = steps.filter((step) =>
+    ["done", "completed", "failed", "abandoned"].includes(String(step.status)),
+  ).length;
+  return (
+    <section className="tasks-pane">
+      <div className="tasks-progress">
+        {completed} / {steps.length} tasks completed
+      </div>
+      <div className="tasks-list">
+        {steps.map((step, index) => {
+          const status = String(step.status ?? "not_started");
+          const complete = ["done", "completed"].includes(status);
+          const active = status === "in_progress";
+          return (
+            <div className="tasks-row" key={`${step.content}-${index}`}>
+              <span
+                className={`tasks-status${complete ? " is-complete" : active ? " is-active" : ""}`}
+                aria-hidden="true"
+              >
+                {complete ? "✓" : active ? "◌" : "○"}
+              </span>
+              <span>
+                #{index + 1} {step.content}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 function SessionRightPanel({
   selected,
   onError,
@@ -9483,6 +9535,7 @@ function SessionRightPanel({
   width,
   onWidthChange,
   eventRefreshKey,
+  transcript,
 }: {
   selected: Session;
   onError: (error: unknown) => void;
@@ -9494,6 +9547,7 @@ function SessionRightPanel({
   width: number;
   onWidthChange: (width: number) => void;
   eventRefreshKey: string;
+  transcript: TimelineEvent[];
 }) {
   const [panelTab, setPanelTab] = useState<PanelTab>("info");
   const [opened, setOpened] = useState<PanelTab[]>(["info"]);
@@ -9525,6 +9579,7 @@ function SessionRightPanel({
     { id: "shell", label: "Shell", icon: "terminal" },
     { id: "changes", label: "Changes", icon: "diff" },
     { id: "progress", label: "Progress", icon: "list" },
+    { id: "tasks", label: "Tasks", icon: "list" },
     { id: "agents", label: "Agents", icon: "list" },
     { id: "artifacts", label: "Artifacts", icon: "file" },
     { id: "pr", label: "PR", icon: "branch" },
@@ -9735,6 +9790,11 @@ function SessionRightPanel({
                 <ProgressPane selected={selected} />
               </div>
             )}
+            {opened.includes("tasks") && panelTab === "tasks" && (
+              <div className="session-pane">
+                <TasksPane events={transcript} />
+              </div>
+            )}
             {opened.includes("agents") && panelTab === "agents" && (
               <div className="session-pane">
                 <PlannedPane title="Agents">
@@ -9767,6 +9827,7 @@ function SessionRightPanel({
                   item.id !== "shell" &&
                   item.id !== "changes" &&
                   item.id !== "progress" &&
+                  item.id !== "tasks" &&
                   item.id !== "agents" &&
                   item.id !== "desktop" &&
                   item.id !== "ide" &&
@@ -10149,6 +10210,11 @@ function AppContent() {
   };
   const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
   const [transcript, setTranscript] = useState<TimelineEvent[]>([]);
+  const transcriptScrollRef = useRef<HTMLDivElement>(null);
+  const transcriptBottomRef = useRef<HTMLDivElement>(null);
+  const transcriptAtBottomRef = useRef(true);
+  const transcriptPreviousHeightRef = useRef(0);
+  const [showTranscriptJump, setShowTranscriptJump] = useState(false);
   const [pendingQuestion, setPendingQuestion] =
     useState<PendingQuestion | null>(null);
   const [surface, setSurface] = useState<
@@ -10172,6 +10238,51 @@ function AppContent() {
     selected?.run_state,
     running,
   );
+  const updateTranscriptScrollState = () => {
+    const element = transcriptScrollRef.current;
+    if (!element) return;
+    const atBottom =
+      element.scrollHeight - element.scrollTop - element.clientHeight <= 12;
+    transcriptAtBottomRef.current = atBottom;
+    setShowTranscriptJump(!atBottom);
+  };
+  const jumpToTranscriptBottom = () => {
+    const element = transcriptScrollRef.current;
+    if (!element) return;
+    transcriptAtBottomRef.current = true;
+    setShowTranscriptJump(false);
+    element.scrollTo({ top: element.scrollHeight, behavior: "smooth" });
+  };
+  useLayoutEffect(() => {
+    const element = transcriptScrollRef.current;
+    const content = transcriptBottomRef.current;
+    if (!element || !content) return;
+    transcriptAtBottomRef.current = true;
+    setShowTranscriptJump(false);
+    const followBottom = () => {
+      if (!transcriptAtBottomRef.current) return;
+      element.scrollTop = element.scrollHeight;
+      transcriptPreviousHeightRef.current = element.scrollHeight;
+    };
+    const resizeObserver = new ResizeObserver(followBottom);
+    resizeObserver.observe(content);
+    followBottom();
+    return () => resizeObserver.disconnect();
+  }, [selectedId]);
+  useEffect(() => {
+    const element = transcriptScrollRef.current;
+    if (!element) return;
+    const wasAtBottom = transcriptAtBottomRef.current;
+    const previousHeight = transcriptPreviousHeightRef.current;
+    const nextHeight = element.scrollHeight;
+    if (wasAtBottom) {
+      element.scrollTop = nextHeight;
+    } else if (nextHeight < previousHeight) {
+      element.scrollTop = Math.min(element.scrollTop, nextHeight);
+    }
+    transcriptPreviousHeightRef.current = nextHeight;
+    updateTranscriptScrollState();
+  }, [transcript, effectiveRunning]);
   const [drawerCollapsed, setDrawerCollapsed] = useState(false);
   const [rightPanelWidth, setRightPanelWidth] = useState(() =>
     Math.min(Math.round(window.innerWidth * 0.3), 460),
@@ -10953,27 +11064,65 @@ function AppContent() {
               </header>
               <div className="main-workspace">
                 <div className="main-chat">
-                  <div className="main-scroll">
-                    <Transcript
-                      events={transcript}
-                      sessionId={selected.id}
-                      hostName={selected.host_name}
-                      running={effectiveRunning}
-                      onApprove={(item, decision) => {
-                        if (!item.callId) return;
-                        void command("resolve_approval", {
-                          sessionId: selected.id,
-                          callId: item.callId,
-                          approve: decision === "allow",
-                        }).catch(onError);
-                      }}
-                      onRetry={() => {
-                        void command("submit_turn", {
-                          request: { session_id: selected.id, text: "" },
-                        }).catch(onError);
-                      }}
-                    />
+                  <div
+                    className="main-scroll"
+                    ref={transcriptScrollRef}
+                    onScroll={updateTranscriptScrollState}
+                  >
+                    <div ref={transcriptBottomRef}>
+                      <Transcript
+                        events={transcript}
+                        sessionId={selected.id}
+                        hostName={selected.host_name}
+                        running={effectiveRunning}
+                        onApprove={(item, decision) => {
+                          if (!item.callId) return;
+                          void command("resolve_approval", {
+                            sessionId: selected.id,
+                            callId: item.callId,
+                            approve: decision === "allow",
+                          }).catch(onError);
+                        }}
+                        onRetry={() => {
+                          void command("submit_turn", {
+                            request: { session_id: selected.id, text: "" },
+                          }).catch(onError);
+                        }}
+                        onQuestionAnswer={(callId, answer) => {
+                          void command("resolve_inbox", {
+                            sessionId: selected.id,
+                            callId,
+                            resolution: answer,
+                          }).catch(onError);
+                        }}
+                      />
+                    </div>
                   </div>
+                  {showTranscriptJump && (
+                    <button
+                      className="transcript-jump-bottom"
+                      type="button"
+                      aria-label="Jump to latest conversation"
+                      title="Jump to latest conversation"
+                      onClick={jumpToTranscriptBottom}
+                    >
+                      <svg
+                        aria-hidden="true"
+                        width="16"
+                        height="16"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                      >
+                        <path
+                          d="M6 9l6 6 6-6"
+                          stroke="currentColor"
+                          strokeWidth="1.8"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        />
+                      </svg>
+                    </button>
+                  )}
                   {pendingQuestion && (
                     <QuestionCard
                       question={pendingQuestion}
@@ -11396,6 +11545,7 @@ function AppContent() {
       {surface === "session" && selected && (
         <SessionRightPanel
           selected={selected}
+          transcript={transcript}
           running={effectiveRunning}
           eventRefreshKey={`${transcript.length}:${transcript.at(-1)?.event_id ?? ""}`}
           collapsed={drawerCollapsed}

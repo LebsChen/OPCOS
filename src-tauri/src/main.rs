@@ -4686,11 +4686,23 @@ fn emit_pending_approval(
     state: &DesktopState,
     session_id: &str,
 ) -> Result<bool, String> {
+    emit_pending_approval_for(app, state, session_id, None)
+}
+
+fn emit_pending_approval_for(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    session_id: &str,
+    requested_call_id: Option<&str>,
+) -> Result<bool, String> {
     let pending = state
         .store
         .load_pending(session_id)
         .map_err(|error| error.to_string())?;
-    let Some(pending) = pending.into_iter().next() else {
+    let Some(pending) = pending
+        .into_iter()
+        .find(|item| requested_call_id.is_none_or(|call_id| item.call_id == call_id))
+    else {
         return Ok(false);
     };
     let is_question = pending.tool == "ask_user";
@@ -12981,11 +12993,10 @@ async fn resolve_approval(
             Ok(())
         }
         Err(opcos_engine::EngineError::ApprovalPending(next_call_id)) => {
-            let _ = next_call_id;
             emit_approval_decision(&app, &state, &session_id, &call_id, approve);
             let calls = approval_artifact_calls(&state, &session_id, &call_id, sequence_before)?;
             record_artifacts_best_effort(&app, &state, &session_id, &host_id, calls).await;
-            emit_pending_approval(&app, &state, &session_id)?;
+            emit_pending_approval_for(&app, &state, &session_id, Some(&next_call_id))?;
             emit(
                 &app,
                 "turn_done",
@@ -22070,61 +22081,49 @@ fn provider_configurations(state: State<'_, DesktopState>) -> Result<Vec<Value>,
             .database
             .lock()
             .map_err(|_| "database lock poisoned".to_owned())?;
-        descriptors
-            .iter()
-            .map(|descriptor| {
-                let account_id = (descriptor.name == "cloudflare")
-                    .then(|| {
-                        connection
-                            .query_row(
-                                "SELECT value FROM settings WHERE key='provider.account_id.cloudflare'",
-                                [],
-                                |row| row.get::<_, String>(0),
-                            )
-                            .ok()
-                    })
-                    .flatten();
-                let key = format!("provider.base_url.{}", descriptor.name);
-                let configured_base_url = connection
-                    .query_row("SELECT value FROM settings WHERE key=?1", [&key], |row| {
-                        row.get::<_, String>(0)
-                    })
-                    .ok();
-                (
-                    descriptor.name.clone(),
-                    configured_base_url,
-                    account_id,
-                )
+        let mut statement = connection
+            .prepare("SELECT key,value FROM settings WHERE key LIKE 'provider.%'")
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
-            .collect::<Vec<_>>()
+            .map_err(|error| error.to_string())?
+            .collect::<Result<HashMap<_, _>, _>>()
+            .map_err(|error| error.to_string())?
     };
     descriptors
         .into_iter()
-        .zip(settings)
-        .map(
-            |(descriptor, (provider, configured_base_url, account_id))| {
-                let key_name = secret_key("provider-key", &descriptor.name);
-                let configured = state
-                    .secrets
-                    .get(&key_name)
-                    .map_err(|error| error.to_string())?
-                    .is_some()
-                    || descriptor.name == "ollama";
-                let base_url = provider_base_url(
-                    &descriptor.name,
-                    configured_base_url.as_deref(),
-                    account_id.as_deref(),
-                    descriptor.default_base_url.as_deref(),
-                )
-                .ok();
-                Ok(json!({
-                    "provider": provider,
-                    "base_url": base_url,
-                    "account_id": account_id,
-                    "configured": configured,
-                }))
-            },
-        )
+        .map(|descriptor| {
+            let key_name = secret_key("provider-key", &descriptor.name);
+            let configured = state
+                .secrets
+                .get(&key_name)
+                .map_err(|error| error.to_string())?
+                .is_some()
+                || descriptor.name == "ollama";
+            let account_id = (descriptor.name == "cloudflare")
+                .then(|| settings.get("provider.account_id.cloudflare").cloned())
+                .flatten();
+            let key = format!("provider.base_url.{}", descriptor.name);
+            let base_url = provider_base_url(
+                &descriptor.name,
+                settings.get(&key).map(String::as_str),
+                account_id.as_deref(),
+                descriptor.default_base_url.as_deref(),
+            )
+            .ok();
+            let model = settings
+                .get(&format!("provider.model.{}", descriptor.name))
+                .cloned();
+            Ok(json!({
+                "provider": descriptor.name,
+                "base_url": base_url,
+                "account_id": account_id,
+                "model": model,
+                "configured": configured,
+            }))
+        })
         .collect()
 }
 
@@ -22140,7 +22139,7 @@ fn save_provider_settings(
     let account_id = if provider == "cloudflare" {
         Some(
             account_id
-                .filter(|value| !value.trim().is_empty())
+                .filter(|v| !v.trim().is_empty())
                 .ok_or_else(|| "Cloudflare account ID is required".to_owned())?,
         )
     } else {
@@ -22162,37 +22161,48 @@ fn save_provider_settings(
             "INSERT OR REPLACE INTO settings(key,value) VALUES ('provider.id',?1)",
             [&provider],
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|e| e.to_string())?;
     connection
         .execute(
             "INSERT OR REPLACE INTO settings(key,value) VALUES ('provider.base_url',?1)",
             [&base_url],
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|e| e.to_string())?;
     let scoped_key = format!("provider.base_url.{provider}");
     connection
         .execute(
             "INSERT OR REPLACE INTO settings(key,value) VALUES (?1,?2)",
             [&scoped_key, &base_url],
         )
-        .map_err(|error| error.to_string())?;
-    if let Some(model) = model.filter(|value| !value.trim().is_empty()) {
-        let model_key = format!("provider.model.{provider}");
-        connection
-            .execute(
-                "INSERT OR REPLACE INTO settings(key,value) VALUES (?1,?2)",
-                [&model_key, &model],
-            )
-            .map_err(|error| error.to_string())?;
-    }
+        .map_err(|e| e.to_string())?;
     if let Some(account_id) = account_id {
-        connection
-            .execute(
-                "INSERT OR REPLACE INTO settings(key,value) VALUES ('provider.account_id.cloudflare',?1)",
-                [&account_id],
-            )
-            .map_err(|error| error.to_string())?;
+        connection.execute("INSERT OR REPLACE INTO settings(key,value) VALUES ('provider.account_id.cloudflare',?1)", [&account_id]).map_err(|e| e.to_string())?;
     }
+    save_provider_model_settings(&connection, &provider, model.as_deref())?;
+    Ok(())
+}
+
+fn save_provider_model_settings(
+    connection: &Connection,
+    provider: &str,
+    model: Option<&str>,
+) -> Result<(), String> {
+    let Some(model) = model.filter(|v| !v.trim().is_empty()) else {
+        return Ok(());
+    };
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES ('provider.model',?1)",
+            [model],
+        )
+        .map_err(|e| e.to_string())?;
+    let scoped_key = format!("provider.model.{provider}");
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES (?1,?2)",
+            [&scoped_key, model],
+        )
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -22206,7 +22216,7 @@ fn provider_base_url(
         return registry::cloudflare_base_url(account_id.unwrap_or_default());
     }
     configured
-        .filter(|value| !value.trim().is_empty())
+        .filter(|v| !v.trim().is_empty())
         .or(default)
         .map(str::to_owned)
         .ok_or_else(|| "provider base URL is not configured; enter one in Provider settings".into())

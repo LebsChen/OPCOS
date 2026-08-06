@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import liveEnvelopes from "../../fixtures/timeline/live-events.json";
 import opcosEvents from "../../fixtures/timeline/opcos-events.json";
+import opcosTodoCapture from "../../fixtures/timeline/opcos-todo-capture.json";
 import planIterations from "../../fixtures/timeline/opcos-plan-iterations.json";
 import terminalReplay from "../../fixtures/timeline/opcos-terminal-replay.json";
 import parityEvents from "../../fixtures/timeline/opcos-devin-parity.json";
@@ -8,6 +9,7 @@ import toolCallOnlyIteration from "../../fixtures/timeline/tool-call-only-iterat
 import persisted from "../../fixtures/timeline/persisted-events.json";
 import {
   buildTimeline,
+  latestPlan,
   mergeEvents,
   TRANSIENT_TIMELINE_EVENT_TYPES,
   type TimelineEvent,
@@ -18,6 +20,79 @@ const saved = persisted as TimelineEvent[];
 const opcos = opcosEvents as TimelineEvent[];
 
 describe("single event-log timeline", () => {
+  it("replays captured tool results and terminal transitions", () => {
+    const nodes = buildTimeline(live);
+    const resultEvent = live.find((event) => event.type === "tool_result");
+    const resultPayload = resultEvent?.tool_result as
+      { call_id?: string; result?: unknown } | undefined;
+    const resultCallId = String(resultPayload?.call_id);
+    const resultRow = nodes
+      .filter((node) => node.kind === "work")
+      .flatMap((node) => node.rows)
+      .find((row) => row.callId === resultCallId);
+    expect(resultPayload).toMatchObject({
+      call_id: resultCallId,
+      result: expect.anything(),
+    });
+    expect(resultRow).toMatchObject({
+      callId: resultCallId,
+      resultSummary: undefined,
+    });
+    expect(nodes).toContainEqual({
+      kind: "sleep",
+      text: "Devin went to sleep",
+    });
+    expect(buildTimeline(saved)).toEqual(nodes);
+    const resumed = buildTimeline([
+      ...live,
+      {
+        type: "user_message",
+        event_id: "after-finished",
+        created_at_ms: 1786040275969,
+        message: "Continue",
+      },
+    ] as TimelineEvent[]);
+    expect(resumed.some((node) => node.kind === "sleep")).toBe(false);
+  });
+
+  it("derives the current task state from the timeline plan", () => {
+    const events = [
+      {
+        type: "todo_update",
+        event_id: "plan-start",
+        created_at_ms: 1,
+        working_event: {
+          event_type: "todo_update",
+          payload: {
+            plan_id: "plan",
+            steps: [
+              { step_id: "one", content: "Inspect", status: "not_started" },
+              { step_id: "two", content: "Fix", status: "not_started" },
+            ],
+          },
+        },
+      },
+      {
+        type: "todo_update",
+        event_id: "plan-progress",
+        created_at_ms: 2,
+        working_event: {
+          event_type: "todo_update",
+          payload: {
+            plan_id: "plan",
+            steps: [
+              { step_id: "one", content: "Inspect", status: "completed" },
+              { step_id: "two", content: "Fix", status: "in_progress" },
+            ],
+          },
+        },
+      },
+    ] as TimelineEvent[];
+    expect(latestPlan(events)).toEqual([
+      { content: "Inspect", status: "completed" },
+      { content: "Fix", status: "in_progress" },
+    ]);
+  });
   it("renders the terminal replay fixture under one shell row", () => {
     const rows = buildTimeline(terminalReplay as TimelineEvent[])
       .filter((node) => node.kind === "work")
@@ -113,7 +188,7 @@ describe("single event-log timeline", () => {
     expect(work?.label).toBe("Worked for 2s");
     expect(work?.rows.map((row) => row.label)).toEqual([
       "Listing files",
-      "browser_status",
+      "Checked browser status",
       "Running tests",
       "cargo test",
     ]);
@@ -131,7 +206,7 @@ describe("single event-log timeline", () => {
       },
     ] as TimelineEvent[]).filter((node) => node.kind === "work");
     expect(work?.rows[0]).toMatchObject({
-      label: "browser_status",
+      label: "Checked browser status",
       isMajorAction: true,
     });
   });
@@ -305,13 +380,20 @@ describe("single event-log timeline", () => {
     const rows = work.flatMap((node) => node.rows.map((row) => row.label));
     expect(rows.some((label) => /^Thought for \d+s$/.test(label))).toBe(true);
     expect(rows).toContain("Edited alpha.txt +1 −0");
-    expect(rows).toContain("Created notes.md +69");
-    expect(rows).not.toContain("write_file");
-    expect(rows).not.toContain("edit_file");
+    expect(rows).toContain("Created notes.md +33");
+    expect(rows).toContain("Wrote <temp-workspace>/notes.md");
+    expect(rows).toContain("Edited <temp-workspace>/alpha.txt");
+    const failedRead = work
+      .flatMap((node) => node.rows)
+      .find((row) => row.resultError);
+    expect(failedRead).toMatchObject({
+      label: "Read <temp-workspace>/session.sqlite",
+      resultSummary: expect.stringContaining("valid UTF-8"),
+    });
     expect(work.some((node) => /^Worked for \d+s$/.test(node.label))).toBe(
       true,
     );
-    expect(work.reduce((sum, node) => sum + node.additions, 0)).toBe(70);
+    expect(work.reduce((sum, node) => sum + node.additions, 0)).toBe(34);
     expect(work.reduce((sum, node) => sum + node.deletions, 0)).toBe(0);
   });
   it("renders OPCOS-native persisted events as one work group", () => {
@@ -480,6 +562,16 @@ describe("single event-log timeline", () => {
       .flatMap((node) => node.rows)
       .find((row) => row.label === "Created 5 Tasks");
     expect(planRow?.plan?.steps).toHaveLength(5);
+  });
+  it("deduplicates repeated visible plan progress from a real session capture", () => {
+    const rows = buildTimeline(opcosTodoCapture as TimelineEvent[])
+      .filter((node) => node.kind === "work")
+      .flatMap((node) => node.rows.map((row) => row.label))
+      .filter((label) => label.includes("#4"));
+    expect(rows).toEqual([
+      "3/4 #4 4. Finish by reporting every command run, each exit code, and whether the workspace changed (it should not).",
+      "4/4 #4 4. Finish by reporting every command run, each exit code, and whether the workspace changed (it should not).",
+    ]);
   });
   it("points plan progress at the next unfinished step", () => {
     const rowsFor = (steps: Record<string, unknown>[]) =>
