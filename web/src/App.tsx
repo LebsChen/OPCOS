@@ -3399,7 +3399,12 @@ function ManageSections({
   const [key, setKey] = useState("");
   const [providerStatus, setProviderStatus] = useState("");
   const [providerConfigs, setProviderConfigs] = useState<
-    Array<{ provider: string; base_url?: string; configured: boolean }>
+    Array<{
+      provider: string;
+      base_url?: string;
+      model?: string;
+      configured: boolean;
+    }>
   >([]);
   const [providerKeys, setProviderKeys] = useState<Record<string, string>>({});
   const [providerStatuses, setProviderStatuses] = useState<
@@ -3736,9 +3741,23 @@ function ManageSections({
   }, [tab, settingsProjectId, selected, onError]);
   useEffect(() => {
     void command<
-      Array<{ provider: string; base_url?: string; configured: boolean }>
+      Array<{
+        provider: string;
+        base_url?: string;
+        model?: string;
+        configured: boolean;
+      }>
     >("provider_configurations")
-      .then(setProviderConfigs)
+      .then((items) => {
+        setProviderConfigs(items);
+        setProviderModels(
+          Object.fromEntries(
+            items
+              .filter((item) => item.model)
+              .map((item) => [item.provider, item.model as string]),
+          ),
+        );
+      })
       .catch(onError);
   }, []);
   useEffect(() => {
@@ -4627,39 +4646,59 @@ function ManageSections({
                         command("save_provider_settings", {
                           provider: descriptor.name,
                           baseUrl: currentUrl || null,
+                          model: providerModels[descriptor.name] || null,
                         })
-                          .then(() =>
-                            providerKeys[descriptor.name]
-                              ? command("save_provider_key", {
-                                  provider: descriptor.name,
-                                  key: providerKeys[descriptor.name],
-                                  projectId: null,
-                                })
-                              : undefined,
-                          )
                           .then(() =>
                             command<boolean>("validate_provider_key", {
                               provider: descriptor.name,
+                              candidateKey:
+                                providerKeys[descriptor.name] || null,
                             }),
                           )
                           .then((ok) => {
-                            setProviderKeys((items) => ({
-                              ...items,
-                              [descriptor.name]: "",
-                            }));
+                            if (ok && providerKeys[descriptor.name]) {
+                              return command("save_provider_key", {
+                                provider: descriptor.name,
+                                key: providerKeys[descriptor.name],
+                                projectId: null,
+                              }).then(() => {
+                                setProviderKeys((items) => ({
+                                  ...items,
+                                  [descriptor.name]: "",
+                                }));
+                                setProviderStatuses((items) => ({
+                                  ...items,
+                                  [descriptor.name]:
+                                    "Provider key validated successfully.",
+                                }));
+                                setProviderConfigs((items) =>
+                                  items.map((item) =>
+                                    item.provider === descriptor.name
+                                      ? { ...item, configured: true }
+                                      : item,
+                                  ),
+                                );
+                              });
+                            }
                             setProviderStatuses((items) => ({
                               ...items,
                               [descriptor.name]: ok
                                 ? "Provider key validated successfully."
                                 : "Provider key validation failed.",
                             }));
-                            setProviderConfigs((items) =>
-                              items.map((item) =>
-                                item.provider === descriptor.name
-                                  ? { ...item, configured: true }
-                                  : item,
-                              ),
-                            );
+                            if (ok) {
+                              setProviderKeys((items) => ({
+                                ...items,
+                                [descriptor.name]: "",
+                              }));
+                              setProviderConfigs((items) =>
+                                items.map((item) =>
+                                  item.provider === descriptor.name
+                                    ? { ...item, configured: true }
+                                    : item,
+                                ),
+                              );
+                            }
                           })
                           .catch((error) =>
                             setProviderStatuses((items) => ({
@@ -4761,6 +4800,7 @@ function ManageSections({
                   command("save_provider_settings", {
                     provider,
                     baseUrl: baseUrl || null,
+                    model: null,
                   })
                     .then(() =>
                       command("save_provider_key", {
@@ -10814,10 +10854,10 @@ function AppContent() {
                           setHomeModel(
                             content.model && content.model !== "auto"
                               ? content.model
-                              : models.find((model) => !model.likely_non_chat)
+                              : (models.find((model) => !model.likely_non_chat)
                                   ?.id ??
                                   models[0]?.id ??
-                                  "auto",
+                                  "auto"),
                           );
                           setHomeHarness(content.harness || "builtin");
                           setHomeMode(content.mode || "Auto");

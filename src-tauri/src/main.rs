@@ -10994,7 +10994,6 @@ fn create_session(
         "session-{}",
         Utc::now().timestamp_nanos_opt().unwrap_or_default()
     );
-    let model = model.unwrap_or_else(|| "auto".into());
     let mode = mode.unwrap_or_else(|| "Auto".into());
     let mode = permission_mode_name(parse_permission_mode(&mode)?).to_owned();
     let harness = harness.unwrap_or_else(|| "builtin".into());
@@ -11021,6 +11020,30 @@ fn create_session(
         } else {
             (host_id.unwrap_or_default(), None)
         };
+    let provider = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        provider
+            .or_else(|| agent.as_ref().and_then(|item| item.provider.clone()))
+            .or_else(|| {
+                connection
+                    .query_row(
+                        "SELECT value FROM settings WHERE key='provider.id'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok()
+            })
+    };
+    let model = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        resolve_provider_model(&connection, provider.as_deref(), model)
+    };
     let settings = {
         let connection = state
             .database
@@ -17233,6 +17256,16 @@ async fn linear_create_session_from_issue(
     let host_name = host_name(&connection, &host_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "remote host not found; session was not created".to_owned())?;
+    let provider = provider.or_else(|| {
+        connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='provider.id'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+    });
+    let model = resolve_provider_model(&connection, provider.as_deref(), model);
     drop(connection);
     let mode = mode.unwrap_or_else(|| "Auto".into());
     let mode = permission_mode_name(parse_permission_mode(&mode)?).to_owned();
@@ -17242,7 +17275,7 @@ async fn linear_create_session_from_issue(
         SessionRecord {
             session_id: session_id.clone(),
             workspace,
-            model: model.unwrap_or_else(|| "auto".into()),
+            model,
             mode,
             harness: harness.unwrap_or_else(|| "builtin".into()),
             title: title.unwrap_or_else(|| {
@@ -21563,6 +21596,72 @@ fn save_agent_settings(
     Ok(settings)
 }
 
+fn provider_model_setting_exact(connection: &Connection, provider: &str) -> Option<String> {
+    let scoped_key = format!("provider.model.{provider}");
+    connection
+        .query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            [&scoped_key],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn provider_model_setting(connection: &Connection, provider: &str) -> Option<String> {
+    provider_model_setting_exact(connection, provider).or_else(|| {
+        connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='provider.model'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    })
+}
+
+fn save_provider_model_settings(
+    connection: &Connection,
+    provider: &str,
+    model: Option<&str>,
+) -> Result<(), String> {
+    let Some(model) = model.filter(|value| !value.trim().is_empty()) else {
+        return Ok(());
+    };
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES ('provider.model',?1)",
+            [model],
+        )
+        .map_err(|error| error.to_string())?;
+    let scoped_key = format!("provider.model.{provider}");
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES (?1,?2)",
+            [&scoped_key, model],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn resolve_provider_model(
+    connection: &Connection,
+    provider: Option<&str>,
+    requested_model: Option<String>,
+) -> String {
+    let requested_model = requested_model.filter(|value| !value.trim().is_empty());
+    if requested_model
+        .as_deref()
+        .is_some_and(|value| value != "auto")
+    {
+        return requested_model.unwrap_or_else(|| "auto".into());
+    }
+    provider_model_setting(connection, provider.unwrap_or_default())
+        .or(requested_model)
+        .unwrap_or_else(|| "auto".into())
+}
+
 #[tauri::command]
 fn list_slash_commands(
     state: State<'_, DesktopState>,
@@ -21713,9 +21812,11 @@ fn provider_configurations(state: State<'_, DesktopState>) -> Result<Vec<Value>,
                 })
                 .ok()
                 .or(descriptor.default_base_url.clone());
+            let model = provider_model_setting_exact(&connection, &descriptor.name);
             Ok(json!({
                 "provider": descriptor.name,
                 "base_url": base_url,
+                "model": model,
                 "configured": configured,
             }))
         })
@@ -21727,6 +21828,7 @@ fn save_provider_settings(
     state: State<'_, DesktopState>,
     provider: String,
     base_url: Option<String>,
+    model: Option<String>,
 ) -> Result<(), String> {
     let descriptor = registry::descriptors()
         .into_iter()
@@ -21762,6 +21864,7 @@ fn save_provider_settings(
             [&scoped_key, &base_url],
         )
         .map_err(|error| error.to_string())?;
+    save_provider_model_settings(&connection, &provider, model.as_deref())?;
     Ok(())
 }
 
@@ -21769,15 +21872,23 @@ fn save_provider_settings(
 async fn validate_provider_key(
     state: State<'_, DesktopState>,
     provider: String,
+    candidate_key: Option<String>,
 ) -> Result<bool, String> {
     let descriptor = registry::descriptors()
         .into_iter()
         .find(|item| item.name == provider)
         .ok_or_else(|| "unknown provider".to_owned())?;
-    let key = state
-        .secrets
-        .get(&secret_key("provider-key", &provider))
-        .map_err(|error| error.to_string())?;
+    let key = if candidate_key
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        candidate_key
+    } else {
+        state
+            .secrets
+            .get(&secret_key("provider-key", &provider))
+            .map_err(|error| error.to_string())?
+    };
     if descriptor.needs_key && key.is_none() {
         return Err("provider key is not configured".to_owned());
     }
@@ -24664,6 +24775,39 @@ agents:
         assert_eq!(settings["message_usage_limit"], 0);
         assert_eq!(settings["open_prs_as"], "ready");
         assert_eq!(settings["computer_use"], true);
+    }
+
+    #[test]
+    fn provider_model_persists_across_reload_for_unknown_model_id() {
+        let path = std::env::temp_dir().join(format!(
+            "opcos-provider-model-{}.db",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute(
+                    "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+                    [],
+                )
+                .unwrap();
+            save_provider_model_settings(&connection, "agnes", Some("agnes-2.5-pro-alpha"))
+                .unwrap();
+            assert_eq!(
+                provider_model_setting(&connection, "agnes").as_deref(),
+                Some("agnes-2.5-pro-alpha")
+            );
+            assert_eq!(provider_model_setting_exact(&connection, "openai"), None);
+        }
+        {
+            let connection = Connection::open(&path).unwrap();
+            assert_eq!(
+                resolve_provider_model(&connection, Some("agnes"), Some("auto".into())),
+                "agnes-2.5-pro-alpha"
+            );
+            assert_eq!(provider_model_setting_exact(&connection, "openai"), None);
+        }
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
