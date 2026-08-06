@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import liveEnvelopes from "../../fixtures/timeline/live-events.json";
 import opcosEvents from "../../fixtures/timeline/opcos-events.json";
 import planIterations from "../../fixtures/timeline/opcos-plan-iterations.json";
+import terminalReplay from "../../fixtures/timeline/opcos-terminal-replay.json";
 import toolCallOnlyIteration from "../../fixtures/timeline/tool-call-only-iteration.json";
 import persisted from "../../fixtures/timeline/persisted-events.json";
 import {
@@ -16,6 +17,25 @@ const saved = persisted as TimelineEvent[];
 const opcos = opcosEvents as TimelineEvent[];
 
 describe("single event-log timeline", () => {
+  it("renders the terminal replay fixture under one shell row", () => {
+    const rows = buildTimeline(terminalReplay as TimelineEvent[])
+      .filter((node) => node.kind === "work")
+      .flatMap((node) => node.rows);
+    expect(rows).toContainEqual(
+      expect.objectContaining({
+        label: "cargo test",
+        terminalOutput: "first\nsecond\n",
+        terminalTruncated: true,
+      }),
+    );
+    expect(rows).toContainEqual({
+      label: "true",
+      callId: "call-terminal-empty",
+      terminalOutput: undefined,
+      terminalTruncated: undefined,
+    });
+  });
+
   it("renders live and reloaded events identically", () => {
     expect(buildTimeline(live)).toEqual(buildTimeline(saved));
   });
@@ -93,6 +113,109 @@ describe("single event-log timeline", () => {
       "1/4#1 Implement the change",
       "Earlier context compacted",
     ]);
+  });
+  it("aggregates terminal chunks under their shell row and marks truncation", () => {
+    const nodes = buildTimeline([
+      {
+        type: "shell_process_started",
+        event_id: "shell",
+        created_at_ms: 1,
+        working_event: {
+          event_type: "shell_process_started",
+          payload: { call_id: "call-1", command: "cargo test" },
+        },
+      },
+      {
+        type: "terminal_update",
+        event_id: "chunk-1",
+        created_at_ms: 2,
+        working_event: {
+          event_type: "terminal_update",
+          payload: { call_id: "call-1", contents: "first\n" },
+        },
+      },
+      {
+        type: "terminal_update",
+        event_id: "chunk-2",
+        created_at_ms: 2,
+        working_event: {
+          event_type: "terminal_update",
+          payload: { call_id: "call-1", contents: "second\n" },
+        },
+      },
+      {
+        type: "shell_process_started",
+        event_id: "shell-empty",
+        created_at_ms: 3,
+        working_event: {
+          event_type: "shell_process_started",
+          payload: { call_id: "call-empty", command: "true" },
+        },
+      },
+      {
+        type: "terminal_update",
+        event_id: "chunk-3",
+        created_at_ms: 4,
+        working_event: {
+          event_type: "terminal_update",
+          payload: {
+            call_id: "call-1",
+            contents: "",
+            truncated: true,
+          },
+        },
+      },
+    ] as TimelineEvent[]);
+    const rows = nodes
+      .filter((node) => node.kind === "work")
+      .flatMap((node) => node.rows);
+    expect(rows).toContainEqual(
+      expect.objectContaining({
+        label: "cargo test",
+        callId: "call-1",
+        terminalOutput: "first\nsecond\n",
+        terminalTruncated: true,
+      }),
+    );
+    expect(rows).toContainEqual({
+      label: "true",
+      callId: "call-empty",
+      terminalOutput: undefined,
+      terminalTruncated: undefined,
+    });
+  });
+  it("renders terminal chunks that arrive before a shell row without a sequence field", () => {
+    const nodes = buildTimeline([
+      {
+        type: "terminal_update",
+        event_id: "chunk",
+        created_at_ms: 1,
+        working_event: {
+          event_type: "terminal_update",
+          payload: { call_id: "call-1", contents: "legacy output" },
+        },
+      },
+      {
+        type: "shell_process_started",
+        event_id: "shell",
+        created_at_ms: 2,
+        working_event: {
+          event_type: "shell_process_started",
+          payload: { call_id: "call-1", command: "echo legacy" },
+        },
+      },
+    ] as TimelineEvent[]);
+    expect(nodes).toContainEqual(
+      expect.objectContaining({
+        kind: "work",
+        rows: [
+          expect.objectContaining({
+            label: "echo legacy",
+            terminalOutput: "legacy output",
+          }),
+        ],
+      }),
+    );
   });
   it("skips legacy bare working-event rows without a resolvable type", () => {
     expect(

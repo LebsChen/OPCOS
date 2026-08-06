@@ -8801,6 +8801,7 @@ type ShellHistoryItem = {
   exit_code?: number | null;
   duration_ms?: number | null;
   output: string;
+  output_truncated?: boolean;
 };
 
 function ShellHistoryPane({ selected }: { selected: Session }) {
@@ -8855,9 +8856,13 @@ function ShellHistoryPane({ selected }: { selected: Session }) {
                 <div className="rail-event-meta">
                   {item.duration_ms == null ? "" : `${item.duration_ms} ms`}
                 </div>
-                {open === item.call_id && item.output && (
-                  <pre className="rail-event-output">{item.output}</pre>
-                )}
+                {open === item.call_id &&
+                  (item.output || item.output_truncated) && (
+                    <pre className="rail-event-output">
+                      {item.output}
+                      {item.output_truncated ? "\n[Output truncated]" : ""}
+                    </pre>
+                  )}
               </div>
             ))}
           </div>

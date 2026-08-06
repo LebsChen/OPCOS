@@ -125,7 +125,7 @@
 | 未关闭差距 | 当前状态 |
 |---|---|
 | attachments / artifacts timeline | **部分关闭**：截图和文件改动 diff 已作为 per-session artifacts 持久化并可在 timeline / artifact rail 按需展开；录屏、citation snippets 仍开放。截图 artifact 当前不会作为视觉输入发送给模型。 |
-| terminal replay / `terminal_update` panel | 仍开放：事件已持久化，但 Devin 式 terminal replay panel 尚未完成。 |
+| terminal replay / `terminal_update` panel | **部分关闭**：`terminal_update` 已按 `call_id` 聚合到 timeline 的 shell 行下，并可展开查看；Shell rail 同样读取 canonical `session_events`。仍不提供 PTY 语义、ANSI 光标/控制序列或终端状态重放。 |
 | iteration stats surfacing | 仍开放：事件可记录，但尚未在 timeline / UI 中提供 Devin 式可见统计面。 |
 | right rail Shell / Desktop / Web IDE panes | **未核实**：七轮没有 RVM token，因此没有真实远端 pane 验证。 |
 
@@ -167,7 +167,8 @@ Artifacts / attachments 这一批已完成的范围是：
 - 截图事件使用 Devin 对齐的 `computer_use` 类型，payload 带
   `screenshot_keys: [artifact_id]`；截图 artifact 的单文件上限为 8 MiB。
 - `write_file` / `edit_file` 的 `multi_edit_result.file_updates[]` 带 diff
-  artifact id；diff 超过 5000 行时不生成 diff artifact，但仍保留
+  artifact id；diff 超过 5000 行，或 old/new 行数乘积超过约 4,000,000
+  个 LCS 单元格时不生成 diff artifact，但仍保留
   `lines_added` / `lines_removed` 统计。
 - timeline 和 artifact rail 只在用户展开/打开时读取 artifact 内容；图片以
   base64 data URL 展示，diff 的新增/删除行有区别显示。
@@ -178,6 +179,19 @@ Artifacts / attachments 这一批已完成的范围是：
   `type: "image"` 输入 block，因此尚未进入模型的视觉输入；这是明确的后续
   open gap。OPCOS 仍没有 Devin `recording_stopped.clean_video_url` 或
   `citation_snippet.data.file_content` 对应能力。
+
+Terminal replay 的当前边界：
+
+- shell 输出以 `terminal_update` 增量事件持久化，前端按 `call_id` 按序拼接，
+  作为对应 shell 命令行下的可展开输出，不为每个 chunk 生成独立 timeline 行。
+- 每个 shell call 最多保留 64 个 chunk，每个 chunk 最多 2000 个字符；超出
+  任一限制时会追加 `{"truncated": true}` 的收尾 `terminal_update`，timeline
+  和 Shell rail 都显示 `Output truncated`。
+- 旧事件没有 chunk 序号时仍可渲染。当前顺序依赖 canonical event 的
+  `created_at_ms` + store `sequence` 排序；同一毫秒内由数据库 sequence 保持
+  插入顺序，因此本批不新增序号字段。
+- 当前没有 PTY、ANSI 控制序列/光标重放、终端尺寸或完整终端状态 replay；
+  LocalHost 的 `pty` surface 仍不可用，右栏 PTY surface 保持 open gap。
 
 真实 Devin 事件样本的字段形状已依据
 `/home/ubuntu/devin_session_events_full.txt` 核对，覆盖 status、shell、file、

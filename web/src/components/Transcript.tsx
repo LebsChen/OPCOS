@@ -46,6 +46,32 @@ function Thought({ text }: { text: string }) {
   );
 }
 
+function TerminalOutput({
+  output,
+  truncated,
+}: {
+  output: string;
+  truncated?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="mt-1">
+      <button
+        className="text-left underline text-xs text-muted"
+        onClick={() => setOpen((value) => !value)}
+      >
+        {open ? "Hide output" : "Show output"}
+      </button>
+      {open && (
+        <pre className="artifact-code whitespace-pre-wrap">
+          {output}
+          {truncated ? "\n[Output truncated]" : ""}
+        </pre>
+      )}
+    </div>
+  );
+}
+
 function ArtifactRow({
   sessionId,
   artifactId,
@@ -256,6 +282,12 @@ export function Transcript({
                 <div className="transcript-item" key={rowIndex}>
                   {row.label}
                   {row.detail && <Thought text={row.detail} />}
+                  {(row.terminalOutput || row.terminalTruncated) && (
+                    <TerminalOutput
+                      output={row.terminalOutput ?? ""}
+                      truncated={row.terminalTruncated}
+                    />
+                  )}
                   {row.artifactId && (
                     <ArtifactRow
                       sessionId={sessionId}

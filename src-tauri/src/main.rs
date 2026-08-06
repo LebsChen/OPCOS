@@ -18453,27 +18453,34 @@ fn session_shell_history(
         .map_err(|error| error.to_string())?;
     let terminal_updates = state
         .store
-        .load_audit(Some(&session_id))
+        .load_session_events(&session_id)
         .map_err(|error| error.to_string())?
         .into_iter()
-        .filter(|event| event.kind == "working_event")
-        .filter_map(|event| {
-            (event.payload.get("event_type").and_then(Value::as_str) == Some("terminal_update"))
-                .then_some(event.payload)
+        .filter_map(|record| {
+            let event = record.event;
+            let working = event.get("working_event")?.as_object()?;
+            (event.get("type").and_then(Value::as_str) == Some("terminal_update")
+                || working.get("event_type").and_then(Value::as_str) == Some("terminal_update"))
+            .then_some(working.get("payload")?.clone())
         })
         .filter_map(|payload| {
-            let call_id = payload.get("payload")?.get("call_id")?.as_str()?;
+            let call_id = payload.get("call_id")?.as_str()?;
             let contents = payload
-                .get("payload")?
-                .get("contents")?
-                .as_str()
+                .get("contents")
+                .and_then(Value::as_str)
                 .unwrap_or_default();
-            Some((call_id.to_owned(), contents.to_owned()))
+            let truncated = payload
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Some((call_id.to_owned(), contents.to_owned(), truncated))
         })
         .fold(
-            std::collections::HashMap::<String, String>::new(),
-            |mut output, (call_id, contents)| {
-                output.entry(call_id).or_default().push_str(&contents);
+            std::collections::HashMap::<String, (String, bool)>::new(),
+            |mut output, (call_id, contents, truncated)| {
+                let entry = output.entry(call_id).or_default();
+                entry.0.push_str(&contents);
+                entry.1 |= truncated;
                 output
             },
         );
@@ -18487,16 +18494,16 @@ fn session_shell_history(
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let result = call.result.unwrap_or(Value::Null);
-            let output = terminal_updates
+            let (output, output_truncated) = terminal_updates
                 .get(&call.call_id)
                 .cloned()
-                .or_else(|| {
+                .unwrap_or_else(|| {
                     result
                         .get("stdout")
                         .and_then(Value::as_str)
-                        .map(str::to_owned)
-                })
-                .unwrap_or_default();
+                        .map(|stdout| (stdout.to_owned(), false))
+                        .unwrap_or_default()
+                });
             let exit_code = result
                 .get("exit_code")
                 .or_else(|| result.get("code"))
@@ -18507,6 +18514,7 @@ fn session_shell_history(
                 "exit_code": exit_code,
                 "duration_ms": result.get("duration_ms").and_then(Value::as_u64),
                 "output": output,
+                "output_truncated": output_truncated,
                 "result": result,
                 "message_sequence": call.message_sequence,
             })

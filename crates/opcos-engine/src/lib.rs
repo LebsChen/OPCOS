@@ -1971,6 +1971,7 @@ where
                         "shell_process_started",
                         "shell",
                         json!({
+                            "call_id": call.id,
                             "command": call.arguments.get("command").and_then(Value::as_str).unwrap_or_default(),
                             "shell_id": call.id,
                             "process_id": call.id,
@@ -2235,15 +2236,23 @@ where
 
     async fn execute_tool_streaming(&self, call: &ToolCall) -> Value {
         let emitted = Arc::new(AtomicUsize::new(0));
+        let truncated = Arc::new(AtomicBool::new(false));
         let call_id = call.id.clone();
         let on_output = {
             let emitted = emitted.clone();
+            let truncated = truncated.clone();
             let engine = self;
+            let call_id = call_id.clone();
             move |chunk: &str| {
                 if emitted.fetch_add(1, Ordering::Relaxed) >= 64 {
+                    truncated.store(true, Ordering::Relaxed);
                     return;
                 }
-                let chunk = chunk.chars().take(2000).collect::<String>();
+                let mut chars = chunk.chars();
+                let chunk = chars.by_ref().take(2000).collect::<String>();
+                if chars.next().is_some() {
+                    truncated.store(true, Ordering::Relaxed);
+                }
                 if chunk.is_empty() {
                     return;
                 }
@@ -2254,10 +2263,19 @@ where
                 );
             }
         };
-        self.executor
+        let result = self
+            .executor
             .execute_streaming(&call.name, call.arguments.clone(), &on_output)
             .await
-            .unwrap_or_else(|error| json!({"error":error}))
+            .unwrap_or_else(|error| json!({"error":error}));
+        if truncated.load(Ordering::Relaxed) {
+            let _ = self.record_working_event(
+                "terminal_update",
+                "shell",
+                json!({"call_id":call_id,"contents":"","truncated":true}),
+            );
+        }
+        result
     }
 
     async fn persist_artifact(
@@ -3186,7 +3204,8 @@ fn unified_diff(path: &str, old: &str, new: &str) -> String {
     }
     let old_lines = old.lines().collect::<Vec<_>>();
     let new_lines = new.lines().collect::<Vec<_>>();
-    if old_lines.len() > MAX_EXACT_DIFF_LINES || new_lines.len() > MAX_EXACT_DIFF_LINES {
+    let cells = old_lines.len().checked_mul(new_lines.len());
+    if cells.is_none() || cells.unwrap_or(usize::MAX) > MAX_EXACT_DIFF_CELLS {
         return String::new();
     }
     let mut lcs = vec![vec![0usize; new_lines.len() + 1]; old_lines.len() + 1];
@@ -3224,6 +3243,8 @@ fn unified_diff(path: &str, old: &str, new: &str) -> String {
 }
 
 const MAX_EXACT_DIFF_LINES: usize = 5_000;
+// 4,000,000 cells × 8 bytes per usize is about 32 MiB for the DP values.
+const MAX_EXACT_DIFF_CELLS: usize = 4_000_000;
 
 #[async_trait]
 impl<P, S, E> AgentEngine for TurnEngine<P, S, E>
@@ -3983,6 +4004,19 @@ mod tests {
             .join("\n");
         let new = old.replace("old-2500", "new-2500");
         assert!(unified_diff("large.txt", &old, &new).is_empty());
+    }
+
+    #[test]
+    fn unified_diff_skips_large_dp_area_below_the_line_limit() {
+        let old = (0..2_001)
+            .map(|index| format!("old-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new = (0..2_001)
+            .map(|index| format!("new-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(unified_diff("area.txt", &old, &new).is_empty());
     }
 
     #[test]
