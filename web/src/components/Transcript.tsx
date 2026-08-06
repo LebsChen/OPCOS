@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { type ReactNode, useEffect, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import { type ApprovalDecision, type Item } from "../types";
 import { buildTimeline, type TimelineEvent } from "../timeline";
 import { ApprovalCard } from "./ApprovalCard";
@@ -56,6 +56,10 @@ function Thought({
       <div className="transcript-thought-body">{text}</div>
     </details>
   );
+}
+
+function thoughtLabel(label?: string): string {
+  return label?.startsWith("Thought for ") ? label : "Thought details";
 }
 
 function PlanCard({
@@ -248,29 +252,65 @@ export function Transcript({
   onRetry?: () => void;
 }) {
   const nodes = buildTimeline(events);
+  const worklogOverrides = useRef(new Set<number>());
+  const [worklogOpen, setWorklogOpen] = useState<Record<number, boolean>>({});
+  const lastWorkIndex = nodes.reduce(
+    (last, node, index) => (node.kind === "work" ? index : last),
+    -1,
+  );
+  useEffect(() => {
+    if (lastWorkIndex < 0 || worklogOverrides.current.has(lastWorkIndex))
+      return;
+    setWorklogOpen((current) => ({
+      ...current,
+      [lastWorkIndex]: Boolean(running),
+    }));
+  }, [lastWorkIndex, running]);
   return (
     <div className="transcript transcript-content">
       {nodes.map((node, index) => {
         if (node.kind === "user")
           return (
             <div className="group transcript-user-message self-end" key={index}>
-              <div className="bubble-user transcript-user-bubble">
-                {node.attachments?.map((attachment) =>
-                  attachment.kind === "image" ? (
-                    <img
-                      key={attachment.name}
-                      className="msg-img"
-                      src={attachment.data_url}
-                      alt={attachment.name}
-                    />
-                  ) : (
-                    <span key={attachment.name} className="msg-file">
-                      📄 {attachment.name}
-                    </span>
-                  ),
-                )}
-                {node.text}
-              </div>
+              {node.text.length > 800 ? (
+                <details className="transcript-user-collapsible">
+                  <summary className="bubble-user transcript-user-bubble">
+                    {node.attachments?.map((attachment) =>
+                      attachment.kind === "image" ? (
+                        <img
+                          key={attachment.name}
+                          className="msg-img"
+                          src={attachment.data_url}
+                          alt={attachment.name}
+                        />
+                      ) : (
+                        <span key={attachment.name} className="msg-file">
+                          📄 {attachment.name}
+                        </span>
+                      ),
+                    )}
+                    {node.text}
+                  </summary>
+                </details>
+              ) : (
+                <div className="bubble-user transcript-user-bubble">
+                  {node.attachments?.map((attachment) =>
+                    attachment.kind === "image" ? (
+                      <img
+                        key={attachment.name}
+                        className="msg-img"
+                        src={attachment.data_url}
+                        alt={attachment.name}
+                      />
+                    ) : (
+                      <span key={attachment.name} className="msg-file">
+                        📄 {attachment.name}
+                      </span>
+                    ),
+                  )}
+                  {node.text}
+                </div>
+              )}
               <BubbleMeta text={node.text} ts={node.ts} />
             </div>
           );
@@ -340,8 +380,11 @@ export function Transcript({
             key={rowIndex}
           >
             <span className="transcript-row-label">{row.label}</span>
+            {row.shellId && (
+              <span className="transcript-row-meta">{row.shellId}</span>
+            )}
             {row.exitCode !== undefined && row.exitCode !== 0 && (
-              <span className="text-xs text-muted">exit {row.exitCode}</span>
+              <span className="transcript-row-meta">exit {row.exitCode}</span>
             )}
             {row.denied && (
               <span className="ml-2 text-xs text-muted">
@@ -354,12 +397,12 @@ export function Transcript({
               </span>
             )}
             {row.detail && !row.thoughtForCallId && (
-              <Thought text={row.detail} label={row.label} />
+              <Thought text={row.detail} label={thoughtLabel(row.label)} />
             )}
             {row.callId && thoughtByCallId.get(row.callId)?.detail && (
               <Thought
                 text={thoughtByCallId.get(row.callId)?.detail ?? ""}
-                label={thoughtByCallId.get(row.callId)?.label}
+                label={thoughtLabel(thoughtByCallId.get(row.callId)?.label)}
               />
             )}
             {(row.terminalOutput || row.terminalTruncated) && (
@@ -419,8 +462,19 @@ export function Transcript({
           return rendered;
         };
         return (
-          <details className="work-segment transcript-worklog" key={index}>
-            <summary className="transcript-worklog-header">
+          <details
+            className="work-segment transcript-worklog"
+            open={worklogOpen[index] ?? (running && index === lastWorkIndex)}
+            onToggle={(event) => {
+              const open = event.currentTarget.open;
+              setWorklogOpen((current) => ({ ...current, [index]: open }));
+            }}
+            key={index}
+          >
+            <summary
+              className="transcript-worklog-header"
+              onClick={() => worklogOverrides.current.add(index)}
+            >
               <span className="transcript-chevron" aria-hidden="true">
                 ›
               </span>
