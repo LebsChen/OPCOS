@@ -643,10 +643,565 @@ model.
 `local input unavailable: could not initialize the X11 input backend`. Treat it as an enigo backend /
 feature-flag gap, not a headless artifact, and do not "fix" it by re-running with a display.
 
+## Testing the local host's persistent shell (no remote host needed)
+
+The built-in local host `本机` is enough to test `LocalHost::exec_persistent_streaming` end to end,
+which is where `run_shell`/`exec` land when a session is bound to `本机`
+(`src-tauri/src/main.rs`, `DesktopExecutor::Local::execute_streaming`). Fixture: any throwaway dir
+**under `$HOME`** (containment is enforced), e.g. `~/opcos-shell-test/subdir/deeper`.
+
+- Put the absolute path in the home composer's **Workspace** field, host `本机`, mode `Auto` (no
+  approval cards), then send prompts of the form *"Use N separate run_shell calls, one command each,
+  do not modify them, do not pass a cwd argument: …"*. Weaker models otherwise collapse the commands
+  into one call with `&&`, or pass a `cwd` argument that silently resets the shell's cwd
+  (`change_cwd`) and destroys any cwd-persistence assertion.
+- The persistent shell session key is `opcos-local-<session_id>`, so **cwd/env persistence must be
+  tested inside one session**; every tool row shows the same `shell-<id>` chip when it is reused.
+- **Proving output streams incrementally:** run `for i in 1 .. 9; do echo "TICK-$i"; sleep 3; done`
+  (keep total < `DEFAULT_EXEC_TIMEOUT_SECONDS = 30`, `crates/opcos-rvm/src/lib.rs`), then click the
+  tool row's `Show output` toggle **while the turn is still running** and capture two snapshots a few
+  seconds apart. A working streaming loop shows a strictly growing line count with no exit chip yet;
+  a non-streaming regression shows an empty block until the row flips to `exit 0`.
+- Two independent truncation limits exist and are easy to confuse. The **live** terminal block in the
+  tool row is capped at 64 chunks × 2000 chars (`opcos-engine/src/lib.rs`), so a 50 000-line command
+  renders only the first ~16 lines there. The **model-visible** result is capped at 64 KiB by
+  `bounded_output_text` (`src-tauri/src/main.rs`), which prepends
+  `[Output truncated: omitted N bytes; showing the last 64 KiB]` and keeps the *tail*. Assert the tail
+  (e.g. line `50000`) from the assistant's reply, not from the row's short live block.
+- Useful adversarial commands for this path: `sh -c 'exit 7'` (exit-code fidelity — a broken wrapper
+  reports `1`), and
+  `printf 'a\nb\nc\n' | grep -c b; echo "PIPESTATUS0=${PIPESTATUS[0]}"`. On POSIX the pipeline must
+  return `exit 0`; `local host I/O failed: local shell exited` there means the shell died mid-command
+  (`shell_exit_diagnostic`) and is always a bug.
+- Cheap post-run checks: `grep -c "local shell exited"` in the app log (expect 0) and
+  `ls /tmp/opcos-shell-output-*` (expect none — temp files should be cleaned up).
+- The Windows PowerShell wrapper in the same file **cannot** be exercised from Linux. Say so
+  explicitly rather than implying the fix is proven; it needs a Windows host — see
+  "Testing the Windows PowerShell wrapper on a real Windows host" below.
+
+### Testing the Windows PowerShell wrapper on a real Windows host
+
+The `windows_persistent_command` / `windows_persistent_streaming_command` builders in
+`crates/opcos-hosts/src/lib.rs` are `#[cfg_attr(not(windows), allow(dead_code))]`, so they **compile
+and run on Linux** even though the code path they feed is Windows-only. That is the lever that makes
+Windows testing possible without a Windows Rust toolchain.
+
+Prefer `cargo test -p opcos-hosts` on the Windows host if you can, but **measure the host's download
+throughput before committing to it**:
+
+```powershell
+$sw=[Diagnostics.Stopwatch]::StartNew(); & curl.exe -s -m 20 -o probe.bin https://static.crates.io/crates/tokio/tokio-1.40.0.crate; $sw.Stop()
+```
+
+On an RVM Windows dev-agent this measured ~80-110 KB/s, which makes a toolchain (~180 MB) plus a
+mingw-w64 linker (~130 MB; these boxes typically have no MSVC, no gcc and no winget, and rustup does
+**not** bundle a GNU linker driver) plus the crates.io tree (~200-300 MB) a 1.5-2 hour download
+before anything compiles. Also note `Invoke-WebRequest` may hang at 0 bytes indefinitely on these
+hosts — use the built-in `curl.exe` instead. Be aware that even a green Windows `cargo test` would
+skip most of the persistent-shell runtime tests, because they are `#[cfg(not(windows))]`.
+
+The practical route (validates the wrapper + marker protocol against real PowerShell, not the Rust
+async plumbing — say so in the report):
+
+1. Add a **temporary** `#[test]` in `mod tests` that calls the real builders with Windows-style paths
+   (`PathBuf::from(r"C:\...")` — `display()` passes the string through on Linux) and writes
+   `{index, marker, wrapper}` JSON to `/tmp`. Never hand-write the wrapper; revert the test after.
+2. `/api/write` the JSON to the host (accepts ≥400 KB bodies; chunk + `tar` reassembly works for
+   bigger payloads), then drive it with a PowerShell script that starts **one**
+   `powershell.exe -NoProfile -NonInteractive -Command -` via `System.Diagnostics.ProcessStartInfo`
+   with `StandardOutputEncoding = [Text.Encoding]::UTF8`, and per case: `WriteLine($wrapper)`,
+   then read until a line containing `"<marker>:"` and split the remainder on `':'` with count 2
+   (the cwd contains `C:`). Run all cases through the *same* child so "the session survived" means
+   something.
+3. Read the child's stdout **one char at a time** (`$out.ReadAsync($buf,0,1)` with `.Wait(ms)` for a
+   timeout), not `ReadLine()`, so CR/LF bytes survive exactly as the Rust reader sees them. Never use
+   `ReadToEndAsync()` — it only completes at EOF, so it hangs forever on a live persistent shell.
+4. `/api/exec-sync` has a hard **30 s** timeout, so launch the driver detached
+   (`Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',… -WindowStyle Hidden`)
+   and poll a log file it appends to.
+
+Things that bit and are likely to bite again:
+
+- **Output is CRLF on real Windows, LF under Linux/macOS `pwsh`.** The wrapper redirects with `>`
+  (CRLF) and replays the file verbatim, and nothing in `opcos-hosts` strips `\r`. The repo's own
+  `windows_persistent_wrapper_works_with_real_powershell` asserts `assert_eq!(output, "plain\n")`, so
+  it is green in CI on Linux `pwsh` but would **fail on Windows**. Expect this class of
+  LF-only-assertion bug in anything claiming Windows coverage; check whether such a test has ever run
+  on Windows before trusting it.
+- To generate the **pre-PR** wrapper for a differential ("was it really broken?") test, use
+  `git worktree add` at the PR's code base. Old Windows-only branches guarded by `#[cfg(windows)]`
+  (e.g. `persistent_env_prefix` returning `setlocal EnableDelayedExpansion && `) will not appear in a
+  Linux build — temporarily flip `#[cfg(windows)]`→`#[cfg(all())]` and
+  `#[cfg(not(windows))]`→`#[cfg(any())]` inside that one function in the throwaway worktree.
+  Symptom of the old bug on PowerShell 5.1: `标记"&&"不是此版本中的有效语句分隔符` /
+  `FullyQualifiedErrorId : InvalidEndOfLine` and, decisively, **no marker line at all** — which is
+  what surfaces as `local host I/O failed: local shell exited` or a timeout.
+- Parse errors emitted *before* the wrapper's `[Console]::OutputEncoding=UTF8` line runs come out in
+  the console's ANSI code page (GBK on a zh-CN host) and look like mojibake if you decode UTF-8.
+  Don't chase it; judge on the presence/absence of the marker.
+- To prove incremental streaming on Windows, sample `<output_path>.working` (the staging file the
+  streaming wrapper redirects into) every ~400 ms while the command runs, opening it with
+  `[IO.File]::Open($p,'Open','Read','ReadWrite')` so the share mode does not conflict. A growing byte
+  count before the marker arrives is the Windows-side precondition for live terminal output.
+- Useful Windows-specific adversarial cases: `& cmd.exe /c exit 3` must report **3** and the *next*
+  pure-cmdlet command must report **0** (no `$LASTEXITCODE` leak); `if (` must be a non-zero result
+  rather than shell death; and `pwsh` being absent is a *feature* — it exercises
+  `spawn_persistent_shell`'s `pwsh.exe` → `powershell.exe` fallback. You can only verify that
+  fallback's premise without a toolchain (`[Diagnostics.Process]::Start("pwsh.exe",…)` throws
+  `The system cannot find the file specified`); do not claim the Rust branch itself ran.
+- `test` and `printf` resolve to the MSYS2 binaries bundled with git-for-windows, so bash-ish
+  commands produce `/usr/bin/test: …` messages and pass through *their* exit code (e.g. 2), not a
+  fixed 1.
+
+### Cloudflare Workers AI as the provider
+
+A usable free provider when no gateway key is around, using `CF_ID` + `CF_TOKEN`:
+
+- Settings → Provider → **Cloudflare Workers AI**. Filling only *API token* + *Cloudflare account ID*
+  makes **Save and validate** fail with
+  `Provider validation failed: provider base URL is not configured; enter one in Provider settings`,
+  because the descriptor has `default_base_url: None` (`crates/opcos-provider/src/registry.rs`) while
+  only the session path derives the URL from the account id (`src-tauri/src/main.rs`). Workaround:
+  type the base URL by hand — `https://api.cloudflare.com/client/v4/accounts/<account-id>/ai/v1` —
+  then validate; you should get `Provider key validated successfully.`
+- `@cf/zai-org/glm-5.2` (first Cloudflare row in `matrix.rs`) returns
+  `not available on the Workers Free plan`. Use **`@cf/zai-org/glm-4.7-flash`**, which is free and
+  does emit real `tool_calls`. Sanity-check any candidate model with one `curl` to
+  `…/ai/v1/chat/completions` including a `tools` array before spending GUI time on it.
+- Note that the account id (not the token) legitimately lands in `opcos.db` as
+  `provider.account_id.cloudflare` and inside the stored base URL — expect a non-zero count for it in
+  a leak check, and assert only that the **token** count is 0.
+
 ## Devin secrets needed
 
+- `CF_ID` + `CF_TOKEN` — Cloudflare account id and API token for the Workers AI provider
+  (free plan; use model `@cf/zai-org/glm-4.7-flash`). `CF_AI_TOKEN` fails authentication.
 - `RVM_WIN_TOKEN` — valid for DevBox `https://devbox.windevos.com` only (Antec `win.windevos.com`
   answers 401 for everything except `/api/health`).
+- `RVM_DEVBOX_URL` + `RVM_DEVBOX_TOKEN` — the Windows RVM dev-agent used for Windows PowerShell
+  wrapper testing (`https://devbox.windevos.com`, Windows PowerShell **5.1**, has `git`, no `pwsh`,
+  no Rust toolchain). Token goes only in an `Authorization: Bearer` header, never in a URL.
 - `OPCOS_PROVIDER_KEY` — OpenAI-compatible gateway `https://ai.yaoshen.de5.net/v1`.
 - `nextapi_token` — OpenAI-compatible gateway `https://api.nextapi.store/v1` (serves `glm-5.2`;
   reports no context length, which is what makes it useful for testing matrix fallback).
+## GitHub Enterprise 实例 panel (project 运行凭据)
+
+- Entry point: project board → scroll to the **bottom** section 项目运行凭据 → the card
+  **GitHub Enterprise 实例**, right column next to *Connector token*. Mouse-wheel scrolling over the
+  centre column can land inside the huge 全局预设 connector catalog (clicking a label there pops a
+  `window.confirm` about removing a preset — Cancel it); scroll with the cursor over the **left
+  sidebar** (x≈250) instead, it scrolls the page without hitting catalog controls.
+- The instance list is **global**, not project-scoped (`list_github_enterprise_instances` takes no
+  project id), but it is only rendered inside `ProjectConfigPanel`, so you need at least one project
+  to reach it. Fastest fixture: sidebar 项目 `+` → name + 仓库路径 `~/opcos-test/demo-repo` → press
+  `Return` in the name field (the 创建 button is below the fold and the dialog does not wheel-scroll).
+- Validation errors from `save_github_enterprise_instance` surface in the app-level red
+  `error-banner` at the bottom of the window (App.tsx `onError` → `setError`), not inside the card.
+  Zoom into that strip to read them. Expected strings:
+  `GitHub Enterprise API base host <x> does not match instance host <y>` and
+  `github.com is always available and must not be registered as a GitHub Enterprise instance`.
+- Persistence lives in `github_instances` (store migration 12). Verify with
+  `pkill -f target/debug/opcos; sleep 4;` then
+  `python3 -c "import sqlite3; ..."` on `~/.config/com.opcos.desktop/opcos.db` — the WAL is
+  checkpointed on shutdown, so a live read is unreliable.
+- Registering with an explicit but path-less API base (`https://<host>`) is a stronger check than an
+  empty one: both must end up as `https://<host>/api/v3`.
+- No GHES server exists on the box; do not attempt live Enterprise API calls — assert on
+  registration/validation/persistence only and say so in the report.
+
+## Testing a newly registered LLM provider (no remote host required)
+
+A provider PR (a `descriptor(...)` in `crates/opcos-provider/src/registry.rs` + entries in
+`matrix.rs`) can be fully accepted against the built-in `本机 (local)` host — you do **not** need an
+RVM token. Recommended flow, all in the real Tauri window:
+
+1. Settings → Provider → the new card. Assert the default Base URL, the presence of the
+   `Provider key` password field (`needs_key`), and `Not configured yet.`
+2. **Capture the pre-key state first**: with no key stored, `provider_models` fails and the card
+   shows `来源：内置回退（provider key is not configured）` with only the `matrix.rs` models. That is
+   the perfect "before" screenshot for the dynamic-discovery assertion.
+3. Type the key from stdin (`printf '%s' "$TOK" | DISPLAY=:0 xdotool type --file -`), click
+   `Test / Save` → `Provider key validated successfully.`
+4. Click the card's `刷新` button, then open the `Model` select. **The discriminator between
+   "real discovery" and "hardcoded list" is a model id the gateway serves but `matrix.rs` does not
+   contain** — curl `<base>/v1/models` yourself first and pick one. The source line must flip to
+   `来源：API 实时发现`. Non-chat models hide behind `显示全部模型`; unknown-capability models are
+   suffixed `(能力未知)`.
+5. Discovery is cached 300 s per (provider, base_url) in `model_discovery`; only `刷新`
+   (`refresh: true`) bypasses it — a stale-looking list is usually the cache, not a bug.
+6. Home composer chips, left→right: Agent template / Role / Harness / 绑定主机 / Provider / 模型 /
+   模式 / Workspace. Pick 绑定主机 `本机`, the new Provider, a discovered model, 模式 `Auto`, and a
+   workspace dir you created under `$HOME`; typing the prompt and pressing send creates the session
+   *and* submits the turn in one go.
+
+### Provider-surface gotchas found this way
+
+- **The provider card's `Model` select is not persisted.** `save_provider_settings` takes only
+  `provider` + `base_url` (`src-tauri/src/main.rs`), and `providerModels` in `App.tsx` is local React
+  state, so after a restart the card always falls back to `descriptor.recommended_model`. Only the
+  per-session model (`sessions.model`) survives. Assert persistence against the DB, and expect this
+  to still be broken unless a PR adds a model parameter to `save_provider_settings`.
+- **A failed validation still leaves `✓ Configured securely.`** and overwrites the previously stored
+  good key, so always re-enter the real key after a negative test.
+- Negative-key wording is `Provider validation failed: provider model discovery returned HTTP 401
+  Unauthorized` — a good anchor, and it does not echo the key.
+- **Tool step arguments render as `[object Object]`** in the transcript `raw` toggle, so you cannot
+  assert tool arguments from the UI. Prove tool execution from disk instead (write a marker file and
+  `cat` it), and report the rendering gap separately.
+- **There is no usage UI**; usage only lands in `usage_events` (session_id, input/output tokens,
+  duration). Read it after a clean shutdown.
+- **There is no `delete_session` in `web/src`** — test sessions can only be cleaned up by deleting
+  the `sessions` (+ `usage_events`) rows from sqlite after shutdown.
+- `computer` `type` does not deliver CJK into the WebView — write prompts in ASCII/English, or paste
+  via xdotool `--file -`. A silently-empty textarea after typing Chinese is this, not a focus bug.
+- To make shell-only evidence visible in the recording, spawn `konsole` on `DISPLAY=:0` running the
+  verification command (`ls`/`cat` of the marker file) and screenshot it next to the app window.
+
+## Testing the working-event timeline (`buildTimeline`) — the surface that keeps regressing
+
+The React timeline is built by `web/src/timeline.ts::buildTimeline` from persisted `session_events`.
+Unit fixtures for it were originally captured from **Devin's** event stream, not OPCOS', so green
+unit tests prove nothing about the real app. Always drive a real session.
+
+### Force all row families in one prompt
+
+A single prompt that reliably produces every row family:
+
+> Plan this out as a task list first, then do it. In this workspace: 1) create `stats.py` with
+> `mean(nums)` and `stdev(nums)`; 2) create `README_STATS.md` documenting them; 3) run
+> `python3 stats.py`; 4) add a `--json` flag and re-run. Update the task list as you finish each step.
+
+Step 4 is what produces an **edit** (`action_type:"edit"`); a task the model gets right first time
+only ever yields `create` rows. Expect `Worked for Xs +N −M` groups containing `Thought for Ns`,
+literal shell command rows, `Created <file> +N`, `Edited <file> +N −M`, and task rows.
+
+### Cross-check the +N/−M numbers instead of eyeballing them
+
+Sum `multi_edit_result.file_updates[].lines_added - lines_removed` per file from sqlite and compare
+with `wc -l` on the real file. They matched exactly (52 / 76) in the last two rounds, so any drift is
+a real bug, not rounding.
+
+### Parity recipe: live == in-app re-read == cold restart
+
+1. Capture the ordered row labels while the turn streams (expand every `<details>` group).
+2. **`Ctrl+R` does not reload the Tauri webview.** Navigate to another view and back into the session
+   to force a `read_transcript`.
+3. `pkill -f target/debug/opcos`, relaunch, reopen the session.
+
+Expand groups by clicking their summary rows **bottom-up** — expanding a group pushes everything
+below it down, so top-down clicking hits the wrong targets.
+
+### Task rows: `steps`, not `todos`
+
+`todo_update` payloads are serialized `PlanRecord`s: `{plan_id, title, status, revision, steps:[{step_id,
+position, description, status}]}`. There is **no `todos` key**. `buildTimeline` must read `steps[]` and
+`description`, and count `done`/`completed` as complete.
+
+Even after that is fixed, check the *progress* rows separately: `previousTodos` is reset to `[]` at
+every `user_message`/`devin_message`/`approval_pending` flush, and this engine emits a `devin_message`
+per iteration — so the `todos.length > previousTodos.length` branch fires every time and you get
+`Created N Tasks` repeated once per group with **zero** `k/n#i <task>` rows. Verify by replaying the
+same branch logic over the persisted events in Python rather than counting rows by eye.
+
+### Slash commands: action vs prompt
+
+`builtin_control_slash_commands()` (`/compact`, `/mode`, `/model`, `/ls`, `/help`) are declared
+`execution:"action"`; `builtin_slash_commands()` (`/implement`, `/plan`, `/review`, …) are
+`execution:"prompt"`. The composer autocomplete labels them `ACTION` / `PROMPT` — use that as the
+quick visual check. Test both kinds every round: an action must produce **no user prose bubble** and
+a backend effect (`/compact` ⇒ exactly one persisted `compacted` event), a prompt must expand into
+its body text in the user bubble.
+
+Caveat: actions other than `/compact` (`/ls`, `/mode`, `/model`, `/help`) emit a `notice` whose kind
+is not in `timeline.ts`'s notice allow-list (`error`, `interrupted`, `provider_error`,
+`compaction_summary_invalid`), so they run but show **nothing** in the UI. Do not read "no output" as
+"the command did not run" — check sqlite/backend state.
+
+**Composer click target:** the slash autocomplete popup sits directly under the textarea and shifts
+the layout. Clicking where the textarea "usually" is often hits the popup and silently drops your
+typing. Screenshot first, click the `Ask OPCOS…` placeholder line specifically, and press `Escape` to
+dismiss the popup before clicking send.
+
+### Compaction
+
+`/compact` on the Builtin harness calls `engine.compact_now()`. Expect `Earlier context compacted` as
+a **row inside** a `Worked for …` group (not a standalone notice), and re-check it after a cold
+restart. Watch for `compaction_summary_invalid` — `glm-5.2` returned a 14k-char summary that the
+engine rejected as `response_too_large`, so compaction succeeded but lost its summary. Note that this
+event is emitted **twice**, and the second copy has no `message`/`text`, which renders as an *empty*
+notice node — that violates the "no empty artifacts" rule and is easy to miss visually.
+
+### Stuck `Running` header
+
+The header can stay `Running`/`Working` indefinitely while `sessions.run_state` is already `idle` —
+always cross-check the DB before believing the UI. One cause (event listener re-subscribing on
+`selected?.id` change) has been fixed, but it still reproduced on a turn that followed a `/compact`
+(which recreates the engine via `engine_for`). `⏹ Stop` clears the state reliably **during** a real
+turn, but does not clear an already-stuck header; only navigating away and back does.
+
+### Context window resolution
+
+The nextapi gateway reports no `context_length` for `glm-5.2` (`capabilities_known=false` in
+`model_discovery_cache`), so a `context_growth_update` with `resolved_context_window=1000000` and
+`context_window_source='matrix'` proves the matrix fallback rather than a gateway value. Assert over
+**every** such event, not just one. "No auto-compaction" alone is weak evidence — a short run stays
+under the old 24k threshold anyway.
+
+### Envelope integrity one-liner
+
+After a clean shutdown, assert on every persisted event: non-empty `type`, non-empty `event_id`,
+integer `created_at_ms`, unique ids, monotonic `created_at_ms`. Zero empty `devin_thoughts` bodies
+and no two consecutive identical thoughts.
+
+### Provider bring-up on a gateway
+
+Settings → Provider → OpenAI: base URL, paste key into the password field, Validate, pick the model.
+After configuring a provider the **home composer's model list stays on the built-in matrix models
+until a full app restart** — restart before concluding the model is unavailable. Once restarted the
+picker opens in <1 s; a multi-second `Loading models…` means something is probing every model.
+
+## Local-host sessions are fully usable (and are the cheapest fixture)
+
+The claim that "OPCOS never executes work locally" is stale: host `本机` (`local`) runs the real
+Builtin harness with real tools. A one-commit `git init` repo under `$HOME`
+(`~/opcos-test/demo-repo`) plus the home composer's Workspace chip is a complete fixture; no RVM
+token is needed to test the timeline, artifacts, iteration stats, shell replay or compaction.
+Right-rail panes on a local host are Info / Shell / Changes / Progress / Agents / Artifacts / PR /
+Insights / Diff (Worklog, Desktop, Web IDE, Browser appear only for non-local hosts), and the Info
+pane opens by default — the "rail buttons hidden behind the topbar" workaround was not needed.
+
+### Which shell path a local `run_shell` really takes
+
+For a local host, `run_shell`/`exec` are intercepted by
+`DesktopExecutor::execute_streaming` (`src-tauri/src/main.rs:4300-4380`) and run through
+`host.spawn(...)`, i.e. **a fresh child process per call** — `LocalHost::exec`'s persistent
+shell/marker/temp-file protocol (`crates/opcos-hosts/src/lib.rs`, reached only from
+`main.rs:4184`) is **not** used. Two cheap runtime probes to confirm this before crediting any
+persistent-shell fix as "verified end to end":
+
+- poll `ls /tmp/opcos-shell-output-*` for the whole run — the persistent protocol creates such
+  files, the spawn path does not;
+- ask for two calls: `OPCOS_PROBE=x; echo set` then `echo "probe=[$OPCOS_PROBE]"`. `probe=[]` means
+  no shell state persists ⇒ spawn path. Cross-shell desync is impossible there, so report such a
+  fix as "not exercised through the UI" rather than passed.
+
+### Terminal replay: reconstruct chunk offsets, don't eyeball
+
+`execute_tool_streaming` (`crates/opcos-engine/src/lib.rs:2312-2355`) splits each PTY read into
+2000-char `terminal_update` events and caps at **64 events** (not 64x2000 chars): a 4096-byte read
+becomes 2000+2000+96, so `seq 1 200000` yields chunk lengths `[2000,2000,96]x21…` and 88016 chars
+total, ending mid-number. Anything else (all-2000 chunks, 128000 chars) means the read size or cap
+changed. Recipe: `pkill -f target/debug/opcos; sleep 4`, then in python read
+`session_events` ordered by `(created_at_ms, sequence)`, group `terminal_update` by `call_id`,
+concatenate the non-truncated `contents`, and compare byte-for-byte with the real command output
+prefix (`subprocess.run(["seq","1","200000"])`). Assert exactly one `{"contents":"","truncated":true}`
+and that it is the **last** event for the call. Note the model sees a *tail*-bounded tool result
+while the UI replay shows the *head* — different windows of the same command, easy to misread.
+
+UI check for the truncation marker: the `pre` is ~21k lines, so expand the shell row's
+**Show output** and scroll with a few `scroll_amount: 1500` wheel actions (~6 lines per click);
+`[Output truncated]` sits right after the mid-line cut.
+
+### Local `run_shell` now goes through one persistent `sh` per session (since `8b9aaf6`)
+
+`DesktopExecutor::execute_streaming` calls `LocalHost::exec_persistent_streaming` with session
+`opcos-local-<session_id>`, so a local GUI session keeps one long-lived `sh`. Verification probes that
+distinguish working from broken:
+
+- **Protocol on the path:** poll `ls -l /tmp/opcos-shell-output-*` every 100 ms during a slow command
+  (e.g. `for i in $(seq 1 12); do echo tick=$i; sleep 0.5; done`). You must see
+  `opcos-shell-output-<uuid>.working` **growing** and then *both* it and the non-`.working` snapshot
+  removed after the run. If no file ever appears, the old `host.spawn` path is being used.
+  Also poll `pgrep -P <opcos pid>`: the same `sh` PID must survive across shell calls.
+- **State persistence:** call 1 `export OPCOS_PROBE=set; cd /tmp; echo first=done`, call 2
+  `echo probe=[$OPCOS_PROBE] pwd=[$PWD]` must return `probe=[set] pwd=[/tmp]`. Remember this changes
+  cwd for every later call in the session — put an explicit `cd <workspace>` in later commands.
+- **Live streaming:** the store's `terminal_update` events for the slow command must have many
+  distinct `created_at_ms` spanning the command duration (12 chunks over 5502 ms for the loop above),
+  not one burst.
+- **Background isolation:** `(sleep 0.05; printf late) & true` then `printf next` — no `late` may
+  appear in any later `tool_result`.
+- Chunking on this path is driven by 8192-byte file reads, so lengths are `[2000,2000,2000,2000,192]`
+  repeating (~106304 chars for 64 events), not the old `[2000,2000,96]` PTY pattern. No TTY/ANSI on
+  this path by design.
+- Truncation event carries `total_bytes` (full command output size); the UI renders
+  `[Output truncated: N bytes omitted; the model saw the tail]` with `N = total_bytes − displayed`,
+  while the model-facing `stdout` starts with
+  `[Output truncated: omitted M bytes; showing the last 64 KiB]` and `stdout_metadata.omitted_bytes = M`.
+  Check `N + displayed == M + retained_tail == real output bytes`.
+
+### Typing non-ASCII into the composer
+
+Automation keyboard input silently drops CJK/emoji before they reach the Tauri window (the prompt echo
+shows them missing). Test UTF-8 with ASCII-only source, e.g.
+`python3 -c "print('\u4e2d\u6587 \u00fcn\u00efc\u00f8d\u00e9 \u2705 done')"`, and read the persisted
+`tool_result` bytes.
+
+### Reading the store: `session_events` shape
+
+Columns are `session_id, event_id, event_json, created_at_ms, sequence` — there is no `event_type`
+column. Type and payload live at `json['working_event']['event_type'|'payload']` (fall back to
+`json['type']`). `tool_calls.result` is often empty; the authoritative model-facing result is the
+`tool_result` field of the `tool_result` event in `session_events`.
+
+### Iteration stats / artifacts anchors
+
+- Info pane's `Iteration stats` card (`web/src/App.tsx:8880`) is fed by `read_session_events`;
+  totals must equal the sum of the per-iteration `details`, and each iteration's input/output
+  tokens must equal a row of the store's `usage_events` table — that is the fabrication check.
+  On the nextapi gateway `input_tokens` legitimately swings (46697 → 203 → 42401) because it reports
+  non-cached prompt tokens; don't read the total as context size.
+- A file edit emits `multi_edit_result.file_updates[0].artifact_id`; the timeline row renders a
+  **View diff** link, and the artifact lands at
+  `~/.config/com.opcos.desktop/artifacts/<session>/<artifact-id>` (compare with `git diff --numstat`).
+  For "no inline base64", scan `session_events` for strings ≥500 chars of the base64 charset and for
+  the `"image":"<base64>"` form — both must be 0.
+- `/compact` on Builtin persists exactly one `compacted` event with `source:"manual"`, the Info pane
+  reads `1 (0 automatic, 1 manual)`, and the row renders inside a `Worked for …` group.
+
+## Timeline-rendering verification (one-liners, thoughts, minor collapse)
+
+Screenshots alone cannot prove "no row was dropped". Re-implement `web/src/timeline.ts` +
+`Transcript.tsx renderRows` as a small Python simulator over the persisted `session_events`
+(see `/home/ubuntu/opcos-test/sim_timeline.py` for a working version) and compare its counts with
+what you see in the GUI. Key semantics to mirror, because they are where bugs hide:
+
+- `devin_message` / `user_message` **flush the current work group**; the engine emits one group per
+  iteration, so a long task produces dozens of groups (Devin shows one per user turn).
+- a `devin_thoughts` row gets `thoughtForCallId` from the *next* action, and `Transcript.tsx` skips
+  such a row at top level and re-renders it from a **per-group** `thoughtByCallId` map. If the target
+  action lands in the *next* group (the common case, since thoughts are emitted at the end of an
+  iteration) the thought renders **nowhere**. Always count `nested / standalone / lost` explicitly.
+- one-liner rows come from `one_line_thoughts.short`; assert `events == rendered rows`.
+- consecutive rows with `is_major_action === false` collapse into an `N minor actions` expander; check
+  the contained rows' timestamps lie between the surrounding rendered rows.
+
+Shell-row metadata gotchas observed on `dbcf337`:
+
+- `shell_process_completed.exit_code` is derived from `result["exit_code"]`, but the desktop executor
+  wraps results as `{"status":…,"result":{"exit_code":…}}`, so **every row renders `exit 0`**. Force a
+  failure (`sh -c 'exit 3'`) and compare the row against the inner value in the store before believing
+  any "non-zero exits look different" claim.
+- `duration_ms` is absent from the payload; the UI falls back to the completed−started timestamp delta.
+- `shell_id_for_session` = `shell-` + first 8 alphanumerics of the session id, and session ids look
+  like `session-<digits>` → the id is the constant `shell-session1` for *every* session. Verify
+  uniqueness across two sessions, not just presence.
+
+## Remote RVM surfaces in the GUI
+
+- Probe the host directly first (`/api/health`, then `/api/exec-sync` with
+  `Authorization: Bearer <token>`) so an unreachable host or a rejected token is never mistaken for an
+  OPCOS bug. `/api/screenshot` and `/api/computer-use` can fail host-side with
+  `resize failed: … convert: not found` (ImageMagick missing) — that is a host gap; the OPCOS-side
+  check is that the error text is surfaced and no local fallback happens.
+- Add the host in Settings → Hosts → *Add host* (name / Remote URL / Bearer token). To keep the token
+  out of your own transcript, click the masked field and type it from the shell with
+  `xdotool type -- "$RVM_<HOST>_TOKEN"` using an env-bound secret. Press **Test** and require `Online`.
+- Bind a **new session** to that host (host dropdown in the new-session form) and set the workspace to
+  a remote path (e.g. `/home/ctyun`). Prove remoteness with `uname -a; whoami; pwd` — the remote user
+  and hostname must appear, never this box's.
+- Things that were broken on `dbcf337` and may still be: remote `cd` does **not** persist between
+  `run_shell` calls (exported env does); the remote path emits **no `terminal_update` events** (no live
+  streaming); the Desktop (VNC) and Editor (Web IDE) rail tabs are hardcoded `PlannedPane`
+  placeholders in `App.tsx` (~9374-9389) even though the `SurfacePanel` VNC/`start_ide_proxy` code
+  exists, so those tabs cannot work regardless of the host.
+- Remote file tools do work; verify out of band with authenticated `/api/read` + `/api/ls` and confirm
+  the file does not exist locally.
+
+## Session model default
+
+A newly created session's model selector defaults to `auto`, which gateways reject with
+`Provider request failed`. Set the model explicitly (e.g. `glm-5.2`) before the first prompt, and note
+that the `<select>` may advance one option per click under automation instead of opening a list.
+
+## Permission modes and approval gating (`Interactive`)
+
+The composer/new-session mode dropdown offers Discuss / Plan / Interactive / Auto / Custom
+(`crates/opcos-policy/src/lib.rs` `classify`). Previous rounds only ever exercised **Auto**, where
+nothing is ever asked; use **Interactive** when the question is "does the harness ask before a side
+effect". In Interactive, every write and every shell call raises a modal card
+(*Run a command* / *Use edit_file* → *Tool action requires approval*, Allow once / Deny) and the run
+blocks; `approval_pending` is persisted per call.
+
+Traps when driving an approval-gated run:
+
+- **Resolved cards stay on screen** with live-looking buttons. Only the bottom-most card is real —
+  always `scroll` to the bottom before clicking, or you will click a dead card and conclude the run hung.
+- Cards say *"runs on the bound remote host"* even for the local host 本机.
+- **Parallel tool calls in one turn are denied, not queued.** If the model emits N calls and one needs
+  approval, the others come back `{"error":"tool call denied pending another approval"}`. This is how a
+  real `propose_plan` call gets thrown away, leaving `plans`/`plan_steps`/`planning_rounds` empty and
+  `plan_get` returning `{"plan":null}` — check the `tool_calls` table and the `tool` role messages before
+  concluding "the model never plans".
+- Budget wall-clock: each approval is a click plus a model round-trip, so a 5-part task can need ~15
+  approvals.
+
+## Keeping the agent out of your own test material
+
+The agent will `grep -rn` over the workspace's *parent* directories when a requirement is not answerable
+from the repo, and it will happily read your test plan and expected results. Keep task fixtures in a
+directory that shares no ancestor with `/home/ubuntu/opcos-test` (e.g. `/home/ubuntu/sandbox/<fixture>`).
+`read_file` is workspace-restricted, but `run_shell` is not. A good ambiguity probe is a requirement that
+references something "we use elsewhere in our codebase" that does not exist.
+
+## Environment flakiness that repeatedly derails runs (not product bugs, but budget for them)
+
+- `run_shell` commands that use pipes plus `${PIPESTATUS[0]}` or that exit non-zero sometimes come back as
+  `{"error":"local host I/O failed: local shell exited"}` — the local shell session dies. Retrying the
+  same command without the pipe works. Prefer simple commands in probes so a shell teardown is not
+  mistaken for a harness defect.
+- `Provider request failed` can hit mid-session even with a small context and a reachable gateway
+  (check with `curl -s -o /dev/null -w '%{http_code}' <base>/models` → 401 means reachable). Switching the
+  composer model chip (e.g. `deepseek-v4-flash` → `glm-5.2`) and pressing **Retry** in the transcript is
+  the fastest recovery; note the model used per session in the report.
+- The app's shell python (pyenv) may lack `pytest` even though your own exec shell has it; a fixture whose
+  task requires pytest can burn many turns. Verify `python3 -m pytest` from inside a session's shell before
+  relying on it.
+- Sending a message right after interacting with the composer Mode menu often does nothing (the menu
+  overlay swallows the click). Click somewhere neutral first, re-type, then click the send arrow — and
+  check the store/transcript that the message actually landed before waiting on it.
+
+
+## Session-specific reliability notes (2026-08)
+
+### Long project paths and GUI input
+
+The project dialog can silently truncate long repository paths when text is entered character by
+character. Prefer clipboard paste (`Ctrl+V`) or create a fixture repository under a short path
+inside the containment-approved workspace. After creation, verify the exact `repo_root` and
+member worktree paths in sqlite and with `git -C <repo> worktree list`; never treat the visible
+field or project board alone as proof of the path that was submitted. Use ASCII prompts when
+possible: computer-use typing can silently drop CJK text in the WebView.
+
+### Workspace containment
+
+Project and session paths must remain under the explicitly approved workspace or the user's home
+for the built-in local host. Do not use `/tmp`, arbitrary host paths, or a path copied from an
+untrusted transcript as a fixture. Before a run, confirm the project repository and session
+workspace are the intended paths; after a run, verify that files and worktrees were created only
+under that boundary.
+
+### Diagnosing a hard freeze
+
+A stuck spinner is not sufficient evidence of a UI problem. Capture process state and every thread
+while the app is hung:
+
+```bash
+ps -o pid,stat,pcpu,wchan:32,cmd -p <pid>
+gdb -q -p <pid> -batch -ex 'thread apply all bt' > /tmp/opcos-freeze.bt
+```
+
+Check whether the process is sleeping in `futex_wait_queue_me` (lock/deadlock) or consuming CPU.
+For SQLite-related hangs, inspect stacks for a recursive `Mutex<rusqlite::Connection>::lock` and
+trace the synchronous call chain. In particular, never hold a database mutex guard while calling
+a state-taking helper that acquires the same mutex; finish the SQL work, drop the guard, then call
+the helper. Reproduce against a clean revision before attributing a freeze to local changes.
+
+### Approval verification discipline
+
+For an approval continuation, record the exact sequence of persisted `approval_pending` and
+`approval_resolved` events by `call_id`. The next pending call must be selected by the engine's
+returned `next_call_id`, never by taking the first database row. A card that says Approved is not
+engine evidence: verify the corresponding persisted resolution event and that the next tool or
+approval actually starts. When several gated writes are needed, use fresh marker filenames and
+verify the remote file state after each Allow/Deny decision.
