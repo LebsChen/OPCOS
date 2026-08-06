@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import liveEnvelopes from "../../fixtures/timeline/live-events.json";
 import opcosEvents from "../../fixtures/timeline/opcos-events.json";
+import opcosTodoCapture from "../../fixtures/timeline/opcos-todo-capture.json";
 import planIterations from "../../fixtures/timeline/opcos-plan-iterations.json";
 import terminalReplay from "../../fixtures/timeline/opcos-terminal-replay.json";
 import parityEvents from "../../fixtures/timeline/opcos-devin-parity.json";
@@ -561,6 +562,16 @@ describe("single event-log timeline", () => {
       .flatMap((node) => node.rows)
       .find((row) => row.label === "Created 5 Tasks");
     expect(planRow?.plan?.steps).toHaveLength(5);
+  });
+  it("deduplicates repeated visible plan progress from a real session capture", () => {
+    const rows = buildTimeline(opcosTodoCapture as TimelineEvent[])
+      .filter((node) => node.kind === "work")
+      .flatMap((node) => node.rows.map((row) => row.label))
+      .filter((label) => label.includes("#4"));
+    expect(rows).toEqual([
+      "3/4 #4 4. Finish by reporting every command run, each exit code, and whether the workspace changed (it should not).",
+      "4/4 #4 4. Finish by reporting every command run, each exit code, and whether the workspace changed (it should not).",
+    ]);
   });
   it("points plan progress at the next unfinished step", () => {
     const rowsFor = (steps: Record<string, unknown>[]) =>

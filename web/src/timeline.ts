@@ -262,6 +262,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
     string,
     Extract<TimelineNode, { kind: "work" }>["rows"][number]
   >();
+  const planProgressLabels = new Map<string, Set<string>>();
   const approvalNodes = new Map<
     string,
     Extract<TimelineNode, { kind: "approval" }>
@@ -707,18 +708,24 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
             }));
           }
           if (previousTodos) {
+            const progressLabels =
+              planProgressLabels.get(planId) ?? new Set<string>();
+            planProgressLabels.set(planId, progressLabels);
             todos.forEach((item, index) => {
               const previous = previousTodos[index];
               if (
                 previous &&
                 previous.step_id === item.step_id &&
                 previous.status === item.status &&
-                previous.description === item.description
+                String(previous.content ?? previous.description ?? "") ===
+                  String(item.content ?? item.description ?? "")
               )
                 return;
-              activeWork.rows.push({
-                label: `${completed}/${todos.length} #${index + 1} ${String(item.content ?? item.title ?? "")}`,
-              });
+              const label = `${completed}/${todos.length} #${index + 1} ${String(item.content ?? item.title ?? "")}`;
+              if (!progressLabels.has(label)) {
+                activeWork.rows.push({ label });
+                progressLabels.add(label);
+              }
             });
           }
         }
