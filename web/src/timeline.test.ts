@@ -475,6 +475,11 @@ describe("single event-log timeline", () => {
     expect(rows.filter((label) => label === "Created 5 Tasks")).toHaveLength(1);
     expect(rows).toContain("1/5 #1 Create files");
     expect(rows).toContain("2/5 #2 Run tests");
+    const planRow = nodes
+      .filter((node) => node.kind === "work")
+      .flatMap((node) => node.rows)
+      .find((row) => row.label === "Created 5 Tasks");
+    expect(planRow?.plan?.steps).toHaveLength(5);
   });
   it("points plan progress at the next unfinished step", () => {
     const rowsFor = (steps: Record<string, unknown>[]) =>

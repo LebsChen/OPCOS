@@ -41,14 +41,52 @@ function BubbleMeta({ text, ts }: { text: string; ts?: number }) {
   );
 }
 
-function Thought({ text }: { text: string }) {
+function Thought({
+  text,
+  label = "Thought details",
+}: {
+  text: string;
+  label?: string;
+}) {
   return (
-    <details>
-      <summary className="cursor-pointer text-xs text-muted">
-        Thought details
+    <details className="transcript-thought">
+      <summary className="transcript-row-header">
+        <span>{label}</span>
       </summary>
-      <div className="whitespace-pre-wrap">{text}</div>
+      <div className="transcript-thought-body">{text}</div>
     </details>
+  );
+}
+
+function PlanCard({
+  steps,
+}: {
+  steps: Array<{ content: string; status?: string }>;
+}) {
+  return (
+    <div className="transcript-plan">
+      <div className="transcript-plan-title">Devin&apos;s execution plan</div>
+      <div className="transcript-plan-steps">
+        {steps.map((step, index) => {
+          const complete = ["done", "completed"].includes(String(step.status));
+          const active = step.status === "in_progress";
+          return (
+            <div
+              className="transcript-plan-step"
+              key={`${step.content}-${index}`}
+            >
+              <span
+                className={`transcript-plan-glyph${complete ? " is-complete" : active ? " is-active" : ""}`}
+                aria-hidden="true"
+              >
+                {complete ? "✓" : active ? "◌" : "○"}
+              </span>
+              <span>{step.content}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
@@ -211,15 +249,12 @@ export function Transcript({
 }) {
   const nodes = buildTimeline(events);
   return (
-    <div className="transcript">
+    <div className="transcript transcript-content">
       {nodes.map((node, index) => {
         if (node.kind === "user")
           return (
-            <div
-              className="group self-end max-w-[78%] flex flex-col items-end"
-              key={index}
-            >
-              <div className="bubble-user px-3.5 py-2.5 rounded-[14px_14px_4px_14px] bg-solid text-onSolid text-[14.5px] leading-relaxed whitespace-pre-wrap">
+            <div className="group transcript-user-message self-end" key={index}>
+              <div className="bubble-user transcript-user-bubble">
                 {node.attachments?.map((attachment) =>
                   attachment.kind === "image" ? (
                     <img
@@ -301,17 +336,12 @@ export function Transcript({
           rowIndex: number,
         ) => (
           <div
-            className={`transcript-item${row.denied ? " text-muted" : row.exitCode !== undefined && row.exitCode !== 0 ? " text-danger" : ""}`}
+            className={`transcript-item transcript-row${row.denied ? " text-muted" : row.exitCode !== undefined && row.exitCode !== 0 ? " text-danger" : ""}`}
             key={rowIndex}
           >
-            <span>{row.label}</span>
-            {row.shellId && (
-              <span className="ml-2 text-xs text-muted">{row.shellId}</span>
-            )}
-            {row.exitCode !== undefined && (
-              <span className="ml-2 text-xs text-muted">
-                exit {row.exitCode}
-              </span>
+            <span className="transcript-row-label">{row.label}</span>
+            {row.exitCode !== undefined && row.exitCode !== 0 && (
+              <span className="text-xs text-muted">exit {row.exitCode}</span>
             )}
             {row.denied && (
               <span className="ml-2 text-xs text-muted">
@@ -319,15 +349,18 @@ export function Transcript({
               </span>
             )}
             {row.durationMs !== undefined && (
-              <span className="ml-2 text-xs text-muted">
+              <span className="transcript-row-duration">
                 {formatDuration(row.durationMs)}
               </span>
             )}
             {row.detail && !row.thoughtForCallId && (
-              <Thought text={row.detail} />
+              <Thought text={row.detail} label={row.label} />
             )}
             {row.callId && thoughtByCallId.get(row.callId)?.detail && (
-              <Thought text={thoughtByCallId.get(row.callId)?.detail ?? ""} />
+              <Thought
+                text={thoughtByCallId.get(row.callId)?.detail ?? ""}
+                label={thoughtByCallId.get(row.callId)?.label}
+              />
             )}
             {(row.terminalOutput || row.terminalTruncated) && (
               <TerminalOutput
@@ -344,6 +377,7 @@ export function Transcript({
                 mime={row.artifactMime}
               />
             )}
+            {row.plan && <PlanCard steps={row.plan.steps} />}
           </div>
         );
         const renderRows = (rows: typeof node.rows) => {
@@ -364,7 +398,7 @@ export function Transcript({
                   className="rounded border border-line p-2"
                   key={`minor-${start}`}
                 >
-                  <summary className="cursor-pointer text-xs text-muted">
+                  <summary className="transcript-minor-summary">
                     {minorRows.length} minor actions
                   </summary>
                   <div className="mt-2 flex flex-col gap-2">
@@ -385,16 +419,30 @@ export function Transcript({
           return rendered;
         };
         return (
-          <details
-            className="work-segment flex flex-col gap-2"
-            open
-            key={index}
-          >
-            <summary className="cursor-pointer text-muted">
-              {node.label} {node.additions ? `+${node.additions}` : ""}{" "}
-              {node.deletions ? `−${node.deletions}` : ""}
+          <details className="work-segment transcript-worklog" key={index}>
+            <summary className="transcript-worklog-header">
+              <span className="transcript-chevron" aria-hidden="true">
+                ›
+              </span>
+              <span className="transcript-worklog-label">
+                <span>{node.label}</span>
+                {!!(node.additions || node.deletions) && (
+                  <span className="transcript-diff-badges">
+                    {node.additions ? (
+                      <span className="transcript-additions">
+                        +{node.additions}
+                      </span>
+                    ) : null}
+                    {node.deletions ? (
+                      <span className="transcript-deletions">
+                        −{node.deletions}
+                      </span>
+                    ) : null}
+                  </span>
+                )}
+              </span>
             </summary>
-            <div className="max-h-[32rem] overflow-auto flex flex-col gap-2 text-ink">
+            <div className="transcript-worklog-body">
               {renderRows(node.rows)}
             </div>
           </details>

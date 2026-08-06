@@ -56,6 +56,12 @@ export type TimelineNode =
         artifactId?: string;
         artifactKind?: string;
         artifactMime?: string;
+        plan?: {
+          steps: Array<{
+            content: string;
+            status?: string;
+          }>;
+        };
       }>;
       additions: number;
       deletions: number;
@@ -506,7 +512,15 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
           ["done", "completed"].includes(String(todo.status)),
         ).length;
         if (!previousTodos || todos.length > previousTodos.length) {
-          activeWork.rows.push({ label: `Created ${todos.length} Tasks` });
+          activeWork.rows.push({
+            label: `Created ${todos.length} Tasks`,
+            plan: {
+              steps: todos.map((todo) => ({
+                content: String(todo.content ?? todo.title ?? ""),
+                status: String(todo.status ?? "not_started"),
+              })),
+            },
+          });
         } else if (previousTodos) {
           todos.forEach((item, index) => {
             const previous = previousTodos[index];
