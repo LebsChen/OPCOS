@@ -622,11 +622,23 @@ mod tests {
 
     #[tokio::test]
     async fn cloudflare_real_api_verification() {
-        let (Some(account_id), Some(token)) =
-            (std::env::var_os("CF_ID"), std::env::var_os("CF_TOKEN"))
-        else {
-            eprintln!("skipping Cloudflare real API verification: CF_ID and CF_TOKEN are not set");
-            return;
+        let (account_id, token, paid_credentials) = match (
+            std::env::var_os("CF_AI_ID"),
+            std::env::var_os("CF_AI_TOKEN"),
+        ) {
+            (Some(account_id), Some(token)) => (account_id, token, true),
+            _ => {
+                let (Some(account_id), Some(token)) =
+                    (std::env::var_os("CF_ID"), std::env::var_os("CF_TOKEN"))
+                else {
+                    eprintln!(
+                        "skipping Cloudflare real API verification: \
+                         CF_AI_ID/CF_AI_TOKEN or CF_ID/CF_TOKEN are not set"
+                    );
+                    return;
+                };
+                (account_id, token, false)
+            }
         };
         let account_id = account_id.to_string_lossy().into_owned();
         let token = token.to_string_lossy().into_owned();
@@ -689,17 +701,26 @@ mod tests {
             .await
             .expect("tool completion");
         assert!(!tool_completion.tool_calls.is_empty());
-        let paid_plan_error = provider
+        let flagship = provider
             .complete(ProviderRequest {
                 model: "@cf/zai-org/glm-5.2".into(),
                 messages: vec![json!({"role":"user","content":"Say hello."})],
                 ..Default::default()
             })
-            .await
-            .expect_err("glm-5.2 should require a paid plan");
-        let paid_plan_error = paid_plan_error.to_string();
-        assert!(paid_plan_error.contains("Workers Free plan"));
-        println!("Cloudflare glm-5.2 paid-plan error: {paid_plan_error}");
+            .await;
+        if paid_credentials {
+            let flagship = flagship.expect("paid Cloudflare credentials should complete glm-5.2");
+            assert!(
+                flagship.text.is_some() || !flagship.reasoning.as_deref().unwrap_or("").is_empty()
+            );
+            assert!(flagship.usage.is_some());
+            println!("Cloudflare glm-5.2 paid completion succeeded");
+        } else {
+            let paid_plan_error = flagship.expect_err("glm-5.2 should require a paid plan");
+            let paid_plan_error = paid_plan_error.to_string();
+            assert!(paid_plan_error.contains("Workers Free plan"));
+            println!("Cloudflare glm-5.2 paid-plan error: {paid_plan_error}");
+        }
     }
 
     async fn response_sequence(
