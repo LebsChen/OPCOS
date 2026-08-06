@@ -1265,74 +1265,89 @@ where
             })
             .map(|message| message.sequence)
             .ok_or_else(|| EngineError::Store("approval assistant message not found".into()))?;
-        let mut calls = Vec::new();
         let target = self
             .store
             .take_pending(&self.session_id, call_id)
             .map_err(|error| EngineError::Store(error.to_string()))?
             .ok_or_else(|| EngineError::ApprovalAlreadyProcessed(call_id.to_owned()))?;
-        let mut pending = vec![target];
-        pending.extend(
-            self.store
-                .load_pending(&self.session_id)
-                .map_err(|error| EngineError::Store(error.to_string()))?,
-        );
-        let active = self.track_tool_calls(
-            &pending
-                .iter()
-                .map(|item| ToolCall {
-                    id: item.call_id.clone(),
-                    name: item.tool.clone(),
-                    arguments: item.arguments.clone(),
-                })
-                .collect::<Vec<_>>(),
-        );
-        for (index, item) in pending.into_iter().enumerate() {
-            let result = if item.call_id == call_id && outcome == ApprovalOutcome::Approve {
-                if item.tool == "ask_user" {
-                    // Questions remain engine-owned pending input. Never execute one
-                    // synchronously through an approval path or fabricate an answer.
-                    json!({"error":"ask_user must be handled by the engine pending mechanism"})
-                } else {
-                    self.execute_tool_streaming(&ToolCall {
-                        id: item.call_id.clone(),
-                        name: item.tool.clone(),
-                        arguments: item.arguments.clone(),
-                    })
-                    .await
-                }
-            } else if item.call_id == call_id {
-                json!({"error":"tool call denied by user"})
+        let assistant_call_ids = self
+            .store
+            .load_messages(&self.session_id)
+            .map_err(|error| EngineError::Store(error.to_string()))?
+            .into_iter()
+            .find(|message| message.sequence == message_sequence)
+            .and_then(|message| message.content.get("tool_calls").cloned())
+            .and_then(|calls| calls.as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|call| call.get("id").and_then(Value::as_str).map(str::to_owned))
+            .collect::<Vec<_>>();
+        let pending_by_id = self
+            .store
+            .load_pending(&self.session_id)
+            .map_err(|error| EngineError::Store(error.to_string()))?
+            .into_iter()
+            .filter(|pending| assistant_call_ids.iter().any(|id| id == &pending.call_id))
+            .map(|pending| (pending.call_id.clone(), pending))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        let target_call = ToolCall {
+            id: target.call_id.clone(),
+            name: target.tool.clone(),
+            arguments: target.arguments.clone(),
+        };
+        let _active = self.track_tool_calls(std::slice::from_ref(&target_call));
+        let result = if outcome == ApprovalOutcome::Approve {
+            if target.tool == "ask_user" {
+                // Questions remain engine-owned pending input. Never execute one
+                // synchronously through an approval path or fabricate an answer.
+                json!({"error":"ask_user must be handled by the engine pending mechanism"})
+            } else if target.tool == "propose_plan" {
+                self.execute_proposed_plan(&target.arguments)
             } else {
-                json!({"error":"tool call denied pending another approval"})
-            };
-            calls.push((
-                ToolCall {
-                    id: item.call_id.clone(),
-                    name: item.tool,
-                    arguments: item.arguments,
-                },
-                result,
-            ));
-            if index > 0 {
-                self.store
-                    .delete_pending(&self.session_id, &item.call_id)
-                    .map_err(|error| EngineError::Store(error.to_string()))?;
+                self.execute_tool_streaming(&target_call).await
             }
-        }
-        for (call, result) in calls {
-            let value = json!({"role":"tool","content":[{"type":"tool_result",
-                "tool_use_id":call.id,"content":[{"type":"text","text":result.to_string()}]}]});
-            self.append("tool", value).await?;
-            self.store
-                .complete_tool_call(&self.session_id, message_sequence, &call.id, &result)
-                .map_err(|error| EngineError::Store(error.to_string()))?;
-            let category = tool_event_category(&call.name);
-            if call.name == "run_shell" {
-                let result_payload = tool_result_payload(&result);
-                let output = result
+        } else {
+            json!({"error":"tool call denied by user"})
+        };
+        self.append(
+            "tool",
+            json!({"role":"tool","content":[{"type":"tool_result",
+            "tool_use_id":target.call_id,"content":[{"type":"text","text":result.to_string()}]}]}),
+        )
+        .await?;
+        self.store
+            .complete_tool_call(&self.session_id, message_sequence, &target.call_id, &result)
+            .map_err(|error| EngineError::Store(error.to_string()))?;
+        let _ = self
+            .working_event(
+                "approval_resolved",
+                "message",
+                json!({
+                    "call_id": target.call_id,
+                    "tool": target.tool,
+                    "approved": outcome == ApprovalOutcome::Approve,
+                }),
+            )
+            .await;
+        if outcome == ApprovalOutcome::Deny {
+            let _ = self
+                .working_event(
+                    "tool_call_denied",
+                    "message",
+                    json!({
+                        "call_id": target.call_id,
+                        "tool": target.tool,
+                        "reason": "denied by user",
+                    }),
+                )
+                .await;
+        } else {
+            let result_payload = tool_result_payload(&result);
+            let category = tool_event_category(&target.tool);
+            if target.tool == "run_shell" {
+                let output = result_payload
                     .get("output")
-                    .or_else(|| result_payload.get("output"))
                     .or_else(|| result_payload.get("stdout"))
                     .map(Value::to_string)
                     .unwrap_or_else(|| result.to_string());
@@ -1342,45 +1357,128 @@ where
                         "shell",
                         json!({
                             "shell_id": shell_id_for_session(&self.session_id),
-                            "process_id": call.id,
-                            "exit_code": result_payload.get("exit_code").and_then(Value::as_i64).unwrap_or_else(|| if result_payload.get("error").is_some() { 1 } else { 0 }),
-                            "duration_ms": result.get("duration_ms").and_then(Value::as_u64).or_else(|| result_payload.get("duration_ms").and_then(Value::as_u64)),
+                            "process_id": target.call_id,
+                            "exit_code": result_payload
+                                .get("exit_code")
+                                .and_then(Value::as_i64)
+                                .unwrap_or_else(|| if result_payload.get("error").is_some() { 1 } else { 0 }),
+                            "duration_ms": result
+                                .get("duration_ms")
+                                .and_then(Value::as_u64)
+                                .or_else(|| result_payload.get("duration_ms").and_then(Value::as_u64)),
                             "output_trunc": output.chars().take(4000).collect::<String>(),
                         }),
                     )
                     .await;
             } else {
-                let result_payload = tool_result_payload(&result);
                 let _ = self
                     .working_event(
-                        &format!("{}_completed", call.name),
+                        &format!("{}_completed", target.tool),
                         category,
                         json!({
-                            "call_id":call.id,
-                            "tool":call.name,
-                            "path": call.arguments.get("path").or_else(|| call.arguments.get("target")),
-                            "ok":result_payload.get("error").is_none(),
-                            "result_type":if result.is_object() {"object"} else if result.is_array() {"array"} else {"value"},
-                            "result_bytes":result.to_string().len(),
+                            "call_id": target.call_id,
+                            "tool": target.tool,
+                            "path": target.arguments.get("path").or_else(|| target.arguments.get("target")),
+                            "ok": result_payload.get("error").is_none(),
+                            "result_type": if result.is_object() { "object" } else if result.is_array() { "array" } else { "value" },
+                            "result_bytes": result.to_string().len(),
                         }),
                     )
                     .await;
             }
-            let _ = self.emit_event(
-                "tool_result",
-                StreamChunk {
-                    tool_result: Some(ToolResult {
-                        call_id: call.id,
-                        name: call.name,
-                        arguments: call.arguments,
-                        result,
-                    }),
-                    ..StreamChunk::default()
-                },
-            );
+            self.emit_plan_snapshot(&target.tool).await?;
         }
-        drop(active);
+        let _ = self.emit_event(
+            "tool_result",
+            StreamChunk {
+                tool_result: Some(ToolResult {
+                    call_id: target.call_id.clone(),
+                    name: target.tool.clone(),
+                    arguments: target.arguments.clone(),
+                    result: result.clone(),
+                }),
+                ..StreamChunk::default()
+            },
+        );
+
+        let remaining = assistant_call_ids
+            .iter()
+            .filter_map(|id| pending_by_id.get(id))
+            .filter(|pending| pending.call_id != call_id)
+            .collect::<Vec<_>>();
+        if outcome == ApprovalOutcome::Approve {
+            if !remaining.is_empty() {
+                let queued_calls = remaining
+                    .iter()
+                    .map(|pending| ToolCall {
+                        id: pending.call_id.clone(),
+                        name: pending.tool.clone(),
+                        arguments: pending.arguments.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                for pending in &remaining {
+                    self.store
+                        .delete_pending(&self.session_id, &pending.call_id)
+                        .map_err(|error| EngineError::Store(error.to_string()))?;
+                }
+                match self.execute_tools(message_sequence, &queued_calls).await {
+                    Ok(_) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            return self.run_loop(self.provider_messages()?).await;
+        }
+
+        for pending in remaining {
+            let denied = json!({"error":"tool call canceled after approval denial"});
+            self.store
+                .delete_pending(&self.session_id, &pending.call_id)
+                .map_err(|error| EngineError::Store(error.to_string()))?;
+            self.append("tool", json!({"role":"tool","content":[{"type":"tool_result",
+                "tool_use_id":pending.call_id,"content":[{"type":"text","text":denied.to_string()}]}]}))
+                .await?;
+            self.store
+                .complete_tool_call(
+                    &self.session_id,
+                    message_sequence,
+                    &pending.call_id,
+                    &denied,
+                )
+                .map_err(|error| EngineError::Store(error.to_string()))?;
+            let _ = self
+                .working_event(
+                    "tool_call_denied",
+                    "message",
+                    json!({
+                        "call_id": pending.call_id,
+                        "tool": pending.tool,
+                        "reason": "canceled after approval denial",
+                    }),
+                )
+                .await;
+        }
         self.run_loop(self.provider_messages()?).await
+    }
+
+    async fn emit_plan_snapshot(&self, tool_name: &str) -> Result<(), EngineError> {
+        if !matches!(tool_name, "propose_plan" | "plan_update" | "plan_revise") {
+            return Ok(());
+        }
+        if let Some(plan) = self
+            .store
+            .load_plan(&self.session_id)
+            .map_err(|error| EngineError::Store(error.to_string()))?
+        {
+            let _ = self
+                .working_event(
+                    "todo_update",
+                    "todo",
+                    serde_json::to_value(plan)
+                        .map_err(|error| EngineError::Store(error.to_string()))?,
+                )
+                .await;
+        }
+        Ok(())
     }
 
     pub async fn change_model(&self, model: impl Into<String>) -> Result<(), EngineError> {
@@ -1726,9 +1824,33 @@ where
                                 .map_err(|error| EngineError::Store(error.to_string()))?;
                         }
                         let tool_started = Instant::now();
-                        let results = self
+                        let results = match self
                             .execute_tools(assistant_sequence, &turn.tool_calls)
-                            .await?;
+                            .await
+                        {
+                            Ok(results) => results,
+                            Err(error) => {
+                                let tool_exec_ms = tool_started.elapsed().as_millis() as u64;
+                                let total_ms = iteration_started.elapsed().as_millis() as u64;
+                                let harness_ms = total_ms
+                                    .saturating_sub(inference_ms)
+                                    .saturating_sub(tool_exec_ms);
+                                let _ = self
+                                    .emit_iteration_stats(IterationStatsData {
+                                        iteration: iteration + 1,
+                                        num_tool_calls: turn.tool_calls.len(),
+                                        duration_ms: total_ms,
+                                        inference_ms,
+                                        tool_exec_ms,
+                                        harness_ms,
+                                        retry_count,
+                                        compaction_count,
+                                        usage: turn.usage.as_ref(),
+                                    })
+                                    .await;
+                                return Err(error);
+                            }
+                        };
                         let tool_exec_ms = tool_started.elapsed().as_millis() as u64;
                         let total_ms = iteration_started.elapsed().as_millis() as u64;
                         let harness_ms = total_ms
@@ -1984,7 +2106,7 @@ where
             }
             let mode = *self.mode.lock().await;
             if call.name == "ask_user"
-                || (call.name == "propose_plan" && mode != PermissionMode::Auto)
+                || (call.name == "propose_plan" && mode == PermissionMode::Plan)
             {
                 if call.name == "ask_user" {
                     let options = call
@@ -2007,6 +2129,19 @@ where
                                 "tool": "ask_user",
                                 "options": options,
                                 "allow_multiple": allow_multiple,
+                            }),
+                        )
+                        .await;
+                } else {
+                    let _ = self
+                        .working_event(
+                            "approval_pending",
+                            "message",
+                            json!({
+                                "call_id": call.id,
+                                "tool": call.name,
+                                "arguments": call.arguments,
+                                "reason": "Plan mode requires plan confirmation",
                             }),
                         )
                         .await;
@@ -2051,7 +2186,11 @@ where
                 }
                 return Err(EngineError::ApprovalPending(call.id.clone()));
             }
-            let mut risk = tool_risk(&call.name);
+            let mut risk = if call.name == "propose_plan" {
+                ToolRisk::Read
+            } else {
+                tool_risk(&call.name)
+            };
             let argument_keys = call
                 .arguments
                 .as_object()
@@ -2197,14 +2336,30 @@ where
                 decision
             };
             if matches!(decision, Decision::Deny) && preflight_reason.is_some() {
+                let reason = preflight_reason
+                    .as_deref()
+                    .unwrap_or("tool call denied by preflight");
                 results[index] = Some(json!({
-                    "error": preflight_reason.as_deref().unwrap_or("tool call denied by preflight")
+                    "error": reason,
+                    "_opcos_not_executed": true,
                 }));
+                let _ = self
+                    .working_event(
+                        "tool_call_denied",
+                        "message",
+                        json!({
+                            "call_id": call.id,
+                            "tool": call.name,
+                            "reason": reason,
+                        }),
+                    )
+                    .await;
                 continue;
             };
             match decision {
                 Decision::Allow
-                    if matches!(risk, ToolRisk::Read | ToolRisk::Search | ToolRisk::GitRead) =>
+                    if matches!(risk, ToolRisk::Read | ToolRisk::Search | ToolRisk::GitRead)
+                        && call.name != "propose_plan" =>
                 {
                     readonly.push((index, call));
                 }
@@ -2233,7 +2388,20 @@ where
                 }
                 Decision::Deny => {
                     self.policy_denied.store(true, Ordering::SeqCst);
-                    results[index] = Some(json!({"error":"tool call denied by policy"}))
+                    results[index] = Some(
+                        json!({"error":"tool call denied by policy","_opcos_not_executed":true}),
+                    );
+                    let _ = self
+                        .working_event(
+                            "tool_call_denied",
+                            "message",
+                            json!({
+                                "call_id": call.id,
+                                "tool": call.name,
+                                "reason": "denied by policy",
+                            }),
+                        )
+                        .await;
                 }
                 Decision::NeedsUser => {
                     let _ = self
@@ -2529,6 +2697,11 @@ where
                         .unwrap_or_else(|| json!({"error": "image artifact unavailable"})),
                 );
             }
+            let not_executed = result
+                .get("_opcos_not_executed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            strip_internal_result_fields(&mut safe_result);
             self.secret_scrubber.scrub(&mut safe_result);
             safe_results.push((call.id.clone(), safe_result.clone()));
             let value = json!({"role":"tool","content":[{"type":"tool_result",
@@ -2538,7 +2711,7 @@ where
                 .complete_tool_call(&self.session_id, assistant_sequence, &call.id, &safe_result)
                 .map_err(|error| EngineError::Store(error.to_string()))?;
             let category = tool_event_category(&call.name);
-            if call.name != "run_shell" {
+            if !not_executed && call.name != "run_shell" {
                 let result_payload = tool_result_payload(&result);
                 let _ = self
                     .working_event(
@@ -2553,7 +2726,7 @@ where
                         }),
                     )
                     .await;
-            } else {
+            } else if !not_executed {
                 let result_payload = tool_result_payload(&result);
                 let output = result
                     .get("output")
@@ -2575,23 +2748,7 @@ where
                     )
                     .await;
             }
-            if (call.name == "propose_plan"
-                || call.name == "plan_update"
-                || call.name == "plan_revise")
-                && let Some(plan) = self
-                    .store
-                    .load_plan(&self.session_id)
-                    .map_err(|error| EngineError::Store(error.to_string()))?
-            {
-                let _ = self
-                    .working_event(
-                        "todo_update",
-                        "todo",
-                        serde_json::to_value(plan)
-                            .map_err(|error| EngineError::Store(error.to_string()))?,
-                    )
-                    .await;
-            }
+            self.emit_plan_snapshot(&call.name).await?;
             let _ = self.emit_event(
                 "tool_result",
                 StreamChunk {
@@ -3301,6 +3458,25 @@ fn tool_result_payload(result: &Value) -> &Value {
         .unwrap_or(result)
 }
 
+fn strip_internal_result_fields(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.retain(|key, value| {
+                if key.starts_with("_opcos_") {
+                    false
+                } else {
+                    strip_internal_result_fields(value);
+                    true
+                }
+            });
+        }
+        Value::Array(values) => {
+            values.iter_mut().for_each(strip_internal_result_fields);
+        }
+        _ => {}
+    }
+}
+
 fn thought_summary(message: &str) -> String {
     let first_line = message.lines().next().unwrap_or_default().trim();
     let mut summary = first_line.chars().take(120).collect::<String>();
@@ -3944,7 +4120,7 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"github_get_pull_request","description":"Read a GitHub pull request, including issue comments and review comments.","parameters":{"type":"object","properties":{"repo":{"type":"string"},"number":{"type":"integer"},"token_secret":{"type":"string"}},"required":["repo","number","token_secret"]}}}),
         json!({"type":"function","function":{"name":"github_ci_status","description":"Read GitHub Actions checks for the bound project repository by pull request number or commit SHA. Classifies code failures separately from billing, runner, cancellation, timeout, and indeterminate states; this is observational and not a delivery gate.","parameters":{"type":"object","properties":{"repo":{"type":"string"},"pull_request":{"type":"integer"},"commit":{"type":"string"}},"required":["repo"]}}}),
         json!({"type":"function","function":{"name":"github_ci_failure_log","description":"Read a bounded tail or offset segment of a failed GitHub Actions job log. Optionally request a step; if it cannot be located, the result explicitly says the returned text is the bounded job tail.","parameters":{"type":"object","properties":{"repo":{"type":"string"},"run_id":{"type":"integer"},"job_id":{"type":"integer"},"step":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"},"tail":{"type":"boolean"}},"required":["repo","run_id"]}}}),
-        json!({"type":"function","function":{"name":"propose_plan","description":"Propose a structured ordered plan and wait for approval. Each step is persisted and can be tracked after approval.","parameters":{"type":"object","properties":{"title":{"type":"string"},"summary":{"type":"string"},"steps":{"type":"array","items":{"type":"string"}}},"required":["title","steps"]}}}),
+        json!({"type":"function","function":{"name":"propose_plan","description":"Persist a structured ordered plan. In Plan mode, the proposal waits for confirmation before it is applied; each step is persisted and can be tracked after creation.","parameters":{"type":"object","properties":{"title":{"type":"string"},"summary":{"type":"string"},"steps":{"type":"array","items":{"type":"string"}}},"required":["title","steps"]}}}),
         json!({"type":"function","function":{"name":"plan_get","description":"Read the current persisted plan, ordered steps, statuses, failure or abandonment reasons, and revision number.","parameters":{"type":"object","properties":{}}}}),
         json!({"type":"function","function":{"name":"plan_update","description":"Update one plan step. Valid statuses are not_started, in_progress, done, failed, and abandoned. Abandoned steps require a reason and failed steps cannot silently become done.","parameters":{"type":"object","properties":{"step_id":{"type":"string"},"status":{"type":"string","enum":["not_started","in_progress","done","failed","abandoned"]},"description":{"type":"string"},"reason":{"type":"string"}},"required":["step_id"]}}}),
         json!({"type":"function","function":{"name":"plan_revise","description":"Revise the current plan with an explicit summary and optional additional ordered steps. Revisions are retained in plan history; steps are never physically deleted.","parameters":{"type":"object","properties":{"summary":{"type":"string"},"add_steps":{"type":"array","items":{"type":"string"}}},"required":["summary"]}}}),
@@ -4444,6 +4620,23 @@ mod tests {
     impl ToolExecutor for FakeTools {
         async fn execute(&self, _: &str, _: Value) -> Result<Value, String> {
             Ok(json!("ok"))
+        }
+    }
+
+    struct ApprovalQueueTools;
+
+    #[async_trait]
+    impl ToolExecutor for ApprovalQueueTools {
+        async fn execute(&self, _: &str, _: Value) -> Result<Value, String> {
+            Ok(json!("ok"))
+        }
+
+        async fn preflight(&self, name: &str, _: &Value) -> Result<PreflightDecision, String> {
+            if name == "run_shell" {
+                Ok(PreflightDecision::NeedsUser("shell approval".into()))
+            } else {
+                Ok(PreflightDecision::Allow)
+            }
         }
     }
 
@@ -5224,6 +5417,13 @@ mod tests {
             Err(EngineError::ApprovalPending(call_id)) if call_id == "call-1"
         ));
         assert_eq!(store.load_pending("s").unwrap().len(), 1);
+        assert!(
+            store
+                .load_session_events("s")
+                .unwrap()
+                .iter()
+                .any(|event| event.event["type"] == "iteration_stats")
+        );
 
         let restarted = TurnEngine::new(
             provider,
@@ -6227,7 +6427,7 @@ mod tests {
             Arc::new(FakeTools),
             "s",
             "/workspace",
-            PermissionMode::Interactive,
+            PermissionMode::Plan,
             "fake",
         );
         engine.set_unattended(true);
@@ -6344,6 +6544,142 @@ mod tests {
                 .any(|event| event == "propose_plan_completed")
         );
         assert!(event_types.iter().any(|event| event == "todo_update"));
+    }
+
+    #[tokio::test]
+    async fn approval_queue_preserves_plan_after_an_earlier_approval() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let calls = vec![
+            ToolCall {
+                id: "shell-needs-approval".into(),
+                name: "run_shell".into(),
+                arguments: json!({"command":"echo ok"}),
+            },
+            ToolCall {
+                id: "plan-after-shell".into(),
+                name: "propose_plan".into(),
+                arguments: json!({
+                    "title": "Fix the harness",
+                    "summary": "Preserve plans in mixed approval batches",
+                    "steps": ["Queue approvals", "Verify persistence"],
+                }),
+            },
+        ];
+        store
+            .append_message(&StoredMessage {
+                session_id: "approval-queue".into(),
+                sequence: 1,
+                role: "assistant".into(),
+                content: json!({
+                    "tool_calls": calls.iter().map(|call| json!({
+                        "id": call.id,
+                        "name": call.name,
+                        "arguments": call.arguments,
+                    })).collect::<Vec<_>>()
+                }),
+                display_only: false,
+            })
+            .unwrap();
+        for call in &calls {
+            store
+                .append_tool_call(&opcos_store::ToolCallRecord {
+                    session_id: "approval-queue".into(),
+                    message_sequence: 1,
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    result: None,
+                })
+                .unwrap();
+        }
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(ApprovalQueueTools),
+            "approval-queue",
+            "/workspace",
+            PermissionMode::Interactive,
+            "fake",
+        );
+        let pending = engine.execute_tools(1, &calls).await;
+        assert!(matches!(
+            pending,
+            Err(EngineError::ApprovalPending(id)) if id == "shell-needs-approval"
+        ));
+        let next = engine
+            .resolve_approval("shell-needs-approval", ApprovalOutcome::Approve)
+            .await;
+        assert!(next.is_ok(), "approval resolution failed: {next:?}");
+        let plan = store
+            .load_plan("approval-queue")
+            .unwrap()
+            .expect("mixed batch plan persisted");
+        assert_eq!(plan.title, "Fix the harness");
+        assert_eq!(plan.steps.len(), 2);
+        assert!(
+            store
+                .load_session_events("approval-queue")
+                .unwrap()
+                .iter()
+                .any(|event| event.event["type"] == "todo_update")
+        );
+    }
+
+    #[tokio::test]
+    async fn unattended_policy_denial_does_not_emit_shell_completion() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let call = ToolCall {
+            id: "denied-shell".into(),
+            name: "run_shell".into(),
+            arguments: json!({"command": "echo should-not-run"}),
+        };
+        store
+            .append_tool_call(&opcos_store::ToolCallRecord {
+                session_id: "unattended-denial".into(),
+                message_sequence: 1,
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+                result: None,
+            })
+            .unwrap();
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "unattended-denial",
+            "/workspace",
+            PermissionMode::Interactive,
+            "fake",
+        );
+        engine.set_unattended(true);
+        engine.execute_tools(1, &[call]).await.unwrap();
+        let events = store.load_session_events("unattended-denial").unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event["type"] == "tool_call_denied")
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.event["type"] == "shell_process_completed")
+        );
+        let denied_call = store
+            .load_tool_calls("unattended-denial")
+            .unwrap()
+            .into_iter()
+            .find(|record| record.call_id == "denied-shell")
+            .expect("denied tool call");
+        let result = denied_call.result.expect("denied result");
+        assert_eq!(result["error"], "tool call denied by policy");
+        assert!(result.get("_opcos_not_executed").is_none());
+        let messages = store.load_messages("unattended-denial").unwrap();
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.content.to_string().contains("_opcos_"))
+        );
     }
 
     #[tokio::test]

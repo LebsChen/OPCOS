@@ -51,6 +51,7 @@ export type TimelineNode =
         processId?: string;
         exitCode?: number;
         durationMs?: number;
+        denied?: boolean;
         isMajorAction?: boolean;
         artifactId?: string;
         artifactKind?: string;
@@ -119,6 +120,11 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
     | { row: Extract<TimelineNode, { kind: "work" }>["rows"][number] }
     | undefined;
   const planSteps = new Map<string, Array<Record<string, unknown>>>();
+  const latestPlans = new Map<string, Array<Record<string, unknown>>>();
+  const approvalNodes = new Map<
+    string,
+    Extract<TimelineNode, { kind: "approval" }>
+  >();
   const pendingTerminal = new Map<
     string,
     { output: string; truncated: boolean; totalBytes?: number }
@@ -136,6 +142,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
       processId?: string;
       exitCode?: number;
       durationMs?: number;
+      denied?: boolean;
       isMajorAction?: boolean;
       startedAt?: number;
     }
@@ -157,6 +164,36 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
     if (!workStarted) workStarted = startedAt;
     workEnded = startedAt;
     return work;
+  };
+  const appendPlanProgress = (
+    activeWork: Extract<TimelineNode, { kind: "work" }>,
+  ) => {
+    const plan = Array.from(latestPlans.values()).at(-1);
+    if (!plan?.length) return;
+    const completed = plan.filter((step) =>
+      ["done", "completed", "failed", "abandoned"].includes(
+        String(step.status),
+      ),
+    ).length;
+    const inProgress = plan.findIndex(
+      (step) => String(step.status) === "in_progress",
+    );
+    const nextNotStarted = plan.findIndex(
+      (step) => String(step.status) === "not_started",
+    );
+    const currentIndex =
+      inProgress >= 0
+        ? inProgress
+        : nextNotStarted >= 0
+          ? nextNotStarted
+          : plan.length - 1;
+    const current = plan[currentIndex];
+    if (!current) return;
+    activeWork.rows.push({
+      label: `${completed}/${plan.length} #${currentIndex + 1} ${String(current.content ?? current.title ?? "")}`,
+      activityLabel: true,
+      isMajorAction: true,
+    });
   };
   const flush = (endedAt = workEnded) => {
     if (!work) return;
@@ -218,15 +255,21 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
             : undefined,
         });
       } else {
-        nodes.push({
+        const node = {
           kind: "approval",
           callId,
           name: String(data.tool ?? "tool"),
           args: data.arguments,
-        });
+        } as Extract<TimelineNode, { kind: "approval" }>;
+        nodes.push(node);
+        if (callId) approvalNodes.set(callId, node);
       }
       workStarted = 0;
       workEnded = 0;
+    } else if (type === "approval_resolved") {
+      const callId = String(data.call_id ?? "");
+      const node = approvalNodes.get(callId);
+      if (node) node.resolved = data.approved === true ? "allow" : "deny";
     } else if (type === "compacted") {
       const activeWork = ensureWork(event.created_at_ms);
       activeWork.rows.push({ label: "Earlier context compacted" });
@@ -325,6 +368,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
           pendingThought.row.thoughtForCallId = callId;
           pendingThought = undefined;
         }
+        appendPlanProgress(activeWork);
         activeWork.rows.push(row);
         if (callId) {
           shellRows.set(callId, row);
@@ -352,6 +396,22 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
             processId: callId,
             exitCode,
             durationMs,
+          });
+        }
+      } else if (type === "tool_call_denied") {
+        const callId =
+          typeof data.call_id === "string" ? data.call_id : undefined;
+        const shellRow = callId ? shellRows.get(callId) : undefined;
+        if (shellRow) {
+          shellRow.denied = true;
+          shellRow.detail = String(data.reason ?? "Tool call was not run");
+        } else {
+          activeWork.rows.push({
+            label: `Not run: ${String(data.tool ?? "tool")}`,
+            detail: String(data.reason ?? "Tool call was not run"),
+            callId,
+            isMajorAction: true,
+            denied: true,
           });
         }
       } else if (type === "terminal_update") {
@@ -391,6 +451,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
             String(item.file_path ?? "")
               .split(/[\\/]/)
               .pop() ?? "";
+          appendPlanProgress(activeWork);
           activeWork.rows.push({
             callId:
               typeof data.call_id === "string" ? data.call_id : undefined,
@@ -459,11 +520,12 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
             )
               return;
             activeWork.rows.push({
-              label: `${completed}/${todos.length}#${index + 1} ${String(item.content ?? item.title ?? "")}`,
+              label: `${completed}/${todos.length} #${index + 1} ${String(item.content ?? item.title ?? "")}`,
             });
           });
         }
         planSteps.set(planId, todos);
+        latestPlans.set(planId, todos);
       } else if (
         type === "read_file_started" ||
         type === "list_dir_started"
@@ -474,6 +536,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
         type === "list_dir_completed"
       ) {
         const target = String(data.path ?? data.target ?? data.file_path ?? "");
+        appendPlanProgress(activeWork);
         activeWork.rows.push({
           label: target
             ? `${type.startsWith("read_file") ? "Read" : "Listed"} ${target}`
@@ -507,6 +570,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
               typeof data.call_id === "string" ? data.call_id : undefined;
             pendingThought = undefined;
           }
+          appendPlanProgress(activeWork);
           activeWork.rows.push(row);
         }
       }

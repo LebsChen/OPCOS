@@ -9567,6 +9567,10 @@ function InboxPane({
                   args: item.payload,
                   reason: "requires approval",
                 }}
+                hostName={
+                  sessions.find((session) => session.id === item.session_id)
+                    ?.host_name
+                }
                 onApprove={(decision) => onResolve(item, decision)}
               />
             ) : (
@@ -10579,6 +10583,7 @@ function AppContent() {
                     <Transcript
                       events={transcript}
                       sessionId={selected.id}
+                      hostName={selected.host_name}
                       running={effectiveRunning}
                       onApprove={(item, decision) => {
                         if (!item.callId) return;

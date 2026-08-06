@@ -194,12 +194,14 @@ function ArtifactRow({
 export function Transcript({
   events,
   sessionId,
+  hostName,
   running,
   onApprove,
   onRetry,
 }: {
   events: TimelineEvent[];
   sessionId: string;
+  hostName?: string;
   running?: boolean;
   onApprove?: (
     item: Extract<Item, { kind: "approval" }>,
@@ -254,7 +256,9 @@ export function Transcript({
                 name: node.name,
                 args: node.args,
                 reason: "Tool action requires approval",
+                resolved: node.resolved,
               }}
+              hostName={hostName}
               compact
               onApprove={(decision) =>
                 onApprove?.(
@@ -294,7 +298,7 @@ export function Transcript({
         );
         const renderRow = (row: (typeof node.rows)[number], rowIndex: number) => (
           <div
-            className={`transcript-item${row.exitCode !== undefined && row.exitCode !== 0 ? " text-danger" : ""}`}
+            className={`transcript-item${row.denied ? " text-muted" : row.exitCode !== undefined && row.exitCode !== 0 ? " text-danger" : ""}`}
             key={rowIndex}
           >
             <span>{row.label}</span>
@@ -306,6 +310,11 @@ export function Transcript({
             {row.exitCode !== undefined && (
               <span className="ml-2 text-xs text-muted">
                 exit {row.exitCode}
+              </span>
+            )}
+            {row.denied && (
+              <span className="ml-2 text-xs text-muted">
+                not run{row.detail ? ` · ${row.detail}` : ""}
               </span>
             )}
             {row.durationMs !== undefined && (

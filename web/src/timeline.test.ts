@@ -133,6 +133,58 @@ describe("single event-log timeline", () => {
       isMajorAction: true,
     });
   });
+  it("marks resolved approvals and denied calls without process completion", () => {
+    const nodes = buildTimeline([
+      {
+        type: "approval_pending",
+        event_id: "approval",
+        created_at_ms: 1,
+        working_event: {
+          event_type: "approval_pending",
+          payload: {
+            call_id: "shell-denied",
+            tool: "run_shell",
+            arguments: { command: "rm -rf output" },
+          },
+        },
+      },
+      {
+        type: "approval_resolved",
+        event_id: "resolved",
+        created_at_ms: 2,
+        working_event: {
+          event_type: "approval_resolved",
+          payload: { call_id: "shell-denied", approved: false },
+        },
+      },
+      {
+        type: "tool_call_denied",
+        event_id: "denied",
+        created_at_ms: 3,
+        working_event: {
+          event_type: "tool_call_denied",
+          payload: {
+            call_id: "queued-shell",
+            tool: "run_shell",
+            reason: "canceled after approval denial",
+          },
+        },
+      },
+    ] as TimelineEvent[]);
+    expect(nodes[0]).toMatchObject({
+      kind: "approval",
+      callId: "shell-denied",
+      resolved: "deny",
+    });
+    const denied = nodes
+      .filter((node) => node.kind === "work")
+      .flatMap((node) => node.rows)
+      .find((row) => row.callId === "queued-shell");
+    expect(denied).toMatchObject({
+      label: "Not run: run_shell",
+      denied: true,
+    });
+  });
   it("keeps legacy events without parity fields renderable", () => {
     const nodes = buildTimeline([
       {
@@ -285,7 +337,7 @@ describe("single event-log timeline", () => {
       "Created notes.md +4",
       "Edited lib.rs +2 −1",
       "Created 4 Tasks",
-      "1/4#1 Implement the change",
+      "1/4 #1 Implement the change",
       "Earlier context compacted",
     ]);
   });
@@ -417,8 +469,55 @@ describe("single event-log timeline", () => {
       .filter((node) => node.kind === "work")
       .flatMap((node) => node.rows.map((row) => row.label));
     expect(rows.filter((label) => label === "Created 5 Tasks")).toHaveLength(1);
-    expect(rows).toContain("1/5#1 Create files");
-    expect(rows).toContain("2/5#2 Run tests");
+    expect(rows).toContain("1/5 #1 Create files");
+    expect(rows).toContain("2/5 #2 Run tests");
+  });
+  it("points plan progress at the next unfinished step", () => {
+    const rowsFor = (steps: Record<string, unknown>[]) =>
+      buildTimeline([
+        {
+          type: "todo_update",
+          event_id: "plan-progress",
+          created_at_ms: 1,
+          steps,
+        },
+        {
+          type: "shell_process_started",
+          event_id: "plan-action",
+          created_at_ms: 2,
+          command: "echo work",
+          call_id: "plan-action-call",
+        },
+      ]).flatMap((node) =>
+        node.kind === "work" ? node.rows.map((row) => row.label) : [],
+      );
+
+    expect(
+      rowsFor([
+        { step_id: "1", description: "First", status: "not_started" },
+        { step_id: "2", description: "Second", status: "not_started" },
+        { step_id: "3", description: "Third", status: "not_started" },
+        { step_id: "4", description: "Fourth", status: "not_started" },
+        { step_id: "5", description: "Fifth", status: "not_started" },
+        { step_id: "6", description: "Sixth", status: "not_started" },
+        { step_id: "7", description: "Seventh", status: "not_started" },
+        { step_id: "8", description: "Eighth", status: "not_started" },
+      ]),
+    ).toContain("0/8 #1 First");
+    expect(
+      rowsFor([
+        { step_id: "1", description: "First", status: "done" },
+        { step_id: "2", description: "Second", status: "in_progress" },
+        { step_id: "3", description: "Third", status: "not_started" },
+      ]),
+    ).toContain("1/3 #2 Second");
+    expect(
+      rowsFor([
+        { step_id: "1", description: "First", status: "done" },
+        { step_id: "2", description: "Second", status: "failed" },
+        { step_id: "3", description: "Third", status: "abandoned" },
+      ]),
+    ).toContain("3/3 #3 Third");
   });
   it("renders control-action notices and skips empty notices", () => {
     const nodes = buildTimeline([
