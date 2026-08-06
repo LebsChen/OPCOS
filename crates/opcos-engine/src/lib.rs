@@ -2651,6 +2651,11 @@ where
                         .unwrap_or_else(|| json!({"error": "image artifact unavailable"})),
                 );
             }
+            let not_executed = result
+                .get("_opcos_not_executed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            strip_internal_result_fields(&mut safe_result);
             self.secret_scrubber.scrub(&mut safe_result);
             safe_results.push((call.id.clone(), safe_result.clone()));
             let value = json!({"role":"tool","content":[{"type":"tool_result",
@@ -2659,10 +2664,6 @@ where
             self.store
                 .complete_tool_call(&self.session_id, assistant_sequence, &call.id, &safe_result)
                 .map_err(|error| EngineError::Store(error.to_string()))?;
-            let not_executed = result
-                .get("_opcos_not_executed")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
             let category = tool_event_category(&call.name);
             if !not_executed && call.name != "run_shell" {
                 let result_payload = tool_result_payload(&result);
@@ -3425,6 +3426,25 @@ fn tool_result_payload(result: &Value) -> &Value {
         .get("result")
         .filter(|value| value.is_object())
         .unwrap_or(result)
+}
+
+fn strip_internal_result_fields(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.retain(|key, value| {
+                if key.starts_with("_opcos_") {
+                    false
+                } else {
+                    strip_internal_result_fields(value);
+                    true
+                }
+            });
+        }
+        Value::Array(values) => {
+            values.iter_mut().for_each(strip_internal_result_fields);
+        }
+        _ => {}
+    }
 }
 
 fn thought_summary(message: &str) -> String {
@@ -6600,6 +6620,21 @@ mod tests {
             !events
                 .iter()
                 .any(|event| event.event["type"] == "shell_process_completed")
+        );
+        let denied_call = store
+            .load_tool_calls("unattended-denial")
+            .unwrap()
+            .into_iter()
+            .find(|record| record.call_id == "denied-shell")
+            .expect("denied tool call");
+        let result = denied_call.result.expect("denied result");
+        assert_eq!(result["error"], "tool call denied by policy");
+        assert!(result.get("_opcos_not_executed").is_none());
+        let messages = store.load_messages("unattended-denial").unwrap();
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.content.to_string().contains("_opcos_"))
         );
     }
 
