@@ -77,6 +77,12 @@ type ProviderDescriptor = {
   needs_key?: boolean;
   default_base_url?: string | null;
   recommended_model?: string | null;
+  fields?: Array<{
+    key: string;
+    label: string;
+    secret: boolean;
+    required: boolean;
+  }>;
 };
 type ProviderModelOption = {
   id: string;
@@ -3399,7 +3405,12 @@ function ManageSections({
   const [key, setKey] = useState("");
   const [providerStatus, setProviderStatus] = useState("");
   const [providerConfigs, setProviderConfigs] = useState<
-    Array<{ provider: string; base_url?: string; configured: boolean }>
+    Array<{
+      provider: string;
+      base_url?: string;
+      account_id?: string;
+      configured: boolean;
+    }>
   >([]);
   const [providerKeys, setProviderKeys] = useState<Record<string, string>>({});
   const [providerStatuses, setProviderStatuses] = useState<
@@ -4530,6 +4541,25 @@ function ManageSections({
                         }
                       />
                     </label>
+                    {descriptor.fields?.some(
+                      (field) => field.key === "account_id",
+                    ) && (
+                      <label>
+                        Cloudflare account ID
+                        <input
+                          value={config?.account_id || ""}
+                          onChange={(event) =>
+                            setProviderConfigs((items) =>
+                              items.map((item) =>
+                                item.provider === descriptor.name
+                                  ? { ...item, account_id: event.target.value }
+                                  : item,
+                              ),
+                            )
+                          }
+                        />
+                      </label>
+                    )}
                     {descriptor.needs_key && (
                       <label>
                         Provider key
@@ -4627,6 +4657,7 @@ function ManageSections({
                         command("save_provider_settings", {
                           provider: descriptor.name,
                           baseUrl: currentUrl || null,
+                          accountId: config?.account_id || null,
                         })
                           .then(() =>
                             providerKeys[descriptor.name]
