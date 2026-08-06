@@ -11,6 +11,7 @@ use opcos_store::{
     CompactionRecord, GrantRecord, NoticeRecord, PendingRecord, SessionStore, StoredMessage,
     ToolCallRecord, UsageRecord,
 };
+use regex::Regex;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -18,7 +19,7 @@ use std::sync::{
     Arc, Mutex as StdMutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
@@ -61,6 +62,15 @@ pub enum EngineError {
 pub trait ToolExecutor: Send + Sync {
     async fn execute(&self, name: &str, arguments: Value) -> Result<Value, String>;
 
+    async fn run_hook_command(
+        &self,
+        _command: &str,
+        _input: Value,
+        _timeout: std::time::Duration,
+    ) -> Result<Option<Value>, String> {
+        Err("lifecycle hooks are not enabled for this executor".into())
+    }
+
     async fn preflight(&self, name: &str, arguments: &Value) -> Result<PreflightDecision, String> {
         let _ = (name, arguments);
         Ok(PreflightDecision::Allow)
@@ -91,6 +101,26 @@ pub enum PreflightDecision {
     Allow,
     NeedsUser(String),
     Deny(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LifecycleHook {
+    pub event: String,
+    pub matcher: Option<String>,
+    pub hook_type: String,
+    pub command: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LifecycleHookConfig {
+    pub enabled: bool,
+    pub hooks: Vec<LifecycleHook>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct HookEffects {
+    blocked: Option<String>,
+    additional_context: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -410,6 +440,9 @@ pub struct TurnEngine<P, S, E> {
     system_instructions: Mutex<Option<String>>,
     runtime_facts: Mutex<Option<String>>,
     permission_rules: Mutex<Option<PermissionRules>>,
+    hook_permission_rules: Mutex<Option<PermissionRules>>,
+    lifecycle_hooks: Mutex<Option<LifecycleHookConfig>>,
+    hook_context: Mutex<Vec<String>>,
     external_tools: Mutex<Vec<Value>>,
     allowed_tools: Mutex<Option<HashSet<String>>>,
     linear_tools_enabled: AtomicBool,
@@ -428,6 +461,49 @@ pub struct TurnEngine<P, S, E> {
 }
 
 type SteeringWaiters = Arc<std::sync::Mutex<Vec<oneshot::Sender<(String, String)>>>>;
+
+// Best-effort input hygiene only; local-only hook enablement is the security boundary.
+fn redact_hook_value(mut value: Value) -> Value {
+    fn visit(value: &mut Value) {
+        match value {
+            Value::String(text) => {
+                if text.len() > 16_384 {
+                    text.truncate(16_384);
+                    text.push('…');
+                }
+                for marker in ["Bearer ", "token=", "password=", "secret="] {
+                    if let Some(start) = text.find(marker) {
+                        let value_start = start + marker.len();
+                        let value_end = text[value_start..]
+                            .find(|character: char| character.is_whitespace() || character == '&')
+                            .map_or(text.len(), |offset| value_start + offset);
+                        text.replace_range(value_start..value_end, "[REDACTED]");
+                    }
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(visit),
+            Value::Object(items) => {
+                for (key, item) in items {
+                    let sensitive = key.to_ascii_lowercase();
+                    if sensitive.contains("token")
+                        || sensitive.contains("secret")
+                        || sensitive.contains("password")
+                        || sensitive.contains("credential")
+                        || sensitive == "key"
+                        || sensitive.ends_with("_key")
+                    {
+                        *item = Value::String("[REDACTED]".into());
+                    } else {
+                        visit(item);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    visit(&mut value);
+    value
+}
 
 struct ActiveToolCallGuard<'a> {
     calls: &'a StdMutex<HashSet<String>>,
@@ -496,6 +572,9 @@ where
             system_instructions: Mutex::new(None),
             runtime_facts: Mutex::new(None),
             permission_rules: Mutex::new(None),
+            hook_permission_rules: Mutex::new(None),
+            lifecycle_hooks: Mutex::new(None),
+            hook_context: Mutex::new(Vec::new()),
             external_tools: Mutex::new(Vec::new()),
             allowed_tools: Mutex::new(None),
             linear_tools_enabled: AtomicBool::new(false),
@@ -524,6 +603,14 @@ where
 
     pub async fn set_permission_rules(&self, rules: Option<PermissionRules>) {
         *self.permission_rules.lock().await = rules;
+    }
+
+    pub async fn set_hook_permission_rules(&self, rules: Option<PermissionRules>) {
+        *self.hook_permission_rules.lock().await = rules;
+    }
+
+    pub async fn set_lifecycle_hooks(&self, hooks: Option<LifecycleHookConfig>) {
+        *self.lifecycle_hooks.lock().await = hooks;
     }
 
     pub async fn set_external_tools(&self, tools: Vec<Value>) {
@@ -563,6 +650,132 @@ where
 
     pub fn set_max_iterations(&self, limit: u64) {
         self.max_iterations.store(limit.max(1), Ordering::SeqCst);
+    }
+
+    async fn lifecycle_hooks(&self, event: &str, tool: Option<&str>, input: Value) -> HookEffects {
+        self.lifecycle_hooks_with_timeout(event, tool, input, Duration::from_secs(10))
+            .await
+    }
+
+    async fn lifecycle_hooks_with_timeout(
+        &self,
+        event: &str,
+        tool: Option<&str>,
+        input: Value,
+        timeout: Duration,
+    ) -> HookEffects {
+        let Some(config) = self.lifecycle_hooks.lock().await.clone() else {
+            return HookEffects::default();
+        };
+        if !config.enabled {
+            return HookEffects::default();
+        }
+        let rules = self.hook_permission_rules.lock().await.clone();
+        let mode = *self.mode.lock().await;
+        let unattended = self.unattended.load(Ordering::SeqCst);
+        let mut effects = HookEffects::default();
+        for hook in config.hooks.iter().filter(|hook| {
+            hook.hook_type == "command"
+                && hook.event == event
+                && hook.matcher.as_deref().is_none_or(|matcher| {
+                    Regex::new(matcher)
+                        .ok()
+                        .is_some_and(|regex| tool.is_some_and(|tool| regex.is_match(tool)))
+                })
+        }) {
+            let decision = decide_with_rules(
+                mode,
+                ToolRisk::Execute,
+                unattended,
+                &[],
+                &hook.command,
+                rules.as_ref(),
+            );
+            if !matches!(decision, Decision::Allow) {
+                continue;
+            }
+            let output = match tokio::time::timeout(
+                timeout,
+                self.executor.run_hook_command(
+                    &hook.command,
+                    redact_hook_value(input.clone()),
+                    timeout,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(Some(value))) => value,
+                _ => continue,
+            };
+            if let Some(decision) = output.get("decision").and_then(Value::as_str)
+                && matches!(decision, "block" | "deny")
+            {
+                effects.blocked = Some(
+                    output
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("blocked by lifecycle hook")
+                        .to_owned(),
+                );
+            }
+            let context = output
+                .pointer("/hookSpecificOutput/additionalContext")
+                .and_then(Value::as_str)
+                .or_else(|| output.get("additionalContext").and_then(Value::as_str));
+            if let Some(context) = context.filter(|context| !context.trim().is_empty()) {
+                effects.additional_context.push(context.to_owned());
+            }
+        }
+        effects
+    }
+
+    async fn take_hook_context(&self) -> Vec<String> {
+        std::mem::take(&mut *self.hook_context.lock().await)
+    }
+
+    async fn execute_tool_with_hooks(&self, call: &ToolCall) -> Value {
+        let pre = self
+            .lifecycle_hooks(
+                "PreToolUse",
+                Some(&call.name),
+                json!({"event":"PreToolUse","tool":call.name,"arguments":call.arguments}),
+            )
+            .await;
+        if let Some(reason) = pre.blocked {
+            return json!({"error":reason});
+        }
+        let result = self.execute_tool(call).await;
+        let post = self
+            .lifecycle_hooks(
+                "PostToolUse",
+                Some(&call.name),
+                json!({"event":"PostToolUse","tool":call.name,"arguments":call.arguments,"result":result}),
+            )
+            .await;
+        self.hook_context
+            .lock()
+            .await
+            .extend(post.additional_context);
+        result
+    }
+
+    async fn apply_post_compaction_hook(&self, messages: &mut Vec<Value>) {
+        let effects = self
+            .lifecycle_hooks(
+                "PostCompaction",
+                None,
+                json!({"event":"PostCompaction","messages":messages}),
+            )
+            .await;
+        for context in effects.additional_context {
+            let value = json!({
+                "role":"user",
+                "content":[{"type":"text","text":context}]
+            });
+            if self.append("user", value.clone()).await.is_ok() {
+                messages.push(value);
+            }
+        }
     }
 
     pub async fn submit_text(&self, text: impl Into<String>) -> Result<AssistantTurn, EngineError> {
@@ -952,7 +1165,9 @@ where
 
     pub async fn compact_now(&self) -> Result<(), EngineError> {
         let messages = self.provider_messages()?;
-        self.compact_context(messages).await.map(|_| ())
+        let mut compacted = self.compact_context(messages).await?;
+        self.apply_post_compaction_hook(&mut compacted).await;
+        Ok(())
     }
 
     pub fn interrupt(&self) {
@@ -1007,6 +1222,7 @@ where
 
     async fn run_loop(&self, mut messages: Vec<Value>) -> Result<AssistantTurn, EngineError> {
         let mut usage: Option<TokenUsage> = None;
+        let mut stop_vetoes = 0;
         let max_iterations = self.max_iterations.load(Ordering::SeqCst);
         for _ in 0..max_iterations {
             if self.interrupted.load(Ordering::SeqCst) {
@@ -1019,6 +1235,7 @@ where
                     .compact_context(messages)
                     .await
                     .map_err(|error| EngineError::ContextExhausted(error.to_string()))?;
+                self.apply_post_compaction_hook(&mut messages).await;
             }
             let request = ProviderRequest {
                 model: self.model.lock().await.clone(),
@@ -1103,6 +1320,30 @@ where
                     let assistant_sequence = *self.sequence.lock().await;
                     messages.push(assistant);
                     if turn.tool_calls.is_empty() {
+                        let stop = self
+                            .lifecycle_hooks(
+                                "Stop",
+                                None,
+                                json!({"event":"Stop","assistant":turn.text}),
+                            )
+                            .await;
+                        if let Some(reason) = stop.blocked
+                            && stop_vetoes < 3
+                        {
+                            stop_vetoes += 1;
+                            let text = if stop.additional_context.is_empty() {
+                                reason
+                            } else {
+                                format!("{reason}\n{}", stop.additional_context.join("\n"))
+                            };
+                            let value = json!({
+                                "role":"user",
+                                "content":[{"type":"text","text":text}]
+                            });
+                            self.append("user", value.clone()).await?;
+                            messages.push(value);
+                            continue;
+                        }
                         let steering = std::mem::take(&mut *self.steering.lock().await);
                         if steering.is_empty() {
                             return Ok(turn);
@@ -1134,6 +1375,14 @@ where
                                 "tool_use_id":call.id,"content":[{"type":"text","text":result.to_string()}]}]});
                             messages.push(value);
                         }
+                        for context in self.take_hook_context().await {
+                            let value = json!({
+                                "role":"user",
+                                "content":[{"type":"text","text":context}]
+                            });
+                            self.append("user", value.clone()).await?;
+                            messages.push(value);
+                        }
                     }
                 }
                 Err(error) => {
@@ -1157,6 +1406,7 @@ where
                             .compact_context(messages)
                             .await
                             .map_err(|error| EngineError::ContextExhausted(error.to_string()))?;
+                        self.apply_post_compaction_hook(&mut messages).await;
                         continue;
                     }
                     return Err(error.into());
@@ -1264,7 +1514,7 @@ where
                 })?;
                 let completed_reads = futures_util::future::join_all(readonly.drain(..).map(
                     |(read_index, read_call): (usize, &ToolCall)| async move {
-                        let result = self.execute_tool(read_call).await;
+                        let result = self.execute_tool_with_hooks(read_call).await;
                         (read_index, result)
                     },
                 ))
@@ -1354,7 +1604,7 @@ where
                     readonly.push((index, call));
                 }
                 Decision::Allow => {
-                    results[index] = Some(self.execute_tool(call).await);
+                    results[index] = Some(self.execute_tool_with_hooks(call).await);
                 }
                 Decision::Deny => {
                     self.policy_denied.store(true, Ordering::SeqCst);
@@ -1363,7 +1613,7 @@ where
                 Decision::NeedsUser => {
                     let completed_reads = futures_util::future::join_all(readonly.drain(..).map(
                         |(read_index, read_call): (usize, &ToolCall)| async move {
-                            let result = self.execute_tool(read_call).await;
+                            let result = self.execute_tool_with_hooks(read_call).await;
                             (read_index, result)
                         },
                     ))
@@ -1408,7 +1658,7 @@ where
         }
         let readonly_results =
             futures_util::future::join_all(readonly.into_iter().map(|(index, call)| async move {
-                let result = self.execute_tool(call).await;
+                let result = self.execute_tool_with_hooks(call).await;
                 (index, result)
             }))
             .await;
@@ -2499,6 +2749,438 @@ mod tests {
         async fn execute(&self, _: &str, _: Value) -> Result<Value, String> {
             Ok(json!("ok"))
         }
+    }
+
+    struct HookTools;
+
+    #[async_trait]
+    impl ToolExecutor for HookTools {
+        async fn execute(&self, _: &str, _: Value) -> Result<Value, String> {
+            Ok(json!("executed"))
+        }
+
+        async fn run_hook_command(
+            &self,
+            command: &str,
+            _input: Value,
+            _timeout: Duration,
+        ) -> Result<Option<Value>, String> {
+            Ok(match command {
+                "block" => Some(json!({
+                    "decision":"block",
+                    "reason":"destructive command blocked"
+                })),
+                "context" => Some(json!({
+                    "hookSpecificOutput":{
+                        "additionalContext":"Remember the approved change ticket."
+                    }
+                })),
+                "stop" => Some(json!({
+                    "decision":"block",
+                    "reason":"continue with verification"
+                })),
+                _ => None,
+            })
+        }
+    }
+
+    struct HangingHookTools;
+
+    #[async_trait]
+    impl ToolExecutor for HangingHookTools {
+        async fn execute(&self, _: &str, _: Value) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+
+        async fn run_hook_command(
+            &self,
+            _: &str,
+            _: Value,
+            _: Duration,
+        ) -> Result<Option<Value>, String> {
+            std::future::pending().await
+        }
+    }
+
+    fn hook_config(event: &str, command: &str) -> LifecycleHookConfig {
+        LifecycleHookConfig {
+            enabled: true,
+            hooks: vec![LifecycleHook {
+                event: event.into(),
+                matcher: None,
+                hook_type: "command".into(),
+                command: command.into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn hook_input_redacts_sensitive_fields_and_inline_credentials() {
+        let value = redact_hook_value(json!({
+            "token": "secret-token",
+            "command": "curl -H 'Authorization: Bearer secret-token' https://example.test?token=secret-token"
+        }));
+        let text = value.to_string();
+        assert!(!text.contains("secret-token"));
+        assert!(text.contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_hook_timeout_does_not_block_turn() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(HangingHookTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine
+            .set_lifecycle_hooks(Some(hook_config("PreToolUse", "hang")))
+            .await;
+        let effects = engine
+            .lifecycle_hooks_with_timeout(
+                "PreToolUse",
+                Some("run_shell"),
+                json!({"command":"safe"}),
+                Duration::from_millis(1),
+            )
+            .await;
+        assert_eq!(effects, HookEffects::default());
+    }
+
+    #[tokio::test]
+    async fn pre_tool_hook_blocks_execution_and_returns_reason() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(HookTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine
+            .set_lifecycle_hooks(Some(hook_config("PreToolUse", "block")))
+            .await;
+        let result = engine
+            .execute_tool_with_hooks(&ToolCall {
+                id: "call".into(),
+                name: "run_shell".into(),
+                arguments: json!({"command":"rm -rf /"}),
+            })
+            .await;
+        assert_eq!(
+            result.get("error").and_then(Value::as_str),
+            Some("destructive command blocked")
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_matcher_limits_pre_tool_interception_to_matching_tools() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(HookTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine
+            .set_lifecycle_hooks(Some(LifecycleHookConfig {
+                enabled: true,
+                hooks: vec![LifecycleHook {
+                    event: "PreToolUse".into(),
+                    matcher: Some("^run_shell$".into()),
+                    hook_type: "command".into(),
+                    command: "block".into(),
+                }],
+            }))
+            .await;
+        let read = engine
+            .execute_tool_with_hooks(&ToolCall {
+                id: "read".into(),
+                name: "read_file".into(),
+                arguments: json!({}),
+            })
+            .await;
+        assert_eq!(read, json!("executed"));
+        let shell = engine
+            .execute_tool_with_hooks(&ToolCall {
+                id: "shell".into(),
+                name: "run_shell".into(),
+                arguments: json!({}),
+            })
+            .await;
+        assert_eq!(
+            shell.get("error").and_then(Value::as_str),
+            Some("destructive command blocked")
+        );
+    }
+
+    #[tokio::test]
+    async fn post_tool_hook_additional_context_is_queued_for_provider() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(HookTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine
+            .set_lifecycle_hooks(Some(hook_config("PostToolUse", "context")))
+            .await;
+        let _ = engine
+            .execute_tool_with_hooks(&ToolCall {
+                id: "call".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":"README.md","token":"secret"}),
+            })
+            .await;
+        assert_eq!(
+            engine.take_hook_context().await,
+            vec!["Remember the approved change ticket."]
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_hooks_are_disabled_without_explicit_enablement() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(HookTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine
+            .set_lifecycle_hooks(Some(LifecycleHookConfig {
+                enabled: false,
+                hooks: vec![LifecycleHook {
+                    event: "PreToolUse".into(),
+                    matcher: None,
+                    hook_type: "command".into(),
+                    command: "block".into(),
+                }],
+            }))
+            .await;
+        let result = engine
+            .execute_tool_with_hooks(&ToolCall {
+                id: "call".into(),
+                name: "run_shell".into(),
+                arguments: json!({"command":"safe"}),
+            })
+            .await;
+        assert_eq!(result, json!("executed"));
+    }
+
+    #[tokio::test]
+    async fn project_hook_allow_rules_cannot_self_authorize_commands() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(HookTools),
+            "s",
+            "/workspace",
+            PermissionMode::Interactive,
+            "fake",
+        );
+        engine
+            .set_lifecycle_hooks(Some(hook_config("PreToolUse", "context")))
+            .await;
+        // This protects the trust boundary: committed project rules must not
+        // self-authorize commands from committed hook configuration.
+        engine
+            .set_hook_permission_rules(Some(PermissionRules {
+                allow: Vec::new(),
+                deny: Vec::new(),
+            }))
+            .await;
+        assert_eq!(
+            engine
+                .lifecycle_hooks("PreToolUse", Some("run_shell"), json!({}))
+                .await,
+            HookEffects::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_hook_allow_rules_can_authorize_commands() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(HookTools),
+            "s",
+            "/workspace",
+            PermissionMode::Interactive,
+            "fake",
+        );
+        engine
+            .set_lifecycle_hooks(Some(hook_config("PreToolUse", "context")))
+            .await;
+        engine
+            .set_hook_permission_rules(Some(PermissionRules {
+                allow: vec!["Exec(context)".into()],
+                deny: Vec::new(),
+            }))
+            .await;
+        let effects = engine
+            .lifecycle_hooks("PreToolUse", Some("run_shell"), json!({}))
+            .await;
+        assert_eq!(
+            effects.additional_context,
+            vec!["Remember the approved change ticket."]
+        );
+    }
+
+    #[tokio::test]
+    async fn project_hook_deny_rules_block_commands_even_with_local_allow() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(HookTools),
+            "s",
+            "/workspace",
+            PermissionMode::Interactive,
+            "fake",
+        );
+        engine
+            .set_lifecycle_hooks(Some(hook_config("PreToolUse", "context")))
+            .await;
+        engine
+            .set_hook_permission_rules(Some(PermissionRules {
+                allow: vec!["Exec(context)".into()],
+                deny: vec!["Exec(context)".into()],
+            }))
+            .await;
+        assert_eq!(
+            engine
+                .lifecycle_hooks("PreToolUse", Some("run_shell"), json!({}))
+                .await,
+            HookEffects::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_loop_without_hooks_preserves_existing_behavior() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let turn = engine.submit_text("hello").await.unwrap();
+        assert_eq!(turn.text.as_deref(), Some("done"));
+    }
+
+    #[tokio::test]
+    async fn post_compaction_hook_injects_context_without_duplicate_system_messages() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            SummaryProvider { fail: false },
+            store,
+            Arc::new(HookTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine
+            .set_system_instructions(Some("Keep workspace constraints.".into()))
+            .await;
+        engine
+            .set_lifecycle_hooks(Some(hook_config("PostCompaction", "context")))
+            .await;
+        let mut messages = engine
+            .compact_context(
+                (0..8)
+                    .map(|index| json!({"role":"user","content":format!("message-{index}")}))
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        engine.apply_post_compaction_hook(&mut messages).await;
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+                .count(),
+            1
+        );
+        assert!(messages.iter().any(|message| {
+            message
+                .pointer("/content/0/text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("approved change ticket"))
+        }));
+    }
+
+    struct StopProvider {
+        calls: Arc<AtomicU64>,
+    }
+
+    #[async_trait]
+    impl Provider for StopProvider {
+        async fn complete(&self, _: ProviderRequest) -> Result<AssistantTurn, ProviderError> {
+            Ok(AssistantTurn::default())
+        }
+
+        async fn stream(
+            &self,
+            _: ProviderRequest,
+            _: mpsc::Sender<StreamChunk>,
+        ) -> Result<AssistantTurn, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(AssistantTurn {
+                text: Some("done".into()),
+                ..Default::default()
+            })
+        }
+
+        fn capabilities(&self, _: &str) -> Caps {
+            Caps::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_hook_veto_is_bounded() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let calls = Arc::new(AtomicU64::new(0));
+        let engine = TurnEngine::new(
+            StopProvider {
+                calls: calls.clone(),
+            },
+            store,
+            Arc::new(HookTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine.set_max_iterations(10);
+        engine
+            .set_lifecycle_hooks(Some(hook_config("Stop", "stop")))
+            .await;
+        let result = engine.run_loop(Vec::new()).await.unwrap();
+        assert_eq!(result.text.as_deref(), Some("done"));
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
     }
 
     #[tokio::test]

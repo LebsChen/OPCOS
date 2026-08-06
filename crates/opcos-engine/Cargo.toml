@@ -13,6 +13,7 @@ opcos-policy = { path = "../opcos-policy" }
 opcos-provider = { path = "../opcos-provider" }
 opcos-hosts = { path = "../opcos-hosts" }
 opcos-store = { path = "../opcos-store" }
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

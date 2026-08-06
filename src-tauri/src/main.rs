@@ -22,9 +22,9 @@ use opcos_assets::{
     parse_command,
 };
 use opcos_engine::{
-    AcpHarness, AcpHarnessConfig, AgentEngine, EngineError, Harness, OpenCodeHarness,
-    OpenCodeHarnessConfig, PreflightDecision, SessionRecorder, ToolExecutor, ToolOrigin,
-    TurnEngine,
+    AcpHarness, AcpHarnessConfig, AgentEngine, EngineError, Harness, LifecycleHook,
+    LifecycleHookConfig, OpenCodeHarness, OpenCodeHarnessConfig, PreflightDecision,
+    SessionRecorder, ToolExecutor, ToolOrigin, TurnEngine,
     computer_use::{
         BestEffortScreenshotChangedVerifier, ComputerUseLoopConfig, ComputerUseStep,
         run_computer_use_loop,
@@ -3440,6 +3440,29 @@ struct IdeProxyState {
 
 #[async_trait]
 impl ToolExecutor for RemoteExecutor {
+    async fn run_hook_command(
+        &self,
+        command: &str,
+        input: Value,
+        timeout: Duration,
+    ) -> Result<Option<Value>, String> {
+        let platform = self
+            .client
+            .health()
+            .await
+            .ok()
+            .and_then(|health| health.platform);
+        run_hook_on_client(
+            &self.client,
+            command,
+            input,
+            timeout,
+            self.workspace.clone(),
+            platform.as_deref(),
+        )
+        .await
+    }
+
     async fn execute(&self, name: &str, arguments: Value) -> Result<Value, String> {
         if name.starts_with("background_job_") {
             if name == "background_job_start" {
@@ -3796,6 +3819,28 @@ impl ToolExecutor for RemoteExecutor {
 
 #[async_trait]
 impl ToolExecutor for DesktopExecutor {
+    async fn run_hook_command(
+        &self,
+        command: &str,
+        input: Value,
+        timeout: Duration,
+    ) -> Result<Option<Value>, String> {
+        match self {
+            Self::Remote(executor) => executor.run_hook_command(command, input, timeout).await,
+            Self::Local(executor) => {
+                run_hook_on_host(
+                    &executor.host,
+                    command,
+                    input,
+                    timeout,
+                    executor.workspace.clone(),
+                    Some(std::env::consts::OS),
+                )
+                .await
+            }
+        }
+    }
+
     async fn execute(&self, name: &str, arguments: Value) -> Result<Value, String> {
         match self {
             Self::Remote(executor) => executor.execute(name, arguments).await,
@@ -6753,6 +6798,79 @@ fn quote_for(platform: Option<&str>, value: &str) -> String {
     }
 }
 
+async fn run_hook_on_client(
+    client: &HttpRvmClient,
+    command: &str,
+    input: Value,
+    timeout: Duration,
+    cwd: String,
+    platform: Option<&str>,
+) -> Result<Option<Value>, String> {
+    let encoded = serde_json::to_string(&input).map_err(|error| error.to_string())?;
+    let quoted = quote_for(platform, &encoded);
+    let command = if platform.is_some_and(|value| value.eq_ignore_ascii_case("windows")) {
+        format!(
+            "Write-Output {quoted} | Invoke-Expression {}",
+            quote_for(platform, command)
+        )
+    } else {
+        format!("printf '%s' {quoted} | {command}")
+    };
+    let result = client
+        .exec_sync(ExecRequest {
+            command,
+            cwd: Some(cwd),
+            timeout_seconds: timeout.as_secs().clamp(1, 10),
+            session: None,
+            env: None,
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    parse_hook_stdout(&result.result.stdout)
+}
+
+async fn run_hook_on_host(
+    host: &dyn Host,
+    command: &str,
+    input: Value,
+    timeout: Duration,
+    cwd: String,
+    platform: Option<&str>,
+) -> Result<Option<Value>, String> {
+    let encoded = serde_json::to_string(&input).map_err(|error| error.to_string())?;
+    let quoted = quote_for(platform, &encoded);
+    let command = if platform.is_some_and(|value| value.eq_ignore_ascii_case("windows")) {
+        format!(
+            "Write-Output {quoted} | Invoke-Expression {}",
+            quote_for(platform, command)
+        )
+    } else {
+        format!("printf '%s' {quoted} | {command}")
+    };
+    let result = host
+        .exec(ExecRequest {
+            command,
+            cwd: Some(cwd),
+            timeout_seconds: timeout.as_secs().clamp(1, 10),
+            session: None,
+            env: None,
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    parse_hook_stdout(&result.result.stdout)
+}
+
+fn parse_hook_stdout(stdout: &str) -> Result<Option<Value>, String> {
+    if stdout.len() > 64 * 1024 {
+        return Ok(None);
+    }
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    Ok(serde_json::from_str(trimmed).ok())
+}
+
 fn project_host_contains(host: &Arc<dyn Host>, candidate: &str) -> bool {
     if host.id() == "local" {
         return dirs::home_dir()
@@ -9331,6 +9449,51 @@ async fn engine_for_with_context(
             opcos_policy::PermissionRules {
                 allow: rules.allow.clone(),
                 deny: rules.deny.clone(),
+            }
+        }))
+        .await;
+    let hook_permission_rules = match (
+        bundle.project_permissions.as_ref(),
+        bundle.local_permissions.as_ref(),
+    ) {
+        (None, None) => None,
+        (project, local) => {
+            let mut deny = project
+                .into_iter()
+                .flat_map(|rules| rules.deny.iter().cloned())
+                .collect::<Vec<_>>();
+            deny.extend(
+                local
+                    .into_iter()
+                    .flat_map(|rules| rules.deny.iter().cloned()),
+            );
+            Some(opcos_policy::PermissionRules {
+                allow: local
+                    .into_iter()
+                    .flat_map(|rules| rules.allow.iter().cloned())
+                    .collect(),
+                deny,
+            })
+        }
+    };
+    // Project rules may tighten hook execution, but only local rules may loosen it.
+    engine
+        .set_hook_permission_rules(hook_permission_rules)
+        .await;
+    engine
+        .set_lifecycle_hooks(bundle.hooks.as_ref().map(|config| {
+            LifecycleHookConfig {
+                enabled: config.enabled,
+                hooks: config
+                    .hooks
+                    .iter()
+                    .map(|hook| LifecycleHook {
+                        event: hook.event.clone(),
+                        matcher: hook.matcher.clone(),
+                        hook_type: hook.hook_type.clone(),
+                        command: hook.command.clone(),
+                    })
+                    .collect(),
             }
         }))
         .await;
@@ -20918,6 +21081,19 @@ fn main() {
 #[cfg(test)]
 mod m7_tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_hook_stdout_invalid_or_oversized_is_ignored() {
+        assert_eq!(parse_hook_stdout("not json").unwrap(), None);
+        assert_eq!(parse_hook_stdout("").unwrap(), None);
+        assert_eq!(parse_hook_stdout(&"x".repeat(64 * 1024 + 1)).unwrap(), None);
+        assert_eq!(
+            parse_hook_stdout(r#"{"decision":"block","reason":"no"}"#)
+                .unwrap()
+                .and_then(|value| value.get("decision").cloned()),
+            Some(Value::String("block".into()))
+        );
+    }
 
     #[test]
     fn learned_skill_secret_patterns_are_rejected_without_sanitizing() {

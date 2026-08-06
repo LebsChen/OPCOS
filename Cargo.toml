@@ -42,6 +42,7 @@ keyring = { version = "3", default-features = false, features = [
     "windows-native",
 ] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+regex = "1"
 ring = "0.17"
 sha2 = "0.10"
 rusqlite = { version = "0.40", features = ["bundled", "chrono"] }
