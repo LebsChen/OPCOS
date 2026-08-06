@@ -2060,7 +2060,7 @@ where
             }
             let mode = *self.mode.lock().await;
             if call.name == "ask_user"
-                || (call.name == "propose_plan" && mode != PermissionMode::Auto)
+                || (call.name == "propose_plan" && mode == PermissionMode::Plan)
             {
                 if call.name == "ask_user" {
                     let options = call
@@ -2083,6 +2083,19 @@ where
                                 "tool": "ask_user",
                                 "options": options,
                                 "allow_multiple": allow_multiple,
+                            }),
+                        )
+                        .await;
+                } else {
+                    let _ = self
+                        .working_event(
+                            "approval_pending",
+                            "message",
+                            json!({
+                                "call_id": call.id,
+                                "tool": call.name,
+                                "arguments": call.arguments,
+                                "reason": "Plan mode requires plan confirmation",
                             }),
                         )
                         .await;
@@ -2127,7 +2140,11 @@ where
                 }
                 return Err(EngineError::ApprovalPending(call.id.clone()));
             }
-            let mut risk = tool_risk(&call.name);
+            let mut risk = if call.name == "propose_plan" {
+                ToolRisk::Read
+            } else {
+                tool_risk(&call.name)
+            };
             let argument_keys = call
                 .arguments
                 .as_object()
@@ -2273,14 +2290,30 @@ where
                 decision
             };
             if matches!(decision, Decision::Deny) && preflight_reason.is_some() {
+                let reason = preflight_reason
+                    .as_deref()
+                    .unwrap_or("tool call denied by preflight");
                 results[index] = Some(json!({
-                    "error": preflight_reason.as_deref().unwrap_or("tool call denied by preflight")
+                    "error": reason,
+                    "_opcos_not_executed": true,
                 }));
+                let _ = self
+                    .working_event(
+                        "tool_call_denied",
+                        "message",
+                        json!({
+                            "call_id": call.id,
+                            "tool": call.name,
+                            "reason": reason,
+                        }),
+                    )
+                    .await;
                 continue;
             };
             match decision {
                 Decision::Allow
-                    if matches!(risk, ToolRisk::Read | ToolRisk::Search | ToolRisk::GitRead) =>
+                    if matches!(risk, ToolRisk::Read | ToolRisk::Search | ToolRisk::GitRead)
+                        && call.name != "propose_plan" =>
                 {
                     readonly.push((index, call));
                 }
@@ -2309,7 +2342,20 @@ where
                 }
                 Decision::Deny => {
                     self.policy_denied.store(true, Ordering::SeqCst);
-                    results[index] = Some(json!({"error":"tool call denied by policy"}))
+                    results[index] = Some(
+                        json!({"error":"tool call denied by policy","_opcos_not_executed":true}),
+                    );
+                    let _ = self
+                        .working_event(
+                            "tool_call_denied",
+                            "message",
+                            json!({
+                                "call_id": call.id,
+                                "tool": call.name,
+                                "reason": "denied by policy",
+                            }),
+                        )
+                        .await;
                 }
                 Decision::NeedsUser => {
                     let _ = self
@@ -2613,8 +2659,12 @@ where
             self.store
                 .complete_tool_call(&self.session_id, assistant_sequence, &call.id, &safe_result)
                 .map_err(|error| EngineError::Store(error.to_string()))?;
+            let not_executed = result
+                .get("_opcos_not_executed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let category = tool_event_category(&call.name);
-            if call.name != "run_shell" {
+            if !not_executed && call.name != "run_shell" {
                 let result_payload = tool_result_payload(&result);
                 let _ = self
                     .working_event(
@@ -2629,7 +2679,7 @@ where
                         }),
                     )
                     .await;
-            } else {
+            } else if !not_executed {
                 let result_payload = tool_result_payload(&result);
                 let output = result
                     .get("output")
@@ -4020,7 +4070,7 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"github_get_pull_request","description":"Read a GitHub pull request, including issue comments and review comments.","parameters":{"type":"object","properties":{"repo":{"type":"string"},"number":{"type":"integer"},"token_secret":{"type":"string"}},"required":["repo","number","token_secret"]}}}),
         json!({"type":"function","function":{"name":"github_ci_status","description":"Read GitHub Actions checks for the bound project repository by pull request number or commit SHA. Classifies code failures separately from billing, runner, cancellation, timeout, and indeterminate states; this is observational and not a delivery gate.","parameters":{"type":"object","properties":{"repo":{"type":"string"},"pull_request":{"type":"integer"},"commit":{"type":"string"}},"required":["repo"]}}}),
         json!({"type":"function","function":{"name":"github_ci_failure_log","description":"Read a bounded tail or offset segment of a failed GitHub Actions job log. Optionally request a step; if it cannot be located, the result explicitly says the returned text is the bounded job tail.","parameters":{"type":"object","properties":{"repo":{"type":"string"},"run_id":{"type":"integer"},"job_id":{"type":"integer"},"step":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"},"tail":{"type":"boolean"}},"required":["repo","run_id"]}}}),
-        json!({"type":"function","function":{"name":"propose_plan","description":"Propose a structured ordered plan and wait for approval. Each step is persisted and can be tracked after approval.","parameters":{"type":"object","properties":{"title":{"type":"string"},"summary":{"type":"string"},"steps":{"type":"array","items":{"type":"string"}}},"required":["title","steps"]}}}),
+        json!({"type":"function","function":{"name":"propose_plan","description":"Persist a structured ordered plan. In Plan mode, the proposal waits for confirmation before it is applied; each step is persisted and can be tracked after creation.","parameters":{"type":"object","properties":{"title":{"type":"string"},"summary":{"type":"string"},"steps":{"type":"array","items":{"type":"string"}}},"required":["title","steps"]}}}),
         json!({"type":"function","function":{"name":"plan_get","description":"Read the current persisted plan, ordered steps, statuses, failure or abandonment reasons, and revision number.","parameters":{"type":"object","properties":{}}}}),
         json!({"type":"function","function":{"name":"plan_update","description":"Update one plan step. Valid statuses are not_started, in_progress, done, failed, and abandoned. Abandoned steps require a reason and failed steps cannot silently become done.","parameters":{"type":"object","properties":{"step_id":{"type":"string"},"status":{"type":"string","enum":["not_started","in_progress","done","failed","abandoned"]},"description":{"type":"string"},"reason":{"type":"string"}},"required":["step_id"]}}}),
         json!({"type":"function","function":{"name":"plan_revise","description":"Revise the current plan with an explicit summary and optional additional ordered steps. Revisions are retained in plan history; steps are never physically deleted.","parameters":{"type":"object","properties":{"summary":{"type":"string"},"add_steps":{"type":"array","items":{"type":"string"}}},"required":["summary"]}}}),
@@ -6320,7 +6370,7 @@ mod tests {
             Arc::new(FakeTools),
             "s",
             "/workspace",
-            PermissionMode::Interactive,
+            PermissionMode::Plan,
             "fake",
         );
         engine.set_unattended(true);
@@ -6491,7 +6541,7 @@ mod tests {
             Arc::new(ApprovalQueueTools),
             "approval-queue",
             "/workspace",
-            PermissionMode::Auto,
+            PermissionMode::Interactive,
             "fake",
         );
         let pending = engine.execute_tools(1, &calls).await;
@@ -6509,6 +6559,48 @@ mod tests {
             .expect("mixed batch plan persisted");
         assert_eq!(plan.title, "Fix the harness");
         assert_eq!(plan.steps.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn unattended_policy_denial_does_not_emit_shell_completion() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let call = ToolCall {
+            id: "denied-shell".into(),
+            name: "run_shell".into(),
+            arguments: json!({"command": "echo should-not-run"}),
+        };
+        store
+            .append_tool_call(&opcos_store::ToolCallRecord {
+                session_id: "unattended-denial".into(),
+                message_sequence: 1,
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+                result: None,
+            })
+            .unwrap();
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "unattended-denial",
+            "/workspace",
+            PermissionMode::Interactive,
+            "fake",
+        );
+        engine.set_unattended(true);
+        engine.execute_tools(1, &[call]).await.unwrap();
+        let events = store.load_session_events("unattended-denial").unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event["type"] == "tool_call_denied")
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.event["type"] == "shell_process_completed")
+        );
     }
 
     #[tokio::test]

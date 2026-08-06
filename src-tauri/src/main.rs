@@ -12972,7 +12972,7 @@ async fn resolve_inbox(
         return Ok(());
     }
     let engine = engine_for(&app, &state, &session_id, ToolOrigin::User).await?;
-    let result = if item.kind == "approval" {
+    let result = if matches!(item.kind.as_str(), "approval" | "plan") {
         engine
             .resolve_approval(
                 &call_id,

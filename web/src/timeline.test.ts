@@ -337,7 +337,7 @@ describe("single event-log timeline", () => {
       "Created notes.md +4",
       "Edited lib.rs +2 −1",
       "Created 4 Tasks",
-      "1/4#1 Implement the change",
+      "1/4 #1 Implement the change",
       "Earlier context compacted",
     ]);
   });
@@ -469,8 +469,8 @@ describe("single event-log timeline", () => {
       .filter((node) => node.kind === "work")
       .flatMap((node) => node.rows.map((row) => row.label));
     expect(rows.filter((label) => label === "Created 5 Tasks")).toHaveLength(1);
-    expect(rows).toContain("1/5#1 Create files");
-    expect(rows).toContain("2/5#2 Run tests");
+    expect(rows).toContain("1/5 #1 Create files");
+    expect(rows).toContain("2/5 #2 Run tests");
   });
   it("renders control-action notices and skips empty notices", () => {
     const nodes = buildTimeline([

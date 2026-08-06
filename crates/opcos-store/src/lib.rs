@@ -6085,10 +6085,35 @@ impl SessionStore for SqliteStore {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let plan = load_plan_with_connection(&connection, session_id)?
             .ok_or_else(|| StoreError::Validation("no active plan".into()))?;
+        let resolved_step_id = plan
+            .steps
+            .iter()
+            .find(|step| step.step_id == step_id)
+            .or_else(|| {
+                step_id
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|ordinal| ordinal.checked_sub(1))
+                    .and_then(|position| plan.steps.get(position))
+            })
+            .map(|step| step.step_id.clone())
+            .ok_or_else(|| {
+                let valid_ids = plan
+                    .steps
+                    .iter()
+                    .map(|step| step.step_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                StoreError::Validation(format!(
+                    "plan step not found; use an ordinal from 1 to {} or one of: {}",
+                    plan.steps.len(),
+                    valid_ids
+                ))
+            })?;
         let (current_status, current_description): (String, String) = connection
             .query_row(
                 "SELECT status,description FROM plan_steps WHERE step_id=?1 AND plan_id=?2",
-                params![step_id, plan.plan_id],
+                params![resolved_step_id, plan.plan_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|_| StoreError::Validation("plan step not found".into()))?;
@@ -6118,7 +6143,7 @@ impl SessionStore for SqliteStore {
             ));
         }
         let now = Utc::now().to_rfc3339();
-        connection.execute("UPDATE plan_steps SET status=?1,description=?2,failure_reason=?3,abandoned_reason=?4,updated_at=?5 WHERE step_id=?6 AND plan_id=?7", params![next_status, description.unwrap_or(&current_description), (next_status == "failed").then(|| reason.unwrap_or("")), (next_status == "abandoned").then(|| reason.unwrap_or("")), now, step_id, plan.plan_id])?;
+        connection.execute("UPDATE plan_steps SET status=?1,description=?2,failure_reason=?3,abandoned_reason=?4,updated_at=?5 WHERE step_id=?6 AND plan_id=?7", params![next_status, description.unwrap_or(&current_description), (next_status == "failed").then(|| reason.unwrap_or("")), (next_status == "abandoned").then(|| reason.unwrap_or("")), now, resolved_step_id, plan.plan_id])?;
         let revision = plan.revision + 1;
         connection.execute(
             "UPDATE plans SET revision=?1,updated_at=?2 WHERE plan_id=?3",
@@ -6126,7 +6151,7 @@ impl SessionStore for SqliteStore {
         )?;
         let updated = load_plan_with_connection(&connection, session_id)?
             .ok_or_else(|| StoreError::Validation("updated plan could not be loaded".into()))?;
-        connection.execute("INSERT INTO plan_revisions (revision_id,plan_id,revision,change_type,summary,snapshot,created_at) VALUES (?1,?2,?3,'step_update',?4,?5,?6)", params![format!("revision-{}", uuid::Uuid::new_v4()), updated.plan_id, revision as i64, format!("updated step {step_id} to {next_status}"), serde_json::to_string(&updated)?, now])?;
+        connection.execute("INSERT INTO plan_revisions (revision_id,plan_id,revision,change_type,summary,snapshot,created_at) VALUES (?1,?2,?3,'step_update',?4,?5,?6)", params![format!("revision-{}", uuid::Uuid::new_v4()), updated.plan_id, revision as i64, format!("updated step {resolved_step_id} to {next_status}"), serde_json::to_string(&updated)?, now])?;
         Ok(updated)
     }
 
@@ -7725,6 +7750,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(plan.steps[0].status, "not_started");
+        let ordinal = store
+            .update_plan_step("session-plan", "1", Some("in_progress"), None, None)
+            .unwrap();
+        assert_eq!(ordinal.steps[0].status, "in_progress");
         let failed = store
             .update_plan_step(
                 "session-plan",
@@ -7764,8 +7793,8 @@ mod tests {
         let revised = store
             .revise_plan("session-plan", "Added follow-up", &["Document".into()])
             .unwrap();
-        assert_eq!(revised.revision, 4);
-        assert_eq!(store.load_plan_revisions(&plan.plan_id).unwrap().len(), 4);
+        assert_eq!(revised.revision, 5);
+        assert_eq!(store.load_plan_revisions(&plan.plan_id).unwrap().len(), 5);
         drop(store);
         let restored = SqliteStore::open(&path).unwrap();
         assert_eq!(
@@ -7774,7 +7803,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .revision,
-            4
+            5
         );
         drop(restored);
         let _ = std::fs::remove_file(path);

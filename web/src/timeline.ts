@@ -120,6 +120,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
     | { row: Extract<TimelineNode, { kind: "work" }>["rows"][number] }
     | undefined;
   const planSteps = new Map<string, Array<Record<string, unknown>>>();
+  const latestPlans = new Map<string, Array<Record<string, unknown>>>();
   const approvalNodes = new Map<
     string,
     Extract<TimelineNode, { kind: "approval" }>
@@ -163,6 +164,26 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
     if (!workStarted) workStarted = startedAt;
     workEnded = startedAt;
     return work;
+  };
+  const appendPlanProgress = (
+    activeWork: Extract<TimelineNode, { kind: "work" }>,
+  ) => {
+    const plan = Array.from(latestPlans.values()).at(-1);
+    if (!plan?.length) return;
+    const completed = plan.filter((step) =>
+      ["done", "completed"].includes(String(step.status)),
+    ).length;
+    const inProgress = plan.findIndex(
+      (step) => String(step.status) === "in_progress",
+    );
+    const currentIndex = inProgress >= 0 ? inProgress : plan.length - 1;
+    const current = plan[currentIndex];
+    if (!current) return;
+    activeWork.rows.push({
+      label: `${completed}/${plan.length} #${currentIndex + 1} ${String(current.content ?? current.title ?? "")}`,
+      activityLabel: true,
+      isMajorAction: true,
+    });
   };
   const flush = (endedAt = workEnded) => {
     if (!work) return;
@@ -337,6 +358,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
           pendingThought.row.thoughtForCallId = callId;
           pendingThought = undefined;
         }
+        appendPlanProgress(activeWork);
         activeWork.rows.push(row);
         if (callId) {
           shellRows.set(callId, row);
@@ -419,6 +441,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
             String(item.file_path ?? "")
               .split(/[\\/]/)
               .pop() ?? "";
+          appendPlanProgress(activeWork);
           activeWork.rows.push({
             callId:
               typeof data.call_id === "string" ? data.call_id : undefined,
@@ -487,11 +510,12 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
             )
               return;
             activeWork.rows.push({
-              label: `${completed}/${todos.length}#${index + 1} ${String(item.content ?? item.title ?? "")}`,
+              label: `${completed}/${todos.length} #${index + 1} ${String(item.content ?? item.title ?? "")}`,
             });
           });
         }
         planSteps.set(planId, todos);
+        latestPlans.set(planId, todos);
       } else if (
         type === "read_file_started" ||
         type === "list_dir_started"
@@ -502,6 +526,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
         type === "list_dir_completed"
       ) {
         const target = String(data.path ?? data.target ?? data.file_path ?? "");
+        appendPlanProgress(activeWork);
         activeWork.rows.push({
           label: target
             ? `${type.startsWith("read_file") ? "Read" : "Listed"} ${target}`
@@ -535,6 +560,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
               typeof data.call_id === "string" ? data.call_id : undefined;
             pendingThought = undefined;
           }
+          appendPlanProgress(activeWork);
           activeWork.rows.push(row);
         }
       }

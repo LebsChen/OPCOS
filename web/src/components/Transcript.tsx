@@ -298,7 +298,7 @@ export function Transcript({
         );
         const renderRow = (row: (typeof node.rows)[number], rowIndex: number) => (
           <div
-            className={`transcript-item${row.exitCode !== undefined && row.exitCode !== 0 ? " text-danger" : ""}`}
+            className={`transcript-item${row.denied ? " text-muted" : row.exitCode !== undefined && row.exitCode !== 0 ? " text-danger" : ""}`}
             key={rowIndex}
           >
             <span>{row.label}</span>
@@ -313,7 +313,7 @@ export function Transcript({
               </span>
             )}
             {row.denied && (
-              <span className="ml-2 text-xs text-danger">
+              <span className="ml-2 text-xs text-muted">
                 not run{row.detail ? ` · ${row.detail}` : ""}
               </span>
             )}
