@@ -10994,7 +10994,6 @@ fn create_session(
         "session-{}",
         Utc::now().timestamp_nanos_opt().unwrap_or_default()
     );
-    let model = model.unwrap_or_else(|| "auto".into());
     let mode = mode.unwrap_or_else(|| "Auto".into());
     let mode = permission_mode_name(parse_permission_mode(&mode)?).to_owned();
     let harness = harness.unwrap_or_else(|| "builtin".into());
@@ -11021,6 +11020,30 @@ fn create_session(
         } else {
             (host_id.unwrap_or_default(), None)
         };
+    let provider = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        provider
+            .or_else(|| agent.as_ref().and_then(|item| item.provider.clone()))
+            .or_else(|| {
+                connection
+                    .query_row(
+                        "SELECT value FROM settings WHERE key='provider.id'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok()
+            })
+    };
+    let model = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        resolve_provider_model(&connection, provider.as_deref(), model)
+    };
     let settings = {
         let connection = state
             .database
@@ -17233,6 +17256,16 @@ async fn linear_create_session_from_issue(
     let host_name = host_name(&connection, &host_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "remote host not found; session was not created".to_owned())?;
+    let provider = provider.or_else(|| {
+        connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='provider.id'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+    });
+    let model = resolve_provider_model(&connection, provider.as_deref(), model);
     drop(connection);
     let mode = mode.unwrap_or_else(|| "Auto".into());
     let mode = permission_mode_name(parse_permission_mode(&mode)?).to_owned();
@@ -17242,7 +17275,7 @@ async fn linear_create_session_from_issue(
         SessionRecord {
             session_id: session_id.clone(),
             workspace,
-            model: model.unwrap_or_else(|| "auto".into()),
+            model,
             mode,
             harness: harness.unwrap_or_else(|| "builtin".into()),
             title: title.unwrap_or_else(|| {
@@ -21795,6 +21828,7 @@ fn save_provider_settings(
     state: State<'_, DesktopState>,
     provider: String,
     base_url: Option<String>,
+    model: Option<String>,
 ) -> Result<(), String> {
     let descriptor = registry::descriptors()
         .into_iter()
@@ -21830,6 +21864,7 @@ fn save_provider_settings(
             [&scoped_key, &base_url],
         )
         .map_err(|error| error.to_string())?;
+    save_provider_model_settings(&connection, &provider, model.as_deref())?;
     Ok(())
 }
 
@@ -21837,15 +21872,23 @@ fn save_provider_settings(
 async fn validate_provider_key(
     state: State<'_, DesktopState>,
     provider: String,
+    candidate_key: Option<String>,
 ) -> Result<bool, String> {
     let descriptor = registry::descriptors()
         .into_iter()
         .find(|item| item.name == provider)
         .ok_or_else(|| "unknown provider".to_owned())?;
-    let key = state
-        .secrets
-        .get(&secret_key("provider-key", &provider))
-        .map_err(|error| error.to_string())?;
+    let key = if candidate_key
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        candidate_key
+    } else {
+        state
+            .secrets
+            .get(&secret_key("provider-key", &provider))
+            .map_err(|error| error.to_string())?
+    };
     if descriptor.needs_key && key.is_none() {
         return Err("provider key is not configured".to_owned());
     }
