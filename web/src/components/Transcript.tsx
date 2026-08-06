@@ -463,7 +463,7 @@ export function Transcript({
             className={`transcript-item transcript-row${row.denied ? " text-muted" : row.exitCode !== undefined && row.exitCode !== 0 ? " text-danger" : ""}`}
             key={rowIndex}
           >
-            {!(row.detail && !row.thoughtForCallId) && (
+            {!row.detail && (
               <span className="transcript-row-label">{row.label}</span>
             )}
             {row.shellId && (
