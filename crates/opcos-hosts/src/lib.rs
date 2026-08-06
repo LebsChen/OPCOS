@@ -5229,6 +5229,7 @@ mod tests {
         let mut stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let mut stdout = std::io::BufReader::new(stdout);
+        let line_ending = if cfg!(windows) { "\r\n" } else { "\n" };
 
         let mut run = |index: usize, user_command: &str, env: Option<Value>| {
             let output_path = root.join(format!("output-{index}"));
@@ -5272,7 +5273,7 @@ mod tests {
 
         let (output, exit_code, _) = run(0, "Write-Output plain", None);
         assert_eq!(exit_code, 0);
-        assert_eq!(output, "plain\n");
+        assert_eq!(output, format!("plain{line_ending}"));
 
         let (_, exit_code, _) = run(
             1,
@@ -5282,13 +5283,13 @@ mod tests {
         assert_ne!(exit_code, 0);
         let (output, exit_code, _) = run(2, "Write-Output after-bashism", None);
         assert_eq!(exit_code, 0);
-        assert_eq!(output, "after-bashism\n");
+        assert_eq!(output, format!("after-bashism{line_ending}"));
 
         let (_, exit_code, _) = run(3, "if (", None);
         assert_ne!(exit_code, 0);
         let (output, exit_code, _) = run(4, "Write-Output after-parse-error", None);
         assert_eq!(exit_code, 0);
-        assert_eq!(output, "after-parse-error\n");
+        assert_eq!(output, format!("after-parse-error{line_ending}"));
 
         let (output, exit_code, _) = run(
             5,
@@ -5296,7 +5297,7 @@ mod tests {
             Some(serde_json::json!({"OPCOS_SCOPED_TEST": "only-this-command"})),
         );
         assert_eq!(exit_code, 0);
-        assert_eq!(output, "only-this-command\n");
+        assert_eq!(output, format!("only-this-command{line_ending}"));
         let (output, exit_code, _) = run(6, "Write-Output $env:OPCOS_SCOPED_TEST", None);
         assert_eq!(exit_code, 0);
         assert!(!output.contains("only-this-command"));
@@ -5310,15 +5311,15 @@ mod tests {
         assert_eq!(exit_code, 3);
         let (output, exit_code, _) = run(8, "Write-Output exit-code-reset", None);
         assert_eq!(exit_code, 0);
-        assert_eq!(output, "exit-code-reset\n");
+        assert_eq!(output, format!("exit-code-reset{line_ending}"));
 
         let (output, exit_code, _) = run(9, "Write-Output '中文 ünïcødé'", None);
         assert_eq!(exit_code, 0);
-        assert_eq!(output, "中文 ünïcødé\n");
+        assert_eq!(output, format!("中文 ünïcødé{line_ending}"));
 
         let (output, exit_code, _) = run(10, "Write-Output line1\nWrite-Output line2", None);
         assert_eq!(exit_code, 0);
-        assert_eq!(output, "line1\nline2\n");
+        assert_eq!(output, format!("line1{line_ending}line2{line_ending}"));
 
         let location = powershell_single_quote(&subdir.display().to_string());
         let (output, exit_code, _) = run(
@@ -5327,7 +5328,7 @@ mod tests {
             None,
         );
         assert_eq!(exit_code, 0);
-        assert_eq!(output, "moved\n");
+        assert_eq!(output, format!("moved{line_ending}"));
         let (output, exit_code, cwd) = run(12, "Write-Output ((Get-Location).Path)", None);
         assert_eq!(exit_code, 0);
         assert_eq!(output.trim(), subdir.display().to_string());
