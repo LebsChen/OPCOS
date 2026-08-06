@@ -160,6 +160,10 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
   };
   const flush = (endedAt = workEnded) => {
     if (!work) return;
+    if (pendingThought) {
+      pendingThought.row.thoughtForCallId = undefined;
+      pendingThought = undefined;
+    }
     if (work.rows.length === 0) {
       work = null;
       return;

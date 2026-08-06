@@ -167,6 +167,53 @@ describe("single event-log timeline", () => {
       }),
     );
   });
+  it("keeps thoughts visible when the next action starts a later work group", () => {
+    const nodes = buildTimeline([
+      {
+        type: "devin_thoughts",
+        event_id: "thought-before-message",
+        created_at_ms: 1000,
+        working_event: {
+          event_type: "devin_thoughts",
+          payload: {
+            message: "I should inspect the repository first.",
+            thinking_duration_ms: 3000,
+          },
+        },
+      },
+      {
+        type: "devin_message",
+        event_id: "message-between-groups",
+        created_at_ms: 1100,
+        working_event: {
+          event_type: "devin_message",
+          payload: { message: "I will inspect the repository." },
+        },
+      },
+      {
+        type: "shell_process_started",
+        event_id: "action-later",
+        created_at_ms: 1200,
+        working_event: {
+          event_type: "shell_process_started",
+          payload: { call_id: "later-call", command: "ls" },
+        },
+      },
+    ] as TimelineEvent[]);
+    const thoughtRows = nodes
+      .filter((node) => node.kind === "work")
+      .flatMap((node) =>
+        node.rows.filter((row) => row.label.startsWith("Thought for ")),
+      );
+    expect(thoughtRows).toHaveLength(1);
+    expect(thoughtRows[0].thoughtForCallId).toBeUndefined();
+    expect(
+      nodes
+        .filter((node) => node.kind === "work")
+        .flatMap((node) => node.rows)
+        .filter((row) => row.label.startsWith("Thought for ")),
+    ).toHaveLength(1);
+  });
   it("deduplicates replayed chunks across arbitrary reconnect boundaries", () => {
     let events: TimelineEvent[] = [];
     for (let i = 0; i < live.length; i += 3) {

@@ -1329,9 +1329,11 @@ where
                 .map_err(|error| EngineError::Store(error.to_string()))?;
             let category = tool_event_category(&call.name);
             if call.name == "run_shell" {
+                let result_payload = tool_result_payload(&result);
                 let output = result
                     .get("output")
-                    .or_else(|| result.get("stdout"))
+                    .or_else(|| result_payload.get("output"))
+                    .or_else(|| result_payload.get("stdout"))
                     .map(Value::to_string)
                     .unwrap_or_else(|| result.to_string());
                 let _ = self
@@ -1341,12 +1343,14 @@ where
                         json!({
                             "shell_id": shell_id_for_session(&self.session_id),
                             "process_id": call.id,
-                            "exit_code": result.get("exit_code").and_then(Value::as_i64).unwrap_or_else(|| if result.get("error").is_some() { 1 } else { 0 }),
+                            "exit_code": result_payload.get("exit_code").and_then(Value::as_i64).unwrap_or_else(|| if result_payload.get("error").is_some() { 1 } else { 0 }),
+                            "duration_ms": result.get("duration_ms").and_then(Value::as_u64).or_else(|| result_payload.get("duration_ms").and_then(Value::as_u64)),
                             "output_trunc": output.chars().take(4000).collect::<String>(),
                         }),
                     )
                     .await;
             } else {
+                let result_payload = tool_result_payload(&result);
                 let _ = self
                     .working_event(
                         &format!("{}_completed", call.name),
@@ -1355,7 +1359,7 @@ where
                             "call_id":call.id,
                             "tool":call.name,
                             "path": call.arguments.get("path").or_else(|| call.arguments.get("target")),
-                            "ok":result.get("error").is_none(),
+                            "ok":result_payload.get("error").is_none(),
                             "result_type":if result.is_object() {"object"} else if result.is_array() {"array"} else {"value"},
                             "result_bytes":result.to_string().len(),
                         }),
@@ -2535,6 +2539,7 @@ where
                 .map_err(|error| EngineError::Store(error.to_string()))?;
             let category = tool_event_category(&call.name);
             if call.name != "run_shell" {
+                let result_payload = tool_result_payload(&result);
                 let _ = self
                     .working_event(
                         &format!("{}_completed", call.name),
@@ -2542,16 +2547,18 @@ where
                         json!({
                             "call_id":call.id,
                             "tool":call.name,
-                            "ok":result.get("error").is_none(),
+                            "ok":result_payload.get("error").is_none(),
                             "result_type":if result.is_object() {"object"} else if result.is_array() {"array"} else {"value"},
                             "result_bytes":result.to_string().len(),
                         }),
                     )
                     .await;
             } else {
+                let result_payload = tool_result_payload(&result);
                 let output = result
                     .get("output")
-                    .or_else(|| result.get("stdout"))
+                    .or_else(|| result_payload.get("output"))
+                    .or_else(|| result_payload.get("stdout"))
                     .map(Value::to_string)
                     .unwrap_or_else(|| result.to_string());
                 let _ = self
@@ -2561,7 +2568,8 @@ where
                         json!({
                             "shell_id": shell_id_for_session(&self.session_id),
                             "process_id": call.id,
-                            "exit_code": result.get("exit_code").and_then(Value::as_i64).unwrap_or_else(|| if result.get("error").is_some() { 1 } else { 0 }),
+                            "exit_code": result_payload.get("exit_code").and_then(Value::as_i64).unwrap_or_else(|| if result_payload.get("error").is_some() { 1 } else { 0 }),
+                            "duration_ms": result.get("duration_ms").and_then(Value::as_u64).or_else(|| result_payload.get("duration_ms").and_then(Value::as_u64)),
                             "output_trunc": output.chars().take(4000).collect::<String>(),
                         }),
                     )
@@ -3276,16 +3284,21 @@ fn is_major_tool(name: &str, category: &str) -> bool {
 }
 
 fn shell_id_for_session(session_id: &str) -> String {
-    let short = session_id
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .take(8)
-        .collect::<String>();
-    if short.is_empty() {
+    if session_id.is_empty() {
         "shell-local".into()
     } else {
-        format!("shell-{short}")
+        let hash = session_id.bytes().fold(0x811c9dc5u32, |hash, byte| {
+            (hash ^ u32::from(byte)).wrapping_mul(0x01000193)
+        });
+        format!("shell-{hash:08x}")
     }
+}
+
+fn tool_result_payload(result: &Value) -> &Value {
+    result
+        .get("result")
+        .filter(|value| value.is_object())
+        .unwrap_or(result)
 }
 
 fn thought_summary(message: &str) -> String {
@@ -6127,6 +6140,79 @@ mod tests {
                 .into_iter()
                 .any(|event| event.event["type"] == "devin_thoughts")
         );
+    }
+
+    #[test]
+    fn shell_ids_distinguish_session_ids() {
+        assert_ne!(
+            shell_id_for_session("session-1000000000001"),
+            shell_id_for_session("session-2000000000002")
+        );
+        assert_eq!(shell_id_for_session(""), "shell-local");
+    }
+
+    #[test]
+    fn tool_result_payload_unwraps_desktop_executor_envelope() {
+        let result = json!({
+            "status": "ok",
+            "duration_ms": 17,
+            "result": {"exit_code": 3, "stdout": "failed"}
+        });
+        let payload = tool_result_payload(&result);
+        assert_eq!(payload["exit_code"], 3);
+        assert_eq!(payload["stdout"], "failed");
+    }
+
+    #[tokio::test]
+    async fn shell_completion_events_read_desktop_executor_envelopes() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "shell-envelope-session",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let call = ToolCall {
+            id: "shell-envelope-call".into(),
+            name: "run_shell".into(),
+            arguments: json!({"command": "sh -c 'exit 3'"}),
+        };
+        store
+            .append_tool_call(&opcos_store::ToolCallRecord {
+                session_id: "shell-envelope-session".into(),
+                message_sequence: 1,
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+                result: None,
+            })
+            .unwrap();
+        engine
+            .persist_tool_results(
+                1,
+                &[call],
+                vec![(
+                    "shell-envelope-call".into(),
+                    json!({
+                        "status": "failed",
+                        "duration_ms": 17,
+                        "result": {"exit_code": 3, "stdout": ""}
+                    }),
+                )],
+            )
+            .await
+            .unwrap();
+        let event = store
+            .load_session_events("shell-envelope-session")
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event["type"] == "shell_process_completed")
+            .expect("shell completion event");
+        assert_eq!(event.event["working_event"]["payload"]["exit_code"], 3);
+        assert_eq!(event.event["working_event"]["payload"]["duration_ms"], 17);
     }
 
     #[tokio::test]
