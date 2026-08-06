@@ -103,15 +103,24 @@
 
 ## 6. Working 过程事件流对齐（当前实现）
 
-### 6.1 PR #91 / 七轮真实验证后的状态
+### 6.1 PR #95 / 真实 GUI + RVM 验证后的状态
 
 以下行为已在真实 Tauri GUI、Local host、真实 gateway `glm-5.2` 上完成验证，
-覆盖七轮 benchmark，并核对 live、重新读取和冷启动结果：
+并核对 live、重新读取和冷启动结果。PR #95 的完整证据在
+`/home/ubuntu/opcos-test/test-report-pr95.md`，对应事件流为
+`/home/ubuntu/opcos-test/opcos-event-stream-pr95-tasklog.jsonl`（714 events）和
+`/home/ubuntu/opcos-test/opcos-event-stream-pr95-rvm.jsonl`（94 events）；Devin 的
+渲染基线是 `/home/ubuntu/opcos-test/devin-tasklog-session.html`。
 
 | 差距 | 当前状态 | 核实结果 |
 |---|---|---|
 | working events 到达 timeline | **已关闭** | canonical envelope 含 `type`、`event_id`、`created_at_ms`；631 个事件 envelope 完整。 |
 | Devin-style 工作行 | **已关闭** | shell、Created、Edited（精确行数）、thoughts 和 `Worked for Xm Ys` 均可见。 |
+| work-group one-line labels | **已关闭** | `one_line_thoughts.short/summary` 已持久化为独立 activity rows；真实任务的 36 个标签全部在 live/cold timeline 中可见。 |
+| major/minor collapse | **已关闭** | `is_major_action` 驱动连续 minor rows 的原位可展开折叠；真实任务中 chronology 无违规。 |
+| thought → action association | **已关闭** | 同组 thought 绑定到后续 action；跨 `devin_message` group 时保留 standalone thought，避免丢失。 |
+| shell row result metadata | **已关闭** | shell row 展示 stable `shell_id`、真实 exit code 和 measured duration；非零退出有危险样式。 |
+| bounded transcript panes | **已关闭** | work group 和 terminal output 都有内部滚动，大输出不会拉长 transcript。 |
 | task rows | **已关闭** | 每个 plan 只显示一次 `Created N Tasks`，后续显示 `k/n#i <task>`；读取真实 `PlanRecord.steps`。 |
 | compaction 行 | **已关闭** | `Earlier context compacted` 出现在 work group 内。 |
 | 空 assistant / 空 work group | **已关闭** | 空 artifact 已移除；有行但耗时为 0 的合法 work group 仍保留。 |
@@ -127,7 +136,7 @@
 | attachments / artifacts timeline | **部分关闭**：截图和文件改动 diff 已作为 per-session artifacts 持久化并可在 timeline / artifact rail 按需展开；录屏、citation snippets 仍开放。截图 artifact 当前不会作为视觉输入发送给模型。 |
 | terminal replay / `terminal_update` panel | **部分关闭**：`terminal_update` 已按 `call_id` 聚合到 timeline 的 shell 行下，并可展开查看；Shell rail 同样读取 canonical `session_events`。仍不提供 PTY 语义、ANSI 光标/控制序列或终端状态重放。 |
 | iteration stats surfacing | **部分关闭**：canonical `iteration_stats` / `iteration_checkpoint` 仍被 timeline 忽略，但 Info pane 从持久化事件计算会话汇总和可折叠的逐轮 timing/tool 明细；更丰富的 Devin context/source/tool aggregates 仍开放。 |
-| right rail Shell / Desktop / Web IDE panes | **未核实**：七轮没有 RVM token，因此没有真实远端 pane 验证。 |
+| right rail Shell / Desktop / Web IDE panes | **部分关闭**：真实 Linux RVM 的 Shell/PTY 已验证；Desktop/VNC 与 Editor/Web IDE 仍是 `PlannedPane` 占位。 |
 
 ### 已实现并已通过本地验证
 
@@ -220,13 +229,16 @@ search、mcp、todo、lifecycle、reasoning、iteration 和 context 事件。下
   分别覆盖并断言 started/completed 成对；尚未用真实模型分别触发每个类别。
 - 远程 RVM worklog 仍使用远端原生事件；本次改动只补齐本地 builtin engine，
   没有改变 RVM host。
-- Devin 的 `one_line_thoughts` 尚未单独生成；当前仅提供聚合的
-  `devin_thoughts`。
+- Devin 的 `one_line_thoughts` 已由现有 provider reasoning 派生并持久化；不额外
+  发起 provider round-trip。`simple_activity_update` 仍是控制事件，不是 Devin
+  式 status pill。
 - Devin 的 `computer_use`、subagent、test-mode、recording、sidekick、
   suspend/resume 控制面事件没有对应 OPCOS 子系统；除本地恢复生命周期
   `resuming_session` 外暂不伪造。
 - PR 事件（`pr_created`、`pr_comment`、`pr_merge_conflict`）尚未增加专用
   集成事件；现有 git/PR 工具仍通过工具生命周期事件记录。
+- Devin 的每行 wall-clock timestamp 和 right-rail-only shell output 尚未实现；
+  这是有意延后的渲染差距，不是本轮已关闭的功能。
 
 ## 7. Devin event stream 对照（本地代码证据版）
 
@@ -250,9 +262,9 @@ working event 的共同 envelope 在 `crates/opcos-engine/src/lib.rs:3103-3138`
 | `session_snapshot` | lifecycle | `compaction_id`、`summary_chars`、`retained_messages` |
 | `resuming_session` | lifecycle | `resume_reason` |
 | `iteration_checkpoint` | lifecycle | `iteration`、`num_tool_calls`，可选 `last_processed_incoming_event_id`；在 Transcript timeline 中被显式忽略 |
-| `shell_process_started` | shell | `call_id`、`command`、`starting_dir` |
+| `shell_process_started` | shell | `call_id`、`shell_id`、`command`、`starting_dir`、`is_major_action` |
 | `terminal_update` | shell | `call_id`、`contents`、收尾时 `truncated`、`total_bytes` |
-| `shell_process_completed` | shell | `process_id`、`exit_code`、`output_trunc` |
+| `shell_process_completed` | shell | `call_id`、`shell_id`、`process_id`、`exit_code`、可选 `duration_ms`、`output_trunc` |
 | `multi_edit_result` | file | `file_updates[]`：`file_path`、`action_type`、`start_line`、`end_line`、`lines_added`、`lines_removed`、可选 `artifact_id` |
 | `computer_use` | computer_use | `call_id`、`screenshot_keys[]` |
 | `todo_update` | todo | 当前完整 plan snapshot：`id/title/summary/status/revision/steps[]` 等 plan 字段 |
@@ -307,11 +319,11 @@ notice 类型；它们共用 `message`/可选 `payload`，不是 Devin 的 shell
 | Devin type | OPCOS type / verdict | 结论 |
 |---|---|---|
 | `terminal_update` | `terminal_update` | **部分**：Devin `contents` 是 base64 原始 bytes；OPCOS 是 plain text `contents`，按 Rust `&str` 和前端 `String` 传递，不能保留 CRLF/ANSI/二进制。OPCOS 也缺少 `shell_id`/`process_id`。 |
-| `shell_process_started` | `shell_process_started` | **部分**：都有 command/starting directory，但 OPCOS 只有 `call_id`，缺稳定短 `shell_id`、`process_id`、`acu_consumption`、`is_major_action`。 |
-| `shell_process_completed` | `shell_process_completed` | **部分**：都有 exit/output 摘要，但 OPCOS 没有 `shell_id`、`timestamp` 级 process identity，也没有明确 total/output encoding 语义。 |
+| `shell_process_started` | `shell_process_started` | **部分**：都有 command/starting directory，OPCOS 现在有稳定短 `shell_id` 和 `call_id`，但仍缺 Devin 的明确 `process_id`/background lifecycle 语义与 raw-byte terminal contract。 |
+| `shell_process_completed` | `shell_process_completed` | **部分**：OPCOS 现在保留真实 exit code、duration、shell identity；仍缺 Devin 的明确 background completion 类型和 raw-byte/output encoding 语义。 |
 | `shell_process_completed_background` | 无 | **缺失**：OPCOS 的 `background_job_*` 工具生命周期不是 Devin 的 shell background completion event，Timeline 没有 background shell 行语义。 |
-| `devin_thoughts` | `devin_thoughts` | **部分**：message/timing 已有；Devin stream 中与 work group 配套的 `one_line_thoughts` 仍无。 |
-| `one_line_thoughts` | 无 | **缺失**：没有 `short` + `summary` 的工作组标题/活动标签。 |
+| `devin_thoughts` | `devin_thoughts` | **部分**：message/timing 已有；同组 thought → action 关联已实现，跨 group 时保留 standalone；`simple_activity_update` 仍不渲染为 status pill。 |
+| `one_line_thoughts` | `one_line_thoughts` | **等价（timeline 语义）**：OPCOS 从现有 reasoning 派生并持久化 `short` + `summary`，activity rows 保留全部标签；它不是额外 provider round-trip。 |
 | `simple_activity_update` | `simple_activity_update` | **部分**：`enum: deciding_action` 已发，但 Timeline 明确忽略，Transcript 没有 Devin 式状态 pill。 |
 | `context_growth_update` | `context_growth_update` | **部分**：有粗略 `current_context_bytes`/估算 tokens/窗口来源；缺 `per_source_context_bytes`、`tool_aggregates`、total output/invocation/image bytes、main-chain growth。 |
 | `iteration_stats` | `iteration_stats` | **等价（语义）**：timing 字段已覆盖 Devin 的 `total_ms`/`harness_ms`/`inference_ms`/`tool_exec_ms`/`num_tool_calls`；**偏离**：OPCOS 仍可附带 provider `input_tokens`/`output_tokens`，Devin representative payload 没有 token 字段。 |
@@ -343,9 +355,14 @@ notice 类型；它们共用 `message`/可选 `payload`，不是 Devin 的 shell
 
 | 优先级 / gap | 证据（Devin 字段 + OPCOS 代码路径） | 用户可见影响 | 努力 |
 |---|---|---|---|
-| P0 原始 terminal bytes 与 stable shell identity | Devin `terminal_update.contents` 是 base64 raw bytes；OPCOS 在 `crates/opcos-engine/src/lib.rs:2336-2352` 写字符串，`web/src/timeline.ts:284-304` 用 `String` 拼接；started 只有 `call_id`（engine:2047-2055） | CRLF、ANSI、非 UTF-8 输出在 timeline/历史中损坏；并发/后台 shell 无法可靠归属，终端 replay 与真实命令不一致 | L |
-| P0 shell lifecycle/background 语义 | Devin 有 `shell_id`+`process_id`、`starting_dir`、`shell_process_completed_background`；OPCOS 只有 `call_id`/`process_id` 且完成事件统一为 `shell_process_completed`（engine:2047-2055、2541-2549） | 用户看不到同一 shell 的连续身份，也无法区分后台进程和已完成前台命令；timeline collapse 不稳定 | M |
-| P0 one-line work-group labels 与 major/minor | Devin 高频 `one_line_thoughts.short/summary`、`simple_activity_update.enum`，major events 带 `is_major_action`/`acu_consumption`；OPCOS only time label `Worked for ...`（`web/src/timeline.ts:252-266`），simple activity 在 `:235-250` 被丢弃 | 工作组标题无法像 Devin 一样概括“Listing files / Editing file”，用户只能展开 generic rows，长 session 可读性明显下降 | M |
+| ~~P0 one-line work-group labels~~ | Devin 高频 `one_line_thoughts.short/summary`；OPCOS 在 engine reasoning path 派生并持久化，`web/src/timeline.ts` 以 activity rows 渲染；真实任务 36/36 标签可见 | 已关闭：工作组不再是无标题 generic rows | M |
+| ~~P0 major/minor collapse~~ | Devin 用 `is_major_action`；OPCOS engine 在 shell/edit/search 等 payload 标记，`web/src/components/Transcript.tsx` 按连续 minor runs 原位折叠；真实 chronology 无违规 | 已关闭：噪声折叠不再重排时间线 | M |
+| ~~P0 thought → action association~~ | Devin thought row 紧邻 action；OPCOS `web/src/timeline.ts` 同组设置 `thoughtForCallId`，跨 flush 保留 standalone，Transcript 同组嵌套渲染；PR95 回归测试覆盖 36/36 可见 | 已关闭：reasoning 不会因跨 iteration group 丢失 | M |
+| ~~P0 shell row metadata~~ | Devin shell 有 `shell_id`/`process_id`/exit/duration；OPCOS `shell_process_*` payload 与 `Transcript.tsx` row metadata 已覆盖，Desktop executor 测量 duration；真实 GUI 已验证 | 已关闭：用户可见 shell 结果完整，非零退出可区分 | M |
+| P0 原始 terminal bytes 与完整 shell lifecycle | Devin `terminal_update.contents` 是 base64 raw bytes，并有 `shell_process_completed_background`；OPCOS engine 与 `web/src/timeline.ts` 仍传 plain text，虽已有 stable `shell_id`/`process_id`，前景/后台完成仍未分型 | CRLF、ANSI、非 UTF-8 输出在 timeline/历史中损坏；后台 shell 无法按 Devin 语义区分；终端 replay 与真实命令不一致 | L |
+| P0 planning/todo surface | Devin DOM 的 plan progress 是行内 `1/4 #1 ...`、`2/4 #2 ...`；OPCOS 有 `PlanRecord`/`todo_update` 和可容纳该形状的 timeline row model，但 PR95 七段任务中 `plans`/`plan_steps` 仍为空，未产生真实 planning rows（engine plan tools；`web/src/timeline.ts` todo branch） | 七步任务没有可见计划、进度或完成边界；用户只能从 37 个 iteration/group 间接推断工作结构 | M |
+| P0 clarifying question and side-effect approval behavior | Devin 对同一 prompt 先询问任务含义；OPCOS 直接执行，早期 run 还无 `ask_user` 就把 pytest 安装进 system Python。代码已有 `ask_user` pending 和 approval paths（`src-tauri/src/main.rs:3738-3740,4680-4726`），但真实行为未在该场景触发 | 歧义任务不会停下来确认，副作用可能在用户未明确同意时发生；这是 harness 行为 gap，不是 Transcript 渲染 gap | M |
+| P0 iteration granularity / work-group coalescing | Devin 同任务是一个 `Worked for 1m 29s +273 −5` group；OPCOS PR95 是 37 iterations、35 个小 groups，因为 `devin_message` flushes each group（`web/src/timeline.ts` flush path） | transcript 高度显著增加，diff totals 被分散，用户难以读出一个 user turn 的整体进展 | M |
 | P1 context composition bar | Devin `current_context_bytes/tokens`、`per_source_context_bytes`、`tool_aggregates`；OPCOS context event 只有粗略 message JSON bytes 和窗口来源（engine:1493-1511） | context bar 不能解释增长来自 system/knowledge/tool output，provider token swings 无法用本地事实校准 | L |
 | P1 file editor snapshot pane | Devin `file_updates[]` 有 `action_type`、line range、`total_lines`、`contents_key`；OPCOS 只有 diff `artifact_id`（engine:2433-2445，`web/src/timeline.ts:306-335`） | 用户能看 diff，但不能打开“编辑后的完整文件快照”，也缺 open/edit 语义和总行数 | M |
 | P1 search activity fidelity | Devin 记录真实 regex/path 和 result filenames；OPCOS started 只保留 `argument_keys`（engine:2058-2067），Timeline 只生成通用 label | 用户无法从 timeline 回看“搜了什么、命中了哪些文件”，搜索活动不可审计 | M |
@@ -353,7 +370,16 @@ notice 类型；它们共用 `message`/可选 `payload`，不是 Devin 的 shell
 | P1 subagent inline lifecycle | Devin `subagent_started/finished` 有 task/title/profile/success/summary；OPCOS coordination 只通过 tool started/completed/status，且完成需 branch/push/PR 核验（`crates/opcos-engine/src/lib.rs:3847-4055`） | 用户看不到“谁在做什么、是否成功、摘要是什么”的连续 delegated work row | M |
 | P2 dedicated MCP and connector rows | Devin 有 `mcp_tool_call_started`/`mcp_tool_call`；OPCOS dynamic qualified MCP events 是 generic tool lifecycle，Timeline 不专门渲染 | MCP/connector 活动在长工作组中难以区分，调试成本上升 | S |
 | P2 lifecycle/control-plane vocabulary | Devin `live_chain_update`、recording、test mode、sidekick、route/ACU/init events；OPCOS 只有部分 local recovery/lifecycle events（engine:1837、2837-2846；src-tauri:9959-10009） | 高级运行状态、录制和 delegated control 不可见；对普通 coding timeline 影响较低 | L |
+| P1 remote cwd persistence | RVM Linux real host preserved exported env but `cd /tmp` did not persist into the next `run_shell`; local persistent protocol does persist cwd. Evidence: `opcos-event-stream-pr95-rvm.jsonl`, report B2 | Remote sessions behave differently from local sessions; commands run from an unexpected directory and Devin-like shell continuity is broken | M |
+| P1 remote live terminal streaming | Devin has frequent `terminal_update`; PR95 RVM stream had zero `terminal_update` events for a long-running remote loop, while local stream emitted chunks. Remote path uses host-native execution/worklog | Remote users see output only after completion and lose live progress/terminal replay | M |
+| P1 remote Desktop/VNC surface | RVM health advertised `vnc_port: 5900`; `web/src/App.tsx:9374-9389` still renders `PlannedPane`, although `SurfacePanel` exists at `web/src/App.tsx:2458-2615` | Remote desktop is advertised but unavailable from the session rail | M |
+| P1 remote Editor/Web IDE surface | RVM health advertised `ide_port: 9877`; `web/src/App.tsx:9374-9389` still renders `PlannedPane`, while `SurfacePanel`/`start_ide_proxy` exists | Remote editor is advertised but unavailable from the session rail | M |
+| P2 per-row wall-clock timestamps | Devin DOM puts a timestamp such as `5:22 PM` on every work row; OPCOS Transcript rows have no row timestamp field (`web/src/timeline.ts`, `web/src/components/Transcript.tsx`) | Users cannot correlate individual actions precisely within a long group | S |
+| P2 right-rail-only shell output | Devin shell rows show command text in Transcript and output in the right rail; OPCOS keeps bounded terminal output nested under the transcript shell row (`web/src/components/Transcript.tsx`) | Transcript remains noisier and less like Devin; output competes with action chronology | M |
+| External RVM host prerequisites | DevBox health was reachable but `/api/exec-sync` returned 401 without a token; Linux host screenshot/computer-use returned `convert: not found` (report B0/B8) | Those surfaces cannot be validated or used on that host, but the failures are external blockers, not OPCOS defects | S |
 
-推荐先做 P0：先改 terminal bytes/identity 和 major/minor grouping，再做 context/file/search/todo
-的结构化 payload。不要为缺失的 Devin Cloud 控制面事件伪造字段；只有 OPCOS 具有真实来源
+推荐下一轮先做 planning/todo surface，再做 clarifying-question/approval behavior；
+然后处理 remote cwd persistence 和 remote streaming，最后才做 VNC/IDE rail integration。
+Raw terminal bytes、per-row timestamps 和 right-rail-only shell output 仍是有意延后的工作。
+不要为缺失的 Devin Cloud 控制面事件伪造字段；只有 OPCOS 具有真实来源
 （本地 context composition、artifact snapshot、search result、coordination state）时才新增事件。

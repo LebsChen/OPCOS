@@ -29,24 +29,47 @@
 - [x] output-window alignment：model result 明示 tail 64 KiB 与 omitted bytes；
   terminal truncated event 带 total byte count，Transcript 说明 model saw the tail。
 
-### Devin event-stream gap backlog（docs-only 盘点）
+### PR #95 timeline parity 已完成
 
-- [ ] P0：terminal replay 改为 base64 raw bytes，补稳定 `shell_id` + `process_id`、
-  `starting_dir`、foreground/background completion 语义。
-- [ ] P0：生成 `one_line_thoughts.short/summary`，并让
-  `simple_activity_update`、`is_major_action` 驱动 work-group collapse/header。
-- [ ] P1：从本地 context composition 计算 `per_source_context_bytes` 和
+- [x] work-group one-line labels from persisted `one_line_thoughts`.
+- [x] major/minor collapse in chronological position.
+- [x] thought → action association with standalone fallback across flushed groups.
+- [x] shell rows with stable per-session `shell_id`, real exit code, and duration.
+- [x] bounded work-group and terminal output panes.
+
+### Devin event-stream gap backlog（按下一轮优先级）
+
+- [ ] P0：planning/todo surface。让真实 `PlanRecord`/`todo_update` 驱动 Devin
+  式行内 `1/4 #1 ...` 进度行；PR95 的七段任务中 plans/plan_steps 仍为空。
+- [ ] P0：clarifying question / side-effect approval behavior。对歧义任务先走
+  `ask_user`，对安装依赖等副作用在执行前请求 approval；这是 harness 行为而非
+  单纯 timeline 渲染。
+- [ ] P0：合并同一 user turn 的 iteration work groups，避免像 PR95 一样产生
+  37 iterations / 35 个小 groups，而 Devin 显示一个 aggregate Worked-for group。
+- [ ] P1：remote `cd` persistence。RVM Linux 上 exported env 可持久化，但 cwd
+  在下一次 `run_shell` 重置。
+- [ ] P1：remote live terminal streaming。RVM stream 当前没有
+  `terminal_update`，长命令只能在完成后看到输出。
+- [ ] P1：remote Desktop/VNC 与 Editor/Web IDE rail surfaces。RVM 已广告
+  `vnc_port`/`ide_port`，但 `App.tsx:9374-9389` 仍是 `PlannedPane`。
+- [ ] P1：本地 context composition 计算 `per_source_context_bytes` 和
   `tool_aggregates`，不使用 provider usage 代替 context bar。
 - [ ] P1：`multi_edit_result` 补 `total_lines`、open/edit 语义和完整 file snapshot
   `contents_key`；search 事件补 regex/path/result filenames。
 - [ ] P1：`todo_update` 补 summary counts 与 `subagent_id`；增加 inline
   `subagent_started` / `subagent_finished` 的真实 coordination payload。
+- [ ] P2：raw terminal bytes/base64 与 foreground/background completion 语义；
+  不在当前 PR 伪造 Devin Cloud 的 binary/control-plane 字段。
+- [ ] P2：每行 wall-clock timestamps，以及 Devin right-rail-only shell output。
 - [ ] P2：MCP/connector 专用 timeline rows，以及 recording/test-mode/sidekick/
   route/ACU 等控制面事件（仅在 OPCOS 有真实来源时实现）。
+- [ ] blocked/external：DevBox 401（缺 token）和 RVM screenshot/computer-use
+  的 `convert: not found`（主机缺 ImageMagick），不当作 OPCOS bug。
 
-### Deferred smaller findings
+### Completed smaller findings
 
-- [ ] Home 默认 `auto` model 会以 `Provider request failed` 失败，Home 不显示错误。
+- [x] Home model selector now chooses the first discovered chat-capable model instead
+  of sending `auto` to gateways that reject it.
 - [ ] `run_state=error` 的 session，Info pane 仍显示 `Ready`。
 - [ ] Home composer 的 Workspace 不会在创建之间清空，可能拼接出错误路径。
 - [ ] 没有 session-delete affordance：frontend 和 `src-tauri` 都没有
