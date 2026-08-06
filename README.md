@@ -2,8 +2,8 @@
 
 OPCOS 是一个 provider-neutral、local-first 的桌面 agent 工作台。它在本机运行
 agent loop、会话状态、审批和 SQLite 持久化；通过统一 Host trait 在 LocalHost
-或 RVM Host 上执行工作。OPCOS 不是任何单一 agent 云的客户端，也不运行
-OPCOS 服务。
+或 RVM Host 上执行工作。OPCOS 不是任何单一 agent 云的客户端，也不代理任何
+外部 agent 服务。
 
 ## 项目总结
 
