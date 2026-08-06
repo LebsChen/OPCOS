@@ -16,8 +16,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    env,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::Duration,
 };
 use thiserror::Error;
@@ -40,6 +41,61 @@ fn configure_no_window(command: &mut Command) {
 
 #[cfg(not(windows))]
 fn configure_no_window(_command: &mut Command) {}
+
+pub fn sanitized_child_environment(
+    secret_values: &[String],
+    explicit: Option<&Value>,
+) -> HashMap<String, String> {
+    const SENSITIVE_PARTS: &[&str] = &[
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "CREDENTIAL",
+        "PRIVATE_KEY",
+        "APIKEY",
+        "API_KEY",
+        "ACCESS_KEY",
+        "_PAT",
+        "SESSION_KEY",
+    ];
+    let is_sensitive = |name: &str| {
+        let upper = name.to_ascii_uppercase();
+        upper == "PAT"
+            || upper == "GH_PAT"
+            || upper == "GITHUB_TOKEN"
+            || SENSITIVE_PARTS.iter().any(|part| upper.contains(part))
+    };
+    let mut environment = env::vars()
+        .filter(|(name, value)| {
+            !is_sensitive(name)
+                && !secret_values
+                    .iter()
+                    .any(|secret| secret.len() >= 8 && secret == value)
+        })
+        .collect::<HashMap<_, _>>();
+    if let Some(Value::Object(values)) = explicit {
+        for (key, value) in values {
+            if let Some(value) = value.as_str() {
+                environment.insert(key.clone(), value.to_owned());
+            }
+        }
+    }
+    environment
+}
+
+pub type SecretValues = Arc<RwLock<Vec<String>>>;
+
+fn sanitized_environment_from_snapshot(
+    secret_values: &SecretValues,
+    explicit: Option<&Value>,
+) -> HashMap<String, String> {
+    let values = secret_values
+        .read()
+        .map(|values| values.clone())
+        .unwrap_or_default();
+    sanitized_child_environment(&values, explicit)
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Capability {
@@ -551,6 +607,7 @@ struct BackgroundJobState {
 pub struct BackgroundJobManager {
     jobs: Arc<Mutex<HashMap<String, Arc<Mutex<BackgroundJobState>>>>>,
     root: Arc<PathBuf>,
+    secret_values: SecretValues,
 }
 
 struct DurableLaunch {
@@ -563,9 +620,27 @@ struct DurableLaunch {
 
 impl BackgroundJobManager {
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self::with_secret_values(root, Vec::new())
+    }
+
+    pub fn with_secret_values(
+        root: impl Into<PathBuf>,
+        secret_values: impl IntoIterator<Item = String>,
+    ) -> Self {
         Self {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             root: Arc::new(root.into()),
+            secret_values: Arc::new(RwLock::new(
+                secret_values.into_iter().filter(|v| v.len() >= 8).collect(),
+            )),
+        }
+    }
+
+    pub fn with_secret_snapshot(root: impl Into<PathBuf>, secret_values: SecretValues) -> Self {
+        Self {
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+            root: Arc::new(root.into()),
+            secret_values,
         }
     }
 
@@ -1011,6 +1086,10 @@ impl BackgroundJobManager {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
+        child.env_clear().envs(sanitized_environment_from_snapshot(
+            &self.secret_values,
+            request.env.as_ref(),
+        ));
         child.spawn()?;
         let status_path = job_root.join("status.json");
         let status = read_local_status(&status_path).await.ok_or_else(|| {
@@ -2298,6 +2377,7 @@ pub struct LocalHost {
     id: String,
     root: PathBuf,
     sessions: Arc<Mutex<HashMap<String, LocalShell>>>,
+    secret_values: SecretValues,
 }
 
 #[derive(Debug)]
@@ -2310,17 +2390,50 @@ struct LocalShell {
 
 impl LocalHost {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, HostError> {
+        Self::with_secret_values(root, Vec::new())
+    }
+
+    pub fn with_secret_values(
+        root: impl Into<PathBuf>,
+        secret_values: impl IntoIterator<Item = String>,
+    ) -> Result<Self, HostError> {
         let root = root.into();
         let root = std::fs::canonicalize(root)?;
         Ok(Self {
             id: "local".into(),
             root,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            secret_values: Arc::new(RwLock::new(
+                secret_values.into_iter().filter(|v| v.len() >= 8).collect(),
+            )),
+        })
+    }
+
+    pub fn with_secret_snapshot(
+        root: impl Into<PathBuf>,
+        secret_values: SecretValues,
+    ) -> Result<Self, HostError> {
+        let root = std::fs::canonicalize(root.into())?;
+        Ok(Self {
+            id: "local".into(),
+            root,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            secret_values,
         })
     }
 
     pub fn with_id(id: impl Into<String>, root: impl Into<PathBuf>) -> Result<Self, HostError> {
         let mut host = Self::new(root)?;
+        host.id = id.into();
+        Ok(host)
+    }
+
+    pub fn with_id_and_secret_values(
+        id: impl Into<String>,
+        root: impl Into<PathBuf>,
+        secret_values: impl IntoIterator<Item = String>,
+    ) -> Result<Self, HostError> {
+        let mut host = Self::with_secret_values(root, secret_values)?;
         host.id = id.into();
         Ok(host)
     }
@@ -2461,13 +2574,12 @@ impl Host for LocalHost {
         }
         let mut command = shell_command(&request.command, &cwd);
         command.kill_on_drop(true);
-        if let Some(Value::Object(env)) = request.env {
-            for (key, value) in env {
-                if let Some(value) = value.as_str() {
-                    command.env(key, value);
-                }
-            }
-        }
+        command
+            .env_clear()
+            .envs(sanitized_environment_from_snapshot(
+                &self.secret_values,
+                request.env.as_ref(),
+            ));
         let output = time::timeout(
             Duration::from_secs(request.timeout_seconds.max(1)),
             command.output(),
@@ -2500,13 +2612,12 @@ impl Host for LocalHost {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        if let Some(Value::Object(env)) = request.env {
-            for (key, value) in env {
-                if let Some(value) = value.as_str() {
-                    command.env(key, value);
-                }
-            }
-        }
+        command
+            .env_clear()
+            .envs(sanitized_environment_from_snapshot(
+                &self.secret_values,
+                request.env.as_ref(),
+            ));
         let mut child = command.spawn()?;
         let stdin = child
             .stdin
@@ -2604,13 +2715,12 @@ impl Host for LocalHost {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        if let Some(Value::Object(env)) = request.env {
-            for (key, value) in env {
-                if let Some(value) = value.as_str() {
-                    command.env(key, value);
-                }
-            }
-        }
+        command
+            .env_clear()
+            .envs(sanitized_environment_from_snapshot(
+                &self.secret_values,
+                request.env.as_ref(),
+            ));
         let mut child = command.spawn()?;
         let stdin = child
             .stdin
@@ -2764,7 +2874,7 @@ impl LocalHost {
                 std::process::id(),
                 sessions.len()
             );
-            let (child, stdin, stdout) = spawn_persistent_shell(cwd).await?;
+            let (child, stdin, stdout) = spawn_persistent_shell(cwd, &self.secret_values).await?;
             let mut shell = LocalShell {
                 _child: child,
                 stdin,
@@ -3120,7 +3230,10 @@ fn shell_single_quote(value: &str) -> String {
     value.replace('\'', "'\\''")
 }
 
-async fn spawn_persistent_shell(cwd: &Path) -> Result<(Child, ChildStdin, ChildStdout), HostError> {
+async fn spawn_persistent_shell(
+    cwd: &Path,
+    secret_values: &SecretValues,
+) -> Result<(Child, ChildStdin, ChildStdout), HostError> {
     #[cfg(windows)]
     let mut process = {
         let mut process = Command::new("powershell.exe");
@@ -3137,6 +3250,9 @@ async fn spawn_persistent_shell(cwd: &Path) -> Result<(Child, ChildStdin, ChildS
         configure_no_window(&mut process);
         process
     };
+    process
+        .env_clear()
+        .envs(sanitized_environment_from_snapshot(secret_values, None));
     let mut child = process
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -3260,6 +3376,15 @@ fn remote_capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
+    static ENV_TEST_LOCK: std::sync::OnceLock<&'static tokio::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    async fn env_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        ENV_TEST_LOCK
+            .get_or_init(|| Box::leak(Box::new(tokio::sync::Mutex::new(()))))
+            .lock()
+            .await
+    }
 
     #[test]
     fn remote_lsp_locations_become_zero_based_ranges() {
@@ -4029,6 +4154,93 @@ mod tests {
         assert!(!host.contains(&path));
         assert!(host.contains_temp(&path));
         assert!(!path.starts_with(&root.display().to_string()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sanitized_environment_preserves_path_and_removes_sensitive_values() {
+        let explicit = serde_json::json!({
+            "INJECTED_SECRET": "allowed-value"
+        });
+        let environment =
+            sanitized_child_environment(&["known-secret-value".to_owned()], Some(&explicit));
+        assert!(environment.contains_key("PATH"));
+        assert_eq!(
+            environment.get("INJECTED_SECRET").map(String::as_str),
+            Some("allowed-value")
+        );
+        assert!(
+            !environment
+                .values()
+                .any(|value| value == "known-secret-value")
+        );
+    }
+
+    #[tokio::test]
+    async fn sanitized_environment_ignores_short_secret_values() {
+        let _guard = env_test_guard().await;
+        let name = format!("OPCOS_TEST_SHORT_VALUE_{}", std::process::id());
+        unsafe {
+            std::env::set_var(&name, "short");
+        }
+        let environment = sanitized_child_environment(&["short".to_owned()], None);
+        assert_eq!(environment.get(&name).map(String::as_str), Some("short"));
+        unsafe {
+            std::env::remove_var(name);
+        }
+    }
+
+    #[tokio::test]
+    async fn local_exec_and_spawn_scrub_inherited_names_and_values() {
+        let _guard = env_test_guard().await;
+        let sensitive_name = format!("OPCOS_TEST_FAKE_CF_TOKEN_{}", std::process::id());
+        let sensitive_value = "known-secret-value-123";
+        unsafe {
+            std::env::set_var(&sensitive_name, "planted-name-secret");
+            std::env::set_var("OPCOS_TEST_VALUE_MATCH", sensitive_value);
+        }
+        let root = tempfile_dir();
+        let host = LocalHost::with_secret_values(&root, [sensitive_value.to_owned()]).unwrap();
+        let command = format!(
+            "printf '%s|%s|%s|%s' \"${{{sensitive_name}:-}}\" \"$OPCOS_TEST_VALUE_MATCH\" \"$PATH\" \"$OPCOS_INJECTED_SECRET\""
+        );
+        let request = ExecRequest {
+            command: command.clone(),
+            cwd: None,
+            timeout_seconds: 5,
+            session: None,
+            env: Some(serde_json::json!({"OPCOS_INJECTED_SECRET": "allowed-value"})),
+        };
+        let result = host.exec(request).await.unwrap();
+        assert!(!result.result.stdout.contains("planted-name-secret"));
+        assert!(!result.result.stdout.contains(sensitive_value));
+        assert!(result.result.stdout.contains("allowed-value"));
+        assert!(result.result.stdout.contains('|'));
+        let mut process = host
+            .spawn(SpawnRequest {
+                command,
+                cwd: None,
+                env: Some(serde_json::json!({"OPCOS_INJECTED_SECRET": "allowed-value"})),
+                cols: 80,
+                rows: 24,
+            })
+            .await
+            .unwrap();
+        let mut output = String::new();
+        while let Some(event) = process.next_event().await.unwrap() {
+            match event {
+                ProcessEvent::Output(text) => output.push_str(&text),
+                ProcessEvent::Exited(_) => break,
+            }
+        }
+        assert!(!output.contains("planted-name-secret"));
+        assert!(!output.contains(sensitive_value));
+        assert!(output.contains("allowed-value"));
+        assert!(output.contains('|'));
+        unsafe {
+            std::env::remove_var(&sensitive_name);
+            std::env::remove_var("OPCOS_TEST_VALUE_MATCH");
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

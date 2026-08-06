@@ -21,6 +21,7 @@ use opcos_assets::{
     KnowledgeEntry, Playbook, SkillEntry, builtin_mcp_catalog, discover as discover_assets,
     expand_command, parse_blueprint, parse_command,
 };
+use opcos_engine::SecretScrubber;
 use opcos_engine::{
     AcpHarness, AcpHarnessConfig, AgentEngine, EngineError, Harness, LifecycleHook,
     LifecycleHookConfig, OpenCodeHarness, OpenCodeHarnessConfig, PreflightDecision,
@@ -43,7 +44,7 @@ use opcos_engine::{
 use opcos_hosts::{
     BackgroundJobManager, ComputerUseAction, DEFAULT_EXEC_TIMEOUT_SECONDS, Host,
     LIFECYCLE_EXEC_TIMEOUT_SECONDS, LifecycleStage, LocalHost, ProcessEvent, RvmHost, ScreenBounds,
-    SpawnRequest, execute_lifecycle_stage,
+    SecretValues, SpawnRequest, execute_lifecycle_stage,
 };
 use opcos_lsp::LspClient;
 use opcos_mcp::{
@@ -338,6 +339,7 @@ fn git_push_policy_target(
 struct DesktopState {
     database: Arc<Mutex<Connection>>,
     secrets: KeyringSecretStore,
+    secret_values: SecretValues,
     store: Arc<SqliteStore>,
     engines: Arc<AsyncMutex<HashMap<String, Arc<GuiEngine>>>>,
     opencode_engines: AsyncMutex<HashMap<String, Arc<opcos_engine::OpenCodeHarness<SqliteStore>>>>,
@@ -2515,6 +2517,8 @@ async fn execute_edit_file_tool(host: &dyn Host, arguments: &Value) -> Result<Va
 async fn execute_background_job_tool(
     jobs: &BackgroundJobManager,
     host: &dyn Host,
+    secrets: &KeyringSecretStore,
+    project_id: Option<&str>,
     name: &str,
     arguments: Value,
 ) -> Result<Value, String> {
@@ -2524,13 +2528,22 @@ async fn execute_background_job_tool(
                 .get("command")
                 .and_then(Value::as_str)
                 .ok_or("missing string argument: command")?;
+            let mut env = serde_json::Map::new();
+            if let Some(names) = arguments.get("secret_names").and_then(Value::as_array) {
+                for name in names.iter().filter_map(Value::as_str) {
+                    let value =
+                        scoped_secret_get_from_store(secrets, project_id, "asset-secret", name)?
+                            .ok_or_else(|| format!("secret is not configured: {name}"))?;
+                    env.insert(name.to_owned(), Value::String(value));
+                }
+            }
             let request = SpawnRequest {
                 command: command.to_owned(),
                 cwd: arguments
                     .get("cwd")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
-                env: None,
+                env: Some(Value::Object(env)),
                 cols: 120,
                 rows: 40,
             };
@@ -3525,7 +3538,15 @@ impl ToolExecutor for RemoteExecutor {
                 self.workspace.clone(),
                 self.client.clone(),
             );
-            return execute_background_job_tool(&self.jobs, &host, name, arguments).await;
+            return execute_background_job_tool(
+                &self.jobs,
+                &host,
+                &self.secrets,
+                self.project_id.as_deref(),
+                name,
+                arguments,
+            )
+            .await;
         }
         if matches!(
             name,
@@ -3895,6 +3916,8 @@ impl ToolExecutor for DesktopExecutor {
                     return execute_background_job_tool(
                         &executor.jobs,
                         &executor.host,
+                        &executor.secrets,
+                        executor.project_id.as_deref(),
                         name,
                         arguments,
                     )
@@ -7993,6 +8016,7 @@ fn clear_project_configuration(state: &DesktopState, project_id: &str) -> Result
             [project_id],
         )
         .map_err(|error| error.to_string())?;
+    refresh_secret_values(state)?;
     Ok(())
 }
 
@@ -8019,6 +8043,80 @@ fn project_secret_descriptor(name: &str) -> (&str, &str) {
             )
         })
         .unwrap_or(("asset-secret", name))
+}
+
+fn current_secret_values(state: &DesktopState) -> Result<Vec<String>, String> {
+    load_secret_values(&state.database, &state.secrets)
+}
+
+fn load_secret_values(
+    database: &Arc<Mutex<Connection>>,
+    secrets: &KeyringSecretStore,
+) -> Result<Vec<String>, String> {
+    let connection = database.lock().map_err(|_| "database lock poisoned")?;
+    let mut statement = connection
+        .prepare("SELECT name,project_id FROM secret_records")
+        .map_err(|error| error.to_string())?;
+    let records = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut values = Vec::new();
+    for record in records {
+        let (name, project_id) = record.map_err(|error| error.to_string())?;
+        let (prefix, id) = project_secret_descriptor(&name);
+        let key = if project_id.is_empty() {
+            secret_key(prefix, id)
+        } else {
+            project_secret_key(&project_id, prefix, id)
+        };
+        if let Some(value) = secrets
+            .get(&key)
+            .map_err(|error| error.to_string())?
+            .filter(|value| value.len() >= 8)
+        {
+            values.push(value);
+        }
+    }
+    Ok(values)
+}
+
+fn refresh_secret_values(state: &DesktopState) -> Result<(), String> {
+    let values = current_secret_values(state)?;
+    let mut snapshot = state
+        .secret_values
+        .write()
+        .map_err(|_| "secret snapshot lock poisoned")?;
+    *snapshot = values;
+    Ok(())
+}
+
+struct KnownSecretScrubber {
+    values: SecretValues,
+}
+
+impl SecretScrubber for KnownSecretScrubber {
+    fn scrub(&self, value: &mut Value) {
+        let values = self
+            .values
+            .read()
+            .map(|values| values.clone())
+            .unwrap_or_default();
+        fn visit(value: &mut Value, secrets: &[String]) {
+            match value {
+                Value::String(text) => {
+                    for secret in secrets {
+                        *text = text.replace(secret, "[REDACTED]");
+                    }
+                }
+                Value::Array(items) => items.iter_mut().for_each(|item| visit(item, secrets)),
+                Value::Object(items) => items.values_mut().for_each(|item| visit(item, secrets)),
+                _ => {}
+            }
+        }
+        visit(value, &values);
+    }
 }
 
 #[tauri::command]
@@ -9116,7 +9214,8 @@ async fn engine_for_with_context(
     let mut remote_platform = None;
     let (workspace, executor, remote_client, allowed_tools, asset_reader) = if host_id == "local" {
         let workspace = PathBuf::from(resolved_workspace.clone());
-        let host = LocalHost::new(&workspace).map_err(|error| error.to_string())?;
+        let host = LocalHost::with_secret_snapshot(&workspace, Arc::clone(&state.secret_values))
+            .map_err(|error| error.to_string())?;
         let asset_reader = SessionAssetReader::Host(HostAssetReader {
             host: Arc::new(host.clone()),
         });
@@ -9316,7 +9415,7 @@ async fn engine_for_with_context(
         name => return Err(format!("provider {name} is not supported for sessions")),
     };
     let permission_mode = parse_permission_mode(&mode).unwrap_or(PermissionMode::Interactive);
-    let engine = Arc::new(TurnEngine::new(
+    let mut engine = TurnEngine::new(
         provider,
         Arc::clone(&state.store),
         executor,
@@ -9324,7 +9423,11 @@ async fn engine_for_with_context(
         workspace.clone(),
         permission_mode,
         model.clone(),
-    ));
+    );
+    engine.set_secret_scrubber(Arc::new(KnownSecretScrubber {
+        values: Arc::clone(&state.secret_values),
+    }));
+    let engine = Arc::new(engine);
     engine.set_linear_tools_enabled(linear_tools_enabled);
     let host_scope = if host_id == "local" {
         "local"
@@ -20627,6 +20730,7 @@ fn save_secret_metadata(
             params![name, scope, purpose, project_id.unwrap_or_default()],
         )
         .map_err(|error| error.to_string())?;
+    refresh_secret_values(&state)?;
     Ok(())
 }
 
@@ -20685,6 +20789,7 @@ fn delete_secret_metadata(
             params![name, project_id.unwrap_or_default()],
         )
         .map_err(|error| error.to_string())?;
+    refresh_secret_values(&state)?;
     Ok(())
 }
 
@@ -20709,6 +20814,7 @@ fn save_provider_key(
     if let Some(project_id) = project_id {
         record_project_secret(&state, &format!("provider-key:{provider}"), &project_id)?;
     }
+    refresh_secret_values(&state)?;
     audit(
         &state,
         "",
@@ -20739,6 +20845,7 @@ fn save_mcp_credential(
     if let Some(project_id) = project_id {
         record_project_secret(&state, &format!("mcp-credential:{server_id}"), &project_id)?;
     }
+    refresh_secret_values(&state)?;
     Ok(())
 }
 
@@ -20763,6 +20870,7 @@ fn save_connector_token(
     if let Some(project_id) = project_id {
         record_project_secret(&state, &format!("connector-token:{kind}"), &project_id)?;
     }
+    refresh_secret_values(&state)?;
     Ok(())
 }
 
@@ -21186,7 +21294,6 @@ fn main() {
             })));
             let mut jobs_path = path.clone();
             jobs_path.set_file_name("background-jobs");
-            let jobs = Arc::new(BackgroundJobManager::new(jobs_path));
             let mut trigger_token_bytes = [0_u8; 32];
             getrandom::fill(&mut trigger_token_bytes).map_err(|error| {
                 tauri::Error::from(std::io::Error::other(format!(
@@ -21210,6 +21317,16 @@ fn main() {
                 .set_nonblocking(true)
                 .map_err(tauri::Error::from)?;
             let database = Arc::new(Mutex::new(database));
+            let secret_values = Arc::new(std::sync::RwLock::new(
+                load_secret_values(&database, &secrets).map_err(|error| {
+                    let cause: Box<dyn std::error::Error> = Box::new(std::io::Error::other(error));
+                    tauri::Error::Setup(cause.into())
+                })?,
+            ));
+            let jobs = Arc::new(BackgroundJobManager::with_secret_snapshot(
+                jobs_path,
+                Arc::clone(&secret_values),
+            ));
             let engines = Arc::new(AsyncMutex::new(HashMap::new()));
             let coordination = Arc::new(AsyncMutex::new(HashMap::new()));
             let (ingress_shutdown, ingress_receiver) = tokio::sync::watch::channel(false);
@@ -21223,6 +21340,7 @@ fn main() {
             app.manage(DesktopState {
                 database: Arc::clone(&database),
                 secrets,
+                secret_values,
                 store,
                 engines: Arc::clone(&engines),
                 opencode_engines: AsyncMutex::new(HashMap::new()),

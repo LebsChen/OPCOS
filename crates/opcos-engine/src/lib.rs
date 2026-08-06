@@ -468,6 +468,17 @@ pub struct TurnEngine<P, S, E> {
     max_iterations: AtomicU64,
     active_tool_calls: StdMutex<HashSet<String>>,
     policy_denied: AtomicBool,
+    secret_scrubber: Arc<dyn SecretScrubber>,
+}
+
+pub trait SecretScrubber: Send + Sync {
+    fn scrub(&self, value: &mut Value);
+}
+
+struct NoopSecretScrubber;
+
+impl SecretScrubber for NoopSecretScrubber {
+    fn scrub(&self, _value: &mut Value) {}
 }
 
 type SteeringWaiters = Arc<std::sync::Mutex<Vec<oneshot::Sender<(String, String)>>>>;
@@ -600,7 +611,12 @@ where
             max_iterations: AtomicU64::new(256),
             active_tool_calls: StdMutex::new(HashSet::new()),
             policy_denied: AtomicBool::new(false),
+            secret_scrubber: Arc::new(NoopSecretScrubber),
         }
+    }
+
+    pub fn set_secret_scrubber(&mut self, scrubber: Arc<dyn SecretScrubber>) {
+        self.secret_scrubber = scrubber;
     }
 
     pub async fn set_system_instructions(&self, instructions: Option<String>) {
@@ -2088,11 +2104,13 @@ where
                 .iter()
                 .find(|call| call.id == call_id)
                 .ok_or_else(|| EngineError::Store(format!("tool call not found: {call_id}")))?;
+            let mut safe_result = result.clone();
+            self.secret_scrubber.scrub(&mut safe_result);
             let value = json!({"role":"tool","content":[{"type":"tool_result",
-                "tool_use_id":call.id,"content":[{"type":"text","text":result.to_string()}]}]});
+                "tool_use_id":call.id,"content":[{"type":"text","text":safe_result.to_string()}]}]});
             self.append("tool", value).await?;
             self.store
-                .complete_tool_call(&self.session_id, assistant_sequence, &call.id, &result)
+                .complete_tool_call(&self.session_id, assistant_sequence, &call.id, &safe_result)
                 .map_err(|error| EngineError::Store(error.to_string()))?;
             let category = tool_event_category(&call.name);
             if call.name != "run_shell" {
@@ -2151,7 +2169,7 @@ where
                         call_id: call.id.clone(),
                         name: call.name.clone(),
                         arguments: call.arguments.clone(),
-                        result,
+                        result: safe_result,
                     }),
                     ..StreamChunk::default()
                 },
@@ -2599,6 +2617,8 @@ where
     }
 
     async fn append(&self, role: &str, content: Value) -> Result<(), EngineError> {
+        let mut content = content;
+        self.secret_scrubber.scrub(&mut content);
         let mut sequence = self.sequence.lock().await;
         *sequence += 1;
         self.store
@@ -2606,13 +2626,16 @@ where
                 session_id: self.session_id.clone(),
                 sequence: *sequence,
                 role: role.into(),
-                content: content.clone(),
+                content,
                 display_only: false,
             })
             .map_err(|error| EngineError::Store(error.to_string()))
     }
 
     async fn notice(&self, kind: &str, content: String) -> Result<(), EngineError> {
+        let mut safe_content = Value::String(content);
+        self.secret_scrubber.scrub(&mut safe_content);
+        let content = safe_content.as_str().unwrap_or_default().to_owned();
         let mut sequence = self.sequence.lock().await;
         *sequence += 1;
         self.store
@@ -2661,17 +2684,11 @@ where
             timestamp: Utc::now().to_rfc3339(),
             payload,
         };
-        self.recorder.append_audit(
-            "working_event",
-            &serde_json::to_value(&event).map_err(|error| EngineError::Store(error.to_string()))?,
-        )?;
-        self.emit_event(
-            event_type,
-            StreamChunk {
-                working_event: Some(event),
-                ..StreamChunk::default()
-            },
-        )
+        let mut event_value =
+            serde_json::to_value(&event).map_err(|error| EngineError::Store(error.to_string()))?;
+        self.secret_scrubber.scrub(&mut event_value);
+        self.recorder.append_audit("working_event", &event_value)?;
+        self.persist_event_value(event_value)
     }
 
     fn emit_event(&self, event_type: &str, mut chunk: StreamChunk) -> Result<(), EngineError> {
@@ -2683,11 +2700,18 @@ where
         chunk.event_id = Some(format!("event-{}", uuid::Uuid::new_v4()));
         chunk.created_at_ms = Some(created_at_ms);
         chunk.timestamp = Some(Utc::now().to_rfc3339());
-        let event =
+        let mut event =
             serde_json::to_value(&chunk).map_err(|error| EngineError::Store(error.to_string()))?;
+        self.secret_scrubber.scrub(&mut event);
+        self.persist_event_value(event)
+    }
+
+    fn persist_event_value(&self, event: Value) -> Result<(), EngineError> {
         self.store
             .append_session_event(&self.session_id, &event)
             .map_err(|error| EngineError::Store(error.to_string()))?;
+        let chunk =
+            serde_json::from_value(event).map_err(|error| EngineError::Store(error.to_string()))?;
         let _ = self.events.try_send(chunk);
         Ok(())
     }
@@ -3231,8 +3255,8 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"read_file","description":"Read a remote file.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}),
         json!({"type":"function","function":{"name":"write_file","description":"Write a remote file. For changes to an existing file, prefer edit_file so unrelated content is preserved.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
         json!({"type":"function","function":{"name":"edit_file","description":"Apply one or more exact replacements to a remote UTF-8 text file. The required edits argument is an array of objects, each with old_string and new_string strings. Example: {\"path\":\"src/lib.rs\",\"edits\":[{\"old_string\":\"old code\",\"new_string\":\"new code\"}]}. Every old_string must match exactly once in the original file; ambiguous or missing matches fail with diagnostics. The whole call is atomic and preserves line endings. Prefer this over rewriting an existing file.","parameters":{"type":"object","examples":[{"path":"src/lib.rs","edits":[{"old_string":"old code","new_string":"new code"}]}],"properties":{"path":{"type":"string","description":"Remote workspace-relative file path."},"edits":{"type":"array","description":"One or more exact replacements, applied atomically.","minItems":1,"items":{"type":"object","properties":{"old_string":{"type":"string","description":"Exact existing text to replace, including whitespace and line breaks."},"new_string":{"type":"string","description":"Replacement text."}},"required":["old_string","new_string"],"additionalProperties":false}}},"required":["path","edits"],"additionalProperties":false}}}),
-        json!({"type":"function","function":{"name":"run_shell","description":"Run a remote shell command.","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}),
-        json!({"type":"function","function":{"name":"background_job_start","description":"Start a long-running shell command in the background and return a job id. Output is retained with bounded storage.","parameters":{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"},"timeout_seconds":{"type":"integer"}},"required":["command"]}}}),
+        json!({"type":"function","function":{"name":"run_shell","description":"Run a shell command. Use cwd to select the workspace directory. Credentials are available only by naming configured secret_names; injected values are redacted from output.","parameters":{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"},"secret_names":{"type":"array","items":{"type":"string"},"description":"Configured secret names to inject into the child environment. This is the only supported credential path; values are redacted from output."}},"required":["command"]}}}),
+        json!({"type":"function","function":{"name":"background_job_start","description":"Start a long-running shell command in the background and return a job id. Output is retained with bounded storage. Use secret_names for the only supported credential injection path; injected values are redacted.","parameters":{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"},"timeout_seconds":{"type":"integer"},"secret_names":{"type":"array","items":{"type":"string"},"description":"Configured secret names to inject into the child environment."}},"required":["command"]}}}),
         json!({"type":"function","function":{"name":"background_job_status","description":"Read a background job status, exit code, and output counters.","parameters":{"type":"object","properties":{"job_id":{"type":"string"}},"required":["job_id"]}}}),
         json!({"type":"function","function":{"name":"background_job_output","description":"Read bounded background job output. Defaults to the tail; use offset for historical lines. The result reports omitted lines and total counters.","parameters":{"type":"object","properties":{"job_id":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"},"tail":{"type":"boolean"}},"required":["job_id"]}}}),
         json!({"type":"function","function":{"name":"background_job_kill","description":"Stop a running background job and return its terminal status.","parameters":{"type":"object","properties":{"job_id":{"type":"string"}},"required":["job_id"]}}}),
@@ -4880,6 +4904,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn secret_scrubber_covers_events_transcript_and_tool_calls() {
+        struct Scrubber;
+        impl SecretScrubber for Scrubber {
+            fn scrub(&self, value: &mut Value) {
+                fn visit(value: &mut Value) {
+                    match value {
+                        Value::String(text) => {
+                            *text = text.replace("known-secret-value", "[REDACTED]")
+                        }
+                        Value::Array(items) => items.iter_mut().for_each(visit),
+                        Value::Object(items) => items.values_mut().for_each(visit),
+                        _ => {}
+                    }
+                }
+                visit(value);
+            }
+        }
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let mut engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine.set_secret_scrubber(Arc::new(Scrubber));
+        let call = ToolCall {
+            id: "secret-call".into(),
+            name: "run_shell".into(),
+            arguments: json!({"command": "env"}),
+        };
+        store
+            .append_tool_call(&opcos_store::ToolCallRecord {
+                session_id: "s".into(),
+                message_sequence: 1,
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+                result: None,
+            })
+            .unwrap();
+        engine
+            .persist_tool_results(
+                1,
+                &[call],
+                vec![(
+                    "secret-call".into(),
+                    json!({"stdout": "known-secret-value", "output": "known-secret-value"}),
+                )],
+            )
+            .await
+            .unwrap();
+        let events = store.load_session_events("s").unwrap();
+        let messages = store.load_messages("s").unwrap();
+        let calls = store.load_tool_calls("s").unwrap();
+        let serialized = serde_json::to_string(&(events, messages, calls)).unwrap();
+        assert!(serialized.contains("[REDACTED]"));
+        assert!(!serialized.contains("known-secret-value"));
+    }
+
+    #[tokio::test]
     async fn switching_a_running_engine_to_auto_allows_write_tools() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let engine = TurnEngine::new(
@@ -5107,6 +5194,19 @@ mod tests {
             "boolean"
         );
         assert_eq!(parameters["required"], json!(["question"]));
+    }
+
+    #[test]
+    fn shell_tool_schemas_expose_workspace_and_secret_injection() {
+        for name in ["run_shell", "background_job_start"] {
+            let definition = tool_definitions()
+                .into_iter()
+                .find(|tool| tool["function"]["name"] == name)
+                .expect("shell tool definition");
+            let properties = &definition["function"]["parameters"]["properties"];
+            assert_eq!(properties["cwd"]["type"], "string");
+            assert_eq!(properties["secret_names"]["type"], "array");
+        }
     }
 
     #[test]
