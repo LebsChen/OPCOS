@@ -9739,7 +9739,7 @@ async fn engine_for_with_context(
     .filter_map(|(name, enabled)| enabled.then_some(name))
     .collect::<Vec<_>>();
     let shell = if platform.eq_ignore_ascii_case("windows") {
-        "powershell (PowerShell syntax is required; bash constructs such as &&, POSIX-tool | pipelines, and ${{PIPESTATUS[...]}} are unavailable)"
+        "powershell (PowerShell syntax is required; bash constructs such as &&, POSIX-tool | pipelines, and ${PIPESTATUS[...]} are unavailable)"
     } else {
         "bash"
     };

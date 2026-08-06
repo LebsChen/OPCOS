@@ -3509,7 +3509,8 @@ fn windows_persistent_command(
     cwd: &Path,
     change_cwd: bool,
 ) -> Result<String, HostError> {
-    let prefix = persistent_env_prefix(env)?.unwrap_or_default();
+    let prefix = powershell_env_prefix(env)?.unwrap_or_default();
+    let (env_setup, env_restore) = powershell_env_scope(env)?;
     let directory = if change_cwd {
         format!(
             "Set-Location -LiteralPath '{}'; ",
@@ -3528,10 +3529,12 @@ fn windows_persistent_command(
          $ProgressPreference='SilentlyContinue'; \
          $global:LASTEXITCODE=0; $opcos_exit=0; \
          try {{ \
-             {directory}{prefix}$null | & {{ Invoke-Expression ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{payload}'))) }} > '{output_path}' 2>&1; \
+             {env_setup}{directory}{prefix}$null | & {{ Invoke-Expression ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{payload}'))) }} > '{output_path}' 2>&1; \
              $opcos_exit=if ($?) {{ if ($null -eq $LASTEXITCODE) {{ 0 }} else {{ $LASTEXITCODE }} }} else {{ 1 }} \
          }} catch {{ \
              $opcos_exit=1; ($_ | Out-String) | Out-File -LiteralPath '{output_path}' -Append -Encoding utf8 \
+         }} finally {{ \
+             {env_restore} \
          }}; \
          if (Test-Path -LiteralPath '{output_path}') {{ \
              $opcos_output=Get-Content -Raw -LiteralPath '{output_path}'; \
@@ -3554,7 +3557,8 @@ fn windows_persistent_streaming_command(
     cwd: &Path,
     change_cwd: bool,
 ) -> Result<String, HostError> {
-    let prefix = persistent_env_prefix(env)?.unwrap_or_default();
+    let prefix = powershell_env_prefix(env)?.unwrap_or_default();
+    let (env_setup, env_restore) = powershell_env_scope(env)?;
     let directory = if change_cwd {
         format!(
             "Set-Location -LiteralPath '{}'; ",
@@ -3577,10 +3581,12 @@ fn windows_persistent_streaming_command(
          Remove-Item -LiteralPath '{staging_path}' -Force -ErrorAction SilentlyContinue; \
          $global:LASTEXITCODE=0; $opcos_exit=0; \
          try {{ \
-             {directory}{prefix}$null | & {{ Invoke-Expression ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{payload}'))) }} > '{staging_path}' 2>&1; \
+             {env_setup}{directory}{prefix}$null | & {{ Invoke-Expression ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{payload}'))) }} > '{staging_path}' 2>&1; \
              $opcos_exit=if ($?) {{ if ($null -eq $LASTEXITCODE) {{ 0 }} else {{ $LASTEXITCODE }} }} else {{ 1 }} \
          }} catch {{ \
              $opcos_exit=1; ($_ | Out-String) | Out-File -LiteralPath '{staging_path}' -Append -Encoding utf8 \
+         }} finally {{ \
+             {env_restore} \
          }}; \
          if (Test-Path -LiteralPath '{staging_path}') {{ Copy-Item -LiteralPath '{staging_path}' -Destination '{output_path}' -Force }}; \
          Remove-Item -LiteralPath '{staging_path}' -Force -ErrorAction SilentlyContinue; \
@@ -3597,12 +3603,82 @@ fn windows_persistent_streaming_command(
 }
 
 fn shell_exit_diagnostic(interpreter: &str, output: &[u8]) -> String {
+    const MAX_CAPTURED_OUTPUT_BYTES: usize = 2 * 1024;
+    let captured = if output.len() > MAX_CAPTURED_OUTPUT_BYTES {
+        format!(
+            "[earlier output omitted; showing last {MAX_CAPTURED_OUTPUT_BYTES} bytes]\n{}",
+            String::from_utf8_lossy(&output[output.len() - MAX_CAPTURED_OUTPUT_BYTES..])
+        )
+    } else {
+        String::from_utf8_lossy(output).into_owned()
+    };
     format!(
         "local {interpreter} shell exited; session discarded and will be respawned on the next command; captured output before shell exit: {}",
-        String::from_utf8_lossy(output)
+        captured
     )
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
+fn powershell_env_scope(env: Option<&Value>) -> Result<(String, String), HostError> {
+    let Some(Value::Object(values)) = env else {
+        return Ok((String::new(), String::new()));
+    };
+    let mut setup = String::new();
+    let mut restore = String::new();
+    for (key, value) in values {
+        let Some(value) = value.as_str() else {
+            continue;
+        };
+        if !is_shell_identifier(key) {
+            return Err(HostError::InvalidResponse(
+                "process environment contains an invalid variable name".into(),
+            ));
+        }
+        let key = powershell_single_quote(key);
+        setup.push_str(&format!(
+            "$opcos_env_present['{key}']=Test-Path -LiteralPath 'Env:{key}'; \
+             if ($opcos_env_present['{key}']) {{ $opcos_env_restore['{key}']=$env:{key} }}; \
+             $env:{key}='{}'; ",
+            powershell_single_quote(value)
+        ));
+        restore.push_str(&format!(
+            "if ($opcos_env_present['{key}']) {{ \
+                 [Environment]::SetEnvironmentVariable('{key}', [string]$opcos_env_restore['{key}'], 'Process') \
+             }} else {{ \
+                 Remove-Item -LiteralPath 'Env:{key}' -Force -ErrorAction SilentlyContinue \
+             }}; ",
+        ));
+    }
+    if setup.is_empty() {
+        Ok((String::new(), String::new()))
+    } else {
+        Ok((
+            format!("$opcos_env_present=@{{}}; $opcos_env_restore=@{{}}; {setup}"),
+            restore,
+        ))
+    }
+}
+
+fn powershell_env_prefix(env: Option<&Value>) -> Result<Option<String>, HostError> {
+    let Some(Value::Object(values)) = env else {
+        return Ok(None);
+    };
+    let prefix = values
+        .iter()
+        .filter_map(|(key, value)| value.as_str().map(|value| (key, value)))
+        .map(|(key, value)| {
+            if !is_shell_identifier(key) {
+                return Err(HostError::InvalidResponse(
+                    "process environment contains an invalid variable name".into(),
+                ));
+            }
+            Ok(format!("$env:{key}='{}'; ", powershell_single_quote(value)))
+        })
+        .collect::<Result<String, _>>()?;
+    Ok((!prefix.is_empty()).then_some(prefix))
+}
+
+#[cfg_attr(windows, allow(dead_code))]
 fn persistent_env_prefix(env: Option<&Value>) -> Result<Option<String>, HostError> {
     let Some(Value::Object(values)) = env else {
         #[cfg(windows)]
@@ -3661,13 +3737,22 @@ async fn spawn_persistent_shell(
     secret_values: &SecretValues,
 ) -> Result<(Child, ChildStdin, ChildStdout, String), HostError> {
     #[cfg(windows)]
-    let (mut process, mut interpreter) = {
-        let mut process = Command::new("powershell.exe");
+    let (mut process, interpreter) = {
+        let (executable, interpreter) = if std::process::Command::new("pwsh.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", "exit 0"])
+            .status()
+            .is_ok()
+        {
+            ("pwsh.exe", "pwsh")
+        } else {
+            ("powershell.exe", "powershell")
+        };
+        let mut process = Command::new(executable);
         process
             .args(["-NoProfile", "-NonInteractive", "-Command", "-"])
             .current_dir(cwd);
         configure_no_window(&mut process);
-        (process, "powershell".to_owned())
+        (process, interpreter.to_owned())
     };
     #[cfg(not(windows))]
     let (mut process, mut interpreter) = {
@@ -5067,6 +5152,7 @@ mod tests {
         assert!(command.contains(&BASE64.encode("Write-Output '中文'")));
         assert!(command.contains("try {"));
         assert!(command.contains("catch {"));
+        assert!(command.contains("finally {"));
         assert!(command.contains("$null | & {"));
         assert!(!command.contains("setlocal"));
         assert!(!command.contains("cmd"));
@@ -5094,10 +5180,10 @@ mod tests {
             false,
         )
         .unwrap();
-        #[cfg(windows)]
         assert!(with_env.contains("$env:OPCOS_TEST='value'; "));
-        #[cfg(not(windows))]
-        assert!(with_env.contains("OPCOS_TEST='value'; export OPCOS_TEST; "));
+        assert!(with_env.contains("$opcos_env_present['OPCOS_TEST']"));
+        assert!(with_env.contains("[Environment]::SetEnvironmentVariable"));
+        assert!(with_env.contains("Remove-Item -LiteralPath 'Env:OPCOS_TEST'"));
     }
 
     #[test]
@@ -5117,6 +5203,7 @@ mod tests {
         assert!(command.contains(&BASE64.encode("Write-Output 'streamed'")));
         assert!(command.contains("try {"));
         assert!(command.contains("catch {"));
+        assert!(command.contains("finally {"));
         assert!(command.contains("Set-Location -LiteralPath 'C:\\workspace'"));
         assert!(command.contains("Copy-Item -LiteralPath 'C:\\Temp\\opcos-shell-output.working'"));
         assert!(
@@ -5137,6 +5224,16 @@ mod tests {
         let marker = command.find("Write-Output (\"__marker__:").unwrap();
         assert!(copy < staging_removal && staging_removal < readback);
         assert!(readback < output_removal && output_removal < marker);
+    }
+
+    #[test]
+    fn shell_exit_diagnostic_caps_captured_output() {
+        let output = format!("BEGIN-{}-TAIL", "x".repeat(3_000));
+        let diagnostic = shell_exit_diagnostic("pwsh", output.as_bytes());
+        assert!(diagnostic.contains("[earlier output omitted; showing last 2048 bytes]"));
+        assert!(diagnostic.ends_with("TAIL"));
+        assert!(!diagnostic.contains("BEGIN-"));
+        assert!(diagnostic.len() < 2_500);
     }
 
     #[test]
@@ -5172,12 +5269,12 @@ mod tests {
         let stdout = child.stdout.take().unwrap();
         let mut stdout = std::io::BufReader::new(stdout);
 
-        let mut run = |index: usize, user_command: &str| {
+        let mut run = |index: usize, user_command: &str, env: Option<Value>| {
             let output_path = root.join(format!("output-{index}"));
             let marker = format!("__REAL_PS_{index}__");
             let wrapper = windows_persistent_streaming_command(
                 user_command,
-                None,
+                env.as_ref(),
                 &marker,
                 &output_path,
                 &root,
@@ -5212,49 +5309,65 @@ mod tests {
             }
         };
 
-        let (output, exit_code, _) = run(0, "Write-Output plain");
+        let (output, exit_code, _) = run(0, "Write-Output plain", None);
         assert_eq!(exit_code, 0);
         assert_eq!(output, "plain\n");
 
-        let (_, exit_code, _) = run(1, "printf 'pipeline\\n' | cat; test ${PIPESTATUS[0]} -eq 0");
+        let (_, exit_code, _) = run(
+            1,
+            "printf 'pipeline\\n' | cat; test ${PIPESTATUS[0]} -eq 0",
+            None,
+        );
         assert_ne!(exit_code, 0);
-        let (output, exit_code, _) = run(2, "Write-Output after-bashism");
+        let (output, exit_code, _) = run(2, "Write-Output after-bashism", None);
         assert_eq!(exit_code, 0);
         assert_eq!(output, "after-bashism\n");
 
-        let (_, exit_code, _) = run(3, "if (");
+        let (_, exit_code, _) = run(3, "if (", None);
         assert_ne!(exit_code, 0);
-        let (output, exit_code, _) = run(4, "Write-Output after-parse-error");
+        let (output, exit_code, _) = run(4, "Write-Output after-parse-error", None);
         assert_eq!(exit_code, 0);
         assert_eq!(output, "after-parse-error\n");
+
+        let (output, exit_code, _) = run(
+            5,
+            "Write-Output $env:OPCOS_SCOPED_TEST",
+            Some(serde_json::json!({"OPCOS_SCOPED_TEST": "only-this-command"})),
+        );
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, "only-this-command\n");
+        let (output, exit_code, _) = run(6, "Write-Output $env:OPCOS_SCOPED_TEST", None);
+        assert_eq!(exit_code, 0);
+        assert!(!output.contains("only-this-command"));
 
         let native_exit = if cfg!(windows) {
             "& cmd.exe /c exit 3"
         } else {
             "& /bin/sh -c 'exit 3'"
         };
-        let (_, exit_code, _) = run(5, native_exit);
+        let (_, exit_code, _) = run(7, native_exit, None);
         assert_eq!(exit_code, 3);
-        let (output, exit_code, _) = run(6, "Write-Output exit-code-reset");
+        let (output, exit_code, _) = run(8, "Write-Output exit-code-reset", None);
         assert_eq!(exit_code, 0);
         assert_eq!(output, "exit-code-reset\n");
 
-        let (output, exit_code, _) = run(7, "Write-Output '中文 ünïcødé'");
+        let (output, exit_code, _) = run(9, "Write-Output '中文 ünïcødé'", None);
         assert_eq!(exit_code, 0);
         assert_eq!(output, "中文 ünïcødé\n");
 
-        let (output, exit_code, _) = run(8, "Write-Output line1\nWrite-Output line2");
+        let (output, exit_code, _) = run(10, "Write-Output line1\nWrite-Output line2", None);
         assert_eq!(exit_code, 0);
         assert_eq!(output, "line1\nline2\n");
 
         let location = powershell_single_quote(&subdir.display().to_string());
         let (output, exit_code, _) = run(
-            9,
+            11,
             &format!("Set-Location -LiteralPath '{location}'; Write-Output moved"),
+            None,
         );
         assert_eq!(exit_code, 0);
         assert_eq!(output, "moved\n");
-        let (output, exit_code, cwd) = run(10, "Write-Output ((Get-Location).Path)");
+        let (output, exit_code, cwd) = run(12, "Write-Output ((Get-Location).Path)", None);
         assert_eq!(exit_code, 0);
         assert_eq!(output.trim(), subdir.display().to_string());
         assert_eq!(cwd, subdir.display().to_string());
