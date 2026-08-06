@@ -42,9 +42,9 @@ use opcos_engine::{
     planner::{parse_planner_output, planner_dedup_key, planning_prompt},
 };
 use opcos_hosts::{
-    BackgroundJobManager, ComputerUseAction, DEFAULT_EXEC_TIMEOUT_SECONDS, Host,
-    LIFECYCLE_EXEC_TIMEOUT_SECONDS, LifecycleStage, LocalHost, ProcessEvent, RvmHost, ScreenBounds,
-    SecretValues, SpawnRequest, execute_lifecycle_stage,
+    BackgroundJobManager, BrowserController, BrowserRequest, ComputerUseAction,
+    DEFAULT_EXEC_TIMEOUT_SECONDS, Host, LIFECYCLE_EXEC_TIMEOUT_SECONDS, LifecycleStage, LocalHost,
+    ProcessEvent, RvmHost, ScreenBounds, SecretValues, SpawnRequest, execute_lifecycle_stage,
 };
 use opcos_lsp::LspClient;
 use opcos_mcp::{
@@ -77,6 +77,8 @@ use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use uuid::Uuid;
+
+mod browser;
 
 struct HostAssetReader {
     host: Arc<dyn Host>,
@@ -357,6 +359,7 @@ struct DesktopState {
     index_root: PathBuf,
     mcp: Arc<McpManager<McpCredentialAdapter>>,
     jobs: Arc<BackgroundJobManager>,
+    local_browser: Arc<dyn BrowserController>,
     ingress_shutdown: tokio::sync::watch::Sender<bool>,
     ingress_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     ci_monitor_shutdown: tokio::sync::watch::Sender<bool>,
@@ -466,6 +469,7 @@ struct LocalExecutor {
     coordination: Arc<AsyncMutex<HashMap<String, CoordinationRuntime>>>,
     origin: ToolOrigin,
     repair_loop: Option<RepairLoopContext>,
+    browser: Arc<dyn BrowserController>,
 }
 
 enum DesktopExecutor {
@@ -3893,6 +3897,13 @@ impl ToolExecutor for RemoteExecutor {
 
 #[async_trait]
 impl ToolExecutor for DesktopExecutor {
+    async fn browser_origin(&self) -> Option<String> {
+        match self {
+            Self::Remote(_) => None,
+            Self::Local(executor) => executor.browser.current_origin().await,
+        }
+    }
+
     async fn run_hook_command(
         &self,
         command: &str,
@@ -3919,6 +3930,16 @@ impl ToolExecutor for DesktopExecutor {
         match self {
             Self::Remote(executor) => executor.execute(name, arguments).await,
             Self::Local(executor) => {
+                if name.starts_with("browser_") {
+                    return executor
+                        .browser
+                        .execute(BrowserRequest {
+                            operation: name.trim_start_matches("browser_").to_owned(),
+                            arguments,
+                        })
+                        .await
+                        .map_err(|error| error.to_string());
+                }
                 if name == "secrets_list" {
                     return list_resolvable_secret_metadata(
                         &executor.database,
@@ -9319,6 +9340,7 @@ async fn engine_for_with_context(
                 coordination: Arc::clone(&state.coordination),
                 origin: origin.clone(),
                 repair_loop: repair_loop.clone(),
+                browser: Arc::clone(&state.local_browser),
             }))),
             None,
             Some(allowed_tools),
@@ -11682,6 +11704,18 @@ fn builtin_allowed_tools(include_local_lsp: bool, include_edit_file: bool) -> Ve
     }
     if include_edit_file {
         tools.push("edit_file".to_owned());
+    }
+    if include_local_lsp {
+        tools.extend([
+            "browser_status".to_owned(),
+            "browser_navigate".to_owned(),
+            "browser_set_viewport".to_owned(),
+            "browser_click".to_owned(),
+            "browser_read".to_owned(),
+            "browser_measure".to_owned(),
+            "browser_assert_geometry".to_owned(),
+            "browser_screenshot".to_owned(),
+        ]);
     }
     tools
 }
@@ -21439,6 +21473,7 @@ fn main() {
                 jobs_path,
                 Arc::clone(&secret_values),
             ));
+            let local_browser = browser::shared_local_browser(None);
             let engines = Arc::new(AsyncMutex::new(HashMap::new()));
             let coordination = Arc::new(AsyncMutex::new(HashMap::new()));
             let (ingress_shutdown, ingress_receiver) = tokio::sync::watch::channel(false);
@@ -21477,6 +21512,7 @@ fn main() {
                 trigger_watcher_stop: Mutex::new(None),
                 mcp: Arc::clone(&mcp),
                 jobs,
+                local_browser,
                 ingress_shutdown,
                 ingress_task: Mutex::new(Some(ingress_task)),
                 ci_monitor_shutdown,
@@ -21987,6 +22023,7 @@ mod m7_tests {
             coordination: Arc::new(AsyncMutex::new(HashMap::new())),
             origin: ToolOrigin::User,
             repair_loop: None,
+            browser: browser::shared_local_browser(None),
         }));
         let result = executor
             .execute("ask_user", json!({"question": "Which format?"}))

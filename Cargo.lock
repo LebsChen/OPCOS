@@ -3550,6 +3550,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "tempfile",
  "tokio",
  "tokio-tungstenite 0.30.0",
  "url",
@@ -3648,6 +3649,7 @@ dependencies = [
  "chrono",
  "serde",
  "thiserror 2.0.19",
+ "url",
 ]
 
 [[package]]

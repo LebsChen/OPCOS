@@ -2055,6 +2055,22 @@ pub trait Host: Send + Sync {
     fn contains_temp(&self, candidate: &str) -> bool;
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct BrowserRequest {
+    pub operation: String,
+    #[serde(default)]
+    pub arguments: Value,
+}
+
+#[async_trait]
+pub trait BrowserController: Send + Sync {
+    async fn execute(&self, request: BrowserRequest) -> Result<Value, HostError>;
+
+    async fn current_origin(&self) -> Option<String> {
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum LifecycleStage {
