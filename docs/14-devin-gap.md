@@ -126,7 +126,7 @@
 |---|---|
 | attachments / artifacts timeline | **部分关闭**：截图和文件改动 diff 已作为 per-session artifacts 持久化并可在 timeline / artifact rail 按需展开；录屏、citation snippets 仍开放。截图 artifact 当前不会作为视觉输入发送给模型。 |
 | terminal replay / `terminal_update` panel | **部分关闭**：`terminal_update` 已按 `call_id` 聚合到 timeline 的 shell 行下，并可展开查看；Shell rail 同样读取 canonical `session_events`。仍不提供 PTY 语义、ANSI 光标/控制序列或终端状态重放。 |
-| iteration stats surfacing | 仍开放：事件可记录，但尚未在 timeline / UI 中提供 Devin 式可见统计面。 |
+| iteration stats surfacing | **部分关闭**：canonical `iteration_stats` / `iteration_checkpoint` 仍被 timeline 忽略，但 Info pane 从持久化事件计算会话汇总和可折叠的逐轮 timing/tool 明细；更丰富的 Devin context/source/tool aggregates 仍开放。 |
 | right rail Shell / Desktop / Web IDE panes | **未核实**：七轮没有 RVM token，因此没有真实远端 pane 验证。 |
 
 ### 已实现并已通过本地验证
@@ -144,7 +144,14 @@ Builtin engine 现在会把 working 过程作为结构化事件同时写入本�
   2000 字符、每次调用最多 64 条做限流，并持久化 `terminal_update`；
 - 本地 Tauri `run_shell` 通过 host process 增量读取输出并转发
   `terminal_update`；远程 RVM 路径保持远端原生执行，不修改 host；
-- provider usage 存在时的 `iteration_stats`，包括工具数量、耗时和 token 数；
+- 每轮 `iteration_stats` 包括总耗时、provider streaming inference、工具执行、
+  harness 剩余时间、可观测 context-overflow retry 次数、自动 compaction 次数和
+  token 数；`iteration_checkpoint` 在能从 canonical incoming event 建立边界时带
+  `last_processed_incoming_event_id`；
+- timing 边界是从该轮 harness 开始到工具执行完成：`inference_ms` 包含
+  `stream_turn` 的完整流式消费，`tool_exec_ms` 包含 `execute_tools` 的聚合耗时，
+  `harness_ms = max(duration_ms - inference_ms - tool_exec_ms, 0)`；provider 内部
+  未暴露的 retry 不计入 `retry_count`。
 - 本地 `session_worklog` 现在从 audit store 返回这些事件，沿用现有 Worklog
   时间线，不新增 UI 布局；Transcript 对 `devin_thoughts` 和
   `simple_activity_update` 沿用已有 thinking/notice 表面。
@@ -154,6 +161,9 @@ Builtin engine 现在会把 working 过程作为结构化事件同时写入本�
   `rules_injected` / `skill_activated`；不复制资产正文。
 - compaction 完成后发本地 `session_snapshot`，正常 turn 收束发
   `iteration_checkpoint`，pending/restart recovery 发 `resuming_session`。
+- Info pane 从 canonical `session_events` 重读 iteration stats，不改变 timeline
+  行数；旧事件缺少拆分字段时显示 Unknown 而不是伪造 0ms。`usage_events` 保持
+  兼容的旧 schema，统计字段只从 canonical iteration events 计算。
 - 对照完整 Devin stream，`terminal_update` payload 使用 `contents` 而非
   `chunk`；OPCOS 保留 `call_id` 作为本地工具关联键，当前没有通用真实
   `shell_id` 或 gzip transport，因此不伪造这两个字段。

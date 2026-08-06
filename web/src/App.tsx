@@ -36,6 +36,7 @@ import {
 } from "./gui";
 import { isErrorNotice, providerErrorPresentation } from "./transcript";
 import { buildTimeline, mergeEvents, type TimelineEvent } from "./timeline";
+import { summarizeIterationStats } from "./iterationStats";
 import { Sidebar } from "./components/Sidebar";
 import { sessionStatusLabel } from "./sessionStatus";
 import { Transcript } from "./components/Transcript";
@@ -8872,6 +8873,60 @@ function ShellHistoryPane({ selected }: { selected: Session }) {
   );
 }
 
+function formatStat(value: number | null, suffix = "") {
+  return value == null ? "Unknown" : `${value}${suffix}`;
+}
+
+function IterationStatsPane({ events }: { events: TimelineEvent[] }) {
+  const summary = summarizeIterationStats(events);
+  return (
+    <section className="mt-4 rounded-lg border border-line p-3">
+      <h3 className="text-sm font-semibold text-ink">Iteration stats</h3>
+      <div className="mt-2 grid grid-cols-2 gap-2 text-xs">
+        <Field k="Iterations" v={String(summary.iterations.length)} />
+        <Field k="Input tokens" v={formatStat(summary.totalInputTokens)} />
+        <Field k="Output tokens" v={formatStat(summary.totalOutputTokens)} />
+        <Field
+          k="Total duration"
+          v={formatStat(summary.totalDurationMs, " ms")}
+        />
+        <Field k="Retries" v={formatStat(summary.totalRetries)} />
+        <Field
+          k="Compactions"
+          v={`${summary.totalCompactions} (${summary.automaticCompactions} automatic, ${summary.manualCompactions} manual)`}
+        />
+      </div>
+      {summary.iterations.length > 0 && (
+        <div className="mt-3 flex flex-col gap-1">
+          {summary.iterations.map((item) => (
+            <details
+              key={item.iteration}
+              className="rounded border border-line"
+            >
+              <summary className="cursor-pointer px-2 py-1 text-xs text-muted">
+                Iteration {item.iteration} · {item.toolCalls} tool calls
+              </summary>
+              <div className="grid grid-cols-2 gap-1 px-2 pb-2 text-xs">
+                <Field k="Duration" v={formatStat(item.durationMs, " ms")} />
+                <Field k="Inference" v={formatStat(item.inferenceMs, " ms")} />
+                <Field
+                  k="Tool execution"
+                  v={formatStat(item.toolExecMs, " ms")}
+                />
+                <Field k="Harness" v={formatStat(item.harnessMs, " ms")} />
+                <Field k="Input" v={formatStat(item.inputTokens)} />
+                <Field k="Output" v={formatStat(item.outputTokens)} />
+                <Field k="Retries" v={formatStat(item.retryCount)} />
+                <Field k="Compactions" v={formatStat(item.compactionCount)} />
+              </div>
+            </details>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
 type FileChange = {
   path: string;
   edit_count: number;
@@ -9072,6 +9127,7 @@ function SessionRightPanel({
   const [insights, setInsights] = useState<Record<string, unknown> | null>(
     null,
   );
+  const [iterationEvents, setIterationEvents] = useState<TimelineEvent[]>([]);
   useEffect(() => {
     setInsights(null);
     void command<Record<string, unknown>>("session_insights", {
@@ -9080,6 +9136,14 @@ function SessionRightPanel({
       .then(setInsights)
       .catch(onError);
   }, [selected.id]);
+  useEffect(() => {
+    setIterationEvents([]);
+    void command<TimelineEvent[]>("read_session_events", {
+      sessionId: selected.id,
+    })
+      .then(setIterationEvents)
+      .catch(onError);
+  }, [selected.id, onError]);
   const informationTabs: Array<{
     id: typeof panelTab;
     label: string;
@@ -9242,6 +9306,7 @@ function SessionRightPanel({
                       </button>
                     </div>
                   )}
+                  <IterationStatsPane events={iterationEvents} />
                 </div>
               </div>
             )}

@@ -1376,7 +1376,7 @@ where
 
     pub async fn compact_now(&self) -> Result<(), EngineError> {
         let messages = self.provider_messages()?;
-        let mut compacted = self.compact_context(messages).await?;
+        let mut compacted = self.compact_context_with_source(messages, "manual").await?;
         self.apply_post_compaction_hook(&mut compacted).await;
         Ok(())
     }
@@ -1451,9 +1451,16 @@ where
     async fn run_loop(&self, mut messages: Vec<Value>) -> Result<AssistantTurn, EngineError> {
         let mut usage: Option<TokenUsage> = None;
         let mut context_overflow_retries = 0;
+        let mut pending_retry_count = 0;
+        let mut pending_compaction_count = 0;
         let mut stop_vetoes = 0;
         let max_iterations = self.max_iterations.load(Ordering::SeqCst);
         for iteration in 0..max_iterations {
+            let iteration_started = Instant::now();
+            let retry_count = pending_retry_count;
+            let mut compaction_count = pending_compaction_count;
+            pending_retry_count = 0;
+            pending_compaction_count = 0;
             let _ = self
                 .working_event(
                     "status_update",
@@ -1468,10 +1475,12 @@ where
                     json!({"enum":"deciding_action","iteration":iteration + 1}),
                 )
                 .await;
-            let context_tokens = messages
+            let current_context_bytes = messages
                 .iter()
-                .map(|message| message.to_string().len() as u64 / 4)
+                .filter_map(|message| serde_json::to_vec(message).ok())
+                .map(|message| message.len() as u64)
                 .sum::<u64>();
+            let context_tokens = current_context_bytes / 4;
             let limits = self.resolved_caps_for_model();
             let _ = self
                 .working_event(
@@ -1479,6 +1488,8 @@ where
                     "other",
                     json!({
                         "estimated_context_tokens":context_tokens,
+                        "current_context_bytes":current_context_bytes,
+                        "iteration_count":iteration + 1,
                         "resolved_context_window": limits.context_window,
                         "context_window_source": limits.context_window_source,
                     }),
@@ -1490,6 +1501,7 @@ where
                 return Err(EngineError::Interrupted);
             }
             if self.should_compact(&messages, usage.as_ref()) {
+                compaction_count += 1;
                 messages = self
                     .compact_context(messages)
                     .await
@@ -1548,8 +1560,9 @@ where
                 },
                 settings: json!({}),
             };
-            let started = Instant::now();
+            let inference_started = Instant::now();
             let (provider_result, partial) = self.stream_turn(request).await;
+            let inference_ms = inference_started.elapsed().as_millis() as u64;
             match provider_result {
                 Ok(turn) => {
                     if let Some(reasoning) =
@@ -1563,7 +1576,7 @@ where
                                     "other",
                                     json!({
                                         "message":message,
-                                        "thinking_duration_ms":started.elapsed().as_millis(),
+                                        "thinking_duration_ms":inference_ms,
                                     }),
                                 )
                                 .await;
@@ -1585,23 +1598,10 @@ where
                                 session_id: self.session_id.clone(),
                                 input_tokens: value.input,
                                 output_tokens: value.output,
-                                duration_ms: started.elapsed().as_millis() as u64,
+                                duration_ms: inference_ms,
                                 recorded_at: Utc::now(),
                             })
                             .map_err(|error| EngineError::Store(error.to_string()))?;
-                        let _ = self
-                            .working_event(
-                                "iteration_stats",
-                                "other",
-                                json!({
-                                    "iteration":iteration + 1,
-                                    "num_tool_calls":turn.tool_calls.len(),
-                                    "duration_ms":started.elapsed().as_millis(),
-                                    "input_tokens":value.input,
-                                    "output_tokens":value.output,
-                                }),
-                            )
-                            .await;
                     }
                     let assistant = json!({"role":"assistant","content":turn.text.clone().unwrap_or_default(),
             "tool_calls":turn.tool_calls,"reasoning":turn.reasoning});
@@ -1630,15 +1630,40 @@ where
                     let assistant_sequence = *self.sequence.lock().await;
                     messages.push(assistant);
                     if turn.tool_calls.is_empty() {
+                        let total_ms = iteration_started.elapsed().as_millis() as u64;
+                        let tool_exec_ms = 0;
+                        let harness_ms = total_ms
+                            .saturating_sub(inference_ms)
+                            .saturating_sub(tool_exec_ms);
+                        let mut stats = json!({
+                            "iteration":iteration + 1,
+                            "num_tool_calls":turn.tool_calls.len(),
+                            "duration_ms":total_ms,
+                            "inference_ms":inference_ms,
+                            "tool_exec_ms":tool_exec_ms,
+                            "harness_ms":harness_ms,
+                            "retry_count":retry_count,
+                            "compaction_count":compaction_count,
+                        });
+                        if let Some(value) = &turn.usage
+                            && let Some(object) = stats.as_object_mut()
+                        {
+                            object.insert("input_tokens".into(), json!(value.input));
+                            object.insert("output_tokens".into(), json!(value.output));
+                        }
+                        let _ = self.working_event("iteration_stats", "other", stats).await;
+                        let mut checkpoint = json!({
+                            "iteration":iteration + 1,
+                            "num_tool_calls":turn.tool_calls.len(),
+                        });
+                        if let Some(event_id) = self.last_consumed_incoming_event_id(&messages)
+                            && let Some(object) = checkpoint.as_object_mut()
+                        {
+                            object
+                                .insert("last_processed_incoming_event_id".into(), json!(event_id));
+                        }
                         let _ = self
-                            .working_event(
-                                "iteration_checkpoint",
-                                "lifecycle",
-                                json!({
-                                    "iteration":iteration + 1,
-                                    "num_tool_calls":turn.tool_calls.len(),
-                                }),
-                            )
+                            .working_event("iteration_checkpoint", "lifecycle", checkpoint)
                             .await;
                         let stop = self
                             .lifecycle_hooks(
@@ -1686,9 +1711,45 @@ where
                                 })
                                 .map_err(|error| EngineError::Store(error.to_string()))?;
                         }
+                        let tool_started = Instant::now();
                         let results = self
                             .execute_tools(assistant_sequence, &turn.tool_calls)
                             .await?;
+                        let tool_exec_ms = tool_started.elapsed().as_millis() as u64;
+                        let total_ms = iteration_started.elapsed().as_millis() as u64;
+                        let harness_ms = total_ms
+                            .saturating_sub(inference_ms)
+                            .saturating_sub(tool_exec_ms);
+                        let mut stats = json!({
+                            "iteration":iteration + 1,
+                            "num_tool_calls":turn.tool_calls.len(),
+                            "duration_ms":total_ms,
+                            "inference_ms":inference_ms,
+                            "tool_exec_ms":tool_exec_ms,
+                            "harness_ms":harness_ms,
+                            "retry_count":retry_count,
+                            "compaction_count":compaction_count,
+                        });
+                        if let Some(value) = &turn.usage
+                            && let Some(object) = stats.as_object_mut()
+                        {
+                            object.insert("input_tokens".into(), json!(value.input));
+                            object.insert("output_tokens".into(), json!(value.output));
+                        }
+                        let _ = self.working_event("iteration_stats", "other", stats).await;
+                        let mut checkpoint = json!({
+                            "iteration":iteration + 1,
+                            "num_tool_calls":turn.tool_calls.len(),
+                        });
+                        if let Some(event_id) = self.last_consumed_incoming_event_id(&messages)
+                            && let Some(object) = checkpoint.as_object_mut()
+                        {
+                            object
+                                .insert("last_processed_incoming_event_id".into(), json!(event_id));
+                        }
+                        let _ = self
+                            .working_event("iteration_checkpoint", "lifecycle", checkpoint)
+                            .await;
                         for (call, result) in turn.tool_calls.iter().zip(results) {
                             let value = json!({"role":"tool","content":[{"type":"tool_result",
                                 "tool_use_id":call.id,"content":[{"type":"text","text":result.to_string()}]}]});
@@ -1742,6 +1803,8 @@ where
                             }
                         }
                         context_overflow_retries += 1;
+                        pending_retry_count += 1;
+                        pending_compaction_count += 1;
                         messages = self
                             .compact_context(messages)
                             .await
@@ -1759,6 +1822,32 @@ where
         )
         .await?;
         Err(EngineError::MaxIterations)
+    }
+
+    fn last_consumed_incoming_event_id(&self, messages: &[Value]) -> Option<String> {
+        let last_user_message = messages.iter().rev().find_map(|message| {
+            (message.get("role").and_then(Value::as_str) == Some("user"))
+                .then(|| message.pointer("/content/0/text").and_then(Value::as_str))
+                .flatten()
+        })?;
+        self.store
+            .load_session_events(&self.session_id)
+            .ok()?
+            .into_iter()
+            .rev()
+            .find_map(|record| {
+                let event_id = record.event_id;
+                let event = record.event;
+                let working = event.get("working_event")?.as_object()?;
+                (event.get("type").and_then(Value::as_str) == Some("user_message")
+                    && working.get("direction").and_then(Value::as_str) == Some("incoming")
+                    && working
+                        .get("payload")
+                        .and_then(|payload| payload.get("message"))
+                        .and_then(Value::as_str)
+                        == Some(last_user_message))
+                .then_some(event_id)
+            })
     }
 
     fn should_compact(&self, messages: &[Value], usage: Option<&TokenUsage>) -> bool {
@@ -1973,8 +2062,6 @@ where
                         json!({
                             "call_id": call.id,
                             "command": call.arguments.get("command").and_then(Value::as_str).unwrap_or_default(),
-                            "shell_id": call.id,
-                            "process_id": call.id,
                             "starting_dir": self.workspace.clone(),
                         }),
                     )
@@ -2561,6 +2648,15 @@ where
     }
 
     async fn compact_context(&self, messages: Vec<Value>) -> Result<Vec<Value>, EngineError> {
+        self.compact_context_with_source(messages, "automatic")
+            .await
+    }
+
+    async fn compact_context_with_source(
+        &self,
+        messages: Vec<Value>,
+        source: &str,
+    ) -> Result<Vec<Value>, EngineError> {
         let plan = self
             .store
             .load_plan(&self.session_id)
@@ -2765,8 +2861,12 @@ where
             )
             .await?;
         }
-        self.notice("compacted", "Earlier context compacted".into())
-            .await?;
+        self.notice_with_payload(
+            "compacted",
+            "Earlier context compacted".into(),
+            json!({"source": source}),
+        )
+        .await?;
         Ok(valid)
     }
 
@@ -3205,7 +3305,7 @@ fn unified_diff(path: &str, old: &str, new: &str) -> String {
     let old_lines = old.lines().collect::<Vec<_>>();
     let new_lines = new.lines().collect::<Vec<_>>();
     let cells = old_lines.len().checked_mul(new_lines.len());
-    if cells.is_none() || cells.unwrap_or(usize::MAX) > MAX_EXACT_DIFF_CELLS {
+    if cells.is_none_or(|cells| cells > MAX_EXACT_DIFF_CELLS) {
         return String::new();
     }
     let mut lcs = vec![vec![0usize; new_lines.len() + 1]; old_lines.len() + 1];
@@ -5677,12 +5777,48 @@ mod tests {
         for event_type in ["user_message", "status_update", "devin_message"] {
             assert!(persisted.iter().any(|event| event["type"] == event_type));
         }
+        let stats = persisted
+            .iter()
+            .find(|event| event["type"] == "iteration_stats")
+            .expect("iteration stats persisted");
+        for field in [
+            "duration_ms",
+            "inference_ms",
+            "tool_exec_ms",
+            "harness_ms",
+            "retry_count",
+            "compaction_count",
+        ] {
+            assert!(stats["working_event"]["payload"][field].is_number());
+        }
+        let stats_payload = &stats["working_event"]["payload"];
+        assert_eq!(
+            stats_payload["duration_ms"].as_u64().unwrap(),
+            stats_payload["inference_ms"].as_u64().unwrap()
+                + stats_payload["tool_exec_ms"].as_u64().unwrap()
+                + stats_payload["harness_ms"].as_u64().unwrap()
+        );
+        let context = persisted
+            .iter()
+            .find(|event| event["type"] == "context_growth_update")
+            .expect("context growth persisted");
+        assert!(context["working_event"]["payload"]["current_context_bytes"].is_number());
+        assert!(context["working_event"]["payload"]["iteration_count"].is_number());
+        let checkpoint = persisted
+            .iter()
+            .find(|event| event["type"] == "iteration_checkpoint")
+            .expect("iteration checkpoint persisted");
+        assert!(
+            checkpoint["working_event"]["payload"]["last_processed_incoming_event_id"]
+                .as_str()
+                .is_some()
+        );
 
         let mut live = Vec::new();
         while let Ok(chunk) = receiver.try_recv() {
             live.push(serde_json::to_value(chunk).unwrap());
         }
-        for event in persisted {
+        for event in &persisted {
             let event_type = event["type"].as_str().unwrap();
             if event_type == "user_message" || event_type == "devin_message" {
                 let live_event = live
