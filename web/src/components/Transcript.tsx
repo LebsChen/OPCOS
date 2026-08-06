@@ -62,6 +62,19 @@ function Thought({
     <details className="transcript-thought">
       <summary className="transcript-row-header">
         <span>{label}</span>
+        <svg
+          className="transcript-thought-chevron"
+          aria-hidden="true"
+          width="16"
+          height="16"
+          viewBox="0 0 24 24"
+          fill="none"
+        >
+          <path
+            d="M9.167 5.086 C 8.866 5.235,8.711 5.578,8.778 5.947 C 8.802 6.084,9.120 6.415,11.752 9.050 L 14.700 12.000 11.772 14.930 C 10.134 16.569,8.825 17.910,8.802 17.973 C 8.636 18.420,8.947 18.937,9.415 18.989 C 9.793 19.032,9.659 19.151,13.093 15.725 C 14.849 13.973,16.331 12.463,16.387 12.369 C 16.526 12.135,16.526 11.865,16.387 11.631 C 16.232 11.370,9.974 5.137,9.791 5.062 C 9.585 4.976,9.371 4.985,9.167 5.086 "
+            fill="currentColor"
+          />
+        </svg>
       </summary>
       <div className="transcript-thought-body">{text}</div>
     </details>
@@ -97,7 +110,7 @@ function UserBubbleContent({
   );
 }
 
-const USER_BUBBLE_MAX_HEIGHT = 320;
+const USER_BUBBLE_MAX_HEIGHT = 290;
 
 function UserBubble({
   attachments,
@@ -171,7 +184,10 @@ function PlanCard({
 }) {
   return (
     <div className="transcript-plan">
-      <div className="transcript-plan-title">Devin&apos;s execution plan</div>
+      <div className="transcript-plan-title">
+        <span aria-hidden="true">☷</span>
+        <span>Devin&apos;s execution plan</span>
+      </div>
       <div className="transcript-plan-steps">
         {steps.map((step, index) => {
           const complete = ["done", "completed"].includes(String(step.status));
@@ -181,6 +197,7 @@ function PlanCard({
               className="transcript-plan-step"
               key={`${step.content}-${index}`}
             >
+              <span className="transcript-plan-number">#{index + 1}</span>
               <span
                 className={`transcript-plan-glyph${complete ? " is-complete" : active ? " is-active" : ""}`}
                 aria-hidden="true"
@@ -380,7 +397,10 @@ export function Transcript({
           );
         if (node.kind === "assistant")
           return (
-            <div className="group bubble-assistant" key={index}>
+            <div
+              className="group bubble-assistant transcript-prose"
+              key={index}
+            >
               <Markdown text={node.text} />
               <BubbleMeta text={node.text} ts={node.ts} />
             </div>
@@ -443,7 +463,9 @@ export function Transcript({
             className={`transcript-item transcript-row${row.denied ? " text-muted" : row.exitCode !== undefined && row.exitCode !== 0 ? " text-danger" : ""}`}
             key={rowIndex}
           >
-            <span className="transcript-row-label">{row.label}</span>
+            {!(row.detail && !row.thoughtForCallId) && (
+              <span className="transcript-row-label">{row.label}</span>
+            )}
             {row.shellId && (
               <span className="transcript-row-meta">{row.shellId}</span>
             )}
@@ -539,9 +561,19 @@ export function Transcript({
               className="transcript-worklog-header"
               onClick={() => worklogOverrides.current.add(index)}
             >
-              <span className="transcript-chevron" aria-hidden="true">
-                ›
-              </span>
+              <svg
+                className="transcript-chevron"
+                aria-hidden="true"
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+              >
+                <path
+                  d="M9.167 5.086 C 8.866 5.235,8.711 5.578,8.778 5.947 C 8.802 6.084,9.120 6.415,11.752 9.050 L 14.700 12.000 11.772 14.930 C 10.134 16.569,8.825 17.910,8.802 17.973 C 8.636 18.420,8.947 18.937,9.415 18.989 C 9.793 19.032,9.659 19.151,13.093 15.725 C 14.849 13.973,16.331 12.463,16.387 12.369 C 16.526 12.135,16.526 11.865,16.387 11.631 C 16.232 11.370,9.974 5.137,9.791 5.062 C 9.585 4.976,9.371 4.985,9.167 5.086 "
+                  fill="currentColor"
+                />
+              </svg>
               <span className="transcript-worklog-label">
                 <span>{node.label}</span>
                 {!!(node.additions || node.deletions) && (

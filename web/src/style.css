@@ -533,9 +533,9 @@ h3 {
 }
 .transcript-content {
   width: 100%;
-  max-width: min(650px, 100%);
-  margin: 0 auto;
-  padding: 20px 16px;
+  max-width: none;
+  margin: 0;
+  padding: 20px 0;
   gap: 20px;
   display: flex;
   flex-direction: column;
@@ -563,18 +563,18 @@ h3 {
   line-height: 20px;
 }
 .transcript-user-bubble-clamped {
-  max-height: 320px;
+  max-height: 290px;
   overflow: hidden;
   -webkit-mask-image: linear-gradient(
     to bottom,
-    #000 0,
-    #000 calc(100% - 28px),
+    #000 calc(100% - 88px),
+    rgba(0, 0, 0, 0.15) calc(100% - 38px),
     transparent 100%
   );
   mask-image: linear-gradient(
     to bottom,
-    #000 0,
-    #000 calc(100% - 28px),
+    #000 calc(100% - 88px),
+    rgba(0, 0, 0, 0.15) calc(100% - 38px),
     transparent 100%
   );
 }
@@ -618,9 +618,9 @@ h3 {
 }
 .transcript-chevron {
   flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
   color: var(--muted);
-  font-size: 22px;
-  line-height: 16px;
   transform-origin: 50% 50%;
   transition: transform 0.2s ease-out;
 }
@@ -659,9 +659,7 @@ h3 {
   min-width: 0;
   flex-direction: column;
   gap: 8px;
-  margin-left: 8px;
-  padding-left: 16px;
-  border-left: 1px solid var(--line);
+  padding-left: 24px;
   color: var(--muted);
   font-size: 13px;
   line-height: 18px;
@@ -698,7 +696,8 @@ h3 {
 .transcript-row-header {
   display: flex;
   align-items: flex-start;
-  gap: 8px;
+  gap: 4px;
+  justify-content: flex-start;
   color: var(--muted);
   cursor: pointer;
   font-size: 13px;
@@ -708,21 +707,22 @@ h3 {
 .transcript-row-header::-webkit-details-marker {
   display: none;
 }
-.transcript-row-header::before {
-  content: "›";
-  flex: 0 0 16px;
-  font-size: 20px;
-  line-height: 16px;
-}
 .transcript-thought {
   flex: 1 0 100%;
-  padding-left: 24px;
 }
-.transcript-thought[open] .transcript-row-header::before {
+.transcript-thought-chevron {
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  margin-left: 0;
+  transform-origin: 50% 50%;
+  transition: transform 0.2s ease-out;
+}
+.transcript-thought[open] .transcript-thought-chevron {
   transform: rotate(90deg);
 }
 .transcript-thought-body {
-  margin: 4px 0 0 24px;
+  margin: 4px 0 0;
   color: var(--muted);
   white-space: pre-wrap;
 }
@@ -735,6 +735,9 @@ h3 {
   background: color-mix(in srgb, var(--panel) 72%, transparent);
 }
 .transcript-plan-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   margin-bottom: 8px;
   color: var(--ink);
   font-size: 13px;
@@ -743,15 +746,24 @@ h3 {
 .transcript-plan-steps {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 0;
 }
 .transcript-plan-step {
   display: flex;
   align-items: flex-start;
   gap: 8px;
   min-height: 18px;
+  padding: 8px 0;
   color: var(--muted);
   font-size: 13px;
+}
+.transcript-plan-step:not(:first-child) {
+  border-top: 1px solid var(--line);
+}
+.transcript-plan-number {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
 }
 .transcript-plan-glyph {
   display: inline-flex;
@@ -775,11 +787,12 @@ h3 {
   font-size: 13px;
   line-height: 18px;
 }
-@media (min-width: 768px) {
-  .transcript-content {
-    padding-right: 28px;
-    padding-left: 28px;
-  }
+.transcript-prose {
+  font-size: 14px;
+  line-height: 20px;
+}
+.transcript-prose p {
+  margin: 0 0 2px;
 }
 .transcript-item {
   margin: 0 0 18px;
