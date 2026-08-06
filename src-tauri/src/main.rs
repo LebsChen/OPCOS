@@ -11155,13 +11155,12 @@ fn create_session(
             })
     };
     let model = if requested_model == "auto" {
-        let connection = state
-            .database
-            .lock()
-            .map_err(|_| "database lock poisoned")?;
-        provider
-            .as_deref()
-            .and_then(|provider| {
+        let configured_model = {
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            provider.as_deref().and_then(|provider| {
                 connection
                     .query_row(
                         "SELECT value FROM settings WHERE key=?1",
@@ -11170,6 +11169,8 @@ fn create_session(
                     )
                     .ok()
             })
+        };
+        configured_model
             .or_else(|| {
                 provider
                     .as_deref()
@@ -13311,16 +13312,16 @@ fn provider_descriptor_for(
     state: &DesktopState,
     provider: &str,
 ) -> Result<registry::ProviderDescriptor, String> {
-    registry::descriptors()
+    if let Some(descriptor) = registry::descriptors()
         .into_iter()
         .find(|item| item.name == provider)
-        .or_else(|| {
-            load_custom_provider_records(state)
-                .ok()?
-                .into_iter()
-                .find(|item| item.id == provider)
-                .map(custom_provider_descriptor)
-        })
+    {
+        return Ok(descriptor);
+    }
+    load_custom_provider_records(state)?
+        .into_iter()
+        .find(|item| item.id == provider)
+        .map(custom_provider_descriptor)
         .ok_or_else(|| "unknown provider".to_owned())
 }
 
