@@ -38,7 +38,17 @@ export type TimelineNode =
   | {
       kind: "work";
       label: string;
-      rows: Array<{ label: string; detail?: string }>;
+      rows: Array<{
+        label: string;
+        detail?: string;
+        callId?: string;
+        terminalOutput?: string;
+        terminalTruncated?: boolean;
+        terminalTotalBytes?: number;
+        artifactId?: string;
+        artifactKind?: string;
+        artifactMime?: string;
+      }>;
       additions: number;
       deletions: number;
     };
@@ -99,6 +109,20 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
   let workStarted = 0;
   let workEnded = 0;
   const planSteps = new Map<string, Array<Record<string, unknown>>>();
+  const pendingTerminal = new Map<
+    string,
+    { output: string; truncated: boolean; totalBytes?: number }
+  >();
+  const shellRows = new Map<
+    string,
+    {
+      label: string;
+      callId?: string;
+      terminalOutput?: string;
+      terminalTruncated?: boolean;
+      terminalTotalBytes?: number;
+    }
+  >();
   const flush = (endedAt = workEnded) => {
     if (!work) return;
     if (work.rows.length === 0) {
@@ -242,7 +266,43 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
           detail: String(data.message ?? ""),
         });
       } else if (type === "shell_process_started") {
-        work.rows.push({ label: String(data.command ?? "") });
+        const callId =
+          typeof data.call_id === "string" ? data.call_id : undefined;
+        const pending = callId ? pendingTerminal.get(callId) : undefined;
+        const row = {
+          label: String(data.command ?? ""),
+          callId,
+          terminalOutput: pending?.output || undefined,
+          terminalTruncated: pending?.truncated || undefined,
+          terminalTotalBytes: pending?.totalBytes,
+        };
+        work.rows.push(row);
+        if (callId) {
+          shellRows.set(callId, row);
+          pendingTerminal.delete(callId);
+        }
+      } else if (type === "terminal_update") {
+        const callId = String(data.call_id ?? "");
+        if (!callId) continue;
+        const contents = String(data.contents ?? "");
+        const truncated = data.truncated === true;
+        const totalBytes =
+          typeof data.total_bytes === "number" ? data.total_bytes : undefined;
+        const row = shellRows.get(callId);
+        if (row) {
+          row.terminalOutput = `${row.terminalOutput ?? ""}${contents}`;
+          if (truncated) row.terminalTruncated = true;
+          if (totalBytes !== undefined) row.terminalTotalBytes = totalBytes;
+        } else {
+          const pending = pendingTerminal.get(callId) ?? {
+            output: "",
+            truncated: false,
+          };
+          pending.output += contents;
+          pending.truncated ||= truncated;
+          if (totalBytes !== undefined) pending.totalBytes = totalBytes;
+          pendingTerminal.set(callId, pending);
+        }
       } else if (type === "multi_edit_result") {
         const updates = Array.isArray(data.file_updates)
           ? data.file_updates
@@ -263,8 +323,31 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
               item.action_type === "create"
                 ? `Created ${basename} +${added}`
                 : `Edited ${basename} +${added} −${removed}`,
+            artifactId:
+              typeof item.artifact_id === "string"
+                ? item.artifact_id
+                : undefined,
+            artifactKind:
+              typeof item.artifact_id === "string" ? "diff" : undefined,
+            artifactMime:
+              typeof item.artifact_id === "string" ? "text/x-diff" : undefined,
           });
         }
+      } else if (type === "computer_use") {
+        const currentWork = work;
+        const keys = Array.isArray(data.screenshot_keys)
+          ? data.screenshot_keys.filter(
+              (key): key is string => typeof key === "string",
+            )
+          : [];
+        keys.forEach((artifactId) => {
+          currentWork?.rows.push({
+            label: "Screenshot",
+            artifactId,
+            artifactKind: "screenshot",
+            artifactMime: "image/png",
+          });
+        });
       } else if (type === "todo_update") {
         const source = Array.isArray(data.steps) ? data.steps : data.todos;
         const todos: Record<string, unknown>[] = Array.isArray(source)

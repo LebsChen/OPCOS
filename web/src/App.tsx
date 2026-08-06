@@ -36,6 +36,7 @@ import {
 } from "./gui";
 import { isErrorNotice, providerErrorPresentation } from "./transcript";
 import { buildTimeline, mergeEvents, type TimelineEvent } from "./timeline";
+import { summarizeIterationStats } from "./iterationStats";
 import { Sidebar } from "./components/Sidebar";
 import { sessionStatusLabel } from "./sessionStatus";
 import { Transcript } from "./components/Transcript";
@@ -8633,6 +8634,7 @@ type ArtifactRecord = {
   id: string;
   path: string;
   kind: string;
+  mime?: string | null;
   size_bytes?: number | null;
   sha256?: string | null;
   created_at: string;
@@ -8650,6 +8652,28 @@ function formatBytes(size: number | null | undefined) {
     if (value < 1024) break;
   }
   return `${value.toFixed(value >= 10 ? 0 : 1)} ${unit}`;
+}
+
+function DiffPreview({ text }: { text: string }) {
+  return (
+    <pre className="artifact-code whitespace-pre-wrap">
+      {text.split("\n").map((line, index) => (
+        <span
+          key={index}
+          className={
+            line.startsWith("+") && !line.startsWith("+++")
+              ? "text-green-600"
+              : line.startsWith("-") && !line.startsWith("---")
+                ? "text-red-600"
+                : undefined
+          }
+        >
+          {line}
+          {"\n"}
+        </span>
+      ))}
+    </pre>
+  );
 }
 
 function ArtifactsPane({ selected }: { selected: Session }) {
@@ -8708,6 +8732,14 @@ function ArtifactsPane({ selected }: { selected: Session }) {
             <div className="rail-muted">Loading…</div>
           ) : content.error ? (
             <div className="rail-error">{String(content.error)}</div>
+          ) : typeof content.content_base64 === "string" ? (
+            <img
+              className="artifact-image max-w-full"
+              src={`data:${String(content.mime ?? opened.mime ?? "image/png")};base64,${content.content_base64}`}
+              alt={opened.path}
+            />
+          ) : opened.kind === "diff" ? (
+            <DiffPreview text={String(content.content ?? "")} />
           ) : (
             <pre className="artifact-code">{String(content.content ?? "")}</pre>
           )}
@@ -8770,6 +8802,7 @@ type ShellHistoryItem = {
   exit_code?: number | null;
   duration_ms?: number | null;
   output: string;
+  output_truncated?: boolean;
 };
 
 function ShellHistoryPane({ selected }: { selected: Session }) {
@@ -8824,14 +8857,73 @@ function ShellHistoryPane({ selected }: { selected: Session }) {
                 <div className="rail-event-meta">
                   {item.duration_ms == null ? "" : `${item.duration_ms} ms`}
                 </div>
-                {open === item.call_id && item.output && (
-                  <pre className="rail-event-output">{item.output}</pre>
-                )}
+                {open === item.call_id &&
+                  (item.output || item.output_truncated) && (
+                    <pre className="rail-event-output">
+                      {item.output}
+                      {item.output_truncated ? "\n[Output truncated]" : ""}
+                    </pre>
+                  )}
               </div>
             ))}
           </div>
         )}
       </div>
+    </section>
+  );
+}
+
+function formatStat(value: number | null, suffix = "") {
+  return value == null ? "Unknown" : `${value}${suffix}`;
+}
+
+function IterationStatsPane({ events }: { events: TimelineEvent[] }) {
+  const summary = summarizeIterationStats(events);
+  return (
+    <section className="mt-4 rounded-lg border border-line p-3">
+      <h3 className="text-sm font-semibold text-ink">Iteration stats</h3>
+      <div className="mt-2 grid grid-cols-2 gap-2 text-xs">
+        <Field k="Iterations" v={String(summary.iterations.length)} />
+        <Field k="Input tokens" v={formatStat(summary.totalInputTokens)} />
+        <Field k="Output tokens" v={formatStat(summary.totalOutputTokens)} />
+        <Field
+          k="Total duration"
+          v={formatStat(summary.totalDurationMs, " ms")}
+        />
+        <Field k="Retries" v={formatStat(summary.totalRetries)} />
+        <Field
+          k="Compactions"
+          v={`${summary.totalCompactions} (${summary.automaticCompactions} automatic, ${summary.manualCompactions} manual)`}
+        />
+      </div>
+      {summary.iterations.length > 0 && (
+        <div className="mt-3 flex flex-col gap-1">
+          {summary.iterations.map((item) => (
+            <details
+              key={item.detailIndex}
+              className="rounded border border-line"
+            >
+              <summary className="cursor-pointer px-2 py-1 text-xs text-muted">
+                Iteration {item.iteration} · #{item.detailIndex} ·{" "}
+                {item.toolCalls} tool calls
+              </summary>
+              <div className="grid grid-cols-2 gap-1 px-2 pb-2 text-xs">
+                <Field k="Duration" v={formatStat(item.durationMs, " ms")} />
+                <Field k="Inference" v={formatStat(item.inferenceMs, " ms")} />
+                <Field
+                  k="Tool execution"
+                  v={formatStat(item.toolExecMs, " ms")}
+                />
+                <Field k="Harness" v={formatStat(item.harnessMs, " ms")} />
+                <Field k="Input" v={formatStat(item.inputTokens)} />
+                <Field k="Output" v={formatStat(item.outputTokens)} />
+                <Field k="Retries" v={formatStat(item.retryCount)} />
+                <Field k="Compactions" v={formatStat(item.compactionCount)} />
+              </div>
+            </details>
+          ))}
+        </div>
+      )}
     </section>
   );
 }
@@ -9020,6 +9112,7 @@ function SessionRightPanel({
   onCollapsedChange,
   width,
   onWidthChange,
+  eventRefreshKey,
 }: {
   selected: Session;
   onError: (error: unknown) => void;
@@ -9030,12 +9123,14 @@ function SessionRightPanel({
   onCollapsedChange?: (collapsed: boolean) => void;
   width: number;
   onWidthChange: (width: number) => void;
+  eventRefreshKey: string;
 }) {
   const [panelTab, setPanelTab] = useState<PanelTab>("info");
   const [opened, setOpened] = useState<PanelTab[]>(["info"]);
   const [insights, setInsights] = useState<Record<string, unknown> | null>(
     null,
   );
+  const [iterationEvents, setIterationEvents] = useState<TimelineEvent[]>([]);
   useEffect(() => {
     setInsights(null);
     void command<Record<string, unknown>>("session_insights", {
@@ -9044,6 +9139,13 @@ function SessionRightPanel({
       .then(setInsights)
       .catch(onError);
   }, [selected.id]);
+  useEffect(() => {
+    void command<TimelineEvent[]>("read_session_events", {
+      sessionId: selected.id,
+    })
+      .then(setIterationEvents)
+      .catch(onError);
+  }, [selected.id, eventRefreshKey, running]);
   const informationTabs: Array<{
     id: typeof panelTab;
     label: string;
@@ -9206,6 +9308,7 @@ function SessionRightPanel({
                       </button>
                     </div>
                   )}
+                  <IterationStatsPane events={iterationEvents} />
                 </div>
               </div>
             )}
@@ -10465,6 +10568,7 @@ function AppContent() {
                   <div className="main-scroll">
                     <Transcript
                       events={transcript}
+                      sessionId={selected.id}
                       running={effectiveRunning}
                       onApprove={(item, decision) => {
                         if (!item.callId) return;
@@ -10897,6 +11001,7 @@ function AppContent() {
         <SessionRightPanel
           selected={selected}
           running={effectiveRunning}
+          eventRefreshKey={`${transcript.length}:${transcript.at(-1)?.event_id ?? ""}`}
           collapsed={drawerCollapsed}
           providers={providers}
           onProviderChange={(provider) =>

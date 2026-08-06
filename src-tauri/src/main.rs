@@ -23,9 +23,10 @@ use opcos_assets::{
 };
 use opcos_engine::SecretScrubber;
 use opcos_engine::{
-    AcpHarness, AcpHarnessConfig, AgentEngine, EngineError, Harness, LifecycleHook,
-    LifecycleHookConfig, OpenCodeHarness, OpenCodeHarnessConfig, PreflightDecision,
-    SessionRecorder, ToolExecutor, ToolOrigin, TurnEngine,
+    AcpHarness, AcpHarnessConfig, AgentEngine, ArtifactReference, ArtifactRequest, ArtifactSink,
+    EngineError, Harness, LifecycleHook, LifecycleHookConfig, OpenCodeHarness,
+    OpenCodeHarnessConfig, PreflightDecision, SessionRecorder, ToolExecutor, ToolOrigin,
+    TurnEngine,
     computer_use::{
         BestEffortScreenshotChangedVerifier, ComputerUseLoopConfig, ComputerUseStep,
         run_computer_use_loop,
@@ -44,7 +45,7 @@ use opcos_engine::{
 use opcos_hosts::{
     BackgroundJobManager, BrowserController, BrowserRequest, ComputerUseAction,
     DEFAULT_EXEC_TIMEOUT_SECONDS, Host, LIFECYCLE_EXEC_TIMEOUT_SECONDS, LifecycleStage, LocalHost,
-    ProcessEvent, RvmHost, ScreenBounds, SecretValues, SpawnRequest, execute_lifecycle_stage,
+    RvmHost, ScreenBounds, SecretValues, SpawnRequest, execute_lifecycle_stage,
 };
 use opcos_lsp::LspClient;
 use opcos_mcp::{
@@ -371,6 +372,7 @@ struct DesktopState {
     ide_proxies: AsyncMutex<HashMap<u16, tauri::async_runtime::JoinHandle<()>>>,
     coordination: Arc<AsyncMutex<HashMap<String, CoordinationRuntime>>>,
     index_root: PathBuf,
+    artifact_root: PathBuf,
     mcp: Arc<McpManager<McpCredentialAdapter>>,
     jobs: Arc<BackgroundJobManager>,
     local_browser: Arc<dyn BrowserController>,
@@ -380,6 +382,62 @@ struct DesktopState {
     ci_monitor_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     runner_shutdown: tokio::sync::watch::Sender<bool>,
     runner_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+}
+
+struct SessionArtifactSink {
+    root: PathBuf,
+    store: Arc<SqliteStore>,
+    session_id: String,
+    host_id: String,
+}
+
+#[async_trait]
+impl ArtifactSink for SessionArtifactSink {
+    async fn persist(&self, request: ArtifactRequest) -> Result<ArtifactReference, String> {
+        if request.session_id != self.session_id {
+            return Err("artifact session mismatch".into());
+        }
+        const MAX_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
+        if request.content.len() > MAX_ARTIFACT_BYTES {
+            return Err(format!(
+                "artifact exceeds the {} MiB limit",
+                MAX_ARTIFACT_BYTES / (1024 * 1024)
+            ));
+        }
+        let id = format!("artifact-{}", Uuid::new_v4());
+        let session_root = self.root.join(&self.session_id);
+        std::fs::create_dir_all(&session_root).map_err(|error| error.to_string())?;
+        let path = session_root.join(&id);
+        std::fs::write(&path, &request.content).map_err(|error| error.to_string())?;
+        let logical_path = format!("artifact://{id}/{}", request.name);
+        let sha256 = {
+            let mut digest = Sha256::new();
+            digest.update(&request.content);
+            format!("{:x}", digest.finalize())
+        };
+        self.store
+            .upsert_artifact(&ArtifactRecord {
+                id: id.clone(),
+                session_id: self.session_id.clone(),
+                turn_id: 0,
+                call_id: request.call_id,
+                host_id: self.host_id.clone(),
+                path: logical_path,
+                size_bytes: Some(request.content.len() as i64),
+                sha256: Some(sha256),
+                mime: Some(request.mime.clone()),
+                kind: request.kind.clone(),
+                created_at: Utc::now(),
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(ArtifactReference {
+            id,
+            name: request.name,
+            kind: request.kind,
+            mime: request.mime,
+            size_bytes: request.content.len() as u64,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -2634,7 +2692,24 @@ fn bounded_output_text(value: &str) -> (String, Value) {
         start -= 1;
     }
     let end = lines.len();
-    let text = lines[start..end].join("\n");
+    let mut text = lines[start..end].join("\n");
+    let omitted_bytes = if start > 0 {
+        loop {
+            let omitted = total_bytes.saturating_sub(text.len() as u64);
+            let header = format!(
+                "[Output truncated: omitted {omitted} bytes; showing the last {} KiB]\n",
+                INLINE_SHELL_OUTPUT_LIMIT_BYTES / 1024
+            );
+            if header.len() + text.len() <= INLINE_SHELL_OUTPUT_LIMIT_BYTES || start + 1 >= end {
+                text = format!("{header}{text}");
+                break omitted;
+            }
+            start += 1;
+            text = lines[start..end].join("\n");
+        }
+    } else {
+        0
+    };
     (
         text,
         json!({
@@ -2644,6 +2719,7 @@ fn bounded_output_text(value: &str) -> (String, Value) {
             "end_line": end as u64,
             "omitted_before": start as u64,
             "omitted_after": 0,
+            "omitted_bytes": omitted_bytes,
             "truncated": start > 0,
         }),
     )
@@ -4275,45 +4351,23 @@ impl ToolExecutor for DesktopExecutor {
             env.insert(name.to_owned(), Value::String(value.clone()));
             values.push(value);
         }
-        let mut process = executor
+        let request = ExecRequest {
+            command: command.to_owned(),
+            cwd: arguments
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            timeout_seconds: DEFAULT_EXEC_TIMEOUT_SECONDS,
+            session: Some(format!("opcos-local-{}", executor.session_id)),
+            env: Some(Value::Object(env)),
+        };
+        let forward_output = |chunk: &str| on_output(chunk);
+        let result = executor
             .host
-            .spawn(SpawnRequest {
-                command: command.to_owned(),
-                cwd: arguments
-                    .get("cwd")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .or_else(|| Some(executor.workspace.clone())),
-                env: Some(Value::Object(env)),
-                cols: 120,
-                rows: 40,
-            })
+            .exec_persistent_streaming(request, &forward_output)
             .await
             .map_err(|error| error.to_string())?;
-        let mut output = String::new();
-        let mut exit_code = None;
-        while let Some(event) = process
-            .next_event()
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            match event {
-                ProcessEvent::Output(chunk) => {
-                    on_output(&chunk);
-                    output.push_str(&chunk);
-                }
-                ProcessEvent::Exited(code) => {
-                    exit_code = code;
-                    break;
-                }
-            }
-        }
-        let _ = process.shutdown().await;
-        let mut result = json!({
-            "stdout":output,
-            "stderr":"",
-            "exit_code":exit_code,
-        });
+        let mut result = serde_json::to_value(result).unwrap_or(Value::Null);
         bound_shell_output(&mut result);
         for value in values {
             redact_json_strings(&mut result, &value);
@@ -9540,6 +9594,12 @@ async fn engine_for_with_context(
         permission_mode,
         model.clone(),
     );
+    engine.set_artifact_sink(Arc::new(SessionArtifactSink {
+        root: state.artifact_root.clone(),
+        store: Arc::clone(&state.store),
+        session_id: session_id.to_owned(),
+        host_id: host_id.clone(),
+    }));
     let discovered_caps = provider_models_for_state(
         state,
         provider_id.clone(),
@@ -11743,6 +11803,52 @@ async fn read_artifact(
         .ok_or_else(|| "artifact reference not found".to_owned())?;
     if artifact.host_id != host_id {
         return Err("artifact belongs to an unavailable host binding".to_owned());
+    }
+    if let Some(relative) = artifact.path.strip_prefix("artifact://") {
+        let artifact_key = relative
+            .split('/')
+            .next()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "artifact path is invalid".to_owned())?;
+        if artifact_key != artifact.id {
+            return Err("artifact path identity mismatch".into());
+        }
+        let path = state.artifact_root.join(&session_id).join(artifact_key);
+        if !path.starts_with(state.artifact_root.join(&session_id)) {
+            return Err("artifact path is outside the artifact directory".into());
+        }
+        let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+        const MAX_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
+        if bytes.len() > MAX_ARTIFACT_BYTES {
+            return Err("artifact exceeds the 8 MiB read limit".into());
+        }
+        if artifact
+            .mime
+            .as_deref()
+            .is_some_and(|mime| mime.starts_with("image/"))
+        {
+            return Ok(json!({
+                "id": artifact.id,
+                "path": artifact.path,
+                "content_base64": base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    bytes,
+                ),
+                "size": artifact.size_bytes,
+                "kind": artifact.kind,
+                "mime": artifact.mime,
+            }));
+        }
+        let content = String::from_utf8(bytes)
+            .map_err(|_| "artifact content is not valid UTF-8".to_owned())?;
+        return Ok(json!({
+            "id": artifact.id,
+            "path": artifact.path,
+            "content": content,
+            "size": artifact.size_bytes,
+            "kind": artifact.kind,
+            "mime": artifact.mime,
+        }));
     }
     let path = host
         .join(&artifact.path)
@@ -18343,27 +18449,34 @@ fn session_shell_history(
         .map_err(|error| error.to_string())?;
     let terminal_updates = state
         .store
-        .load_audit(Some(&session_id))
+        .load_session_events(&session_id)
         .map_err(|error| error.to_string())?
         .into_iter()
-        .filter(|event| event.kind == "working_event")
-        .filter_map(|event| {
-            (event.payload.get("event_type").and_then(Value::as_str) == Some("terminal_update"))
-                .then_some(event.payload)
+        .filter_map(|record| {
+            let event = record.event;
+            let working = event.get("working_event")?.as_object()?;
+            (event.get("type").and_then(Value::as_str) == Some("terminal_update")
+                || working.get("event_type").and_then(Value::as_str) == Some("terminal_update"))
+            .then_some(working.get("payload")?.clone())
         })
         .filter_map(|payload| {
-            let call_id = payload.get("payload")?.get("call_id")?.as_str()?;
+            let call_id = payload.get("call_id")?.as_str()?;
             let contents = payload
-                .get("payload")?
-                .get("contents")?
-                .as_str()
+                .get("contents")
+                .and_then(Value::as_str)
                 .unwrap_or_default();
-            Some((call_id.to_owned(), contents.to_owned()))
+            let truncated = payload
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Some((call_id.to_owned(), contents.to_owned(), truncated))
         })
         .fold(
-            std::collections::HashMap::<String, String>::new(),
-            |mut output, (call_id, contents)| {
-                output.entry(call_id).or_default().push_str(&contents);
+            std::collections::HashMap::<String, (String, bool)>::new(),
+            |mut output, (call_id, contents, truncated)| {
+                let entry = output.entry(call_id).or_default();
+                entry.0.push_str(&contents);
+                entry.1 |= truncated;
                 output
             },
         );
@@ -18377,16 +18490,16 @@ fn session_shell_history(
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let result = call.result.unwrap_or(Value::Null);
-            let output = terminal_updates
+            let (output, output_truncated) = terminal_updates
                 .get(&call.call_id)
                 .cloned()
-                .or_else(|| {
+                .unwrap_or_else(|| {
                     result
                         .get("stdout")
                         .and_then(Value::as_str)
-                        .map(str::to_owned)
-                })
-                .unwrap_or_default();
+                        .map(|stdout| (stdout.to_owned(), false))
+                        .unwrap_or_default()
+                });
             let exit_code = result
                 .get("exit_code")
                 .or_else(|| result.get("code"))
@@ -18397,6 +18510,7 @@ fn session_shell_history(
                 "exit_code": exit_code,
                 "duration_ms": result.get("duration_ms").and_then(Value::as_u64),
                 "output": output,
+                "output_truncated": output_truncated,
                 "result": result,
                 "message_sequence": call.message_sequence,
             })
@@ -21800,6 +21914,12 @@ fn main() {
                     std::fs::create_dir_all(&root).map_err(tauri::Error::from)?;
                     root
                 },
+                artifact_root: {
+                    let mut root = path.clone();
+                    root.set_file_name("artifacts");
+                    std::fs::create_dir_all(&root).map_err(tauri::Error::from)?;
+                    root
+                },
                 trigger_http_token: trigger_http_token.clone(),
                 trigger_http_port,
                 trigger_watcher_reload: Mutex::new(None),
@@ -22636,6 +22756,9 @@ mod m7_tests {
         assert_eq!(metadata["total_lines"], 20_000);
         assert_eq!(metadata["omitted_before"], metadata["start_line"]);
         assert_eq!(metadata["omitted_after"], 0);
+        assert!(metadata["omitted_bytes"].as_u64().unwrap() > 0);
+        assert!(output.contains("Output truncated:"));
+        assert!(output.contains("showing the last 64 KiB"));
         assert!(output.len() <= INLINE_SHELL_OUTPUT_LIMIT_BYTES);
     }
 

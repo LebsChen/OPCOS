@@ -3,7 +3,7 @@
 本文只记录代码已经实现的能力、明确限制和未完成事项。`[x]` 表示当前
 `origin/dev` 的代码已具备；`[ ]` 表示没有完成，不以文档目标代替实现。
 
-## PR #91 P0/P1 状态（七轮真实验证后）
+## PR #93 P0/P1 状态（当前分支）
 
 ### P0 runtime batch
 
@@ -14,13 +14,35 @@
   assumed；真实 gateway `glm-5.2` 通过 Local host 验证 1M window。
 - [x] crash-orphaned `running` session startup reconciliation 和 authoritative Stop。
 
-### P1 / 下一批
+### PR #93 已完成
 
-- [ ] attachments/artifacts timeline parity（screenshots、recordings、file contents、
-  citation snippets）。
-- [ ] terminal replay / `terminal_update` panel。
-- [ ] iteration stats surfacing。
-- [ ] Shell/Desktop/Web IDE right-rail panes；七轮没有 RVM token，当前未核实。
+- [x] artifacts / attachments：截图和 diff artifact 持久化、timeline 展开读取，
+  以及 artifact rail 的本地展示；recording、citation snippet 仍是明确 open gap。
+- [x] terminal replay：`terminal_update` 按 `call_id` 聚合，64 chunks / 2000 chars
+  上限，显式 truncated 收尾和 timeline 展示。
+- [x] iteration stats：canonical timing 事件、Info pane 汇总和逐轮 timing 明细。
+- [x] LocalHost persistent shell protocol：POSIX/Windows marker、临时文件、stdin
+  隔离和 late background output regression。
+- [x] Local GUI streaming shell：`DesktopExecutor::execute_streaming` 复用
+  `opcos-local-<session_id>` persistent session，保留 cwd/env/exit code 和 live
+  streaming；该路径不提供 PTY/ANSI 语义。
+- [x] output-window alignment：model result 明示 tail 64 KiB 与 omitted bytes；
+  terminal truncated event 带 total byte count，Transcript 说明 model saw the tail。
+
+### Devin event-stream gap backlog（docs-only 盘点）
+
+- [ ] P0：terminal replay 改为 base64 raw bytes，补稳定 `shell_id` + `process_id`、
+  `starting_dir`、foreground/background completion 语义。
+- [ ] P0：生成 `one_line_thoughts.short/summary`，并让
+  `simple_activity_update`、`is_major_action` 驱动 work-group collapse/header。
+- [ ] P1：从本地 context composition 计算 `per_source_context_bytes` 和
+  `tool_aggregates`，不使用 provider usage 代替 context bar。
+- [ ] P1：`multi_edit_result` 补 `total_lines`、open/edit 语义和完整 file snapshot
+  `contents_key`；search 事件补 regex/path/result filenames。
+- [ ] P1：`todo_update` 补 summary counts 与 `subagent_id`；增加 inline
+  `subagent_started` / `subagent_finished` 的真实 coordination payload。
+- [ ] P2：MCP/connector 专用 timeline rows，以及 recording/test-mode/sidekick/
+  route/ACU 等控制面事件（仅在 OPCOS 有真实来源时实现）。
 
 ### Deferred smaller findings
 

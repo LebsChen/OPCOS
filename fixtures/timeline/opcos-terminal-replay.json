@@ -1,0 +1,69 @@
+[
+  {
+    "type": "shell_process_started",
+    "event_id": "shell-terminal-replay",
+    "created_at_ms": 1,
+    "working_event": {
+      "event_type": "shell_process_started",
+      "category": "shell",
+      "payload": {
+        "call_id": "call-terminal-replay",
+        "command": "cargo test"
+      }
+    }
+  },
+  {
+    "type": "terminal_update",
+    "event_id": "terminal-replay-1",
+    "created_at_ms": 2,
+    "working_event": {
+      "event_type": "terminal_update",
+      "category": "shell",
+      "payload": {
+        "call_id": "call-terminal-replay",
+        "contents": "first\n"
+      }
+    }
+  },
+  {
+    "type": "terminal_update",
+    "event_id": "terminal-replay-2",
+    "created_at_ms": 2,
+    "working_event": {
+      "event_type": "terminal_update",
+      "category": "shell",
+      "payload": {
+        "call_id": "call-terminal-replay",
+        "contents": "second\n"
+      }
+    }
+  },
+  {
+    "type": "terminal_update",
+    "event_id": "terminal-replay-truncated",
+    "created_at_ms": 3,
+    "working_event": {
+      "event_type": "terminal_update",
+      "category": "shell",
+      "payload": {
+        "call_id": "call-terminal-replay",
+        "contents": "",
+        "truncated": true,
+        "total_bytes": 100
+      }
+    }
+  },
+  {
+    "type": "shell_process_started",
+    "event_id": "shell-terminal-empty",
+    "created_at_ms": 4,
+    "working_event": {
+      "event_type": "shell_process_started",
+      "category": "shell",
+      "payload": {
+        "call_id": "call-terminal-empty",
+        "command": "true"
+      }
+    }
+  }
+]

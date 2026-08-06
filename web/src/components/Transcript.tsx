@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { useEffect, useState } from "react";
 import { type ApprovalDecision, type Item } from "../types";
 import { buildTimeline, type TimelineEvent } from "../timeline";
 import { ApprovalCard } from "./ApprovalCard";
@@ -45,13 +46,154 @@ function Thought({ text }: { text: string }) {
   );
 }
 
+function TerminalOutput({
+  output,
+  truncated,
+  totalBytes,
+}: {
+  output: string;
+  truncated?: boolean;
+  totalBytes?: number;
+}) {
+  const [open, setOpen] = useState(false);
+  const omittedBytes =
+    totalBytes === undefined
+      ? undefined
+      : Math.max(0, totalBytes - new TextEncoder().encode(output).length);
+  return (
+    <div className="mt-1">
+      <button
+        className="text-left underline text-xs text-muted"
+        onClick={() => setOpen((value) => !value)}
+      >
+        {open ? "Hide output" : "Show output"}
+      </button>
+      {open && (
+        <pre className="artifact-code whitespace-pre-wrap">
+          {output}
+          {truncated
+            ? `\n[Output truncated: ${
+                omittedBytes === undefined ? "some" : omittedBytes
+              } bytes omitted; the model saw the tail]`
+            : ""}
+        </pre>
+      )}
+    </div>
+  );
+}
+
+function ArtifactRow({
+  sessionId,
+  artifactId,
+  kind,
+  mime,
+}: {
+  sessionId: string;
+  artifactId: string;
+  kind?: string;
+  mime?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [content, setContent] = useState<Record<string, unknown> | null>(null);
+  const [error, setError] = useState("");
+  const [lightboxOpen, setLightboxOpen] = useState(false);
+  useEffect(() => {
+    if (!lightboxOpen) return;
+    const close = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setLightboxOpen(false);
+    };
+    window.addEventListener("keydown", close);
+    return () => window.removeEventListener("keydown", close);
+  }, [lightboxOpen]);
+  const load = () => {
+    if (content || error) {
+      setOpen((value) => !value);
+      return;
+    }
+    setOpen(true);
+    void invoke<Record<string, unknown>>("read_artifact", {
+      sessionId,
+      artifactId,
+    })
+      .then(setContent)
+      .catch((reason) => setError(String(reason)));
+  };
+  const image =
+    typeof content?.content_base64 === "string"
+      ? `data:${String(content.mime ?? mime ?? "image/png")};base64,${content.content_base64}`
+      : null;
+  const diff =
+    kind === "diff" && typeof content?.content === "string"
+      ? String(content.content)
+          .split("\n")
+          .map((line, index) => (
+            <span
+              key={index}
+              className={
+                line.startsWith("+") && !line.startsWith("+++")
+                  ? "text-green-600"
+                  : line.startsWith("-") && !line.startsWith("---")
+                    ? "text-red-600"
+                    : undefined
+              }
+            >
+              {line}
+              {"\n"}
+            </span>
+          ))
+      : null;
+  return (
+    <div className="artifact-inline">
+      <button className="text-left underline" onClick={load}>
+        {kind === "screenshot" ? "View screenshot" : "View diff"}
+      </button>
+      {open && (
+        <div className="mt-1">
+          {error ? (
+            <span className="text-red-500">{error}</span>
+          ) : image ? (
+            <img
+              className="max-w-full max-h-64 cursor-zoom-in"
+              src={image}
+              alt="Screenshot artifact"
+              onClick={() => setLightboxOpen(true)}
+            />
+          ) : content ? (
+            <pre className="artifact-code whitespace-pre-wrap">
+              {diff ?? String(content.content ?? "")}
+            </pre>
+          ) : (
+            <span className="text-muted">Loading…</span>
+          )}
+        </div>
+      )}
+      {lightboxOpen && image && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-6"
+          role="presentation"
+          onClick={() => setLightboxOpen(false)}
+        >
+          <img
+            className="max-h-full max-w-full"
+            src={image}
+            alt="Screenshot artifact enlarged"
+            onClick={(event) => event.stopPropagation()}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function Transcript({
   events,
+  sessionId,
   running,
   onApprove,
   onRetry,
 }: {
   events: TimelineEvent[];
+  sessionId: string;
   running?: boolean;
   onApprove?: (
     item: Extract<Item, { kind: "approval" }>,
@@ -150,6 +292,21 @@ export function Transcript({
                 <div className="transcript-item" key={rowIndex}>
                   {row.label}
                   {row.detail && <Thought text={row.detail} />}
+                  {(row.terminalOutput || row.terminalTruncated) && (
+                    <TerminalOutput
+                      output={row.terminalOutput ?? ""}
+                      truncated={row.terminalTruncated}
+                      totalBytes={row.terminalTotalBytes}
+                    />
+                  )}
+                  {row.artifactId && (
+                    <ArtifactRow
+                      sessionId={sessionId}
+                      artifactId={row.artifactId}
+                      kind={row.artifactKind}
+                      mime={row.artifactMime}
+                    />
+                  )}
                 </div>
               ))}
             </div>

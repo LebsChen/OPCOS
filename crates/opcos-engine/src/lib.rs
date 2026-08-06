@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use base64::Engine as _;
 use chrono::Utc;
 use opcos_policy::{
     Decision, DurableGrant, PermissionMode, PermissionRules, ToolRisk, browser_click_target,
@@ -106,6 +107,30 @@ pub trait ToolExecutor: Send + Sync {
         let _ = arguments;
         name.to_owned()
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactRequest {
+    pub session_id: String,
+    pub call_id: String,
+    pub name: String,
+    pub kind: String,
+    pub mime: String,
+    pub content: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactReference {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub mime: String,
+    pub size_bytes: u64,
+}
+
+#[async_trait]
+pub trait ArtifactSink: Send + Sync {
+    async fn persist(&self, request: ArtifactRequest) -> Result<ArtifactReference, String>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -451,6 +476,7 @@ pub struct TurnEngine<P, S, E> {
     limit_identity: Mutex<Option<(String, String, String)>>,
     interrupted: AtomicBool,
     steering: Mutex<Vec<String>>,
+    last_incoming_event_id: Mutex<Option<String>>,
     steering_waiters: SteeringWaiters,
     events: mpsc::Sender<StreamChunk>,
     receiver: Mutex<Option<mpsc::Receiver<StreamChunk>>>,
@@ -480,6 +506,7 @@ pub struct TurnEngine<P, S, E> {
     policy_denied: AtomicBool,
     mutating_api_gate_enabled: AtomicBool,
     secret_scrubber: Arc<dyn SecretScrubber>,
+    artifact_sink: Option<Arc<dyn ArtifactSink>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -487,6 +514,18 @@ struct ResolvedLimits {
     context_window: u64,
     context_window_source: &'static str,
     max_output_tokens: u64,
+}
+
+struct IterationStatsData<'a> {
+    iteration: u64,
+    num_tool_calls: usize,
+    duration_ms: u64,
+    inference_ms: u64,
+    tool_exec_ms: u64,
+    harness_ms: u64,
+    retry_count: u64,
+    compaction_count: u64,
+    usage: Option<&'a TokenUsage>,
 }
 
 pub trait SecretScrubber: Send + Sync {
@@ -604,6 +643,7 @@ where
             limit_identity: Mutex::new(None),
             interrupted: AtomicBool::new(false),
             steering: Mutex::new(Vec::new()),
+            last_incoming_event_id: Mutex::new(None),
             steering_waiters: Arc::new(std::sync::Mutex::new(Vec::new())),
             events,
             receiver: Mutex::new(Some(receiver)),
@@ -633,11 +673,16 @@ where
             policy_denied: AtomicBool::new(false),
             mutating_api_gate_enabled: AtomicBool::new(true),
             secret_scrubber: Arc::new(NoopSecretScrubber),
+            artifact_sink: None,
         }
     }
 
     pub fn set_secret_scrubber(&mut self, scrubber: Arc<dyn SecretScrubber>) {
         self.secret_scrubber = scrubber;
+    }
+
+    pub fn set_artifact_sink(&mut self, sink: Arc<dyn ArtifactSink>) {
+        self.artifact_sink = Some(sink);
     }
 
     pub async fn set_system_instructions(&self, instructions: Option<String>) {
@@ -896,13 +941,14 @@ where
             timestamp: Utc::now().to_rfc3339(),
             payload: Value::Object(payload),
         };
-        self.emit_event(
+        let event_id = self.emit_event(
             "user_message",
             StreamChunk {
                 working_event: Some(event),
                 ..StreamChunk::default()
             },
         )?;
+        *self.last_incoming_event_id.lock().await = Some(event_id);
         let value = json!({"role":"user","content":[{"type":"text","text":text}]});
         self.append("user", value.clone()).await?;
         Ok(value)
@@ -1345,7 +1391,7 @@ where
 
     pub async fn compact_now(&self) -> Result<(), EngineError> {
         let messages = self.provider_messages()?;
-        let mut compacted = self.compact_context(messages).await?;
+        let mut compacted = self.compact_context_with_source(messages, "manual").await?;
         self.apply_post_compaction_hook(&mut compacted).await;
         Ok(())
     }
@@ -1420,9 +1466,16 @@ where
     async fn run_loop(&self, mut messages: Vec<Value>) -> Result<AssistantTurn, EngineError> {
         let mut usage: Option<TokenUsage> = None;
         let mut context_overflow_retries = 0;
+        let mut pending_retry_count = 0;
+        let mut pending_compaction_count = 0;
         let mut stop_vetoes = 0;
         let max_iterations = self.max_iterations.load(Ordering::SeqCst);
         for iteration in 0..max_iterations {
+            let iteration_started = Instant::now();
+            let retry_count = pending_retry_count;
+            let mut compaction_count = pending_compaction_count;
+            pending_retry_count = 0;
+            pending_compaction_count = 0;
             let _ = self
                 .working_event(
                     "status_update",
@@ -1437,10 +1490,12 @@ where
                     json!({"enum":"deciding_action","iteration":iteration + 1}),
                 )
                 .await;
-            let context_tokens = messages
+            let current_context_bytes = messages
                 .iter()
-                .map(|message| message.to_string().len() as u64 / 4)
+                .filter_map(|message| serde_json::to_vec(message).ok())
+                .map(|message| message.len() as u64)
                 .sum::<u64>();
+            let context_tokens = current_context_bytes / 4;
             let limits = self.resolved_caps_for_model();
             let _ = self
                 .working_event(
@@ -1448,6 +1503,8 @@ where
                     "other",
                     json!({
                         "estimated_context_tokens":context_tokens,
+                        "current_context_bytes":current_context_bytes,
+                        "iteration_count":iteration + 1,
                         "resolved_context_window": limits.context_window,
                         "context_window_source": limits.context_window_source,
                     }),
@@ -1459,6 +1516,7 @@ where
                 return Err(EngineError::Interrupted);
             }
             if self.should_compact(&messages, usage.as_ref()) {
+                compaction_count += 1;
                 messages = self
                     .compact_context(messages)
                     .await
@@ -1517,8 +1575,9 @@ where
                 },
                 settings: json!({}),
             };
-            let started = Instant::now();
+            let inference_started = Instant::now();
             let (provider_result, partial) = self.stream_turn(request).await;
+            let inference_ms = inference_started.elapsed().as_millis() as u64;
             match provider_result {
                 Ok(turn) => {
                     if let Some(reasoning) =
@@ -1532,7 +1591,7 @@ where
                                     "other",
                                     json!({
                                         "message":message,
-                                        "thinking_duration_ms":started.elapsed().as_millis(),
+                                        "thinking_duration_ms":inference_ms,
                                     }),
                                 )
                                 .await;
@@ -1554,23 +1613,10 @@ where
                                 session_id: self.session_id.clone(),
                                 input_tokens: value.input,
                                 output_tokens: value.output,
-                                duration_ms: started.elapsed().as_millis() as u64,
+                                duration_ms: inference_ms,
                                 recorded_at: Utc::now(),
                             })
                             .map_err(|error| EngineError::Store(error.to_string()))?;
-                        let _ = self
-                            .working_event(
-                                "iteration_stats",
-                                "other",
-                                json!({
-                                    "iteration":iteration + 1,
-                                    "num_tool_calls":turn.tool_calls.len(),
-                                    "duration_ms":started.elapsed().as_millis(),
-                                    "input_tokens":value.input,
-                                    "output_tokens":value.output,
-                                }),
-                            )
-                            .await;
                     }
                     let assistant = json!({"role":"assistant","content":turn.text.clone().unwrap_or_default(),
             "tool_calls":turn.tool_calls,"reasoning":turn.reasoning});
@@ -1599,15 +1645,23 @@ where
                     let assistant_sequence = *self.sequence.lock().await;
                     messages.push(assistant);
                     if turn.tool_calls.is_empty() {
+                        let total_ms = iteration_started.elapsed().as_millis() as u64;
+                        let tool_exec_ms = 0;
+                        let harness_ms = total_ms
+                            .saturating_sub(inference_ms)
+                            .saturating_sub(tool_exec_ms);
                         let _ = self
-                            .working_event(
-                                "iteration_checkpoint",
-                                "lifecycle",
-                                json!({
-                                    "iteration":iteration + 1,
-                                    "num_tool_calls":turn.tool_calls.len(),
-                                }),
-                            )
+                            .emit_iteration_stats(IterationStatsData {
+                                iteration: iteration + 1,
+                                num_tool_calls: turn.tool_calls.len(),
+                                duration_ms: total_ms,
+                                inference_ms,
+                                tool_exec_ms,
+                                harness_ms,
+                                retry_count,
+                                compaction_count,
+                                usage: turn.usage.as_ref(),
+                            })
                             .await;
                         let stop = self
                             .lifecycle_hooks(
@@ -1655,9 +1709,28 @@ where
                                 })
                                 .map_err(|error| EngineError::Store(error.to_string()))?;
                         }
+                        let tool_started = Instant::now();
                         let results = self
                             .execute_tools(assistant_sequence, &turn.tool_calls)
                             .await?;
+                        let tool_exec_ms = tool_started.elapsed().as_millis() as u64;
+                        let total_ms = iteration_started.elapsed().as_millis() as u64;
+                        let harness_ms = total_ms
+                            .saturating_sub(inference_ms)
+                            .saturating_sub(tool_exec_ms);
+                        let _ = self
+                            .emit_iteration_stats(IterationStatsData {
+                                iteration: iteration + 1,
+                                num_tool_calls: turn.tool_calls.len(),
+                                duration_ms: total_ms,
+                                inference_ms,
+                                tool_exec_ms,
+                                harness_ms,
+                                retry_count,
+                                compaction_count,
+                                usage: turn.usage.as_ref(),
+                            })
+                            .await;
                         for (call, result) in turn.tool_calls.iter().zip(results) {
                             let value = json!({"role":"tool","content":[{"type":"tool_result",
                                 "tool_use_id":call.id,"content":[{"type":"text","text":result.to_string()}]}]});
@@ -1711,6 +1784,8 @@ where
                             }
                         }
                         context_overflow_retries += 1;
+                        pending_retry_count += 1;
+                        pending_compaction_count += 1;
                         messages = self
                             .compact_context(messages)
                             .await
@@ -1728,6 +1803,39 @@ where
         )
         .await?;
         Err(EngineError::MaxIterations)
+    }
+
+    async fn emit_iteration_stats(&self, data: IterationStatsData<'_>) -> Result<(), EngineError> {
+        let mut stats = json!({
+            "iteration": data.iteration,
+            "num_tool_calls": data.num_tool_calls,
+            "duration_ms": data.duration_ms,
+            "inference_ms": data.inference_ms,
+            "tool_exec_ms": data.tool_exec_ms,
+            "harness_ms": data.harness_ms,
+            "retry_count": data.retry_count,
+            "compaction_count": data.compaction_count,
+        });
+        if let Some(value) = data.usage
+            && let Some(object) = stats.as_object_mut()
+        {
+            object.insert("input_tokens".into(), json!(value.input));
+            object.insert("output_tokens".into(), json!(value.output));
+        }
+        self.working_event("iteration_stats", "other", stats)
+            .await?;
+
+        let mut checkpoint = json!({
+            "iteration": data.iteration,
+            "num_tool_calls": data.num_tool_calls,
+        });
+        if let Some(event_id) = self.last_incoming_event_id.lock().await.clone()
+            && let Some(object) = checkpoint.as_object_mut()
+        {
+            object.insert("last_processed_incoming_event_id".into(), json!(event_id));
+        }
+        self.working_event("iteration_checkpoint", "lifecycle", checkpoint)
+            .await
     }
 
     fn should_compact(&self, messages: &[Value], usage: Option<&TokenUsage>) -> bool {
@@ -1940,9 +2048,8 @@ where
                         "shell_process_started",
                         "shell",
                         json!({
+                            "call_id": call.id,
                             "command": call.arguments.get("command").and_then(Value::as_str).unwrap_or_default(),
-                            "shell_id": call.id,
-                            "process_id": call.id,
                             "starting_dir": self.workspace.clone(),
                         }),
                     )
@@ -2184,36 +2291,96 @@ where
                     .map(|result| (calls[index].id.clone(), result))
             })
             .collect::<Vec<_>>();
-        self.persist_tool_results(assistant_sequence, calls, persisted)
+        let safe_results = self
+            .persist_tool_results(assistant_sequence, calls, persisted)
             .await?;
-        Ok(results.into_iter().map(Option::unwrap).collect())
+        let safe_by_id = safe_results
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        Ok(calls
+            .iter()
+            .zip(results)
+            .map(|(call, result)| {
+                safe_by_id
+                    .get(&call.id)
+                    .cloned()
+                    .unwrap_or_else(|| result.unwrap_or(Value::Null))
+            })
+            .collect())
     }
 
     async fn execute_tool_streaming(&self, call: &ToolCall) -> Value {
         let emitted = Arc::new(AtomicUsize::new(0));
+        let truncated = Arc::new(AtomicBool::new(false));
+        let total_bytes = Arc::new(AtomicU64::new(0));
         let call_id = call.id.clone();
         let on_output = {
             let emitted = emitted.clone();
+            let truncated = truncated.clone();
+            let total_bytes = total_bytes.clone();
             let engine = self;
+            let call_id = call_id.clone();
             move |chunk: &str| {
-                if emitted.fetch_add(1, Ordering::Relaxed) >= 64 {
-                    return;
+                total_bytes.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                let mut remaining = chunk;
+                while !remaining.is_empty() {
+                    if emitted.fetch_add(1, Ordering::Relaxed) >= 64 {
+                        truncated.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    let end = remaining
+                        .char_indices()
+                        .nth(2000)
+                        .map_or(remaining.len(), |(index, _)| index);
+                    let piece = &remaining[..end];
+                    let _ = engine.record_working_event(
+                        "terminal_update",
+                        "shell",
+                        json!({"call_id":call_id,"contents":piece}),
+                    );
+                    remaining = &remaining[end..];
                 }
-                let chunk = chunk.chars().take(2000).collect::<String>();
-                if chunk.is_empty() {
-                    return;
-                }
-                let _ = engine.record_working_event(
-                    "terminal_update",
-                    "shell",
-                    json!({"call_id":call_id,"contents":chunk}),
-                );
             }
         };
-        self.executor
+        let result = self
+            .executor
             .execute_streaming(&call.name, call.arguments.clone(), &on_output)
             .await
-            .unwrap_or_else(|error| json!({"error":error}))
+            .unwrap_or_else(|error| json!({"error":error}));
+        if truncated.load(Ordering::Relaxed) {
+            let _ = self.record_working_event(
+                "terminal_update",
+                "shell",
+                json!({
+                    "call_id":call_id,
+                    "contents":"",
+                    "truncated":true,
+                    "total_bytes":total_bytes.load(Ordering::Relaxed),
+                }),
+            );
+        }
+        result
+    }
+
+    async fn persist_artifact(
+        &self,
+        call: &ToolCall,
+        name: String,
+        kind: &str,
+        mime: &str,
+        content: Vec<u8>,
+    ) -> Option<ArtifactReference> {
+        let sink = self.artifact_sink.as_ref()?;
+        sink.persist(ArtifactRequest {
+            session_id: self.session_id.clone(),
+            call_id: call.id.clone(),
+            name,
+            kind: kind.to_owned(),
+            mime: mime.to_owned(),
+            content,
+        })
+        .await
+        .ok()
     }
 
     async fn emit_file_change(&self, call: &ToolCall, previous: Option<&str>) {
@@ -2251,6 +2418,17 @@ where
             content
         };
         let (lines_added, lines_removed) = line_diff_counts(old, &new);
+        let diff = unified_diff(path, old, &new);
+        let diff_artifact_id = if diff.trim().is_empty() {
+            None
+        } else {
+            let mut value = Value::String(diff);
+            self.secret_scrubber.scrub(&mut value);
+            let content = value.as_str().unwrap_or_default().as_bytes().to_vec();
+            self.persist_artifact(call, format!("{path}.diff"), "diff", "text/x-diff", content)
+                .await
+                .map(|reference| reference.id)
+        };
         let _ = self
             .working_event(
                 "multi_edit_result",
@@ -2263,10 +2441,48 @@ where
                         "end_line": new.lines().count().max(1),
                         "lines_added": lines_added,
                         "lines_removed": lines_removed,
+                        "artifact_id": diff_artifact_id,
                     }]
                 }),
             )
             .await;
+    }
+
+    async fn emit_screenshot_artifact(&self, call: &ToolCall, result: &Value) -> Option<String> {
+        let image = result.get("image").and_then(Value::as_str)?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(image)
+            .ok()?;
+        let format = result
+            .get("format")
+            .and_then(Value::as_str)
+            .filter(|format| !format.trim().is_empty())
+            .unwrap_or("png");
+        let mime = match format {
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            _ => "image/png",
+        };
+        let reference = self
+            .persist_artifact(
+                call,
+                format!("screenshot.{format}"),
+                "screenshot",
+                mime,
+                bytes,
+            )
+            .await?;
+        let _ = self
+            .working_event(
+                "computer_use",
+                "computer_use",
+                json!({
+                    "call_id": call.id,
+                    "screenshot_keys": [reference.id],
+                }),
+            )
+            .await;
+        Some(reference.id)
     }
 
     async fn persist_tool_results(
@@ -2274,14 +2490,26 @@ where
         assistant_sequence: i64,
         calls: &[ToolCall],
         results: Vec<(String, Value)>,
-    ) -> Result<(), EngineError> {
+    ) -> Result<Vec<(String, Value)>, EngineError> {
+        let mut safe_results = Vec::with_capacity(results.len());
         for (call_id, result) in results {
             let call = calls
                 .iter()
                 .find(|call| call.id == call_id)
                 .ok_or_else(|| EngineError::Store(format!("tool call not found: {call_id}")))?;
             let mut safe_result = result.clone();
+            let has_image = result.get("image").and_then(Value::as_str).is_some();
+            let screenshot_id = self.emit_screenshot_artifact(call, &result).await;
+            if has_image && let Some(object) = safe_result.as_object_mut() {
+                object.insert(
+                    "image".into(),
+                    screenshot_id
+                        .map(|artifact_id| json!({"artifact_id": artifact_id}))
+                        .unwrap_or_else(|| json!({"error": "image artifact unavailable"})),
+                );
+            }
             self.secret_scrubber.scrub(&mut safe_result);
+            safe_results.push((call.id.clone(), safe_result.clone()));
             let value = json!({"role":"tool","content":[{"type":"tool_result",
                 "tool_use_id":call.id,"content":[{"type":"text","text":safe_result.to_string()}]}]});
             self.append("tool", value).await?;
@@ -2351,7 +2579,7 @@ where
                 },
             );
         }
-        Ok(())
+        Ok(safe_results)
     }
 
     fn provider_messages(&self) -> Result<Vec<Value>, EngineError> {
@@ -2417,6 +2645,15 @@ where
     }
 
     async fn compact_context(&self, messages: Vec<Value>) -> Result<Vec<Value>, EngineError> {
+        self.compact_context_with_source(messages, "automatic")
+            .await
+    }
+
+    async fn compact_context_with_source(
+        &self,
+        messages: Vec<Value>,
+        source: &str,
+    ) -> Result<Vec<Value>, EngineError> {
         let plan = self
             .store
             .load_plan(&self.session_id)
@@ -2621,8 +2858,12 @@ where
             )
             .await?;
         }
-        self.notice("compacted", "Earlier context compacted".into())
-            .await?;
+        self.notice_with_payload(
+            "compacted",
+            "Earlier context compacted".into(),
+            json!({"source": source}),
+        )
+        .await?;
         Ok(valid)
     }
 
@@ -2856,6 +3097,7 @@ where
                 ..StreamChunk::default()
             },
         )
+        .map(|_| ())
     }
 
     async fn working_event(
@@ -2893,9 +3135,10 @@ where
                 ..StreamChunk::default()
             },
         )
+        .map(|_| ())
     }
 
-    fn emit_event(&self, event_type: &str, mut chunk: StreamChunk) -> Result<(), EngineError> {
+    fn emit_event(&self, event_type: &str, mut chunk: StreamChunk) -> Result<String, EngineError> {
         let created_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| EngineError::Store(error.to_string()))?
@@ -2907,7 +3150,8 @@ where
         let mut event =
             serde_json::to_value(&chunk).map_err(|error| EngineError::Store(error.to_string()))?;
         self.secret_scrubber.scrub(&mut event);
-        self.persist_event_value(event)
+        self.persist_event_value(event)?;
+        Ok(chunk.event_id.unwrap_or_default())
     }
 
     fn persist_event_value(&self, event: Value) -> Result<(), EngineError> {
@@ -3007,8 +3251,7 @@ fn tool_event_category(name: &str) -> &'static str {
 fn line_diff_counts(old: &str, new: &str) -> (usize, usize) {
     let old_lines = old.lines().collect::<Vec<_>>();
     let new_lines = new.lines().collect::<Vec<_>>();
-    const EXACT_LINE_LIMIT: usize = 5_000;
-    if old_lines.len() > EXACT_LINE_LIMIT || new_lines.len() > EXACT_LINE_LIMIT {
+    if old_lines.len() > MAX_EXACT_DIFF_LINES || new_lines.len() > MAX_EXACT_DIFF_LINES {
         let mut old_counts = HashMap::<&str, usize>::new();
         let mut new_counts = HashMap::<&str, usize>::new();
         for line in old_lines {
@@ -3054,6 +3297,54 @@ fn line_diff_counts(old: &str, new: &str) -> (usize, usize) {
         (additions, deletions)
     }
 }
+
+fn unified_diff(path: &str, old: &str, new: &str) -> String {
+    if old == new {
+        return String::new();
+    }
+    let old_lines = old.lines().collect::<Vec<_>>();
+    let new_lines = new.lines().collect::<Vec<_>>();
+    let cells = old_lines.len().checked_mul(new_lines.len());
+    if cells.is_none_or(|cells| cells > MAX_EXACT_DIFF_CELLS) {
+        return String::new();
+    }
+    let mut lcs = vec![vec![0usize; new_lines.len() + 1]; old_lines.len() + 1];
+    for old_index in (0..old_lines.len()).rev() {
+        for new_index in (0..new_lines.len()).rev() {
+            lcs[old_index][new_index] = if old_lines[old_index] == new_lines[new_index] {
+                lcs[old_index + 1][new_index + 1] + 1
+            } else {
+                lcs[old_index + 1][new_index].max(lcs[old_index][new_index + 1])
+            };
+        }
+    }
+    let mut lines = vec![format!("--- {path}"), format!("+++ {path}")];
+    let (mut old_index, mut new_index) = (0, 0);
+    while old_index < old_lines.len() || new_index < new_lines.len() {
+        if old_index < old_lines.len()
+            && new_index < new_lines.len()
+            && old_lines[old_index] == new_lines[new_index]
+        {
+            lines.push(format!(" {}", old_lines[old_index]));
+            old_index += 1;
+            new_index += 1;
+        } else if new_index < new_lines.len()
+            && (old_index == old_lines.len()
+                || lcs[old_index][new_index + 1] > lcs[old_index + 1][new_index])
+        {
+            lines.push(format!("+{}", new_lines[new_index]));
+            new_index += 1;
+        } else {
+            lines.push(format!("-{}", old_lines[old_index]));
+            old_index += 1;
+        }
+    }
+    format!("{}\n", lines.join("\n"))
+}
+
+const MAX_EXACT_DIFF_LINES: usize = 5_000;
+// 4,000,000 cells × 8 bytes per usize is about 32 MiB for the DP values.
+const MAX_EXACT_DIFF_CELLS: usize = 4_000_000;
 
 #[async_trait]
 impl<P, S, E> AgentEngine for TurnEngine<P, S, E>
@@ -3798,6 +4089,37 @@ mod tests {
     }
 
     #[test]
+    fn unified_diff_preserves_old_and_new_file_content() {
+        assert_eq!(
+            unified_diff("src/lib.rs", "one\ntwo\n", "one\nthree\n"),
+            "--- src/lib.rs\n+++ src/lib.rs\n one\n-two\n+three\n"
+        );
+    }
+
+    #[test]
+    fn unified_diff_skips_files_over_the_exact_diff_limit() {
+        let old = (0..5_001)
+            .map(|index| format!("old-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new = old.replace("old-2500", "new-2500");
+        assert!(unified_diff("large.txt", &old, &new).is_empty());
+    }
+
+    #[test]
+    fn unified_diff_skips_large_dp_area_below_the_line_limit() {
+        let old = (0..2_001)
+            .map(|index| format!("old-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new = (0..2_001)
+            .map(|index| format!("new-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(unified_diff("area.txt", &old, &new).is_empty());
+    }
+
+    #[test]
     fn large_file_change_counts_use_bounded_fallback() {
         let old = (0..6_001)
             .map(|index| {
@@ -4056,6 +4378,27 @@ mod tests {
     impl ToolExecutor for FakeTools {
         async fn execute(&self, _: &str, _: Value) -> Result<Value, String> {
             Ok(json!("ok"))
+        }
+    }
+
+    struct StreamingTools {
+        output: String,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for StreamingTools {
+        async fn execute(&self, _: &str, _: Value) -> Result<Value, String> {
+            Ok(json!("ok"))
+        }
+
+        async fn execute_streaming(
+            &self,
+            _: &str,
+            _: Value,
+            on_output: &(dyn for<'a> Fn(&'a str) + Send + Sync + '_),
+        ) -> Result<Value, String> {
+            on_output(&self.output);
+            Ok(json!({"stdout": self.output}))
         }
     }
 
@@ -5250,6 +5593,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_tool_results_use_the_same_artifact_reference_for_storage_and_provider() {
+        struct Sink;
+        #[async_trait]
+        impl ArtifactSink for Sink {
+            async fn persist(&self, request: ArtifactRequest) -> Result<ArtifactReference, String> {
+                assert_eq!(request.content, b"hello");
+                Ok(ArtifactReference {
+                    id: "artifact-image".into(),
+                    name: request.name,
+                    kind: request.kind,
+                    mime: request.mime,
+                    size_bytes: request.content.len() as u64,
+                })
+            }
+        }
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let mut engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine.set_artifact_sink(Arc::new(Sink));
+        let call = ToolCall {
+            id: "image-call".into(),
+            name: "browser_screenshot".into(),
+            arguments: json!({}),
+        };
+        store
+            .append_tool_call(&opcos_store::ToolCallRecord {
+                session_id: "s".into(),
+                message_sequence: 1,
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+                result: None,
+            })
+            .unwrap();
+        let result = json!({"format":"png","image":"aGVsbG8="});
+        let provider_results = engine
+            .persist_tool_results(1, &[call], vec![("image-call".into(), result)])
+            .await
+            .unwrap();
+        let expected = json!({
+            "format": "png",
+            "image": {"artifact_id": "artifact-image"}
+        });
+        assert_eq!(provider_results[0].1, expected);
+        let messages = store.load_messages("s").unwrap();
+        assert_eq!(
+            messages.last().unwrap().content["content"][0]["content"][0]["text"],
+            expected.to_string()
+        );
+        assert!(
+            !messages
+                .last()
+                .unwrap()
+                .content
+                .to_string()
+                .contains("aGVsbG8=")
+        );
+    }
+
+    #[tokio::test]
     async fn secret_scrubber_covers_events_transcript_and_tool_calls() {
         struct Scrubber;
         impl SecretScrubber for Scrubber {
@@ -5388,12 +5798,48 @@ mod tests {
         for event_type in ["user_message", "status_update", "devin_message"] {
             assert!(persisted.iter().any(|event| event["type"] == event_type));
         }
+        let stats = persisted
+            .iter()
+            .find(|event| event["type"] == "iteration_stats")
+            .expect("iteration stats persisted");
+        for field in [
+            "duration_ms",
+            "inference_ms",
+            "tool_exec_ms",
+            "harness_ms",
+            "retry_count",
+            "compaction_count",
+        ] {
+            assert!(stats["working_event"]["payload"][field].is_number());
+        }
+        let stats_payload = &stats["working_event"]["payload"];
+        assert_eq!(
+            stats_payload["duration_ms"].as_u64().unwrap(),
+            stats_payload["inference_ms"].as_u64().unwrap()
+                + stats_payload["tool_exec_ms"].as_u64().unwrap()
+                + stats_payload["harness_ms"].as_u64().unwrap()
+        );
+        let context = persisted
+            .iter()
+            .find(|event| event["type"] == "context_growth_update")
+            .expect("context growth persisted");
+        assert!(context["working_event"]["payload"]["current_context_bytes"].is_number());
+        assert!(context["working_event"]["payload"]["iteration_count"].is_number());
+        let checkpoint = persisted
+            .iter()
+            .find(|event| event["type"] == "iteration_checkpoint")
+            .expect("iteration checkpoint persisted");
+        assert!(
+            checkpoint["working_event"]["payload"]["last_processed_incoming_event_id"]
+                .as_str()
+                .is_some()
+        );
 
         let mut live = Vec::new();
         while let Ok(chunk) = receiver.try_recv() {
             live.push(serde_json::to_value(chunk).unwrap());
         }
-        for event in persisted {
+        for event in &persisted {
             let event_type = event["type"].as_str().unwrap();
             if event_type == "user_message" || event_type == "devin_message" {
                 let live_event = live
@@ -5404,6 +5850,117 @@ mod tests {
                 assert_eq!(live_event["type"], event["type"]);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_tracks_the_latest_duplicate_incoming_message_by_event_id() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "duplicate-incoming-session",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine
+            .append_user_message("same message".into(), None)
+            .await
+            .unwrap();
+        engine
+            .append_user_message("same message".into(), None)
+            .await
+            .unwrap();
+        let incoming_ids = store
+            .load_session_events("duplicate-incoming-session")
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.event["type"] == "user_message")
+            .map(|record| record.event_id)
+            .collect::<Vec<_>>();
+        assert_eq!(incoming_ids.len(), 2);
+
+        engine
+            .run_loop(engine.provider_messages().unwrap())
+            .await
+            .unwrap();
+
+        let checkpoint = store
+            .load_session_events("duplicate-incoming-session")
+            .unwrap()
+            .into_iter()
+            .find(|record| record.event["type"] == "iteration_checkpoint")
+            .expect("iteration checkpoint persisted");
+        assert_eq!(
+            checkpoint.event["working_event"]["payload"]["last_processed_incoming_event_id"],
+            incoming_ids[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_updates_preserve_the_contiguous_output_prefix_before_truncating() {
+        let output = (0..150_000)
+            .map(|index| char::from(b'a' + (index % 26) as u8))
+            .collect::<String>();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(StreamingTools {
+                output: output.clone(),
+            }),
+            "terminal-continuity-session",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+
+        engine
+            .execute_tool_streaming(&ToolCall {
+                id: "terminal-call".into(),
+                name: "run_shell".into(),
+                arguments: json!({"command": "long-output"}),
+            })
+            .await;
+
+        let events = store
+            .load_session_events("terminal-continuity-session")
+            .unwrap();
+        let updates = events
+            .iter()
+            .filter(|record| record.event["type"] == "terminal_update")
+            .collect::<Vec<_>>();
+        let contents = updates
+            .iter()
+            .filter_map(|record| {
+                let payload = &record.event["working_event"]["payload"];
+                (!payload["truncated"].as_bool().unwrap_or(false))
+                    .then(|| payload["contents"].as_str().unwrap())
+            })
+            .collect::<String>();
+        let expected = output.chars().take(64 * 2000).collect::<String>();
+        assert_eq!(contents, expected);
+        assert!(
+            updates.last().unwrap().event["working_event"]["payload"]["truncated"]
+                .as_bool()
+                .unwrap()
+        );
+        assert_eq!(
+            updates.last().unwrap().event["working_event"]["payload"]["total_bytes"],
+            output.len()
+        );
+        assert_eq!(
+            updates
+                .iter()
+                .filter(|record| {
+                    !record.event["working_event"]["payload"]["truncated"]
+                        .as_bool()
+                        .unwrap_or(false)
+                })
+                .count(),
+            64
+        );
     }
 
     #[derive(Clone)]
