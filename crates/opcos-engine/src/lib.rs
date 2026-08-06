@@ -2375,7 +2375,7 @@ fn tool_definitions() -> Vec<Value> {
     let mut tools = vec![
         json!({"type":"function","function":{"name":"read_file","description":"Read a remote file.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}),
         json!({"type":"function","function":{"name":"write_file","description":"Write a remote file. For changes to an existing file, prefer edit_file so unrelated content is preserved.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
-        json!({"type":"function","function":{"name":"edit_file","description":"Apply one or more exact old_string/new_string replacements to a remote UTF-8 text file. Every old_string must match exactly once in the original file; ambiguous or missing matches fail with diagnostics. The whole call is atomic and preserves line endings. Prefer this over rewriting an existing file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"edits":{"type":"array","items":{"type":"object","properties":{"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["old_string","new_string"]}}},"required":["path","edits"]}}}),
+        json!({"type":"function","function":{"name":"edit_file","description":"Apply one or more exact replacements to a remote UTF-8 text file. The required edits argument is an array of objects, each with old_string and new_string strings. Example: {\"path\":\"src/lib.rs\",\"edits\":[{\"old_string\":\"old code\",\"new_string\":\"new code\"}]}. Every old_string must match exactly once in the original file; ambiguous or missing matches fail with diagnostics. The whole call is atomic and preserves line endings. Prefer this over rewriting an existing file.","parameters":{"type":"object","examples":[{"path":"src/lib.rs","edits":[{"old_string":"old code","new_string":"new code"}]}],"properties":{"path":{"type":"string","description":"Remote workspace-relative file path."},"edits":{"type":"array","description":"One or more exact replacements, applied atomically.","minItems":1,"items":{"type":"object","properties":{"old_string":{"type":"string","description":"Exact existing text to replace, including whitespace and line breaks."},"new_string":{"type":"string","description":"Replacement text."}},"required":["old_string","new_string"],"additionalProperties":false}}},"required":["path","edits"],"additionalProperties":false}}}),
         json!({"type":"function","function":{"name":"run_shell","description":"Run a remote shell command.","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}),
         json!({"type":"function","function":{"name":"background_job_start","description":"Start a long-running shell command in the background and return a job id. Output is retained with bounded storage.","parameters":{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"},"timeout_seconds":{"type":"integer"}},"required":["command"]}}}),
         json!({"type":"function","function":{"name":"background_job_status","description":"Read a background job status, exit code, and output counters.","parameters":{"type":"object","properties":{"job_id":{"type":"string"}},"required":["job_id"]}}}),
@@ -2431,6 +2431,18 @@ fn tool_definitions() -> Vec<Value> {
     tools.push(json!({"type":"function","function":{"name":"external_ingress_sources","description":"List configured external event sources and their health state. Read-only; secret values are never returned.","parameters":{"type":"object","properties":{}}}}));
     tools.extend(coordination_tool_definitions());
     tools
+}
+
+pub fn builtin_tool_names() -> HashSet<String> {
+    tool_definitions()
+        .into_iter()
+        .filter_map(|tool| {
+            tool.get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect()
 }
 
 pub fn coordination_tool_definitions() -> Vec<Value> {
@@ -2655,11 +2667,18 @@ mod tests {
             .into_iter()
             .find(|tool| tool["function"]["name"] == "edit_file")
             .unwrap();
-        assert!(
-            definition["function"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("Prefer this over rewriting")
+        let description = definition["function"]["description"].as_str().unwrap();
+        assert!(description.contains("required edits argument is an array"));
+        assert!(description.contains("\"old_string\""));
+        assert!(description.contains("\"new_string\""));
+        assert!(description.contains("Prefer this over rewriting"));
+        assert_eq!(
+            definition["function"]["parameters"]["required"],
+            json!(["path", "edits"])
+        );
+        assert_eq!(
+            definition["function"]["parameters"]["properties"]["edits"]["items"]["required"],
+            json!(["old_string", "new_string"])
         );
     }
 

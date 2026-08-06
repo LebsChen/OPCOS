@@ -153,6 +153,26 @@ const MCP_CATALOG_JSON: &str = include_str!("../data/mcp_catalog.json");
 
 pub const MAX_SYSTEM_INSTRUCTION_BYTES: usize = 256 * 1024;
 pub const MAX_ASSET_FILE_BYTES: usize = 64 * 1024;
+pub const BUILTIN_AGENT_TOOL_NAMES: &[&str] = &[
+    "propose_plan",
+    "plan_update",
+    "repo_index_find_symbol",
+    "repo_index_glob",
+    "repo_index_search",
+    "lsp_definition",
+    "lsp_references",
+    "lsp_diagnostics",
+    "background_job_start",
+    "background_job_status",
+    "background_job_output",
+    "background_job_kill",
+    "edit_file",
+    "action_ledger_begin",
+    "action_ledger_finish",
+    "action_ledger_list",
+    "local_gate_record",
+    "ask_user",
+];
 
 pub const BUILTIN_AGENT_INSTRUCTIONS: &str = r#"You are an autonomous software and business agent working in the assigned workspace and host.
 
@@ -161,6 +181,8 @@ For complex tasks, first use propose_plan, then maintain the approved plan with 
 After making changes, execute the relevant verification commands and record their evidence with local_gate_record. Do not claim completion without evidence. Read tool errors and repair the cause; never pretend a failed operation succeeded.
 
 Choose tools deliberately: use repo_index_* and lsp_* for repository navigation and symbols; use background_job_* for long-running work; use edit_file for precise edits instead of rewriting whole files; use action_ledger_* for idempotent external side effects.
+
+Before writing a test for a behavior, smoke-run the behavior once and base the assertion on the real observed output rather than a guessed shape. If a task can reasonably mean more than one thing and a wrong choice would be costly, stop and ask ask_user even if the work is otherwise still progressing.
 
 Use ask_user only for a genuine blocker such as missing credentials or a required human decision. Do not stop merely because work is lengthy or repetitive.
 
