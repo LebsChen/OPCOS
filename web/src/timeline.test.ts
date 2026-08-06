@@ -262,6 +262,105 @@ describe("single event-log timeline", () => {
       denied: true,
     });
   });
+  it("keeps pending questions out of the worklog and records their answer", () => {
+    const nodes = buildTimeline([
+      {
+        type: "ask_user_pending",
+        event_id: "question",
+        created_at_ms: 1,
+        working_event: {
+          event_type: "ask_user_pending",
+          payload: { call_id: "question-1", question: "Which option?" },
+        },
+      },
+      {
+        type: "user_question_answered",
+        event_id: "answer",
+        created_at_ms: 2,
+        working_event: {
+          event_type: "user_question_answered",
+          payload: { call_id: "question-1", answer_type: "text" },
+        },
+      },
+    ] as TimelineEvent[]);
+    expect(nodes.some((node) => node.kind === "question")).toBe(false);
+    expect(nodes).toContainEqual(
+      expect.objectContaining({
+        kind: "work",
+        rows: [expect.objectContaining({ label: "Answered question" })],
+      }),
+    );
+  });
+  it("uses the persisted approval resolution field", () => {
+    const nodes = buildTimeline([
+      {
+        type: "approval_pending",
+        event_id: "approval",
+        created_at_ms: 1,
+        working_event: {
+          event_type: "approval_pending",
+          payload: {
+            call_id: "approval-1",
+            tool: "run_shell",
+            arguments: { command: "echo ok" },
+          },
+        },
+      },
+      {
+        type: "approval_resolved",
+        event_id: "resolved",
+        created_at_ms: 2,
+        working_event: {
+          event_type: "approval_resolved",
+          payload: { call_id: "approval-1", approved: true },
+        },
+      },
+    ] as TimelineEvent[]);
+    expect(nodes[0]).toMatchObject({
+      kind: "approval",
+      resolved: "allow",
+    });
+  });
+  it("renders in-flight deltas without making them reload history", () => {
+    const live = mergeEvents(
+      [],
+      {
+        type: "assistant_delta",
+        event_id: "delta-1",
+        created_at_ms: 1,
+        working_event: {
+          event_type: "assistant_delta",
+          payload: { text_delta: "still " },
+        },
+      } as TimelineEvent,
+      true,
+    );
+    const complete = mergeEvents(
+      live,
+      {
+        type: "assistant_delta",
+        event_id: "delta-2",
+        created_at_ms: 2,
+        working_event: {
+          event_type: "assistant_delta",
+          payload: { text_delta: "working" },
+        },
+      } as TimelineEvent,
+      true,
+    );
+    expect(buildTimeline(complete)).toContainEqual(
+      expect.objectContaining({
+        kind: "work",
+        rows: [
+          expect.objectContaining({
+            label: "Responding",
+            detail: "still working",
+          }),
+        ],
+      }),
+    );
+    expect(mergeEvents([], complete)).toEqual([]);
+  });
   it("keeps legacy events without parity fields renderable", () => {
     const nodes = buildTimeline([
       {
