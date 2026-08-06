@@ -21783,6 +21783,7 @@ fn provider_configurations(state: State<'_, DesktopState>) -> Result<Vec<Value>,
             Ok(json!({
                 "provider": descriptor.name,
                 "base_url": base_url,
+                "model": model,
                 "configured": configured,
             }))
         })
