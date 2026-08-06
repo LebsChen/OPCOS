@@ -1836,14 +1836,21 @@ where
                     && message.get("tool_calls").is_some())
             });
         }
-        let fallback_summary =
-            "Earlier messages compacted; recent complete tool exchanges retained.".to_owned();
-        let summary_text = if discarded.is_empty() {
-            fallback_summary.clone()
+        let (summary_text, summary_issue) = if discarded.is_empty() {
+            (
+                "Earlier messages compacted; recent complete tool exchanges retained.".to_owned(),
+                None,
+            )
         } else {
-            self.compaction_summary(&discarded)
-                .await
-                .unwrap_or(fallback_summary)
+            match self.compaction_summary(&discarded).await {
+                Ok(summary) => (summary, None),
+                Err(reason) => (
+                    format!(
+                        "Compaction summary unavailable ({reason}); recent complete tool exchanges retained."
+                    ),
+                    Some(reason),
+                ),
+            }
         };
         valid.insert(
             0,
@@ -1873,15 +1880,23 @@ where
                 retained_from: retained.len() as i64,
             })
             .map_err(|error| EngineError::Store(error.to_string()))?;
+        if let Some(reason) = summary_issue {
+            self.notice(
+                "compaction_summary_invalid",
+                format!("Compaction summary was not stored as model output: {reason}"),
+            )
+            .await?;
+        }
         self.notice("compacted", "Earlier context compacted".into())
             .await?;
         Ok(valid)
     }
 
-    async fn compaction_summary(&self, discarded: &[Value]) -> Option<String> {
+    async fn compaction_summary(&self, discarded: &[Value]) -> Result<String, String> {
         let mut context = String::new();
         for message in discarded {
-            let mut encoded = serde_json::to_string(message).ok()?;
+            let mut encoded =
+                serde_json::to_string(message).map_err(|_| "context_encoding_failed".to_owned())?;
             if encoded.len() > 4000 {
                 encoded.truncate(4000);
                 encoded.push('…');
@@ -1897,15 +1912,83 @@ where
             .complete(ProviderRequest {
                 model: self.model.lock().await.clone(),
                 messages: vec![
-                    json!({"role":"system","content":"Summarize the prior agent context into concise structured points. Include: original goal; completed actions and results; key discoveries and file paths; unfinished next steps. Do not invent facts."}),
+                    json!({"role":"system","content":"Summarize the prior agent context into concise structured points. Use exactly these sections: Goal; Completed actions and results; Key discoveries and file paths; Unfinished next steps. Do not invent facts, emit tool calls, or include reasoning tags."}),
                     json!({"role":"user","content":context}),
                 ],
                 tools: Vec::new(),
-                settings: json!({}),
+                settings: json!({"max_tokens":8192,"temperature":0.2}),
             })
             .await
-            .ok()?;
-        response.text.filter(|text| !text.trim().is_empty())
+            .map_err(|_| "provider_request_failed".to_owned())?;
+        let text = response.text.ok_or_else(|| "empty_response".to_owned())?;
+        Self::validate_compaction_summary(&text)?;
+        Ok(text.trim().to_owned())
+    }
+
+    fn validate_compaction_summary(text: &str) -> Result<(), String> {
+        let without_reasoning = strip_reasoning_blocks(text);
+        let trimmed = without_reasoning.trim();
+        if trimmed.is_empty() {
+            return Err("empty_response".into());
+        }
+        if trimmed.len() > 12_000 {
+            return Err("response_too_large".into());
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(trimmed)
+            && (value.is_array() || value.get("tool_calls").is_some())
+        {
+            return Err("tool_calls_payload".into());
+        }
+        if trimmed.matches("\"role\":").count() >= 2
+            || trimmed.matches("\"tool_call_id\"").count() >= 2
+            || trimmed.matches("{\"role\"").count() >= 2
+        {
+            return Err("raw_transcript".into());
+        }
+        if trimmed.chars().count() < 40 {
+            return Err("summary_too_short".into());
+        }
+        let normalized = trimmed.to_ascii_lowercase();
+        let sections = [
+            ("goal", &["goal", "目标", "任务"][..]),
+            (
+                "completed_actions",
+                &["completed", "已完成", "完成的", "已经完成", "进展"][..],
+            ),
+            (
+                "discoveries_or_paths",
+                &[
+                    "discover",
+                    "file path",
+                    "finding",
+                    "发现",
+                    "文件路径",
+                    "关键",
+                ][..],
+            ),
+            (
+                "next_steps",
+                &[
+                    "next step",
+                    "remaining",
+                    "unfinished",
+                    "下一步",
+                    "未完成",
+                    "待办",
+                    "后续",
+                ][..],
+            ),
+        ];
+        let mut missing = Vec::new();
+        for (label, keywords) in sections {
+            if !keywords.iter().any(|keyword| normalized.contains(keyword)) {
+                missing.push(label);
+            }
+        }
+        if missing.len() > 1 {
+            return Err(format!("missing_{}", missing.join("_and_")));
+        }
+        Ok(())
     }
 
     async fn append(&self, role: &str, content: Value) -> Result<(), EngineError> {
@@ -2456,6 +2539,27 @@ pub fn coordination_tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"coordination_dispatch","description":"Dispatch work asynchronously from the current builtin OPCOS Leader session to an existing Worker role. Only a Leader may call this tool; the caller role is derived from the bound session and cannot be supplied by the model. This never creates sessions or recursively spawns agents. Returns a task id and pending status; Worker reports are not completion evidence.","parameters":{"type":"object","properties":{"task_id":{"type":"string"},"worker_role_id":{"type":"string"},"message":{"type":"string"}},"required":["task_id","worker_role_id","message"]}}}),
         json!({"type":"function","function":{"name":"coordination_status","description":"Read bounded status for an asynchronously dispatched coordination task. Worker self-reports remain worker_reported/awaiting_verification; only verified branch, push, PR, and GitHub API checks can establish delivery. Returns recommended_after_seconds and does not block or encourage tight polling.","parameters":{"type":"object","properties":{"task_id":{"type":"string"},"limit":{"type":"integer"}},"required":["task_id"]}}}),
     ]
+}
+
+fn strip_reasoning_blocks(text: &str) -> String {
+    let mut current = text.to_owned();
+    for (open, close) in [("<think>", "</think>"), ("<analysis>", "</analysis>")] {
+        let mut result = String::new();
+        let mut rest = current.as_str();
+        while let Some(start) = rest.find(open) {
+            result.push_str(&rest[..start]);
+            match rest[start..].find(close) {
+                Some(end) => rest = &rest[start + end + close.len()..],
+                None => {
+                    rest = "";
+                    break;
+                }
+            }
+        }
+        result.push_str(rest);
+        current = result;
+    }
+    current
 }
 
 fn format_plan_context(plan: &opcos_store::PlanRecord) -> String {
@@ -3119,7 +3223,10 @@ mod tests {
     async fn post_compaction_hook_injects_context_without_duplicate_system_messages() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let engine = TurnEngine::new(
-            SummaryProvider { fail: false },
+            SummaryProvider {
+                fail: false,
+                text: None,
+            },
             store,
             Arc::new(HookTools),
             "s",
@@ -4229,6 +4336,7 @@ mod tests {
     #[derive(Clone)]
     struct SummaryProvider {
         fail: bool,
+        text: Option<String>,
     }
 
     #[async_trait]
@@ -4238,7 +4346,13 @@ mod tests {
                 Err(ProviderError::Request("summary unavailable".into()))
             } else {
                 Ok(AssistantTurn {
-                    text: Some("Goal: inspect the repository.\nNext: verify the change.".into()),
+                    text: Some(self.text.clone().unwrap_or_else(|| {
+                        "Goal: inspect the repository.\n\
+                         Completed actions and results: reviewed the repository.\n\
+                         Key discoveries and file paths: summary code is in crates/opcos-engine/src/lib.rs.\n\
+                         Unfinished next steps: verify the change."
+                            .into()
+                    })),
                     ..Default::default()
                 })
             }
@@ -4261,7 +4375,10 @@ mod tests {
     async fn compaction_keeps_system_instructions_at_the_front() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let engine = TurnEngine::new(
-            SummaryProvider { fail: false },
+            SummaryProvider {
+                fail: false,
+                text: None,
+            },
             store,
             Arc::new(FakeTools),
             "s",
@@ -4311,7 +4428,10 @@ mod tests {
     async fn compaction_persists_provider_summary() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let engine = TurnEngine::new(
-            SummaryProvider { fail: false },
+            SummaryProvider {
+                fail: false,
+                text: None,
+            },
             store.clone(),
             Arc::new(FakeTools),
             "s",
@@ -4334,15 +4454,147 @@ mod tests {
         }));
         assert_eq!(
             store.load_compaction("s").unwrap().unwrap().summary,
-            "Goal: inspect the repository.\nNext: verify the change."
+            "Goal: inspect the repository.\n\
+                 Completed actions and results: reviewed the repository.\n\
+                 Key discoveries and file paths: summary code is in crates/opcos-engine/src/lib.rs.\n\
+                 Unfinished next steps: verify the change."
         );
+    }
+
+    #[test]
+    fn compaction_summary_validation_rejects_untrusted_shapes() {
+        let oversized = "x".repeat(12_001);
+        for (name, text) in [
+            ("reasoning", "<think>internal reasoning</think>"),
+            ("tool_calls", r#"{"tool_calls":[{"name":"read_file"}]}"#),
+            ("oversized", oversized.as_str()),
+            (
+                "missing_sections",
+                "Goal: only the goal is present, nothing else was recorded here at all.",
+            ),
+            ("empty", "   "),
+            (
+                "think_only",
+                "<think>some hidden reasoning about the task</think>",
+            ),
+            (
+                "raw_transcript",
+                r#"{"role":"user","content":"fix the bug"}
+{"role":"assistant","content":"reading files","tool_calls":[]}
+{"role":"tool","tool_call_id":"abc","content":"ok"}"#,
+            ),
+            ("too_short", "目标：修复。"),
+        ] {
+            assert!(
+                TurnEngine::<SummaryProvider, SqliteStore, FakeTools>::validate_compaction_summary(
+                    text
+                )
+                .is_err(),
+                "{name} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_summary_validation_accepts_observed_markdown_shapes() {
+        for text in [
+            "**Goal**\nFix pricing bugs.\n\n\
+             **Completed actions and results**\n- Read `src/pricing.py`.\n\n\
+             **Key discoveries and file paths**\n- `src/pricing.py` contains the rounding bug.\n\n\
+             **Unfinished next steps**\n- Add regression coverage.",
+            "Goal\n修复定价问题。\n\n\
+             Completed actions and results\n已检查 `src/pricing.py`。\n\n\
+             Key discoveries and file paths\n发现舍入逻辑需要修复。\n\n\
+             Unfinished next steps\n补充回归测试。",
+            "**Goal**\n修复定价问题。\n\n\
+             **Completed actions and results**\n已检查 `src/pricing.py`。\n\n\
+             **Key discoveries and file paths**\n发现舍入逻辑需要修复。\n\n\
+             **Unfinished next steps**\n补充回归测试。",
+            "## 目标\n修复定价模块的舍入问题。\n\n\
+             ## 已完成\n检查了 `src/pricing.py` 并定位问题。\n\n\
+             ## 关键发现\n舍入逻辑在负数场景出错。\n\n\
+             ## 下一步\n补充回归测试并验证。",
+            "<think>internal planning</think>**Goal**\nFix pricing bugs in the module.\n\n\
+             **Completed actions and results**\n- Read `src/pricing.py`.\n\n\
+             **Key discoveries and file paths**\n- Rounding bug found.\n\n\
+             **Unfinished next steps**\n- Add regression coverage.",
+            "Goal: repair the failing pricing pipeline end to end.\n\
+             Completed: reviewed the module and reproduced the failure.\n\
+             Next steps: patch rounding and rerun the suite.",
+        ] {
+            assert!(
+                TurnEngine::<SummaryProvider, SqliteStore, FakeTools>::validate_compaction_summary(
+                    text
+                )
+                .is_ok(),
+                "observed summary shape was rejected: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_summary_validation_accepts_real_model_fixtures() {
+        let fixtures =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/compaction");
+        let entries: Vec<_> = std::fs::read_dir(&fixtures)
+            .expect("fixtures/compaction must exist")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "txt"))
+            .collect();
+        assert!(
+            entries.len() >= 4,
+            "expected at least four real-model compaction fixtures"
+        );
+        for entry in entries {
+            let text = std::fs::read_to_string(entry.path()).unwrap();
+            assert!(
+                TurnEngine::<SummaryProvider, SqliteStore, FakeTools>::validate_compaction_summary(
+                    &text
+                )
+                .is_ok(),
+                "real model fixture was rejected: {:?}",
+                entry.path()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_compaction_summary_uses_visible_fallback() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            SummaryProvider {
+                fail: false,
+                text: Some(r#"{"tool_calls":[{"name":"read_file"}]}"#.into()),
+            },
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let messages = (0..8)
+            .map(|index| json!({"role":"user","content":format!("message-{index}")}))
+            .collect();
+        let compacted = engine.compact_context(messages).await.unwrap();
+        let summary = store.load_compaction("s").unwrap().unwrap().summary;
+        assert!(summary.starts_with("Compaction summary unavailable (tool_calls_payload)"));
+        assert!(compacted.iter().any(|message| {
+            message
+                .pointer("/content/0/text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text == summary)
+        }));
     }
 
     #[tokio::test]
     async fn failed_compaction_summary_falls_back_to_recent_context() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let engine = TurnEngine::new(
-            SummaryProvider { fail: true },
+            SummaryProvider {
+                fail: true,
+                text: None,
+            },
             store.clone(),
             Arc::new(FakeTools),
             "s",
@@ -4358,8 +4610,13 @@ mod tests {
             .collect();
         let compacted = engine.compact_context(messages).await.unwrap();
         assert!(compacted.iter().any(|message| {
-            message.pointer("/content/0/text").and_then(Value::as_str)
-                == Some("Earlier messages compacted; recent complete tool exchanges retained.")
+            message
+                .pointer("/content/0/text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| {
+                    text.contains("Compaction summary unavailable (provider_request_failed)")
+                        && text.contains("recent complete tool exchanges retained.")
+                })
         }));
         assert!(store.load_compaction("s").unwrap().is_some());
     }
