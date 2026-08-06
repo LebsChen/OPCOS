@@ -31,8 +31,8 @@ GitHub 只有一个领域模型，多实例差异体现在「实例身份」上�
   `github@<host>`。两个实例上的同名 `owner/repo` 不会互相借用凭据。
 - 仓库身份、push 授权 target、action 幂等键和事件 subject 都带实例，形如
   `git_push:<project>:<host>/<owner>/<repo>:<branch>`。
-- push、PR 创建/读取/评论/reviewer、checks、CI 失败日志、CI 修复循环、交付
-  核验和事件 ingress 都路由到解析出的实例。
+- push、PR 创建/读取/评论/reviewer、checks、CI 失败日志、交付核验和事件
+  ingress 都路由到解析出的实例。
 
 ## Architecture
 

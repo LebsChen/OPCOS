@@ -3,6 +3,36 @@
 本文只记录代码已经实现的能力、明确限制和未完成事项。`[x]` 表示当前
 `origin/dev` 的代码已具备；`[ ]` 表示没有完成，不以文档目标代替实现。
 
+## PR #91 P0/P1 状态（七轮真实验证后）
+
+### P0 runtime batch
+
+- [x] working-event envelope、Devin-style timeline rows、PlanRecord task progress、
+  compaction row、空 artifact 清理、control slash actions、steering bubbles、
+  live/re-read/cold-restart parity。
+- [x] model-aware context/output limits：gateway → matrix → probe → learned → user →
+  assumed；真实 gateway `glm-5.2` 通过 Local host 验证 1M window。
+- [x] crash-orphaned `running` session startup reconciliation 和 authoritative Stop。
+
+### P1 / 下一批
+
+- [ ] attachments/artifacts timeline parity（screenshots、recordings、file contents、
+  citation snippets）。
+- [ ] terminal replay / `terminal_update` panel。
+- [ ] iteration stats surfacing。
+- [ ] Shell/Desktop/Web IDE right-rail panes；七轮没有 RVM token，当前未核实。
+
+### Deferred smaller findings
+
+- [ ] Home 默认 `auto` model 会以 `Provider request failed` 失败，Home 不显示错误。
+- [ ] `run_state=error` 的 session，Info pane 仍显示 `Ready`。
+- [ ] Home composer 的 Workspace 不会在创建之间清空，可能拼接出错误路径。
+- [ ] 没有 session-delete affordance：frontend 和 `src-tauri` 都没有
+  `delete_session` command；`deleteQuestion` / `sessionActions` i18n keys 未使用。
+
+Compaction summary cap 的提高尚未在真实运行中触发：四轮真实 summary 约
+1.5–2.1k 字符，只有边界 unit test 覆盖该 cap。
+
 ## 已完成能力
 
 ### Agent runtime、Host 和安全边界

@@ -65,6 +65,41 @@ Observed in one session (176 events):
 (`edit` / `create`), `start_line`, `end_line`, `lines_added`, `lines_removed`,
 `contents_key` and `prev_contents_key`.
 
+## OPCOS 对应关系（PR #91 后）
+
+OPCOS 使用同一类 append-only canonical working-event envelope；下表记录已实现的
+对应关系，而不是声称两端 payload 完全相同：
+
+| Devin event | OPCOS event / 当前对应 | 状态 |
+|---|---|---|
+| `initial_user_message` / `user_message` | `user_message`；steering 也使用此类型，并以 `source: "steering"` 区分 | 已验证持久化、重读和冷启动 |
+| `devin_message` | `devin_message` | 已验证 |
+| `devin_thoughts` | `devin_thoughts`，带 `thinking_duration_ms` | 已验证 |
+| `shell_process_started` / `shell_process_completed` | `shell_process_started` / `shell_process_completed` | 已实现；本地 shell 真实验证 |
+| `terminal_update` | `terminal_update`，使用 `contents`；OPCOS 保留本地 `call_id` | 已持久化，replay panel 仍开放 |
+| `multi_edit_result` | `write_file_started` / `write_file_completed` 及 file-change payload | 已渲染 Created / Edited 和精确行数 |
+| `todo_update` | `todo_update`，payload 使用真实 `PlanRecord.steps` | 已渲染 task header / progress rows |
+| `status_update` / `simple_activity_update` | `status_update` / `simple_activity_update` | 已实现 |
+| `iteration_stats` | `iteration_stats` | 可记录；UI surfacing 仍开放 |
+| `context_growth_update` | `context_growth_update` | 已实现；来源和 1M matrix resolution 已验证 |
+| compaction lifecycle | OPCOS `compacted` 与 `session_snapshot` | `Earlier context compacted` 已渲染；summary cap raise 仅有边界单测，未在真实运行中触发 |
+| Devin control / lifecycle rows | OPCOS `turn_done`、`resuming_session`、control-action notice events | 已实现的 OPCOS 对应，不伪造 Devin 专有事件 |
+
+### Attachment and artifact sources captured from Devin
+
+附件不是普通 event text 的一部分，真实 `/api/events/<session_id>/stream` 样本显示：
+
+- `user_message` / `initial_user_message` 可带 `rich_content`；
+- `terminal_update` 通过 `contents_gzip`（base64 gzip）或 `contents_key` 引用终端内容；
+- `multi_edit_result.file_updates[]` 可带 `contents_key` 和 `prev_contents_key`，同时包含
+  `file_path`、`action_type`、行号和增删统计；
+- `GET /api/presigned-url/batch/<devin_id>` 为 `editor_files/*` 和
+  `terminal_contents/*` payload 提供 S3 presigned URLs；
+- `GET /api/ide/<devin_id>/file_diffs` 提供 Changes rail 的 diff/body 数据；
+- `GET /api/events/first-load/<devin_id>` 和
+  `GET /api/events/<devin_id>/stream?order=desc` 返回相同 event objects，客户端按
+  `event_id` / `created_at_ms` 合并，因此附件引用也随 event log 重读。
+
 ## Timeline rendering
 
 DOM markers: `message-history--item message-item` for message bubbles,

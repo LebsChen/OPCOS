@@ -502,12 +502,29 @@ for some and not others:
 | `⏹ Stop` on an already-stuck header | clears |
 
 When the natural cases all pass and no header sticks, the last row is not reachable by normal use.
-The only remaining way to manufacture a stuck header is to `pkill` the app mid-turn and relaunch:
-`sessions.run_state` stays `running` (there is no startup reconciliation), so the session reopens with
-a `Running` header and a `Live` badge and no engine behind it. Note the important asymmetry when you
-report the result: a `⏹ Stop` implementation that "clears the local flag and then refreshes" cannot
-fix this state, because the refresh reads `running` straight back out of the DB. Fixing it needs the
-backend to reconcile the row (on startup, or in the interrupt handler when no engine exists).
+The way to manufacture the crash case is to `pkill -9` the app mid-turn and relaunch. Always confirm
+the **precondition** in the DB between the kill and the relaunch (`run_state` should be `running`
+/ `none` at that point) — otherwise a passing result after relaunch proves nothing, because you
+cannot tell reconciliation from "the turn had already finished".
+
+Status strings are the cheapest on-screen assertion here, and they are rendered in the **session
+header subtitle** (`本机 · <workspace> · <model> · <status>`, `App.tsx` → `sessionStatusLabel`), *not*
+in the Info pane, whose `STATUS` field reads only `run_state` and still shows `Ready` for interrupted
+and error sessions. Zoom the subtitle line and assert the exact string:
+
+| stop_reason | header subtitle |
+|---|---|
+| `interrupted_by_user` (⏹ Stop) | `已中断` |
+| `interrupted_by_crash` (startup reconciliation) | `已中断（应用退出）` |
+
+After any reconciliation change, also check the **negative** case: a session already terminal for
+another reason must not be rewritten — e.g. `interrupted_by_user` must survive a restart rather than
+becoming `interrupted_by_crash`. And check that the recovered session is *usable*: send a message in
+it immediately, with no navigation or restart.
+
+Historical note worth keeping: a `⏹ Stop` implementation that "clears the local flag and then
+refreshes" cannot fix an orphaned row, because the refresh reads `running` straight back out of the
+DB — the interrupt has to write the terminal state itself.
 
 Two things that make this worth chasing rather than dismissing as cosmetic:
 
@@ -556,14 +573,17 @@ escalate immediately if it fails.
 Sending while a turn is running is routed by `submissionRoute(running, canSteer)`. Test it and check
 the DB, because the UI gives you almost nothing:
 
-- A steer during a genuinely running turn **is delivered** (the agent acts on it) but is **not**
-  persisted as `user_message` and **never renders a user bubble or notice** — the typed text just
-  disappears from the composer for minutes. Don't conclude "silently dropped" from the DB alone:
-  grep the whole event JSON for your text; it shows up inside `turn` / `devin_thoughts` payloads if
-  it was really delivered. Use a distinctive marker string (e.g. `SECOND ATTEMPT:`) so this grep is
-  unambiguous.
-- In a *stuck* `Running` state (see above) the same route sends the text to a non-existent engine:
-  composer clears, nothing persists, no notice. This is the real silent drop.
+- A steer should render a **user bubble** within a couple of seconds and persist exactly **one**
+  `user_message` event whose payload carries `"source": "steering"` (normal prompts carry no
+  `source` key). Assert the count, not just presence — an earlier version appended the steer twice
+  (once when queued, once when consumed mid-loop), so **two** events per steer is a regression.
+- Always use a distinctive marker string (`STEER ONE:` / `POST CRASH:`) so DB greps are unambiguous,
+  and always reconcile **messages you submitted through the GUI** against
+  `select count(*) ... where type='user_message'`. That single number caught both a silent drop and
+  a duplicate append in different rounds.
+- Don't conclude "silently dropped" from a missing `user_message` alone: a steer can be delivered to
+  the model without being persisted. Grep the whole event JSON — it shows up inside `turn` /
+  `devin_thoughts` payloads if it really reached the model — and check whether the agent acted on it.
 - The `blocked` branch and its notice (`The session is still running; your message was not sent.`)
   may be unreachable with the Builtin harness, since `canSteer` is true there. If you never see it,
   say so rather than marking it passed.
@@ -572,6 +592,14 @@ the DB, because the UI gives you almost nothing:
 
 Replay dumps: dump the **whole `event_json` row**, not `working_event` — a large fraction of rows
 (178 of 699 in one run) have `working_event: null` and `buildTimeline` throws on them.
+
+When a round touches Rust, don't trust `cargo build` saying "Finished" or the binary mtime (a rebase
+can leave the commit date *after* a perfectly current binary). Verify the change is in the artifact:
+`strings target/debug/opcos | grep -c <new_symbol_or_literal>`, and also grep for a literal the
+commit **removed** — seeing the new string and a zero count for the old one is conclusive.
+
+Also check for a stray second app instance before recording (`wmctrl -l` showing `OPCOS <2>`): two
+windows share one SQLite file and make every DB assertion ambiguous.
 
 1. Capture the ordered row labels while the turn streams (expand every `<details>` group).
 2. **`Ctrl+R` does not reload the Tauri webview.** Navigate to another view and back into the session
