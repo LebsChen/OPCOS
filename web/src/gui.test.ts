@@ -12,6 +12,7 @@ import {
   reconcileRunningState,
   effectiveRunningState,
   mergeSessionsPreservingOptimistic,
+  reconcileSelectedIdAfterRefresh,
   selectedSessionFromList,
   sessionViewSelection,
   updateSessionRunState,
@@ -218,7 +219,27 @@ describe("GUI boundary behavior", () => {
       stop_reason: "none",
     };
     expect(sessionViewSelection("s", null, lastKnown)).toEqual(lastKnown);
+    expect(sessionViewSelection("other", null, lastKnown)).toBeNull();
     expect(sessionViewSelection(null, null, lastKnown)).toBeNull();
+  });
+
+  it("clears selection when a non-optimistic selected session is deleted", () => {
+    const session = {
+      id: "s",
+      title: "task",
+      host_id: "h",
+      host_name: "host",
+      model: "model",
+      mode: "Auto",
+      harness: "builtin",
+      run_state: "idle",
+      stop_reason: "none",
+    };
+    expect(reconcileSelectedIdAfterRefresh("s", [], new Set())).toBeNull();
+    expect(reconcileSelectedIdAfterRefresh("s", [], new Set(["s"]))).toBe("s");
+    expect(reconcileSelectedIdAfterRefresh("s", [session], new Set())).toBe(
+      "s",
+    );
   });
 
   it("does not contain the retired private gateway address", () => {

@@ -31,6 +31,7 @@ import {
   sessionViewSelection,
   submitFailureMessage,
   type PendingQuestionData,
+  reconcileSelectedIdAfterRefresh,
   updateSessionRunState,
 } from "./gui";
 import { isErrorNotice, providerErrorPresentation } from "./transcript";
@@ -9831,6 +9832,16 @@ function AppContent() {
     ]);
     setHosts(nextHosts);
     const optimisticSessionIds = new Set(optimisticSessionIdsRef.current);
+    const nextSelectedId = reconcileSelectedIdAfterRefresh(
+      selectedIdRef.current ?? null,
+      nextSessions,
+      optimisticSessionIds,
+    );
+    if (nextSelectedId === null && selectedIdRef.current) {
+      selectedIdRef.current = undefined;
+      lastSelectedSessionRef.current = null;
+      setSelectedId(null);
+    }
     setSessions((current) =>
       mergeSessionsPreservingOptimistic(
         current,

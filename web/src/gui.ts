@@ -137,7 +137,21 @@ export function sessionViewSelection(
   selected: Session | null,
   lastKnown: Session | null,
 ): Session | null {
-  return selected ?? (selectedId ? lastKnown : null);
+  return selected ?? (lastKnown?.id === selectedId ? lastKnown : null);
+}
+
+export function reconcileSelectedIdAfterRefresh(
+  selectedId: string | null,
+  refreshed: Session[],
+  optimisticIds: ReadonlySet<string>,
+): string | null {
+  if (
+    !selectedId ||
+    refreshed.some((session) => session.id === selectedId) ||
+    optimisticIds.has(selectedId)
+  )
+    return selectedId;
+  return null;
 }
 
 export function mergeSessionsPreservingOptimistic(
