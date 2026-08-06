@@ -2404,7 +2404,6 @@ struct LocalShell {
     _child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
-    marker: String,
 }
 
 impl LocalHost {
@@ -2916,25 +2915,22 @@ impl LocalHost {
         env: Option<&Value>,
     ) -> Result<ExecResult, HostError> {
         let mut sessions = self.sessions.lock().await;
+        let marker = format!("{}-{}__", "OPCOS_LOCAL_COMMAND", Uuid::new_v4().simple());
+        let output_path =
+            std::env::temp_dir().join(format!("opcos-shell-output-{}", Uuid::new_v4().simple()));
         if !sessions.contains_key(session) {
-            let marker = format!(
-                "__OPCOS_LOCAL_SHELL_{}_{}__",
-                std::process::id(),
-                sessions.len()
-            );
             let (child, stdin, stdout) = spawn_persistent_shell(cwd, &self.secret_values).await?;
             let mut shell = LocalShell {
                 _child: child,
                 stdin,
                 stdout: BufReader::new(stdout),
-                marker,
             };
             let write_result = match shell
                 .stdin
                 .write_all(
                     format!(
                         "{}\n",
-                        persistent_command(command, env, &shell.marker, cwd, change_cwd)?
+                        persistent_command(command, env, &marker, &output_path, cwd, change_cwd,)?
                     )
                     .as_bytes(),
                 )
@@ -2957,7 +2953,14 @@ impl LocalHost {
                     .write_all(
                         format!(
                             "{}\n",
-                            persistent_command(command, env, &shell.marker, cwd, change_cwd)?
+                            persistent_command(
+                                command,
+                                env,
+                                &marker,
+                                &output_path,
+                                cwd,
+                                change_cwd,
+                            )?
                         )
                         .as_bytes(),
                     )
@@ -2978,7 +2981,7 @@ impl LocalHost {
         let result = {
             let shell = sessions.get_mut(session).expect("session exists");
             let mut stdout = String::new();
-            let marker = format!("{}:", shell.marker);
+            let marker = format!("{}:", marker);
             time::timeout(Duration::from_secs(timeout_seconds.max(1)), async {
                 loop {
                     let mut line = String::new();
@@ -3018,6 +3021,7 @@ impl LocalHost {
                     let _ = shell._child.kill().await;
                     let _ = shell._child.wait().await;
                 }
+                let _ = tokio::fs::remove_file(&output_path).await;
                 return Err(error);
             }
         };
@@ -3178,11 +3182,13 @@ fn persistent_command(
     command: &str,
     env: Option<&Value>,
     marker: &str,
+    output_path: &Path,
     cwd: &Path,
     change_cwd: bool,
 ) -> Result<String, HostError> {
     #[cfg(windows)]
     {
+        let _ = output_path;
         let prefix = persistent_env_prefix(env)?.unwrap_or_default();
         let directory = if change_cwd {
             format!(
@@ -3213,14 +3219,19 @@ fn persistent_command(
         };
         let command = if let Some(prefix) = persistent_env_prefix(env)? {
             format!(
-                "{directory}({prefix}eval '{}') 2>&1",
+                "{directory}({prefix}eval '{}')",
                 shell_single_quote(command)
             )
         } else {
-            format!("{directory}{command} 2>&1")
+            format!("{directory}eval '{}'", shell_single_quote(command))
         };
         Ok(format!(
-            "{command}; __opcos_exit=$?; printf '{marker}:%s:%s\\n' \"$__opcos_exit\" \"$PWD\""
+            "{command} > '{}' 2>&1 < /dev/null; \
+             __opcos_exit=$?; cat '{}'; rm -f '{}'; \
+             printf '{marker}:%s:%s\\n' \"$__opcos_exit\" \"$PWD\"",
+            shell_single_quote(&output_path.display().to_string()),
+            shell_single_quote(&output_path.display().to_string()),
+            shell_single_quote(&output_path.display().to_string()),
         ))
     }
 }
@@ -4071,6 +4082,55 @@ mod tests {
 
     #[cfg(not(windows))]
     #[tokio::test]
+    async fn local_host_persistent_shell_discards_late_background_output() {
+        let root = tempfile_dir();
+        let host = LocalHost::new(&root).unwrap();
+        let session = Some("background-output-session".into());
+
+        let first = host
+            .exec(ExecRequest {
+                command: "(sleep 0.05; printf late) & true".into(),
+                cwd: None,
+                timeout_seconds: 5,
+                session: session.clone(),
+                env: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.result.stdout, "");
+
+        let second = host
+            .exec(ExecRequest {
+                command: "printf next".into(),
+                cwd: None,
+                timeout_seconds: 5,
+                session: session.clone(),
+                env: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.result.stdout, "next");
+
+        let third = host
+            .exec(ExecRequest {
+                command: "sleep 0.1; printf clean".into(),
+                cwd: None,
+                timeout_seconds: 5,
+                session,
+                env: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(third.result.stdout, "clean");
+
+        host.close_session("background-output-session")
+            .await
+            .unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
     async fn persistent_environment_with_cwd_is_scoped_and_preserves_cwd() {
         let root = tempfile_dir();
         let subdir = root.join("subdir");
@@ -4221,12 +4281,13 @@ mod tests {
             "echo ok",
             Some(&serde_json::json!({"OPCOS_SECRET": "value"})),
             "__marker__",
+            Path::new("/tmp/opcos-shell-output-test"),
             Path::new("."),
             false,
         )
         .unwrap();
         #[cfg(not(windows))]
-        assert!(command.contains("(OPCOS_SECRET='value'; export OPCOS_SECRET; eval"));
+        assert!(command.contains("OPCOS_SECRET='value'; export OPCOS_SECRET; eval"));
         #[cfg(windows)]
         assert!(command.contains("setlocal") && command.contains("endlocal"));
     }
@@ -4380,6 +4441,7 @@ mod tests {
             "Write-Output '中文'",
             None,
             "__marker__",
+            Path::new("C:\\Temp\\opcos-shell-output-test"),
             Path::new("."),
             false,
         )
