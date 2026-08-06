@@ -424,6 +424,11 @@ type InboxRecord = {
   resolution?: string | null;
 };
 type PendingQuestion = PendingQuestionData;
+type PendingApproval = {
+  callId: string;
+  name: string;
+  args: Record<string, unknown>;
+};
 
 const OPENWORKER_CONNECTORS: ConnectorCatalogEntry[] = [
   { name: "Telegram", description: "Two-way messaging with a Telegram bot." },
@@ -10210,6 +10215,7 @@ function AppContent() {
   };
   const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
   const [transcript, setTranscript] = useState<TimelineEvent[]>([]);
+  const [liveTranscript, setLiveTranscript] = useState<TimelineEvent[]>([]);
   const transcriptScrollRef = useRef<HTMLDivElement>(null);
   const transcriptBottomRef = useRef<HTMLDivElement>(null);
   const transcriptAtBottomRef = useRef(true);
@@ -10217,6 +10223,8 @@ function AppContent() {
   const [showTranscriptJump, setShowTranscriptJump] = useState(false);
   const [pendingQuestion, setPendingQuestion] =
     useState<PendingQuestion | null>(null);
+  const [pendingApproval, setPendingApproval] =
+    useState<PendingApproval | null>(null);
   const [surface, setSurface] = useState<
     "session" | "automations" | "manage" | "activity" | "inbox" | "project"
   >("session");
@@ -10237,6 +10245,10 @@ function AppContent() {
     pendingQuestion !== null,
     selected?.run_state,
     running,
+  );
+  const liveEvents = useMemo(
+    () => mergeEvents(transcript, liveTranscript, true),
+    [transcript, liveTranscript],
   );
   const updateTranscriptScrollState = () => {
     const element = transcriptScrollRef.current;
@@ -10530,7 +10542,9 @@ function AppContent() {
   useEffect(() => {
     const currentGeneration = ++generation.current;
     setTranscript([]);
+    setLiveTranscript([]);
     setPendingQuestion(null);
+    setPendingApproval(null);
     setRunning(false);
     if (!selected) return;
     void Promise.all([
@@ -10553,6 +10567,9 @@ function AppContent() {
         const pending = pendingItems.find(
           (item) => item.tool === "ask_user" && item.state !== "resolved",
         );
+        const approval = pendingItems.find(
+          (item) => item.tool !== "ask_user" && item.state !== "resolved",
+        );
         const inboxPending = inboxItems.find(
           (item) =>
             item.session_id === selected.id &&
@@ -10571,7 +10588,15 @@ function AppContent() {
             ),
           );
         }
+        if (approval) {
+          setPendingApproval({
+            callId: approval.call_id,
+            name: approval.tool,
+            args: approval.arguments,
+          });
+        }
         setTranscript(mergeEvents([], items));
+        setLiveTranscript([]);
       })
       .catch((reason) => {
         if (generation.current === currentGeneration)
@@ -10610,6 +10635,24 @@ function AppContent() {
         return;
       if (payload.kind === "stream") {
         const streamPayload = payload.payload;
+        const workingEvent =
+          streamPayload.working_event &&
+          typeof streamPayload.working_event === "object"
+            ? (streamPayload.working_event as Record<string, unknown>)
+            : undefined;
+        const workingPayload =
+          workingEvent?.payload && typeof workingEvent.payload === "object"
+            ? (workingEvent.payload as Record<string, unknown>)
+            : undefined;
+        if (streamPayload.type === "user_question_answered") {
+          const callId =
+            typeof workingPayload?.call_id === "string"
+              ? workingPayload.call_id
+              : "";
+          setPendingQuestion((current) =>
+            current?.callId === callId ? null : current,
+          );
+        }
         if (streamPayload.type === "compacted") {
           setRunning(false);
         }
@@ -10637,6 +10680,7 @@ function AppContent() {
         }
       }
       if (payload.kind === "turn_done") {
+        setLiveTranscript([]);
         const runState =
           typeof payload.payload.run_state === "string"
             ? payload.payload.run_state
@@ -10662,25 +10706,8 @@ function AppContent() {
           }
         }
       }
-      const approvalTool =
-        typeof payload.payload?.tool === "string"
-          ? payload.payload.tool
-          : typeof payload.payload?.toolName === "string"
-            ? payload.payload.toolName
-            : "";
-      const isAskUserApproval =
-        payload.kind === "approval" && approvalTool === "ask_user";
-      if (
-        payload.kind === "question_requested" ||
-        payload.kind === "question" ||
-        payload.payload?.kind === "question_requested" ||
-        isAskUserApproval
-      ) {
-        const questionPayload =
-          payload.payload?.payload &&
-          typeof payload.payload.payload === "object"
-            ? (payload.payload.payload as Record<string, unknown>)
-            : payload.payload;
+      if (payload.kind === "question_requested") {
+        const questionPayload = payload.payload;
         const args =
           questionPayload.arguments &&
           typeof questionPayload.arguments === "object"
@@ -10700,6 +10727,34 @@ function AppContent() {
             }),
           );
         }
+      }
+      if (payload.kind === "approval") {
+        const approvalPayload = payload.payload;
+        const callId =
+          typeof approvalPayload.call_id === "string"
+            ? approvalPayload.call_id
+            : "";
+        const tool =
+          typeof approvalPayload.tool === "string"
+            ? approvalPayload.tool
+            : "tool";
+        const args =
+          approvalPayload.arguments &&
+          typeof approvalPayload.arguments === "object"
+            ? (approvalPayload.arguments as Record<string, unknown>)
+            : {};
+        if (callId && tool !== "ask_user") {
+          setPendingApproval({ callId, name: tool, args });
+        }
+      }
+      if (payload.kind === "approval_resolved") {
+        const callId =
+          typeof payload.payload?.call_id === "string"
+            ? payload.payload.call_id
+            : "";
+        setPendingApproval((current) =>
+          current?.callId === callId ? null : current,
+        );
       }
       if (
         payload.kind === "approval_resolved" ||
@@ -10736,8 +10791,8 @@ function AppContent() {
         typeof payload.payload.created_at_ms === "number" &&
         typeof payload.payload.type === "string"
       ) {
-        setTranscript((items) =>
-          mergeEvents(items, payload.payload as unknown as TimelineEvent),
+        setLiveTranscript((items) =>
+          mergeEvents(items, payload.payload as unknown as TimelineEvent, true),
         );
       }
     });
@@ -11071,18 +11126,10 @@ function AppContent() {
                   >
                     <div ref={transcriptBottomRef}>
                       <Transcript
-                        events={transcript}
+                        events={liveEvents}
                         sessionId={selected.id}
                         hostName={selected.host_name}
                         running={effectiveRunning}
-                        onApprove={(item, decision) => {
-                          if (!item.callId) return;
-                          void command("resolve_approval", {
-                            sessionId: selected.id,
-                            callId: item.callId,
-                            approve: decision === "allow",
-                          }).catch(onError);
-                        }}
                         onRetry={() => {
                           void command("submit_turn", {
                             request: { session_id: selected.id, text: "" },
@@ -11123,23 +11170,37 @@ function AppContent() {
                       </svg>
                     </button>
                   )}
+                  {pendingApproval && (
+                    <div className="transcript-interaction-card">
+                      <ApprovalCard
+                        item={{
+                          kind: "approval",
+                          callId: pendingApproval.callId,
+                          name: pendingApproval.name,
+                          args: pendingApproval.args,
+                          reason: "Tool action requires approval",
+                        }}
+                        hostName={selected.host_name}
+                        onApprove={(decision) => {
+                          void command("resolve_approval", {
+                            sessionId: selected.id,
+                            callId: pendingApproval.callId,
+                            approve: decision === "allow",
+                          }).catch(onError);
+                        }}
+                      />
+                    </div>
+                  )}
                   {pendingQuestion && (
                     <QuestionCard
                       question={pendingQuestion}
                       onAnswer={async (answer) => {
-                        const answeredQuestion = pendingQuestion;
-                        setPendingQuestion(null);
                         setRunning(true);
-                        try {
-                          await command("resolve_inbox", {
-                            sessionId: selected.id,
-                            callId: answeredQuestion.callId,
-                            resolution: answer,
-                          });
-                        } catch (reason) {
-                          setPendingQuestion(answeredQuestion);
-                          throw reason;
-                        }
+                        await command("resolve_inbox", {
+                          sessionId: selected.id,
+                          callId: pendingQuestion.callId,
+                          resolution: answer,
+                        });
                       }}
                     />
                   )}

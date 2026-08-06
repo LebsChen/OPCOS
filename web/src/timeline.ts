@@ -39,6 +39,7 @@ export type TimelineNode =
   | {
       kind: "work";
       label: string;
+      startedAt?: number;
       rows: Array<{
         label: string;
         detail?: string;
@@ -221,6 +222,7 @@ function resultSummary(raw: unknown): {
 export function mergeEvents(
   existing: TimelineEvent[],
   incoming: TimelineEvent | TimelineEvent[],
+  includeTransient = false,
 ): TimelineEvent[] {
   const all = [
     ...existing,
@@ -229,6 +231,7 @@ export function mergeEvents(
   const seen = new Set<string>();
   const unique = all.filter((event) => {
     if (
+      !includeTransient &&
       TRANSIENT_TIMELINE_EVENT_TYPES.includes(
         eventType(event) as (typeof TRANSIENT_TIMELINE_EVENT_TYPES)[number],
       )
@@ -305,6 +308,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
         rows: [],
         additions: 0,
         deletions: 0,
+        startedAt,
       };
     }
     if (!workStarted) workStarted = startedAt;
@@ -390,33 +394,28 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
       workStarted = 0;
       workEnded = 0;
     } else if (type === "approval_pending" || type === "ask_user_pending") {
+      if (type === "ask_user_pending") {
+        continue;
+      }
       flush(event.created_at_ms);
       const callId = String(data.call_id ?? "");
-      if (type === "ask_user_pending") {
-        nodes.push({
-          kind: "question",
-          callId,
-          text: String(data.question ?? data.message ?? "Question"),
-          options: Array.isArray(data.options)
-            ? data.options.map(String)
-            : undefined,
-        });
-      } else {
-        const node = {
-          kind: "approval",
-          callId,
-          name: String(data.tool ?? "tool"),
-          args: data.arguments,
-        } as Extract<TimelineNode, { kind: "approval" }>;
-        nodes.push(node);
-        if (callId) approvalNodes.set(callId, node);
-      }
+      const node = {
+        kind: "approval",
+        callId,
+        name: String(data.tool ?? "tool"),
+        args: data.arguments,
+      } as Extract<TimelineNode, { kind: "approval" }>;
+      nodes.push(node);
+      if (callId) approvalNodes.set(callId, node);
       workStarted = 0;
       workEnded = 0;
     } else if (type === "approval_resolved") {
       const callId = String(data.call_id ?? "");
       const node = approvalNodes.get(callId);
       if (node) node.resolved = data.approved === true ? "allow" : "deny";
+    } else if (type === "user_question_answered") {
+      const activeWork = ensureWork(event.created_at_ms);
+      activeWork.rows.push({ label: "Answered question" });
     } else if (type === "compacted") {
       const activeWork = ensureWork(event.created_at_ms);
       activeWork.rows.push({ label: "Earlier context compacted" });
@@ -479,11 +478,53 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
         "session_snapshot",
         "iteration_checkpoint",
         "turn",
-        ...TRANSIENT_TIMELINE_EVENT_TYPES,
         "stream_reset",
       ].includes(type)
     ) {
       continue;
+    } else if (type === "assistant_delta" || type === "reasoning_delta") {
+      const activeWork = ensureWork(event.created_at_ms);
+      const text = String(
+        type === "assistant_delta"
+          ? (data.text_delta ?? data.text ?? "")
+          : (data.reasoning_delta ?? data.text ?? ""),
+      );
+      if (text) {
+        const label = type === "assistant_delta" ? "Responding" : "Thinking";
+        const existing = activeWork.rows.find((row) => row.label === label);
+        if (existing) existing.detail = `${existing.detail ?? ""}${text}`;
+        else {
+          activeWork.rows.push({
+            label,
+            detail: text,
+            activityLabel: true,
+            isMajorAction: true,
+          });
+        }
+      }
+    } else if (type === "tool_call_delta") {
+      const activeWork = ensureWork(event.created_at_ms);
+      const delta =
+        data.tool_call_delta && typeof data.tool_call_delta === "object"
+          ? (data.tool_call_delta as Record<string, unknown>)
+          : data;
+      const callId = String(delta.id ?? "");
+      const name = String(delta.name ?? "Using tool");
+      const existing = callId
+        ? genericRows.get(callId)
+        : activeWork.rows.find((row) => row.label === name);
+      if (existing) {
+        existing.detail = `${existing.detail ?? ""}${String(delta.arguments_fragment ?? "")}`;
+      } else {
+        const row = {
+          label: name,
+          callId: callId || undefined,
+          detail: String(delta.arguments_fragment ?? ""),
+          isMajorAction: true,
+        };
+        activeWork.rows.push(row);
+        if (callId) genericRows.set(callId, row);
+      }
     } else if (type === "tool_result") {
       const resultEvent =
         data.tool_result && typeof data.tool_result === "object"

@@ -6,13 +6,11 @@ import {
   useRef,
   useState,
 } from "react";
-import { type ApprovalDecision, type Item } from "../types";
 import {
   buildTimeline,
   type TimelineEvent,
   type TimelineNode,
 } from "../timeline";
-import { ApprovalCard } from "./ApprovalCard";
 import { Markdown } from "./Markdown";
 
 const CHEVRON_PATH =
@@ -299,20 +297,17 @@ function TerminalOutput({
   truncated?: boolean;
   totalBytes?: number;
 }) {
-  const [open, setOpen] = useState(false);
   const omittedBytes =
     totalBytes === undefined
       ? undefined
       : Math.max(0, totalBytes - new TextEncoder().encode(output).length);
   return (
-    <div className="mt-1">
-      <button
-        className="text-left underline text-xs text-muted"
-        onClick={() => setOpen((value) => !value)}
-      >
-        {open ? "Hide output" : "Show output"}
-      </button>
-      {open && (
+    <details className="transcript-thought transcript-output">
+      <summary className="transcript-row-header">
+        <span>Show output</span>
+        <TranscriptChevron className="transcript-thought-chevron" />
+      </summary>
+      <div className="transcript-thought-body">
         <pre className="artifact-code max-h-96 overflow-auto whitespace-pre-wrap break-words">
           {output}
           {truncated
@@ -321,8 +316,8 @@ function TerminalOutput({
               } bytes omitted; the model saw the tail]`
             : ""}
         </pre>
-      )}
-    </div>
+      </div>
+    </details>
   );
 }
 
@@ -337,7 +332,6 @@ function ArtifactRow({
   kind?: string;
   mime?: string;
 }) {
-  const [open, setOpen] = useState(false);
   const [content, setContent] = useState<Record<string, unknown> | null>(null);
   const [error, setError] = useState("");
   const [lightboxOpen, setLightboxOpen] = useState(false);
@@ -350,11 +344,7 @@ function ArtifactRow({
     return () => window.removeEventListener("keydown", close);
   }, [lightboxOpen]);
   const load = () => {
-    if (content || error) {
-      setOpen((value) => !value);
-      return;
-    }
-    setOpen(true);
+    if (content || error) return;
     void invoke<Record<string, unknown>>("read_artifact", {
       sessionId,
       artifactId,
@@ -388,11 +378,17 @@ function ArtifactRow({
       : null;
   return (
     <div className="artifact-inline">
-      <button className="text-left underline" onClick={load}>
-        {kind === "screenshot" ? "View screenshot" : "View diff"}
-      </button>
-      {open && (
-        <div className="mt-1">
+      <details
+        className="transcript-thought transcript-artifact"
+        onToggle={(event) => {
+          if (event.currentTarget.open) load();
+        }}
+      >
+        <summary className="transcript-row-header">
+          <span>{kind === "screenshot" ? "View screenshot" : "View diff"}</span>
+          <TranscriptChevron className="transcript-thought-chevron" />
+        </summary>
+        <div className="transcript-thought-body">
           {error ? (
             <span className="text-red-500">{error}</span>
           ) : image ? (
@@ -410,7 +406,7 @@ function ArtifactRow({
             <span className="text-muted">Loading…</span>
           )}
         </div>
-      )}
+      </details>
       {lightboxOpen && image && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-6"
@@ -434,7 +430,6 @@ export function Transcript({
   sessionId,
   hostName,
   running,
-  onApprove,
   onRetry,
   onQuestionAnswer,
 }: {
@@ -442,16 +437,18 @@ export function Transcript({
   sessionId: string;
   hostName?: string;
   running?: boolean;
-  onApprove?: (
-    item: Extract<Item, { kind: "approval" }>,
-    decision: ApprovalDecision,
-  ) => void;
   onRetry?: () => void;
   onQuestionAnswer?: (callId: string, answer: string) => void;
 }) {
   const nodes = buildTimeline(events);
   const worklogOverrides = useRef(new Set<number>());
   const [worklogOpen, setWorklogOpen] = useState<Record<number, boolean>>({});
+  const [clock, setClock] = useState(() => Date.now());
+  useEffect(() => {
+    if (!running) return;
+    const interval = window.setInterval(() => setClock(Date.now()), 1000);
+    return () => window.clearInterval(interval);
+  }, [running]);
   const lastWorkIndex = nodes.reduce(
     (last, node, index) => (node.kind === "work" ? index : last),
     -1,
@@ -485,33 +482,12 @@ export function Transcript({
             </div>
           );
         if (node.kind === "approval")
-          return (
-            <ApprovalCard
-              key={index}
-              item={{
-                kind: "approval",
-                callId: node.callId,
-                name: node.name,
-                args: node.args,
-                reason: "Tool action requires approval",
-                resolved: node.resolved,
-              }}
-              hostName={hostName}
-              compact
-              onApprove={(decision) =>
-                onApprove?.(
-                  {
-                    kind: "approval",
-                    callId: node.callId,
-                    name: node.name,
-                    args: node.args,
-                    reason: "Tool action requires approval",
-                  },
-                  decision,
-                )
-              }
-            />
-          );
+          return node.resolved ? (
+            <div className="transcript-resolved" key={index}>
+              Worked · {node.resolved === "allow" ? "Allowed" : "Denied"}{" "}
+              {node.name}
+            </div>
+          ) : null;
         if (node.kind === "question")
           return (
             <QuestionCard
@@ -582,15 +558,6 @@ export function Transcript({
                   {row.resultSummary}
                 </span>
               )}
-              {row.detail && !row.thoughtForCallId && (
-                <Thought text={row.detail} label={thoughtLabel(row.label)} />
-              )}
-              {row.callId && thoughtByCallId.get(row.callId)?.detail && (
-                <Thought
-                  text={thoughtByCallId.get(row.callId)?.detail ?? ""}
-                  label={thoughtLabel(thoughtByCallId.get(row.callId)?.label)}
-                />
-              )}
               {(row.terminalOutput || row.terminalTruncated) && (
                 <TerminalOutput
                   output={row.terminalOutput ?? ""}
@@ -607,6 +574,15 @@ export function Transcript({
                 />
               )}
               {row.plan && <PlanCard steps={row.plan.steps} />}
+              {row.detail && !row.thoughtForCallId && (
+                <Thought text={row.detail} label={thoughtLabel(row.label)} />
+              )}
+              {row.callId && thoughtByCallId.get(row.callId)?.detail && (
+                <Thought
+                  text={thoughtByCallId.get(row.callId)?.detail ?? ""}
+                  label={thoughtLabel(thoughtByCallId.get(row.callId)?.label)}
+                />
+              )}
             </div>
           );
         };
@@ -664,7 +640,13 @@ export function Transcript({
             >
               <TranscriptChevron className="transcript-chevron" />
               <span className="transcript-worklog-label">
-                <span>{node.label}</span>
+                <span>
+                  {running &&
+                  index === lastWorkIndex &&
+                  node.startedAt !== undefined
+                    ? `Working for ${Math.max(0, Math.floor((clock - node.startedAt) / 1000))}s`
+                    : node.label}
+                </span>
                 {!!(node.additions || node.deletions) && (
                   <span className="transcript-diff-badges">
                     {node.additions ? (
