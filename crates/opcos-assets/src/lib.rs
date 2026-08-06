@@ -186,6 +186,7 @@ pub const BUILTIN_AGENT_TOOL_NAMES: &[&str] = &[
     "browser_measure",
     "browser_assert_geometry",
     "browser_screenshot",
+    "computer_use",
     "edit_file",
     "action_ledger_begin",
     "action_ledger_finish",

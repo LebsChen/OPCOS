@@ -7,9 +7,13 @@ license.workspace = true
 [dependencies]
 async-trait.workspace = true
 base64.workspace = true
+enigo.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
+png.workspace = true
 opcos-rvm = { path = "../opcos-rvm" }
+opcos-computer-use.workspace = true
+x11rb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -17,3 +21,6 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 uuid.workspace = true
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+xcap.workspace = true

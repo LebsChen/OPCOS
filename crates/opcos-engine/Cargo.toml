@@ -10,6 +10,7 @@ base64.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
 opcos-policy = { path = "../opcos-policy" }
+opcos-computer-use.workspace = true
 opcos-provider = { path = "../opcos-provider" }
 opcos-hosts = { path = "../opcos-hosts" }
 opcos-assets = { path = "../opcos-assets" }

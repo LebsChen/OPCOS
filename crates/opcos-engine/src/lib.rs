@@ -1876,6 +1876,18 @@ where
                 None
             };
             let mut target = mutating_api_target.as_deref().unwrap_or(&target);
+            if call.name == "computer_use" {
+                let action = call
+                    .arguments
+                    .get("action")
+                    .and_then(|value| value.get("action"))
+                    .and_then(Value::as_str);
+                if action == Some("screenshot") {
+                    risk = ToolRisk::External;
+                } else {
+                    risk = ToolRisk::Execute;
+                }
+            }
             let click_origin = if call.name == "browser_click" {
                 self.executor.browser_origin().await
             } else {
@@ -2842,7 +2854,7 @@ fn tool_risk(name: &str) -> ToolRisk {
         | "browser_assert_geometry"
         | "browser_screenshot"
         | "browser_set_viewport" => ToolRisk::Read,
-        "browser_navigate" | "browser_click" => ToolRisk::External,
+        "browser_navigate" | "browser_click" | "computer_use" => ToolRisk::External,
         "background_job_start" | "background_job_kill" => ToolRisk::Execute,
         "background_job_status" | "background_job_output" => ToolRisk::Read,
         _ => ToolRisk::External,
@@ -3331,6 +3343,91 @@ where
     }
 }
 
+fn computer_use_parameters_schema() -> Value {
+    let coordinate = json!({
+        "type": "array",
+        "items": {"type": "integer"},
+        "minItems": 2,
+        "maxItems": 2
+    });
+    let no_args = |action: &str| {
+        json!({
+            "type": "object",
+            "properties": {"action": {"const": action}},
+            "required": ["action"],
+            "additionalProperties": false
+        })
+    };
+    let coordinate_action = |action: &str| {
+        json!({
+            "type": "object",
+            "properties": {"action": {"const": action}, "coordinate": coordinate.clone()},
+            "required": ["action", "coordinate"],
+            "additionalProperties": false
+        })
+    };
+    json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "oneOf": [
+                    no_args("screenshot"),
+                    no_args("cursor_position"),
+                    no_args("wait"),
+                    {
+                        "type": "object",
+                        "properties": {"action": {"const": "key"}, "key": {"type": "string"}},
+                        "required": ["action", "key"], "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "properties": {"action": {"const": "hold_key"}, "key": {"type": "string"}},
+                        "required": ["action", "key"], "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "properties": {"action": {"const": "type"}, "text": {"type": "string"}},
+                        "required": ["action", "text"], "additionalProperties": false
+                    },
+                    coordinate_action("mouse_move"),
+                    {
+                        "type": "object",
+                        "properties": {
+                            "action": {"const": "scroll"},
+                            "coordinate": coordinate.clone(),
+                            "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
+                            "amount": {"type": "integer"}
+                        },
+                        "required": ["action", "coordinate", "direction", "amount"],
+                        "additionalProperties": false
+                    },
+                    coordinate_action("left_click"),
+                    coordinate_action("right_click"),
+                    coordinate_action("middle_click"),
+                    coordinate_action("double_click"),
+                    coordinate_action("triple_click"),
+                    {
+                        "type": "object",
+                        "properties": {
+                            "action": {"const": "left_click_drag"},
+                            "coordinate": coordinate.clone(),
+                            "coordinate2": coordinate.clone()
+                        },
+                        "required": ["action", "coordinate", "coordinate2"],
+                        "additionalProperties": false
+                    },
+                    coordinate_action("left_mouse_down"),
+                    coordinate_action("left_mouse_up")
+                ]
+            },
+            "screen_width": {"type": "integer", "minimum": 1, "description": "Optional when omitted; derived from a screenshot."},
+            "screen_height": {"type": "integer", "minimum": 1, "description": "Optional when omitted; derived from a screenshot."}
+        },
+        "required": ["action"],
+        "additionalProperties": false
+    })
+}
+
 fn tool_definitions() -> Vec<Value> {
     let mut tools = vec![
         json!({"type":"function","function":{"name":"read_file","description":"Read a remote file.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}),
@@ -3345,6 +3442,7 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"browser_measure","description":"Return an element's bounding box and selected computed layout values. Read-only.","parameters":{"type":"object","properties":{"selector":{"type":"string"}},"required":["selector"]}}}),
         json!({"type":"function","function":{"name":"browser_assert_geometry","description":"Check element geometry, including container overflow and overlap between two elements. Read-only.","parameters":{"type":"object","properties":{"first":{"type":"string"},"second":{"type":"string"},"container":{"type":"string"}},"required":["first"]}}}),
         json!({"type":"function","function":{"name":"browser_screenshot","description":"Capture a PNG screenshot from the isolated local browser. Read-only.","parameters":{"type":"object","properties":{}}}}),
+        json!({"type":"function","function":{"name":"computer_use","description":"Perform one validated screenshot or desktop computer-use action. Call screenshot first when screen dimensions are unknown; its returned dimensions can be supplied for coordinate actions. Full-desktop screenshots and input actions are policy-controlled.","parameters":computer_use_parameters_schema()}}),
         json!({"type":"function","function":{"name":"secrets_list","description":"List configured credential names available to the current session. Returns names and non-sensitive metadata only; secret values, prefixes, suffixes, and lengths are never returned. Use a returned name with secret_names for credential injection.","parameters":{"type":"object","properties":{}}}}),
         json!({"type":"function","function":{"name":"background_job_start","description":"Start a long-running shell command in the background and return a job id. Output is retained with bounded storage. Use secret_names for the only supported credential injection path; injected values are redacted.","parameters":{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"},"timeout_seconds":{"type":"integer"},"secret_names":{"type":"array","items":{"type":"string"},"description":"Configured secret names to inject into the child environment."}},"required":["command"]}}}),
         json!({"type":"function","function":{"name":"background_job_status","description":"Read a background job status, exit code, and output counters.","parameters":{"type":"object","properties":{"job_id":{"type":"string"}},"required":["job_id"]}}}),

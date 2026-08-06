@@ -2,12 +2,12 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
+pub use opcos_computer_use::{ComputerUseAction, ComputerUseResponse, ScreenBounds, Screenshot};
 pub use opcos_rvm::ExecRequest;
 use opcos_rvm::{
     Capabilities as RvmCapabilities, CommandResult, HttpRvmClient, RvmClient, RvmError,
     RvmWebSocket, WsKind, WsParams,
 };
-pub use opcos_rvm::{ComputerUseAction, ComputerUseResponse, ScreenBounds, Screenshot};
 pub use opcos_rvm::{DEFAULT_EXEC_TIMEOUT_SECONDS, LIFECYCLE_EXEC_TIMEOUT_SECONDS};
 pub use opcos_rvm::{DirectoryListing, ExecResult, FileContent, Health};
 pub use opcos_rvm::{StorageHash, StorageStat};
@@ -30,6 +30,8 @@ use tokio::{
     time,
 };
 use uuid::Uuid;
+mod local_desktop;
+use local_desktop::LocalDesktop;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -2394,6 +2396,7 @@ pub struct LocalHost {
     root: PathBuf,
     sessions: Arc<Mutex<HashMap<String, LocalShell>>>,
     secret_values: SecretValues,
+    desktop: Arc<LocalDesktop>,
 }
 
 #[derive(Debug)]
@@ -2422,6 +2425,7 @@ impl LocalHost {
             secret_values: Arc::new(RwLock::new(
                 secret_values.into_iter().filter(|v| v.len() >= 8).collect(),
             )),
+            desktop: Arc::new(LocalDesktop::new()),
         })
     }
 
@@ -2435,6 +2439,7 @@ impl LocalHost {
             root,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             secret_values,
+            desktop: Arc::new(LocalDesktop::new()),
         })
     }
 
@@ -2490,7 +2495,7 @@ impl LocalHost {
         Ok(canonical)
     }
 
-    fn capability_items(observed_at: DateTime<Utc>) -> HostCapabilities {
+    fn capability_items(&self, observed_at: DateTime<Utc>) -> HostCapabilities {
         let available = [
             "exec",
             "exec_sync",
@@ -2502,11 +2507,10 @@ impl LocalHost {
             "stdio",
             "lsp",
         ];
+        let (screenshot_reason, computer_use_reason) = self.desktop.capability_reasons();
         let unavailable = [
             ("pty", "not implemented by the in-process LocalHost"),
             ("vnc", "not available for the in-process LocalHost"),
-            ("computer_use", "not available for the in-process LocalHost"),
-            ("screenshot", "not available for the in-process LocalHost"),
             ("ide", "not available for the in-process LocalHost"),
             ("mcp", "not available for the in-process LocalHost"),
         ];
@@ -2529,6 +2533,18 @@ impl LocalHost {
             observed_at,
             reason: Some(reason.into()),
         }));
+        for (name, reason) in [
+            ("screenshot", screenshot_reason),
+            ("computer_use", computer_use_reason),
+        ] {
+            items.push(Capability {
+                name: name.into(),
+                available: reason.is_none(),
+                source: "runtime".into(),
+                observed_at,
+                reason,
+            });
+        }
         HostCapabilities { observed_at, items }
     }
 }
@@ -2566,7 +2582,21 @@ impl Host for LocalHost {
     }
 
     async fn capabilities(&self) -> Result<HostCapabilities, HostError> {
-        Ok(Self::capability_items(Utc::now()))
+        Ok(self.capability_items(Utc::now()))
+    }
+
+    async fn screenshot(&self) -> Result<Screenshot, HostError> {
+        self.desktop.screenshot().map_err(HostError::Unsupported)
+    }
+
+    async fn computer_use(
+        &self,
+        action: ComputerUseAction,
+        bounds: ScreenBounds,
+    ) -> Result<ComputerUseResponse, HostError> {
+        self.desktop
+            .computer_use(action, bounds)
+            .map_err(HostError::Unsupported)
     }
 
     async fn exec(&self, request: ExecRequest) -> Result<ExecResult, HostError> {
