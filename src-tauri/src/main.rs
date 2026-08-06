@@ -9377,7 +9377,7 @@ async fn engine_for_with_context(
         String::new()
     };
     let base_url = if provider_id == "cloudflare" {
-        format!("https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1")
+        registry::cloudflare_base_url(&account_id)?
     } else {
         base_url
     };
@@ -13186,10 +13186,11 @@ async fn provider_models_for_state(
         String::new()
     };
     let base_url = if provider == "cloudflare" && !account_id.is_empty() {
-        format!("https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1")
+        registry::cloudflare_base_url(&account_id)?
     } else {
         configured_base_url.unwrap_or_default()
     };
+    let account_id = (provider == "cloudflare").then_some(account_id.as_str());
     let region = if provider == "bedrock" {
         let connection = state
             .database
@@ -13204,8 +13205,6 @@ async fn provider_models_for_state(
             .ok()
             .or_else(|| std::env::var("AWS_REGION").ok())
             .unwrap_or_else(|| "us-east-1".into())
-    } else if provider == "cloudflare" {
-        account_id.clone()
     } else {
         String::new()
     };
@@ -13272,6 +13271,7 @@ async fn provider_models_for_state(
             (!base_url.is_empty()).then_some(base_url.as_str()),
             key.as_deref(),
             (!region.is_empty()).then_some(region.as_str()),
+            account_id,
         )
         .await
     };
@@ -21784,13 +21784,6 @@ fn provider_configurations(state: State<'_, DesktopState>) -> Result<Vec<Value>,
                 .map_err(|error| error.to_string())?
                 .is_some()
                 || descriptor.name == "ollama";
-            let key = format!("provider.base_url.{}", descriptor.name);
-            let base_url = connection
-                .query_row("SELECT value FROM settings WHERE key=?1", [&key], |row| {
-                    row.get::<_, String>(0)
-                })
-                .ok()
-                .or(descriptor.default_base_url.clone());
             let account_id = (descriptor.name == "cloudflare")
                 .then(|| {
                     connection
@@ -21802,6 +21795,19 @@ fn provider_configurations(state: State<'_, DesktopState>) -> Result<Vec<Value>,
                         .ok()
                 })
                 .flatten();
+            let key = format!("provider.base_url.{}", descriptor.name);
+            let configured_base_url = connection
+                .query_row("SELECT value FROM settings WHERE key=?1", [&key], |row| {
+                    row.get::<_, String>(0)
+                })
+                .ok();
+            let base_url = provider_base_url(
+                &descriptor.name,
+                configured_base_url.as_deref(),
+                account_id.as_deref(),
+                descriptor.default_base_url.as_deref(),
+            )
+            .ok();
             Ok(json!({
                 "provider": descriptor.name,
                 "base_url": base_url,
@@ -21832,19 +21838,12 @@ fn save_provider_settings(
     } else {
         None
     };
-    let base_url = if provider == "cloudflare" {
-        format!(
-            "https://api.cloudflare.com/client/v4/accounts/{}/ai/v1",
-            account_id.as_deref().unwrap_or_default()
-        )
-    } else {
-        base_url
-            .filter(|value| !value.trim().is_empty())
-            .or(descriptor.default_base_url)
-            .ok_or_else(|| {
-                "provider base URL is not configured; enter one in Provider settings".to_owned()
-            })?
-    };
+    let base_url = provider_base_url(
+        &provider,
+        base_url.as_deref(),
+        account_id.as_deref(),
+        descriptor.default_base_url.as_deref(),
+    )?;
     url::Url::parse(&base_url).map_err(|_| "provider base URL is invalid".to_owned())?;
     let connection = state
         .database
@@ -21878,6 +21877,22 @@ fn save_provider_settings(
             .map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+fn provider_base_url(
+    provider: &str,
+    configured: Option<&str>,
+    account_id: Option<&str>,
+    default: Option<&str>,
+) -> Result<String, String> {
+    if provider == "cloudflare" {
+        return registry::cloudflare_base_url(account_id.unwrap_or_default());
+    }
+    configured
+        .filter(|value| !value.trim().is_empty())
+        .or(default)
+        .map(str::to_owned)
+        .ok_or_else(|| "provider base URL is not configured; enter one in Provider settings".into())
 }
 
 #[tauri::command]
@@ -21927,10 +21942,9 @@ async fn validate_provider_key(
         None
     };
     let base_url = if provider == "cloudflare" {
-        Some(format!(
-            "https://api.cloudflare.com/client/v4/accounts/{}/ai/v1",
-            account_id.as_deref().unwrap_or_default()
-        ))
+        Some(registry::cloudflare_base_url(
+            account_id.as_deref().unwrap_or_default(),
+        )?)
     } else {
         configured_base_url.or(descriptor.default_base_url)
     };
@@ -21939,8 +21953,6 @@ async fn validate_provider_key(
     }
     let region = if provider == "bedrock" {
         std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into())
-    } else if provider == "cloudflare" {
-        account_id.unwrap_or_default()
     } else {
         String::new()
     };
@@ -21950,6 +21962,7 @@ async fn validate_provider_key(
         base_url.as_deref(),
         key.as_deref(),
         (!region.is_empty()).then_some(region.as_str()),
+        account_id.as_deref(),
     )
     .await
     .map(|_| true)
@@ -22400,6 +22413,14 @@ fn main() {
 #[cfg(test)]
 mod m7_tests {
     use super::*;
+
+    #[test]
+    fn cloudflare_save_url_is_composed_without_manual_base_url() {
+        assert_eq!(
+            provider_base_url("cloudflare", None, Some("account-123"), None).unwrap(),
+            "https://api.cloudflare.com/client/v4/accounts/account-123/ai/v1"
+        );
+    }
 
     #[test]
     fn builtin_prompt_tools_are_present_in_local_tool_catalog_and_allowlist() {

@@ -1,7 +1,7 @@
 use crate::matrix::limit_caps_for_model;
 use crate::{
-    AssistantTurn, Caps, Provider, ProviderConfig, ProviderError, ProviderRequest, StreamChunk,
-    TRANSIENT_RETRY_LIMIT, TokenUsage, ToolCall, ToolCallDelta, apply_bearer_headers,
+    AssistantTurn, Caps, Provider, ProviderConfig, ProviderDialect, ProviderError, ProviderRequest,
+    StreamChunk, TRANSIENT_RETRY_LIMIT, TokenUsage, ToolCall, ToolCallDelta, apply_bearer_headers,
     classify_context_error, client, is_transient_request_error, is_transient_status, retry_delay,
     sanitize_secret, settings_object, stream_client, tool_schema,
 };
@@ -21,9 +21,9 @@ impl OpenAiProvider {
     }
 
     pub fn new_cloudflare(config: ProviderConfig) -> Self {
-        let mut config = config;
-        config.cloudflare = true;
-        Self { config }
+        Self {
+            config: config.cloudflare(),
+        }
     }
 
     fn body(&self, request: &ProviderRequest, stream: bool) -> Value {
@@ -128,7 +128,7 @@ impl OpenAiProvider {
                 transient_attempt = 0;
                 continue;
             }
-            let message = if self.config.cloudflare {
+            let message = if self.config.dialect == ProviderDialect::Cloudflare {
                 cloudflare_error_message(&text)
                     .unwrap_or_else(|| sanitize_secret(&text, self.config.api_key.expose()))
             } else {
@@ -476,7 +476,7 @@ async fn stream_once(
                 continue;
             };
             if let Some(value) = usage(value.get("usage")) {
-                let value = if provider.config.cloudflare {
+                let value = if provider.config.dialect == ProviderDialect::Cloudflare {
                     let previous: TokenUsage = final_usage.clone().unwrap_or_default();
                     TokenUsage {
                         input: previous.input.saturating_add(value.input),
@@ -636,6 +636,7 @@ mod tests {
             "cloudflare",
             None,
             Some(&token),
+            None,
             Some(&account_id),
         )
         .await
@@ -645,7 +646,7 @@ mod tests {
                 .iter()
                 .any(|model| model.id == "@cf/zai-org/glm-4.7-flash")
         );
-        let base_url = format!("https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1");
+        let base_url = crate::registry::cloudflare_base_url(&account_id).expect("account id");
         let provider = OpenAiProvider::new_cloudflare(ProviderConfig::new(&base_url, token));
         let request = ProviderRequest {
             model: "@cf/zai-org/glm-4.7-flash".into(),

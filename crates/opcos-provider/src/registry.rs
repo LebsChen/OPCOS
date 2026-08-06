@@ -329,6 +329,16 @@ pub fn descriptors() -> Vec<ProviderDescriptor> {
     ]
 }
 
+pub fn cloudflare_base_url(account_id: &str) -> Result<String, String> {
+    let account_id = account_id.trim();
+    if account_id.is_empty() {
+        return Err("Cloudflare account ID is required".to_owned());
+    }
+    Ok(format!(
+        "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1"
+    ))
+}
+
 fn field(key: &str, label: &str, secret: bool, required: bool) -> ProviderField {
     ProviderField {
         key: key.into(),
@@ -657,7 +667,9 @@ fn parse_cloudflare_models(body: &serde_json::Value) -> Vec<DiscoveredModel> {
         .filter_map(|model| {
             let id = model.get("name").and_then(Value::as_str)?.to_owned();
             let mut discovered = model_from_id("cloudflare", id);
-            if let Some(description) = model.get("description").and_then(Value::as_str) {
+            if discovered.label == discovered.id
+                && let Some(description) = model.get("description").and_then(Value::as_str)
+            {
                 discovered.label = format!("{} · {description}", discovered.label);
             }
             let property = |name: &str| {
@@ -677,6 +689,14 @@ fn parse_cloudflare_models(body: &serde_json::Value) -> Vec<DiscoveredModel> {
             {
                 discovered.capabilities.context_window = Some(context);
                 discovered.capabilities.context_window_source = Some("gateway".into());
+                discovered.capabilities_known = true;
+            }
+            if let Some(function_calling) = property("function_calling").and_then(|value| {
+                value
+                    .as_bool()
+                    .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+            }) {
+                discovered.capabilities.tools = function_calling;
                 discovered.capabilities_known = true;
             }
             Some(discovered)
@@ -734,10 +754,11 @@ pub async fn discover_provider_models(
     base_url: Option<&str>,
     api_key: Option<&str>,
     region: Option<&str>,
+    account_id: Option<&str>,
 ) -> Result<Vec<DiscoveredModel>, String> {
     match provider {
         "cloudflare" => {
-            let account_id = region
+            let account_id = account_id
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| "Cloudflare account ID is not configured".to_owned())?;
             let key = api_key
@@ -909,22 +930,52 @@ mod tests {
                     "name": "@cf/zai-org/glm-5.2",
                     "description": "reasoning model",
                     "task": {"name": "Text Generation"},
-                    "properties": [{"property_id": "context_window", "value": "262144"}]
+                    "properties": [
+                        {"property_id": "context_window", "value": "262144"},
+                        {"property_id": "function_calling", "value": "false"}
+                    ]
                 },
                 {
                     "name": "@cf/foo/embed",
                     "task": {"name": "Embeddings"},
                     "properties": []
+                },
+                {
+                    "name": "@cf/foo/new-model",
+                    "description": "new model",
+                    "task": {"name": "Text Generation"},
+                    "properties": []
+                },
+                {
+                    "name": "@cf/zai-org/glm-4.7-flash",
+                    "description": "flash model",
+                    "task": {"name": "Text Generation"},
+                    "properties": []
                 }
             ]
         }));
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].id, "@cf/zai-org/glm-5.2");
-        assert_eq!(models[0].capabilities.context_window, Some(262_144));
+        assert_eq!(models.len(), 3);
+        let glm = models
+            .iter()
+            .find(|model| model.id.ends_with("glm-5.2"))
+            .unwrap();
+        assert_eq!(glm.capabilities.context_window, Some(262_144));
         assert_eq!(
-            models[0].capabilities.context_window_source.as_deref(),
+            glm.capabilities.context_window_source.as_deref(),
             Some("gateway")
         );
+        assert!(!glm.capabilities.tools);
+        assert_eq!(glm.label, "GLM-5.2 · Cloudflare Workers AI");
+        let known = models
+            .iter()
+            .find(|model| model.id.ends_with("glm-4.7-flash"))
+            .unwrap();
+        assert_eq!(known.label, "GLM-4.7 Flash · Cloudflare Workers AI");
+        let unknown = models
+            .iter()
+            .find(|model| model.id.ends_with("new-model"))
+            .unwrap();
+        assert_eq!(unknown.label, "@cf/foo/new-model · new model");
     }
 
     #[test]
@@ -1168,6 +1219,7 @@ mod tests {
             Some(&format!("http://{address}")),
             Some("test-key"),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1200,6 +1252,7 @@ mod tests {
             Some(&format!("http://{address}")),
             Some("test-key"),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1225,6 +1278,7 @@ mod tests {
             "openai",
             Some(&format!("http://{address}")),
             Some("sk-secret-test-key"),
+            None,
             None,
         )
         .await
