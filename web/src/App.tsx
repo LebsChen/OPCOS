@@ -4487,6 +4487,10 @@ function ManageSections({
               );
               const currentUrl =
                 config?.base_url || descriptor.default_base_url || "";
+              const isCloudflare = descriptor.name === "cloudflare";
+              const accountField = descriptor.fields?.find(
+                (field) => field.key === "account_id",
+              );
               return (
                 <div>
                   <button
@@ -4514,38 +4518,45 @@ function ManageSections({
                   </div>
                   <div className="form-grid mt-4">
                     <label>
-                      Base URL
+                      {isCloudflare ? "Base URL (derived)" : "Base URL"}
                       <input
                         type="url"
                         value={currentUrl}
-                        onChange={(event) =>
-                          setProviderConfigs((items) => {
-                            const found = items.some(
-                              (item) => item.provider === descriptor.name,
-                            );
-                            return found
-                              ? items.map((item) =>
-                                  item.provider === descriptor.name
-                                    ? { ...item, base_url: event.target.value }
-                                    : item,
-                                )
-                              : [
-                                  ...items,
-                                  {
-                                    provider: descriptor.name,
-                                    base_url: event.target.value,
-                                    configured: Boolean(config?.configured),
-                                  },
-                                ];
-                          })
+                        readOnly={isCloudflare}
+                        onChange={
+                          isCloudflare
+                            ? undefined
+                            : (event) =>
+                                setProviderConfigs((items) => {
+                                  const found = items.some(
+                                    (item) => item.provider === descriptor.name,
+                                  );
+                                  return found
+                                    ? items.map((item) =>
+                                        item.provider === descriptor.name
+                                          ? {
+                                              ...item,
+                                              base_url: event.target.value,
+                                            }
+                                          : item,
+                                      )
+                                    : [
+                                        ...items,
+                                        {
+                                          provider: descriptor.name,
+                                          base_url: event.target.value,
+                                          configured: Boolean(
+                                            config?.configured,
+                                          ),
+                                        },
+                                      ];
+                                })
                         }
                       />
                     </label>
-                    {descriptor.fields?.some(
-                      (field) => field.key === "account_id",
-                    ) && (
+                    {accountField && (
                       <label>
-                        Cloudflare account ID
+                        {accountField.label}
                         <input
                           value={config?.account_id || ""}
                           onChange={(event) =>
