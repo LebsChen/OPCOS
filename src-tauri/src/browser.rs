@@ -567,6 +567,23 @@ mod tests {
             "browser cold-start reached CDP and navigated in {:?}",
             started.elapsed()
         );
+        for _ in 0..20 {
+            let page = browser
+                .execute(BrowserRequest {
+                    operation: "read".into(),
+                    arguments: json!({"selector":"body"}),
+                })
+                .await
+                .unwrap();
+            let html = page.get("html").and_then(Value::as_str).unwrap_or_default();
+            if ["container", "wide", "art", "hero"]
+                .iter()
+                .all(|id| html.contains(&format!("id=\"{id}\"")))
+            {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
         browser
             .execute(BrowserRequest {
                 operation: "set_viewport".into(),
