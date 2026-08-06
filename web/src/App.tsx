@@ -3508,6 +3508,16 @@ function ManageSections({
     {},
   );
   const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
+  const [customProviderEditorOpen, setCustomProviderEditorOpen] =
+    useState(false);
+  const [customProviderId, setCustomProviderId] = useState<string | null>(null);
+  const [customProviderName, setCustomProviderName] = useState("");
+  const [customProviderDialect, setCustomProviderDialect] =
+    useState("openai-compatible");
+  const [customProviderBaseUrl, setCustomProviderBaseUrl] = useState("");
+  const [customProviderKey, setCustomProviderKey] = useState("");
+  const [customProviderModel, setCustomProviderModel] = useState("");
+  const [customProviderStatus, setCustomProviderStatus] = useState("");
   const [assetTitle, setAssetTitle] = useState("");
   const [assetBody, setAssetBody] = useState("");
   const [instructionsDraft, setInstructionsDraft] = useState("");
@@ -4489,50 +4499,86 @@ function ManageSections({
         )}
         {tab === "provider" &&
           (selectedProvider === null ? (
-            <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,440px),440px))] gap-2.5">
-              {providers.map((descriptor) => {
-                const config = providerConfigs.find(
-                  (item) => item.provider === descriptor.name,
-                );
-                return (
-                  <IntegrationCard
-                    key={descriptor.name}
-                    icon={descriptor.title.slice(0, 1)}
-                    title={descriptor.title}
-                    badge={{
-                      label:
+            <div className="space-y-3">
+              <div className="flex justify-end">
+                <Button
+                  className="primary"
+                  onClick={() => {
+                    setCustomProviderId(null);
+                    setCustomProviderName("");
+                    setCustomProviderDialect("openai-compatible");
+                    setCustomProviderBaseUrl("");
+                    setCustomProviderKey("");
+                    setCustomProviderModel("");
+                    setCustomProviderStatus("");
+                    setCustomProviderEditorOpen(true);
+                  }}
+                >
+                  添加自定义 Provider
+                </Button>
+              </div>
+              <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,440px),440px))] gap-2.5">
+                {providers.map((descriptor) => {
+                  const config = providerConfigs.find(
+                    (item) => item.provider === descriptor.name,
+                  );
+                  return (
+                    <IntegrationCard
+                      key={descriptor.name}
+                      icon={descriptor.title.slice(0, 1)}
+                      title={descriptor.title}
+                      badge={{
+                        label:
+                          descriptor.available === false
+                            ? "Not integrated"
+                            : config?.configured
+                              ? "Enabled"
+                              : "Not configured",
+                        tone:
+                          descriptor.available === false || !config?.configured
+                            ? "neutral"
+                            : "success",
+                      }}
+                      description={
                         descriptor.available === false
-                          ? "Not integrated"
+                          ? "Not integrated."
                           : config?.configured
-                            ? "Enabled"
-                            : "Not configured",
-                      tone:
-                        descriptor.available === false || !config?.configured
-                          ? "neutral"
-                          : "success",
-                    }}
-                    description={
-                      descriptor.available === false
-                        ? "Not integrated."
-                        : config?.configured
-                          ? "Configured securely."
-                          : config?.base_url || "Not configured yet."
-                    }
-                    disabled={descriptor.available === false}
-                    onClick={() =>
-                      descriptor.available !== false &&
-                      setSelectedProvider(descriptor.name)
-                    }
-                    actions={
-                      descriptor.available !== false ? (
-                        <span className="ml-auto text-faint text-[14px]">
-                          ›
-                        </span>
-                      ) : undefined
-                    }
-                  />
-                );
-              })}
+                            ? "Configured securely."
+                            : config?.base_url || "Not configured yet."
+                      }
+                      disabled={descriptor.available === false}
+                      onClick={() => {
+                        if (descriptor.available === false) return;
+                        if (descriptor.name.startsWith("custom-")) {
+                          setCustomProviderId(descriptor.name);
+                          setCustomProviderName(descriptor.title);
+                          setCustomProviderDialect("openai-compatible");
+                          setCustomProviderBaseUrl(
+                            config?.base_url ||
+                              descriptor.default_base_url ||
+                              "",
+                          );
+                          setCustomProviderKey("");
+                          setCustomProviderModel(
+                            descriptor.recommended_model || "",
+                          );
+                          setCustomProviderStatus("");
+                          setCustomProviderEditorOpen(true);
+                        } else {
+                          setSelectedProvider(descriptor.name);
+                        }
+                      }}
+                      actions={
+                        descriptor.available !== false ? (
+                          <span className="ml-auto text-faint text-[14px]">
+                            ›
+                          </span>
+                        ) : undefined
+                      }
+                    />
+                  );
+                })}
+              </div>
             </div>
           ) : (
             (() => {
@@ -4900,6 +4946,161 @@ function ManageSections({
                 {providerStatus}
               </div>
             )}
+          </div>
+        )}
+        {tab === "provider" && customProviderEditorOpen && (
+          <div
+            className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4"
+            onClick={() => setCustomProviderEditorOpen(false)}
+          >
+            <section
+              className="w-full max-w-2xl space-y-3 rounded-xl border border-line bg-panel p-5 shadow-xl"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="flex items-center justify-between">
+                <strong>
+                  {customProviderId
+                    ? "编辑自定义 Provider"
+                    : "添加自定义 Provider"}
+                </strong>
+                <button
+                  className="text-muted hover:text-ink"
+                  onClick={() => setCustomProviderEditorOpen(false)}
+                >
+                  ×
+                </button>
+              </div>
+              <div className="form-grid">
+                <label>
+                  Name
+                  <input
+                    className="input"
+                    value={customProviderName}
+                    onChange={(event) =>
+                      setCustomProviderName(event.target.value)
+                    }
+                    placeholder="NextAPI"
+                  />
+                </label>
+                <label>
+                  API dialect
+                  <select
+                    className="input"
+                    value={customProviderDialect}
+                    onChange={(event) =>
+                      setCustomProviderDialect(event.target.value)
+                    }
+                  >
+                    <option value="openai-compatible">OpenAI-compatible</option>
+                    <option value="cloudflare">Cloudflare</option>
+                  </select>
+                </label>
+                <label>
+                  Base URL
+                  <input
+                    className="input"
+                    type="url"
+                    value={customProviderBaseUrl}
+                    onChange={(event) =>
+                      setCustomProviderBaseUrl(event.target.value)
+                    }
+                    placeholder="https://api.nextapi.store/v1"
+                  />
+                </label>
+                <label>
+                  Model
+                  <input
+                    className="input"
+                    value={customProviderModel}
+                    onChange={(event) =>
+                      setCustomProviderModel(event.target.value)
+                    }
+                    placeholder="glm-5.2"
+                  />
+                </label>
+                <label className="sm:col-span-2">
+                  Key
+                  <input
+                    className="input"
+                    type="password"
+                    value={customProviderKey}
+                    onChange={(event) =>
+                      setCustomProviderKey(event.target.value)
+                    }
+                    placeholder={customProviderId ? "Stored securely" : ""}
+                  />
+                </label>
+              </div>
+              <div className="flex items-center justify-end gap-2">
+                <Button onClick={() => setCustomProviderEditorOpen(false)}>
+                  关闭
+                </Button>
+                <Button
+                  className="primary"
+                  onClick={() => {
+                    setCustomProviderStatus("Validating…");
+                    void command<string>("save_custom_provider", {
+                      id: customProviderId,
+                      name: customProviderName,
+                      dialect: customProviderDialect,
+                      baseUrl: customProviderBaseUrl,
+                      model: customProviderModel,
+                    })
+                      .then((providerId) =>
+                        command<boolean>("validate_provider_key", {
+                          provider: providerId,
+                          key: customProviderKey || null,
+                        }).then((valid) => ({ providerId, valid })),
+                      )
+                      .then(({ providerId, valid }) => {
+                        if (!valid) {
+                          throw new Error("Provider key validation failed.");
+                        }
+                        return command("save_provider_settings", {
+                          provider: providerId,
+                          baseUrl: customProviderBaseUrl,
+                          accountId: null,
+                          model: customProviderModel,
+                        })
+                          .then(() =>
+                            customProviderKey
+                              ? command("save_provider_key", {
+                                  provider: providerId,
+                                  key: customProviderKey,
+                                  projectId: null,
+                                })
+                              : undefined,
+                          )
+                          .then(() => onRefresh());
+                      })
+                      .then(() => {
+                        setCustomProviderKey("");
+                        setCustomProviderStatus(
+                          "Provider key validated successfully.",
+                        );
+                        setCustomProviderEditorOpen(false);
+                      })
+                      .catch((error) =>
+                        setCustomProviderStatus(errorMessage(error)),
+                      );
+                  }}
+                >
+                  验证并保存
+                </Button>
+              </div>
+              {customProviderStatus && (
+                <div
+                  className={
+                    customProviderStatus.includes("failed") ||
+                    customProviderStatus.includes("Failed")
+                      ? "failure"
+                      : "text-muted text-sm"
+                  }
+                >
+                  {customProviderStatus}
+                </div>
+              )}
+            </section>
           </div>
         )}
         {tab === "hosts" && (
@@ -10641,6 +10842,10 @@ function AppContent() {
         onSelectSession={(id: string) => {
           const next = sessions.find((item) => item.id === id);
           if (!next) return;
+          const project = next.project_id
+            ? projects.find((item) => item.id === next.project_id)
+            : undefined;
+          if (project) setSelectedProject(project);
           setSelected(next);
           setSurface("session");
         }}
