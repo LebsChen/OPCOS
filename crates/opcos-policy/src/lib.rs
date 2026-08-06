@@ -40,6 +40,111 @@ pub struct PermissionRules {
     pub allow: Vec<String>,
     #[serde(default)]
     pub deny: Vec<String>,
+    #[serde(default)]
+    pub mutating_api_gate: Option<bool>,
+}
+
+pub fn mutating_http_target(command: &str) -> Option<String> {
+    // Deliberately conservative shell-text heuristic: variable-built URLs,
+    // scripts, and language HTTP clients are outside this check.
+    if !command.split_whitespace().any(|token| {
+        matches!(
+            token.trim_matches(|character: char| "'\";,|()".contains(character)),
+            "curl" | "wget" | "http"
+        )
+    }) {
+        return None;
+    }
+    let mutating = command_tokens_mutate(command);
+    if !mutating {
+        return None;
+    }
+    let host = command
+        .split_whitespace()
+        .filter_map(|token| {
+            token
+                .strip_prefix("http://")
+                .or_else(|| token.strip_prefix("https://"))
+        })
+        .map(|token| token.trim_matches(|character: char| "'\"),;".contains(character)))
+        .find_map(|url| {
+            let authority = url.split('/').next().unwrap_or_default();
+            let host = authority.rsplit('@').next().unwrap_or(authority);
+            let host = host
+                .split(':')
+                .next()
+                .unwrap_or(host)
+                .trim_matches(['[', ']']);
+            (!is_local_http_host(host)).then(|| host.to_ascii_lowercase())
+        })?;
+    Some(format!("mutating_http:{host}"))
+}
+
+fn command_tokens_mutate(command: &str) -> bool {
+    let tokens = command
+        .split_whitespace()
+        .map(|token| token.trim_matches(|character: char| "'\";,|()".contains(character)))
+        .collect::<Vec<_>>();
+    for (index, token) in tokens.iter().enumerate() {
+        let lower = token.to_ascii_lowercase();
+        if lower == "http"
+            && tokens.get(index + 1).is_some_and(|method| {
+                matches!(
+                    method.to_ascii_lowercase().as_str(),
+                    "post" | "put" | "patch" | "delete"
+                )
+            })
+        {
+            return true;
+        }
+        let short_method = token.strip_prefix("-X");
+        let long_method = lower
+            .strip_prefix("--request=")
+            .or_else(|| lower.strip_prefix("--method="));
+        if short_method.or(long_method).is_some_and(|method| {
+            matches!(
+                method.to_ascii_lowercase().as_str(),
+                "post" | "put" | "patch" | "delete"
+            )
+        }) || matches!(*token, "-X" | "--request" | "--method")
+            && tokens.get(index + 1).is_some_and(|method| {
+                matches!(
+                    method.to_ascii_lowercase().as_str(),
+                    "post" | "put" | "patch" | "delete"
+                )
+            })
+        {
+            return true;
+        }
+        if matches!(
+            *token,
+            "-d" | "-F"
+                | "-T"
+                | "--data"
+                | "--data-raw"
+                | "--data-binary"
+                | "--data-urlencode"
+                | "--upload-file"
+        ) || token.starts_with("-d")
+            || token.starts_with("-F")
+            || token.starts_with("-T")
+            || lower.starts_with("--data=")
+            || lower.starts_with("--upload-file=")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_local_http_host(host: &str) -> bool {
+    host == "localhost"
+        || host == "::1"
+        || host == "0:0:0:0:0:0:0:1"
+        || host == "0.0.0.0"
+        || host == "::"
+        || host == "127.0.0.1"
+        || host.starts_with("127.")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -288,6 +393,56 @@ mod tests {
         assert_eq!(
             classify(PermissionMode::Interactive, true, false),
             Decision::NeedsUser
+        );
+    }
+
+    #[test]
+    fn mutating_http_gate_detects_external_writes_but_not_gets_or_local_calls() {
+        assert_eq!(
+            mutating_http_target(
+                "curl -X PUT https://api.cloudflare.com/client/v4/accounts/id/cfd_tunnel/tunnel/configurations"
+            ),
+            Some("mutating_http:api.cloudflare.com".into())
+        );
+        assert_eq!(
+            mutating_http_target("curl 'https://api.cloudflare.com/client/v4/zones'"),
+            None
+        );
+        assert_eq!(
+            mutating_http_target("curl -f https://api.example.com/thing"),
+            None
+        );
+        assert_eq!(
+            mutating_http_target("wget -t 3 https://example.com/file"),
+            None
+        );
+        assert_eq!(
+            mutating_http_target("curl -D headers.txt https://example.com/file"),
+            None
+        );
+        assert_eq!(
+            mutating_http_target("curl -F field=value https://example.com/upload"),
+            Some("mutating_http:example.com".into())
+        );
+        assert_eq!(
+            mutating_http_target("curl -T payload.txt https://example.com/upload"),
+            Some("mutating_http:example.com".into())
+        );
+        assert_eq!(
+            mutating_http_target("curl -d payload https://example.com/upload"),
+            Some("mutating_http:example.com".into())
+        );
+        assert_eq!(
+            mutating_http_target("curl -X POST http://127.0.0.1:3000/api"),
+            None
+        );
+        assert_eq!(
+            mutating_http_target("wget --method=PATCH --body-data='{}' https://example.com/api"),
+            Some("mutating_http:example.com".into())
+        );
+        assert_eq!(
+            mutating_http_target("http DELETE https://example.com/resource"),
+            Some("mutating_http:example.com".into())
         );
     }
 
