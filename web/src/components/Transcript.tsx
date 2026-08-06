@@ -1,7 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { type ApprovalDecision, type Item } from "../types";
-import { buildTimeline, type TimelineEvent } from "../timeline";
+import {
+  buildTimeline,
+  type TimelineEvent,
+  type TimelineNode,
+} from "../timeline";
 import { ApprovalCard } from "./ApprovalCard";
 import { Markdown } from "./Markdown";
 
@@ -60,6 +64,31 @@ function Thought({
 
 function thoughtLabel(label?: string): string {
   return label?.startsWith("Thought for ") ? label : "Thought details";
+}
+
+function UserBubbleContent({
+  attachments,
+  text,
+}: Pick<Extract<TimelineNode, { kind: "user" }>, "attachments" | "text">) {
+  return (
+    <>
+      {attachments?.map((attachment) =>
+        attachment.kind === "image" ? (
+          <img
+            key={attachment.name}
+            className="msg-img"
+            src={attachment.data_url}
+            alt={attachment.name}
+          />
+        ) : (
+          <span key={attachment.name} className="msg-file">
+            📄 {attachment.name}
+          </span>
+        ),
+      )}
+      {text}
+    </>
+  );
 }
 
 function PlanCard({
@@ -272,45 +301,14 @@ export function Transcript({
         if (node.kind === "user")
           return (
             <div className="group transcript-user-message self-end" key={index}>
-              {node.text.length > 800 ? (
-                <details className="transcript-user-collapsible">
-                  <summary className="bubble-user transcript-user-bubble">
-                    {node.attachments?.map((attachment) =>
-                      attachment.kind === "image" ? (
-                        <img
-                          key={attachment.name}
-                          className="msg-img"
-                          src={attachment.data_url}
-                          alt={attachment.name}
-                        />
-                      ) : (
-                        <span key={attachment.name} className="msg-file">
-                          📄 {attachment.name}
-                        </span>
-                      ),
-                    )}
-                    {node.text}
-                  </summary>
-                </details>
-              ) : (
-                <div className="bubble-user transcript-user-bubble">
-                  {node.attachments?.map((attachment) =>
-                    attachment.kind === "image" ? (
-                      <img
-                        key={attachment.name}
-                        className="msg-img"
-                        src={attachment.data_url}
-                        alt={attachment.name}
-                      />
-                    ) : (
-                      <span key={attachment.name} className="msg-file">
-                        📄 {attachment.name}
-                      </span>
-                    ),
-                  )}
-                  {node.text}
-                </div>
-              )}
+              <details className="transcript-user-collapsible">
+                <summary className="bubble-user transcript-user-bubble">
+                  <UserBubbleContent
+                    attachments={node.attachments}
+                    text={node.text}
+                  />
+                </summary>
+              </details>
               <BubbleMeta text={node.text} ts={node.ts} />
             </div>
           );

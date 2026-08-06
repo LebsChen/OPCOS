@@ -555,14 +555,18 @@ h3 {
 }
 .transcript-user-bubble {
   max-width: min(100%, 560px);
-  max-height: 320px;
-  overflow: hidden;
   padding: 12px 20px;
   border-radius: 16px 4px 16px 16px;
   background: var(--solid);
   color: var(--on-solid);
   white-space: pre-wrap;
   line-height: 20px;
+}
+.transcript-user-collapsible > summary {
+  max-height: 320px;
+  overflow: hidden;
+  list-style: none;
+  cursor: pointer;
   -webkit-mask-image: linear-gradient(
     to bottom,
     #000 0,
@@ -578,10 +582,6 @@ h3 {
 }
 .transcript-user-collapsible {
   max-width: min(100%, 560px);
-}
-.transcript-user-collapsible > summary {
-  list-style: none;
-  cursor: pointer;
 }
 .transcript-user-collapsible > summary::-webkit-details-marker {
   display: none;
