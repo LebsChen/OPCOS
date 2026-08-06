@@ -5308,6 +5308,54 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct ConsecutiveApprovalProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for ConsecutiveApprovalProvider {
+        async fn complete(&self, _: ProviderRequest) -> Result<AssistantTurn, ProviderError> {
+            unreachable!()
+        }
+
+        async fn stream(
+            &self,
+            _: ProviderRequest,
+            _: mpsc::Sender<StreamChunk>,
+        ) -> Result<AssistantTurn, ProviderError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            match call {
+                0 => Ok(AssistantTurn {
+                    tool_calls: vec![ToolCall {
+                        id: "approval-1".into(),
+                        name: "write_file".into(),
+                        arguments: json!({"path":"first","content":"first"}),
+                    }],
+                    ..Default::default()
+                }),
+                1 => Ok(AssistantTurn {
+                    tool_calls: vec![ToolCall {
+                        id: "approval-2".into(),
+                        name: "write_file".into(),
+                        arguments: json!({"path":"second","content":"second"}),
+                    }],
+                    ..Default::default()
+                }),
+                2 => Ok(AssistantTurn {
+                    text: Some("finished".into()),
+                    finish_reason: Some("stop".into()),
+                    ..Default::default()
+                }),
+                _ => unreachable!(),
+            }
+        }
+
+        fn capabilities(&self, _: &str) -> Caps {
+            Caps::default()
+        }
+    }
+
+    #[derive(Clone)]
     struct HarnessProvider {
         calls: Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -5452,6 +5500,61 @@ mod tests {
         assert!(messages.iter().any(|message| {
             message.role == "tool" && message.content.to_string().contains("denied by user")
         }));
+    }
+
+    #[tokio::test]
+    async fn consecutive_approvals_resume_the_same_turn() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            ConsecutiveApprovalProvider {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            },
+            store.clone(),
+            Arc::new(FakeTools),
+            "consecutive-approvals",
+            "/workspace",
+            PermissionMode::Interactive,
+            "fake",
+        );
+
+        assert!(matches!(
+            engine.submit_text("start").await,
+            Err(EngineError::ApprovalPending(call_id)) if call_id == "approval-1"
+        ));
+        assert_eq!(
+            store.load_pending("consecutive-approvals").unwrap()[0].call_id,
+            "approval-1"
+        );
+
+        assert!(matches!(
+            engine
+                .resolve_approval("approval-1", ApprovalOutcome::Approve)
+                .await,
+            Err(EngineError::ApprovalPending(call_id)) if call_id == "approval-2"
+        ));
+        assert_eq!(
+            store.load_pending("consecutive-approvals").unwrap()[0].call_id,
+            "approval-2"
+        );
+
+        let turn = engine
+            .resolve_approval("approval-2", ApprovalOutcome::Approve)
+            .await
+            .unwrap();
+        assert_eq!(turn.text.as_deref(), Some("finished"));
+        assert!(
+            store
+                .load_pending("consecutive-approvals")
+                .unwrap()
+                .is_empty()
+        );
+        let events = store.load_session_events("consecutive-approvals").unwrap();
+        let resolved = events
+            .iter()
+            .filter(|event| event.event["type"] == "approval_resolved")
+            .filter_map(|event| event.event["working_event"]["payload"]["call_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(resolved, vec!["approval-1", "approval-2"]);
     }
 
     #[tokio::test]
