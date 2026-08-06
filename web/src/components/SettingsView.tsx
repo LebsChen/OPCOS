@@ -11,7 +11,9 @@ export type SettingsSection =
   | "appearance"
   | "agent"
   | "environment"
-  | "market"
+  | "library"
+  | "experts"
+  | "teams"
   | "provider"
   | "hosts"
   | "agents"
@@ -30,7 +32,9 @@ const tabs: Array<{ key: SettingsSection; label: string; icon: IconName }> = [
   { key: "appearance", label: "general", icon: "sliders" },
   { key: "agent", label: "Agent defaults", icon: "sparkle" },
   { key: "environment", label: "Environment", icon: "folder" },
-  { key: "market", label: "市场", icon: "sparkle" },
+  { key: "library", label: "配置库", icon: "sparkle" },
+  { key: "experts", label: "专家", icon: "sparkle" },
+  { key: "teams", label: "团队", icon: "board" },
   { key: "provider", label: "provider", icon: "sparkle" },
   { key: "hosts", label: "hosts", icon: "folder" },
   { key: "agents", label: "agents", icon: "fileCode" },

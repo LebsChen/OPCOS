@@ -25,6 +25,7 @@ export type Session = {
 export type ProjectAgent = {
   id: string;
   project_id: string;
+  template_id?: string | null;
   sort_order: number;
   name: string;
   role: string;

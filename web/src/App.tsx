@@ -192,7 +192,7 @@ type BlueprintStatus = {
   content: string;
   value: Record<string, unknown>;
 };
-type MarketTemplate = {
+type LibraryEntry = {
   id: string;
   kind: string;
   name: string;
@@ -203,7 +203,7 @@ type MarketTemplate = {
   readonly: boolean;
   source?: string;
 };
-type ProjectConfigurationTemplate = MarketTemplate & {
+type ProjectConfigurationTemplate = LibraryEntry & {
   template_id: string;
   source: string;
   applied: boolean;
@@ -802,16 +802,16 @@ function ProjectDialog({
   const [defaultBranch, setDefaultBranch] = useState("main");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
-  const [teamTemplates, setTeamTemplates] = useState<MarketTemplate[]>([]);
-  const [configTemplates, setConfigTemplates] = useState<MarketTemplate[]>([]);
+  const [teamTemplates, setTeamTemplates] = useState<LibraryEntry[]>([]);
+  const [configTemplates, setConfigTemplates] = useState<LibraryEntry[]>([]);
   const [teamTemplateId, setTeamTemplateId] = useState("");
   const [configTemplateIds, setConfigTemplateIds] = useState<string[]>([]);
   useEffect(() => {
     void Promise.all([
-      command<MarketTemplate[]>("list_template_market", {
+      command<LibraryEntry[]>("list_configured_library", {
         kind: "team-template",
       }),
-      command<MarketTemplate[]>("list_template_market"),
+      command<LibraryEntry[]>("list_configured_library"),
     ]).then(([teams, templates]) => {
       setTeamTemplates(teams);
       setConfigTemplates(
@@ -3433,15 +3433,16 @@ function ManageSections({
     null,
   );
   const [skillBrowse, setSkillBrowse] = useState<SkillRulesBrowse | null>(null);
-  const [marketTemplates, setMarketTemplates] = useState<MarketTemplate[]>([]);
-  const [marketKind, setMarketKind] = useState<
+  const [libraryEntries, setLibraryEntries] = useState<LibraryEntry[]>([]);
+  const [libraryKind, setLibraryKind] = useState<
     "agent-template" | "team-template" | "config"
   >("agent-template");
   const [templateDraftName, setTemplateDraftName] = useState("");
+  const [templateDraftId, setTemplateDraftId] = useState<string | null>(null);
   const [templateDraftDescription, setTemplateDraftDescription] = useState("");
   const [templateDraftContent, setTemplateDraftContent] = useState("{}");
   const [templateDraftStatus, setTemplateDraftStatus] = useState("");
-  const [marketProjectId, setMarketProjectId] = useState("");
+  const [libraryProjectId, setLibraryProjectId] = useState("");
   const [environmentTab, setEnvironmentTab] = useState<
     "blueprints" | "snapshots" | "advanced" | "outposts"
   >("blueprints");
@@ -3657,7 +3658,9 @@ function ManageSections({
       "Environment",
       "管理 Blueprint、固定环境说明、有序仓库 setup 和长期主机。",
     ],
-    market: ["市场", "浏览和管理 Agent、Team 与配置模板。"],
+    library: ["配置库", "管理可供项目启用的专家、团队与配置资源。"],
+    experts: ["专家", "管理可供项目启用的专家库。"],
+    teams: ["团队", "管理可供项目启用的团队库。"],
   };
   const assetKinds = [
     "agents",
@@ -3671,6 +3674,12 @@ function ManageSections({
     : "knowledge";
   const assetTabVisible =
     tab !== "skill" && assetKinds.includes(tab as (typeof assetKinds)[number]);
+  const activeLibraryKind =
+    tab === "experts"
+      ? "agent-template"
+      : tab === "teams"
+        ? "team-template"
+        : libraryKind;
   const assetLabel =
     assetTabKind === "agents"
       ? "规则"
@@ -3720,9 +3729,9 @@ function ManageSections({
       .catch(onError);
   }, [tab, settingsProjectId, selected, onError]);
   useEffect(() => {
-    if (tab !== "market") return;
-    void command<MarketTemplate[]>("list_template_market")
-      .then(setMarketTemplates)
+    if (!["library", "experts", "teams"].includes(tab)) return;
+    void command<LibraryEntry[]>("list_configured_library")
+      .then(setLibraryEntries)
       .catch(onError);
   }, [tab, onError]);
   useEffect(() => {
@@ -3780,7 +3789,9 @@ function ManageSections({
           tab === "provider" ||
           tab === "blueprint" ||
           tab === "agent" ||
-          tab === "market"
+          tab === "library" ||
+          tab === "experts" ||
+          tab === "teams"
             ? "rounded-xl2 border border-line bg-panel p-5"
             : ""
         }
@@ -5096,13 +5107,13 @@ function ManageSections({
             })()}
           </div>
         )}
-        {tab === "market" && (
+        {(tab === "library" || tab === "experts" || tab === "teams") && (
           <div className="space-y-4">
             <div className="flex flex-wrap items-center gap-2 rounded-lg border border-line p-3">
               <select
                 className="input"
-                value={marketProjectId}
-                onChange={(event) => setMarketProjectId(event.target.value)}
+                value={libraryProjectId}
+                onChange={(event) => setLibraryProjectId(event.target.value)}
               >
                 <option value="">选择项目进行仓库同步</option>
                 {projects.map((project) => (
@@ -5114,10 +5125,10 @@ function ManageSections({
               <button
                 type="button"
                 className="btn"
-                disabled={!marketProjectId}
+                disabled={!libraryProjectId}
                 onClick={() =>
                   void command("import_repository_templates", {
-                    projectId: marketProjectId,
+                    projectId: libraryProjectId,
                   })
                     .then((result) =>
                       setTemplateDraftStatus(
@@ -5125,8 +5136,8 @@ function ManageSections({
                       ),
                     )
                     .then(() =>
-                      command<MarketTemplate[]>("list_template_market").then(
-                        setMarketTemplates,
+                      command<LibraryEntry[]>("list_configured_library").then(
+                        setLibraryEntries,
                       ),
                     )
                     .catch(onError)
@@ -5137,17 +5148,17 @@ function ManageSections({
               <button
                 type="button"
                 className="btn"
-                disabled={!marketProjectId}
+                disabled={!libraryProjectId}
                 onClick={() =>
                   void command("save_project_as_team_template", {
-                    projectId: marketProjectId,
+                    projectId: libraryProjectId,
                   })
                     .then(() =>
                       setTemplateDraftStatus("项目已另存为 Team 模板"),
                     )
                     .then(() =>
-                      command<MarketTemplate[]>("list_template_market").then(
-                        setMarketTemplates,
+                      command<LibraryEntry[]>("list_configured_library").then(
+                        setLibraryEntries,
                       ),
                     )
                     .catch(onError)
@@ -5159,8 +5170,8 @@ function ManageSections({
             <div className="flex gap-2 border-b border-line pb-2">
               {(
                 [
-                  ["agent-template", "Agent 市场"],
-                  ["team-template", "Team 市场"],
+                  ["agent-template", "专家"],
+                  ["team-template", "团队"],
                   ["config", "配置模板"],
                 ] as const
               ).map(([value, label]) => (
@@ -5168,11 +5179,11 @@ function ManageSections({
                   key={value}
                   type="button"
                   className={`px-3 py-1.5 rounded-md text-sm ${
-                    marketKind === value
+                    libraryKind === value
                       ? "bg-paper text-accent font-medium"
                       : "text-muted"
                   }`}
-                  onClick={() => setMarketKind(value)}
+                  onClick={() => setLibraryKind(value)}
                 >
                   {label}
                 </button>
@@ -5203,9 +5214,9 @@ function ManageSections({
                   setTemplateDraftContent(event.target.value)
                 }
                 placeholder={
-                  marketKind === "agent-template"
+                  activeLibraryKind === "agent-template"
                     ? '{"role":"Code","model":"auto"}'
-                    : marketKind === "team-template"
+                    : activeLibraryKind === "team-template"
                       ? '{"workflow":{"workflow":[]},"agents":[]}'
                       : "模板内容"
                 }
@@ -5218,8 +5229,11 @@ function ManageSections({
                   disabled={!templateDraftName.trim()}
                   onClick={() => {
                     const kind =
-                      marketKind === "config" ? "blueprint" : marketKind;
+                      activeLibraryKind === "config"
+                        ? "blueprint"
+                        : activeLibraryKind;
                     void command("save_template", {
+                      id: templateDraftId,
                       kind,
                       name: templateDraftName.trim(),
                       description: templateDraftDescription.trim(),
@@ -5228,11 +5242,12 @@ function ManageSections({
                       .then(() => {
                         setTemplateDraftStatus("已保存");
                         setTemplateDraftName("");
-                        return command<MarketTemplate[]>(
-                          "list_template_market",
+                        setTemplateDraftId(null);
+                        return command<LibraryEntry[]>(
+                          "list_configured_library",
                         );
                       })
-                      .then(setMarketTemplates)
+                      .then(setLibraryEntries)
                       .catch(onError);
                   }}
                 >
@@ -5241,13 +5256,13 @@ function ManageSections({
               </div>
             </section>
             <div className="grid gap-3 md:grid-cols-2">
-              {marketTemplates
+              {libraryEntries
                 .filter((template) =>
-                  marketKind === "config"
+                  activeLibraryKind === "config"
                     ? !["agent-template", "team-template"].includes(
                         template.kind,
                       )
-                    : template.kind === marketKind,
+                    : template.kind === activeLibraryKind,
                 )
                 .map((template) => (
                   <article
@@ -5283,6 +5298,7 @@ function ManageSections({
                           className="btn"
                           onClick={() => {
                             setTemplateDraftName(`${template.name} 副本`);
+                            setTemplateDraftId(null);
                             setTemplateDraftDescription(template.description);
                             setTemplateDraftContent(template.content);
                           }}
@@ -5292,7 +5308,7 @@ function ManageSections({
                       </div>
                     )}
                     {!template.readonly &&
-                      marketProjectId &&
+                      libraryProjectId &&
                       ["agent-template", "team-template"].includes(
                         template.kind,
                       ) && (
@@ -5302,7 +5318,7 @@ function ManageSections({
                           onClick={() =>
                             void command("export_template_to_repository", {
                               templateId: template.id,
-                              projectId: marketProjectId,
+                              projectId: libraryProjectId,
                             })
                               .then(() =>
                                 setTemplateDraftStatus("已导出到仓库"),
@@ -5319,7 +5335,7 @@ function ManageSections({
                                     "export_template_to_repository",
                                     {
                                       templateId: template.id,
-                                      projectId: marketProjectId,
+                                      projectId: libraryProjectId,
                                       overwrite: true,
                                     },
                                   ).then(() =>
@@ -5333,13 +5349,56 @@ function ManageSections({
                           导出到仓库
                         </button>
                       )}
+                    {!template.readonly && (
+                      <div className="mt-2 flex gap-2">
+                        <button
+                          type="button"
+                          className="btn"
+                          onClick={() => {
+                            setLibraryKind(
+                              template.kind as
+                                "agent-template" | "team-template" | "config",
+                            );
+                            setTemplateDraftName(template.name);
+                            setTemplateDraftId(template.id);
+                            setTemplateDraftDescription(
+                              template.description || "",
+                            );
+                            setTemplateDraftContent(template.content);
+                            window.scrollTo({ top: 0, behavior: "smooth" });
+                          }}
+                        >
+                          编辑
+                        </button>
+                        <button
+                          type="button"
+                          className="btn danger"
+                          onClick={() => {
+                            if (!window.confirm(`删除「${template.name}」？`))
+                              return;
+                            void command("delete_template", {
+                              id: template.id,
+                            })
+                              .then(() =>
+                                command<LibraryEntry[]>(
+                                  "list_configured_library",
+                                ),
+                              )
+                              .then(setLibraryEntries)
+                              .catch(onError);
+                          }}
+                        >
+                          删除
+                        </button>
+                      </div>
+                    )}
                   </article>
                 ))}
             </div>
-            {!marketTemplates.some((template) =>
-              marketKind === "config"
+            {!libraryEntries.some((template) =>
+              activeLibraryKind === "config"
                 ? !["agent-template", "team-template"].includes(template.kind)
-                : template.kind === marketKind,
+                : template.kind === activeLibraryKind,
             ) && <div className="py-8 text-sm text-muted">暂无模板</div>}
           </div>
         )}
@@ -9886,9 +9945,9 @@ function AppContent() {
   const [homeRole, setHomeRole] = useState("");
   const [homeSystemPrompt, setHomeSystemPrompt] = useState("");
   const [homeAgentTemplateId, setHomeAgentTemplateId] = useState("");
-  const [homeAgentTemplates, setHomeAgentTemplates] = useState<
-    MarketTemplate[]
-  >([]);
+  const [homeAgentTemplates, setHomeAgentTemplates] = useState<LibraryEntry[]>(
+    [],
+  );
   const [harnessOptions, setHarnessOptions] = useState<
     Array<{ id: string; label: string; available: boolean; reason?: string }>
   >([]);
@@ -10059,7 +10118,7 @@ function AppContent() {
     if (!homeProvider && providers[0]) setHomeProvider(providers[0].name);
   }, [providers, homeProvider]);
   useEffect(() => {
-    void command<MarketTemplate[]>("list_template_market", {
+    void command<LibraryEntry[]>("list_configured_library", {
       kind: "agent-template",
     })
       .then(setHomeAgentTemplates)

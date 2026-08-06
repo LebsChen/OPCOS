@@ -7515,8 +7515,7 @@ fn copy_config_templates(
         tx.query_row(
             "SELECT id FROM config_object
                  WHERE id=?1 AND scope_kind='global'
-                   AND status <> 'deleted'
-                   AND kind NOT IN ('agent-template','team-template')",
+                   AND status <> 'deleted'",
             [template_id],
             |row| row.get::<_, String>(0),
         )
@@ -7554,7 +7553,6 @@ fn list_project_configuration_templates(
              LEFT JOIN project_config_selection selection
                ON selection.project_id=?1 AND selection.object_id=t.id
              WHERE t.scope_kind='global' AND t.status <> 'deleted'
-               AND t.kind NOT IN ('agent-template','team-template')
              ORDER BY t.name",
         )
         .map_err(|error| error.to_string())?;
@@ -7935,6 +7933,14 @@ async fn create_project_from_team_template(
     config_ids.extend(config_template_ids.unwrap_or_default());
     config_ids.sort();
     config_ids.dedup();
+    config_ids.push(team_template_id.clone());
+    config_ids.extend(
+        members
+            .iter()
+            .filter_map(|member| member.template_id.clone()),
+    );
+    config_ids.sort();
+    config_ids.dedup();
     if let Err(error) = copy_config_templates_to_project(&state, &project_id, &config_ids) {
         let _ = delete_project(state.clone(), project_id.clone(), Some(true)).await;
         return Err(error);
@@ -7971,6 +7977,7 @@ async fn create_project_from_team_template(
         if let Err(error) = create_project_agent(
             state.clone(),
             project_id.clone(),
+            values.template_id,
             values
                 .name
                 .unwrap_or_else(|| format!("成员 {}", sort_order + 1)),
@@ -8302,6 +8309,7 @@ fn list_project_agents(
 async fn create_project_agent(
     state: State<'_, DesktopState>,
     project_id: String,
+    template_id: Option<String>,
     name: String,
     role: String,
     sort_order: Option<u32>,
@@ -8384,6 +8392,7 @@ async fn create_project_agent(
     let agent = ProjectAgentRecord {
         id,
         project_id,
+        template_id,
         sort_order,
         name,
         role,
@@ -13466,7 +13475,7 @@ fn list_assets(
 }
 
 #[tauri::command]
-fn list_template_market(
+fn list_configured_library(
     state: State<'_, DesktopState>,
     kind: Option<String>,
 ) -> Result<Vec<Value>, String> {
@@ -22244,7 +22253,7 @@ fn main() {
             provider_descriptors,
             provider_models,
             list_assets,
-            list_template_market,
+            list_configured_library,
             save_template,
             delete_template,
             import_repository_templates,
@@ -24863,6 +24872,7 @@ agents:
         let agent = ProjectAgentRecord {
             id: "agent-1".into(),
             project_id: project.id.clone(),
+            template_id: None,
             sort_order: 1,
             name: "Code".into(),
             role: "Code".into(),

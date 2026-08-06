@@ -90,6 +90,7 @@ pub struct ProjectRecord {
 pub struct ProjectAgentRecord {
     pub id: String,
     pub project_id: String,
+    pub template_id: Option<String>,
     pub sort_order: u32,
     pub name: String,
     pub role: String,
@@ -1104,20 +1105,21 @@ fn project_agent_from_row(row: &rusqlite::Row<'_>) -> Result<ProjectAgentRecord,
     Ok(ProjectAgentRecord {
         id: row.get(0)?,
         project_id: row.get(1)?,
-        sort_order: row.get::<_, i64>(2)? as u32,
-        name: row.get(3)?,
-        role: row.get(4)?,
-        session_id: row.get(5)?,
-        provider: row.get(6)?,
-        model: row.get(7)?,
-        harness: row.get(8)?,
-        mode: row.get(9)?,
-        system_prompt: row.get(10)?,
-        worktree_path: row.get(11)?,
-        branch: row.get(12)?,
-        state: row.get(13)?,
-        created_at: parse_timestamp(row.get(14)?)?,
-        updated_at: parse_timestamp(row.get(15)?)?,
+        template_id: row.get(2)?,
+        sort_order: row.get::<_, i64>(3)? as u32,
+        name: row.get(4)?,
+        role: row.get(5)?,
+        session_id: row.get(6)?,
+        provider: row.get(7)?,
+        model: row.get(8)?,
+        harness: row.get(9)?,
+        mode: row.get(10)?,
+        system_prompt: row.get(11)?,
+        worktree_path: row.get(12)?,
+        branch: row.get(13)?,
+        state: row.get(14)?,
+        created_at: parse_timestamp(row.get(15)?)?,
+        updated_at: parse_timestamp(row.get(16)?)?,
     })
 }
 
@@ -4351,6 +4353,7 @@ impl SqliteStore {
              CREATE TABLE IF NOT EXISTS project_agents (
                id TEXT PRIMARY KEY,
                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+               template_id TEXT,
                sort_order INTEGER NOT NULL,
                name TEXT NOT NULL,
                role TEXT NOT NULL,
@@ -4376,6 +4379,12 @@ impl SqliteStore {
                unattended INTEGER NOT NULL DEFAULT 0
              );",
             )?;
+            if !table_columns(&connection, "project_agents")?
+                .iter()
+                .any(|column| column == "template_id")
+            {
+                connection.execute("ALTER TABLE project_agents ADD COLUMN template_id TEXT", [])?;
+            }
             let session_columns = table_columns(&connection, "sessions")?;
             if !session_columns.iter().any(|column| column == "harness") {
                 connection.execute(
@@ -5353,10 +5362,10 @@ impl SqliteStore {
             ));
         }
         self.connection.lock().expect("sqlite mutex poisoned").execute(
-            "INSERT INTO project_agents(id,project_id,sort_order,name,role,session_id,provider,model,harness,mode,system_prompt,worktree_path,branch,state,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
-             ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,sort_order=excluded.sort_order,name=excluded.name,role=excluded.role,session_id=excluded.session_id,provider=excluded.provider,model=excluded.model,harness=excluded.harness,mode=excluded.mode,system_prompt=excluded.system_prompt,worktree_path=excluded.worktree_path,branch=excluded.branch,state=excluded.state,created_at=excluded.created_at,updated_at=excluded.updated_at",
+            "INSERT INTO project_agents(id,project_id,template_id,sort_order,name,role,session_id,provider,model,harness,mode,system_prompt,worktree_path,branch,state,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
+             ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,template_id=excluded.template_id,sort_order=excluded.sort_order,name=excluded.name,role=excluded.role,session_id=excluded.session_id,provider=excluded.provider,model=excluded.model,harness=excluded.harness,mode=excluded.mode,system_prompt=excluded.system_prompt,worktree_path=excluded.worktree_path,branch=excluded.branch,state=excluded.state,created_at=excluded.created_at,updated_at=excluded.updated_at",
             params![
-                agent.id, agent.project_id, agent.sort_order, agent.name, agent.role,
+                agent.id, agent.project_id, agent.template_id, agent.sort_order, agent.name, agent.role,
                 agent.session_id, agent.provider, agent.model, agent.harness, agent.mode,
                 agent.system_prompt, agent.worktree_path, agent.branch, agent.state,
                 agent.created_at.to_rfc3339(), agent.updated_at.to_rfc3339()
@@ -5369,7 +5378,7 @@ impl SqliteStore {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         connection
             .query_row(
-                "SELECT id,project_id,sort_order,name,role,session_id,provider,model,harness,mode,system_prompt,worktree_path,branch,state,created_at,updated_at FROM project_agents WHERE id=?1",
+                "SELECT id,project_id,template_id,sort_order,name,role,session_id,provider,model,harness,mode,system_prompt,worktree_path,branch,state,created_at,updated_at FROM project_agents WHERE id=?1",
                 [id],
                 project_agent_from_row,
             )
@@ -5384,7 +5393,7 @@ impl SqliteStore {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         connection
             .query_row(
-                "SELECT id,project_id,sort_order,name,role,session_id,provider,model,harness,mode,system_prompt,worktree_path,branch,state,created_at,updated_at FROM project_agents WHERE session_id=?1",
+                "SELECT id,project_id,template_id,sort_order,name,role,session_id,provider,model,harness,mode,system_prompt,worktree_path,branch,state,created_at,updated_at FROM project_agents WHERE session_id=?1",
                 [session_id],
                 project_agent_from_row,
             )
@@ -5398,7 +5407,7 @@ impl SqliteStore {
     ) -> Result<Vec<ProjectAgentRecord>, StoreError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id,project_id,sort_order,name,role,session_id,provider,model,harness,mode,system_prompt,worktree_path,branch,state,created_at,updated_at FROM project_agents WHERE project_id=?1 ORDER BY sort_order,id",
+            "SELECT id,project_id,template_id,sort_order,name,role,session_id,provider,model,harness,mode,system_prompt,worktree_path,branch,state,created_at,updated_at FROM project_agents WHERE project_id=?1 ORDER BY sort_order,id",
         )?;
         statement
             .query_map([project_id], project_agent_from_row)?
@@ -6547,6 +6556,7 @@ mod tests {
         let lead = ProjectAgentRecord {
             id: "agent-1".into(),
             project_id: "project-1".into(),
+            template_id: None,
             sort_order: 0,
             name: "Lead".into(),
             role: "Lead".into(),
