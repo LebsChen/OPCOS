@@ -42,8 +42,8 @@ use opcos_engine::{
 };
 use opcos_hosts::{
     BackgroundJobManager, ComputerUseAction, DEFAULT_EXEC_TIMEOUT_SECONDS, Host,
-    LIFECYCLE_EXEC_TIMEOUT_SECONDS, LifecycleStage, LocalHost, RvmHost, ScreenBounds, SpawnRequest,
-    execute_lifecycle_stage,
+    LIFECYCLE_EXEC_TIMEOUT_SECONDS, LifecycleStage, LocalHost, ProcessEvent, RvmHost, ScreenBounds,
+    SpawnRequest, execute_lifecycle_stage,
 };
 use opcos_lsp::LspClient;
 use opcos_mcp::{
@@ -4152,6 +4152,88 @@ impl ToolExecutor for DesktopExecutor {
         }
     }
 
+    async fn execute_streaming(
+        &self,
+        name: &str,
+        arguments: Value,
+        on_output: &(dyn for<'a> Fn(&'a str) + Send + Sync + '_),
+    ) -> Result<Value, String> {
+        let DesktopExecutor::Local(executor) = self else {
+            return self.execute(name, arguments).await;
+        };
+        if !matches!(name, "run_shell" | "exec") {
+            return self.execute(name, arguments).await;
+        }
+        let command = arguments
+            .get("command")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "missing string argument: command".to_owned())?;
+        let names = arguments
+            .get("secret_names")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        let mut env = serde_json::Map::new();
+        let mut values = Vec::new();
+        for name in names {
+            let value = scoped_secret_get_from_store(
+                &executor.secrets,
+                executor.project_id.as_deref(),
+                "asset-secret",
+                name,
+            )?
+            .ok_or_else(|| format!("secret is not configured: {name}"))?;
+            env.insert(name.to_owned(), Value::String(value.clone()));
+            values.push(value);
+        }
+        let mut process = executor
+            .host
+            .spawn(SpawnRequest {
+                command: command.to_owned(),
+                cwd: arguments
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| Some(executor.workspace.clone())),
+                env: Some(Value::Object(env)),
+                cols: 120,
+                rows: 40,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut output = String::new();
+        let mut exit_code = None;
+        while let Some(event) = process
+            .next_event()
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            match event {
+                ProcessEvent::Output(chunk) => {
+                    on_output(&chunk);
+                    output.push_str(&chunk);
+                }
+                ProcessEvent::Exited(code) => {
+                    exit_code = code;
+                    break;
+                }
+            }
+        }
+        let _ = process.shutdown().await;
+        let mut result = json!({
+            "stdout":output,
+            "stderr":"",
+            "exit_code":exit_code,
+        });
+        bound_shell_output(&mut result);
+        for value in values {
+            redact_json_strings(&mut result, &value);
+        }
+        Ok(result)
+    }
+
     fn tool_origin(&self) -> ToolOrigin {
         match self {
             Self::Remote(executor) => executor.origin.clone(),
@@ -4454,25 +4536,42 @@ fn emit_pending_approval(
     let Some(pending) = pending.into_iter().next() else {
         return Ok(false);
     };
+    let is_question = pending.tool == "ask_user";
     emit(
         app,
-        "approval",
+        if is_question {
+            "question_requested"
+        } else {
+            "approval"
+        },
         Some(session_id),
-        json!({
-            "call_id": pending.call_id,
-            "tool": pending.tool,
-            "arguments": redact_approval_value(&pending.arguments),
-            "risk": approval_risk(&pending.tool),
-            "reason": "Tool action requires approval",
-        }),
+        if is_question {
+            json!({
+                "call_id": pending.call_id,
+                "tool": pending.tool,
+                "arguments": redact_approval_value(&pending.arguments),
+            })
+        } else {
+            json!({
+                "call_id": pending.call_id,
+                "tool": pending.tool,
+                "arguments": redact_approval_value(&pending.arguments),
+                "risk": approval_risk(&pending.tool),
+                "reason": "Tool action requires approval",
+            })
+        },
     );
     emit(
         app,
         "notice",
         Some(session_id),
         json!({
-            "kind": "approval_pending",
-            "text": "Approval required before this tool can continue"
+            "kind": if is_question { "question_pending" } else { "approval_pending" },
+            "text": if is_question {
+                "Question requires an answer before this tool can continue"
+            } else {
+                "Approval required before this tool can continue"
+            }
         }),
     );
     Ok(true)
@@ -8027,7 +8126,7 @@ async fn create_project_agent(
         provider,
         model: model.unwrap_or_else(|| "auto".into()),
         harness: harness.unwrap_or_else(|| "builtin".into()),
-        mode: mode.unwrap_or_else(|| "Interactive".into()),
+        mode: mode.unwrap_or_else(|| "Auto".into()),
         system_prompt: system_prompt.unwrap_or_default(),
         worktree_path,
         branch,
@@ -9493,6 +9592,58 @@ async fn engine_for_with_context(
             project: session.project_id.as_deref(),
         })))
         .await;
+    if !bundle.knowledge.is_empty() {
+        let working_event = json!({
+            "event_type":"note_used",
+            "category":"other",
+            "direction":"outgoing",
+            "timestamp":Utc::now().to_rfc3339(),
+            "payload":{
+                "knowledge_count":bundle.knowledge.len(),
+                "skills_count":bundle.skills.len(),
+                "commands_count":bundle.commands.len(),
+            }
+        });
+        audit(state, session_id, "working_event", working_event.clone());
+        emit(
+            app,
+            "stream",
+            Some(session_id),
+            json!({"working_event":working_event}),
+        );
+    }
+    for rule in &bundle.agents {
+        let working_event = json!({
+            "event_type":"rules_injected",
+            "category":"other",
+            "direction":"outgoing",
+            "timestamp":Utc::now().to_rfc3339(),
+            "payload":{"path":rule.path},
+        });
+        audit(state, session_id, "working_event", working_event.clone());
+        emit(
+            app,
+            "stream",
+            Some(session_id),
+            json!({"working_event":working_event}),
+        );
+    }
+    for skill in bundle.skills.iter().filter(|skill| skill.active) {
+        let working_event = json!({
+            "event_type":"skill_activated",
+            "category":"other",
+            "direction":"outgoing",
+            "timestamp":Utc::now().to_rfc3339(),
+            "payload":{"name":skill.name,"path":skill.path},
+        });
+        audit(state, session_id, "working_event", working_event.clone());
+        emit(
+            app,
+            "stream",
+            Some(session_id),
+            json!({"working_event":working_event}),
+        );
+    }
     engine
         .set_permission_rules(bundle.permissions.as_ref().map(|rules| {
             opcos_policy::PermissionRules {
@@ -10403,7 +10554,7 @@ fn create_session(
         Utc::now().timestamp_nanos_opt().unwrap_or_default()
     );
     let model = model.unwrap_or_else(|| "auto".into());
-    let mode = mode.unwrap_or_else(|| "Interactive".into());
+    let mode = mode.unwrap_or_else(|| "Auto".into());
     let mode = permission_mode_name(parse_permission_mode(&mode)?).to_owned();
     let harness = harness.unwrap_or_else(|| "builtin".into());
     if !matches!(harness.as_str(), "builtin" | "opencode" | "acp") {
@@ -10867,6 +11018,18 @@ async fn read_transcript(
                 })
                 .collect()
         })
+}
+
+#[tauri::command]
+fn read_session_events(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Vec<Value>, String> {
+    state
+        .store
+        .load_session_events(&session_id)
+        .map_err(|error| error.to_string())
+        .map(|events| events.into_iter().map(|record| record.event).collect())
 }
 
 fn artifact_kind(path: &str) -> (&'static str, Option<&'static str>) {
@@ -16481,7 +16644,7 @@ async fn linear_create_session_from_issue(
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "remote host not found; session was not created".to_owned())?;
     drop(connection);
-    let mode = mode.unwrap_or_else(|| "Interactive".into());
+    let mode = mode.unwrap_or_else(|| "Auto".into());
     let mode = permission_mode_name(parse_permission_mode(&mode)?).to_owned();
     let now = Utc::now();
     save_session_via_factory(
@@ -17671,7 +17834,23 @@ async fn session_worklog(
 ) -> Result<Value, String> {
     let host_id = session_host_id(&state, &session_id)?;
     if host_id == "local" {
-        return Err("本机 host 不提供远程 worklog".into());
+        let mut events = state
+            .store
+            .load_audit(Some(&session_id))
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(|event| event.kind == "working_event")
+            .map(|event| {
+                let mut payload = event.payload;
+                if let Some(object) = payload.as_object_mut() {
+                    object.insert("sequence".into(), json!(event.sequence));
+                }
+                payload
+            })
+            .collect::<Vec<_>>();
+        events.reverse();
+        let last_id = events.len().to_string();
+        return Ok(json!({"events":events,"last_id":last_id,"window_lost":false}));
     }
     let page = client_for(&state, &host_id)?
         .worklog_query(&after_id, limit.unwrap_or(200))
@@ -17681,6 +17860,164 @@ async fn session_worklog(
         && !page.last_id.is_empty()
         && page.last_id.parse::<u64>().ok() < after_id.parse::<u64>().ok();
     Ok(json!({"events":page.events,"last_id":page.last_id,"window_lost":reset}))
+}
+
+#[tauri::command]
+fn session_shell_history(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Vec<Value>, String> {
+    let calls = state
+        .store
+        .load_tool_calls(&session_id)
+        .map_err(|error| error.to_string())?;
+    let terminal_updates = state
+        .store
+        .load_audit(Some(&session_id))
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|event| event.kind == "working_event")
+        .filter_map(|event| {
+            (event.payload.get("event_type").and_then(Value::as_str) == Some("terminal_update"))
+                .then_some(event.payload)
+        })
+        .filter_map(|payload| {
+            let call_id = payload.get("payload")?.get("call_id")?.as_str()?;
+            let contents = payload
+                .get("payload")?
+                .get("contents")?
+                .as_str()
+                .unwrap_or_default();
+            Some((call_id.to_owned(), contents.to_owned()))
+        })
+        .fold(
+            std::collections::HashMap::<String, String>::new(),
+            |mut output, (call_id, contents)| {
+                output.entry(call_id).or_default().push_str(&contents);
+                output
+            },
+        );
+    let mut history = calls
+        .into_iter()
+        .filter(|call| call.name == "run_shell")
+        .map(|call| {
+            let command = call
+                .arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let result = call.result.unwrap_or(Value::Null);
+            let output = terminal_updates
+                .get(&call.call_id)
+                .cloned()
+                .or_else(|| {
+                    result
+                        .get("stdout")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default();
+            let exit_code = result
+                .get("exit_code")
+                .or_else(|| result.get("code"))
+                .and_then(Value::as_i64);
+            json!({
+                "call_id": call.call_id,
+                "command": command,
+                "exit_code": exit_code,
+                "duration_ms": result.get("duration_ms").and_then(Value::as_u64),
+                "output": output,
+                "result": result,
+                "message_sequence": call.message_sequence,
+            })
+        })
+        .collect::<Vec<_>>();
+    history.reverse();
+    Ok(history)
+}
+
+#[tauri::command]
+fn session_file_changes(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Vec<Value>, String> {
+    let calls = state
+        .store
+        .load_tool_calls(&session_id)
+        .map_err(|error| error.to_string())?;
+    let mut files = std::collections::BTreeMap::<String, Vec<Value>>::new();
+    for call in calls.into_iter().filter(|call| {
+        matches!(
+            call.name.as_str(),
+            "edit_file"
+                | "write_file"
+                | "replace_in_file"
+                | "apply_patch"
+                | "apply_unified_diff"
+                | "multi_edit"
+        )
+    }) {
+        let result = call.result.unwrap_or(Value::Null);
+        let edits = call
+            .arguments
+            .get("edits")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_else(|| vec![call.arguments.clone()]);
+        for edit in edits {
+            let path = edit
+                .get("path")
+                .or_else(|| edit.get("file_path"))
+                .and_then(Value::as_str)
+                .or_else(|| call.arguments.get("path").and_then(Value::as_str))
+                .unwrap_or("(unknown file)")
+                .to_owned();
+            files.entry(path).or_default().push(json!({
+                "call_id": call.call_id,
+                "tool": call.name,
+                "old_string": edit.get("old_string").or_else(|| edit.get("old")),
+                "new_string": edit.get("new_string").or_else(|| edit.get("new")),
+                "result": result,
+                "message_sequence": call.message_sequence,
+            }));
+        }
+    }
+    Ok(files
+        .into_iter()
+        .rev()
+        .map(|(path, edits)| json!({"path":path,"edit_count":edits.len(),"edits":edits}))
+        .collect())
+}
+
+#[tauri::command]
+fn session_progress(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    category: Option<String>,
+) -> Result<Vec<Value>, String> {
+    let mut events = state
+        .store
+        .load_audit(Some(&session_id))
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|event| event.kind == "working_event")
+        .filter(|event| {
+            category.as_deref().is_none_or(|wanted| {
+                event.payload.get("category").and_then(Value::as_str) == Some(wanted)
+            })
+        })
+        .map(|event| {
+            json!({
+                "sequence": event.sequence,
+                "event_type": event.payload.get("event_type"),
+                "category": event.payload.get("category"),
+                "timestamp": event.payload.get("timestamp"),
+                "payload": event.payload.get("payload"),
+            })
+        })
+        .collect::<Vec<_>>();
+    events.reverse();
+    Ok(events)
 }
 
 #[derive(Debug, Deserialize)]
@@ -21021,6 +21358,7 @@ fn main() {
             harness_options,
             change_harness,
             list_sessions,
+            read_session_events,
             read_transcript,
             submit_turn,
             list_artifacts,
@@ -21084,6 +21422,9 @@ fn main() {
             review_snapshot,
             review_file_diff,
             session_worklog,
+            session_shell_history,
+            session_file_changes,
+            session_progress,
             session_insights,
             trigger_http_info,
             audit_events,

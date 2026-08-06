@@ -62,6 +62,48 @@ export type TranscriptItem = {
 export type SurfaceTab =
   "chat" | "terminal" | "desktop" | "browser" | "ide" | "review" | "worklog";
 
+export type PendingQuestionData = {
+  callId: string;
+  question: string;
+  options?: string[];
+  allowMultiple?: boolean;
+};
+
+export function pendingQuestionFromPayload(
+  callId: string,
+  payload: Record<string, unknown>,
+): PendingQuestionData {
+  const nestedQuestion =
+    payload.question && typeof payload.question === "object"
+      ? (payload.question as Record<string, unknown>)
+      : {};
+  const rawOptions =
+    payload.options ?? payload.choices ?? nestedQuestion.options;
+  const options = Array.isArray(rawOptions)
+    ? rawOptions.filter(
+        (option): option is string => typeof option === "string",
+      )
+    : [];
+  return {
+    callId,
+    question:
+      typeof payload.question === "string"
+        ? payload.question
+        : typeof nestedQuestion.question === "string"
+          ? nestedQuestion.question
+          : typeof payload.prompt === "string"
+            ? payload.prompt
+            : "Answer required",
+    options: options.length > 0 ? options : undefined,
+    allowMultiple:
+      payload.allow_multiple === true ||
+      payload.allowMultiple === true ||
+      payload.multi === true ||
+      nestedQuestion.allow_multiple === true ||
+      nestedQuestion.multi === true,
+  };
+}
+
 export function hostStatusLabel(host: Host): string {
   if (host.online === true) return "Online";
   if (host.online === false) return "Offline";

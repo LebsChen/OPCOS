@@ -449,6 +449,84 @@ body {
   flex-direction: column;
   gap: 20px;
 }
+.current-activity {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 8px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.current-activity .spinner {
+  flex: none;
+}
+
+.rail-event-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.rail-event-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 8px;
+  background: var(--paper);
+}
+
+.rail-event-head {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  text-align: left;
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.rail-event-head code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rail-event-meta,
+.rail-event-summary {
+  color: var(--muted);
+  font-size: 11px;
+  margin-top: 4px;
+}
+
+.rail-event-output,
+.rail-git-diff pre {
+  max-height: 240px;
+  overflow: auto;
+  margin-top: 7px;
+  padding: 7px;
+  border-radius: 5px;
+  background: var(--canvas);
+  color: var(--ink);
+  font:
+    11px/1.45 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.rail-ok {
+  color: var(--ok);
+}
+
+.rail-git-diff {
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
 .bubble-assistant {
   font-size: 15px;
   line-height: 1.55;
@@ -4254,6 +4332,42 @@ html[data-theme="dark"] .hiw-sticky {
 @keyframes toast-drain {
   to {
     width: 0;
+  }
+}
+
+.error-toast {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: min(460px, calc(100vw - 40px));
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--line));
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--danger);
+  box-shadow: 0 12px 30px rgb(0 0 0 / 18%);
+  animation: error-toast-in 0.2s ease-out;
+}
+
+.error-toast button {
+  flex: 0 0 auto;
+  color: inherit;
+  font-size: 18px;
+  line-height: 1;
+}
+
+@keyframes error-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
   }
 }
 

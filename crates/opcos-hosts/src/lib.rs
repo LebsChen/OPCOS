@@ -1024,6 +1024,19 @@ impl BackgroundJobManager {
         ))
     }
 
+    #[cfg(not(unix))]
+    async fn start_local_posix_wrapper(
+        &self,
+        _job_id: &str,
+        _request: &SpawnRequest,
+        _launch_nonce: &str,
+        _timeout_seconds: Option<u64>,
+    ) -> Result<DurableLaunch, HostError> {
+        Err(HostError::Unsupported(
+            "local POSIX background jobs are unsupported on this platform".into(),
+        ))
+    }
+
     pub async fn cleanup_finished(&self, max_age: chrono::Duration) {
         let cutoff = Utc::now() - max_age;
         let expired = {
@@ -1372,6 +1385,11 @@ async fn local_process_alive(pid: Option<u32>) -> bool {
         .output()
         .await
         .is_ok_and(|output| output.status.success())
+}
+
+#[cfg(not(unix))]
+async fn local_process_alive(_pid: Option<u32>) -> bool {
+    false
 }
 
 #[cfg(unix)]
@@ -1817,6 +1835,12 @@ fn segment_path(root: &Path, job_id: &str, segment: usize) -> PathBuf {
 
 fn powershell_single_quote(value: &str) -> String {
     value.replace('\'', "''")
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn powershell_marker_line(marker: &str) -> String {
+    let marker = marker.replace('"', "\"\"");
+    format!("Write-Output (\"{marker}:\" + $opcos_exit + \":\" + (Get-Location).Path)")
 }
 
 fn remote_sibling_path(path: &str, name: &str) -> String {
@@ -2877,8 +2901,18 @@ impl LocalHost {
 fn shell_command(command: &str, cwd: &Path) -> Command {
     #[cfg(windows)]
     {
-        let mut process = Command::new("cmd");
-        process.arg("/C").arg(command).current_dir(cwd);
+        let mut process = Command::new("powershell.exe");
+        process
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "$OutputEncoding=[Text.Encoding]::UTF8; \
+                     [Console]::OutputEncoding=[Text.Encoding]::UTF8; {command}"
+                ),
+            ])
+            .current_dir(cwd);
         configure_no_window(&mut process);
         process
     }
@@ -2993,12 +3027,20 @@ fn persistent_command(
     {
         let prefix = persistent_env_prefix(env)?.unwrap_or_default();
         let directory = if change_cwd {
-            format!("cd /d \"{}\" && ", cwd.display())
+            format!(
+                "Set-Location -LiteralPath '{}'; ",
+                powershell_single_quote(&cwd.display().to_string())
+            )
         } else {
             String::new()
         };
         Ok(format!(
-            "{prefix}{directory}{command} 2>&1 & echo {marker}:!ERRORLEVEL!:!CD! & endlocal"
+            "$OutputEncoding=[Text.Encoding]::UTF8; \
+             [Console]::OutputEncoding=[Text.Encoding]::UTF8; \
+             {prefix}{directory}{command} 2>&1; \
+             $opcos_exit=if ($?) {{ if ($null -eq $LASTEXITCODE) {{ 0 }} else {{ $LASTEXITCODE }} }} else {{ 1 }}; \
+             {}",
+            powershell_marker_line(marker)
         ))
     }
     #[cfg(not(windows))]
@@ -3042,14 +3084,12 @@ fn persistent_env_prefix(env: Option<&Value>) -> Result<Option<String>, HostErro
         .map(|(key, value)| -> Result<String, HostError> {
             #[cfg(windows)]
             {
-                if key.chars().any(|ch| "&|<>^%!\"".contains(ch))
-                    || value.chars().any(|ch| "&|<>^%!\"".contains(ch))
-                {
+                if !is_shell_identifier(key) {
                     return Err(HostError::InvalidResponse(
-                        "persistent shell environment contains unsupported cmd characters".into(),
+                        "process environment contains an invalid variable name".into(),
                     ));
                 }
-                Ok(format!("set \"{key}={value}\" && "))
+                Ok(format!("$env:{key}='{}'; ", powershell_single_quote(value)))
             }
             #[cfg(not(windows))]
             {
@@ -3064,7 +3104,7 @@ fn persistent_env_prefix(env: Option<&Value>) -> Result<Option<String>, HostErro
         .collect::<Result<String, _>>()?;
     #[cfg(windows)]
     {
-        Ok(Some(format!("setlocal EnableDelayedExpansion && {prefix}")))
+        Ok((!prefix.is_empty()).then_some(prefix))
     }
     #[cfg(not(windows))]
     {
@@ -3083,8 +3123,10 @@ fn shell_single_quote(value: &str) -> String {
 async fn spawn_persistent_shell(cwd: &Path) -> Result<(Child, ChildStdin, ChildStdout), HostError> {
     #[cfg(windows)]
     let mut process = {
-        let mut process = Command::new("cmd");
-        process.args(["/Q", "/D", "/V:ON", "/K"]).current_dir(cwd);
+        let mut process = Command::new("powershell.exe");
+        process
+            .args(["-NoProfile", "-NonInteractive", "-Command", "-"])
+            .current_dir(cwd);
         configure_no_window(&mut process);
         process
     };
@@ -3990,15 +4032,33 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn powershell_marker_expands_exit_code_and_cwd() {
+        let marker = powershell_marker_line("__marker__");
+        assert_eq!(
+            marker,
+            "Write-Output (\"__marker__:\" + $opcos_exit + \":\" + (Get-Location).Path)"
+        );
+        assert!(!marker.contains("'$opcos_exit"));
+        assert!(!marker.contains("'$((Get-Location).Path)'"));
+    }
+
     #[cfg(windows)]
     #[test]
-    fn windows_persistent_command_uses_delayed_expansion() {
-        let command =
-            persistent_command("exit /b 7", None, "__marker__", Path::new("."), false).unwrap();
-        assert!(!command.contains("%ERRORLEVEL%"));
-        assert!(!command.contains("%CD%"));
-        assert!(command.contains("!ERRORLEVEL!"));
-        assert!(command.contains("!CD!"));
+    fn windows_persistent_command_uses_powershell_utf8_and_literal_paths() {
+        let command = persistent_command(
+            "Write-Output '中文'",
+            None,
+            "__marker__",
+            Path::new("."),
+            false,
+        )
+        .unwrap();
+        assert!(command.contains("[Text.Encoding]::UTF8"));
+        assert!(command.contains(
+            "Write-Output (\"__marker__:\" + $opcos_exit + \":\" + (Get-Location).Path)"
+        ));
+        assert!(!command.contains("cmd"));
     }
 
     fn tempfile_dir() -> PathBuf {

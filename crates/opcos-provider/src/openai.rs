@@ -2,7 +2,7 @@ use crate::{
     AssistantTurn, Caps, Provider, ProviderConfig, ProviderError, ProviderRequest, StreamChunk,
     TRANSIENT_RETRY_LIMIT, TokenUsage, ToolCall, ToolCallDelta, apply_bearer_headers,
     classify_context_error, client, is_transient_request_error, is_transient_status, retry_delay,
-    sanitize_secret, settings_object, tool_schema,
+    sanitize_secret, settings_object, stream_client, tool_schema,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -43,8 +43,12 @@ impl OpenAiProvider {
         body
     }
 
-    async fn send(&self, body: Value) -> Result<reqwest::Response, ProviderError> {
-        let http = client(&self.config)?;
+    async fn send(&self, body: Value, streaming: bool) -> Result<reqwest::Response, ProviderError> {
+        let http = if streaming {
+            stream_client(&self.config)?
+        } else {
+            client(&self.config)?
+        };
         let url = format!(
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
@@ -79,7 +83,10 @@ impl OpenAiProvider {
             if let Some(error) = classify_context_error(status, &text) {
                 return Err(error);
             }
-            if is_transient_status(status) && transient_attempt < TRANSIENT_RETRY_LIMIT {
+            if !streaming
+                && is_transient_status(status)
+                && transient_attempt < TRANSIENT_RETRY_LIMIT
+            {
                 tokio::time::sleep(retry_delay(transient_attempt, retry_after.as_ref())).await;
                 transient_attempt += 1;
                 continue;
@@ -230,6 +237,36 @@ fn reasoning(value: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn completion_text(value: &Value) -> Option<String> {
+    value
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| reasoning(value))
+}
+
+fn parse_stream_value(event: &crate::sse::SseEvent) -> Option<Value> {
+    match crate::sse::parse_json(event) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            tracing::warn!(
+                event = %event.event,
+                error = %error,
+                "skipping malformed OpenAI-compatible SSE event"
+            );
+            None
+        }
+    }
+}
+
+fn stream_choice(value: &Value) -> Option<&Value> {
+    value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+}
+
 fn parse_tool_calls(value: Option<&Value>) -> Vec<ToolCall> {
     value
         .and_then(Value::as_array)
@@ -298,7 +335,7 @@ fn salvage(text: Option<String>, tools: &[Value]) -> (Option<String>, Vec<ToolCa
 #[async_trait]
 impl Provider for OpenAiProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<AssistantTurn, ProviderError> {
-        let response = self.send(self.body(&request, false)).await?;
+        let response = self.send(self.body(&request, false), false).await?;
         let value = response
             .json::<Value>()
             .await
@@ -318,10 +355,7 @@ impl Provider for OpenAiProvider {
         } else {
             return Err(ProviderError::Protocol("missing choices".into()));
         };
-        let text = message
-            .get("content")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let text = completion_text(message);
         let mut calls = parse_tool_calls(message.get("tool_calls"));
         let (text, salvaged) = salvage(text, &request.tools);
         if calls.is_empty() {
@@ -340,142 +374,6 @@ impl Provider for OpenAiProvider {
         })
     }
 
-    async fn stream(
-        &self,
-        request: ProviderRequest,
-        output: Sender<StreamChunk>,
-    ) -> Result<AssistantTurn, ProviderError> {
-        let response = self.send(self.body(&request, true)).await?;
-        let mut decoder = crate::sse::SseDecoder::new();
-        let mut text = String::new();
-        let mut thought = String::new();
-        let mut calls: std::collections::BTreeMap<usize, (String, String, String)> =
-            std::collections::BTreeMap::new();
-        let mut finish = None;
-        let mut final_usage = None;
-        let mut bytes = response.bytes_stream();
-        while let Some(chunk) = bytes.next().await {
-            for event in decoder.push(&chunk.map_err(crate::request_error)?) {
-                if event.data == "[DONE]" {
-                    continue;
-                }
-                let value: Value =
-                    crate::sse::parse_json(&event).map_err(ProviderError::Protocol)?;
-                if let Some(value) = usage(value.get("usage")) {
-                    final_usage = Some(value.clone());
-                    output
-                        .send(StreamChunk {
-                            usage: Some(value),
-                            ..Default::default()
-                        })
-                        .await
-                        .map_err(|_| ProviderError::Protocol("stream receiver closed".into()))?;
-                }
-                let choice = value
-                    .get("choices")
-                    .and_then(Value::as_array)
-                    .and_then(|choices| choices.first());
-                let Some(choice) = choice else { continue };
-                finish = choice
-                    .get("finish_reason")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .or(finish);
-                let delta = choice.get("delta").unwrap_or(choice);
-                if let Some(part) = delta.get("content").and_then(Value::as_str) {
-                    text.push_str(part);
-                    output
-                        .send(StreamChunk {
-                            text_delta: Some(part.into()),
-                            ..Default::default()
-                        })
-                        .await
-                        .map_err(|_| ProviderError::Protocol("stream receiver closed".into()))?;
-                }
-                if let Some(part) = reasoning(delta) {
-                    thought.push_str(&part);
-                    output
-                        .send(StreamChunk {
-                            reasoning_delta: Some(part),
-                            ..Default::default()
-                        })
-                        .await
-                        .map_err(|_| ProviderError::Protocol("stream receiver closed".into()))?;
-                }
-                for call in delta
-                    .get("tool_calls")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                {
-                    let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                    let entry = calls
-                        .entry(index)
-                        .or_insert_with(|| ("".into(), "".into(), "".into()));
-                    if let Some(id) = call.get("id").and_then(Value::as_str) {
-                        entry.0 = id.into();
-                    }
-                    if let Some(function) = call.get("function") {
-                        let name = function
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned);
-                        if let Some(name_value) = &name {
-                            entry.1 = name_value.clone();
-                        }
-                        let args = function
-                            .get("arguments")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned);
-                        if let Some(args_value) = &args {
-                            entry.2.push_str(args_value);
-                        }
-                        if name.is_some() || args.is_some() || call.get("id").is_some() {
-                            output
-                                .send(StreamChunk {
-                                    tool_call_delta: Some(ToolCallDelta {
-                                        index,
-                                        id: call
-                                            .get("id")
-                                            .and_then(Value::as_str)
-                                            .map(str::to_owned),
-                                        name,
-                                        arguments_fragment: args,
-                                    }),
-                                    ..Default::default()
-                                })
-                                .await
-                                .map_err(|_| {
-                                    ProviderError::Protocol("stream receiver closed".into())
-                                })?;
-                        }
-                    }
-                }
-            }
-        }
-        let tool_calls = calls
-            .into_values()
-            .map(|(id, name, args)| ToolCall {
-                id,
-                name,
-                arguments: serde_json::from_str(&args).unwrap_or_else(|_| json!({"_raw":args})),
-            })
-            .collect();
-        let (text, salvaged) = salvage((!text.is_empty()).then_some(text), &request.tools);
-        Ok(AssistantTurn {
-            text,
-            tool_calls: if salvaged.is_empty() {
-                tool_calls
-            } else {
-                salvaged
-            },
-            finish_reason: finish,
-            reasoning: (!thought.is_empty()).then_some(thought),
-            extras: json!({}),
-            usage: final_usage,
-        })
-    }
-
     fn capabilities(&self, _model: &str) -> Caps {
         Caps {
             tools: true,
@@ -486,6 +384,175 @@ impl Provider for OpenAiProvider {
             context_window: None,
         }
     }
+
+    async fn stream(
+        &self,
+        request: ProviderRequest,
+        output: Sender<StreamChunk>,
+    ) -> Result<AssistantTurn, ProviderError> {
+        let mut attempt = 0;
+        loop {
+            match stream_once(self, &request, &output).await {
+                Err(error)
+                    if (matches!(&error, ProviderError::Request(_))
+                        || matches!(
+                            &error,
+                            ProviderError::Http { status, .. } if is_transient_status(*status)
+                        ))
+                        && attempt < TRANSIENT_RETRY_LIMIT =>
+                {
+                    tracing::warn!(
+                        attempt,
+                        error = %error,
+                        "transient OpenAI-compatible stream transport error; retrying"
+                    );
+                    output
+                        .send(StreamChunk {
+                            stream_reset: true,
+                            ..Default::default()
+                        })
+                        .await
+                        .map_err(|_| ProviderError::Protocol("stream receiver closed".into()))?;
+                    tokio::time::sleep(retry_delay(attempt, None)).await;
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
+async fn stream_once(
+    provider: &OpenAiProvider,
+    request: &ProviderRequest,
+    output: &Sender<StreamChunk>,
+) -> Result<AssistantTurn, ProviderError> {
+    let response = provider.send(provider.body(request, true), true).await?;
+    let mut decoder = crate::sse::SseDecoder::new();
+    let mut text = String::new();
+    let mut thought = String::new();
+    let mut calls: std::collections::BTreeMap<usize, (String, String, String)> =
+        std::collections::BTreeMap::new();
+    let mut finish = None;
+    let mut final_usage = None;
+    let mut bytes = response.bytes_stream();
+    while let Some(chunk) = bytes.next().await {
+        for event in decoder.push(&chunk.map_err(crate::request_error)?) {
+            if event.data == "[DONE]" {
+                continue;
+            }
+            let Some(value) = parse_stream_value(&event) else {
+                continue;
+            };
+            if let Some(value) = usage(value.get("usage")) {
+                final_usage = Some(value.clone());
+                output
+                    .send(StreamChunk {
+                        usage: Some(value),
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(|_| ProviderError::Protocol("stream receiver closed".into()))?;
+            }
+            let Some(choice) = stream_choice(&value) else {
+                tracing::warn!("skipping OpenAI-compatible SSE event without choices");
+                continue;
+            };
+            finish = choice
+                .get("finish_reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or(finish);
+            let delta = choice.get("delta").unwrap_or(choice);
+            if let Some(part) = delta.get("content").and_then(Value::as_str) {
+                text.push_str(part);
+                output
+                    .send(StreamChunk {
+                        text_delta: Some(part.into()),
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(|_| ProviderError::Protocol("stream receiver closed".into()))?;
+            }
+            if let Some(part) = reasoning(delta) {
+                thought.push_str(&part);
+                output
+                    .send(StreamChunk {
+                        reasoning_delta: Some(part),
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(|_| ProviderError::Protocol("stream receiver closed".into()))?;
+            }
+            for call in delta
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let entry = calls
+                    .entry(index)
+                    .or_insert_with(|| ("".into(), "".into(), "".into()));
+                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                    entry.0 = id.into();
+                }
+                if let Some(function) = call.get("function") {
+                    let name = function
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    if let Some(name_value) = &name {
+                        entry.1 = name_value.clone();
+                    }
+                    let args = function
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    if let Some(args_value) = &args {
+                        entry.2.push_str(args_value);
+                    }
+                    if name.is_some() || args.is_some() || call.get("id").is_some() {
+                        output
+                            .send(StreamChunk {
+                                tool_call_delta: Some(ToolCallDelta {
+                                    index,
+                                    id: call.get("id").and_then(Value::as_str).map(str::to_owned),
+                                    name,
+                                    arguments_fragment: args,
+                                }),
+                                ..Default::default()
+                            })
+                            .await
+                            .map_err(|_| {
+                                ProviderError::Protocol("stream receiver closed".into())
+                            })?;
+                    }
+                }
+            }
+        }
+    }
+    let tool_calls = calls
+        .into_values()
+        .map(|(id, name, args)| ToolCall {
+            id,
+            name,
+            arguments: serde_json::from_str(&args).unwrap_or_else(|_| json!({"_raw":args})),
+        })
+        .collect();
+    let (text, salvaged) = salvage((!text.is_empty()).then_some(text), &request.tools);
+    Ok(AssistantTurn {
+        text,
+        tool_calls: if salvaged.is_empty() {
+            tool_calls
+        } else {
+            salvaged
+        },
+        finish_reason: finish,
+        reasoning: (!thought.is_empty()).then_some(thought),
+        extras: json!({}),
+        usage: final_usage,
+    })
 }
 
 #[cfg(test)]
@@ -498,6 +565,7 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
+        sync::mpsc,
         task::JoinHandle,
     };
 
@@ -638,6 +706,38 @@ mod tests {
         assert_eq!(value["content"].as_str(), Some("visible answer"));
     }
 
+    #[test]
+    fn completion_uses_reasoning_content_when_content_is_empty() {
+        let value = json!({
+            "content": "",
+            "reasoning_content": "Goal\nCompleted actions and results\nKey discoveries and file paths\nUnfinished next steps"
+        });
+        assert_eq!(
+            completion_text(&value).as_deref(),
+            Some(
+                "Goal\nCompleted actions and results\nKey discoveries and file paths\nUnfinished next steps"
+            )
+        );
+    }
+
+    #[test]
+    fn malformed_stream_event_is_skipped_without_protocol_failure() {
+        let event = crate::sse::SseEvent {
+            event: "message".into(),
+            data: "{not-json".into(),
+        };
+        assert!(parse_stream_value(&event).is_none());
+    }
+
+    #[test]
+    fn unexpected_stream_shape_is_skipped_without_choices() {
+        let value = json!({
+            "usage": {"completion_tokens": 4},
+            "choices": "unexpected"
+        });
+        assert!(stream_choice(&value).is_none());
+    }
+
     #[tokio::test]
     async fn retries_transient_http_responses_before_success() {
         let (base_url, calls, task) = response_sequence(vec![429, 500, 200], Some("0")).await;
@@ -651,6 +751,79 @@ mod tests {
             .unwrap();
         assert_eq!(turn.text.as_deref(), Some("ok"));
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retries_gateway_overload_statuses_before_success() {
+        let (base_url, calls, task) = response_sequence(vec![503, 529, 200], Some("0")).await;
+        let provider = OpenAiProvider::new(ProviderConfig::new(base_url, "test-key"));
+        let turn = provider
+            .complete(ProviderRequest {
+                model: "test".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(turn.text.as_deref(), Some("ok"));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn streaming_overload_retry_emits_stream_reset() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            for (status, body) in [
+                (503_u16, "system_cpu_overloaded"),
+                (
+                    200_u16,
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n\
+                     data: [DONE]\n\n",
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 {status} Error\r\nContent-Type: text/event-stream\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let provider =
+            OpenAiProvider::new(ProviderConfig::new(format!("http://{address}"), "test-key"));
+        let (output, mut chunks) = mpsc::channel(8);
+        let turn_task = tokio::spawn(async move {
+            provider
+                .stream(
+                    ProviderRequest {
+                        model: "test".into(),
+                        ..Default::default()
+                    },
+                    output,
+                )
+                .await
+        });
+        let first = chunks.recv().await.expect("stream reset chunk");
+        assert!(first.stream_reset);
+        assert_eq!(
+            turn_task.await.unwrap().unwrap().text.as_deref(),
+            Some("ok")
+        );
         task.await.unwrap();
     }
 
@@ -673,6 +846,60 @@ mod tests {
             }
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 4);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn streaming_uses_idle_timeout_instead_of_total_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let count = stream.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                      Connection: close\r\n\r\n\
+                      data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            stream
+                .write_all(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\" second\"},\
+                      \"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                )
+                .await
+                .unwrap();
+        });
+        let mut config = ProviderConfig::new(format!("http://{address}"), "test-key");
+        config.timeout_seconds = 1;
+        let provider = OpenAiProvider::new(config);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        let turn = provider
+            .stream(
+                ProviderRequest {
+                    model: "test".into(),
+                    ..Default::default()
+                },
+                sender,
+            )
+            .await
+            .unwrap();
+        assert_eq!(turn.text.as_deref(), Some("first second"));
+        while receiver.recv().await.is_some() {}
         task.await.unwrap();
     }
 

@@ -8,6 +8,7 @@ import {
   redactApproval,
   submitFailureMessage,
   providerBaseUrlError,
+  pendingQuestionFromPayload,
 } from "./gui";
 
 describe("GUI boundary behavior", () => {
@@ -63,6 +64,47 @@ describe("GUI boundary behavior", () => {
       "base URL is not configured",
     );
     expect(providerBaseUrlError("", true)).toBeNull();
+  });
+
+  it("preserves ask_user options and multi-select metadata", () => {
+    expect(
+      pendingQuestionFromPayload("q-1", {
+        question: "Choose a delivery format",
+        options: ["A", "B", 3],
+        allow_multiple: true,
+      }),
+    ).toEqual({
+      callId: "q-1",
+      question: "Choose a delivery format",
+      options: ["A", "B"],
+      allowMultiple: true,
+    });
+  });
+
+  it("accepts legacy open-ended ask_user payloads", () => {
+    expect(
+      pendingQuestionFromPayload("q-2", { question: "Tell me more" }),
+    ).toEqual({
+      callId: "q-2",
+      question: "Tell me more",
+      options: undefined,
+      allowMultiple: false,
+    });
+  });
+
+  it("normalizes an ask_user approval event as a question payload", () => {
+    expect(
+      pendingQuestionFromPayload("q-3", {
+        prompt: "Choose one",
+        options: ["A", "B"],
+        allowMultiple: true,
+      }),
+    ).toMatchObject({
+      callId: "q-3",
+      question: "Choose one",
+      options: ["A", "B"],
+      allowMultiple: true,
+    });
   });
 
   it("does not contain the retired private gateway address", () => {

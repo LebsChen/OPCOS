@@ -22,14 +22,13 @@ import {
   hostFailureMessage,
   hostStatusLabel,
   errorMessage,
+  pendingQuestionFromPayload,
   redactApproval,
   submitFailureMessage,
+  type PendingQuestionData,
 } from "./gui";
-import {
-  TranscriptViewItem,
-  normalizeTranscript,
-  reduceStreamEvent,
-} from "./transcript";
+import { isErrorNotice, providerErrorPresentation } from "./transcript";
+import { buildTimeline, mergeEvents, type TimelineEvent } from "./timeline";
 import { Sidebar } from "./components/Sidebar";
 import { sessionStatusLabel } from "./sessionStatus";
 import { Transcript } from "./components/Transcript";
@@ -38,7 +37,6 @@ import { Composer, PlusMenu, SendButton } from "./components/Composer";
 import { SelectMenu as OpenWorkerSelectMenu } from "./components/SelectMenu";
 import { SettingsView, type SettingsSection } from "./components/SettingsView";
 import { Icon } from "./components/Icon";
-import type { Item } from "./types";
 import { CollectionPage } from "./components/CollectionPage";
 import { IntegrationCard } from "./components/IntegrationCard";
 import { getLocale, setLocale, subscribeLocale, translate } from "./i18n";
@@ -405,10 +403,7 @@ type InboxRecord = {
   created_at: string;
   resolution?: string | null;
 };
-type PendingQuestion = {
-  callId: string;
-  question: string;
-};
+type PendingQuestion = PendingQuestionData;
 
 const OPENWORKER_CONNECTORS: ConnectorCatalogEntry[] = [
   { name: "Telegram", description: "Two-way messaging with a Telegram bot." },
@@ -604,6 +599,10 @@ type RailIconName =
   | "sparkle"
   | "diff"
   | "terminal"
+  | "shell"
+  | "changes"
+  | "progress"
+  | "agents"
   | "monitor"
   | "code"
   | "grid"
@@ -1018,7 +1017,7 @@ function MemberDialog({
   const [provider, setProvider] = useState(agent?.provider || "");
   const [model, setModel] = useState(agent?.model || "auto");
   const [harness, setHarness] = useState(agent?.harness || "builtin");
-  const [sessionMode, setSessionMode] = useState(agent?.mode || "Interactive");
+  const [sessionMode, setSessionMode] = useState(agent?.mode || "Auto");
   const [branch, setBranch] = useState(agent?.branch || "");
   const [state, setState] = useState(agent?.state || "Active");
   const [error, setError] = useState("");
@@ -8459,6 +8458,10 @@ type PanelTab =
   | "artifacts"
   | "pr"
   | "terminal"
+  | "shell"
+  | "changes"
+  | "progress"
+  | "agents"
   | "desktop"
   | "ide"
   | "review"
@@ -8478,6 +8481,10 @@ function paneRoute(): PaneRoute | null {
     "artifacts",
     "pr",
     "terminal",
+    "shell",
+    "changes",
+    "progress",
+    "agents",
     "desktop",
     "ide",
     "review",
@@ -8748,6 +8755,252 @@ function ArtifactsPane({ selected }: { selected: Session }) {
   );
 }
 
+type ShellHistoryItem = {
+  call_id: string;
+  command: string;
+  exit_code?: number | null;
+  duration_ms?: number | null;
+  output: string;
+};
+
+function ShellHistoryPane({ selected }: { selected: Session }) {
+  const [items, setItems] = useState<ShellHistoryItem[]>([]);
+  const [error, setError] = useState("");
+  const [open, setOpen] = useState<string | null>(null);
+  const refresh = () =>
+    void command<ShellHistoryItem[]>("session_shell_history", {
+      sessionId: selected.id,
+    })
+      .then(setItems)
+      .catch((reason) => setError(errorMessage(reason)));
+  useEffect(() => {
+    refresh();
+  }, [selected.id]);
+  return (
+    <section className="rail-section">
+      <div className="rail-section-head">
+        <strong>Shell</strong>
+        <button
+          className="rail-mini-btn"
+          onClick={refresh}
+          title="Refresh shell history"
+        >
+          <RailIcon name="refresh" size={16} />
+        </button>
+      </div>
+      <div className="rail-section-body">
+        {error ? (
+          <div className="rail-error">{error}</div>
+        ) : items.length === 0 ? (
+          <div className="rail-muted">No shell commands recorded yet.</div>
+        ) : (
+          <div className="rail-event-list">
+            {items.map((item) => (
+              <div className="rail-event-card" key={item.call_id}>
+                <button
+                  className="rail-event-head"
+                  onClick={() =>
+                    setOpen(open === item.call_id ? null : item.call_id)
+                  }
+                >
+                  <code>{item.command || "(empty command)"}</code>
+                  <span
+                    className={item.exit_code === 0 ? "rail-ok" : "rail-muted"}
+                  >
+                    {item.exit_code == null
+                      ? "running"
+                      : `exit ${item.exit_code}`}
+                  </span>
+                </button>
+                <div className="rail-event-meta">
+                  {item.duration_ms == null ? "" : `${item.duration_ms} ms`}
+                </div>
+                {open === item.call_id && item.output && (
+                  <pre className="rail-event-output">{item.output}</pre>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+type FileChange = {
+  path: string;
+  edit_count: number;
+  edits: Array<Record<string, unknown>>;
+};
+
+function ChangesPane({ selected }: { selected: Session }) {
+  const [items, setItems] = useState<FileChange[]>([]);
+  const [gitDiff, setGitDiff] = useState<Record<string, unknown> | null>(null);
+  const [error, setError] = useState("");
+  const [open, setOpen] = useState<string | null>(null);
+  const refresh = () => {
+    setError("");
+    void Promise.all([
+      command<FileChange[]>("session_file_changes", { sessionId: selected.id }),
+      selected.workspace
+        ? command<Record<string, unknown>>("review_snapshot", {
+            sessionId: selected.id,
+            cwd: selected.workspace,
+            base: "HEAD",
+          })
+        : Promise.resolve(null),
+    ])
+      .then(([changes, snapshot]) => {
+        setItems(changes);
+        setGitDiff(snapshot);
+      })
+      .catch((reason) => setError(errorMessage(reason)));
+  };
+  useEffect(() => {
+    refresh();
+  }, [selected.id, selected.workspace]);
+  const changes = (gitDiff?.changes as Record<string, unknown> | undefined)
+    ?.files;
+  return (
+    <section className="rail-section">
+      <div className="rail-section-head">
+        <strong>Changes</strong>
+        <button
+          className="rail-mini-btn"
+          onClick={refresh}
+          title="Refresh changes"
+        >
+          <RailIcon name="refresh" size={16} />
+        </button>
+      </div>
+      <div className="rail-section-body">
+        {error && <div className="rail-error">{error}</div>}
+        {items.length === 0 ? (
+          <div className="rail-muted">No file edits recorded yet.</div>
+        ) : (
+          <div className="rail-event-list">
+            {items.map((item) => (
+              <div className="rail-event-card" key={item.path}>
+                <button
+                  className="rail-event-head"
+                  onClick={() => setOpen(open === item.path ? null : item.path)}
+                >
+                  <code>{item.path}</code>
+                  <span className="rail-muted">{item.edit_count} edits</span>
+                </button>
+                {open === item.path &&
+                  item.edits.map((edit, index) => (
+                    <pre className="rail-event-output" key={index}>
+                      {JSON.stringify(edit, null, 2)}
+                    </pre>
+                  ))}
+              </div>
+            ))}
+          </div>
+        )}
+        {Array.isArray(changes) && changes.length > 0 && (
+          <details className="rail-git-diff">
+            <summary>Current git diff</summary>
+            <pre>{JSON.stringify(changes, null, 2)}</pre>
+          </details>
+        )}
+        {!gitDiff && selected.workspace && (
+          <div className="rail-muted">
+            Git diff unavailable for this host/workspace.
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+type ProgressEvent = {
+  sequence: number;
+  event_type?: string;
+  category?: string;
+  timestamp?: string;
+  payload?: Record<string, unknown>;
+};
+
+function ProgressPane({ selected }: { selected: Session }) {
+  const [events, setEvents] = useState<ProgressEvent[]>([]);
+  const [category, setCategory] = useState("");
+  const [error, setError] = useState("");
+  const refresh = () =>
+    void command<ProgressEvent[]>("session_progress", {
+      sessionId: selected.id,
+      category: category || null,
+    })
+      .then(setEvents)
+      .catch((reason) => setError(errorMessage(reason)));
+  useEffect(() => {
+    refresh();
+  }, [selected.id, category]);
+  const categories = [
+    ...new Set(events.map((event) => event.category).filter(Boolean)),
+  ];
+  return (
+    <section className="rail-section">
+      <div className="rail-section-head">
+        <strong>Progress</strong>
+        <select
+          value={category}
+          onChange={(event) => setCategory(event.target.value)}
+        >
+          <option value="">All</option>
+          {categories.map((item) => (
+            <option key={item} value={item}>
+              {item}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div className="rail-section-body">
+        {error ? (
+          <div className="rail-error">{error}</div>
+        ) : events.length === 0 ? (
+          <div className="rail-muted">No progress events recorded yet.</div>
+        ) : (
+          <div className="rail-event-list">
+            {events.map((event) => (
+              <div
+                className="rail-event-card"
+                key={`${event.sequence}-${event.event_type}`}
+              >
+                <div className="rail-event-head">
+                  <strong>{event.event_type || "working_event"}</strong>
+                  <span className="rail-muted">{event.category}</span>
+                </div>
+                <div className="rail-event-meta">
+                  {event.timestamp
+                    ? new Date(event.timestamp).toLocaleString()
+                    : ""}
+                </div>
+                <div className="rail-event-summary">
+                  {JSON.stringify(event.payload || {})}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function PlannedPane({ title, children }: { title: string; children: string }) {
+  return (
+    <section className="rail-section">
+      <div className="rail-section-head">
+        <strong>{title}</strong>
+      </div>
+      <div className="rail-section-body">
+        <div className="rail-muted">{children}</div>
+      </div>
+    </section>
+  );
+}
+
 function SessionRightPanel({
   selected,
   onError,
@@ -8788,6 +9041,10 @@ function SessionRightPanel({
     icon: RailIconName;
   }> = [
     { id: "info", label: "Info", icon: "info" },
+    { id: "shell", label: "Shell", icon: "terminal" },
+    { id: "changes", label: "Changes", icon: "diff" },
+    { id: "progress", label: "Progress", icon: "list" },
+    { id: "agents", label: "Agents", icon: "list" },
     { id: "artifacts", label: "Artifacts", icon: "file" },
     { id: "pr", label: "PR", icon: "branch" },
     { id: "insights", label: "Insights", icon: "sparkle" },
@@ -8808,15 +9065,22 @@ function SessionRightPanel({
     id: typeof panelTab;
     label: string;
     icon: RailIconName;
-  }> =
-    selected.host_id === "local"
+  }> = [
+    { id: "desktop", label: "Desktop", icon: "monitor" },
+    { id: "ide", label: "Editor", icon: "code" },
+    ...(selected.host_id === "local"
       ? []
       : [
-          { id: "terminal", label: "Shell", icon: "terminal" },
-          { id: "desktop", label: "Desktop", icon: "monitor" },
-          { id: "ide", label: "Web IDE", icon: "code" },
-          { id: "browser", label: "Browser", icon: "grid" },
-        ];
+          {
+            id: "terminal" as const,
+            label: "Terminal",
+            icon: "terminal" as const,
+          },
+        ]),
+    ...(selected.host_id === "local"
+      ? []
+      : [{ id: "browser" as const, label: "Browser", icon: "grid" as const }]),
+  ];
   const tabs = [...informationTabs, ...workspaceTabs, ...remoteTabs];
   const workspaceTabIds: PanelTab[] = [
     "review",
@@ -8974,11 +9238,56 @@ function SessionRightPanel({
                 <ArtifactsPane selected={selected} />
               </div>
             )}
+            {opened.includes("shell") && panelTab === "shell" && (
+              <div className="session-pane">
+                <ShellHistoryPane selected={selected} />
+              </div>
+            )}
+            {opened.includes("changes") && panelTab === "changes" && (
+              <div className="session-pane">
+                <ChangesPane selected={selected} />
+              </div>
+            )}
+            {opened.includes("progress") && panelTab === "progress" && (
+              <div className="session-pane">
+                <ProgressPane selected={selected} />
+              </div>
+            )}
+            {opened.includes("agents") && panelTab === "agents" && (
+              <div className="session-pane">
+                <PlannedPane title="Agents">
+                  Agents and child-session management are planned for the
+                  project_agents/sub-session integration.
+                </PlannedPane>
+              </div>
+            )}
+            {opened.includes("desktop") && panelTab === "desktop" && (
+              <div className="session-pane">
+                <PlannedPane title="Desktop">
+                  Desktop viewing and control is planned for the local VNC
+                  bridge and remote RVM /vnc-ws integration.
+                </PlannedPane>
+              </div>
+            )}
+            {opened.includes("ide") && panelTab === "ide" && (
+              <div className="session-pane">
+                <PlannedPane title="Editor">
+                  Full machine editor control is planned for the host editor
+                  integration.
+                </PlannedPane>
+              </div>
+            )}
             {tabs
               .filter(
                 (item) =>
                   item.id !== "info" &&
                   item.id !== "artifacts" &&
+                  item.id !== "shell" &&
+                  item.id !== "changes" &&
+                  item.id !== "progress" &&
+                  item.id !== "agents" &&
+                  item.id !== "desktop" &&
+                  item.id !== "ide" &&
                   opened.includes(item.id),
               )
               .map((item) => (
@@ -9230,11 +9539,55 @@ function QuestionCard({
   onAnswer: (answer: string) => Promise<void>;
 }) {
   const [answer, setAnswer] = useState("");
+  const [selectedOptions, setSelectedOptions] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
+  const options = question.options ?? [];
+  const submit = (value: string) => {
+    if (!value.trim() || submitting) return;
+    setSubmitting(true);
+    void onAnswer(value.trim()).catch(() => setSubmitting(false));
+  };
   return (
     <div className="approval rounded-xl border border-line p-3 mb-4">
       <strong>Question</strong>
       <div className="approval-with mt-3">{question.question}</div>
+      {options.length > 0 && (
+        <div className="approval-btns mt-3 flex-wrap">
+          {options.map((option) => {
+            const selected = selectedOptions.includes(option);
+            return (
+              <button
+                key={option}
+                className={`btn ${selected ? "approval-primary" : ""}`}
+                disabled={submitting}
+                aria-pressed={selected}
+                onClick={() => {
+                  if (question.allowMultiple) {
+                    setSelectedOptions((current) =>
+                      selected
+                        ? current.filter((item) => item !== option)
+                        : [...current, option],
+                    );
+                  } else {
+                    submit(option);
+                  }
+                }}
+              >
+                {option}
+              </button>
+            );
+          })}
+          {question.allowMultiple && (
+            <button
+              className="btn approval-primary"
+              disabled={submitting || selectedOptions.length === 0}
+              onClick={() => submit(JSON.stringify(selectedOptions))}
+            >
+              {submitting ? "Sending…" : "Submit selection"}
+            </button>
+          )}
+        </div>
+      )}
       <div className="approval-btns mt-3">
         <input
           className="ob-input flex-1"
@@ -9247,10 +9600,7 @@ function QuestionCard({
         <button
           className="btn approval-primary"
           disabled={submitting || !answer.trim()}
-          onClick={() => {
-            setSubmitting(true);
-            void onAnswer(answer.trim()).catch(() => setSubmitting(false));
-          }}
+          onClick={() => submit(answer)}
         >
           {submitting ? "Sending…" : "Answer"}
         </button>
@@ -9266,7 +9616,7 @@ function AppContent() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selected, setSelected] = useState<Session | null>(null);
   const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
-  const [transcript, setTranscript] = useState<TranscriptViewItem[]>([]);
+  const [transcript, setTranscript] = useState<TimelineEvent[]>([]);
   const [pendingQuestion, setPendingQuestion] =
     useState<PendingQuestion | null>(null);
   const [surface, setSurface] = useState<
@@ -9280,6 +9630,7 @@ function AppContent() {
   const [settingsTab, setSettingsTab] = useState<SettingsSection>("provider");
   const [query, setQuery] = useState("");
   const [error, setError] = useState("");
+  const errorTimer = useRef<number | undefined>(undefined);
   const [running, setRunning] = useState(false);
   const [drawerCollapsed, setDrawerCollapsed] = useState(false);
   const [rightPanelWidth, setRightPanelWidth] = useState(() =>
@@ -9318,7 +9669,7 @@ function AppContent() {
   const [homeHostId, setHomeHostId] = useState("");
   const [homeProvider, setHomeProvider] = useState("");
   const [homeModel, setHomeModel] = useState("auto");
-  const [homeMode, setHomeMode] = useState("Interactive");
+  const [homeMode, setHomeMode] = useState("Auto");
   const [homeHarness, setHomeHarness] = useState("builtin");
   const [homeRole, setHomeRole] = useState("");
   const [homeSystemPrompt, setHomeSystemPrompt] = useState("");
@@ -9335,6 +9686,40 @@ function AppContent() {
   const [homeWorkspace, setHomeWorkspace] = useState("");
   const [secretBackend, setSecretBackend] = useState("");
   const generation = useRef(0);
+  const showErrorToast = (reason: unknown) => {
+    const runtime = (window as Window & { __TAURI_INTERNALS__?: unknown })
+      .__TAURI_INTERNALS__;
+    const message = errorMessage(reason);
+    if (
+      message.includes("Approval required before this tool can continue") ||
+      message.includes(
+        "Question requires an answer before this tool can continue",
+      )
+    )
+      return;
+    if (!runtime && /invoke|tauri/i.test(message)) return;
+    const providerLike =
+      /provider|HTTP\s+\d{3}|bad_response|overloaded|request failed/i.test(
+        message,
+      );
+    const toast = providerLike
+      ? providerErrorPresentation(redactApproval(message)).toast
+      : redactApproval(message);
+    setError(toast);
+    if (errorTimer.current !== undefined)
+      window.clearTimeout(errorTimer.current);
+    errorTimer.current = window.setTimeout(() => {
+      setError("");
+      errorTimer.current = undefined;
+    }, 6000);
+  };
+  useEffect(
+    () => () => {
+      if (errorTimer.current !== undefined)
+        window.clearTimeout(errorTimer.current);
+    },
+    [],
+  );
   useEffect(() => {
     void command<SlashCommand[]>("list_slash_commands", {
       projectId: selected?.project_id || null,
@@ -9472,13 +9857,26 @@ function AppContent() {
     setPendingQuestion(null);
     setRunning(false);
     if (!selected) return;
-    void command<Array<{ kind: string; payload: Record<string, unknown> }>>(
-      "read_transcript",
-      { sessionId: selected.id },
-    )
-      .then((items) => {
-        if (generation.current === currentGeneration)
-          setTranscript(normalizeTranscript(items));
+    void Promise.all([
+      command<TimelineEvent[]>("read_session_events", {
+        sessionId: selected.id,
+      }),
+      command<InboxRecord[]>("list_inbox"),
+    ])
+      .then(([items, inboxItems]) => {
+        if (generation.current !== currentGeneration) return;
+        const pending = inboxItems.find(
+          (item) =>
+            item.session_id === selected.id &&
+            item.state === "pending" &&
+            (item.kind === "question" || item.tool === "ask_user"),
+        );
+        if (pending) {
+          setPendingQuestion(
+            pendingQuestionFromPayload(pending.call_id, pending.payload),
+          );
+        }
+        setTranscript(mergeEvents([], items));
       })
       .catch((reason) => {
         if (generation.current === currentGeneration)
@@ -9555,25 +9953,37 @@ function AppContent() {
           );
         }
       }
-      if (payload.kind === "question_requested") {
+      const approvalTool =
+        typeof payload.payload?.tool === "string"
+          ? payload.payload.tool
+          : typeof payload.payload?.toolName === "string"
+            ? payload.payload.toolName
+            : "";
+      const isAskUserApproval =
+        payload.kind === "approval" && approvalTool === "ask_user";
+      if (
+        payload.kind === "question_requested" ||
+        payload.kind === "question" ||
+        payload.payload?.kind === "question_requested" ||
+        isAskUserApproval
+      ) {
+        const questionPayload =
+          payload.payload?.payload &&
+          typeof payload.payload.payload === "object"
+            ? (payload.payload.payload as Record<string, unknown>)
+            : payload.payload;
         const args =
-          payload.payload.arguments &&
-          typeof payload.payload.arguments === "object"
-            ? (payload.payload.arguments as Record<string, unknown>)
+          questionPayload.arguments &&
+          typeof questionPayload.arguments === "object"
+            ? (questionPayload.arguments as Record<string, unknown>)
             : {};
         const callId =
-          typeof payload.payload.call_id === "string"
-            ? payload.payload.call_id
+          typeof questionPayload.call_id === "string"
+            ? questionPayload.call_id
             : "";
         if (callId) {
           setPendingQuestion({
-            callId,
-            question:
-              typeof args.question === "string"
-                ? args.question
-                : typeof args.prompt === "string"
-                  ? args.prompt
-                  : "Answer required",
+            ...pendingQuestionFromPayload(callId, args),
           });
           setRunning(false);
         }
@@ -9591,12 +10001,32 @@ function AppContent() {
         )
       )
         setRunning(false);
-      setTranscript((items) =>
-        reduceStreamEvent(items, {
-          kind: payload.kind,
-          payload: payload.payload,
-        }),
-      );
+      if (payload.kind === "notice") {
+        const noticeText =
+          typeof payload.payload?.text === "string"
+            ? payload.payload.text
+            : typeof payload.payload?.message === "string"
+              ? payload.payload.message
+              : "";
+        if (
+          isErrorNotice({
+            kind: "notice",
+            noticeKind: String(payload.payload?.kind || ""),
+            text: noticeText,
+          })
+        )
+          showErrorToast(noticeText);
+      }
+      if (
+        payload.kind === "stream" &&
+        typeof payload.payload.event_id === "string" &&
+        typeof payload.payload.created_at_ms === "number" &&
+        typeof payload.payload.type === "string"
+      ) {
+        setTranscript((items) =>
+          mergeEvents(items, payload.payload as unknown as TimelineEvent),
+        );
+      }
     });
     return () => {
       active = false;
@@ -9604,18 +10034,7 @@ function AppContent() {
     };
   }, [selected?.id]);
   const onError = (reason: unknown) => {
-    const runtime = (window as Window & { __TAURI_INTERNALS__?: unknown })
-      .__TAURI_INTERNALS__;
-    const message = errorMessage(reason);
-    if (
-      message.includes("Approval required before this tool can continue") ||
-      message.includes(
-        "Question requires an answer before this tool can continue",
-      )
-    )
-      return;
-    if (!runtime && /invoke|tauri/i.test(message)) return;
-    setError(redactApproval(message));
+    showErrorToast(reason);
   };
   const addHost = async (event: FormEvent) => {
     event.preventDefault();
@@ -9715,63 +10134,9 @@ function AppContent() {
       onError(submitFailureMessage(reason));
     }
   };
-  const activeItems = useMemo(() => transcript, [transcript]);
-  const transcriptItems = useMemo<Item[]>(() => {
-    const output: Item[] = [];
-    activeItems.forEach((item) => {
-      if (item.kind === "user")
-        output.push({ kind: "user", text: item.text || "" });
-      if (item.kind === "assistant")
-        output.push({
-          kind: "assistant",
-          text: item.text || "",
-          reasoning: item.reasoning,
-        });
-      if (item.kind === "thinking")
-        output.push({
-          kind: "assistant",
-          text: "",
-          reasoning: item.reasoning || item.text || "",
-        });
-      if (item.kind === "tool" && (item.approval || item.resolved))
-        output.push({
-          kind: "approval",
-          callId: item.callId,
-          name: item.toolName || "approval",
-          args: item.arguments,
-          reason: item.text || "Tool action requires approval",
-          resolved: item.resolved,
-        });
-      else if (item.kind === "tool")
-        output.push({
-          kind: "tool",
-          id: item.id,
-          name: item.toolName || "tool",
-          args: item.arguments,
-          status: item.status || "ok",
-          preview: item.result ? String(item.result) : undefined,
-        });
-      if (item.kind === "approval")
-        output.push({
-          kind: "approval",
-          callId: item.callId,
-          name: item.toolName || "approval",
-          args: item.arguments,
-          reason: item.text || "",
-          resolved: item.status === "ok" ? "allow" : undefined,
-        });
-      if (item.kind === "notice")
-        output.push({
-          kind: "notice",
-          tone: item.noticeKind === "error" ? "warn" : "info",
-          text: item.text || "",
-        });
-    });
-    return output;
-  }, [activeItems]);
-  const approvalPending = activeItems.some(
-    (item) =>
-      item.kind === "tool" && item.approval && item.status === "pending",
+  const approvalPending = useMemo(
+    () => buildTimeline(transcript).some((item) => item.kind === "approval"),
+    [transcript],
   );
   const toggleAsset = (asset: Asset) => {
     if (!selected) return;
@@ -9972,7 +10337,7 @@ function AppContent() {
               <div className="main-chat">
                 <div className="main-scroll">
                   <Transcript
-                    items={transcriptItems}
+                    events={transcript}
                     running={running}
                     onApprove={(item, decision) => {
                       if (!item.callId) return;
@@ -9982,19 +10347,30 @@ function AppContent() {
                         approve: decision === "allow",
                       }).catch(onError);
                     }}
+                    onRetry={() => {
+                      void command("submit_turn", {
+                        request: { session_id: selected.id, text: "" },
+                      }).catch(onError);
+                    }}
                   />
                 </div>
                 {pendingQuestion && (
                   <QuestionCard
                     question={pendingQuestion}
                     onAnswer={async (answer) => {
-                      setRunning(true);
-                      await command("resolve_inbox", {
-                        sessionId: selected.id,
-                        callId: pendingQuestion.callId,
-                        resolution: answer,
-                      });
+                      const answeredQuestion = pendingQuestion;
                       setPendingQuestion(null);
+                      setRunning(true);
+                      try {
+                        await command("resolve_inbox", {
+                          sessionId: selected.id,
+                          callId: answeredQuestion.callId,
+                          resolution: answer,
+                        });
+                      } catch (reason) {
+                        setPendingQuestion(answeredQuestion);
+                        throw reason;
+                      }
                     }}
                   />
                 )}
@@ -10192,7 +10568,7 @@ function AppContent() {
                           setHomeProvider(content.provider || "");
                           setHomeModel(content.model || "auto");
                           setHomeHarness(content.harness || "builtin");
-                          setHomeMode(content.mode || "Interactive");
+                          setHomeMode(content.mode || "Auto");
                           setHomeSystemPrompt(content.system_prompt || "");
                         } catch {
                           onError("Agent 模板内容不是有效 JSON");
@@ -10346,9 +10722,19 @@ function AppContent() {
           </div>
         )}
         {error && (
-          <div className="error-banner">
+          <div className="error-toast" role="alert" data-testid="error-toast">
             {error}
-            <button onClick={() => setError("")}>×</button>
+            <button
+              aria-label="Dismiss notification"
+              onClick={() => {
+                setError("");
+                if (errorTimer.current !== undefined)
+                  window.clearTimeout(errorTimer.current);
+                errorTimer.current = undefined;
+              }}
+            >
+              ×
+            </button>
           </div>
         )}
       </main>

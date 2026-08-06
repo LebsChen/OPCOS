@@ -5,7 +5,7 @@ use opcos_policy::{
 };
 use opcos_provider::{
     AssistantTurn, Caps, Provider, ProviderError, ProviderRequest, StreamChunk, TokenUsage,
-    ToolCall, ToolResult,
+    ToolCall, ToolResult, WorkingEvent,
 };
 use opcos_store::{
     CompactionRecord, GrantRecord, NoticeRecord, PendingRecord, SessionStore, StoredMessage,
@@ -17,11 +17,12 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::{
     Arc, Mutex as StdMutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc, oneshot};
+use uuid::Uuid;
 
 mod acp;
 pub mod computer_use;
@@ -61,6 +62,15 @@ pub enum EngineError {
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
     async fn execute(&self, name: &str, arguments: Value) -> Result<Value, String>;
+
+    async fn execute_streaming(
+        &self,
+        name: &str,
+        arguments: Value,
+        _on_output: &(dyn for<'a> Fn(&'a str) + Send + Sync + '_),
+    ) -> Result<Value, String> {
+        self.execute(name, arguments).await
+    }
 
     async fn run_hook_command(
         &self,
@@ -744,7 +754,7 @@ where
         if let Some(reason) = pre.blocked {
             return json!({"error":reason});
         }
-        let result = self.execute_tool(call).await;
+        let result = self.execute_tool_streaming(call).await;
         let post = self
             .lifecycle_hooks(
                 "PostToolUse",
@@ -757,6 +767,40 @@ where
             .await
             .extend(post.additional_context);
         result
+    }
+
+    fn execute_proposed_plan(&self, arguments: &Value) -> Value {
+        let object = arguments.as_object();
+        let title = object
+            .and_then(|value| value.get("title"))
+            .and_then(Value::as_str)
+            .unwrap_or("Implementation plan");
+        let summary = object
+            .and_then(|value| value.get("summary"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let steps = object
+            .and_then(|value| value.get("steps"))
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        match self
+            .store
+            .create_plan(&self.session_id, None, title, summary, &steps)
+        {
+            Ok(plan) => json!({
+                "status": "created",
+                "plan_id": plan.plan_id,
+                "steps": plan.steps.len(),
+            }),
+            Err(error) => json!({"error": error.to_string()}),
+        }
     }
 
     async fn apply_post_compaction_hook(&self, messages: &mut Vec<Value>) {
@@ -784,6 +828,28 @@ where
         self.set_session_status("running", "none");
         let value = json!({"role":"user","content":[{"type":"text","text":text.into()}]});
         let result = async {
+            let text = value
+                .get("content")
+                .and_then(Value::as_array)
+                .and_then(|parts| parts.first())
+                .and_then(|part| part.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let event = WorkingEvent {
+                event_type: "user_message".into(),
+                category: "message".into(),
+                direction: "incoming".into(),
+                timestamp: Utc::now().to_rfc3339(),
+                payload: json!({"message":text}),
+            };
+            self.emit_event(
+                "user_message",
+                StreamChunk {
+                    working_event: Some(event),
+                    ..StreamChunk::default()
+                },
+            )?;
             self.append("user", value).await?;
             self.run_loop(self.provider_messages()?).await
         }
@@ -804,6 +870,13 @@ where
     pub async fn resume_pending_turn(&self) -> Result<Option<AssistantTurn>, EngineError> {
         self.set_session_status("running", "none");
         self.policy_denied.store(false, Ordering::SeqCst);
+        let _ = self
+            .working_event(
+                "resuming_session",
+                "lifecycle",
+                json!({"resume_reason":"pending_recovery"}),
+            )
+            .await;
         let result = self.resume_pending_turn_inner().await;
         self.finish_turn(&result);
         result
@@ -1055,6 +1128,17 @@ where
         self.store
             .complete_tool_call(&self.session_id, message_sequence, call_id, &result)
             .map_err(|error| EngineError::Store(error.to_string()))?;
+        let _ = self
+            .working_event(
+                "user_question_answered",
+                "message",
+                json!({
+                    "call_id":pending.call_id,
+                    "question_type":pending.tool,
+                    "answer_type":if response.is_string() {"text"} else {"structured"},
+                }),
+            )
+            .await;
         self.run_loop(self.provider_messages()?).await
     }
 
@@ -1112,7 +1196,7 @@ where
                     // synchronously through an approval path or fabricate an answer.
                     json!({"error":"ask_user must be handled by the engine pending mechanism"})
                 } else {
-                    self.execute_tool(&ToolCall {
+                    self.execute_tool_streaming(&ToolCall {
                         id: item.call_id.clone(),
                         name: item.tool.clone(),
                         arguments: item.arguments.clone(),
@@ -1145,9 +1229,43 @@ where
             self.store
                 .complete_tool_call(&self.session_id, message_sequence, &call.id, &result)
                 .map_err(|error| EngineError::Store(error.to_string()))?;
-            let _ = self
-                .events
-                .send(StreamChunk {
+            let category = tool_event_category(&call.name);
+            if call.name == "run_shell" {
+                let output = result
+                    .get("output")
+                    .or_else(|| result.get("stdout"))
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| result.to_string());
+                let _ = self
+                    .working_event(
+                        "shell_process_completed",
+                        "shell",
+                        json!({
+                            "process_id": call.id,
+                            "exit_code": result.get("exit_code").and_then(Value::as_i64).unwrap_or_else(|| if result.get("error").is_some() { 1 } else { 0 }),
+                            "output_trunc": output.chars().take(4000).collect::<String>(),
+                        }),
+                    )
+                    .await;
+            } else {
+                let _ = self
+                    .working_event(
+                        &format!("{}_completed", call.name),
+                        category,
+                        json!({
+                            "call_id":call.id,
+                            "tool":call.name,
+                            "path": call.arguments.get("path").or_else(|| call.arguments.get("target")),
+                            "ok":result.get("error").is_none(),
+                            "result_type":if result.is_object() {"object"} else if result.is_array() {"array"} else {"value"},
+                            "result_bytes":result.to_string().len(),
+                        }),
+                    )
+                    .await;
+            }
+            let _ = self.emit_event(
+                "tool_result",
+                StreamChunk {
                     tool_result: Some(ToolResult {
                         call_id: call.id,
                         name: call.name,
@@ -1155,8 +1273,8 @@ where
                         result,
                     }),
                     ..StreamChunk::default()
-                })
-                .await;
+                },
+            );
         }
         drop(active);
         self.run_loop(self.provider_messages()?).await
@@ -1230,7 +1348,32 @@ where
         let mut usage: Option<TokenUsage> = None;
         let mut stop_vetoes = 0;
         let max_iterations = self.max_iterations.load(Ordering::SeqCst);
-        for _ in 0..max_iterations {
+        for iteration in 0..max_iterations {
+            let _ = self
+                .working_event(
+                    "status_update",
+                    "status",
+                    json!({"enum":"working","message":"Working"}),
+                )
+                .await;
+            let _ = self
+                .working_event(
+                    "simple_activity_update",
+                    "status",
+                    json!({"enum":"deciding_action","iteration":iteration + 1}),
+                )
+                .await;
+            let context_tokens = messages
+                .iter()
+                .map(|message| message.to_string().len() as u64 / 4)
+                .sum::<u64>();
+            let _ = self
+                .working_event(
+                    "context_growth_update",
+                    "other",
+                    json!({"estimated_context_tokens":context_tokens}),
+                )
+                .await;
             if self.interrupted.load(Ordering::SeqCst) {
                 self.notice("interrupted", "Turn interrupted".into())
                     .await?;
@@ -1299,6 +1442,23 @@ where
             let (provider_result, partial) = self.stream_turn(request).await;
             match provider_result {
                 Ok(turn) => {
+                    if let Some(reasoning) =
+                        partial.reasoning.as_deref().or(turn.reasoning.as_deref())
+                    {
+                        let message = reasoning.chars().take(4000).collect::<String>();
+                        if !message.is_empty() {
+                            let _ = self
+                                .working_event(
+                                    "devin_thoughts",
+                                    "other",
+                                    json!({
+                                        "message":message,
+                                        "thinking_duration_ms":started.elapsed().as_millis(),
+                                    }),
+                                )
+                                .await;
+                        }
+                    }
                     usage = turn.usage.clone();
                     if let Some(value) = &turn.usage {
                         let limit = self.message_usage_limit.load(Ordering::SeqCst);
@@ -1319,13 +1479,55 @@ where
                                 recorded_at: Utc::now(),
                             })
                             .map_err(|error| EngineError::Store(error.to_string()))?;
+                        let _ = self
+                            .working_event(
+                                "iteration_stats",
+                                "other",
+                                json!({
+                                    "iteration":iteration + 1,
+                                    "num_tool_calls":turn.tool_calls.len(),
+                                    "duration_ms":started.elapsed().as_millis(),
+                                    "input_tokens":value.input,
+                                    "output_tokens":value.output,
+                                }),
+                            )
+                            .await;
                     }
                     let assistant = json!({"role":"assistant","content":turn.text.clone().unwrap_or_default(),
                         "tool_calls":turn.tool_calls,"reasoning":turn.reasoning});
                     self.append("assistant", assistant.clone()).await?;
+                    let _ = self
+                        .working_event(
+                            "devin_message",
+                            "message",
+                            json!({
+                                "message": turn.text.clone().unwrap_or_default(),
+                                "tool_calls": turn.tool_calls.len()
+                            }),
+                        )
+                        .await;
+                    if !partial.turn_emitted {
+                        let _ = self.emit_event(
+                            "turn",
+                            StreamChunk {
+                                turn: Some(turn.clone()),
+                                ..StreamChunk::default()
+                            },
+                        );
+                    }
                     let assistant_sequence = *self.sequence.lock().await;
                     messages.push(assistant);
                     if turn.tool_calls.is_empty() {
+                        let _ = self
+                            .working_event(
+                                "iteration_checkpoint",
+                                "lifecycle",
+                                json!({
+                                    "iteration":iteration + 1,
+                                    "num_tool_calls":turn.tool_calls.len(),
+                                }),
+                            )
+                            .await;
                         let stop = self
                             .lifecycle_hooks(
                                 "Stop",
@@ -1467,15 +1669,34 @@ where
                     if self.interrupted.load(Ordering::SeqCst) {
                         return (Err(ProviderError::Protocol("interrupted".into())), partial);
                     }
+                    if chunk.stream_reset {
+                        partial = PartialOutput::default();
+                        let _ = self.emit_event("stream_reset", chunk);
+                        continue;
+                    }
                     if let Some(text) = chunk.text_delta.clone() {
                         partial.text.get_or_insert_with(String::new).push_str(&text);
                     }
                     if let Some(reasoning) = chunk.reasoning_delta.clone() {
                         partial.reasoning.get_or_insert_with(String::new).push_str(&reasoning);
                     }
-                    if self.events.send(chunk).await.is_err() {
-                        return (Err(ProviderError::Protocol("stream receiver closed".into())), partial);
+                    if chunk.turn.is_some() {
+                        partial.turn_emitted = true;
                     }
+                    let event_type = if chunk.text_delta.is_some() {
+                        "assistant_delta"
+                    } else if chunk.reasoning_delta.is_some() {
+                        "reasoning_delta"
+                    } else if chunk.tool_call_delta.is_some() {
+                        "tool_call_delta"
+                    } else if chunk.tool_result.is_some() {
+                        "tool_result"
+                    } else if chunk.turn.is_some() {
+                        "turn"
+                    } else {
+                        "stream"
+                    };
+                    let _ = self.emit_event(event_type, chunk);
                 }
                 _ = self.interrupt_notify.notified() => {
                     return (Err(ProviderError::Protocol("interrupted".into())), partial);
@@ -1510,7 +1731,35 @@ where
                 results[index] = Some(json!({"error":"tool call interrupted"}));
                 continue;
             }
-            if matches!(call.name.as_str(), "propose_plan" | "ask_user") {
+            let mode = *self.mode.lock().await;
+            if call.name == "ask_user"
+                || (call.name == "propose_plan" && mode != PermissionMode::Auto)
+            {
+                if call.name == "ask_user" {
+                    let options = call
+                        .arguments
+                        .get("options")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let allow_multiple = call
+                        .arguments
+                        .get("allow_multiple")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let _ = self
+                        .working_event(
+                            "ask_user_pending",
+                            "message",
+                            json!({
+                                "call_id": call.id,
+                                "tool": "ask_user",
+                                "options": options,
+                                "allow_multiple": allow_multiple,
+                            }),
+                        )
+                        .await;
+                }
                 self.save_pending(&PendingRecord {
                     session_id: self.session_id.clone(),
                     call_id: call.id.clone(),
@@ -1552,6 +1801,38 @@ where
                 return Err(EngineError::ApprovalPending(call.id.clone()));
             }
             let risk = tool_risk(&call.name);
+            let argument_keys = call
+                .arguments
+                .as_object()
+                .map(|arguments| arguments.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            let category = tool_event_category(&call.name);
+            if call.name == "run_shell" {
+                let _ = self
+                    .working_event(
+                        "shell_process_started",
+                        "shell",
+                        json!({
+                            "command": call.arguments.get("command").and_then(Value::as_str).unwrap_or_default(),
+                            "shell_id": call.id,
+                            "process_id": call.id,
+                            "starting_dir": self.workspace.clone(),
+                        }),
+                    )
+                    .await;
+            } else {
+                let _ = self
+                    .working_event(
+                        &format!("{}_started", call.name),
+                        category,
+                        json!({
+                            "call_id":call.id,
+                            "tool":call.name,
+                            "argument_keys":argument_keys,
+                        }),
+                    )
+                    .await;
+            }
             let mode = *self.mode.lock().await;
             let target = self.executor.policy_target(&call.name, &call.arguments);
             let preflight = self
@@ -1610,13 +1891,44 @@ where
                     readonly.push((index, call));
                 }
                 Decision::Allow => {
-                    results[index] = Some(self.execute_tool_with_hooks(call).await);
+                    let previous = if matches!(call.name.as_str(), "write_file" | "edit_file") {
+                        self.executor
+                            .execute(
+                                "read_file",
+                                json!({"path": call.arguments.get("path").and_then(Value::as_str).unwrap_or_default()}),
+                            )
+                            .await
+                            .ok()
+                            .and_then(|value| value.get("content").and_then(Value::as_str).map(str::to_owned))
+                    } else {
+                        None
+                    };
+                    let result = if call.name == "propose_plan" {
+                        self.execute_proposed_plan(&call.arguments)
+                    } else {
+                        self.execute_tool_with_hooks(call).await
+                    };
+                    if matches!(call.name.as_str(), "write_file" | "edit_file") {
+                        self.emit_file_change(call, previous.as_deref()).await;
+                    }
+                    results[index] = Some(result);
                 }
                 Decision::Deny => {
                     self.policy_denied.store(true, Ordering::SeqCst);
                     results[index] = Some(json!({"error":"tool call denied by policy"}))
                 }
                 Decision::NeedsUser => {
+                    let _ = self
+                        .working_event(
+                            "approval_pending",
+                            "message",
+                            json!({
+                                "call_id": call.id,
+                                "tool": call.name,
+                                "arguments": call.arguments,
+                            }),
+                        )
+                        .await;
                     let completed_reads = futures_util::future::join_all(readonly.drain(..).map(
                         |(read_index, read_call): (usize, &ToolCall)| async move {
                             let result = self.execute_tool_with_hooks(read_call).await;
@@ -1685,11 +1997,84 @@ where
         Ok(results.into_iter().map(Option::unwrap).collect())
     }
 
-    async fn execute_tool(&self, call: &ToolCall) -> Value {
+    async fn execute_tool_streaming(&self, call: &ToolCall) -> Value {
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let call_id = call.id.clone();
+        let on_output = {
+            let emitted = emitted.clone();
+            let engine = self;
+            move |chunk: &str| {
+                if emitted.fetch_add(1, Ordering::Relaxed) >= 64 {
+                    return;
+                }
+                let chunk = chunk.chars().take(2000).collect::<String>();
+                if chunk.is_empty() {
+                    return;
+                }
+                let _ = engine.record_working_event(
+                    "terminal_update",
+                    "shell",
+                    json!({"call_id":call_id,"contents":chunk}),
+                );
+            }
+        };
         self.executor
-            .execute(&call.name, call.arguments.clone())
+            .execute_streaming(&call.name, call.arguments.clone(), &on_output)
             .await
             .unwrap_or_else(|error| json!({"error":error}))
+    }
+
+    async fn emit_file_change(&self, call: &ToolCall, previous: Option<&str>) {
+        let path = call
+            .arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let old = previous.unwrap_or_default();
+        let new = if call.name == "write_file" {
+            call.arguments
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        } else {
+            let mut content = old.to_owned();
+            for edit in call
+                .arguments
+                .get("edits")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let old_string = edit
+                    .get("old_string")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let new_string = edit
+                    .get("new_string")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                content = content.replacen(old_string, new_string, 1);
+            }
+            content
+        };
+        let (lines_added, lines_removed) = line_diff_counts(old, &new);
+        let _ = self
+            .working_event(
+                "multi_edit_result",
+                "file",
+                json!({
+                    "file_updates": [{
+                        "file_path": path,
+                        "action_type": if call.name == "write_file" && previous.is_none() { "create" } else { "edit" },
+                        "start_line": 1,
+                        "end_line": new.lines().count().max(1),
+                        "lines_added": lines_added,
+                        "lines_removed": lines_removed,
+                    }]
+                }),
+            )
+            .await;
     }
 
     async fn persist_tool_results(
@@ -1709,9 +2094,59 @@ where
             self.store
                 .complete_tool_call(&self.session_id, assistant_sequence, &call.id, &result)
                 .map_err(|error| EngineError::Store(error.to_string()))?;
-            let _ = self
-                .events
-                .send(StreamChunk {
+            let category = tool_event_category(&call.name);
+            if call.name != "run_shell" {
+                let _ = self
+                    .working_event(
+                        &format!("{}_completed", call.name),
+                        category,
+                        json!({
+                            "call_id":call.id,
+                            "tool":call.name,
+                            "ok":result.get("error").is_none(),
+                            "result_type":if result.is_object() {"object"} else if result.is_array() {"array"} else {"value"},
+                            "result_bytes":result.to_string().len(),
+                        }),
+                    )
+                    .await;
+            } else {
+                let output = result
+                    .get("output")
+                    .or_else(|| result.get("stdout"))
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| result.to_string());
+                let _ = self
+                    .working_event(
+                        "shell_process_completed",
+                        "shell",
+                        json!({
+                            "process_id": call.id,
+                            "exit_code": result.get("exit_code").and_then(Value::as_i64).unwrap_or_else(|| if result.get("error").is_some() { 1 } else { 0 }),
+                            "output_trunc": output.chars().take(4000).collect::<String>(),
+                        }),
+                    )
+                    .await;
+            }
+            if (call.name == "propose_plan"
+                || call.name == "plan_update"
+                || call.name == "plan_revise")
+                && let Some(plan) = self
+                    .store
+                    .load_plan(&self.session_id)
+                    .map_err(|error| EngineError::Store(error.to_string()))?
+            {
+                let _ = self
+                    .working_event(
+                        "todo_update",
+                        "todo",
+                        serde_json::to_value(plan)
+                            .map_err(|error| EngineError::Store(error.to_string()))?,
+                    )
+                    .await;
+            }
+            let _ = self.emit_event(
+                "tool_result",
+                StreamChunk {
                     tool_result: Some(ToolResult {
                         call_id: call.id.clone(),
                         name: call.name.clone(),
@@ -1719,8 +2154,8 @@ where
                         result,
                     }),
                     ..StreamChunk::default()
-                })
-                .await;
+                },
+            );
         }
         Ok(())
     }
@@ -1803,7 +2238,41 @@ where
                 conversational.push(message);
             }
         }
-        let split_at = conversational.len().saturating_sub(6);
+        let target_split = conversational.len().saturating_sub(6);
+        let mut split_at = 0;
+        let mut cursor = 0;
+        while cursor < conversational.len() {
+            let start = cursor;
+            let message = &conversational[cursor];
+            cursor += 1;
+            if message.get("role").and_then(Value::as_str) == Some("assistant") {
+                let call_ids = message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|call| call.get("id").and_then(Value::as_str))
+                    .collect::<std::collections::HashSet<_>>();
+                if !call_ids.is_empty() {
+                    while cursor < conversational.len()
+                        && conversational[cursor].get("role").and_then(Value::as_str)
+                            == Some("tool")
+                        && conversational[cursor]
+                            .pointer("/content/0/tool_use_id")
+                            .or_else(|| conversational[cursor].get("tool_call_id"))
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| call_ids.contains(id))
+                    {
+                        cursor += 1;
+                    }
+                }
+            }
+            if cursor <= target_split {
+                split_at = cursor;
+            } else if start < target_split {
+                break;
+            }
+        }
         let discarded = conversational[..split_at].to_vec();
         let retained = conversational[split_at..].to_vec();
         let mut valid = Vec::new();
@@ -1824,6 +2293,7 @@ where
             if message.get("role").and_then(Value::as_str) == Some("tool")
                 && let Some(id) = message
                     .pointer("/content/0/tool_use_id")
+                    .or_else(|| message.get("tool_call_id"))
                     .and_then(Value::as_str)
             {
                 pending_ids.remove(id);
@@ -1832,9 +2302,59 @@ where
         }
         if !pending_ids.is_empty() {
             valid.retain(|message| {
-                !(message.get("role").and_then(Value::as_str) == Some("assistant")
-                    && message.get("tool_calls").is_some())
+                if message.get("role").and_then(Value::as_str) != Some("assistant") {
+                    return !(message.get("role").and_then(Value::as_str) == Some("tool")
+                        && message
+                            .pointer("/content/0/tool_use_id")
+                            .or_else(|| message.get("tool_call_id"))
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| pending_ids.contains(id)));
+                }
+                let calls = message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|call| call.get("id").and_then(Value::as_str));
+                !calls.clone().any(|id| pending_ids.contains(id))
             });
+        }
+        valid.retain(|message| {
+            let role = message.get("role").and_then(Value::as_str);
+            if !matches!(role, Some("user" | "assistant" | "tool")) {
+                return true;
+            }
+            if role == Some("assistant")
+                && message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|calls| !calls.is_empty())
+            {
+                return true;
+            }
+            match message.get("content") {
+                Some(Value::String(text)) => !text.trim().is_empty(),
+                Some(Value::Array(parts)) => !parts.is_empty(),
+                Some(Value::Object(object)) => !object.is_empty(),
+                _ => false,
+            }
+        });
+        for message in &mut valid {
+            if message.get("role").and_then(Value::as_str) == Some("assistant")
+                && message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|calls| !calls.is_empty())
+                && message.get("content").is_some_and(|content| match content {
+                    Value::String(text) => text.trim().is_empty(),
+                    Value::Array(parts) => parts.is_empty(),
+                    Value::Null => true,
+                    _ => false,
+                })
+                && let Some(object) = message.as_object_mut()
+            {
+                object.remove("content");
+            }
         }
         let (summary_text, summary_issue) = if discarded.is_empty() {
             (
@@ -1844,11 +2364,12 @@ where
         } else {
             match self.compaction_summary(&discarded).await {
                 Ok(summary) => (summary, None),
-                Err(reason) => (
+                Err(rejection) => (
                     format!(
-                        "Compaction summary unavailable ({reason}); recent complete tool exchanges retained."
+                        "Compaction summary unavailable ({}); recent complete tool exchanges retained.",
+                        rejection.reason
                     ),
-                    Some(reason),
+                    Some(rejection),
                 ),
             }
         };
@@ -1873,6 +2394,7 @@ where
             }));
         }
         valid.insert(0, system_message(&system_sections));
+        let summary_chars = summary_text.chars().count();
         self.store
             .save_compaction(&CompactionRecord {
                 session_id: self.session_id.clone(),
@@ -1880,23 +2402,50 @@ where
                 retained_from: retained.len() as i64,
             })
             .map_err(|error| EngineError::Store(error.to_string()))?;
-        if let Some(reason) = summary_issue {
+        let _ = self
+            .working_event(
+                "session_snapshot",
+                "lifecycle",
+                json!({
+                    "compaction_id":Uuid::new_v4().to_string(),
+                    "summary_chars":summary_chars,
+                    "retained_messages":retained.len(),
+                }),
+            )
+            .await;
+        if let Some(rejection) = summary_issue {
             self.notice(
                 "compaction_summary_invalid",
-                format!("Compaction summary was not stored as model output: {reason}"),
+                format!(
+                    "Compaction summary was not stored as model output: {}",
+                    rejection.reason
+                ),
             )
             .await?;
+            let _ = self
+                .working_event(
+                    "compaction_summary_invalid",
+                    "lifecycle",
+                    json!({
+                        "reason": rejection.reason,
+                        "diagnostics": rejection.diagnostics,
+                    }),
+                )
+                .await;
         }
         self.notice("compacted", "Earlier context compacted".into())
             .await?;
         Ok(valid)
     }
 
-    async fn compaction_summary(&self, discarded: &[Value]) -> Result<String, String> {
+    async fn compaction_summary(
+        &self,
+        discarded: &[Value],
+    ) -> Result<String, CompactionSummaryRejection> {
         let mut context = String::new();
         for message in discarded {
-            let mut encoded =
-                serde_json::to_string(message).map_err(|_| "context_encoding_failed".to_owned())?;
+            let mut encoded = serde_json::to_string(message)
+                .map_err(|_| CompactionSummaryRejection::without_text("context_encoding_failed"))?;
             if encoded.len() > 4000 {
                 encoded.truncate(4000);
                 encoded.push('…');
@@ -1919,10 +2468,68 @@ where
                 settings: json!({"max_tokens":8192,"temperature":0.2}),
             })
             .await
-            .map_err(|_| "provider_request_failed".to_owned())?;
-        let text = response.text.ok_or_else(|| "empty_response".to_owned())?;
-        Self::validate_compaction_summary(&text)?;
+            .map_err(|_| CompactionSummaryRejection::without_text("provider_request_failed"))?;
+        let text = response
+            .text
+            .filter(|text| !text.trim().is_empty())
+            .or(response.reasoning)
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| CompactionSummaryRejection::without_text("empty_response"))?;
+        Self::validate_compaction_summary(&text).map_err(|reason| CompactionSummaryRejection {
+            reason,
+            diagnostics: Self::compaction_summary_diagnostics(&text),
+        })?;
         Ok(text.trim().to_owned())
+    }
+
+    fn compaction_summary_diagnostics(text: &str) -> Value {
+        let without_reasoning = strip_reasoning_blocks(text);
+        let normalized = without_reasoning.trim().to_ascii_lowercase();
+        let has_cjk = without_reasoning.chars().any(|character| {
+            ('\u{3040}'..='\u{30ff}').contains(&character)
+                || ('\u{3400}'..='\u{4dbf}').contains(&character)
+                || ('\u{4e00}'..='\u{9fff}').contains(&character)
+        });
+        let has_latin = without_reasoning
+            .chars()
+            .any(|character| character.is_ascii_alphabetic());
+        let goal = ["goal", "目标", "任务"]
+            .iter()
+            .any(|keyword| normalized.contains(keyword));
+        let completed_actions = ["completed", "已完成", "完成的", "已经完成", "进展"]
+            .iter()
+            .any(|keyword| normalized.contains(keyword));
+        let discoveries_or_paths = [
+            "discover",
+            "file path",
+            "finding",
+            "发现",
+            "文件路径",
+            "关键",
+        ]
+        .iter()
+        .any(|keyword| normalized.contains(keyword));
+        let next_steps = [
+            "next step",
+            "remaining",
+            "unfinished",
+            "下一步",
+            "未完成",
+            "待办",
+            "后续",
+        ]
+        .iter()
+        .any(|keyword| normalized.contains(keyword));
+        json!({
+            "summary_chars": without_reasoning.chars().count(),
+            "sections": {
+                "goal": goal,
+                "completed_actions": completed_actions,
+                "discoveries_or_paths": discoveries_or_paths,
+                "next_steps": next_steps,
+            },
+            "language_hint": if has_cjk && has_latin { "mixed" } else if has_cjk { "zh" } else if has_latin { "en" } else { "unknown" },
+        })
     }
 
     fn validate_compaction_summary(text: &str) -> Result<(), String> {
@@ -1999,7 +2606,7 @@ where
                 session_id: self.session_id.clone(),
                 sequence: *sequence,
                 role: role.into(),
-                content,
+                content: content.clone(),
                 display_only: false,
             })
             .map_err(|error| EngineError::Store(error.to_string()))
@@ -2013,9 +2620,76 @@ where
                 session_id: self.session_id.clone(),
                 sequence: *sequence,
                 kind: kind.into(),
-                content,
+                content: content.clone(),
             })
-            .map_err(|error| EngineError::Store(error.to_string()))
+            .map_err(|error| EngineError::Store(error.to_string()))?;
+        let event = WorkingEvent {
+            event_type: kind.into(),
+            category: "notice".into(),
+            direction: "outgoing".into(),
+            timestamp: Utc::now().to_rfc3339(),
+            payload: json!({"message": content}),
+        };
+        self.emit_event(
+            kind,
+            StreamChunk {
+                working_event: Some(event),
+                ..StreamChunk::default()
+            },
+        )
+    }
+
+    async fn working_event(
+        &self,
+        event_type: &str,
+        category: &str,
+        payload: Value,
+    ) -> Result<(), EngineError> {
+        self.record_working_event(event_type, category, payload)
+    }
+
+    fn record_working_event(
+        &self,
+        event_type: &str,
+        category: &str,
+        payload: Value,
+    ) -> Result<(), EngineError> {
+        let event = WorkingEvent {
+            event_type: event_type.into(),
+            category: category.into(),
+            direction: "outgoing".into(),
+            timestamp: Utc::now().to_rfc3339(),
+            payload,
+        };
+        self.recorder.append_audit(
+            "working_event",
+            &serde_json::to_value(&event).map_err(|error| EngineError::Store(error.to_string()))?,
+        )?;
+        self.emit_event(
+            event_type,
+            StreamChunk {
+                working_event: Some(event),
+                ..StreamChunk::default()
+            },
+        )
+    }
+
+    fn emit_event(&self, event_type: &str, mut chunk: StreamChunk) -> Result<(), EngineError> {
+        let created_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| EngineError::Store(error.to_string()))?
+            .as_millis() as i64;
+        chunk.event_type = Some(event_type.to_owned());
+        chunk.event_id = Some(format!("event-{}", uuid::Uuid::new_v4()));
+        chunk.created_at_ms = Some(created_at_ms);
+        chunk.timestamp = Some(Utc::now().to_rfc3339());
+        let event =
+            serde_json::to_value(&chunk).map_err(|error| EngineError::Store(error.to_string()))?;
+        self.store
+            .append_session_event(&self.session_id, &event)
+            .map_err(|error| EngineError::Store(error.to_string()))?;
+        let _ = self.events.try_send(chunk);
+        Ok(())
     }
 }
 
@@ -2070,6 +2744,75 @@ fn tool_risk(name: &str) -> ToolRisk {
     }
 }
 
+fn tool_event_category(name: &str) -> &'static str {
+    if name == "edit_file" {
+        "file"
+    } else if name.starts_with("repo_index_") || name == "list_dir" || name == "read_file" {
+        "search"
+    } else if name.starts_with("git_") {
+        "git"
+    } else if name.starts_with("mcp_") || name.contains("__") {
+        "mcp"
+    } else if name == "run_shell" || name == "background_job_start" {
+        "shell"
+    } else if name == "propose_plan" || name.starts_with("plan_") {
+        "todo"
+    } else {
+        "other"
+    }
+}
+
+fn line_diff_counts(old: &str, new: &str) -> (usize, usize) {
+    let old_lines = old.lines().collect::<Vec<_>>();
+    let new_lines = new.lines().collect::<Vec<_>>();
+    const EXACT_LINE_LIMIT: usize = 5_000;
+    if old_lines.len() > EXACT_LINE_LIMIT || new_lines.len() > EXACT_LINE_LIMIT {
+        let mut old_counts = HashMap::<&str, usize>::new();
+        let mut new_counts = HashMap::<&str, usize>::new();
+        for line in old_lines {
+            *old_counts.entry(line).or_default() += 1;
+        }
+        for line in new_lines {
+            *new_counts.entry(line).or_default() += 1;
+        }
+        let common = old_counts
+            .iter()
+            .map(|(line, count)| (*count).min(*new_counts.get(line).unwrap_or(&0)))
+            .sum::<usize>();
+        return (
+            new_counts.values().sum::<usize>() - common,
+            old_counts.values().sum::<usize>() - common,
+        );
+    }
+
+    let (shorter, longer, swapped) = if old_lines.len() <= new_lines.len() {
+        (&old_lines, &new_lines, false)
+    } else {
+        (&new_lines, &old_lines, true)
+    };
+    let mut previous = vec![0usize; shorter.len() + 1];
+    let mut current = vec![0usize; shorter.len() + 1];
+    for long_line in longer {
+        for (index, short_line) in shorter.iter().enumerate() {
+            current[index + 1] = if long_line == short_line {
+                previous[index] + 1
+            } else {
+                previous[index + 1].max(current[index])
+            };
+        }
+        std::mem::swap(&mut previous, &mut current);
+        current.fill(0);
+    }
+    let common = previous[shorter.len()];
+    let additions = new_lines.len() - common;
+    let deletions = old_lines.len() - common;
+    if swapped {
+        (deletions, additions)
+    } else {
+        (additions, deletions)
+    }
+}
+
 #[async_trait]
 impl<P, S, E> AgentEngine for TurnEngine<P, S, E>
 where
@@ -2105,6 +2848,29 @@ pub struct BuiltinHarness<P, S, E> {
     next_turn_id: AtomicU64,
     turns: Arc<Mutex<HashMap<String, TurnState>>>,
     pending_turns: Arc<Mutex<HashMap<String, String>>>,
+}
+
+struct CompactionSummaryRejection {
+    reason: String,
+    diagnostics: Value,
+}
+
+impl CompactionSummaryRejection {
+    fn without_text(reason: &str) -> Self {
+        Self {
+            reason: reason.to_owned(),
+            diagnostics: json!({
+                "summary_chars": 0,
+                "sections": {
+                    "goal": false,
+                    "completed_actions": false,
+                    "discoveries_or_paths": false,
+                    "next_steps": false,
+                },
+                "language_hint": "unknown",
+            }),
+        }
+    }
 }
 
 struct TurnState {
@@ -2494,7 +3260,7 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"skill_save_learned","description":"Persist a reusable workflow explicitly described by the model. Nothing is auto-captured. The verification field is only a model assertion, never an OPCOS verification; credentials or secret-like values are rejected. Learned skills never modify user-authored skills.","parameters":{"type":"object","properties":{"title":{"type":"string"},"summary":{"type":"string"},"applies_when":{"type":"string"},"steps":{"type":"array","items":{"type":"string"}},"verification":{"type":"string"},"caveats":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}},"source_commit":{"type":"string"},"model_asserted_status":{"type":"string","enum":["model_asserted_validated","model_asserted_observed","model_asserted_partial"]},"supersedes_id":{"type":"string"}},"required":["title","summary","applies_when","steps","verification","source_commit","model_asserted_status"]}}}),
         json!({"type":"function","function":{"name":"skill_search_learned","description":"Search explicitly saved learned workflows for the current repository. Results are bounded to at most five and prominently mark source-commit mismatches as STALE CANDIDATE; model-asserted verification is not an objective fact.","parameters":{"type":"object","properties":{"query":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}}}}}}),
         json!({"type":"function","function":{"name":"skill_get_learned","description":"Read one explicitly saved learned workflow. The result includes its source commit, model-asserted verification status, version links, and stale/conflict warnings.","parameters":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}}),
-        json!({"type":"function","function":{"name":"ask_user","description":"Ask the user a question and wait for an answer.","parameters":{"type":"object","properties":{"question":{"type":"string"}},"required":["question"]}}}),
+        json!({"type":"function","function":{"name":"ask_user","description":"Ask the user a question and wait for an answer. When the user must choose from discrete answers, provide options; set allow_multiple to true when more than one option may be selected.","parameters":{"type":"object","properties":{"question":{"type":"string"},"options":{"type":"array","items":{"type":"string"},"description":"Optional discrete answer choices. Omit for an open-ended question."},"allow_multiple":{"type":"boolean","description":"Allow selecting more than one option from options."}},"required":["question"]}}}),
         json!({"type":"function","function":{"name":"linear_get_issue","description":"Read a Linear issue by identifier. Read-only.","parameters":{"type":"object","properties":{"identifier":{"type":"string"}},"required":["identifier"]}}}),
         json!({"type":"function","function":{"name":"linear_list_my_issues","description":"List Linear issues assigned to the current user. Read-only.","parameters":{"type":"object","properties":{"limit":{"type":"integer"}}}}}),
         json!({"type":"function","function":{"name":"linear_comment_issue","description":"Add a comment to a Linear issue. Requires approval.","parameters":{"type":"object","properties":{"issue_id":{"type":"string"},"body":{"type":"string"}},"required":["issue_id","body"]}}}),
@@ -2679,6 +3445,7 @@ fn downgrade_images(value: &mut Value) {
 struct PartialOutput {
     text: Option<String>,
     reasoning: Option<String>,
+    turn_emitted: bool,
 }
 
 #[cfg(test)]
@@ -2687,6 +3454,51 @@ mod tests {
     use async_trait::async_trait;
     use opcos_provider::ToolCallDelta;
     use opcos_store::{SessionRecord, SessionStore, SqliteStore};
+
+    #[test]
+    fn file_change_counts_use_real_line_content() {
+        assert_eq!(line_diff_counts("one\ntwo\n", "one\nthree\nfour\n"), (2, 1));
+    }
+
+    #[test]
+    fn large_file_change_counts_use_bounded_fallback() {
+        let old = (0..6_001)
+            .map(|index| {
+                if index == 3_000 {
+                    "old-line".to_owned()
+                } else {
+                    format!("line-{index}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new = old.replacen("old-line", "new-line", 1);
+        assert_eq!(line_diff_counts(&old, &new), (1, 1));
+    }
+
+    #[test]
+    fn session_event_round_trip_preserves_streamed_object() {
+        let path =
+            std::env::temp_dir().join(format!("opcos-events-{}.sqlite", uuid::Uuid::new_v4()));
+        let store = SqliteStore::open(&path).unwrap();
+        let event = json!({
+            "type": "devin_message",
+            "event_id": "event-test",
+            "created_at_ms": 42,
+            "timestamp": "2025-01-01T00:00:00Z",
+            "message": "The work is complete."
+        });
+        store.append_session_event("session", &event).unwrap();
+        assert_eq!(
+            store.load_session_events("session").unwrap()[0].event,
+            event
+        );
+        assert_eq!(
+            store.load_session_events("session").unwrap()[0].event["message"],
+            "The work is complete."
+        );
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn host_capability_filter_removes_unsupported_tools() {
@@ -3226,6 +4038,7 @@ mod tests {
             SummaryProvider {
                 fail: false,
                 text: None,
+                reasoning: None,
             },
             store,
             Arc::new(HookTools),
@@ -3687,7 +4500,7 @@ mod tests {
             HarnessProvider {
                 calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             },
-            store,
+            store.clone(),
             Arc::new(FakeTools),
             "harness-session",
             "/workspace",
@@ -3789,6 +4602,31 @@ mod tests {
         assert!(read_result < write_call);
         assert!(write_call < write_result);
         assert!(write_result < finished);
+        let working_events = store
+            .load_audit(Some("harness-session"))
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "working_event")
+            .filter_map(|event| {
+                event
+                    .payload
+                    .get("event_type")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            working_events
+                .iter()
+                .any(|event| event == "write_file_started"),
+            "{working_events:?}"
+        );
+        assert!(
+            working_events
+                .iter()
+                .any(|event| event == "write_file_completed"),
+            "{working_events:?}"
+        );
     }
 
     #[tokio::test]
@@ -4085,7 +4923,7 @@ mod tests {
             Arc::new(FakeTools),
             "s",
             "/workspace",
-            PermissionMode::Auto,
+            PermissionMode::Interactive,
             "fake",
         );
         engine.set_unattended(true);
@@ -4135,6 +4973,140 @@ mod tests {
         assert!(matches!(pending, Err(EngineError::ApprovalPending(id)) if id == "ask-1"));
         assert_eq!(store.load_pending("s").unwrap()[0].state, "ask_user");
         assert_eq!(store.list_inbox().unwrap()[0].kind, "question");
+    }
+
+    #[tokio::test]
+    async fn auto_mode_executes_propose_plan_and_emits_snapshot() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let plan_call = ToolCall {
+            id: "plan-auto".into(),
+            name: "propose_plan".into(),
+            arguments: json!({
+                "title": "Fix the bug",
+                "summary": "Implement and verify the fix",
+                "steps": ["Inspect the code", "Run the tests"],
+            }),
+        };
+        store
+            .append_tool_call(&opcos_store::ToolCallRecord {
+                session_id: "s".into(),
+                message_sequence: 1,
+                call_id: plan_call.id.clone(),
+                name: plan_call.name.clone(),
+                arguments: plan_call.arguments.clone(),
+                result: None,
+            })
+            .unwrap();
+
+        let result = engine.execute_tools(1, &[plan_call]).await.unwrap();
+        assert_eq!(
+            result[0].get("status").and_then(Value::as_str),
+            Some("created")
+        );
+        assert!(store.load_pending("s").unwrap().is_empty());
+        let plan = store.load_plan("s").unwrap().expect("plan persisted");
+        assert_eq!(plan.title, "Fix the bug");
+        assert_eq!(plan.steps.len(), 2);
+        let event_types = store
+            .load_audit(Some("s"))
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "working_event")
+            .filter_map(|event| {
+                event
+                    .payload
+                    .get("event_type")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            event_types
+                .iter()
+                .any(|event| event == "propose_plan_started")
+        );
+        assert!(
+            event_types
+                .iter()
+                .any(|event| event == "propose_plan_completed")
+        );
+        assert!(event_types.iter().any(|event| event == "todo_update"));
+    }
+
+    #[tokio::test]
+    async fn ask_user_options_are_persisted_and_emitted_without_approval() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let ask = ToolCall {
+            id: "ask-options".into(),
+            name: "ask_user".into(),
+            arguments: json!({
+                "question": "Choose a delivery format",
+                "options": ["A", "B", "C"],
+                "allow_multiple": false,
+            }),
+        };
+        store
+            .append_tool_call(&opcos_store::ToolCallRecord {
+                session_id: "s".into(),
+                message_sequence: 1,
+                call_id: ask.id.clone(),
+                name: ask.name.clone(),
+                arguments: ask.arguments.clone(),
+                result: None,
+            })
+            .unwrap();
+
+        let result = engine.execute_tools(1, &[ask]).await;
+        assert!(matches!(
+            result,
+            Err(EngineError::ApprovalPending(call_id)) if call_id == "ask-options"
+        ));
+        let pending = store.load_pending("s").unwrap();
+        assert_eq!(pending[0].arguments["options"], json!(["A", "B", "C"]));
+        assert_eq!(pending[0].arguments["allow_multiple"], false);
+        let event = store
+            .load_audit(Some("s"))
+            .unwrap()
+            .into_iter()
+            .find(|event| {
+                event.kind == "working_event" && event.payload["event_type"] == "ask_user_pending"
+            })
+            .expect("ask_user pending working event");
+        assert_eq!(event.payload["payload"]["options"], json!(["A", "B", "C"]));
+        assert_eq!(event.payload["payload"]["allow_multiple"], false);
+    }
+
+    #[test]
+    fn ask_user_tool_schema_supports_discrete_options() {
+        let definition = tool_definitions()
+            .into_iter()
+            .find(|tool| tool["function"]["name"] == "ask_user")
+            .expect("ask_user tool definition");
+        let parameters = &definition["function"]["parameters"];
+        assert_eq!(parameters["properties"]["options"]["type"], "array");
+        assert_eq!(
+            parameters["properties"]["allow_multiple"]["type"],
+            "boolean"
+        );
+        assert_eq!(parameters["required"], json!(["question"]));
     }
 
     #[test]
@@ -4333,10 +5305,65 @@ mod tests {
         assert!(store.load_compaction("s").unwrap().is_some());
     }
 
+    #[tokio::test]
+    async fn compaction_moves_boundary_to_keep_tool_exchange_together() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let mut messages = (0..3)
+            .map(|index| json!({"role":"user","content":format!("old-{index}")}))
+            .collect::<Vec<_>>();
+        messages.push(json!({
+            "role":"assistant",
+            "content":"",
+            "tool_calls":[{"id":"call-1","name":"read_file","arguments":{}}]
+        }));
+        messages.push(json!({
+            "role":"tool",
+            "content":[{"type":"tool_result","tool_use_id":"call-1","content":[{"type":"text","text":"ok"}]}]
+        }));
+        messages
+            .extend((0..5).map(|index| json!({"role":"user","content":format!("new-{index}")})));
+
+        let compacted = engine.compact_context(messages).await.unwrap();
+        let assistant = compacted
+            .iter()
+            .find(|message| message.get("role").and_then(Value::as_str) == Some("assistant"));
+        let tool = compacted
+            .iter()
+            .find(|message| message.get("role").and_then(Value::as_str) == Some("tool"));
+        assert!(assistant.is_some());
+        assert_eq!(
+            assistant
+                .and_then(|message| message.pointer("/tool_calls/0/id"))
+                .and_then(Value::as_str),
+            Some("call-1")
+        );
+        assert_eq!(
+            tool.and_then(|message| message.pointer("/content/0/tool_use_id"))
+                .and_then(Value::as_str),
+            Some("call-1")
+        );
+        assert!(compacted.iter().all(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_none_or(|text| !text.trim().is_empty())
+        }));
+    }
+
     #[derive(Clone)]
     struct SummaryProvider {
         fail: bool,
         text: Option<String>,
+        reasoning: Option<String>,
     }
 
     #[async_trait]
@@ -4353,6 +5380,7 @@ mod tests {
                          Unfinished next steps: verify the change."
                             .into()
                     })),
+                    reasoning: self.reasoning.clone(),
                     ..Default::default()
                 })
             }
@@ -4378,6 +5406,7 @@ mod tests {
             SummaryProvider {
                 fail: false,
                 text: None,
+                reasoning: None,
             },
             store,
             Arc::new(FakeTools),
@@ -4431,6 +5460,7 @@ mod tests {
             SummaryProvider {
                 fail: false,
                 text: None,
+                reasoning: None,
             },
             store.clone(),
             Arc::new(FakeTools),
@@ -4458,6 +5488,39 @@ mod tests {
                  Completed actions and results: reviewed the repository.\n\
                  Key discoveries and file paths: summary code is in crates/opcos-engine/src/lib.rs.\n\
                  Unfinished next steps: verify the change."
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_uses_reasoning_when_provider_content_is_empty() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let reasoning = "Goal: inspect the repository.\n\
+            Completed actions and results: reviewed the repository.\n\
+            Key discoveries and file paths: summary code is in crates/opcos-engine/src/lib.rs.\n\
+            Unfinished next steps: verify the change."
+            .to_owned();
+        let engine = TurnEngine::new(
+            SummaryProvider {
+                fail: false,
+                text: Some("   ".into()),
+                reasoning: Some(reasoning.clone()),
+            },
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let messages = (0..8)
+            .map(|index| json!({"role":"user","content":format!("message-{index}")}))
+            .collect();
+
+        engine.compact_context(messages).await.unwrap();
+
+        assert_eq!(
+            store.load_compaction("s").unwrap().unwrap().summary,
+            reasoning
         );
     }
 
@@ -4558,6 +5621,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn compaction_summary_diagnostics_report_sections_without_text() {
+        let diagnostics =
+            TurnEngine::<SummaryProvider, SqliteStore, FakeTools>::compaction_summary_diagnostics(
+                "Goal\nFix it.\n\nCompleted actions and results\nRead files.\n\n\
+                 Key discoveries and file paths\nsrc/lib.rs.\n\nUnfinished next steps\nRun tests.",
+            );
+        assert_eq!(diagnostics["summary_chars"], 133);
+        assert_eq!(diagnostics["language_hint"], "en");
+        assert_eq!(diagnostics["sections"]["goal"], true);
+        assert_eq!(diagnostics["sections"]["completed_actions"], true);
+        assert_eq!(diagnostics["sections"]["discoveries_or_paths"], true);
+        assert_eq!(diagnostics["sections"]["next_steps"], true);
+        assert!(diagnostics.get("text").is_none());
+    }
+
     #[tokio::test]
     async fn invalid_compaction_summary_uses_visible_fallback() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
@@ -4565,6 +5644,7 @@ mod tests {
             SummaryProvider {
                 fail: false,
                 text: Some(r#"{"tool_calls":[{"name":"read_file"}]}"#.into()),
+                reasoning: None,
             },
             store.clone(),
             Arc::new(FakeTools),
@@ -4594,6 +5674,7 @@ mod tests {
             SummaryProvider {
                 fail: true,
                 text: None,
+                reasoning: None,
             },
             store.clone(),
             Arc::new(FakeTools),

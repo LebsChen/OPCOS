@@ -56,6 +56,7 @@ export function humanizeTool(name: string, args: any): HumanLine {
       return { pre: "Read ", obj: baseName(String(a.path ?? "a file")) };
     case "write_file":
       return { pre: "Wrote ", obj: baseName(String(a.path ?? "a file")) };
+    case "edit_file":
     case "replace_in_file":
     case "apply_patch":
     case "apply_unified_diff":
@@ -115,8 +116,12 @@ export function humanizeTool(name: string, args: any): HumanLine {
       };
     case "ask_user":
       return { pre: "Asked you a question" };
-    case "propose_plan":
-      return { pre: "Proposed a plan" };
+    case "propose_plan": {
+      const steps = Array.isArray(a.steps) ? a.steps.length : 0;
+      return {
+        pre: steps > 0 ? `Proposed a plan (${steps} steps)` : "Proposed a plan",
+      };
+    }
     case "request_directory":
       return { pre: "Asked for folder access — ", obj: String(a.path ?? "") };
     default: {

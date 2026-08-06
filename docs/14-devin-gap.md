@@ -100,3 +100,57 @@
 - 仍开放的行为差距里，有两条已经在 #77 的提示词里加了指引，但**行为是否真的改变**还需要下一轮真实任务验证。
 - 架构级差距里，几条旧文案需要改写成“部分成立”或“未核实”，不能再机械照抄旧清单。
 - 逆向来源要只吸收行为原则，不吸收不可信项目里的“虚构工具名”或自授权模型。
+
+## 6. Working 过程事件流对齐（当前实现）
+
+### 已实现并已通过本地验证
+
+Builtin engine 现在会把 working 过程作为结构化事件同时写入本地 audit store，
+并通过既有 `opcos://event` 的 `stream` payload 向前端转发。事件具有：
+
+- `event_type`、`category`、`direction`、`timestamp` 和结构化 `payload`；
+- 每轮的 `status_update`、`simple_activity_update`、`context_growth_update`；
+- 每回合聚合后的 provider reasoning 对应一条 `devin_thoughts`（最多 4000 字符）；
+  payload 同时带 `thinking_duration_ms`；
+- 工具调用的 `<tool>_started` / `<tool>_completed`，完成事件只带参数 key、
+  结果类型、字节数和成功标记，不复制原始敏感参数；
+- `ToolExecutor::execute_streaming` 可选流式入口；engine 对输出按每次最多
+  2000 字符、每次调用最多 64 条做限流，并持久化 `terminal_update`；
+- 本地 Tauri `run_shell` 通过 host process 增量读取输出并转发
+  `terminal_update`；远程 RVM 路径保持远端原生执行，不修改 host；
+- provider usage 存在时的 `iteration_stats`，包括工具数量、耗时和 token 数；
+- 本地 `session_worklog` 现在从 audit store 返回这些事件，沿用现有 Worklog
+  时间线，不新增 UI 布局；Transcript 对 `devin_thoughts` 和
+  `simple_activity_update` 沿用已有 thinking/notice 表面。
+- `plan_update` / `plan_revise` 完成后发 `todo_update`，payload 是完整本地
+  plan snapshot；pending question resolution 后发 `user_question_answered`。
+- 本地资产注入保留 `note_used`，并额外为 rules/active skills 发
+  `rules_injected` / `skill_activated`；不复制资产正文。
+- compaction 完成后发本地 `session_snapshot`，正常 turn 收束发
+  `iteration_checkpoint`，pending/restart recovery 发 `resuming_session`。
+- 对照完整 Devin stream，`terminal_update` payload 使用 `contents` 而非
+  `chunk`；OPCOS 保留 `call_id` 作为本地工具关联键，当前没有通用真实
+  `shell_id` 或 gzip transport，因此不伪造这两个字段。
+
+真实 Devin 事件样本的字段形状已依据
+`/home/ubuntu/devin_session_events_full.txt` 核对，覆盖 status、shell、file、
+search、mcp、todo、lifecycle、reasoning、iteration 和 context 事件。新增
+engine example 的确定性事件断言、workspace 相关测试和 clippy 已通过；本地浏览器 UI
+TypeScript、production build 和 format check 已通过。
+
+### 尚未等价或未核实
+
+- 通用 executor 的默认 streaming 实现仍回退到 `execute`，因此只有实现该可选
+  入口的 executor 能提供真实增量；本地 DesktopExecutor 已实现，远程 RVM
+  仍使用远端原生 worklog/执行流。
+- MCP、search、git 和 todo 的 category 已在 fake engine/store/executor E2E 中
+  分别覆盖并断言 started/completed 成对；尚未用真实模型分别触发每个类别。
+- 远程 RVM worklog 仍使用远端原生事件；本次改动只补齐本地 builtin engine，
+  没有改变 RVM host。
+- Devin 的 `one_line_thoughts` 尚未单独生成；当前仅提供聚合的
+  `devin_thoughts`。
+- Devin 的 `computer_use`、subagent、test-mode、recording、sidekick、
+  suspend/resume 控制面事件没有对应 OPCOS 子系统；除本地恢复生命周期
+  `resuming_session` 外暂不伪造。
+- PR 事件（`pr_created`、`pr_comment`、`pr_merge_conflict`）尚未增加专用
+  集成事件；现有 git/PR 工具仍通过工具生命周期事件记录。
