@@ -743,10 +743,6 @@ h3 {
   flex: 0 0 auto;
   min-width: 0;
 }
-.transcript-output,
-.transcript-artifact {
-  margin-left: auto;
-}
 .transcript-thought-chevron {
   flex: 0 0 16px;
   width: 16px;
