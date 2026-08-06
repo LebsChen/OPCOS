@@ -171,12 +171,22 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
     const plan = Array.from(latestPlans.values()).at(-1);
     if (!plan?.length) return;
     const completed = plan.filter((step) =>
-      ["done", "completed"].includes(String(step.status)),
+      ["done", "completed", "failed", "abandoned"].includes(
+        String(step.status),
+      ),
     ).length;
     const inProgress = plan.findIndex(
       (step) => String(step.status) === "in_progress",
     );
-    const currentIndex = inProgress >= 0 ? inProgress : plan.length - 1;
+    const nextNotStarted = plan.findIndex(
+      (step) => String(step.status) === "not_started",
+    );
+    const currentIndex =
+      inProgress >= 0
+        ? inProgress
+        : nextNotStarted >= 0
+          ? nextNotStarted
+          : plan.length - 1;
     const current = plan[currentIndex];
     if (!current) return;
     activeWork.rows.push({

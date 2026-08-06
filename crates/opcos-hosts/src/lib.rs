@@ -3583,8 +3583,10 @@ async fn spawn_persistent_shell(
     };
     #[cfg(not(windows))]
     let mut process = {
-        let mut process = Command::new("sh");
-        process.arg("-s").current_dir(cwd);
+        let mut process = Command::new("bash");
+        process
+            .args(["--noprofile", "--norc", "-s"])
+            .current_dir(cwd);
         configure_no_window(&mut process);
         process
     };
@@ -4426,6 +4428,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(line_count.result.stdout.trim(), "2");
+
+        let pipeline_status = host
+            .exec_persistent_streaming(
+                request(
+                    "printf 'pipeline\\n' | cat; test ${PIPESTATUS[0]} -eq 0",
+                    None,
+                    None,
+                ),
+                &on_output,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pipeline_status.result.exit_code, 0);
+        let subshell_failure = host
+            .exec_persistent_streaming(request("sh -c 'exit 3'", None, None), &on_output)
+            .await
+            .unwrap();
+        assert_eq!(subshell_failure.result.exit_code, 3);
+        let after_subshell_failure = host
+            .exec_persistent_streaming(request("printf shell-alive", None, None), &on_output)
+            .await
+            .unwrap();
+        assert_eq!(after_subshell_failure.result.stdout, "shell-alive");
 
         let git_status = host
             .exec_persistent_streaming(

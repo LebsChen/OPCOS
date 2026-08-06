@@ -472,6 +472,53 @@ describe("single event-log timeline", () => {
     expect(rows).toContain("1/5 #1 Create files");
     expect(rows).toContain("2/5 #2 Run tests");
   });
+  it("points plan progress at the next unfinished step", () => {
+    const rowsFor = (steps: Record<string, unknown>[]) =>
+      buildTimeline([
+        {
+          type: "todo_update",
+          event_id: "plan-progress",
+          created_at_ms: 1,
+          steps,
+        },
+        {
+          type: "shell_process_started",
+          event_id: "plan-action",
+          created_at_ms: 2,
+          command: "echo work",
+          call_id: "plan-action-call",
+        },
+      ]).flatMap((node) =>
+        node.kind === "work" ? node.rows.map((row) => row.label) : [],
+      );
+
+    expect(
+      rowsFor([
+        { step_id: "1", description: "First", status: "not_started" },
+        { step_id: "2", description: "Second", status: "not_started" },
+        { step_id: "3", description: "Third", status: "not_started" },
+        { step_id: "4", description: "Fourth", status: "not_started" },
+        { step_id: "5", description: "Fifth", status: "not_started" },
+        { step_id: "6", description: "Sixth", status: "not_started" },
+        { step_id: "7", description: "Seventh", status: "not_started" },
+        { step_id: "8", description: "Eighth", status: "not_started" },
+      ]),
+    ).toContain("0/8 #1 First");
+    expect(
+      rowsFor([
+        { step_id: "1", description: "First", status: "done" },
+        { step_id: "2", description: "Second", status: "in_progress" },
+        { step_id: "3", description: "Third", status: "not_started" },
+      ]),
+    ).toContain("1/3 #2 Second");
+    expect(
+      rowsFor([
+        { step_id: "1", description: "First", status: "done" },
+        { step_id: "2", description: "Second", status: "failed" },
+        { step_id: "3", description: "Third", status: "abandoned" },
+      ]),
+    ).toContain("3/3 #3 Third");
+  });
   it("renders control-action notices and skips empty notices", () => {
     const nodes = buildTimeline([
       {

@@ -1386,6 +1386,7 @@ where
                     )
                     .await;
             }
+            self.emit_plan_snapshot(&target.tool).await?;
         }
         let _ = self.emit_event(
             "tool_result",
@@ -1457,6 +1458,27 @@ where
                 .await;
         }
         self.run_loop(self.provider_messages()?).await
+    }
+
+    async fn emit_plan_snapshot(&self, tool_name: &str) -> Result<(), EngineError> {
+        if !matches!(tool_name, "propose_plan" | "plan_update" | "plan_revise") {
+            return Ok(());
+        }
+        if let Some(plan) = self
+            .store
+            .load_plan(&self.session_id)
+            .map_err(|error| EngineError::Store(error.to_string()))?
+        {
+            let _ = self
+                .working_event(
+                    "todo_update",
+                    "todo",
+                    serde_json::to_value(plan)
+                        .map_err(|error| EngineError::Store(error.to_string()))?,
+                )
+                .await;
+        }
+        Ok(())
     }
 
     pub async fn change_model(&self, model: impl Into<String>) -> Result<(), EngineError> {
@@ -2702,23 +2724,7 @@ where
                     )
                     .await;
             }
-            if (call.name == "propose_plan"
-                || call.name == "plan_update"
-                || call.name == "plan_revise")
-                && let Some(plan) = self
-                    .store
-                    .load_plan(&self.session_id)
-                    .map_err(|error| EngineError::Store(error.to_string()))?
-            {
-                let _ = self
-                    .working_event(
-                        "todo_update",
-                        "todo",
-                        serde_json::to_value(plan)
-                            .map_err(|error| EngineError::Store(error.to_string()))?,
-                    )
-                    .await;
-            }
+            self.emit_plan_snapshot(&call.name).await?;
             let _ = self.emit_event(
                 "tool_result",
                 StreamChunk {
@@ -6579,6 +6585,13 @@ mod tests {
             .expect("mixed batch plan persisted");
         assert_eq!(plan.title, "Fix the harness");
         assert_eq!(plan.steps.len(), 2);
+        assert!(
+            store
+                .load_session_events("approval-queue")
+                .unwrap()
+                .iter()
+                .any(|event| event.event["type"] == "todo_update")
+        );
     }
 
     #[tokio::test]
