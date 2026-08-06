@@ -1,6 +1,7 @@
 use crate::{Caps, matrix};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fmt;
 use std::time::Duration;
 
@@ -169,6 +170,22 @@ pub fn descriptors() -> Vec<ProviderDescriptor> {
             true,
         ),
         ProviderDescriptor {
+            name: "cloudflare".into(),
+            title: "Cloudflare Workers AI".into(),
+            available: true,
+            needs_key: true,
+            default_base_url: None,
+            fields: vec![
+                field("api_key", "API token", true, true),
+                field("account_id", "Cloudflare account ID", false, true),
+            ],
+            recommended_model: matrix::models_for_provider("cloudflare")
+                .first()
+                .map(|entry| matrix::canonical_model_id("cloudflare", entry.id)),
+            env_key: Some("CLOUDFLARE_API_TOKEN".into()),
+            openai_compatible: true,
+        },
+        ProviderDescriptor {
             name: "bedrock".into(),
             title: "AWS Bedrock".into(),
             available: true,
@@ -310,6 +327,16 @@ pub fn descriptors() -> Vec<ProviderDescriptor> {
             openai_compatible: true,
         },
     ]
+}
+
+pub fn cloudflare_base_url(account_id: &str) -> Result<String, String> {
+    let account_id = account_id.trim();
+    if account_id.is_empty() {
+        return Err("Cloudflare account ID is required".to_owned());
+    }
+    Ok(format!(
+        "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1"
+    ))
 }
 
 fn field(key: &str, label: &str, secret: bool, required: bool) -> ProviderField {
@@ -584,6 +611,101 @@ fn models_endpoint(base_url: &str, provider: &str) -> String {
     }
 }
 
+fn cloudflare_models_endpoint(
+    account_id: &str,
+    page: u64,
+    per_page: u64,
+    search: Option<&str>,
+) -> String {
+    let encode = |value: &str| {
+        value
+            .bytes()
+            .flat_map(|byte| {
+                if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+                    vec![byte as char]
+                } else {
+                    format!("%{byte:02X}").chars().collect()
+                }
+            })
+            .collect::<String>()
+    };
+    let mut url = format!(
+        "https://api.cloudflare.com/client/v4/accounts/{}/ai/models/search?page={page}&per_page={per_page}",
+        encode(account_id)
+    );
+    if let Some(search) = search.filter(|value| !value.is_empty()) {
+        url.push_str("&search=");
+        url.push_str(&encode(search));
+    }
+    url
+}
+
+fn cloudflare_error_message(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    value
+        .get("errors")
+        .and_then(Value::as_array)
+        .and_then(|errors| errors.first())
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn parse_cloudflare_models(body: &serde_json::Value) -> Vec<DiscoveredModel> {
+    let mut models = body
+        .get("result")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|model| {
+            model
+                .get("task")
+                .and_then(|task| task.get("name"))
+                .and_then(Value::as_str)
+                == Some("Text Generation")
+        })
+        .filter_map(|model| {
+            let id = model.get("name").and_then(Value::as_str)?.to_owned();
+            let mut discovered = model_from_id("cloudflare", id);
+            if discovered.label == discovered.id
+                && let Some(description) = model.get("description").and_then(Value::as_str)
+            {
+                discovered.label = format!("{} · {description}", discovered.label);
+            }
+            let property = |name: &str| {
+                model
+                    .get("properties")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .find(|property| {
+                        property.get("property_id").and_then(Value::as_str) == Some(name)
+                    })
+                    .and_then(|property| property.get("value"))
+            };
+            if let Some(context) = property("context_window")
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse().ok())
+            {
+                discovered.capabilities.context_window = Some(context);
+                discovered.capabilities.context_window_source = Some("gateway".into());
+                discovered.capabilities_known = true;
+            }
+            if let Some(function_calling) = property("function_calling").and_then(|value| {
+                value
+                    .as_bool()
+                    .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+            }) {
+                discovered.capabilities.tools = function_calling;
+                discovered.capabilities_known = true;
+            }
+            Some(discovered)
+        })
+        .collect::<Vec<_>>();
+    sort_discovered_models(&mut models);
+    models
+}
+
 async fn discover_http_models(
     client: &Client,
     provider: &str,
@@ -632,8 +754,53 @@ pub async fn discover_provider_models(
     base_url: Option<&str>,
     api_key: Option<&str>,
     region: Option<&str>,
+    account_id: Option<&str>,
 ) -> Result<Vec<DiscoveredModel>, String> {
     match provider {
+        "cloudflare" => {
+            let account_id = account_id
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "Cloudflare account ID is not configured".to_owned())?;
+            let key = api_key
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "provider key is not configured".to_owned())?;
+            let mut page = 1;
+            let mut models = Vec::new();
+            loop {
+                let response = client
+                    .get(cloudflare_models_endpoint(account_id, page, 100, None))
+                    .bearer_auth(key)
+                    .send()
+                    .await
+                    .map_err(|_| "provider model discovery request failed".to_owned())?;
+                let status = response.status();
+                let text = response
+                    .text()
+                    .await
+                    .map_err(|_| "invalid model discovery response".to_owned())?;
+                if !status.is_success() {
+                    return Err(cloudflare_error_message(&text).unwrap_or_else(|| {
+                        format!("provider model discovery returned HTTP {status}")
+                    }));
+                }
+                let body: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|_| "invalid model discovery response".to_owned())?;
+                models.extend(parse_cloudflare_models(&body));
+                let total_pages = body
+                    .get("result_info")
+                    .and_then(|info| info.get("total_pages"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(page);
+                if page >= total_pages {
+                    break;
+                }
+                page += 1;
+            }
+            if models.is_empty() {
+                return Err("provider returned no text generation models".into());
+            }
+            Ok(models)
+        }
         "bedrock" => {
             crate::bedrock::BedrockProvider::new(region.unwrap_or("us-east-1"))
                 .discover_models()
@@ -728,6 +895,18 @@ mod tests {
             ("agnes", "https://apihub.agnes-ai.com/v1"),
         ];
         let descriptors = descriptors();
+        let cloudflare = descriptors
+            .iter()
+            .find(|descriptor| descriptor.name == "cloudflare")
+            .expect("Cloudflare should be registered");
+        assert_eq!(cloudflare.default_base_url, None);
+        assert_eq!(cloudflare.env_key.as_deref(), Some("CLOUDFLARE_API_TOKEN"));
+        assert!(
+            cloudflare
+                .fields
+                .iter()
+                .any(|field| field.key == "account_id")
+        );
         for (name, base_url) in expected {
             let descriptor = descriptors
                 .iter()
@@ -741,6 +920,62 @@ mod tests {
             assert_eq!(descriptor.default_base_url.as_deref(), Some(base_url));
             assert!(descriptor.needs_key, "{name} should require an API key");
         }
+    }
+
+    #[test]
+    fn parses_cloudflare_text_generation_models_and_gateway_context() {
+        let models = parse_cloudflare_models(&serde_json::json!({
+            "result": [
+                {
+                    "name": "@cf/zai-org/glm-5.2",
+                    "description": "reasoning model",
+                    "task": {"name": "Text Generation"},
+                    "properties": [
+                        {"property_id": "context_window", "value": "262144"},
+                        {"property_id": "function_calling", "value": "false"}
+                    ]
+                },
+                {
+                    "name": "@cf/foo/embed",
+                    "task": {"name": "Embeddings"},
+                    "properties": []
+                },
+                {
+                    "name": "@cf/foo/new-model",
+                    "description": "new model",
+                    "task": {"name": "Text Generation"},
+                    "properties": []
+                },
+                {
+                    "name": "@cf/zai-org/glm-4.7-flash",
+                    "description": "flash model",
+                    "task": {"name": "Text Generation"},
+                    "properties": []
+                }
+            ]
+        }));
+        assert_eq!(models.len(), 3);
+        let glm = models
+            .iter()
+            .find(|model| model.id.ends_with("glm-5.2"))
+            .unwrap();
+        assert_eq!(glm.capabilities.context_window, Some(262_144));
+        assert_eq!(
+            glm.capabilities.context_window_source.as_deref(),
+            Some("gateway")
+        );
+        assert!(!glm.capabilities.tools);
+        assert_eq!(glm.label, "GLM-5.2 · Cloudflare Workers AI");
+        let known = models
+            .iter()
+            .find(|model| model.id.ends_with("glm-4.7-flash"))
+            .unwrap();
+        assert_eq!(known.label, "GLM-4.7 Flash · Cloudflare Workers AI");
+        let unknown = models
+            .iter()
+            .find(|model| model.id.ends_with("new-model"))
+            .unwrap();
+        assert_eq!(unknown.label, "@cf/foo/new-model · new model");
     }
 
     #[test]
@@ -984,6 +1219,7 @@ mod tests {
             Some(&format!("http://{address}")),
             Some("test-key"),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1016,6 +1252,7 @@ mod tests {
             Some(&format!("http://{address}")),
             Some("test-key"),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1041,6 +1278,7 @@ mod tests {
             "openai",
             Some(&format!("http://{address}")),
             Some("sk-secret-test-key"),
+            None,
             None,
         )
         .await

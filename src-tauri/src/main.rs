@@ -9379,6 +9379,26 @@ async fn engine_for_with_context(
         .or(configured_base_url)
         .or(descriptor.default_base_url)
         .unwrap_or_default();
+    let account_id = if provider_id == "cloudflare" {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='provider.account_id.cloudflare'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|_| "Cloudflare account ID is not configured".to_owned())?
+    } else {
+        String::new()
+    };
+    let base_url = if provider_id == "cloudflare" {
+        registry::cloudflare_base_url(&account_id)?
+    } else {
+        base_url
+    };
     let linear_tools_enabled = scoped_secret_get(
         state,
         session.project_id.as_deref(),
@@ -9595,13 +9615,39 @@ async fn engine_for_with_context(
             })?;
             Box::new(AnthropicProvider::new(ProviderConfig::new(&base_url, key)))
         }
+        "cloudflare" => {
+            let key = scoped_secret_get(
+                state,
+                session.project_id.as_deref(),
+                "provider-key",
+                &provider_id,
+            )?
+            .or_else(|| {
+                descriptor
+                    .env_key
+                    .as_deref()
+                    .and_then(|name| std::env::var(name).ok())
+            })
+            .ok_or_else(|| {
+                "provider key is not configured; open Provider settings first".to_owned()
+            })?;
+            Box::new(OpenAiProvider::new_cloudflare(ProviderConfig::new(
+                &base_url, key,
+            )))
+        }
         _name if descriptor.openai_compatible => {
             let stored_key = scoped_secret_get(
                 state,
                 session.project_id.as_deref(),
                 "provider-key",
                 &provider_id,
-            )?;
+            )?
+            .or_else(|| {
+                descriptor
+                    .env_key
+                    .as_deref()
+                    .and_then(|name| std::env::var(name).ok())
+            });
             let key = match stored_key {
                 Some(key) => key,
                 None if descriptor.needs_key => {
@@ -13165,7 +13211,27 @@ async fn provider_models_for_state(
             .ok()
             .or(descriptor.default_base_url.clone())
     };
-    let base_url = configured_base_url.unwrap_or_default();
+    let account_id = if provider == "cloudflare" {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='provider.account_id.cloudflare'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let base_url = if provider == "cloudflare" && !account_id.is_empty() {
+        registry::cloudflare_base_url(&account_id)?
+    } else {
+        configured_base_url.unwrap_or_default()
+    };
+    let account_id = (provider == "cloudflare").then_some(account_id.as_str());
     let region = if provider == "bedrock" {
         let connection = state
             .database
@@ -13224,7 +13290,13 @@ async fn provider_models_for_state(
     let key = state
         .secrets
         .get(&secret_key("provider-key", &provider))
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())?
+        .or_else(|| {
+            descriptor
+                .env_key
+                .as_deref()
+                .and_then(|name| std::env::var(name).ok())
+        });
     let reason = if descriptor.needs_key && key.is_none() {
         Some("provider key is not configured".to_owned())
     } else {
@@ -13240,6 +13312,7 @@ async fn provider_models_for_state(
             (!base_url.is_empty()).then_some(base_url.as_str()),
             key.as_deref(),
             (!region.is_empty()).then_some(region.as_str()),
+            account_id,
         )
         .await
     };
@@ -21840,17 +21913,24 @@ fn provider_configurations(state: State<'_, DesktopState>) -> Result<Vec<Value>,
                 .map_err(|error| error.to_string())?
                 .is_some()
                 || descriptor.name == "ollama";
+            let account_id = (descriptor.name == "cloudflare")
+                .then(|| settings.get("provider.account_id.cloudflare").cloned())
+                .flatten();
             let key = format!("provider.base_url.{}", descriptor.name);
-            let base_url = settings
-                .get(&key)
-                .cloned()
-                .or(descriptor.default_base_url.clone());
+            let base_url = provider_base_url(
+                &descriptor.name,
+                settings.get(&key).map(String::as_str),
+                account_id.as_deref(),
+                descriptor.default_base_url.as_deref(),
+            )
+            .ok();
             let model = settings
                 .get(&format!("provider.model.{}", descriptor.name))
                 .cloned();
             Ok(json!({
                 "provider": descriptor.name,
                 "base_url": base_url,
+                "account_id": account_id,
                 "model": model,
                 "configured": configured,
             }))
@@ -21863,18 +21943,28 @@ fn save_provider_settings(
     state: State<'_, DesktopState>,
     provider: String,
     base_url: Option<String>,
+    account_id: Option<String>,
     model: Option<String>,
 ) -> Result<(), String> {
     let descriptor = registry::descriptors()
         .into_iter()
         .find(|item| item.name == provider)
         .ok_or_else(|| "unknown provider".to_owned())?;
-    let base_url = base_url
-        .filter(|value| !value.trim().is_empty())
-        .or(descriptor.default_base_url)
-        .ok_or_else(|| {
-            "provider base URL is not configured; enter one in Provider settings".to_owned()
-        })?;
+    let account_id = if provider == "cloudflare" {
+        Some(
+            account_id
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "Cloudflare account ID is required".to_owned())?,
+        )
+    } else {
+        None
+    };
+    let base_url = provider_base_url(
+        &provider,
+        base_url.as_deref(),
+        account_id.as_deref(),
+        descriptor.default_base_url.as_deref(),
+    )?;
     url::Url::parse(&base_url).map_err(|_| "provider base URL is invalid".to_owned())?;
     let connection = state
         .database
@@ -21899,8 +21989,32 @@ fn save_provider_settings(
             [&scoped_key, &base_url],
         )
         .map_err(|error| error.to_string())?;
+    if let Some(account_id) = account_id {
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO settings(key,value) VALUES ('provider.account_id.cloudflare',?1)",
+                [&account_id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
     save_provider_model_settings(&connection, &provider, model.as_deref())?;
     Ok(())
+}
+
+fn provider_base_url(
+    provider: &str,
+    configured: Option<&str>,
+    account_id: Option<&str>,
+    default: Option<&str>,
+) -> Result<String, String> {
+    if provider == "cloudflare" {
+        return registry::cloudflare_base_url(account_id.unwrap_or_default());
+    }
+    configured
+        .filter(|value| !value.trim().is_empty())
+        .or(default)
+        .map(str::to_owned)
+        .ok_or_else(|| "provider base URL is not configured; enter one in Provider settings".into())
 }
 
 #[tauri::command]
@@ -21940,7 +22054,30 @@ async fn validate_provider_key(
             )
             .ok()
     };
-    let base_url = configured_base_url.or(descriptor.default_base_url);
+    let account_id = if provider == "cloudflare" {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        Some(
+            connection
+                .query_row(
+                    "SELECT value FROM settings WHERE key='provider.account_id.cloudflare'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|_| "Cloudflare account ID is not configured".to_owned())?,
+        )
+    } else {
+        None
+    };
+    let base_url = if provider == "cloudflare" {
+        Some(registry::cloudflare_base_url(
+            account_id.as_deref().unwrap_or_default(),
+        )?)
+    } else {
+        configured_base_url.or(descriptor.default_base_url)
+    };
     if provider == "vertex" {
         return Err("model discovery is unsupported for Vertex AI".into());
     }
@@ -21955,6 +22092,7 @@ async fn validate_provider_key(
         base_url.as_deref(),
         key.as_deref(),
         (!region.is_empty()).then_some(region.as_str()),
+        account_id.as_deref(),
     )
     .await
     .map(|_| true)
@@ -22405,6 +22543,14 @@ fn main() {
 #[cfg(test)]
 mod m7_tests {
     use super::*;
+
+    #[test]
+    fn cloudflare_save_url_is_composed_without_manual_base_url() {
+        assert_eq!(
+            provider_base_url("cloudflare", None, Some("account-123"), None).unwrap(),
+            "https://api.cloudflare.com/client/v4/accounts/account-123/ai/v1"
+        );
+    }
 
     #[test]
     fn builtin_prompt_tools_are_present_in_local_tool_catalog_and_allowlist() {

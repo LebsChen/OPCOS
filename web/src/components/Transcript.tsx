@@ -1,9 +1,37 @@
 import { invoke } from "@tauri-apps/api/core";
-import { type ReactNode, useEffect, useState } from "react";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { type ApprovalDecision, type Item } from "../types";
-import { buildTimeline, type TimelineEvent } from "../timeline";
+import {
+  buildTimeline,
+  type TimelineEvent,
+  type TimelineNode,
+} from "../timeline";
 import { ApprovalCard } from "./ApprovalCard";
 import { Markdown } from "./Markdown";
+
+const CHEVRON_PATH =
+  "M9.167 5.086 C 8.866 5.235,8.711 5.578,8.778 5.947 C 8.802 6.084,9.120 6.415,11.752 9.050 L 14.700 12.000 11.772 14.930 C 10.134 16.569,8.825 17.910,8.802 17.973 C 8.636 18.420,8.947 18.937,9.415 18.989 C 9.793 19.032,9.659 19.151,13.093 15.725 C 14.849 13.973,16.331 12.463,16.387 12.369 C 16.526 12.135,16.526 11.865,16.387 11.631 C 16.232 11.370,9.974 5.137,9.791 5.062 C 9.585 4.976,9.371 4.985,9.167 5.086 ";
+
+function TranscriptChevron({ className }: { className: string }) {
+  return (
+    <svg
+      className={className}
+      aria-hidden="true"
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+    >
+      <path d={CHEVRON_PATH} fill="currentColor" />
+    </svg>
+  );
+}
 
 function formatDuration(durationMs: number): string {
   if (durationMs < 1000) return `${Math.round(durationMs)}ms`;
@@ -41,14 +69,224 @@ function BubbleMeta({ text, ts }: { text: string; ts?: number }) {
   );
 }
 
-function Thought({ text }: { text: string }) {
+function Thought({
+  text,
+  label = "Thought details",
+}: {
+  text: string;
+  label?: string;
+}) {
   return (
-    <details>
-      <summary className="cursor-pointer text-xs text-muted">
-        Thought details
+    <details className="transcript-thought">
+      <summary className="transcript-row-header">
+        <span>{label}</span>
+        <TranscriptChevron className="transcript-thought-chevron" />
       </summary>
-      <div className="whitespace-pre-wrap">{text}</div>
+      <div className="transcript-thought-body">{text}</div>
     </details>
+  );
+}
+
+function thoughtLabel(label?: string): string {
+  return label?.startsWith("Thought for ") ? label : "Thought details";
+}
+
+function QuestionCard({
+  text,
+  options,
+  onAnswer,
+}: {
+  text: string;
+  options?: string[];
+  onAnswer?: (answer: string) => void;
+}) {
+  const [answer, setAnswer] = useState("");
+  return (
+    <div className="approval transcript-question-card">
+      <strong>Question</strong>
+      <div className="approval-with">{text}</div>
+      {options && options.length > 0 && (
+        <div className="approval-btns flex-wrap">
+          {options.map((option) => (
+            <button
+              className="btn"
+              key={option}
+              type="button"
+              onClick={() => onAnswer?.(option)}
+            >
+              {option}
+            </button>
+          ))}
+        </div>
+      )}
+      <div className="approval-btns">
+        <input
+          className="input"
+          value={answer}
+          placeholder="Type an answer"
+          onChange={(event) => setAnswer(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && answer.trim()) {
+              onAnswer?.(answer.trim());
+              setAnswer("");
+            }
+          }}
+        />
+        <button
+          className="btn approval-primary"
+          type="button"
+          disabled={!answer.trim()}
+          onClick={() => {
+            onAnswer?.(answer.trim());
+            setAnswer("");
+          }}
+        >
+          Send
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function UserBubbleContent({
+  attachments,
+  text,
+}: Pick<Extract<TimelineNode, { kind: "user" }>, "attachments" | "text">) {
+  return (
+    <>
+      {attachments?.map((attachment) =>
+        attachment.kind === "image" ? (
+          <img
+            key={attachment.name}
+            className="msg-img"
+            src={attachment.data_url}
+            alt={attachment.name}
+          />
+        ) : (
+          <span key={attachment.name} className="msg-file">
+            📄 {attachment.name}
+          </span>
+        ),
+      )}
+      {text}
+    </>
+  );
+}
+
+const USER_BUBBLE_MAX_HEIGHT = 290;
+
+function UserBubble({
+  attachments,
+  text,
+}: Pick<Extract<TimelineNode, { kind: "user" }>, "attachments" | "text">) {
+  const bubbleRef = useRef<HTMLElement | null>(null);
+  const [overflowing, setOverflowing] = useState(false);
+  const measureOverflow = useCallback(() => {
+    const bubble = bubbleRef.current;
+    if (!bubble) return;
+    const clamped = bubble.classList.contains("transcript-user-bubble-clamped");
+    if (clamped) bubble.classList.remove("transcript-user-bubble-clamped");
+    const nextOverflowing = bubble.scrollHeight > USER_BUBBLE_MAX_HEIGHT;
+    if (clamped) bubble.classList.add("transcript-user-bubble-clamped");
+    setOverflowing(nextOverflowing);
+  }, []);
+
+  useEffect(() => {
+    const bubble = bubbleRef.current;
+    if (!bubble) return;
+    const resizeObserver =
+      typeof ResizeObserver === "undefined"
+        ? undefined
+        : new ResizeObserver(measureOverflow);
+    resizeObserver?.observe(bubble);
+    const mutationObserver = new MutationObserver(measureOverflow);
+    mutationObserver.observe(bubble, {
+      characterData: true,
+      childList: true,
+      subtree: true,
+    });
+    measureOverflow();
+    return () => {
+      resizeObserver?.disconnect();
+      mutationObserver.disconnect();
+    };
+  }, [measureOverflow, overflowing]);
+
+  const content = <UserBubbleContent attachments={attachments} text={text} />;
+  const className = `bubble-user transcript-user-bubble${overflowing ? " transcript-user-bubble-clamped" : ""}`;
+  if (!overflowing) {
+    return (
+      <div
+        className={className}
+        ref={(element) => {
+          bubbleRef.current = element;
+        }}
+      >
+        {content}
+      </div>
+    );
+  }
+  return (
+    <details className="transcript-user-collapsible">
+      <summary
+        className={className}
+        ref={(element) => {
+          bubbleRef.current = element;
+        }}
+      >
+        {content}
+      </summary>
+    </details>
+  );
+}
+
+function PlanCard({
+  steps,
+}: {
+  steps: Array<{ content: string; status?: string }>;
+}) {
+  return (
+    <div className="transcript-plan">
+      <div className="transcript-plan-title">
+        <svg
+          className="transcript-plan-icon"
+          aria-hidden="true"
+          width="16"
+          height="16"
+          viewBox="0 0 24 24"
+          fill="none"
+        >
+          <path
+            d="M5 6h14M5 12h14M5 18h14"
+            stroke="currentColor"
+            strokeWidth="1.75"
+            strokeLinecap="round"
+          />
+        </svg>
+        <span>Devin&apos;s execution plan</span>
+      </div>
+      <div className="transcript-plan-steps">
+        {steps.map((step, index) => {
+          const complete = ["done", "completed"].includes(String(step.status));
+          const active = step.status === "in_progress";
+          return (
+            <div
+              className="transcript-plan-step"
+              key={`${step.content}-${index}`}
+            >
+              <span className="transcript-plan-number">#{index + 1}</span>
+              <span
+                className={`transcript-plan-glyph${complete ? " is-complete" : active ? " is-active" : ""}`}
+                aria-hidden="true"
+              >
+                {complete ? "✓" : active ? "◌" : "○"}
+              </span>
+              <span>{step.content}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
@@ -198,6 +436,7 @@ export function Transcript({
   running,
   onApprove,
   onRetry,
+  onQuestionAnswer,
 }: {
   events: TimelineEvent[];
   sessionId: string;
@@ -208,40 +447,39 @@ export function Transcript({
     decision: ApprovalDecision,
   ) => void;
   onRetry?: () => void;
+  onQuestionAnswer?: (callId: string, answer: string) => void;
 }) {
   const nodes = buildTimeline(events);
+  const worklogOverrides = useRef(new Set<number>());
+  const [worklogOpen, setWorklogOpen] = useState<Record<number, boolean>>({});
+  const lastWorkIndex = nodes.reduce(
+    (last, node, index) => (node.kind === "work" ? index : last),
+    -1,
+  );
+  useEffect(() => {
+    if (lastWorkIndex < 0 || worklogOverrides.current.has(lastWorkIndex))
+      return;
+    setWorklogOpen((current) => ({
+      ...current,
+      [lastWorkIndex]: Boolean(running),
+    }));
+  }, [lastWorkIndex, running]);
   return (
-    <div className="transcript">
+    <div className="transcript transcript-content">
       {nodes.map((node, index) => {
         if (node.kind === "user")
           return (
-            <div
-              className="group self-end max-w-[78%] flex flex-col items-end"
-              key={index}
-            >
-              <div className="bubble-user px-3.5 py-2.5 rounded-[14px_14px_4px_14px] bg-solid text-onSolid text-[14.5px] leading-relaxed whitespace-pre-wrap">
-                {node.attachments?.map((attachment) =>
-                  attachment.kind === "image" ? (
-                    <img
-                      key={attachment.name}
-                      className="msg-img"
-                      src={attachment.data_url}
-                      alt={attachment.name}
-                    />
-                  ) : (
-                    <span key={attachment.name} className="msg-file">
-                      📄 {attachment.name}
-                    </span>
-                  ),
-                )}
-                {node.text}
-              </div>
+            <div className="group transcript-user-message self-end" key={index}>
+              <UserBubble attachments={node.attachments} text={node.text} />
               <BubbleMeta text={node.text} ts={node.ts} />
             </div>
           );
         if (node.kind === "assistant")
           return (
-            <div className="group bubble-assistant" key={index}>
+            <div
+              className="group bubble-assistant transcript-prose"
+              key={index}
+            >
               <Markdown text={node.text} />
               <BubbleMeta text={node.text} ts={node.ts} />
             </div>
@@ -276,7 +514,17 @@ export function Transcript({
           );
         if (node.kind === "question")
           return (
-            <div className="notice" key={index}>
+            <QuestionCard
+              key={index}
+              text={node.text}
+              options={node.options}
+              onAnswer={(answer) => onQuestionAnswer?.(node.callId, answer)}
+            />
+          );
+        if (node.kind === "sleep")
+          return (
+            <div className="transcript-sleep" key={index}>
+              <span className="transcript-sleep-dot" />
               {node.text}
             </div>
           );
@@ -299,53 +547,69 @@ export function Transcript({
         const renderRow = (
           row: (typeof node.rows)[number],
           rowIndex: number,
-        ) => (
-          <div
-            className={`transcript-item${row.denied ? " text-muted" : row.exitCode !== undefined && row.exitCode !== 0 ? " text-danger" : ""}`}
-            key={rowIndex}
-          >
-            <span>{row.label}</span>
-            {row.shellId && (
-              <span className="ml-2 text-xs text-muted">{row.shellId}</span>
-            )}
-            {row.exitCode !== undefined && (
-              <span className="ml-2 text-xs text-muted">
-                exit {row.exitCode}
-              </span>
-            )}
-            {row.denied && (
-              <span className="ml-2 text-xs text-muted">
-                not run{row.detail ? ` · ${row.detail}` : ""}
-              </span>
-            )}
-            {row.durationMs !== undefined && (
-              <span className="ml-2 text-xs text-muted">
-                {formatDuration(row.durationMs)}
-              </span>
-            )}
-            {row.detail && !row.thoughtForCallId && (
-              <Thought text={row.detail} />
-            )}
-            {row.callId && thoughtByCallId.get(row.callId)?.detail && (
-              <Thought text={thoughtByCallId.get(row.callId)?.detail ?? ""} />
-            )}
-            {(row.terminalOutput || row.terminalTruncated) && (
-              <TerminalOutput
-                output={row.terminalOutput ?? ""}
-                truncated={row.terminalTruncated}
-                totalBytes={row.terminalTotalBytes}
-              />
-            )}
-            {row.artifactId && (
-              <ArtifactRow
-                sessionId={sessionId}
-                artifactId={row.artifactId}
-                kind={row.artifactKind}
-                mime={row.artifactMime}
-              />
-            )}
-          </div>
-        );
+        ) => {
+          const isThoughtRow =
+            Boolean(row.detail) && row.label.startsWith("Thought for ");
+          return (
+            <div
+              className={`transcript-item transcript-row${row.denied ? " text-muted" : row.resultError || (row.exitCode !== undefined && row.exitCode !== 0) ? " text-danger" : ""}`}
+              key={rowIndex}
+            >
+              {!isThoughtRow && (
+                <span className="transcript-row-label">{row.label}</span>
+              )}
+              {row.shellId && (
+                <span className="transcript-row-meta">{row.shellId}</span>
+              )}
+              {row.exitCode !== undefined && row.exitCode !== 0 && (
+                <span className="transcript-row-meta">exit {row.exitCode}</span>
+              )}
+              {row.denied && (
+                <span className="ml-2 text-xs text-muted">
+                  not run{row.detail ? ` · ${row.detail}` : ""}
+                </span>
+              )}
+              {row.durationMs !== undefined && (
+                <span className="transcript-row-duration">
+                  {formatDuration(row.durationMs)}
+                </span>
+              )}
+              {row.resultSummary && (
+                <span
+                  className={`transcript-row-result${row.resultError ? " text-danger" : ""}`}
+                >
+                  {row.resultError && "failed · "}
+                  {row.resultSummary}
+                </span>
+              )}
+              {row.detail && !row.thoughtForCallId && (
+                <Thought text={row.detail} label={thoughtLabel(row.label)} />
+              )}
+              {row.callId && thoughtByCallId.get(row.callId)?.detail && (
+                <Thought
+                  text={thoughtByCallId.get(row.callId)?.detail ?? ""}
+                  label={thoughtLabel(thoughtByCallId.get(row.callId)?.label)}
+                />
+              )}
+              {(row.terminalOutput || row.terminalTruncated) && (
+                <TerminalOutput
+                  output={row.terminalOutput ?? ""}
+                  truncated={row.terminalTruncated}
+                  totalBytes={row.terminalTotalBytes}
+                />
+              )}
+              {row.artifactId && (
+                <ArtifactRow
+                  sessionId={sessionId}
+                  artifactId={row.artifactId}
+                  kind={row.artifactKind}
+                  mime={row.artifactMime}
+                />
+              )}
+              {row.plan && <PlanCard steps={row.plan.steps} />}
+            </div>
+          );
+        };
         const renderRows = (rows: typeof node.rows) => {
           const rendered: ReactNode[] = [];
           let rowIndex = 0;
@@ -364,7 +628,7 @@ export function Transcript({
                   className="rounded border border-line p-2"
                   key={`minor-${start}`}
                 >
-                  <summary className="cursor-pointer text-xs text-muted">
+                  <summary className="transcript-minor-summary">
                     {minorRows.length} minor actions
                   </summary>
                   <div className="mt-2 flex flex-col gap-2">
@@ -386,15 +650,38 @@ export function Transcript({
         };
         return (
           <details
-            className="work-segment flex flex-col gap-2"
-            open
+            className="work-segment transcript-worklog"
+            open={worklogOpen[index] ?? (running && index === lastWorkIndex)}
+            onToggle={(event) => {
+              const open = event.currentTarget.open;
+              setWorklogOpen((current) => ({ ...current, [index]: open }));
+            }}
             key={index}
           >
-            <summary className="cursor-pointer text-muted">
-              {node.label} {node.additions ? `+${node.additions}` : ""}{" "}
-              {node.deletions ? `−${node.deletions}` : ""}
+            <summary
+              className="transcript-worklog-header"
+              onClick={() => worklogOverrides.current.add(index)}
+            >
+              <TranscriptChevron className="transcript-chevron" />
+              <span className="transcript-worklog-label">
+                <span>{node.label}</span>
+                {!!(node.additions || node.deletions) && (
+                  <span className="transcript-diff-badges">
+                    {node.additions ? (
+                      <span className="transcript-additions">
+                        +{node.additions}
+                      </span>
+                    ) : null}
+                    {node.deletions ? (
+                      <span className="transcript-deletions">
+                        −{node.deletions}
+                      </span>
+                    ) : null}
+                  </span>
+                )}
+              </span>
             </summary>
-            <div className="max-h-[32rem] overflow-auto flex flex-col gap-2 text-ink">
+            <div className="transcript-worklog-body">
               {renderRows(node.rows)}
             </div>
           </details>

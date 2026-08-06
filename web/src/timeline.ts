@@ -29,6 +29,7 @@ export type TimelineNode =
       resolved?: "allow" | "deny";
     }
   | { kind: "question"; callId: string; text: string; options?: string[] }
+  | { kind: "sleep"; text: string }
   | {
       kind: "notice";
       text: string;
@@ -51,11 +52,20 @@ export type TimelineNode =
         processId?: string;
         exitCode?: number;
         durationMs?: number;
+        startedAt?: number;
+        resultSummary?: string;
+        resultError?: boolean;
         denied?: boolean;
         isMajorAction?: boolean;
         artifactId?: string;
         artifactKind?: string;
         artifactMime?: string;
+        plan?: {
+          steps: Array<{
+            content: string;
+            status?: string;
+          }>;
+        };
       }>;
       additions: number;
       deletions: number;
@@ -80,6 +90,132 @@ function eventType(event: TimelineEvent): string {
     typeof (working as Record<string, unknown>).event_type === "string"
     ? String((working as Record<string, unknown>).event_type)
     : "";
+}
+
+function toolLabel(tool: string, args: unknown): string {
+  const values =
+    args && typeof args === "object"
+      ? (args as Record<string, unknown>)
+      : undefined;
+  const target = String(
+    values?.path ??
+      values?.target ??
+      values?.file_path ??
+      values?.command ??
+      values?.query ??
+      values?.pattern ??
+      values?.identifier ??
+      values?.issue_id ??
+      values?.repo ??
+      "",
+  ).trim();
+  const verb =
+    {
+      read_file: "Read",
+      list_dir: "Listed",
+      write_file: "Wrote",
+      edit_file: "Edited",
+      git_status: "Checked git status",
+      git_diff: "Reviewed git diff",
+      git_log: "Viewed git log",
+      git_rev_parse: "Resolved git revision",
+      git_create_branch: "Created branch",
+      git_stage_commit: "Created commit",
+      git_push: "Pushed changes",
+      github_create_issue: "Created GitHub issue",
+      github_create_pull_request: "Created GitHub pull request",
+      github_get_pull_request: "Read GitHub pull request",
+      github_list_issues: "Listed GitHub issues",
+      github_list_repositories: "Listed GitHub repositories",
+      github_ci_status: "Checked GitHub CI",
+      github_ci_failure_log: "Read GitHub CI failure log",
+      linear_get_issue: "Read Linear issue",
+      linear_list_my_issues: "Listed Linear issues",
+      linear_comment_issue: "Commented on Linear issue",
+      linear_update_issue_status: "Updated Linear issue",
+      gitlab_list_projects: "Listed GitLab projects",
+      gitlab_list_issues: "Listed GitLab issues",
+      jira_search_issues: "Searched Jira issues",
+      repo_index_find_symbol: "Found repository symbol",
+      repo_index_glob: "Matched repository paths",
+      repo_index_search: "Searched repository index",
+      lsp_definition: "Found definition",
+      lsp_references: "Found references",
+      lsp_diagnostics: "Checked diagnostics",
+      browser_navigate: "Navigated browser",
+      browser_read: "Read browser",
+      browser_measure: "Measured browser",
+      browser_assert_geometry: "Verified browser geometry",
+      browser_screenshot: "Captured browser screenshot",
+      browser_status: "Checked browser status",
+      browser_set_viewport: "Set browser viewport",
+      browser_click: "Clicked browser",
+      computer_use: "Used computer",
+      run_shell: "Ran command",
+      background_job_start: "Started background job",
+      background_job_status: "Checked background job",
+      background_job_output: "Read background job output",
+      background_job_kill: "Stopped background job",
+      propose_plan: "Created plan",
+      plan_get: "Read plan",
+      plan_update: "Updated plan",
+      plan_revise: "Revised plan",
+      secrets_list: "Listed secrets",
+      skill_search_learned: "Searched learned skills",
+      skill_get_learned: "Read learned skill",
+      skill_save_learned: "Saved learned skill",
+    }[tool] ??
+    (tool.startsWith("slack_")
+      ? "Used Slack"
+      : tool.startsWith("discord_")
+        ? "Used Discord"
+        : tool.startsWith("telegram_")
+          ? "Used Telegram"
+          : tool.startsWith("notion_")
+            ? "Searched Notion"
+            : tool.startsWith("stripe_")
+              ? "Read Stripe"
+              : tool);
+  return target ? `${verb} ${target}` : verb;
+}
+
+function resultSummary(raw: unknown): {
+  summary?: string;
+  error: boolean;
+} {
+  if (typeof raw === "string") {
+    return { summary: raw.slice(0, 240), error: false };
+  }
+  if (!raw || typeof raw !== "object") {
+    return { error: false };
+  }
+  const value = raw as Record<string, unknown>;
+  const errorValue = value.error;
+  const error =
+    errorValue !== undefined || value.ok === false || value.success === false;
+  for (const key of ["error", "message", "detail", "reason", "summary"]) {
+    const candidate = value[key];
+    if (typeof candidate === "string" && candidate.trim()) {
+      return { summary: candidate.slice(0, 240), error };
+    }
+  }
+  const content = value.content;
+  if (typeof content === "string" && content.trim()) {
+    return { summary: content.slice(0, 240), error };
+  }
+  if (Array.isArray(content)) {
+    const text = content
+      .map((item) =>
+        item && typeof item === "object"
+          ? (item as Record<string, unknown>).text
+          : undefined,
+      )
+      .filter((item): item is string => typeof item === "string")
+      .join(" ")
+      .trim();
+    if (text) return { summary: text.slice(0, 240), error };
+  }
+  return { error };
 }
 
 export function mergeEvents(
@@ -116,11 +252,17 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
   let work: Extract<TimelineNode, { kind: "work" }> | null = null;
   let workStarted = 0;
   let workEnded = 0;
+  let sleepPending = false;
   let pendingThought:
     | { row: Extract<TimelineNode, { kind: "work" }>["rows"][number] }
     | undefined;
   const planSteps = new Map<string, Array<Record<string, unknown>>>();
   const latestPlans = new Map<string, Array<Record<string, unknown>>>();
+  const planRows = new Map<
+    string,
+    Extract<TimelineNode, { kind: "work" }>["rows"][number]
+  >();
+  const planProgressLabels = new Map<string, Set<string>>();
   const approvalNodes = new Map<
     string,
     Extract<TimelineNode, { kind: "approval" }>
@@ -146,6 +288,10 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
       isMajorAction?: boolean;
       startedAt?: number;
     }
+  >();
+  const genericRows = new Map<
+    string,
+    Extract<TimelineNode, { kind: "work" }>["rows"][number]
   >();
   const pendingShellCompletions = new Map<
     string,
@@ -215,6 +361,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
     if (!type) continue;
     const data = payload(event);
     if (type === "user_message" || type === "initial_user_message") {
+      sleepPending = false;
       flush(event.created_at_ms);
       nodes.push({
         kind: "user",
@@ -283,6 +430,14 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
           isMajorAction: true,
         });
       }
+    } else if (type === "turn_finished") {
+      if (
+        String(data.run_state ?? "").toLowerCase() === "idle" &&
+        String(data.stop_reason ?? "").toLowerCase() === "finished"
+      ) {
+        flush(event.created_at_ms);
+        sleepPending = true;
+      }
     } else if (
       [
         "error",
@@ -323,14 +478,42 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
         "is_typing",
         "session_snapshot",
         "iteration_checkpoint",
-        "status_update",
         "turn",
-        "tool_result",
         ...TRANSIENT_TIMELINE_EVENT_TYPES,
         "stream_reset",
       ].includes(type)
     ) {
       continue;
+    } else if (type === "tool_result") {
+      const resultEvent =
+        data.tool_result && typeof data.tool_result === "object"
+          ? (data.tool_result as Record<string, unknown>)
+          : data;
+      const callId = String(
+        resultEvent.call_id ??
+          resultEvent.tool_use_id ??
+          resultEvent.tool_call_id ??
+          "",
+      );
+      const row = callId ? genericRows.get(callId) : undefined;
+      if (row) {
+        const raw =
+          resultEvent.result ??
+          resultEvent.output ??
+          resultEvent.content ??
+          resultEvent.message;
+        const result = resultSummary(raw);
+        const tool = String(resultEvent.name ?? "");
+        if (tool) row.label = toolLabel(tool, resultEvent.arguments);
+        row.resultSummary = result.summary;
+        row.resultError = row.resultError === true || result.error;
+        row.durationMs =
+          typeof data.duration_ms === "number"
+            ? data.duration_ms
+            : row.startedAt === undefined
+              ? undefined
+              : Math.max(0, event.created_at_ms - row.startedAt);
+      }
     } else {
       const activeWork = ensureWork(event.created_at_ms);
       if (type === "devin_thoughts") {
@@ -506,30 +689,68 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
           ["done", "completed"].includes(String(todo.status)),
         ).length;
         if (!previousTodos || todos.length > previousTodos.length) {
-          activeWork.rows.push({ label: `Created ${todos.length} Tasks` });
-        } else if (previousTodos) {
-          todos.forEach((item, index) => {
-            const previous = previousTodos[index];
-            if (
-              previous &&
-              previous.step_id === item.step_id &&
-              previous.status === item.status &&
-              previous.description === item.description
-            )
-              return;
-            activeWork.rows.push({
-              label: `${completed}/${todos.length} #${index + 1} ${String(item.content ?? item.title ?? "")}`,
-            });
+          activeWork.rows.push({
+            label: `Created ${todos.length} Tasks`,
+            plan: {
+              steps: todos.map((todo) => ({
+                content: String(todo.content ?? todo.title ?? ""),
+                status: String(todo.status ?? "not_started"),
+              })),
+            },
           });
+          planRows.set(planId, activeWork.rows.at(-1)!);
+        } else {
+          const planRow = planRows.get(planId);
+          if (planRow?.plan) {
+            planRow.plan.steps = todos.map((todo) => ({
+              content: String(todo.content ?? todo.title ?? ""),
+              status: String(todo.status ?? "not_started"),
+            }));
+          }
+          if (previousTodos) {
+            const progressLabels =
+              planProgressLabels.get(planId) ?? new Set<string>();
+            planProgressLabels.set(planId, progressLabels);
+            todos.forEach((item, index) => {
+              const previous = previousTodos[index];
+              if (
+                previous &&
+                previous.step_id === item.step_id &&
+                previous.status === item.status &&
+                String(previous.content ?? previous.description ?? "") ===
+                  String(item.content ?? item.description ?? "")
+              )
+                return;
+              const label = `${completed}/${todos.length} #${index + 1} ${String(item.content ?? item.title ?? "")}`;
+              if (!progressLabels.has(label)) {
+                activeWork.rows.push({ label });
+                progressLabels.add(label);
+              }
+            });
+          }
         }
         planSteps.set(planId, todos);
         latestPlans.set(planId, todos);
-      } else if (type === "read_file_started" || type === "list_dir_started") {
-        continue;
       } else if (
         type === "read_file_completed" ||
         type === "list_dir_completed"
       ) {
+        const callId =
+          typeof data.call_id === "string" ? data.call_id : undefined;
+        const started = callId ? genericRows.get(callId) : undefined;
+        if (started) {
+          if (data.ok === false) {
+            started.resultError = true;
+            started.resultSummary ??= "Failed";
+          }
+          started.durationMs =
+            typeof data.duration_ms === "number"
+              ? data.duration_ms
+              : started.startedAt === undefined
+                ? undefined
+                : Math.max(0, event.created_at_ms - started.startedAt);
+          continue;
+        }
         const target = String(data.path ?? data.target ?? data.file_path ?? "");
         appendPlanProgress(activeWork);
         activeWork.rows.push({
@@ -540,6 +761,22 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
               : "Listed directory",
           isMajorAction: true,
         });
+      } else if (type.endsWith("_completed")) {
+        const callId =
+          typeof data.call_id === "string" ? data.call_id : undefined;
+        const started = callId ? genericRows.get(callId) : undefined;
+        if (started) {
+          if (data.ok === false) {
+            started.resultError = true;
+            started.resultSummary ??= "Failed";
+          }
+          started.durationMs =
+            typeof data.duration_ms === "number"
+              ? data.duration_ms
+              : started.startedAt === undefined
+                ? undefined
+                : Math.max(0, event.created_at_ms - started.startedAt);
+        }
       } else if (type.endsWith("_started")) {
         if (
           ![
@@ -547,13 +784,13 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
             "plan_update_started",
             "plan_get_started",
             "plan_revise_started",
-          ].includes(type) &&
-          type !== "write_file_started" &&
-          type !== "edit_file_started"
+          ].includes(type)
         ) {
+          const tool = String(data.tool ?? type.replace(/_started$/, ""));
           const row = {
-            label: String(data.command ?? data.tool ?? type),
+            label: toolLabel(tool, data.arguments),
             callId: typeof data.call_id === "string" ? data.call_id : undefined,
+            startedAt: event.created_at_ms,
             isMajorAction:
               typeof data.is_major_action === "boolean"
                 ? data.is_major_action
@@ -566,10 +803,24 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
           }
           appendPlanProgress(activeWork);
           activeWork.rows.push(row);
+          if (row.callId) genericRows.set(row.callId, row);
         }
       }
     }
   }
   flush(workEnded || events.at(-1)?.created_at_ms || workStarted);
+  if (sleepPending) nodes.push({ kind: "sleep", text: "Devin went to sleep" });
   return nodes;
+}
+
+export function latestPlan(
+  events: TimelineEvent[],
+): Array<{ content: string; status?: string }> | null {
+  const plans = buildTimeline(events)
+    .flatMap((node) => (node.kind === "work" ? node.rows : []))
+    .map((row) => row.plan?.steps)
+    .filter((steps): steps is Array<{ content: string; status?: string }> =>
+      Boolean(steps),
+    );
+  return plans.at(-1) ?? null;
 }

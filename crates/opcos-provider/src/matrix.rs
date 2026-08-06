@@ -499,6 +499,21 @@ pub const MATRIX: &[ModelEntry] = &[
             ..DEFAULT_CAPS
         },
     },
+    ModelEntry {
+        id: "@cf/zai-org/glm-5.2",
+        provider: "cloudflare",
+        label: "GLM-5.2 · Cloudflare Workers AI",
+        capabilities: Caps {
+            context_window: Some(262_144),
+            ..DEFAULT_CAPS
+        },
+    },
+    ModelEntry {
+        id: "@cf/zai-org/glm-4.7-flash",
+        provider: "cloudflare",
+        label: "GLM-4.7 Flash · Cloudflare Workers AI",
+        capabilities: DEFAULT_CAPS,
+    },
 ];
 
 pub fn entry_for(model: &str) -> Option<&'static ModelEntry> {
@@ -590,6 +605,19 @@ mod tests {
         assert_eq!(
             capabilities_for_model("openai", "glm-5.2").and_then(|caps| caps.context_window),
             Some(1_000_000)
+        );
+    }
+
+    #[test]
+    fn cloudflare_ids_preserve_at_sign_and_slash() {
+        assert_eq!(
+            canonical_model_id("cloudflare", "@cf/zai-org/glm-5.2"),
+            "@cf/zai-org/glm-5.2"
+        );
+        assert_eq!(
+            capabilities_for_model("cloudflare", "@cf/zai-org/glm-5.2")
+                .and_then(|caps| caps.context_window),
+            Some(262_144)
         );
     }
 }

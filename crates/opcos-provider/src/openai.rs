@@ -1,7 +1,7 @@
 use crate::matrix::limit_caps_for_model;
 use crate::{
-    AssistantTurn, Caps, Provider, ProviderConfig, ProviderError, ProviderRequest, StreamChunk,
-    TRANSIENT_RETRY_LIMIT, TokenUsage, ToolCall, ToolCallDelta, apply_bearer_headers,
+    AssistantTurn, Caps, Provider, ProviderConfig, ProviderDialect, ProviderError, ProviderRequest,
+    StreamChunk, TRANSIENT_RETRY_LIMIT, TokenUsage, ToolCall, ToolCallDelta, apply_bearer_headers,
     classify_context_error, client, is_transient_request_error, is_transient_status, retry_delay,
     sanitize_secret, settings_object, stream_client, tool_schema,
 };
@@ -18,6 +18,12 @@ pub struct OpenAiProvider {
 impl OpenAiProvider {
     pub fn new(config: ProviderConfig) -> Self {
         Self { config }
+    }
+
+    pub fn new_cloudflare(config: ProviderConfig) -> Self {
+        Self {
+            config: config.cloudflare(),
+        }
     }
 
     fn body(&self, request: &ProviderRequest, stream: bool) -> Value {
@@ -122,11 +128,40 @@ impl OpenAiProvider {
                 transient_attempt = 0;
                 continue;
             }
-            return Err(ProviderError::Http {
-                status,
-                message: sanitize_secret(&text, self.config.api_key.expose()),
-            });
+            let message = if self.config.dialect == ProviderDialect::Cloudflare {
+                cloudflare_error_message(&text)
+                    .unwrap_or_else(|| sanitize_secret(&text, self.config.api_key.expose()))
+            } else {
+                sanitize_secret(&text, self.config.api_key.expose())
+            };
+            return Err(ProviderError::Http { status, message });
         }
+    }
+}
+
+fn cloudflare_error_message(text: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    value
+        .get("errors")
+        .and_then(Value::as_array)
+        .and_then(|errors| errors.first())
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+#[cfg(test)]
+fn cloudflare_live_test_unavailable(error: &ProviderError) -> bool {
+    let ProviderError::Http { status, message } = error else {
+        return false;
+    };
+    matches!(status.as_u16(), 401 | 403) && {
+        let message = message.to_ascii_lowercase();
+        message.contains("workers free plan")
+            || message.contains("paid plan")
+            || message.contains("not authorized")
+            || message.contains("forbidden")
+            || message.contains("unauthorized")
     }
 }
 
@@ -456,6 +491,17 @@ async fn stream_once(
                 continue;
             };
             if let Some(value) = usage(value.get("usage")) {
+                let value = if provider.config.dialect == ProviderDialect::Cloudflare {
+                    let previous: TokenUsage = final_usage.clone().unwrap_or_default();
+                    TokenUsage {
+                        input: previous.input.saturating_add(value.input),
+                        output: previous.output.saturating_add(value.output),
+                        cache_read: previous.cache_read.saturating_add(value.cache_read),
+                        cache_write: previous.cache_write.saturating_add(value.cache_write),
+                    }
+                } else {
+                    value
+                };
                 final_usage = Some(value.clone());
                 output
                     .send(StreamChunk {
@@ -588,6 +634,121 @@ mod tests {
         sync::mpsc,
         task::JoinHandle,
     };
+
+    #[tokio::test]
+    async fn cloudflare_real_api_verification() {
+        let (account_id, token, paid_credentials) = match (
+            std::env::var_os("CF_AI_ID"),
+            std::env::var_os("CF_AI_TOKEN"),
+        ) {
+            (Some(account_id), Some(token)) => (account_id, token, true),
+            _ => {
+                let (Some(account_id), Some(token)) =
+                    (std::env::var_os("CF_ID"), std::env::var_os("CF_TOKEN"))
+                else {
+                    eprintln!(
+                        "skipping Cloudflare real API verification: \
+                         CF_AI_ID/CF_AI_TOKEN or CF_ID/CF_TOKEN are not set"
+                    );
+                    return;
+                };
+                (account_id, token, false)
+            }
+        };
+        let account_id = account_id.to_string_lossy().into_owned();
+        let token = token.to_string_lossy().into_owned();
+        let client = reqwest::Client::new();
+        let models = crate::registry::discover_provider_models(
+            &client,
+            "cloudflare",
+            None,
+            Some(&token),
+            None,
+            Some(&account_id),
+        )
+        .await
+        .expect("Cloudflare discovery should succeed");
+        assert!(
+            models
+                .iter()
+                .any(|model| model.id == "@cf/zai-org/glm-4.7-flash")
+        );
+        let base_url = crate::registry::cloudflare_base_url(&account_id).expect("account id");
+        let provider = OpenAiProvider::new_cloudflare(ProviderConfig::new(&base_url, token));
+        let request = ProviderRequest {
+            model: "@cf/zai-org/glm-4.7-flash".into(),
+            messages: vec![json!({"role":"user","content":"Reply with exactly OK."})],
+            ..Default::default()
+        };
+        let completion = provider
+            .complete(request.clone())
+            .await
+            .expect("completion");
+        assert!(
+            completion.text.is_some() || !completion.reasoning.as_deref().unwrap_or("").is_empty()
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+        let stream_provider = provider.clone();
+        let stream_task =
+            tokio::spawn(async move { stream_provider.stream(request, sender).await });
+        let mut usage = None;
+        while let Some(chunk) = receiver.recv().await {
+            if chunk.usage.is_some() {
+                usage = chunk.usage;
+            }
+        }
+        let streamed = stream_task.await.expect("stream task").expect("stream");
+        assert!(streamed.text.is_some() || streamed.reasoning.is_some());
+        assert!(usage.or(streamed.usage).is_some());
+        let tool_request = ProviderRequest {
+            model: "@cf/zai-org/glm-4.7-flash".into(),
+            messages: vec![json!({"role":"user","content":"Call the get_weather tool."})],
+            tools: vec![json!({
+                "type":"function",
+                "function":{"name":"get_weather","description":"Get weather","parameters":{
+                    "type":"object","properties":{"city":{"type":"string"}},"required":["city"]
+                }}
+            })],
+            settings: json!({"tool_choice":"required"}),
+        };
+        let tool_completion = provider
+            .complete(tool_request)
+            .await
+            .expect("tool completion");
+        assert!(!tool_completion.tool_calls.is_empty());
+        let flagship = provider
+            .complete(ProviderRequest {
+                model: "@cf/zai-org/glm-5.2".into(),
+                messages: vec![json!({"role":"user","content":"Say hello."})],
+                ..Default::default()
+            })
+            .await;
+        if paid_credentials {
+            let flagship = match flagship {
+                Ok(flagship) => flagship,
+                Err(error) if cloudflare_live_test_unavailable(&error) => {
+                    eprintln!(
+                        "skipping Cloudflare real API verification: \
+                         configured paid Workers AI credentials are not entitled to glm-5.2 ({error})"
+                    );
+                    return;
+                }
+                Err(error) => {
+                    panic!("paid Cloudflare credentials should complete glm-5.2: {error}")
+                }
+            };
+            assert!(
+                flagship.text.is_some() || !flagship.reasoning.as_deref().unwrap_or("").is_empty()
+            );
+            assert!(flagship.usage.is_some());
+            println!("Cloudflare glm-5.2 paid completion succeeded");
+        } else {
+            let paid_plan_error = flagship.expect_err("glm-5.2 should require a paid plan");
+            let paid_plan_error = paid_plan_error.to_string();
+            assert!(paid_plan_error.contains("Workers Free plan"));
+            println!("Cloudflare glm-5.2 paid-plan error: {paid_plan_error}");
+        }
+    }
 
     async fn response_sequence(
         statuses: Vec<u16>,
@@ -843,6 +1004,62 @@ mod tests {
         assert_eq!(
             turn_task.await.unwrap().unwrap().text.as_deref(),
             Some("ok")
+        );
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cloudflare_stream_usage_accumulates_per_chunk_deltas() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let count = stream.read(&mut buffer).await.unwrap();
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2}}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":3}}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let provider = OpenAiProvider::new_cloudflare(ProviderConfig::new(
+            format!("http://{address}"),
+            "test-key",
+        ));
+        let (output, mut chunks) = mpsc::channel(8);
+        let turn_task = tokio::spawn(async move {
+            provider
+                .stream(
+                    ProviderRequest {
+                        model: "test".into(),
+                        ..Default::default()
+                    },
+                    output,
+                )
+                .await
+        });
+        while chunks.recv().await.is_some() {}
+        let turn = turn_task.await.unwrap().unwrap();
+        assert_eq!(
+            turn.usage,
+            Some(TokenUsage {
+                input: 7,
+                output: 5,
+                cache_read: 0,
+                cache_write: 0,
+            })
         );
         task.await.unwrap();
     }

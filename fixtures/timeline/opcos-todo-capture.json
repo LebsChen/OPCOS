@@ -1,0 +1,610 @@
+[
+  {
+    "type": "todo_update",
+    "event_id": "event-72c59c38-51ff-4fe2-903c-4c5d9fd8a915",
+    "created_at_ms": 1786039083518,
+    "timestamp": "2026-08-06T17:58:03.518399380+00:00",
+    "stream_reset": false,
+    "text_delta": null,
+    "reasoning_delta": null,
+    "tool_call_delta": null,
+    "tool_result": null,
+    "usage": null,
+    "turn": null,
+    "working_event": {
+      "event_type": "todo_update",
+      "category": "todo",
+      "direction": "outgoing",
+      "timestamp": "2026-08-06T17:58:03.517996804+00:00",
+      "payload": {
+        "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+        "session_id": "session-1786039014604915256",
+        "project_id": null,
+        "title": "Transcript UI multi-step verification",
+        "summary": "A read-only, three-step transcript-verification exercise that inspects the workspace, intentionally runs a failing command to surface a non-zero exit code, and runs a slow multi-marker background command so the running worklog remains visible. No files will be created or deleted.",
+        "status": "active",
+        "revision": 1,
+        "created_at": "2026-08-06T17:58:03.514575869+00:00",
+        "updated_at": "2026-08-06T17:58:03.514575869+00:00",
+        "steps": [
+          {
+            "step_id": "step-61c14f71-dbf0-4397-87fc-851afc539b8a",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 0,
+            "description": "1. Inspect the workspace without changing files: list the workspace directory and check git status (read-only, no file creation or deletion).",
+            "status": "not_started",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T17:58:03.514575869+00:00"
+          },
+          {
+            "step_id": "step-cd83f9d3-71cb-438e-878b-4c92e6565d2b",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 1,
+            "description": "2. Run a deliberately failing command `sh -c 'exit 7'` and report its non-zero exit code exactly as observed.",
+            "status": "not_started",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T17:58:03.514575869+00:00"
+          },
+          {
+            "step_id": "step-0a8f2934-a734-424c-8eba-79af13be9a8e",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 2,
+            "description": "3. Run a long, wrapped shell command that prints several numbered markers slowly (with sleeps between them) in the background so the running worklog stays visible while active; then read its output and confirm completion.",
+            "status": "not_started",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T17:58:03.514575869+00:00"
+          },
+          {
+            "step_id": "step-4a6acd64-b799-4f7f-b681-7d3562babba2",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 3,
+            "description": "4. Finish by reporting every command run, each exit code, and whether the workspace changed (it should not).",
+            "status": "not_started",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T17:58:03.514575869+00:00"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "todo_update",
+    "event_id": "event-8af5142d-0f09-4780-93e3-2fdb17b0d1c6",
+    "created_at_ms": 1786039230297,
+    "timestamp": "2026-08-06T18:00:30.297643750+00:00",
+    "stream_reset": false,
+    "text_delta": null,
+    "reasoning_delta": null,
+    "tool_call_delta": null,
+    "tool_result": null,
+    "usage": null,
+    "turn": null,
+    "working_event": {
+      "event_type": "todo_update",
+      "category": "todo",
+      "direction": "outgoing",
+      "timestamp": "2026-08-06T18:00:30.297300096+00:00",
+      "payload": {
+        "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+        "session_id": "session-1786039014604915256",
+        "project_id": null,
+        "title": "Transcript UI multi-step verification",
+        "summary": "A read-only, three-step transcript-verification exercise that inspects the workspace, intentionally runs a failing command to surface a non-zero exit code, and runs a slow multi-marker background command so the running worklog remains visible. No files will be created or deleted.",
+        "status": "active",
+        "revision": 2,
+        "created_at": "2026-08-06T17:58:03.514575869+00:00",
+        "updated_at": "2026-08-06T18:00:30.289511578+00:00",
+        "steps": [
+          {
+            "step_id": "step-61c14f71-dbf0-4397-87fc-851afc539b8a",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 0,
+            "description": "1. Inspect the workspace without changing files: list the workspace directory and check git status (read-only, no file creation or deletion).",
+            "status": "in_progress",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T18:00:30.289511578+00:00"
+          },
+          {
+            "step_id": "step-cd83f9d3-71cb-438e-878b-4c92e6565d2b",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 1,
+            "description": "2. Run a deliberately failing command `sh -c 'exit 7'` and report its non-zero exit code exactly as observed.",
+            "status": "not_started",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T17:58:03.514575869+00:00"
+          },
+          {
+            "step_id": "step-0a8f2934-a734-424c-8eba-79af13be9a8e",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 2,
+            "description": "3. Run a long, wrapped shell command that prints several numbered markers slowly (with sleeps between them) in the background so the running worklog stays visible while active; then read its output and confirm completion.",
+            "status": "not_started",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T17:58:03.514575869+00:00"
+          },
+          {
+            "step_id": "step-4a6acd64-b799-4f7f-b681-7d3562babba2",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 3,
+            "description": "4. Finish by reporting every command run, each exit code, and whether the workspace changed (it should not).",
+            "status": "not_started",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T17:58:03.514575869+00:00"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "todo_update",
+    "event_id": "event-89dd275c-884c-4075-84ac-7fa830beaaf6",
+    "created_at_ms": 1786039394878,
+    "timestamp": "2026-08-06T18:03:14.878866394+00:00",
+    "stream_reset": false,
+    "text_delta": null,
+    "reasoning_delta": null,
+    "tool_call_delta": null,
+    "tool_result": null,
+    "usage": null,
+    "turn": null,
+    "working_event": {
+      "event_type": "todo_update",
+      "category": "todo",
+      "direction": "outgoing",
+      "timestamp": "2026-08-06T18:03:14.875664543+00:00",
+      "payload": {
+        "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+        "session_id": "session-1786039014604915256",
+        "project_id": null,
+        "title": "Transcript UI multi-step verification",
+        "summary": "A read-only, three-step transcript-verification exercise that inspects the workspace, intentionally runs a failing command to surface a non-zero exit code, and runs a slow multi-marker background command so the running worklog remains visible. No files will be created or deleted.",
+        "status": "active",
+        "revision": 3,
+        "created_at": "2026-08-06T17:58:03.514575869+00:00",
+        "updated_at": "2026-08-06T18:03:14.870502977+00:00",
+        "steps": [
+          {
+            "step_id": "step-61c14f71-dbf0-4397-87fc-851afc539b8a",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 0,
+            "description": "1. Inspect the workspace without changing files: list the workspace directory and check git status (read-only, no file creation or deletion).",
+            "status": "done",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T18:03:14.870502977+00:00"
+          },
+          {
+            "step_id": "step-cd83f9d3-71cb-438e-878b-4c92e6565d2b",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 1,
+            "description": "2. Run a deliberately failing command `sh -c 'exit 7'` and report its non-zero exit code exactly as observed.",
+            "status": "not_started",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T17:58:03.514575869+00:00"
+          },
+          {
+            "step_id": "step-0a8f2934-a734-424c-8eba-79af13be9a8e",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 2,
+            "description": "3. Run a long, wrapped shell command that prints several numbered markers slowly (with sleeps between them) in the background so the running worklog stays visible while active; then read its output and confirm completion.",
+            "status": "not_started",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T17:58:03.514575869+00:00"
+          },
+          {
+            "step_id": "step-4a6acd64-b799-4f7f-b681-7d3562babba2",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 3,
+            "description": "4. Finish by reporting every command run, each exit code, and whether the workspace changed (it should not).",
+            "status": "not_started",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T17:58:03.514575869+00:00"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "todo_update",
+    "event_id": "event-13d3df3d-19e6-463e-bc49-c02892bec2c0",
+    "created_at_ms": 1786039396363,
+    "timestamp": "2026-08-06T18:03:16.363721534+00:00",
+    "stream_reset": false,
+    "text_delta": null,
+    "reasoning_delta": null,
+    "tool_call_delta": null,
+    "tool_result": null,
+    "usage": null,
+    "turn": null,
+    "working_event": {
+      "event_type": "todo_update",
+      "category": "todo",
+      "direction": "outgoing",
+      "timestamp": "2026-08-06T18:03:16.358846286+00:00",
+      "payload": {
+        "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+        "session_id": "session-1786039014604915256",
+        "project_id": null,
+        "title": "Transcript UI multi-step verification",
+        "summary": "A read-only, three-step transcript-verification exercise that inspects the workspace, intentionally runs a failing command to surface a non-zero exit code, and runs a slow multi-marker background command so the running worklog remains visible. No files will be created or deleted.",
+        "status": "active",
+        "revision": 4,
+        "created_at": "2026-08-06T17:58:03.514575869+00:00",
+        "updated_at": "2026-08-06T18:03:16.338425147+00:00",
+        "steps": [
+          {
+            "step_id": "step-61c14f71-dbf0-4397-87fc-851afc539b8a",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 0,
+            "description": "1. Inspect the workspace without changing files: list the workspace directory and check git status (read-only, no file creation or deletion).",
+            "status": "done",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T18:03:14.870502977+00:00"
+          },
+          {
+            "step_id": "step-cd83f9d3-71cb-438e-878b-4c92e6565d2b",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 1,
+            "description": "2. Run a deliberately failing command `sh -c 'exit 7'` and report its non-zero exit code exactly as observed.",
+            "status": "done",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T18:03:16.338425147+00:00"
+          },
+          {
+            "step_id": "step-0a8f2934-a734-424c-8eba-79af13be9a8e",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 2,
+            "description": "3. Run a long, wrapped shell command that prints several numbered markers slowly (with sleeps between them) in the background so the running worklog stays visible while active; then read its output and confirm completion.",
+            "status": "not_started",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T17:58:03.514575869+00:00"
+          },
+          {
+            "step_id": "step-4a6acd64-b799-4f7f-b681-7d3562babba2",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 3,
+            "description": "4. Finish by reporting every command run, each exit code, and whether the workspace changed (it should not).",
+            "status": "not_started",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T17:58:03.514575869+00:00"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "todo_update",
+    "event_id": "event-9f4b8f2b-0dd4-4e71-808b-205c07107ea3",
+    "created_at_ms": 1786039397360,
+    "timestamp": "2026-08-06T18:03:17.360472738+00:00",
+    "stream_reset": false,
+    "text_delta": null,
+    "reasoning_delta": null,
+    "tool_call_delta": null,
+    "tool_result": null,
+    "usage": null,
+    "turn": null,
+    "working_event": {
+      "event_type": "todo_update",
+      "category": "todo",
+      "direction": "outgoing",
+      "timestamp": "2026-08-06T18:03:17.360150732+00:00",
+      "payload": {
+        "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+        "session_id": "session-1786039014604915256",
+        "project_id": null,
+        "title": "Transcript UI multi-step verification",
+        "summary": "A read-only, three-step transcript-verification exercise that inspects the workspace, intentionally runs a failing command to surface a non-zero exit code, and runs a slow multi-marker background command so the running worklog remains visible. No files will be created or deleted.",
+        "status": "active",
+        "revision": 5,
+        "created_at": "2026-08-06T17:58:03.514575869+00:00",
+        "updated_at": "2026-08-06T18:03:17.343021979+00:00",
+        "steps": [
+          {
+            "step_id": "step-61c14f71-dbf0-4397-87fc-851afc539b8a",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 0,
+            "description": "1. Inspect the workspace without changing files: list the workspace directory and check git status (read-only, no file creation or deletion).",
+            "status": "done",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T18:03:14.870502977+00:00"
+          },
+          {
+            "step_id": "step-cd83f9d3-71cb-438e-878b-4c92e6565d2b",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 1,
+            "description": "2. Run a deliberately failing command `sh -c 'exit 7'` and report its non-zero exit code exactly as observed.",
+            "status": "done",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T18:03:16.338425147+00:00"
+          },
+          {
+            "step_id": "step-0a8f2934-a734-424c-8eba-79af13be9a8e",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 2,
+            "description": "3. Run a long, wrapped shell command that prints several numbered markers slowly (with sleeps between them) in the background so the running worklog stays visible while active; then read its output and confirm completion.",
+            "status": "in_progress",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T18:03:17.343021979+00:00"
+          },
+          {
+            "step_id": "step-4a6acd64-b799-4f7f-b681-7d3562babba2",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 3,
+            "description": "4. Finish by reporting every command run, each exit code, and whether the workspace changed (it should not).",
+            "status": "not_started",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T17:58:03.514575869+00:00"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "todo_update",
+    "event_id": "event-4afc2ab0-0d55-4017-b93a-fbc6c75b9f88",
+    "created_at_ms": 1786039536642,
+    "timestamp": "2026-08-06T18:05:36.642037667+00:00",
+    "stream_reset": false,
+    "text_delta": null,
+    "reasoning_delta": null,
+    "tool_call_delta": null,
+    "tool_result": null,
+    "usage": null,
+    "turn": null,
+    "working_event": {
+      "event_type": "todo_update",
+      "category": "todo",
+      "direction": "outgoing",
+      "timestamp": "2026-08-06T18:05:36.641261773+00:00",
+      "payload": {
+        "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+        "session_id": "session-1786039014604915256",
+        "project_id": null,
+        "title": "Transcript UI multi-step verification",
+        "summary": "A read-only, three-step transcript-verification exercise that inspects the workspace, intentionally runs a failing command to surface a non-zero exit code, and runs a slow multi-marker background command so the running worklog remains visible. No files will be created or deleted.",
+        "status": "active",
+        "revision": 6,
+        "created_at": "2026-08-06T17:58:03.514575869+00:00",
+        "updated_at": "2026-08-06T18:05:36.637179559+00:00",
+        "steps": [
+          {
+            "step_id": "step-61c14f71-dbf0-4397-87fc-851afc539b8a",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 0,
+            "description": "1. Inspect the workspace without changing files: list the workspace directory and check git status (read-only, no file creation or deletion).",
+            "status": "done",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T18:03:14.870502977+00:00"
+          },
+          {
+            "step_id": "step-cd83f9d3-71cb-438e-878b-4c92e6565d2b",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 1,
+            "description": "2. Run a deliberately failing command `sh -c 'exit 7'` and report its non-zero exit code exactly as observed.",
+            "status": "done",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T18:03:16.338425147+00:00"
+          },
+          {
+            "step_id": "step-0a8f2934-a734-424c-8eba-79af13be9a8e",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 2,
+            "description": "3. Run a long, wrapped shell command that prints several numbered markers slowly (with sleeps between them) in the background so the running worklog stays visible while active; then read its output and confirm completion.",
+            "status": "done",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T18:05:36.637179559+00:00"
+          },
+          {
+            "step_id": "step-4a6acd64-b799-4f7f-b681-7d3562babba2",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 3,
+            "description": "4. Finish by reporting every command run, each exit code, and whether the workspace changed (it should not).",
+            "status": "not_started",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T17:58:03.514575869+00:00"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "todo_update",
+    "event_id": "event-9fba6f42-288b-43d3-abc0-9a621f088ee1",
+    "created_at_ms": 1786039537920,
+    "timestamp": "2026-08-06T18:05:37.920943745+00:00",
+    "stream_reset": false,
+    "text_delta": null,
+    "reasoning_delta": null,
+    "tool_call_delta": null,
+    "tool_result": null,
+    "usage": null,
+    "turn": null,
+    "working_event": {
+      "event_type": "todo_update",
+      "category": "todo",
+      "direction": "outgoing",
+      "timestamp": "2026-08-06T18:05:37.920607760+00:00",
+      "payload": {
+        "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+        "session_id": "session-1786039014604915256",
+        "project_id": null,
+        "title": "Transcript UI multi-step verification",
+        "summary": "A read-only, three-step transcript-verification exercise that inspects the workspace, intentionally runs a failing command to surface a non-zero exit code, and runs a slow multi-marker background command so the running worklog remains visible. No files will be created or deleted.",
+        "status": "active",
+        "revision": 7,
+        "created_at": "2026-08-06T17:58:03.514575869+00:00",
+        "updated_at": "2026-08-06T18:05:37.916059194+00:00",
+        "steps": [
+          {
+            "step_id": "step-61c14f71-dbf0-4397-87fc-851afc539b8a",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 0,
+            "description": "1. Inspect the workspace without changing files: list the workspace directory and check git status (read-only, no file creation or deletion).",
+            "status": "done",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T18:03:14.870502977+00:00"
+          },
+          {
+            "step_id": "step-cd83f9d3-71cb-438e-878b-4c92e6565d2b",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 1,
+            "description": "2. Run a deliberately failing command `sh -c 'exit 7'` and report its non-zero exit code exactly as observed.",
+            "status": "done",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T18:03:16.338425147+00:00"
+          },
+          {
+            "step_id": "step-0a8f2934-a734-424c-8eba-79af13be9a8e",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 2,
+            "description": "3. Run a long, wrapped shell command that prints several numbered markers slowly (with sleeps between them) in the background so the running worklog stays visible while active; then read its output and confirm completion.",
+            "status": "done",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T18:05:36.637179559+00:00"
+          },
+          {
+            "step_id": "step-4a6acd64-b799-4f7f-b681-7d3562babba2",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 3,
+            "description": "4. Finish by reporting every command run, each exit code, and whether the workspace changed (it should not).",
+            "status": "in_progress",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T18:05:37.916059194+00:00"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "todo_update",
+    "event_id": "event-6379b73d-96cf-4c27-aed9-80d0c9c8609d",
+    "created_at_ms": 1786040829507,
+    "timestamp": "2026-08-06T18:27:09.507764695+00:00",
+    "stream_reset": false,
+    "text_delta": null,
+    "reasoning_delta": null,
+    "tool_call_delta": null,
+    "tool_result": null,
+    "usage": null,
+    "turn": null,
+    "working_event": {
+      "event_type": "todo_update",
+      "category": "todo",
+      "direction": "outgoing",
+      "timestamp": "2026-08-06T18:27:09.507373619+00:00",
+      "payload": {
+        "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+        "session_id": "session-1786039014604915256",
+        "project_id": null,
+        "title": "Transcript UI multi-step verification",
+        "summary": "A read-only, three-step transcript-verification exercise that inspects the workspace, intentionally runs a failing command to surface a non-zero exit code, and runs a slow multi-marker background command so the running worklog remains visible. No files will be created or deleted.",
+        "status": "active",
+        "revision": 8,
+        "created_at": "2026-08-06T17:58:03.514575869+00:00",
+        "updated_at": "2026-08-06T18:27:09.501733747+00:00",
+        "steps": [
+          {
+            "step_id": "step-61c14f71-dbf0-4397-87fc-851afc539b8a",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 0,
+            "description": "1. Inspect the workspace without changing files: list the workspace directory and check git status (read-only, no file creation or deletion).",
+            "status": "done",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T18:03:14.870502977+00:00"
+          },
+          {
+            "step_id": "step-cd83f9d3-71cb-438e-878b-4c92e6565d2b",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 1,
+            "description": "2. Run a deliberately failing command `sh -c 'exit 7'` and report its non-zero exit code exactly as observed.",
+            "status": "done",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T18:03:16.338425147+00:00"
+          },
+          {
+            "step_id": "step-0a8f2934-a734-424c-8eba-79af13be9a8e",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 2,
+            "description": "3. Run a long, wrapped shell command that prints several numbered markers slowly (with sleeps between them) in the background so the running worklog stays visible while active; then read its output and confirm completion.",
+            "status": "done",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T18:05:36.637179559+00:00"
+          },
+          {
+            "step_id": "step-4a6acd64-b799-4f7f-b681-7d3562babba2",
+            "plan_id": "plan-22e7a731-c605-43e2-8d63-6726729c6a58",
+            "position": 3,
+            "description": "4. Finish by reporting every command run, each exit code, and whether the workspace changed (it should not).",
+            "status": "done",
+            "failure_reason": null,
+            "abandoned_reason": null,
+            "created_at": "2026-08-06T17:58:03.514575869+00:00",
+            "updated_at": "2026-08-06T18:27:09.501733747+00:00"
+          }
+        ]
+      }
+    }
+  }
+]

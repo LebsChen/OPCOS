@@ -145,6 +145,14 @@ pub struct ProviderConfig {
     pub timeout_seconds: u64,
     /// Maximum idle gap between streaming response chunks, in seconds.
     pub stream_idle_timeout_seconds: u64,
+    pub dialect: ProviderDialect,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProviderDialect {
+    #[default]
+    OpenAi,
+    Cloudflare,
 }
 
 impl ProviderConfig {
@@ -155,7 +163,13 @@ impl ProviderConfig {
             headers: Vec::new(),
             timeout_seconds: 60,
             stream_idle_timeout_seconds: 120,
+            dialect: ProviderDialect::OpenAi,
         }
+    }
+
+    pub fn cloudflare(mut self) -> Self {
+        self.dialect = ProviderDialect::Cloudflare;
+        self
     }
 }
 

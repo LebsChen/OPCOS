@@ -5,6 +5,115 @@ agent loop、会话状态、审批和 SQLite 持久化；通过统一 Host trait
 或 RVM Host 上执行工作。OPCOS 不是任何单一 agent 云的客户端，也不运行
 Devin 服务。
 
+## 项目总结
+
+一句话：**LLM + Harness + VM**。OPCOS 把三者装进一个桌面应用——模型来自可插拔
+的 provider，harness 是本仓库自己的 agent 运行时，VM 既可以是本机也可以是远程
+RVM 主机。
+
+- **LLM**：`opcos-provider` 提供 provider registry、动态模型发现、能力（context
+  window / max output）解析和多方言适配（OpenAI 兼容、Cloudflare Workers AI
+  等）；模型可按 global/project/session 覆盖。
+- **Harness**：`opcos-engine` 的 `TurnEngine` 是主执行路径——迭代式 agent loop、
+  工具目录、审批、压缩、steering、生命周期 hook、iteration stats 和结构化事件
+  流。`Harness` trait 让 OpenCode 和 ACP 作为并列 harness 接入，而不是分叉出
+  第二套 runtime。
+- **VM**：`opcos-hosts` 的 Host trait 统一 LocalHost 与 RVM Host——文件、shell、
+  持久 shell/PTY、进程、后台 job、repository index、LSP、浏览器/CDP、
+  Computer Use、VNC 的可用性都由 Host 声明的 capability 决定，远端不可用时报错
+  而不是静默回落到本机。
+
+围绕这三层的是让它能「自主跑」的部分：`opcos-store` 的 SQLite 持久化
+（会话、消息、审批、审计、action ledger、work queue、plan、events）、
+`opcos-policy` 的风险分级与审批策略、`opcos-assets` 的 Instructions/Agents/
+Knowledge/Playbooks/Skills/Commands/MCP 声明发现、`opcos-mcp` 的 MCP 生命周期，
+以及 event rule → work queue → planner 的事件驱动通路。
+
+### Agent 工作流程
+
+单个 turn 的执行路径（`TurnEngine::run_loop`，`crates/opcos-engine/src/lib.rs`）：
+
+```mermaid
+flowchart TD
+    U[用户消息 / steering / 事件唤醒] --> LOOP{{"迭代 (上限 max_iterations)"}}
+    LOOP --> CTX["估算 context，必要时压缩<br/>should_compact → compact_context"]
+    CTX --> INF["provider 推理<br/>text / reasoning / tool_call 增量流"]
+    INF --> TC{有 tool call?}
+    TC -- 否 --> STOP["Stop hook<br/>(可 veto，最多 3 次)"]
+    STOP --> DONE[AssistantTurn 收口]
+    TC -- 是 --> PRE["preflight + policy<br/>风险分级 / 路径边界 / grant"]
+    PRE -- Deny --> RES
+    PRE -- NeedsUser --> APV["ApprovalSurface<br/>pending approval → UI / Inbox"]
+    APV -- 拒绝 --> RES
+    APV -- 批准 --> EXEC
+    PRE -- Allow --> EXEC["ToolExecutor 执行<br/>(可流式，输出有界截断)"]
+    EXEC --> HOST["Host / MCP / GitHub / connector"]
+    HOST --> ART["产物落 ArtifactSink<br/>凭据经 SecretScrubber 洗掉"]
+    ART --> RES[tool result 回写 messages + SQLite]
+    RES --> STATS["iteration stats 事件<br/>inference / tool / harness 耗时"]
+    STATS --> LOOP
+    DONE --> EV
+    STATS --> EV["结构化事件流<br/>status_update / one_line_thoughts /<br/>devin_message / context_growth_update"]
+    EV --> UI[Tauri event channel → transcript]
+```
+
+事件驱动（无人值守）通路与上面的 turn 循环相接：
+
+```mermaid
+flowchart LR
+    EXT["外部事件<br/>(GitHub / connector / 定时 / 手工)"] --> RULE["event rule 匹配<br/>event_bus::dispatch_event"]
+    RULE -->|Enqueue| Q["durable work_queue<br/>claim / lease / renew / retry / dead-letter"]
+    RULE -->|PlanGoal| PL["planner<br/>goal → PlannedWorkItem[]"]
+    PL --> Q
+    Q --> S["session turn<br/>(上图的 agent loop)"]
+    S --> LEDGER["action ledger<br/>幂等 key + 状态 + 结果摘要"]
+    S --> COORD["coordination_dispatch<br/>Leader → 已存在的 Worker session"]
+    COORD --> VERIFY["交付核验<br/>branch / push / PR / CI，而不是 Worker 自述"]
+```
+
+### Harness 架构
+
+```mermaid
+flowchart TB
+    subgraph FE["web (React / TS / Vite)"]
+        T[Transcript / Composer / Settings]
+    end
+    T <-->|Tauri invoke + event channel| ADP
+
+    subgraph ADP["src-tauri (desktop adapter)"]
+        D[命令分发 / Host dispatch / connector dispatch]
+        SEC[SecretStore]
+        SQL[(SQLite)]
+    end
+
+    D --> H{{"Harness trait<br/>start_turn / events / interrupt /<br/>reply_approval / reply_question / resume"}}
+    H --> BI["Builtin TurnEngine<br/>(opcos-engine)"]
+    H --> OC["OpenCode harness<br/>(经 Host 启动)"]
+    H --> ACP["ACP harness<br/>(独立路径，不共享工具目录)"]
+
+    BI --> PROV["opcos-provider<br/>registry / 模型发现 / 方言适配"]
+    PROV --> LLM["LLM 端点<br/>OpenAI 兼容 / Cloudflare Workers AI / …"]
+
+    BI --> TE["ToolExecutor"]
+    TE --> HOSTS["opcos-hosts<br/>Host trait"]
+    HOSTS --> LH["LocalHost"]
+    HOSTS --> RVM["RVM Host<br/>(opcos-rvm wire client)"]
+    LH --> CAP["文件 / shell / PTY / job /<br/>index / LSP / CDP / Computer Use / VNC<br/>(按 capability 声明)"]
+    RVM --> CAP
+    TE --> MCP["opcos-mcp<br/>server 生命周期 / 工具发现"]
+    TE --> GH["GitHub / Linear / Notion / …<br/>connector 工具"]
+
+    BI --> POL["opcos-policy<br/>风险 / 路径 / 审批策略"]
+    BI --> ST["opcos-store<br/>会话 / 审批 / ledger / queue / plan / events"]
+    BI --> AS["opcos-assets<br/>Instructions / Agents / Knowledge /<br/>Playbooks / Skills / Commands / MCP"]
+    ST --> SQL
+    TE --> SEC
+    RVM -->|Authorization: Bearer| SEC
+```
+
+分层约束由 `AGENTS.md` 固定：`opcos-rvm` 不依赖 `opcos-engine`，
+`opcos-engine` 不依赖 Tauri/前端，`src-tauri` 只是 adapter。
+
 ## 当前边界
 
 - 本地 agent loop 是主要执行路径；OpenCode harness 也可通过 Host 启动。
