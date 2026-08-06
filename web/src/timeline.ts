@@ -42,6 +42,7 @@ export type TimelineNode =
         label: string;
         detail?: string;
         thoughtForCallId?: string;
+        activityLabel?: boolean;
         callId?: string;
         terminalOutput?: string;
         terminalTruncated?: boolean;
@@ -164,9 +165,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
       return;
     }
     const seconds = Math.max(0, Math.round((endedAt - workStarted) / 1000));
-    if (work.label === "Worked for 0s" || work.label.startsWith("Worked for ")) {
-      work.label = `Worked for ${seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`}`;
-    }
+    work.label = `Worked for ${seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`}`;
     nodes.push(work);
     work = null;
   };
@@ -230,7 +229,13 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
     } else if (type === "one_line_thoughts") {
       const activeWork = ensureWork(event.created_at_ms);
       const short = String(data.short ?? data.summary ?? "").trim();
-      if (short) activeWork.label = short;
+      if (short) {
+        activeWork.rows.push({
+          label: short,
+          activityLabel: true,
+          isMajorAction: true,
+        });
+      }
     } else if (
       [
         "error",
@@ -383,6 +388,8 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
               .split(/[\\/]/)
               .pop() ?? "";
           activeWork.rows.push({
+            callId:
+              typeof data.call_id === "string" ? data.call_id : undefined,
             label:
               item.action_type === "create"
                 ? `Created ${basename} +${added}`
@@ -484,10 +491,12 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
         ) {
           const row = {
             label: String(data.command ?? data.tool ?? type),
+            callId:
+              typeof data.call_id === "string" ? data.call_id : undefined,
             isMajorAction:
               typeof data.is_major_action === "boolean"
                 ? data.is_major_action
-                : false,
+                : true,
           };
           if (pendingThought) {
             pendingThought.row.thoughtForCallId =

@@ -1,9 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useEffect, useState } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 import { type ApprovalDecision, type Item } from "../types";
 import { buildTimeline, type TimelineEvent } from "../timeline";
 import { ApprovalCard } from "./ApprovalCard";
 import { Markdown } from "./Markdown";
+
+function formatDuration(durationMs: number): string {
+  if (durationMs < 1000) return `${Math.round(durationMs)}ms`;
+  const seconds = durationMs / 1000;
+  return `${Number(seconds.toFixed(seconds < 10 ? 1 : 0))}s`;
+}
 
 function BubbleMeta({ text, ts }: { text: string; ts?: number }) {
   const [copied, setCopied] = useState(false);
@@ -281,11 +287,10 @@ export function Transcript({
               )}
             </div>
           );
-        const majorRows = node.rows.filter(
-          (row) => row.isMajorAction !== false,
-        );
-        const minorRows = node.rows.filter(
-          (row) => row.isMajorAction === false,
+        const thoughtByCallId = new Map(
+          node.rows
+            .filter((row) => row.thoughtForCallId)
+            .map((row) => [row.thoughtForCallId, row]),
         );
         const renderRow = (row: (typeof node.rows)[number], rowIndex: number) => (
           <div
@@ -305,10 +310,15 @@ export function Transcript({
             )}
             {row.durationMs !== undefined && (
               <span className="ml-2 text-xs text-muted">
-                {row.durationMs} ms
+                {formatDuration(row.durationMs)}
               </span>
             )}
-            {row.detail && <Thought text={row.detail} />}
+            {row.detail && !row.thoughtForCallId && (
+              <Thought text={row.detail} />
+            )}
+            {row.callId && thoughtByCallId.get(row.callId)?.detail && (
+              <Thought text={thoughtByCallId.get(row.callId)?.detail ?? ""} />
+            )}
             {(row.terminalOutput || row.terminalTruncated) && (
               <TerminalOutput
                 output={row.terminalOutput ?? ""}
@@ -326,6 +336,44 @@ export function Transcript({
             )}
           </div>
         );
+        const renderRows = (rows: typeof node.rows) => {
+          const rendered: ReactNode[] = [];
+          let rowIndex = 0;
+          while (rowIndex < rows.length) {
+            if (rows[rowIndex].isMajorAction === false) {
+              const start = rowIndex;
+              while (
+                rowIndex < rows.length &&
+                rows[rowIndex].isMajorAction === false
+              ) {
+                rowIndex += 1;
+              }
+              const minorRows = rows.slice(start, rowIndex);
+              rendered.push(
+                <details
+                  className="rounded border border-line p-2"
+                  key={`minor-${start}`}
+                >
+                  <summary className="cursor-pointer text-xs text-muted">
+                    {minorRows.length} minor actions
+                  </summary>
+                  <div className="mt-2 flex flex-col gap-2">
+                    {minorRows.map((row, offset) =>
+                      renderRow(row, start + offset),
+                    )}
+                  </div>
+                </details>,
+              );
+            } else {
+              const row = rows[rowIndex];
+              if (!row.thoughtForCallId) {
+                rendered.push(renderRow(row, rowIndex));
+              }
+              rowIndex += 1;
+            }
+          }
+          return rendered;
+        };
         return (
           <details className="work-segment flex flex-col gap-2" open key={index}>
             <summary className="cursor-pointer text-muted">
@@ -333,17 +381,7 @@ export function Transcript({
               {node.deletions ? `−${node.deletions}` : ""}
             </summary>
             <div className="max-h-[32rem] overflow-auto flex flex-col gap-2 text-ink">
-              {majorRows.map(renderRow)}
-              {minorRows.length > 0 && (
-                <details className="rounded border border-line p-2">
-                  <summary className="cursor-pointer text-xs text-muted">
-                    {minorRows.length} minor actions
-                  </summary>
-                  <div className="mt-2 flex flex-col gap-2">
-                    {minorRows.map(renderRow)}
-                  </div>
-                </details>
-              )}
+              {renderRows(node.rows)}
             </div>
           </details>
         );

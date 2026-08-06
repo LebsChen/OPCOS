@@ -45,9 +45,13 @@ describe("single event-log timeline", () => {
   it("uses Devin-style group labels, attached thoughts, and shell results", () => {
     const nodes = buildTimeline(parityEvents as TimelineEvent[]);
     const work = nodes.find((node) => node.kind === "work");
-    expect(work).toMatchObject({ label: "Listing files" });
+    expect(work).toMatchObject({ label: "Worked for 2s" });
     expect(work?.rows).toEqual(
       expect.arrayContaining([
+        expect.objectContaining({
+          label: "Listing files",
+          activityLabel: true,
+        }),
         expect.objectContaining({
           label: "Thought for 1s",
           thoughtForCallId: "call-shell",
@@ -63,6 +67,71 @@ describe("single event-log timeline", () => {
       ]),
     );
     expect(work?.rows.some((row) => row.isMajorAction === false)).toBe(true);
+  });
+  it("keeps every one-line label without replacing the finished group header", () => {
+    const nodes = buildTimeline([
+      {
+        type: "one_line_thoughts",
+        event_id: "label-1",
+        created_at_ms: 1000,
+        working_event: {
+          event_type: "one_line_thoughts",
+          payload: { short: "Listing files" },
+        },
+      },
+      {
+        type: "browser_status_started",
+        event_id: "minor-1",
+        created_at_ms: 1100,
+        working_event: {
+          event_type: "browser_status_started",
+          payload: { tool: "browser_status", is_major_action: false },
+        },
+      },
+      {
+        type: "one_line_thoughts",
+        event_id: "label-2",
+        created_at_ms: 2000,
+        working_event: {
+          event_type: "one_line_thoughts",
+          payload: { short: "Running tests" },
+        },
+      },
+      {
+        type: "shell_process_started",
+        event_id: "shell-label",
+        created_at_ms: 3000,
+        working_event: {
+          event_type: "shell_process_started",
+          payload: { call_id: "label-call", command: "cargo test" },
+        },
+      },
+    ] as TimelineEvent[]);
+    const work = nodes.find((node) => node.kind === "work");
+    expect(work?.label).toBe("Worked for 2s");
+    expect(work?.rows.map((row) => row.label)).toEqual([
+      "Listing files",
+      "browser_status",
+      "Running tests",
+      "cargo test",
+    ]);
+  });
+  it("defaults legacy generic actions to major", () => {
+    const [work] = buildTimeline([
+      {
+        type: "browser_status_started",
+        event_id: "legacy-generic",
+        created_at_ms: 1,
+        working_event: {
+          event_type: "browser_status_started",
+          payload: { tool: "browser_status" },
+        },
+      },
+    ] as TimelineEvent[]).filter((node) => node.kind === "work");
+    expect(work?.rows[0]).toMatchObject({
+      label: "browser_status",
+      isMajorAction: true,
+    });
   });
   it("keeps legacy events without parity fields renderable", () => {
     const nodes = buildTimeline([
