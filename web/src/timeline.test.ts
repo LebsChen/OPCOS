@@ -35,7 +35,7 @@ describe("single event-log timeline", () => {
     });
     expect(resultRow).toMatchObject({
       callId: resultCallId,
-      resultSummary: expect.stringContaining('"items"'),
+      resultSummary: undefined,
     });
     expect(nodes).toContainEqual({
       kind: "sleep",
@@ -187,7 +187,7 @@ describe("single event-log timeline", () => {
     expect(work?.label).toBe("Worked for 2s");
     expect(work?.rows.map((row) => row.label)).toEqual([
       "Listing files",
-      "browser_status",
+      "Checked browser status",
       "Running tests",
       "cargo test",
     ]);
@@ -205,7 +205,7 @@ describe("single event-log timeline", () => {
       },
     ] as TimelineEvent[]).filter((node) => node.kind === "work");
     expect(work?.rows[0]).toMatchObject({
-      label: "browser_status",
+      label: "Checked browser status",
       isMajorAction: true,
     });
   });

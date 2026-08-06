@@ -102,6 +102,11 @@ function toolLabel(tool: string, args: unknown): string {
       values?.target ??
       values?.file_path ??
       values?.command ??
+      values?.query ??
+      values?.pattern ??
+      values?.identifier ??
+      values?.issue_id ??
+      values?.repo ??
       "",
   ).trim();
   const verb =
@@ -110,8 +115,107 @@ function toolLabel(tool: string, args: unknown): string {
       list_dir: "Listed",
       write_file: "Wrote",
       edit_file: "Edited",
-    }[tool] ?? tool;
+      git_status: "Checked git status",
+      git_diff: "Reviewed git diff",
+      git_log: "Viewed git log",
+      git_rev_parse: "Resolved git revision",
+      git_create_branch: "Created branch",
+      git_stage_commit: "Created commit",
+      git_push: "Pushed changes",
+      github_create_issue: "Created GitHub issue",
+      github_create_pull_request: "Created GitHub pull request",
+      github_get_pull_request: "Read GitHub pull request",
+      github_list_issues: "Listed GitHub issues",
+      github_list_repositories: "Listed GitHub repositories",
+      github_ci_status: "Checked GitHub CI",
+      github_ci_failure_log: "Read GitHub CI failure log",
+      linear_get_issue: "Read Linear issue",
+      linear_list_my_issues: "Listed Linear issues",
+      linear_comment_issue: "Commented on Linear issue",
+      linear_update_issue_status: "Updated Linear issue",
+      gitlab_list_projects: "Listed GitLab projects",
+      gitlab_list_issues: "Listed GitLab issues",
+      jira_search_issues: "Searched Jira issues",
+      repo_index_find_symbol: "Found repository symbol",
+      repo_index_glob: "Matched repository paths",
+      repo_index_search: "Searched repository index",
+      lsp_definition: "Found definition",
+      lsp_references: "Found references",
+      lsp_diagnostics: "Checked diagnostics",
+      browser_navigate: "Navigated browser",
+      browser_read: "Read browser",
+      browser_measure: "Measured browser",
+      browser_assert_geometry: "Verified browser geometry",
+      browser_screenshot: "Captured browser screenshot",
+      browser_status: "Checked browser status",
+      browser_set_viewport: "Set browser viewport",
+      browser_click: "Clicked browser",
+      computer_use: "Used computer",
+      run_shell: "Ran command",
+      background_job_start: "Started background job",
+      background_job_status: "Checked background job",
+      background_job_output: "Read background job output",
+      background_job_kill: "Stopped background job",
+      propose_plan: "Created plan",
+      plan_get: "Read plan",
+      plan_update: "Updated plan",
+      plan_revise: "Revised plan",
+      secrets_list: "Listed secrets",
+      skill_search_learned: "Searched learned skills",
+      skill_get_learned: "Read learned skill",
+      skill_save_learned: "Saved learned skill",
+    }[tool] ??
+    (tool.startsWith("slack_")
+      ? "Used Slack"
+      : tool.startsWith("discord_")
+        ? "Used Discord"
+        : tool.startsWith("telegram_")
+          ? "Used Telegram"
+          : tool.startsWith("notion_")
+            ? "Searched Notion"
+            : tool.startsWith("stripe_")
+              ? "Read Stripe"
+              : tool);
   return target ? `${verb} ${target}` : verb;
+}
+
+function resultSummary(raw: unknown): {
+  summary?: string;
+  error: boolean;
+} {
+  if (typeof raw === "string") {
+    return { summary: raw.slice(0, 240), error: false };
+  }
+  if (!raw || typeof raw !== "object") {
+    return { error: false };
+  }
+  const value = raw as Record<string, unknown>;
+  const errorValue = value.error;
+  const error =
+    errorValue !== undefined || value.ok === false || value.success === false;
+  for (const key of ["error", "message", "detail", "reason", "summary"]) {
+    const candidate = value[key];
+    if (typeof candidate === "string" && candidate.trim()) {
+      return { summary: candidate.slice(0, 240), error };
+    }
+  }
+  const content = value.content;
+  if (typeof content === "string" && content.trim()) {
+    return { summary: content.slice(0, 240), error };
+  }
+  if (Array.isArray(content)) {
+    const text = content
+      .map((item) =>
+        item && typeof item === "object"
+          ? (item as Record<string, unknown>).text
+          : undefined,
+      )
+      .filter((item): item is string => typeof item === "string")
+      .join(" ")
+      .trim();
+    if (text) return { summary: text.slice(0, 240), error };
+  }
+  return { error };
 }
 
 export function mergeEvents(
@@ -397,23 +501,11 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
           resultEvent.output ??
           resultEvent.content ??
           resultEvent.message;
-        const summary =
-          typeof raw === "string"
-            ? raw
-            : raw === undefined
-              ? ""
-              : JSON.stringify(raw);
-        const resultObject =
-          raw && typeof raw === "object"
-            ? (raw as Record<string, unknown>)
-            : undefined;
+        const result = resultSummary(raw);
         const tool = String(resultEvent.name ?? "");
         if (tool) row.label = toolLabel(tool, resultEvent.arguments);
-        row.resultSummary = summary ? summary.slice(0, 240) : "Completed";
-        row.resultError =
-          resultObject?.error !== undefined ||
-          resultObject?.ok === false ||
-          resultObject?.success === false;
+        row.resultSummary = result.summary;
+        row.resultError = row.resultError === true || result.error;
         row.durationMs =
           typeof data.duration_ms === "number"
             ? data.duration_ms
@@ -640,8 +732,10 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
           typeof data.call_id === "string" ? data.call_id : undefined;
         const started = callId ? genericRows.get(callId) : undefined;
         if (started) {
-          started.resultSummary = data.ok === false ? "Failed" : "Completed";
-          started.resultError = data.ok === false;
+          if (data.ok === false) {
+            started.resultError = true;
+            started.resultSummary ??= "Failed";
+          }
           started.durationMs =
             typeof data.duration_ms === "number"
               ? data.duration_ms
@@ -665,11 +759,10 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
           typeof data.call_id === "string" ? data.call_id : undefined;
         const started = callId ? genericRows.get(callId) : undefined;
         if (started) {
-          started.resultSummary =
-            data.ok === false
-              ? "Failed"
-              : (started.resultSummary ?? "Completed");
-          started.resultError = data.ok === false;
+          if (data.ok === false) {
+            started.resultError = true;
+            started.resultSummary ??= "Failed";
+          }
           started.durationMs =
             typeof data.duration_ms === "number"
               ? data.duration_ms
