@@ -135,6 +135,17 @@ fn normalize_message(message: &Value) -> Value {
         .filter(|(key, _)| !key.starts_with('_'))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<serde_json::Map<_, _>>();
+    let nested_tool_use_id = normalized
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|blocks| {
+            blocks.iter().find_map(|block| {
+                block
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+        });
     if let Some(content) = normalized.get("content").cloned()
         && let Some(blocks) = content.as_array()
     {
@@ -177,10 +188,14 @@ fn normalize_message(message: &Value) -> Value {
         }).collect();
         normalized.insert("tool_calls".into(), Value::Array(calls));
     }
-    if normalized.get("role").and_then(Value::as_str) == Some("tool")
-        && let Some(id) = normalized.remove("tool_use_id")
-    {
-        normalized.insert("tool_call_id".into(), id);
+    if normalized.get("role").and_then(Value::as_str) == Some("tool") {
+        let top_level_tool_use_id = normalized.remove("tool_use_id");
+        if !normalized.contains_key("tool_call_id")
+            && let Some(id) =
+                top_level_tool_use_id.or_else(|| nested_tool_use_id.map(Value::String))
+        {
+            normalized.insert("tool_call_id".into(), id);
+        }
     }
     Value::Object(normalized)
 }
@@ -554,6 +569,41 @@ mod tests {
             &[json!({"type":"function","function":{"name":"read_file"}})],
         );
         assert_eq!(salvaged[0].name, "read_file");
+    }
+
+    #[test]
+    fn normalizes_tool_call_id_from_top_level_or_nested_content() {
+        let top_level = normalize_message(&json!({
+            "role": "tool",
+            "tool_use_id": "top-level",
+            "content": "result"
+        }));
+        assert_eq!(top_level["tool_call_id"], "top-level");
+
+        let nested = normalize_message(&json!({
+            "role": "tool",
+            "content": [{"tool_use_id": "nested", "text": "result"}]
+        }));
+        assert_eq!(nested["tool_call_id"], "nested");
+        assert_eq!(nested["content"], "result");
+    }
+
+    #[test]
+    fn preserves_tool_messages_without_or_with_existing_tool_call_id() {
+        let missing = normalize_message(&json!({
+            "role": "tool",
+            "content": [{"text": "result"}]
+        }));
+        assert!(missing.get("tool_call_id").is_none());
+
+        let existing = normalize_message(&json!({
+            "role": "tool",
+            "tool_call_id": "existing",
+            "tool_use_id": "ignored",
+            "content": [{"tool_use_id": "nested", "text": "result"}]
+        }));
+        assert_eq!(existing["tool_call_id"], "existing");
+        assert!(existing.get("tool_use_id").is_none());
     }
 
     #[test]

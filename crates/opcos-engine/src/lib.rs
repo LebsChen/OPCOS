@@ -2202,8 +2202,9 @@ fn format_plan_context(plan: &opcos_store::PlanRecord) -> String {
             .or(step.abandoned_reason.as_deref())
             .unwrap_or("");
         let line = format!(
-            "{}. [{}] {}{}",
+            "{}. [id: {}] [{}] {}{}",
             step.position + 1,
+            step.step_id,
             step.status,
             step.description,
             if reason.is_empty() {
@@ -3417,6 +3418,32 @@ mod tests {
             .unwrap();
         assert!(context.contains("tests failed"));
         assert!(context.contains("requirement removed"));
+    }
+
+    #[test]
+    fn plan_context_identifier_updates_the_matching_plan_step() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let plan = store
+            .create_plan(
+                "s",
+                None,
+                "Tracked work",
+                "Keep state",
+                &["Implement".into(), "Verify".into()],
+            )
+            .unwrap();
+        let context = format_plan_context(&plan);
+        let identifier = context
+            .lines()
+            .find_map(|line| line.split("[id: ").nth(1))
+            .and_then(|value| value.split(']').next())
+            .unwrap();
+        assert_eq!(identifier, plan.steps[0].step_id);
+
+        let updated = store
+            .update_plan_step("s", identifier, Some("in_progress"), None, None)
+            .unwrap();
+        assert_eq!(updated.steps[0].status, "in_progress");
     }
 
     #[tokio::test]
