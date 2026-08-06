@@ -406,6 +406,7 @@ pub struct TurnEngine<P, S, E> {
     interrupt_notify: Arc<tokio::sync::Notify>,
     unattended: AtomicBool,
     system_instructions: Mutex<Option<String>>,
+    runtime_facts: Mutex<Option<String>>,
     external_tools: Mutex<Vec<Value>>,
     allowed_tools: Mutex<Option<HashSet<String>>>,
     linear_tools_enabled: AtomicBool,
@@ -490,6 +491,7 @@ where
             interrupt_notify: Arc::new(tokio::sync::Notify::new()),
             unattended: AtomicBool::new(false),
             system_instructions: Mutex::new(None),
+            runtime_facts: Mutex::new(None),
             external_tools: Mutex::new(Vec::new()),
             allowed_tools: Mutex::new(None),
             linear_tools_enabled: AtomicBool::new(false),
@@ -510,6 +512,10 @@ where
 
     pub async fn set_system_instructions(&self, instructions: Option<String>) {
         *self.system_instructions.lock().await = instructions;
+    }
+
+    pub async fn set_runtime_facts(&self, facts: Option<String>) {
+        *self.runtime_facts.lock().await = facts;
     }
 
     pub async fn set_external_tools(&self, tools: Vec<Value>) {
@@ -1463,46 +1469,56 @@ where
                     })
                     .collect()
             })?;
-        if let Ok(instructions) = self.system_instructions.try_lock()
-            && let Some(instructions) = instructions.as_ref()
-        {
-            messages.insert(
-                0,
-                json!({"role":"system","content":[{"type":"text","text":instructions}]}),
-            );
-        }
-        if let Some(plan) = self
+        let plan = self
             .store
             .load_plan(&self.session_id)
-            .map_err(|error| EngineError::Store(error.to_string()))?
-        {
-            messages.insert(
-                0,
-                json!({"role":"system","content":[{"type":"text","text":format_plan_context(&plan)}]}),
-            );
+            .map_err(|error| EngineError::Store(error.to_string()))?;
+        let mut system_sections = Vec::new();
+        if let Some(plan) = plan.as_ref() {
+            system_sections.push(format_plan_context(plan));
         }
+        system_sections.push(self.runtime_context_text());
+        if let Ok(instructions) = self.system_instructions.try_lock()
+            && let Some(instructions) = instructions.as_ref()
+            && !instructions.trim().is_empty()
+        {
+            system_sections.push(instructions.clone());
+        }
+        messages.insert(0, system_message(&system_sections));
         Ok(messages)
     }
 
-    fn plan_context_message(&self) -> Result<Option<Value>, EngineError> {
-        self.store
-            .load_plan(&self.session_id)
-            .map_err(|error| EngineError::Store(error.to_string()))
-            .map(|plan| plan.map(|plan| json!({"role":"system","content":[{"type":"text","text":format_plan_context(&plan)}]})))
+    fn runtime_context_text(&self) -> String {
+        let mode = self
+            .mode
+            .try_lock()
+            .map(|mode| format!("{mode:?}"))
+            .unwrap_or_else(|_| "unknown".into());
+        let mut context = format!(
+            "Runtime context:\n- Workspace: {}\n- Permission mode: {}",
+            self.workspace, mode
+        );
+        if let Ok(facts) = self.runtime_facts.try_lock()
+            && let Some(facts) = facts.as_ref()
+            && !facts.trim().is_empty()
+        {
+            context.push('\n');
+            context.push_str(facts.trim());
+        }
+        context
     }
 
     async fn compact_context(&self, messages: Vec<Value>) -> Result<Vec<Value>, EngineError> {
-        let plan = self.plan_context_message()?;
-        let mut fixed = Vec::new();
+        let plan = self
+            .store
+            .load_plan(&self.session_id)
+            .map_err(|error| EngineError::Store(error.to_string()))?;
+        let mut existing_system_sections = Vec::new();
         let mut conversational = Vec::new();
         for message in messages {
             if message.get("role").and_then(Value::as_str) == Some("system") {
-                let is_plan = message
-                    .pointer("/content/0/text")
-                    .and_then(Value::as_str)
-                    .is_some_and(|text| text.starts_with("Persisted execution plan ("));
-                if !is_plan {
-                    fixed.push(message);
+                if let Some(text) = message.pointer("/content/0/text").and_then(Value::as_str) {
+                    existing_system_sections.push(text.to_owned());
                 }
             } else {
                 conversational.push(message);
@@ -1554,10 +1570,23 @@ where
             0,
             json!({"role":"user","content":[{"type":"text","text":summary_text.clone()}]}),
         );
-        valid.splice(0..0, fixed);
-        if let Some(plan) = plan {
-            valid.insert(0, plan);
+        let mut system_sections = Vec::new();
+        if let Some(plan) = plan.as_ref() {
+            system_sections.push(format_plan_context(plan));
         }
+        system_sections.push(self.runtime_context_text());
+        if let Ok(instructions) = self.system_instructions.try_lock()
+            && let Some(instructions) = instructions.as_ref()
+            && !instructions.trim().is_empty()
+        {
+            system_sections.push(instructions.clone());
+        } else {
+            system_sections.extend(existing_system_sections.into_iter().filter(|section| {
+                !section.starts_with("Persisted execution plan (")
+                    && !section.starts_with("Runtime context:")
+            }));
+        }
+        valid.insert(0, system_message(&system_sections));
         self.store
             .save_compaction(&CompactionRecord {
                 session_id: self.session_id.clone(),
@@ -2170,6 +2199,16 @@ fn format_plan_context(plan: &opcos_store::PlanRecord) -> String {
     text
 }
 
+fn system_message(sections: &[String]) -> Value {
+    json!({
+        "role": "system",
+        "content": [{
+            "type": "text",
+            "text": sections.join("\n\n"),
+        }],
+    })
+}
+
 pub fn action_ledger_tool_definitions() -> Vec<Value> {
     vec![
         json!({"type":"function","function":{"name":"action_ledger_begin","description":"Claim an idempotent external action before performing it. An in-flight result is unsafe to retry without reconciliation.","parameters":{"type":"object","properties":{"action_type":{"type":"string"},"platform":{"type":"string"},"account_id":{"type":"string"},"idempotency_key":{"type":"string"}},"required":["action_type","platform","account_id","idempotency_key"]}}}),
@@ -2436,6 +2475,122 @@ mod tests {
         async fn execute(&self, _: &str, _: Value) -> Result<Value, String> {
             Ok(json!("ok"))
         }
+    }
+
+    #[tokio::test]
+    async fn provider_messages_include_runtime_context_as_system_message() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(FakeTools),
+            "s",
+            "/workspace/project",
+            PermissionMode::Interactive,
+            "fake",
+        );
+        engine
+            .set_system_instructions(Some("built-in and user instructions".into()))
+            .await;
+        let messages = engine.provider_messages().unwrap();
+        assert_eq!(
+            messages[0].get("role").and_then(Value::as_str),
+            Some("system")
+        );
+        assert_eq!(
+            messages[0]
+                .pointer("/content/0/text")
+                .and_then(Value::as_str),
+            Some(
+                "Runtime context:\n- Workspace: /workspace/project\n- Permission mode: Interactive\n\nbuilt-in and user instructions"
+            )
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_messages_merge_plan_runtime_and_instructions_into_one_system_message() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .create_plan(
+                "s",
+                None,
+                "Ship feature",
+                "Implement and verify",
+                &["Code".into()],
+            )
+            .unwrap();
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(FakeTools),
+            "s",
+            "/workspace/project",
+            PermissionMode::Interactive,
+            "fake",
+        );
+        engine
+            .set_system_instructions(Some("Built-in Agent Instructions".into()))
+            .await;
+        let messages = engine.provider_messages().unwrap();
+        let systems = messages
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+            .collect::<Vec<_>>();
+        assert_eq!(systems.len(), 1);
+        assert_eq!(
+            messages[0].get("role").and_then(Value::as_str),
+            Some("system")
+        );
+        let text = systems[0]
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(text.starts_with("Persisted execution plan ("));
+        assert!(text.contains("Runtime context:"));
+        assert!(text.contains("Workspace: /workspace/project"));
+        assert!(text.contains("Permission mode: Interactive"));
+        assert!(text.contains("Built-in Agent Instructions"));
+    }
+
+    #[tokio::test]
+    async fn provider_messages_include_configured_runtime_facts_in_single_system_message() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(FakeTools),
+            "s",
+            "/workspace/project",
+            PermissionMode::Interactive,
+            "fake-model",
+        );
+        engine
+            .set_runtime_facts(Some(
+                "Runtime facts:\n- Execution host: local (local)\n- Platform: linux\n- Current UTC time: 2026-01-01T00:00:00Z\n- Enabled integrations: github, linear"
+                    .into(),
+            ))
+            .await;
+        let messages = engine.provider_messages().unwrap();
+        let systems = messages
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+            .collect::<Vec<_>>();
+        assert_eq!(systems.len(), 1);
+        let text = systems[0]
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(text.contains("Execution host: local (local)"));
+        assert!(text.contains("Platform: linux"));
+        assert!(text.contains("Current UTC time: 2026-01-01T00:00:00Z"));
+        assert!(text.contains("Enabled integrations: github, linear"));
     }
 
     #[tokio::test]
@@ -3242,6 +3397,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compaction_keeps_one_system_message_at_the_front() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .create_plan("s", None, "Tracked work", "Keep state", &["Verify".into()])
+            .unwrap();
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(FakeTools),
+            "s",
+            "/workspace/project",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine
+            .set_system_instructions(Some("Built-in Agent Instructions".into()))
+            .await;
+        let mut messages = vec![json!({
+            "role": "system",
+            "content": [{"type": "text", "text": "stale system context"}]
+        })];
+        messages.extend(
+            (0..10).map(|index| json!({"role":"user","content":format!("message-{index}")})),
+        );
+        let compacted = engine.compact_context(messages).await.unwrap();
+        let systems = compacted
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+            .collect::<Vec<_>>();
+        assert_eq!(systems.len(), 1);
+        assert_eq!(
+            compacted[0].get("role").and_then(Value::as_str),
+            Some("system")
+        );
+        let text = systems[0]
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(text.starts_with("Persisted execution plan ("));
+        assert!(text.contains("Runtime context:"));
+        assert!(text.contains("Workspace: /workspace/project"));
+        assert!(text.contains("Built-in Agent Instructions"));
+        assert!(!text.contains("stale system context"));
+    }
+
+    #[tokio::test]
     async fn compaction_persists_state_and_keeps_complete_tool_pairs() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let engine = TurnEngine::new(
@@ -3323,15 +3524,30 @@ mod tests {
         );
         let compacted = engine.compact_context(messages).await.unwrap();
         assert_eq!(
+            compacted
+                .iter()
+                .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+                .count(),
+            1
+        );
+        assert_eq!(
             compacted[0]
                 .pointer("/content/0/text")
                 .and_then(Value::as_str),
-            Some("Always preserve workspace constraints.")
+            Some(
+                "Runtime context:\n- Workspace: /workspace\n- Permission mode: Auto\n\nAlways preserve workspace constraints."
+            )
         );
         assert_eq!(
             compacted[1].get("role").and_then(Value::as_str),
             Some("user")
         );
+        assert!(compacted.iter().any(|message| {
+            message
+                .pointer("/content/0/text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("Goal: inspect the repository."))
+        }));
     }
 
     #[tokio::test]

@@ -107,6 +107,34 @@ pub struct McpCatalogEntry {
 
 const MCP_CATALOG_JSON: &str = include_str!("../data/mcp_catalog.json");
 
+pub const BUILTIN_AGENT_INSTRUCTIONS: &str = r#"You are an autonomous software and business agent working in the assigned workspace and host.
+
+For complex tasks, first use propose_plan, then maintain the approved plan with plan_update. The persisted plan is authoritative; do not announce plan status in prose.
+
+After making changes, execute the relevant verification commands and record their evidence with local_gate_record. Do not claim completion without evidence. Read tool errors and repair the cause; never pretend a failed operation succeeded.
+
+Choose tools deliberately: use repo_index_* and lsp_* for repository navigation and symbols; use background_job_* for long-running work; use edit_file for precise edits instead of rewriting whole files; use action_ledger_* for idempotent external side effects.
+
+Use ask_user only for a genuine blocker such as missing credentials or a required human decision. Do not stop merely because work is lengthy or repetitive.
+
+Never print or commit secrets. Use the existing secret-reference mechanisms and keep credentials out of files, logs, transcripts, and tool results.
+
+Before editing a file, understand its surrounding code, imports, conventions, and existing abstractions. Match the local style, reuse established libraries and helpers, and follow nearby patterns. Before adding a component, inspect comparable components and their framework, naming, and type conventions.
+
+Never assume a library is available. Confirm it is already used in the repository or declared in Cargo.toml, package.json, or the relevant dependency manifest before relying on it.
+
+Do not add comments that merely restate code; prefer clear names and existing conventions. Add a comment only when the logic genuinely needs explanation or the user requests one.
+
+Do not change tests merely to make them pass unless the task explicitly requires a test change. When a test fails, first investigate the implementation and the test's assumptions.
+
+Before delivery, run the repository's established formatting, lint, type, build, and test gates, then record their evidence with local_gate_record. Environment, dependency, or credential problems should be reported honestly while you continue through safe workarounds; do not make broad environment changes to hide them.
+
+When blocked, gather relevant code, tool output, and reproduction details before deciding on a root cause. Make git and GitHub decisions deliberately: verify the base and target branch, update an existing pull request when appropriate, never force-push, never alter git configuration, and stage only intended files. Use git_* and github_* tools for repository operations when available.
+
+Pause for a self-review before changing implementation after exploration, before making a consequential git or pull request decision, and before reporting completion. Confirm that all references and behavior are covered, the requested scope is complete, and the reported evidence matches reality. Prefer parallel execution for independent investigations and verification steps.
+
+Completion requires verifiable deliverables such as a branch, commit, pull request, or test output. A self-reported success is not evidence."#;
+
 pub fn builtin_mcp_catalog() -> Result<Vec<McpCatalogEntry>, AssetError> {
     let entries: Vec<McpCatalogEntry> = serde_json::from_str(MCP_CATALOG_JSON)
         .map_err(|error| AssetError::Invalid(format!("MCP catalog: {error}")))?;
@@ -225,7 +253,9 @@ pub fn redact_secret(value: &mut serde_json::Value, secret: &str) {
 
 impl AssetBundle {
     pub fn system_instructions(&self) -> String {
-        let mut sections = Vec::new();
+        let mut sections = vec![format!(
+            "[Built-in Agent Instructions]\n{BUILTIN_AGENT_INSTRUCTIONS}"
+        )];
         if let Some(instructions) = &self.instructions {
             sections.push(format!("[Global Instructions]\n{}", instructions.content));
         }
@@ -561,6 +591,33 @@ mod tests {
         assert!(rendered.find("agents").unwrap() < rendered.find("knowledge").unwrap());
         assert!(rendered.find("knowledge").unwrap() < rendered.find("playbook").unwrap());
         assert!(rendered.find("playbook").unwrap() < rendered.find("skill").unwrap());
+    }
+
+    #[test]
+    fn system_instructions_always_include_builtin_agent_instructions() {
+        let rendered = AssetBundle::default().system_instructions();
+        assert!(!rendered.is_empty());
+        assert!(rendered.contains(BUILTIN_AGENT_INSTRUCTIONS));
+        assert!(rendered.contains("Do not change tests merely to make them pass"));
+        assert!(rendered.contains("Never assume a library is available"));
+        assert!(rendered.contains("Pause for a self-review"));
+    }
+
+    #[test]
+    fn builtin_instructions_precede_user_assets() {
+        let bundle = AssetBundle {
+            instructions: Some(InstructionSource {
+                path: "global".into(),
+                content: "User-specific instructions".into(),
+            }),
+            ..AssetBundle::default()
+        };
+        let rendered = bundle.system_instructions();
+        assert!(rendered.starts_with("[Built-in Agent Instructions]"));
+        assert!(
+            rendered.find(BUILTIN_AGENT_INSTRUCTIONS).unwrap()
+                < rendered.find("User-specific instructions").unwrap()
+        );
     }
 
     #[test]
