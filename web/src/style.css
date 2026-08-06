@@ -1222,6 +1222,68 @@ h3 {
   flex: 1;
   overflow: auto;
 }
+.tasks-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 8px 16px;
+}
+.tasks-progress {
+  color: var(--color-muted);
+  font-size: 12px;
+  line-height: 16px;
+}
+.tasks-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.tasks-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  color: var(--color-muted);
+  font-size: 13px;
+  line-height: 18px;
+}
+.tasks-status {
+  flex: 0 0 14px;
+  margin-top: 2px;
+  color: var(--color-muted);
+  font-size: 14px;
+  line-height: 14px;
+  text-align: center;
+}
+.tasks-status.is-complete {
+  color: var(--color-accent);
+}
+.tasks-status.is-active {
+  color: var(--color-accent);
+}
+.tasks-empty {
+  padding: 8px;
+  color: var(--color-muted);
+  font-size: 13px;
+}
+.transcript-row-result {
+  color: var(--color-muted);
+  font-size: 12px;
+  line-height: 18px;
+}
+.transcript-sleep {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--color-muted);
+  font-size: 13px;
+  line-height: 18px;
+}
+.transcript-sleep-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--color-muted);
+}
 .standalone-pane {
   display: flex;
   width: 100vw;

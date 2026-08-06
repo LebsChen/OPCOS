@@ -91,6 +91,63 @@ function thoughtLabel(label?: string): string {
   return label?.startsWith("Thought for ") ? label : "Thought details";
 }
 
+function QuestionCard({
+  text,
+  options,
+  onAnswer,
+}: {
+  text: string;
+  options?: string[];
+  onAnswer?: (answer: string) => void;
+}) {
+  const [answer, setAnswer] = useState("");
+  return (
+    <div className="approval transcript-question-card">
+      <strong>Question</strong>
+      <div className="approval-with">{text}</div>
+      {options && options.length > 0 && (
+        <div className="approval-btns flex-wrap">
+          {options.map((option) => (
+            <button
+              className="btn"
+              key={option}
+              type="button"
+              onClick={() => onAnswer?.(option)}
+            >
+              {option}
+            </button>
+          ))}
+        </div>
+      )}
+      <div className="approval-btns">
+        <input
+          className="input"
+          value={answer}
+          placeholder="Type an answer"
+          onChange={(event) => setAnswer(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && answer.trim()) {
+              onAnswer?.(answer.trim());
+              setAnswer("");
+            }
+          }}
+        />
+        <button
+          className="btn approval-primary"
+          type="button"
+          disabled={!answer.trim()}
+          onClick={() => {
+            onAnswer?.(answer.trim());
+            setAnswer("");
+          }}
+        >
+          Send
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function UserBubbleContent({
   attachments,
   text,
@@ -379,6 +436,7 @@ export function Transcript({
   running,
   onApprove,
   onRetry,
+  onQuestionAnswer,
 }: {
   events: TimelineEvent[];
   sessionId: string;
@@ -389,6 +447,7 @@ export function Transcript({
     decision: ApprovalDecision,
   ) => void;
   onRetry?: () => void;
+  onQuestionAnswer?: (callId: string, answer: string) => void;
 }) {
   const nodes = buildTimeline(events);
   const worklogOverrides = useRef(new Set<number>());
@@ -455,7 +514,17 @@ export function Transcript({
           );
         if (node.kind === "question")
           return (
-            <div className="notice" key={index}>
+            <QuestionCard
+              key={index}
+              text={node.text}
+              options={node.options}
+              onAnswer={(answer) => onQuestionAnswer?.(node.callId, answer)}
+            />
+          );
+        if (node.kind === "sleep")
+          return (
+            <div className="transcript-sleep" key={index}>
+              <span className="transcript-sleep-dot" />
               {node.text}
             </div>
           );
@@ -503,6 +572,11 @@ export function Transcript({
               {row.durationMs !== undefined && (
                 <span className="transcript-row-duration">
                   {formatDuration(row.durationMs)}
+                </span>
+              )}
+              {row.resultSummary && (
+                <span className="transcript-row-result">
+                  {row.resultSummary}
                 </span>
               )}
               {row.detail && !row.thoughtForCallId && (

@@ -8,6 +8,7 @@ import toolCallOnlyIteration from "../../fixtures/timeline/tool-call-only-iterat
 import persisted from "../../fixtures/timeline/persisted-events.json";
 import {
   buildTimeline,
+  latestPlan,
   mergeEvents,
   TRANSIENT_TIMELINE_EVENT_TYPES,
   type TimelineEvent,
@@ -18,6 +19,92 @@ const saved = persisted as TimelineEvent[];
 const opcos = opcosEvents as TimelineEvent[];
 
 describe("single event-log timeline", () => {
+  it("renders sleep state and resolves generic tool results in place", () => {
+    const nodes = buildTimeline([
+      {
+        type: "browser_started",
+        event_id: "generic-start",
+        created_at_ms: 100,
+        working_event: {
+          event_type: "browser_started",
+          payload: { call_id: "browser-call", tool: "browser" },
+        },
+      },
+      {
+        type: "tool_result",
+        event_id: "generic-result",
+        created_at_ms: 250,
+        working_event: {
+          event_type: "tool_result",
+          payload: { tool_use_id: "browser-call", result: "Page loaded" },
+        },
+      },
+      {
+        type: "status_update",
+        event_id: "sleep",
+        created_at_ms: 300,
+        working_event: {
+          event_type: "status_update",
+          payload: { status: "sleeping" },
+        },
+      },
+    ] as TimelineEvent[]);
+    expect(nodes).toContainEqual({
+      kind: "sleep",
+      text: "Devin went to sleep",
+    });
+    expect(nodes).toContainEqual(
+      expect.objectContaining({
+        kind: "work",
+        rows: [
+          expect.objectContaining({
+            callId: "browser-call",
+            resultSummary: "Page loaded",
+            durationMs: 150,
+          }),
+        ],
+      }),
+    );
+  });
+
+  it("derives the current task state from the timeline plan", () => {
+    const events = [
+      {
+        type: "todo_update",
+        event_id: "plan-start",
+        created_at_ms: 1,
+        working_event: {
+          event_type: "todo_update",
+          payload: {
+            plan_id: "plan",
+            steps: [
+              { step_id: "one", content: "Inspect", status: "not_started" },
+              { step_id: "two", content: "Fix", status: "not_started" },
+            ],
+          },
+        },
+      },
+      {
+        type: "todo_update",
+        event_id: "plan-progress",
+        created_at_ms: 2,
+        working_event: {
+          event_type: "todo_update",
+          payload: {
+            plan_id: "plan",
+            steps: [
+              { step_id: "one", content: "Inspect", status: "completed" },
+              { step_id: "two", content: "Fix", status: "in_progress" },
+            ],
+          },
+        },
+      },
+    ] as TimelineEvent[];
+    expect(latestPlan(events)).toEqual([
+      { content: "Inspect", status: "completed" },
+      { content: "Fix", status: "in_progress" },
+    ]);
+  });
   it("renders the terminal replay fixture under one shell row", () => {
     const rows = buildTimeline(terminalReplay as TimelineEvent[])
       .filter((node) => node.kind === "work")

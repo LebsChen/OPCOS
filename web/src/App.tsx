@@ -36,7 +36,12 @@ import {
   updateSessionRunState,
 } from "./gui";
 import { isErrorNotice, providerErrorPresentation } from "./transcript";
-import { buildTimeline, mergeEvents, type TimelineEvent } from "./timeline";
+import {
+  buildTimeline,
+  latestPlan,
+  mergeEvents,
+  type TimelineEvent,
+} from "./timeline";
 import { summarizeIterationStats } from "./iterationStats";
 import { Sidebar } from "./components/Sidebar";
 import { sessionStatusLabel } from "./sessionStatus";
@@ -617,6 +622,7 @@ type RailIconName =
   | "shell"
   | "changes"
   | "progress"
+  | "tasks"
   | "agents"
   | "monitor"
   | "code"
@@ -8514,6 +8520,7 @@ type PanelTab =
   | "shell"
   | "changes"
   | "progress"
+  | "tasks"
   | "agents"
   | "desktop"
   | "ide"
@@ -8537,6 +8544,7 @@ function paneRoute(): PaneRoute | null {
     "shell",
     "changes",
     "progress",
+    "tasks",
     "agents",
     "desktop",
     "ide",
@@ -9145,6 +9153,47 @@ function PlannedPane({ title, children }: { title: string; children: string }) {
   );
 }
 
+function TasksPane({ events }: { events: TimelineEvent[] }) {
+  const steps = latestPlan(events);
+  if (!steps?.length) {
+    return (
+      <section className="tasks-pane">
+        <div className="tasks-empty">No tasks yet.</div>
+      </section>
+    );
+  }
+  const completed = steps.filter((step) =>
+    ["done", "completed", "failed", "abandoned"].includes(String(step.status)),
+  ).length;
+  return (
+    <section className="tasks-pane">
+      <div className="tasks-progress">
+        {completed} / {steps.length} tasks completed
+      </div>
+      <div className="tasks-list">
+        {steps.map((step, index) => {
+          const status = String(step.status ?? "not_started");
+          const complete = ["done", "completed"].includes(status);
+          const active = status === "in_progress";
+          return (
+            <div className="tasks-row" key={`${step.content}-${index}`}>
+              <span
+                className={`tasks-status${complete ? " is-complete" : active ? " is-active" : ""}`}
+                aria-hidden="true"
+              >
+                {complete ? "✓" : active ? "◌" : "○"}
+              </span>
+              <span>
+                #{index + 1} {step.content}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 function SessionRightPanel({
   selected,
   onError,
@@ -9156,6 +9205,7 @@ function SessionRightPanel({
   width,
   onWidthChange,
   eventRefreshKey,
+  transcript,
 }: {
   selected: Session;
   onError: (error: unknown) => void;
@@ -9167,6 +9217,7 @@ function SessionRightPanel({
   width: number;
   onWidthChange: (width: number) => void;
   eventRefreshKey: string;
+  transcript: TimelineEvent[];
 }) {
   const [panelTab, setPanelTab] = useState<PanelTab>("info");
   const [opened, setOpened] = useState<PanelTab[]>(["info"]);
@@ -9198,6 +9249,7 @@ function SessionRightPanel({
     { id: "shell", label: "Shell", icon: "terminal" },
     { id: "changes", label: "Changes", icon: "diff" },
     { id: "progress", label: "Progress", icon: "list" },
+    { id: "tasks", label: "Tasks", icon: "list" },
     { id: "agents", label: "Agents", icon: "list" },
     { id: "artifacts", label: "Artifacts", icon: "file" },
     { id: "pr", label: "PR", icon: "branch" },
@@ -9408,6 +9460,11 @@ function SessionRightPanel({
                 <ProgressPane selected={selected} />
               </div>
             )}
+            {opened.includes("tasks") && panelTab === "tasks" && (
+              <div className="session-pane">
+                <TasksPane events={transcript} />
+              </div>
+            )}
             {opened.includes("agents") && panelTab === "agents" && (
               <div className="session-pane">
                 <PlannedPane title="Agents">
@@ -9440,6 +9497,7 @@ function SessionRightPanel({
                   item.id !== "shell" &&
                   item.id !== "changes" &&
                   item.id !== "progress" &&
+                  item.id !== "tasks" &&
                   item.id !== "agents" &&
                   item.id !== "desktop" &&
                   item.id !== "ide" &&
@@ -10696,6 +10754,13 @@ function AppContent() {
                             request: { session_id: selected.id, text: "" },
                           }).catch(onError);
                         }}
+                        onQuestionAnswer={(callId, answer) => {
+                          void command("resolve_inbox", {
+                            sessionId: selected.id,
+                            callId,
+                            resolution: answer,
+                          }).catch(onError);
+                        }}
                       />
                     </div>
                   </div>
@@ -11146,6 +11211,7 @@ function AppContent() {
       {surface === "session" && selected && (
         <SessionRightPanel
           selected={selected}
+          transcript={transcript}
           running={effectiveRunning}
           eventRefreshKey={`${transcript.length}:${transcript.at(-1)?.event_id ?? ""}`}
           collapsed={drawerCollapsed}

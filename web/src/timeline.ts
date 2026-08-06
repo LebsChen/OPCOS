@@ -29,6 +29,7 @@ export type TimelineNode =
       resolved?: "allow" | "deny";
     }
   | { kind: "question"; callId: string; text: string; options?: string[] }
+  | { kind: "sleep"; text: string }
   | {
       kind: "notice";
       text: string;
@@ -51,6 +52,9 @@ export type TimelineNode =
         processId?: string;
         exitCode?: number;
         durationMs?: number;
+        startedAt?: number;
+        resultSummary?: string;
+        resultError?: boolean;
         denied?: boolean;
         isMajorAction?: boolean;
         artifactId?: string;
@@ -127,6 +131,10 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
     | undefined;
   const planSteps = new Map<string, Array<Record<string, unknown>>>();
   const latestPlans = new Map<string, Array<Record<string, unknown>>>();
+  const planRows = new Map<
+    string,
+    Extract<TimelineNode, { kind: "work" }>["rows"][number]
+  >();
   const approvalNodes = new Map<
     string,
     Extract<TimelineNode, { kind: "approval" }>
@@ -152,6 +160,10 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
       isMajorAction?: boolean;
       startedAt?: number;
     }
+  >();
+  const genericRows = new Map<
+    string,
+    Extract<TimelineNode, { kind: "work" }>["rows"][number]
   >();
   const pendingShellCompletions = new Map<
     string,
@@ -289,6 +301,14 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
           isMajorAction: true,
         });
       }
+    } else if (type === "status_update") {
+      const state = String(
+        data.status ?? data.state ?? data.mode ?? "",
+      ).toLowerCase();
+      if (["sleep", "sleeping", "idle"].includes(state)) {
+        flush(event.created_at_ms);
+        nodes.push({ kind: "sleep", text: "Devin went to sleep" });
+      }
     } else if (
       [
         "error",
@@ -329,14 +349,33 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
         "is_typing",
         "session_snapshot",
         "iteration_checkpoint",
-        "status_update",
         "turn",
-        "tool_result",
         ...TRANSIENT_TIMELINE_EVENT_TYPES,
         "stream_reset",
       ].includes(type)
     ) {
       continue;
+    } else if (type === "tool_result") {
+      const callId = String(
+        data.call_id ?? data.tool_use_id ?? data.tool_call_id ?? "",
+      );
+      const row = callId ? genericRows.get(callId) : undefined;
+      if (row) {
+        const raw = data.result ?? data.output ?? data.content ?? data.message;
+        const summary =
+          typeof raw === "string"
+            ? raw
+            : raw === undefined
+              ? ""
+              : JSON.stringify(raw);
+        row.resultSummary = summary ? summary.slice(0, 240) : "Completed";
+        row.durationMs =
+          typeof data.duration_ms === "number"
+            ? data.duration_ms
+            : row.startedAt === undefined
+              ? undefined
+              : Math.max(0, event.created_at_ms - row.startedAt);
+      }
     } else {
       const activeWork = ensureWork(event.created_at_ms);
       if (type === "devin_thoughts") {
@@ -521,20 +560,30 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
               })),
             },
           });
-        } else if (previousTodos) {
-          todos.forEach((item, index) => {
-            const previous = previousTodos[index];
-            if (
-              previous &&
-              previous.step_id === item.step_id &&
-              previous.status === item.status &&
-              previous.description === item.description
-            )
-              return;
-            activeWork.rows.push({
-              label: `${completed}/${todos.length} #${index + 1} ${String(item.content ?? item.title ?? "")}`,
+          planRows.set(planId, activeWork.rows.at(-1)!);
+        } else {
+          const planRow = planRows.get(planId);
+          if (planRow?.plan) {
+            planRow.plan.steps = todos.map((todo) => ({
+              content: String(todo.content ?? todo.title ?? ""),
+              status: String(todo.status ?? "not_started"),
+            }));
+          }
+          if (previousTodos) {
+            todos.forEach((item, index) => {
+              const previous = previousTodos[index];
+              if (
+                previous &&
+                previous.step_id === item.step_id &&
+                previous.status === item.status &&
+                previous.description === item.description
+              )
+                return;
+              activeWork.rows.push({
+                label: `${completed}/${todos.length} #${index + 1} ${String(item.content ?? item.title ?? "")}`,
+              });
             });
-          });
+          }
         }
         planSteps.set(planId, todos);
         latestPlans.set(planId, todos);
@@ -568,6 +617,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
           const row = {
             label: String(data.command ?? data.tool ?? type),
             callId: typeof data.call_id === "string" ? data.call_id : undefined,
+            startedAt: event.created_at_ms,
             isMajorAction:
               typeof data.is_major_action === "boolean"
                 ? data.is_major_action
@@ -580,10 +630,23 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
           }
           appendPlanProgress(activeWork);
           activeWork.rows.push(row);
+          if (row.callId) genericRows.set(row.callId, row);
         }
       }
     }
   }
   flush(workEnded || events.at(-1)?.created_at_ms || workStarted);
   return nodes;
+}
+
+export function latestPlan(
+  events: TimelineEvent[],
+): Array<{ content: string; status?: string }> | null {
+  const plans = buildTimeline(events)
+    .flatMap((node) => (node.kind === "work" ? node.rows : []))
+    .map((row) => row.plan?.steps)
+    .filter((steps): steps is Array<{ content: string; status?: string }> =>
+      Boolean(steps),
+    );
+  return plans.at(-1) ?? null;
 }
