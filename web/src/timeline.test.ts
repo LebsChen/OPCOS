@@ -26,6 +26,7 @@ describe("single event-log timeline", () => {
         label: "cargo test",
         terminalOutput: "first\nsecond\n",
         terminalTruncated: true,
+        terminalTotalBytes: 100,
       }),
     );
     expect(rows).toContainEqual({
@@ -33,6 +34,7 @@ describe("single event-log timeline", () => {
       callId: "call-terminal-empty",
       terminalOutput: undefined,
       terminalTruncated: undefined,
+      terminalTotalBytes: undefined,
     });
   });
 
@@ -162,6 +164,7 @@ describe("single event-log timeline", () => {
             call_id: "call-1",
             contents: "",
             truncated: true,
+            total_bytes: 100,
           },
         },
       },
@@ -175,6 +178,7 @@ describe("single event-log timeline", () => {
         callId: "call-1",
         terminalOutput: "first\nsecond\n",
         terminalTruncated: true,
+        terminalTotalBytes: 100,
       }),
     );
     expect(rows).toContainEqual({
@@ -182,6 +186,7 @@ describe("single event-log timeline", () => {
       callId: "call-empty",
       terminalOutput: undefined,
       terminalTruncated: undefined,
+      terminalTotalBytes: undefined,
     });
   });
   it("renders terminal chunks that arrive before a shell row without a sequence field", () => {

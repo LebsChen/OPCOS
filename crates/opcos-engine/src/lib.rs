@@ -2312,13 +2312,16 @@ where
     async fn execute_tool_streaming(&self, call: &ToolCall) -> Value {
         let emitted = Arc::new(AtomicUsize::new(0));
         let truncated = Arc::new(AtomicBool::new(false));
+        let total_bytes = Arc::new(AtomicU64::new(0));
         let call_id = call.id.clone();
         let on_output = {
             let emitted = emitted.clone();
             let truncated = truncated.clone();
+            let total_bytes = total_bytes.clone();
             let engine = self;
             let call_id = call_id.clone();
             move |chunk: &str| {
+                total_bytes.fetch_add(chunk.len() as u64, Ordering::Relaxed);
                 let mut remaining = chunk;
                 while !remaining.is_empty() {
                     if emitted.fetch_add(1, Ordering::Relaxed) >= 64 {
@@ -2348,7 +2351,12 @@ where
             let _ = self.record_working_event(
                 "terminal_update",
                 "shell",
-                json!({"call_id":call_id,"contents":"","truncated":true}),
+                json!({
+                    "call_id":call_id,
+                    "contents":"",
+                    "truncated":true,
+                    "total_bytes":total_bytes.load(Ordering::Relaxed),
+                }),
             );
         }
         result
@@ -5937,6 +5945,10 @@ mod tests {
             updates.last().unwrap().event["working_event"]["payload"]["truncated"]
                 .as_bool()
                 .unwrap()
+        );
+        assert_eq!(
+            updates.last().unwrap().event["working_event"]["payload"]["total_bytes"],
+            output.len()
         );
         assert_eq!(
             updates

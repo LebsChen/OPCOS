@@ -45,7 +45,7 @@ use opcos_engine::{
 use opcos_hosts::{
     BackgroundJobManager, BrowserController, BrowserRequest, ComputerUseAction,
     DEFAULT_EXEC_TIMEOUT_SECONDS, Host, LIFECYCLE_EXEC_TIMEOUT_SECONDS, LifecycleStage, LocalHost,
-    ProcessEvent, RvmHost, ScreenBounds, SecretValues, SpawnRequest, execute_lifecycle_stage,
+    RvmHost, ScreenBounds, SecretValues, SpawnRequest, execute_lifecycle_stage,
 };
 use opcos_lsp::LspClient;
 use opcos_mcp::{
@@ -2692,7 +2692,24 @@ fn bounded_output_text(value: &str) -> (String, Value) {
         start -= 1;
     }
     let end = lines.len();
-    let text = lines[start..end].join("\n");
+    let mut text = lines[start..end].join("\n");
+    let omitted_bytes = if start > 0 {
+        loop {
+            let omitted = total_bytes.saturating_sub(text.len() as u64);
+            let header = format!(
+                "[Output truncated: omitted {omitted} bytes; showing the last {} KiB]\n",
+                INLINE_SHELL_OUTPUT_LIMIT_BYTES / 1024
+            );
+            if header.len() + text.len() <= INLINE_SHELL_OUTPUT_LIMIT_BYTES || start + 1 >= end {
+                text = format!("{header}{text}");
+                break omitted;
+            }
+            start += 1;
+            text = lines[start..end].join("\n");
+        }
+    } else {
+        0
+    };
     (
         text,
         json!({
@@ -2702,6 +2719,7 @@ fn bounded_output_text(value: &str) -> (String, Value) {
             "end_line": end as u64,
             "omitted_before": start as u64,
             "omitted_after": 0,
+            "omitted_bytes": omitted_bytes,
             "truncated": start > 0,
         }),
     )
@@ -4333,45 +4351,23 @@ impl ToolExecutor for DesktopExecutor {
             env.insert(name.to_owned(), Value::String(value.clone()));
             values.push(value);
         }
-        let mut process = executor
+        let request = ExecRequest {
+            command: command.to_owned(),
+            cwd: arguments
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            timeout_seconds: DEFAULT_EXEC_TIMEOUT_SECONDS,
+            session: Some(format!("opcos-local-{}", executor.session_id)),
+            env: Some(Value::Object(env)),
+        };
+        let forward_output = |chunk: &str| on_output(chunk);
+        let result = executor
             .host
-            .spawn(SpawnRequest {
-                command: command.to_owned(),
-                cwd: arguments
-                    .get("cwd")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .or_else(|| Some(executor.workspace.clone())),
-                env: Some(Value::Object(env)),
-                cols: 120,
-                rows: 40,
-            })
+            .exec_persistent_streaming(request, &forward_output)
             .await
             .map_err(|error| error.to_string())?;
-        let mut output = String::new();
-        let mut exit_code = None;
-        while let Some(event) = process
-            .next_event()
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            match event {
-                ProcessEvent::Output(chunk) => {
-                    on_output(&chunk);
-                    output.push_str(&chunk);
-                }
-                ProcessEvent::Exited(code) => {
-                    exit_code = code;
-                    break;
-                }
-            }
-        }
-        let _ = process.shutdown().await;
-        let mut result = json!({
-            "stdout":output,
-            "stderr":"",
-            "exit_code":exit_code,
-        });
+        let mut result = serde_json::to_value(result).unwrap_or(Value::Null);
         bound_shell_output(&mut result);
         for value in values {
             redact_json_strings(&mut result, &value);
@@ -22760,6 +22756,9 @@ mod m7_tests {
         assert_eq!(metadata["total_lines"], 20_000);
         assert_eq!(metadata["omitted_before"], metadata["start_line"]);
         assert_eq!(metadata["omitted_after"], 0);
+        assert!(metadata["omitted_bytes"].as_u64().unwrap() > 0);
+        assert!(output.contains("Output truncated:"));
+        assert!(output.contains("showing the last 64 KiB"));
         assert!(output.len() <= INLINE_SHELL_OUTPUT_LIMIT_BYTES);
     }
 

@@ -44,6 +44,7 @@ export type TimelineNode =
         callId?: string;
         terminalOutput?: string;
         terminalTruncated?: boolean;
+        terminalTotalBytes?: number;
         artifactId?: string;
         artifactKind?: string;
         artifactMime?: string;
@@ -110,7 +111,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
   const planSteps = new Map<string, Array<Record<string, unknown>>>();
   const pendingTerminal = new Map<
     string,
-    { output: string; truncated: boolean }
+    { output: string; truncated: boolean; totalBytes?: number }
   >();
   const shellRows = new Map<
     string,
@@ -119,6 +120,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
       callId?: string;
       terminalOutput?: string;
       terminalTruncated?: boolean;
+      terminalTotalBytes?: number;
     }
   >();
   const flush = (endedAt = workEnded) => {
@@ -272,6 +274,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
           callId,
           terminalOutput: pending?.output || undefined,
           terminalTruncated: pending?.truncated || undefined,
+          terminalTotalBytes: pending?.totalBytes,
         };
         work.rows.push(row);
         if (callId) {
@@ -283,10 +286,13 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
         if (!callId) continue;
         const contents = String(data.contents ?? "");
         const truncated = data.truncated === true;
+        const totalBytes =
+          typeof data.total_bytes === "number" ? data.total_bytes : undefined;
         const row = shellRows.get(callId);
         if (row) {
           row.terminalOutput = `${row.terminalOutput ?? ""}${contents}`;
           if (truncated) row.terminalTruncated = true;
+          if (totalBytes !== undefined) row.terminalTotalBytes = totalBytes;
         } else {
           const pending = pendingTerminal.get(callId) ?? {
             output: "",
@@ -294,6 +300,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
           };
           pending.output += contents;
           pending.truncated ||= truncated;
+          if (totalBytes !== undefined) pending.totalBytes = totalBytes;
           pendingTerminal.set(callId, pending);
         }
       } else if (type === "multi_edit_result") {

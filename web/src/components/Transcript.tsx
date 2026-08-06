@@ -49,11 +49,17 @@ function Thought({ text }: { text: string }) {
 function TerminalOutput({
   output,
   truncated,
+  totalBytes,
 }: {
   output: string;
   truncated?: boolean;
+  totalBytes?: number;
 }) {
   const [open, setOpen] = useState(false);
+  const omittedBytes =
+    totalBytes === undefined
+      ? undefined
+      : Math.max(0, totalBytes - new TextEncoder().encode(output).length);
   return (
     <div className="mt-1">
       <button
@@ -65,7 +71,11 @@ function TerminalOutput({
       {open && (
         <pre className="artifact-code whitespace-pre-wrap">
           {output}
-          {truncated ? "\n[Output truncated]" : ""}
+          {truncated
+            ? `\n[Output truncated: ${
+                omittedBytes === undefined ? "some" : omittedBytes
+              } bytes omitted; the model saw the tail]`
+            : ""}
         </pre>
       )}
     </div>
@@ -286,6 +296,7 @@ export function Transcript({
                     <TerminalOutput
                       output={row.terminalOutput ?? ""}
                       truncated={row.terminalTruncated}
+                      totalBytes={row.terminalTotalBytes}
                     />
                   )}
                   {row.artifactId && (

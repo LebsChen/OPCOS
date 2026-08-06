@@ -48,7 +48,8 @@
       "payload": {
         "call_id": "call-terminal-replay",
         "contents": "",
-        "truncated": true
+        "truncated": true,
+        "total_bytes": 100
       }
     }
   },

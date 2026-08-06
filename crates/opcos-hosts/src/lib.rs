@@ -24,7 +24,7 @@ use std::{
 use thiserror::Error;
 use tokio::{
     fs,
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, SeekFrom},
     process::{Child, ChildStdin, ChildStdout, Command},
     sync::{Mutex, mpsc, oneshot},
     time,
@@ -2905,6 +2905,202 @@ impl Host for LocalHost {
 }
 
 impl LocalHost {
+    pub async fn exec_persistent_streaming(
+        &self,
+        request: ExecRequest,
+        on_output: &(dyn Fn(&str) + Send + Sync),
+    ) -> Result<ExecResult, HostError> {
+        let session = request.session.as_deref().ok_or_else(|| {
+            HostError::InvalidResponse("streaming persistent shell requires a session".into())
+        })?;
+        let cwd = request
+            .cwd
+            .as_deref()
+            .map(|path| self.secure_path(path))
+            .transpose()?
+            .unwrap_or_else(|| self.root.clone());
+        let change_cwd = request.cwd.is_some();
+        #[cfg(windows)]
+        {
+            let result = self
+                .exec_persistent(
+                    session,
+                    &request.command,
+                    &cwd,
+                    request.timeout_seconds,
+                    change_cwd,
+                    request.env.as_ref(),
+                )
+                .await?;
+            on_output(&result.result.stdout);
+            return Ok(result);
+        }
+        #[cfg(not(windows))]
+        {
+            let mut sessions = self.sessions.lock().await;
+            let marker = format!("{}-{}__", "OPCOS_LOCAL_COMMAND", Uuid::new_v4().simple());
+            let output_path = std::env::temp_dir()
+                .join(format!("opcos-shell-output-{}", Uuid::new_v4().simple()));
+            let staging_path = PathBuf::from(format!("{}.working", output_path.display()));
+            if !sessions.contains_key(session) {
+                let (child, stdin, stdout) =
+                    spawn_persistent_shell(&cwd, &self.secret_values).await?;
+                let mut shell = LocalShell {
+                    _child: child,
+                    stdin,
+                    stdout: BufReader::new(stdout),
+                };
+                let shell_command = persistent_streaming_command(
+                    &request.command,
+                    request.env.as_ref(),
+                    &marker,
+                    &output_path,
+                    &cwd,
+                    change_cwd,
+                )?;
+                let write_result = match shell
+                    .stdin
+                    .write_all(format!("{shell_command}\n").as_bytes())
+                    .await
+                {
+                    Ok(()) => shell.stdin.flush().await,
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = write_result {
+                    let _ = shell._child.kill().await;
+                    let _ = shell._child.wait().await;
+                    let _ = tokio::fs::remove_file(&output_path).await;
+                    let _ = tokio::fs::remove_file(&staging_path).await;
+                    return Err(HostError::Io(error));
+                }
+                sessions.insert(session.to_owned(), shell);
+            } else {
+                let write_result = {
+                    let shell = sessions.get_mut(session).expect("session exists");
+                    let shell_command = persistent_streaming_command(
+                        &request.command,
+                        request.env.as_ref(),
+                        &marker,
+                        &output_path,
+                        &cwd,
+                        change_cwd,
+                    )?;
+                    match shell
+                        .stdin
+                        .write_all(format!("{shell_command}\n").as_bytes())
+                        .await
+                    {
+                        Ok(()) => shell.stdin.flush().await,
+                        Err(error) => Err(error),
+                    }
+                };
+                if let Err(error) = write_result {
+                    if let Some(mut shell) = sessions.remove(session) {
+                        let _ = shell._child.kill().await;
+                        let _ = shell._child.wait().await;
+                    }
+                    let _ = tokio::fs::remove_file(&output_path).await;
+                    let _ = tokio::fs::remove_file(&staging_path).await;
+                    return Err(HostError::Io(error));
+                }
+            }
+            let command_result: Result<(String, i32, String), HostError> = async {
+                let shell = sessions.get_mut(session).expect("session exists");
+                let marker = format!("{}:", marker);
+                let mut output = Vec::new();
+                let mut file_offset = 0_u64;
+                let mut decoder = Utf8Decoder::default();
+                let mut marker_line = String::new();
+                let marker_result = time::timeout(
+                    Duration::from_secs(request.timeout_seconds.max(1)),
+                    async {
+                    loop {
+                        tokio::select! {
+                            read = shell.stdout.read_line(&mut marker_line) => {
+                                let read = read?;
+                                if read == 0 {
+                                    return Err(HostError::Io(std::io::Error::new(
+                                        std::io::ErrorKind::BrokenPipe,
+                                        "local shell exited",
+                                    )));
+                                }
+                                if let Some(marker_start) = marker_line.find(&marker) {
+                                    let marker_values =
+                                        marker_line[marker_start + marker.len()..].trim().splitn(2, ':');
+                                    let mut marker_values = marker_values;
+                                    let exit_code = marker_values
+                                        .next()
+                                        .unwrap_or_default()
+                                        .parse::<i32>()
+                                        .map_err(|_| HostError::InvalidResponse(
+                                            "local shell returned an invalid exit code".into(),
+                                        ))?;
+                                    let actual_cwd = marker_values.next().unwrap_or_default().to_owned();
+                                    break Ok((exit_code, actual_cwd));
+                                }
+                                marker_line.clear();
+                            }
+                            _ = time::sleep(Duration::from_millis(10)) => {
+                                tail_output_file(
+                                    &staging_path,
+                                    &mut file_offset,
+                                    &mut output,
+                                    &mut decoder,
+                                    on_output,
+                                ).await?;
+                            }
+                        }
+                        }
+                    },
+                )
+                .await
+                .map_err(|_| HostError::Timeout)??;
+                tail_output_file(
+                    &output_path,
+                    &mut file_offset,
+                    &mut output,
+                    &mut decoder,
+                    on_output,
+                )
+                .await?;
+                if let Some(text) = decoder.finish() {
+                    on_output(&text);
+                }
+                Ok((
+                    String::from_utf8_lossy(&output).into_owned(),
+                    marker_result.0,
+                    marker_result.1,
+                ))
+            }
+            .await;
+            let (stdout, exit_code, actual_cwd) = match command_result {
+                Ok(result) => result,
+                Err(error) => {
+                    if let Some(mut shell) = sessions.remove(session) {
+                        let _ = shell._child.kill().await;
+                        let _ = shell._child.wait().await;
+                    }
+                    let _ = tokio::fs::remove_file(&output_path).await;
+                    let _ = tokio::fs::remove_file(&staging_path).await;
+                    return Err(error);
+                }
+            };
+            let _ = tokio::fs::remove_file(&output_path).await;
+            let _ = tokio::fs::remove_file(&staging_path).await;
+            Ok(ExecResult {
+                status: "completed_stderr_merged".into(),
+                result: CommandResult {
+                    stdout,
+                    stderr: String::new(),
+                    exit_code,
+                    timed_out: false,
+                    session: Some(session.to_owned()),
+                    cwd: Some(actual_cwd),
+                },
+            })
+        }
+    }
+
     async fn exec_persistent(
         &self,
         session: &str,
@@ -3060,6 +3256,32 @@ impl LocalHost {
     }
 }
 
+async fn tail_output_file(
+    path: &Path,
+    offset: &mut u64,
+    output: &mut Vec<u8>,
+    decoder: &mut Utf8Decoder,
+    on_output: &(dyn Fn(&str) + Send + Sync),
+) -> Result<(), HostError> {
+    let Ok(mut file) = fs::File::open(path).await else {
+        return Ok(());
+    };
+    file.seek(SeekFrom::Start(*offset)).await?;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let size = file.read(&mut buffer).await?;
+        if size == 0 {
+            break;
+        }
+        output.extend_from_slice(&buffer[..size]);
+        *offset += size as u64;
+        if let Some(text) = decoder.push(&buffer[..size]) {
+            on_output(&text);
+        }
+    }
+    Ok(())
+}
+
 fn shell_command(command: &str, cwd: &Path) -> Command {
     #[cfg(windows)]
     {
@@ -3170,6 +3392,42 @@ fn remote_env_file(env: Option<&Value>) -> Result<String, HostError> {
             ))
         })
         .collect()
+}
+
+#[cfg(not(windows))]
+fn persistent_streaming_command(
+    command: &str,
+    env: Option<&Value>,
+    marker: &str,
+    output_path: &Path,
+    cwd: &Path,
+    change_cwd: bool,
+) -> Result<String, HostError> {
+    let directory = if change_cwd {
+        format!(
+            "cd -- '{}' && ",
+            cwd.display().to_string().replace('\'', "'\\''")
+        )
+    } else {
+        String::new()
+    };
+    let command = if let Some(prefix) = persistent_env_prefix(env)? {
+        format!(
+            "{directory}({prefix}eval '{}')",
+            shell_single_quote(command)
+        )
+    } else {
+        format!("{directory}eval '{}'", shell_single_quote(command))
+    };
+    let output_path = shell_single_quote(&output_path.display().to_string());
+    let staging_path = shell_single_quote(&format!("{output_path}.working"));
+    Ok(format!(
+        "rm -f '{output_path}' '{staging_path}'; \
+         {command} > '{staging_path}' 2>&1 < /dev/null; \
+         __opcos_exit=$?; cp '{staging_path}' '{output_path}'; \
+         rm -f '{staging_path}'; \
+         printf '{marker}:%s:%s\\n' \"$__opcos_exit\" \"$PWD\""
+    ))
 }
 
 fn is_shell_identifier(value: &str) -> bool {
@@ -4103,6 +4361,181 @@ mod tests {
 
     #[cfg(not(windows))]
     #[tokio::test]
+    async fn local_host_persistent_streaming_preserves_state_and_output() {
+        let root = tempfile_dir();
+        let subdir = root.join("subdir");
+        fs::create_dir_all(&subdir).unwrap();
+        let host = LocalHost::new(&root).unwrap();
+        let chunks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let on_output = {
+            let chunks = chunks.clone();
+            move |chunk: &str| chunks.lock().unwrap().push(chunk.to_owned())
+        };
+        let request = |command: &str, cwd: Option<String>, env: Option<Value>| ExecRequest {
+            command: command.into(),
+            cwd,
+            timeout_seconds: 10,
+            session: Some("streaming-session".into()),
+            env,
+        };
+
+        let first = host
+            .exec_persistent_streaming(
+                request(
+                    "printf '中文 ünïcødé ✅\\n'; cd subdir; export STREAM_VALUE=set",
+                    None,
+                    None,
+                ),
+                &on_output,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.result.exit_code, 0);
+        assert_eq!(first.result.stdout, "中文 ünïcødé ✅\n");
+
+        let second = host
+            .exec_persistent_streaming(
+                request(
+                    "printf 'cwd=%s env=%s\\n' \"$PWD\" \"$STREAM_VALUE\"",
+                    None,
+                    None,
+                ),
+                &on_output,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second.result.stdout,
+            format!("cwd={} env=set\n", subdir.display())
+        );
+
+        let listing = host
+            .exec_persistent_streaming(
+                request("ls", Some(root.display().to_string()), None),
+                &on_output,
+            )
+            .await
+            .unwrap();
+        assert!(listing.result.stdout.contains("subdir"));
+
+        let line_count = host
+            .exec_persistent_streaming(
+                request("printf 'one\\ntwo\\n' | wc -l", None, None),
+                &on_output,
+            )
+            .await
+            .unwrap();
+        assert_eq!(line_count.result.stdout.trim(), "2");
+
+        let git_status = host
+            .exec_persistent_streaming(
+                request("git init -q; git status --short", None, None),
+                &on_output,
+            )
+            .await
+            .unwrap();
+        assert_eq!(git_status.result.exit_code, 0);
+        assert!(git_status.result.stdout.is_empty());
+
+        let background_start = chunks.lock().unwrap().len();
+        let background = host
+            .exec_persistent_streaming(
+                request("(sleep 0.05; printf late) & true", None, None),
+                &on_output,
+            )
+            .await
+            .unwrap();
+        assert_eq!(background.result.stdout, "");
+        assert_eq!(
+            chunks
+                .lock()
+                .unwrap()
+                .iter()
+                .skip(background_start)
+                .cloned()
+                .collect::<String>(),
+            background.result.stdout
+        );
+        let background_next_start = chunks.lock().unwrap().len();
+        let background_next = host
+            .exec_persistent_streaming(request("printf next", None, None), &on_output)
+            .await
+            .unwrap();
+        assert_eq!(background_next.result.stdout, "next");
+        assert_eq!(
+            chunks
+                .lock()
+                .unwrap()
+                .iter()
+                .skip(background_next_start)
+                .cloned()
+                .collect::<String>(),
+            background_next.result.stdout
+        );
+
+        let scoped = host
+            .exec_persistent_streaming(
+                request(
+                    "printf '%s\\n' \"$STREAM_SCOPED\"",
+                    None,
+                    Some(serde_json::json!({"STREAM_SCOPED": "only-here"})),
+                ),
+                &on_output,
+            )
+            .await
+            .unwrap();
+        assert_eq!(scoped.result.stdout, "only-here\n");
+
+        let next = host
+            .exec_persistent_streaming(
+                request(
+                    "printf 'scoped=%s\\n' \"${STREAM_SCOPED:-missing}\"",
+                    None,
+                    None,
+                ),
+                &on_output,
+            )
+            .await
+            .unwrap();
+        assert_eq!(next.result.stdout, "scoped=missing\n");
+
+        let large = "x".repeat(3 * 1024 * 1024);
+        let large_start = chunks.lock().unwrap().len();
+        let large_result = host
+            .exec_persistent_streaming(
+                request("head -c 3145728 /dev/zero | tr '\\0' x", None, None),
+                &on_output,
+            )
+            .await
+            .unwrap();
+        assert_eq!(large_result.result.stdout, large);
+        assert_eq!(
+            chunks
+                .lock()
+                .unwrap()
+                .iter()
+                .skip(large_start)
+                .cloned()
+                .collect::<String>(),
+            large_result.result.stdout
+        );
+
+        let failure = host
+            .exec_persistent_streaming(
+                request("sh -c 'printf failure >&2; exit 7'", None, None),
+                &on_output,
+            )
+            .await
+            .unwrap();
+        assert_eq!(failure.result.exit_code, 7);
+        assert_eq!(failure.result.stdout, "failure");
+
+        host.close_session("streaming-session").await.unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
     async fn local_host_persistent_shell_discards_late_background_output() {
         let root = tempfile_dir();
         let host = LocalHost::new(&root).unwrap();
@@ -4453,6 +4886,30 @@ mod tests {
         );
         assert!(!marker.contains("'$opcos_exit"));
         assert!(!marker.contains("'$((Get-Location).Path)'"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn persistent_streaming_command_snapshots_output_before_marker() {
+        let command = persistent_streaming_command(
+            "printf output",
+            None,
+            "__marker__",
+            Path::new("/tmp/opcos-shell-output-test"),
+            Path::new("/workspace"),
+            true,
+        )
+        .unwrap();
+        assert!(command.contains("> '/tmp/opcos-shell-output-test.working'"));
+        assert!(command.contains("< /dev/null"));
+        assert!(command.contains("cp '/tmp/opcos-shell-output-test.working'"));
+        assert!(command.contains("rm -f '/tmp/opcos-shell-output-test.working'"));
+        assert!(!command.contains(" cat "));
+        let marker = command
+            .find("printf '__marker__:%s:%s")
+            .expect("marker is emitted");
+        assert_eq!(command[marker..].matches("printf").count(), 1);
+        assert!(command.ends_with("\"$PWD\""));
     }
 
     #[test]
