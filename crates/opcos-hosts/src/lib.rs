@@ -3188,24 +3188,7 @@ fn persistent_command(
 ) -> Result<String, HostError> {
     #[cfg(windows)]
     {
-        let _ = output_path;
-        let prefix = persistent_env_prefix(env)?.unwrap_or_default();
-        let directory = if change_cwd {
-            format!(
-                "Set-Location -LiteralPath '{}'; ",
-                powershell_single_quote(&cwd.display().to_string())
-            )
-        } else {
-            String::new()
-        };
-        Ok(format!(
-            "$OutputEncoding=[Text.Encoding]::UTF8; \
-             [Console]::OutputEncoding=[Text.Encoding]::UTF8; \
-             {prefix}{directory}{command} 2>&1; \
-             $opcos_exit=if ($?) {{ if ($null -eq $LASTEXITCODE) {{ 0 }} else {{ $LASTEXITCODE }} }} else {{ 1 }}; \
-             {}",
-            powershell_marker_line(marker)
-        ))
+        return windows_persistent_command(command, env, marker, output_path, cwd, change_cwd);
     }
     #[cfg(not(windows))]
     {
@@ -3234,6 +3217,37 @@ fn persistent_command(
             shell_single_quote(&output_path.display().to_string()),
         ))
     }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_persistent_command(
+    command: &str,
+    env: Option<&Value>,
+    marker: &str,
+    output_path: &Path,
+    cwd: &Path,
+    change_cwd: bool,
+) -> Result<String, HostError> {
+    let prefix = persistent_env_prefix(env)?.unwrap_or_default();
+    let directory = if change_cwd {
+        format!(
+            "Set-Location -LiteralPath '{}'; ",
+            powershell_single_quote(&cwd.display().to_string())
+        )
+    } else {
+        String::new()
+    };
+    let output_path = powershell_single_quote(&output_path.display().to_string());
+    Ok(format!(
+        "$OutputEncoding=[Text.Encoding]::UTF8; \
+         [Console]::OutputEncoding=[Text.Encoding]::UTF8; \
+         {directory}$null | & {{ {prefix}{command} }} > '{output_path}' 2>&1; \
+         $opcos_exit=if ($?) {{ if ($null -eq $LASTEXITCODE) {{ 0 }} else {{ $LASTEXITCODE }} }} else {{ 1 }}; \
+         Get-Content -Raw -LiteralPath '{output_path}'; \
+         Remove-Item -LiteralPath '{output_path}' -Force -ErrorAction SilentlyContinue; \
+         {}",
+        powershell_marker_line(marker)
+    ))
 }
 
 fn persistent_env_prefix(env: Option<&Value>) -> Result<Option<String>, HostError> {
@@ -4287,7 +4301,7 @@ mod tests {
         )
         .unwrap();
         #[cfg(not(windows))]
-        assert!(command.contains("OPCOS_SECRET='value'; export OPCOS_SECRET; eval"));
+        assert!(command.contains("(OPCOS_SECRET='value'; export OPCOS_SECRET; eval"));
         #[cfg(windows)]
         assert!(command.contains("setlocal") && command.contains("endlocal"));
     }
@@ -4434,19 +4448,27 @@ mod tests {
         assert!(!marker.contains("'$((Get-Location).Path)'"));
     }
 
-    #[cfg(windows)]
     #[test]
     fn windows_persistent_command_uses_powershell_utf8_and_literal_paths() {
-        let command = persistent_command(
+        let command = windows_persistent_command(
             "Write-Output '中文'",
             None,
             "__marker__",
-            Path::new("C:\\Temp\\opcos-shell-output-test"),
+            Path::new("C:\\Temp\\opcos-shell-output-'test"),
             Path::new("."),
             false,
         )
         .unwrap();
         assert!(command.contains("[Text.Encoding]::UTF8"));
+        assert!(command.contains("$null | & {"));
+        assert!(command.contains("> 'C:\\Temp\\opcos-shell-output-''test'"));
+        assert!(command.contains("Get-Content -Raw -LiteralPath"));
+        assert!(command.contains("Remove-Item -LiteralPath"));
+        assert!(command.contains("2>&1"));
+        let readback = command.find("Get-Content").unwrap();
+        let removal = command.find("Remove-Item").unwrap();
+        let marker = command.find("Write-Output (\"__marker__:").unwrap();
+        assert!(readback < removal && removal < marker);
         assert!(command.contains(
             "Write-Output (\"__marker__:\" + $opcos_exit + \":\" + (Get-Location).Path)"
         ));
