@@ -1,6 +1,7 @@
 import type { TimelineEvent } from "./timeline";
 
 export type IterationStat = {
+  detailIndex: number;
   iteration: number;
   toolCalls: number;
   durationMs: number | null;
@@ -60,9 +61,10 @@ export function summarizeIterationStats(
 ): IterationStatsSummary {
   const iterations = events
     .filter((event) => eventType(event) === "iteration_stats")
-    .map((event) => {
+    .map((event, index) => {
       const data = payload(event);
       return {
+        detailIndex: index + 1,
         iteration: numberOrNull(data.iteration) ?? 0,
         toolCalls: numberOrNull(data.num_tool_calls) ?? 0,
         durationMs: numberOrNull(data.duration_ms),

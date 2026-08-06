@@ -43,4 +43,22 @@ describe("iteration stats", () => {
       ),
     ).toBe(false);
   });
+
+  it("assigns stable unique detail indexes when iteration numbers repeat", () => {
+    const first = JSON.parse(JSON.stringify(fixture[1])) as TimelineEvent;
+    const second = JSON.parse(JSON.stringify(fixture[1])) as TimelineEvent;
+    (second.working_event as Record<string, unknown>).payload = {
+      ...((second.working_event as Record<string, unknown>).payload as Record<
+        string,
+        unknown
+      >),
+      iteration: 1,
+    };
+    const summary = summarizeIterationStats([first, second]);
+    expect(summary.iterations.map((item) => item.detailIndex)).toEqual([1, 2]);
+    expect(summary.iterations.map((item) => item.iteration)).toEqual([1, 1]);
+    expect(
+      summarizeIterationStats(JSON.parse(JSON.stringify([first, second]))),
+    ).toEqual(summary);
+  });
 });

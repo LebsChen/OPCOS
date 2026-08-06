@@ -8900,11 +8900,12 @@ function IterationStatsPane({ events }: { events: TimelineEvent[] }) {
         <div className="mt-3 flex flex-col gap-1">
           {summary.iterations.map((item) => (
             <details
-              key={item.iteration}
+              key={item.detailIndex}
               className="rounded border border-line"
             >
               <summary className="cursor-pointer px-2 py-1 text-xs text-muted">
-                Iteration {item.iteration} · {item.toolCalls} tool calls
+                Iteration {item.iteration} · #{item.detailIndex} ·{" "}
+                {item.toolCalls} tool calls
               </summary>
               <div className="grid grid-cols-2 gap-1 px-2 pb-2 text-xs">
                 <Field k="Duration" v={formatStat(item.durationMs, " ms")} />
@@ -9137,13 +9138,12 @@ function SessionRightPanel({
       .catch(onError);
   }, [selected.id]);
   useEffect(() => {
-    setIterationEvents([]);
     void command<TimelineEvent[]>("read_session_events", {
       sessionId: selected.id,
     })
       .then(setIterationEvents)
       .catch(onError);
-  }, [selected.id, onError]);
+  }, [selected.id]);
   const informationTabs: Array<{
     id: typeof panelTab;
     label: string;

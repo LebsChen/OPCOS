@@ -2679,7 +2679,7 @@ impl Host for LocalHost {
             .ok_or_else(|| HostError::InvalidResponse("local process stderr unavailable".into()))?;
         let (events, receiver) = mpsc::channel(64);
         let output = events.clone();
-        tokio::spawn(async move {
+        let stdout_task = tokio::spawn(async move {
             let mut decoder = Utf8Decoder::default();
             let mut buffer = [0_u8; 4096];
             loop {
@@ -2703,7 +2703,7 @@ impl Host for LocalHost {
             }
         });
         let output = events.clone();
-        tokio::spawn(async move {
+        let stderr_task = tokio::spawn(async move {
             let mut decoder = Utf8Decoder::default();
             let mut buffer = [0_u8; 4096];
             loop {
@@ -2736,6 +2736,8 @@ impl Host for LocalHost {
                     None
                 }
             };
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
             let _ = events.send(Ok(ProcessEvent::Exited(code))).await;
         });
         Ok(Box::new(LocalProcess {
@@ -3618,6 +3620,37 @@ mod tests {
         }
         assert!(output.contains("streamed"));
         assert!(exited);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_host_process_stream_drains_stdout_before_exit() {
+        let root = tempfile_dir();
+        let host = LocalHost::new(&root).unwrap();
+        let expected = "0123456789".repeat(20_000);
+        for _ in 0..10 {
+            let mut process = host
+                .spawn(SpawnRequest {
+                    command:
+                        "i=0; while [ \"$i\" -lt 20000 ]; do printf '0123456789'; i=$((i+1)); done"
+                            .into(),
+                    cwd: None,
+                    env: None,
+                    cols: 80,
+                    rows: 24,
+                })
+                .await
+                .unwrap();
+            let mut output = String::new();
+            while let Some(event) = process.next_event().await.unwrap() {
+                match event {
+                    ProcessEvent::Output(text) => output.push_str(&text),
+                    ProcessEvent::Exited(_) => break,
+                }
+            }
+            assert_eq!(output, expected);
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

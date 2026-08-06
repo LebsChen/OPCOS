@@ -2319,23 +2319,24 @@ where
             let engine = self;
             let call_id = call_id.clone();
             move |chunk: &str| {
-                if emitted.fetch_add(1, Ordering::Relaxed) >= 64 {
-                    truncated.store(true, Ordering::Relaxed);
-                    return;
+                let mut remaining = chunk;
+                while !remaining.is_empty() {
+                    if emitted.fetch_add(1, Ordering::Relaxed) >= 64 {
+                        truncated.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    let end = remaining
+                        .char_indices()
+                        .nth(2000)
+                        .map_or(remaining.len(), |(index, _)| index);
+                    let piece = &remaining[..end];
+                    let _ = engine.record_working_event(
+                        "terminal_update",
+                        "shell",
+                        json!({"call_id":call_id,"contents":piece}),
+                    );
+                    remaining = &remaining[end..];
                 }
-                let mut chars = chunk.chars();
-                let chunk = chars.by_ref().take(2000).collect::<String>();
-                if chars.next().is_some() {
-                    truncated.store(true, Ordering::Relaxed);
-                }
-                if chunk.is_empty() {
-                    return;
-                }
-                let _ = engine.record_working_event(
-                    "terminal_update",
-                    "shell",
-                    json!({"call_id":call_id,"contents":chunk}),
-                );
             }
         };
         let result = self
@@ -4372,6 +4373,27 @@ mod tests {
         }
     }
 
+    struct StreamingTools {
+        output: String,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for StreamingTools {
+        async fn execute(&self, _: &str, _: Value) -> Result<Value, String> {
+            Ok(json!("ok"))
+        }
+
+        async fn execute_streaming(
+            &self,
+            _: &str,
+            _: Value,
+            on_output: &(dyn for<'a> Fn(&'a str) + Send + Sync + '_),
+        ) -> Result<Value, String> {
+            on_output(&self.output);
+            Ok(json!({"stdout": self.output}))
+        }
+    }
+
     struct HookTools;
 
     #[async_trait]
@@ -5865,6 +5887,67 @@ mod tests {
         assert_eq!(
             checkpoint.event["working_event"]["payload"]["last_processed_incoming_event_id"],
             incoming_ids[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_updates_preserve_the_contiguous_output_prefix_before_truncating() {
+        let output = (0..150_000)
+            .map(|index| char::from(b'a' + (index % 26) as u8))
+            .collect::<String>();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(StreamingTools {
+                output: output.clone(),
+            }),
+            "terminal-continuity-session",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+
+        engine
+            .execute_tool_streaming(&ToolCall {
+                id: "terminal-call".into(),
+                name: "run_shell".into(),
+                arguments: json!({"command": "long-output"}),
+            })
+            .await;
+
+        let events = store
+            .load_session_events("terminal-continuity-session")
+            .unwrap();
+        let updates = events
+            .iter()
+            .filter(|record| record.event["type"] == "terminal_update")
+            .collect::<Vec<_>>();
+        let contents = updates
+            .iter()
+            .filter_map(|record| {
+                let payload = &record.event["working_event"]["payload"];
+                (!payload["truncated"].as_bool().unwrap_or(false))
+                    .then(|| payload["contents"].as_str().unwrap())
+            })
+            .collect::<String>();
+        let expected = output.chars().take(64 * 2000).collect::<String>();
+        assert_eq!(contents, expected);
+        assert!(
+            updates.last().unwrap().event["working_event"]["payload"]["truncated"]
+                .as_bool()
+                .unwrap()
+        );
+        assert_eq!(
+            updates
+                .iter()
+                .filter(|record| {
+                    !record.event["working_event"]["payload"]["truncated"]
+                        .as_bool()
+                        .unwrap_or(false)
+                })
+                .count(),
+            64
         );
     }
 
