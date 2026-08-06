@@ -3241,7 +3241,7 @@ fn windows_persistent_command(
     Ok(format!(
         "$OutputEncoding=[Text.Encoding]::UTF8; \
          [Console]::OutputEncoding=[Text.Encoding]::UTF8; \
-         $PSDefaultParameterValues['Out-File:Encoding']=[Text.UTF8Encoding]::new($false); \
+         $PSDefaultParameterValues['Out-File:Encoding']='utf8'; \
          $PSDefaultParameterValues['Out-File:Width']=2147483647; \
          {directory}$null | & {{ {prefix}{command} }} > '{output_path}' 2>&1; \
          $opcos_exit=if ($?) {{ if ($null -eq $LASTEXITCODE) {{ 0 }} else {{ $LASTEXITCODE }} }} else {{ 1 }}; \
@@ -4467,9 +4467,7 @@ mod tests {
         )
         .unwrap();
         assert!(command.contains("[Text.Encoding]::UTF8"));
-        assert!(command.contains(
-            "$PSDefaultParameterValues['Out-File:Encoding']=[Text.UTF8Encoding]::new($false)"
-        ));
+        assert!(command.contains("$PSDefaultParameterValues['Out-File:Encoding']='utf8'"));
         assert!(command.contains("$PSDefaultParameterValues['Out-File:Width']=2147483647"));
         assert!(command.contains("$null | & {"));
         assert!(command.contains("> 'C:\\Temp\\opcos-shell-output-''test'"));
