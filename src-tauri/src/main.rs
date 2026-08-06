@@ -7412,9 +7412,11 @@ fn project_root(project_id: &str) -> Result<String, String> {
         .ok_or_else(|| "project path is not valid UTF-8".to_owned())
 }
 
-fn worktree_branch(role: &str, sequence: u32) -> String {
+fn worktree_branch(role: &str, sequence: u32, project_id: &str) -> String {
     let role = role.trim().to_ascii_lowercase().replace(' ', "-");
-    format!("agent/{role}-{sequence}")
+    let tail = project_id.rsplit('-').next().unwrap_or(project_id);
+    let project_suffix = &tail[tail.len().saturating_sub(8)..];
+    format!("agent/{role}-{sequence}-{project_suffix}")
 }
 
 #[tauri::command]
@@ -7921,8 +7923,7 @@ async fn create_project_from_team_template(
     project_record.workflow_json =
         serde_json::to_string(&workflow).map_err(|error| error.to_string())?;
     if let Err(error) = state.store.save_project(&project_record) {
-        let _ = delete_project(state.clone(), project_id.clone(), Some(true)).await;
-        return Err(error.to_string());
+        return Err(rollback_project_creation(state.clone(), &project_id, error.to_string()).await);
     }
     let mut config_ids = team
         .get("config_template_ids")
@@ -7936,8 +7937,7 @@ async fn create_project_from_team_template(
     config_ids.sort();
     config_ids.dedup();
     if let Err(error) = copy_config_templates_to_project(&state, &project_id, &config_ids) {
-        let _ = delete_project(state.clone(), project_id.clone(), Some(true)).await;
-        return Err(error);
+        return Err(rollback_project_creation(state.clone(), &project_id, error).await);
     }
     for (sort_order, member) in members.into_iter().enumerate() {
         let mut values = member;
@@ -7946,13 +7946,18 @@ async fn create_project_from_team_template(
                 match load_template_content(&state, template_id) {
                     Ok(value) => value,
                     Err(error) => {
-                        let _ = delete_project(state.clone(), project_id.clone(), Some(true)).await;
-                        return Err(error);
+                        return Err(
+                            rollback_project_creation(state.clone(), &project_id, error).await
+                        );
                     }
                 };
             if agent_kind != "agent-template" {
-                let _ = delete_project(state.clone(), project_id.clone(), Some(true)).await;
-                return Err(format!("{template_id} is not an agent template"));
+                return Err(rollback_project_creation(
+                    state.clone(),
+                    &project_id,
+                    format!("{template_id} is not an agent template"),
+                )
+                .await);
             }
             let template: TeamTemplateAgent = serde_json::from_str(&agent_content)
                 .map_err(|error| format!("invalid agent template: {error}"))?;
@@ -7985,8 +7990,7 @@ async fn create_project_from_team_template(
         )
         .await
         {
-            let _ = delete_project(state.clone(), project_id.clone(), Some(true)).await;
-            return Err(error);
+            return Err(rollback_project_creation(state.clone(), &project_id, error).await);
         }
     }
     list_projects(state)
@@ -7994,6 +7998,19 @@ async fn create_project_from_team_template(
         .into_iter()
         .find(|item| item.project.id == project_id)
         .ok_or_else(|| "created project could not be reloaded".to_owned())
+}
+
+async fn rollback_project_creation(
+    state: State<'_, DesktopState>,
+    project_id: &str,
+    error: String,
+) -> String {
+    match delete_project(state, project_id.to_owned(), Some(true)).await {
+        Ok(_) => error,
+        Err(cleanup_error) => {
+            format!("{error}; project cleanup failed: {cleanup_error}")
+        }
+    }
 }
 
 #[tauri::command]
@@ -8183,6 +8200,7 @@ fn clear_project_configuration(state: &DesktopState, project_id: &str) -> Result
             [project_id],
         )
         .map_err(|error| error.to_string())?;
+    drop(connection);
     refresh_secret_values(state)?;
     Ok(())
 }
@@ -8334,7 +8352,7 @@ async fn create_project_agent(
     let branch = if sort_order == 0 {
         project.default_branch.clone()
     } else {
-        branch.unwrap_or_else(|| worktree_branch(&role, sort_order))
+        branch.unwrap_or_else(|| worktree_branch(&role, sort_order, &project.id))
     };
     let host = project_host(&state, &project).await?;
     if !project_host_contains(&host, &project.repo_root)
@@ -11045,7 +11063,6 @@ fn create_session(
         "session-{}",
         Utc::now().timestamp_nanos_opt().unwrap_or_default()
     );
-    let model = model.unwrap_or_else(|| "auto".into());
     let mode = mode.unwrap_or_else(|| "Auto".into());
     let mode = permission_mode_name(parse_permission_mode(&mode)?).to_owned();
     let harness = harness.unwrap_or_else(|| "builtin".into());
@@ -11072,6 +11089,30 @@ fn create_session(
         } else {
             (host_id.unwrap_or_default(), None)
         };
+    let provider = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        provider
+            .or_else(|| agent.as_ref().and_then(|item| item.provider.clone()))
+            .or_else(|| {
+                connection
+                    .query_row(
+                        "SELECT value FROM settings WHERE key='provider.id'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok()
+            })
+    };
+    let model = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        resolve_provider_model(&connection, provider.as_deref(), model)
+    };
     let settings = {
         let connection = state
             .database
@@ -17311,6 +17352,16 @@ async fn linear_create_session_from_issue(
     let host_name = host_name(&connection, &host_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "remote host not found; session was not created".to_owned())?;
+    let provider = provider.or_else(|| {
+        connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='provider.id'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+    });
+    let model = resolve_provider_model(&connection, provider.as_deref(), model);
     drop(connection);
     let mode = mode.unwrap_or_else(|| "Auto".into());
     let mode = permission_mode_name(parse_permission_mode(&mode)?).to_owned();
@@ -17320,7 +17371,7 @@ async fn linear_create_session_from_issue(
         SessionRecord {
             session_id: session_id.clone(),
             workspace,
-            model: model.unwrap_or_else(|| "auto".into()),
+            model,
             mode,
             harness: harness.unwrap_or_else(|| "builtin".into()),
             title: title.unwrap_or_else(|| {
@@ -21641,6 +21692,72 @@ fn save_agent_settings(
     Ok(settings)
 }
 
+fn provider_model_setting_exact(connection: &Connection, provider: &str) -> Option<String> {
+    let scoped_key = format!("provider.model.{provider}");
+    connection
+        .query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            [&scoped_key],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn provider_model_setting(connection: &Connection, provider: &str) -> Option<String> {
+    provider_model_setting_exact(connection, provider).or_else(|| {
+        connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='provider.model'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    })
+}
+
+fn save_provider_model_settings(
+    connection: &Connection,
+    provider: &str,
+    model: Option<&str>,
+) -> Result<(), String> {
+    let Some(model) = model.filter(|value| !value.trim().is_empty()) else {
+        return Ok(());
+    };
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES ('provider.model',?1)",
+            [model],
+        )
+        .map_err(|error| error.to_string())?;
+    let scoped_key = format!("provider.model.{provider}");
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES (?1,?2)",
+            [&scoped_key, model],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn resolve_provider_model(
+    connection: &Connection,
+    provider: Option<&str>,
+    requested_model: Option<String>,
+) -> String {
+    let requested_model = requested_model.filter(|value| !value.trim().is_empty());
+    if requested_model
+        .as_deref()
+        .is_some_and(|value| value != "auto")
+    {
+        return requested_model.unwrap_or_else(|| "auto".into());
+    }
+    provider_model_setting(connection, provider.unwrap_or_default())
+        .or(requested_model)
+        .unwrap_or_else(|| "auto".into())
+}
+
 #[tauri::command]
 fn list_slash_commands(
     state: State<'_, DesktopState>,
@@ -21770,10 +21887,22 @@ fn reset_slash_commands(
 
 #[tauri::command]
 fn provider_configurations(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
-    let connection = state
-        .database
-        .lock()
-        .map_err(|_| "database lock poisoned".to_owned())?;
+    let settings = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned".to_owned())?;
+        let mut statement = connection
+            .prepare("SELECT key,value FROM settings WHERE key LIKE 'provider.%'")
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<HashMap<_, _>, _>>()
+            .map_err(|error| error.to_string())?
+    };
     registry::descriptors()
         .into_iter()
         .map(|descriptor| {
@@ -21785,33 +21914,24 @@ fn provider_configurations(state: State<'_, DesktopState>) -> Result<Vec<Value>,
                 .is_some()
                 || descriptor.name == "ollama";
             let account_id = (descriptor.name == "cloudflare")
-                .then(|| {
-                    connection
-                        .query_row(
-                            "SELECT value FROM settings WHERE key='provider.account_id.cloudflare'",
-                            [],
-                            |row| row.get::<_, String>(0),
-                        )
-                        .ok()
-                })
+                .then(|| settings.get("provider.account_id.cloudflare").cloned())
                 .flatten();
             let key = format!("provider.base_url.{}", descriptor.name);
-            let configured_base_url = connection
-                .query_row("SELECT value FROM settings WHERE key=?1", [&key], |row| {
-                    row.get::<_, String>(0)
-                })
-                .ok();
             let base_url = provider_base_url(
                 &descriptor.name,
-                configured_base_url.as_deref(),
+                settings.get(&key).map(String::as_str),
                 account_id.as_deref(),
                 descriptor.default_base_url.as_deref(),
             )
             .ok();
+            let model = settings
+                .get(&format!("provider.model.{}", descriptor.name))
+                .cloned();
             Ok(json!({
                 "provider": descriptor.name,
                 "base_url": base_url,
                 "account_id": account_id,
+                "model": model,
                 "configured": configured,
             }))
         })
@@ -21824,6 +21944,7 @@ fn save_provider_settings(
     provider: String,
     base_url: Option<String>,
     account_id: Option<String>,
+    model: Option<String>,
 ) -> Result<(), String> {
     let descriptor = registry::descriptors()
         .into_iter()
@@ -21876,6 +21997,7 @@ fn save_provider_settings(
             )
             .map_err(|error| error.to_string())?;
     }
+    save_provider_model_settings(&connection, &provider, model.as_deref())?;
     Ok(())
 }
 
@@ -21899,15 +22021,23 @@ fn provider_base_url(
 async fn validate_provider_key(
     state: State<'_, DesktopState>,
     provider: String,
+    candidate_key: Option<String>,
 ) -> Result<bool, String> {
     let descriptor = registry::descriptors()
         .into_iter()
         .find(|item| item.name == provider)
         .ok_or_else(|| "unknown provider".to_owned())?;
-    let key = state
-        .secrets
-        .get(&secret_key("provider-key", &provider))
-        .map_err(|error| error.to_string())?;
+    let key = if candidate_key
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        candidate_key
+    } else {
+        state
+            .secrets
+            .get(&secret_key("provider-key", &provider))
+            .map_err(|error| error.to_string())?
+    };
     if descriptor.needs_key && key.is_none() {
         return Err("provider key is not configured".to_owned());
     }
@@ -24261,6 +24391,18 @@ agents:
     }
 
     #[test]
+    fn project_agent_branches_are_scoped_to_the_project() {
+        assert_eq!(
+            worktree_branch("Code", 1, "project-1786051024651411911"),
+            "agent/code-1-51411911"
+        );
+        assert_ne!(
+            worktree_branch("Code", 1, "project-1786051024651411911"),
+            worktree_branch("Code", 1, "project-1786048179578068371")
+        );
+    }
+
+    #[test]
     fn project_git_commands_quote_posix_and_windows_paths() {
         let posix = git_worktree_add_command(
             Some("linux"),
@@ -24826,6 +24968,39 @@ agents:
         assert_eq!(settings["message_usage_limit"], 0);
         assert_eq!(settings["open_prs_as"], "ready");
         assert_eq!(settings["computer_use"], true);
+    }
+
+    #[test]
+    fn provider_model_persists_across_reload_for_unknown_model_id() {
+        let path = std::env::temp_dir().join(format!(
+            "opcos-provider-model-{}.db",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute(
+                    "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+                    [],
+                )
+                .unwrap();
+            save_provider_model_settings(&connection, "agnes", Some("agnes-2.5-pro-alpha"))
+                .unwrap();
+            assert_eq!(
+                provider_model_setting(&connection, "agnes").as_deref(),
+                Some("agnes-2.5-pro-alpha")
+            );
+            assert_eq!(provider_model_setting_exact(&connection, "openai"), None);
+        }
+        {
+            let connection = Connection::open(&path).unwrap();
+            assert_eq!(
+                resolve_provider_model(&connection, Some("agnes"), Some("auto".into())),
+                "agnes-2.5-pro-alpha"
+            );
+            assert_eq!(provider_model_setting_exact(&connection, "openai"), None);
+        }
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
