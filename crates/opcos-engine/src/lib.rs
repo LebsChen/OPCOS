@@ -476,6 +476,7 @@ pub struct TurnEngine<P, S, E> {
     limit_identity: Mutex<Option<(String, String, String)>>,
     interrupted: AtomicBool,
     steering: Mutex<Vec<String>>,
+    last_incoming_event_id: Mutex<Option<String>>,
     steering_waiters: SteeringWaiters,
     events: mpsc::Sender<StreamChunk>,
     receiver: Mutex<Option<mpsc::Receiver<StreamChunk>>>,
@@ -513,6 +514,18 @@ struct ResolvedLimits {
     context_window: u64,
     context_window_source: &'static str,
     max_output_tokens: u64,
+}
+
+struct IterationStatsData<'a> {
+    iteration: u64,
+    num_tool_calls: usize,
+    duration_ms: u64,
+    inference_ms: u64,
+    tool_exec_ms: u64,
+    harness_ms: u64,
+    retry_count: u64,
+    compaction_count: u64,
+    usage: Option<&'a TokenUsage>,
 }
 
 pub trait SecretScrubber: Send + Sync {
@@ -630,6 +643,7 @@ where
             limit_identity: Mutex::new(None),
             interrupted: AtomicBool::new(false),
             steering: Mutex::new(Vec::new()),
+            last_incoming_event_id: Mutex::new(None),
             steering_waiters: Arc::new(std::sync::Mutex::new(Vec::new())),
             events,
             receiver: Mutex::new(Some(receiver)),
@@ -927,13 +941,14 @@ where
             timestamp: Utc::now().to_rfc3339(),
             payload: Value::Object(payload),
         };
-        self.emit_event(
+        let event_id = self.emit_event(
             "user_message",
             StreamChunk {
                 working_event: Some(event),
                 ..StreamChunk::default()
             },
         )?;
+        *self.last_incoming_event_id.lock().await = Some(event_id);
         let value = json!({"role":"user","content":[{"type":"text","text":text}]});
         self.append("user", value.clone()).await?;
         Ok(value)
@@ -1635,35 +1650,18 @@ where
                         let harness_ms = total_ms
                             .saturating_sub(inference_ms)
                             .saturating_sub(tool_exec_ms);
-                        let mut stats = json!({
-                            "iteration":iteration + 1,
-                            "num_tool_calls":turn.tool_calls.len(),
-                            "duration_ms":total_ms,
-                            "inference_ms":inference_ms,
-                            "tool_exec_ms":tool_exec_ms,
-                            "harness_ms":harness_ms,
-                            "retry_count":retry_count,
-                            "compaction_count":compaction_count,
-                        });
-                        if let Some(value) = &turn.usage
-                            && let Some(object) = stats.as_object_mut()
-                        {
-                            object.insert("input_tokens".into(), json!(value.input));
-                            object.insert("output_tokens".into(), json!(value.output));
-                        }
-                        let _ = self.working_event("iteration_stats", "other", stats).await;
-                        let mut checkpoint = json!({
-                            "iteration":iteration + 1,
-                            "num_tool_calls":turn.tool_calls.len(),
-                        });
-                        if let Some(event_id) = self.last_consumed_incoming_event_id(&messages)
-                            && let Some(object) = checkpoint.as_object_mut()
-                        {
-                            object
-                                .insert("last_processed_incoming_event_id".into(), json!(event_id));
-                        }
                         let _ = self
-                            .working_event("iteration_checkpoint", "lifecycle", checkpoint)
+                            .emit_iteration_stats(IterationStatsData {
+                                iteration: iteration + 1,
+                                num_tool_calls: turn.tool_calls.len(),
+                                duration_ms: total_ms,
+                                inference_ms,
+                                tool_exec_ms,
+                                harness_ms,
+                                retry_count,
+                                compaction_count,
+                                usage: turn.usage.as_ref(),
+                            })
                             .await;
                         let stop = self
                             .lifecycle_hooks(
@@ -1720,35 +1718,18 @@ where
                         let harness_ms = total_ms
                             .saturating_sub(inference_ms)
                             .saturating_sub(tool_exec_ms);
-                        let mut stats = json!({
-                            "iteration":iteration + 1,
-                            "num_tool_calls":turn.tool_calls.len(),
-                            "duration_ms":total_ms,
-                            "inference_ms":inference_ms,
-                            "tool_exec_ms":tool_exec_ms,
-                            "harness_ms":harness_ms,
-                            "retry_count":retry_count,
-                            "compaction_count":compaction_count,
-                        });
-                        if let Some(value) = &turn.usage
-                            && let Some(object) = stats.as_object_mut()
-                        {
-                            object.insert("input_tokens".into(), json!(value.input));
-                            object.insert("output_tokens".into(), json!(value.output));
-                        }
-                        let _ = self.working_event("iteration_stats", "other", stats).await;
-                        let mut checkpoint = json!({
-                            "iteration":iteration + 1,
-                            "num_tool_calls":turn.tool_calls.len(),
-                        });
-                        if let Some(event_id) = self.last_consumed_incoming_event_id(&messages)
-                            && let Some(object) = checkpoint.as_object_mut()
-                        {
-                            object
-                                .insert("last_processed_incoming_event_id".into(), json!(event_id));
-                        }
                         let _ = self
-                            .working_event("iteration_checkpoint", "lifecycle", checkpoint)
+                            .emit_iteration_stats(IterationStatsData {
+                                iteration: iteration + 1,
+                                num_tool_calls: turn.tool_calls.len(),
+                                duration_ms: total_ms,
+                                inference_ms,
+                                tool_exec_ms,
+                                harness_ms,
+                                retry_count,
+                                compaction_count,
+                                usage: turn.usage.as_ref(),
+                            })
                             .await;
                         for (call, result) in turn.tool_calls.iter().zip(results) {
                             let value = json!({"role":"tool","content":[{"type":"tool_result",
@@ -1824,30 +1805,37 @@ where
         Err(EngineError::MaxIterations)
     }
 
-    fn last_consumed_incoming_event_id(&self, messages: &[Value]) -> Option<String> {
-        let last_user_message = messages.iter().rev().find_map(|message| {
-            (message.get("role").and_then(Value::as_str) == Some("user"))
-                .then(|| message.pointer("/content/0/text").and_then(Value::as_str))
-                .flatten()
-        })?;
-        self.store
-            .load_session_events(&self.session_id)
-            .ok()?
-            .into_iter()
-            .rev()
-            .find_map(|record| {
-                let event_id = record.event_id;
-                let event = record.event;
-                let working = event.get("working_event")?.as_object()?;
-                (event.get("type").and_then(Value::as_str) == Some("user_message")
-                    && working.get("direction").and_then(Value::as_str) == Some("incoming")
-                    && working
-                        .get("payload")
-                        .and_then(|payload| payload.get("message"))
-                        .and_then(Value::as_str)
-                        == Some(last_user_message))
-                .then_some(event_id)
-            })
+    async fn emit_iteration_stats(&self, data: IterationStatsData<'_>) -> Result<(), EngineError> {
+        let mut stats = json!({
+            "iteration": data.iteration,
+            "num_tool_calls": data.num_tool_calls,
+            "duration_ms": data.duration_ms,
+            "inference_ms": data.inference_ms,
+            "tool_exec_ms": data.tool_exec_ms,
+            "harness_ms": data.harness_ms,
+            "retry_count": data.retry_count,
+            "compaction_count": data.compaction_count,
+        });
+        if let Some(value) = data.usage
+            && let Some(object) = stats.as_object_mut()
+        {
+            object.insert("input_tokens".into(), json!(value.input));
+            object.insert("output_tokens".into(), json!(value.output));
+        }
+        self.working_event("iteration_stats", "other", stats)
+            .await?;
+
+        let mut checkpoint = json!({
+            "iteration": data.iteration,
+            "num_tool_calls": data.num_tool_calls,
+        });
+        if let Some(event_id) = self.last_incoming_event_id.lock().await.clone()
+            && let Some(object) = checkpoint.as_object_mut()
+        {
+            object.insert("last_processed_incoming_event_id".into(), json!(event_id));
+        }
+        self.working_event("iteration_checkpoint", "lifecycle", checkpoint)
+            .await
     }
 
     fn should_compact(&self, messages: &[Value], usage: Option<&TokenUsage>) -> bool {
@@ -3100,6 +3088,7 @@ where
                 ..StreamChunk::default()
             },
         )
+        .map(|_| ())
     }
 
     async fn working_event(
@@ -3137,9 +3126,10 @@ where
                 ..StreamChunk::default()
             },
         )
+        .map(|_| ())
     }
 
-    fn emit_event(&self, event_type: &str, mut chunk: StreamChunk) -> Result<(), EngineError> {
+    fn emit_event(&self, event_type: &str, mut chunk: StreamChunk) -> Result<String, EngineError> {
         let created_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| EngineError::Store(error.to_string()))?
@@ -3151,7 +3141,8 @@ where
         let mut event =
             serde_json::to_value(&chunk).map_err(|error| EngineError::Store(error.to_string()))?;
         self.secret_scrubber.scrub(&mut event);
-        self.persist_event_value(event)
+        self.persist_event_value(event)?;
+        Ok(chunk.event_id.unwrap_or_default())
     }
 
     fn persist_event_value(&self, event: Value) -> Result<(), EngineError> {
@@ -5829,6 +5820,52 @@ mod tests {
                 assert_eq!(live_event["type"], event["type"]);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_tracks_the_latest_duplicate_incoming_message_by_event_id() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "duplicate-incoming-session",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine
+            .append_user_message("same message".into(), None)
+            .await
+            .unwrap();
+        engine
+            .append_user_message("same message".into(), None)
+            .await
+            .unwrap();
+        let incoming_ids = store
+            .load_session_events("duplicate-incoming-session")
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.event["type"] == "user_message")
+            .map(|record| record.event_id)
+            .collect::<Vec<_>>();
+        assert_eq!(incoming_ids.len(), 2);
+
+        engine
+            .run_loop(engine.provider_messages().unwrap())
+            .await
+            .unwrap();
+
+        let checkpoint = store
+            .load_session_events("duplicate-incoming-session")
+            .unwrap()
+            .into_iter()
+            .find(|record| record.event["type"] == "iteration_checkpoint")
+            .expect("iteration checkpoint persisted");
+        assert_eq!(
+            checkpoint.event["working_event"]["payload"]["last_processed_incoming_event_id"],
+            incoming_ids[1]
+        );
     }
 
     #[derive(Clone)]
