@@ -1,5 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
-import { type ReactNode, useEffect, useRef, useState } from "react";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { type ApprovalDecision, type Item } from "../types";
 import {
   buildTimeline,
@@ -88,6 +94,73 @@ function UserBubbleContent({
       )}
       {text}
     </>
+  );
+}
+
+const USER_BUBBLE_MAX_HEIGHT = 320;
+
+function UserBubble({
+  attachments,
+  text,
+}: Pick<Extract<TimelineNode, { kind: "user" }>, "attachments" | "text">) {
+  const bubbleRef = useRef<HTMLElement | null>(null);
+  const [overflowing, setOverflowing] = useState(false);
+  const measureOverflow = useCallback(() => {
+    const bubble = bubbleRef.current;
+    if (!bubble) return;
+    const clamped = bubble.classList.contains("transcript-user-bubble-clamped");
+    if (clamped) bubble.classList.remove("transcript-user-bubble-clamped");
+    const nextOverflowing = bubble.scrollHeight > USER_BUBBLE_MAX_HEIGHT;
+    if (clamped) bubble.classList.add("transcript-user-bubble-clamped");
+    setOverflowing(nextOverflowing);
+  }, []);
+
+  useEffect(() => {
+    const bubble = bubbleRef.current;
+    if (!bubble) return;
+    const resizeObserver =
+      typeof ResizeObserver === "undefined"
+        ? undefined
+        : new ResizeObserver(measureOverflow);
+    resizeObserver?.observe(bubble);
+    const mutationObserver = new MutationObserver(measureOverflow);
+    mutationObserver.observe(bubble, {
+      characterData: true,
+      childList: true,
+      subtree: true,
+    });
+    measureOverflow();
+    return () => {
+      resizeObserver?.disconnect();
+      mutationObserver.disconnect();
+    };
+  }, [measureOverflow, overflowing]);
+
+  const content = <UserBubbleContent attachments={attachments} text={text} />;
+  const className = `bubble-user transcript-user-bubble${overflowing ? " transcript-user-bubble-clamped" : ""}`;
+  if (!overflowing) {
+    return (
+      <div
+        className={className}
+        ref={(element) => {
+          bubbleRef.current = element;
+        }}
+      >
+        {content}
+      </div>
+    );
+  }
+  return (
+    <details className="transcript-user-collapsible">
+      <summary
+        className={className}
+        ref={(element) => {
+          bubbleRef.current = element;
+        }}
+      >
+        {content}
+      </summary>
+    </details>
   );
 }
 
@@ -301,14 +374,7 @@ export function Transcript({
         if (node.kind === "user")
           return (
             <div className="group transcript-user-message self-end" key={index}>
-              <details className="transcript-user-collapsible">
-                <summary className="bubble-user transcript-user-bubble">
-                  <UserBubbleContent
-                    attachments={node.attachments}
-                    text={node.text}
-                  />
-                </summary>
-              </details>
+              <UserBubble attachments={node.attachments} text={node.text} />
               <BubbleMeta text={node.text} ts={node.ts} />
             </div>
           );

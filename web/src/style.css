@@ -562,11 +562,9 @@ h3 {
   white-space: pre-wrap;
   line-height: 20px;
 }
-.transcript-user-collapsible > summary {
+.transcript-user-bubble-clamped {
   max-height: 320px;
   overflow: hidden;
-  list-style: none;
-  cursor: pointer;
   -webkit-mask-image: linear-gradient(
     to bottom,
     #000 0,
@@ -583,10 +581,14 @@ h3 {
 .transcript-user-collapsible {
   max-width: min(100%, 560px);
 }
+.transcript-user-collapsible > summary {
+  list-style: none;
+  cursor: pointer;
+}
 .transcript-user-collapsible > summary::-webkit-details-marker {
   display: none;
 }
-.transcript-user-collapsible[open] .transcript-user-bubble {
+.transcript-user-collapsible[open] .transcript-user-bubble-clamped {
   max-height: none;
   -webkit-mask-image: none;
   mask-image: none;
