@@ -3241,9 +3241,16 @@ fn windows_persistent_command(
     Ok(format!(
         "$OutputEncoding=[Text.Encoding]::UTF8; \
          [Console]::OutputEncoding=[Text.Encoding]::UTF8; \
+         $PSDefaultParameterValues['Out-File:Encoding']=[Text.UTF8Encoding]::new($false); \
+         $PSDefaultParameterValues['Out-File:Width']=2147483647; \
          {directory}$null | & {{ {prefix}{command} }} > '{output_path}' 2>&1; \
          $opcos_exit=if ($?) {{ if ($null -eq $LASTEXITCODE) {{ 0 }} else {{ $LASTEXITCODE }} }} else {{ 1 }}; \
-         Get-Content -Raw -LiteralPath '{output_path}'; \
+         if (Test-Path -LiteralPath '{output_path}') {{ \
+             $opcos_output=Get-Content -Raw -LiteralPath '{output_path}'; \
+             if ($null -ne $opcos_output -and $opcos_output.Length -gt 0) {{ \
+                 [Console]::Out.Write($opcos_output) \
+             }} \
+         }}; \
          Remove-Item -LiteralPath '{output_path}' -Force -ErrorAction SilentlyContinue; \
          {}",
         powershell_marker_line(marker)
@@ -4460,15 +4467,22 @@ mod tests {
         )
         .unwrap();
         assert!(command.contains("[Text.Encoding]::UTF8"));
+        assert!(command.contains(
+            "$PSDefaultParameterValues['Out-File:Encoding']=[Text.UTF8Encoding]::new($false)"
+        ));
+        assert!(command.contains("$PSDefaultParameterValues['Out-File:Width']=2147483647"));
         assert!(command.contains("$null | & {"));
         assert!(command.contains("> 'C:\\Temp\\opcos-shell-output-''test'"));
-        assert!(command.contains("Get-Content -Raw -LiteralPath"));
+        assert!(command.contains("if (Test-Path -LiteralPath"));
+        assert!(command.contains("$opcos_output=Get-Content -Raw -LiteralPath"));
+        assert!(command.contains("[Console]::Out.Write($opcos_output)"));
         assert!(command.contains("Remove-Item -LiteralPath"));
         assert!(command.contains("2>&1"));
-        let readback = command.find("Get-Content").unwrap();
+        let readback = command.find("$opcos_output=Get-Content").unwrap();
+        let writeback = command.find("[Console]::Out.Write").unwrap();
         let removal = command.find("Remove-Item").unwrap();
         let marker = command.find("Write-Output (\"__marker__:").unwrap();
-        assert!(readback < removal && removal < marker);
+        assert!(readback < writeback && writeback < removal && removal < marker);
         assert!(command.contains(
             "Write-Output (\"__marker__:\" + $opcos_exit + \":\" + (Get-Location).Path)"
         ));
