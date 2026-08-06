@@ -42,6 +42,16 @@ describe("single event-log timeline", () => {
       text: "Devin went to sleep",
     });
     expect(buildTimeline(saved)).toEqual(nodes);
+    const resumed = buildTimeline([
+      ...live,
+      {
+        type: "user_message",
+        event_id: "after-finished",
+        created_at_ms: 1786040275969,
+        message: "Continue",
+      },
+    ] as TimelineEvent[]);
+    expect(resumed.some((node) => node.kind === "sleep")).toBe(false);
   });
 
   it("derives the current task state from the timeline plan", () => {
@@ -370,8 +380,15 @@ describe("single event-log timeline", () => {
     expect(rows.some((label) => /^Thought for \d+s$/.test(label))).toBe(true);
     expect(rows).toContain("Edited alpha.txt +1 −0");
     expect(rows).toContain("Created notes.md +33");
-    expect(rows).toContain("write_file");
-    expect(rows).toContain("edit_file");
+    expect(rows).toContain("Wrote <temp-workspace>/notes.md");
+    expect(rows).toContain("Edited <temp-workspace>/alpha.txt");
+    const failedRead = work
+      .flatMap((node) => node.rows)
+      .find((row) => row.resultError);
+    expect(failedRead).toMatchObject({
+      label: "Read <temp-workspace>/session.sqlite",
+      resultSummary: expect.stringContaining("valid UTF-8"),
+    });
     expect(work.some((node) => /^Worked for \d+s$/.test(node.label))).toBe(
       true,
     );

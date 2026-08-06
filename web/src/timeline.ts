@@ -92,6 +92,28 @@ function eventType(event: TimelineEvent): string {
     : "";
 }
 
+function toolLabel(tool: string, args: unknown): string {
+  const values =
+    args && typeof args === "object"
+      ? (args as Record<string, unknown>)
+      : undefined;
+  const target = String(
+    values?.path ??
+      values?.target ??
+      values?.file_path ??
+      values?.command ??
+      "",
+  ).trim();
+  const verb =
+    {
+      read_file: "Read",
+      list_dir: "Listed",
+      write_file: "Wrote",
+      edit_file: "Edited",
+    }[tool] ?? tool;
+  return target ? `${verb} ${target}` : verb;
+}
+
 export function mergeEvents(
   existing: TimelineEvent[],
   incoming: TimelineEvent | TimelineEvent[],
@@ -126,6 +148,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
   let work: Extract<TimelineNode, { kind: "work" }> | null = null;
   let workStarted = 0;
   let workEnded = 0;
+  let sleepPending = false;
   let pendingThought:
     | { row: Extract<TimelineNode, { kind: "work" }>["rows"][number] }
     | undefined;
@@ -233,6 +256,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
     if (!type) continue;
     const data = payload(event);
     if (type === "user_message" || type === "initial_user_message") {
+      sleepPending = false;
       flush(event.created_at_ms);
       nodes.push({
         kind: "user",
@@ -307,7 +331,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
         String(data.stop_reason ?? "").toLowerCase() === "finished"
       ) {
         flush(event.created_at_ms);
-        nodes.push({ kind: "sleep", text: "Devin went to sleep" });
+        sleepPending = true;
       }
     } else if (
       [
@@ -379,7 +403,17 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
             : raw === undefined
               ? ""
               : JSON.stringify(raw);
+        const resultObject =
+          raw && typeof raw === "object"
+            ? (raw as Record<string, unknown>)
+            : undefined;
+        const tool = String(resultEvent.name ?? "");
+        if (tool) row.label = toolLabel(tool, resultEvent.arguments);
         row.resultSummary = summary ? summary.slice(0, 240) : "Completed";
+        row.resultError =
+          resultObject?.error !== undefined ||
+          resultObject?.ok === false ||
+          resultObject?.success === false;
         row.durationMs =
           typeof data.duration_ms === "number"
             ? data.duration_ms
@@ -607,6 +641,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
         const started = callId ? genericRows.get(callId) : undefined;
         if (started) {
           started.resultSummary = data.ok === false ? "Failed" : "Completed";
+          started.resultError = data.ok === false;
           started.durationMs =
             typeof data.duration_ms === "number"
               ? data.duration_ms
@@ -634,6 +669,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
             data.ok === false
               ? "Failed"
               : (started.resultSummary ?? "Completed");
+          started.resultError = data.ok === false;
           started.durationMs =
             typeof data.duration_ms === "number"
               ? data.duration_ms
@@ -650,8 +686,9 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
             "plan_revise_started",
           ].includes(type)
         ) {
+          const tool = String(data.tool ?? type.replace(/_started$/, ""));
           const row = {
-            label: String(data.command ?? data.tool ?? type),
+            label: toolLabel(tool, data.arguments),
             callId: typeof data.call_id === "string" ? data.call_id : undefined,
             startedAt: event.created_at_ms,
             isMajorAction:
@@ -672,6 +709,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
     }
   }
   flush(workEnded || events.at(-1)?.created_at_ms || workStarted);
+  if (sleepPending) nodes.push({ kind: "sleep", text: "Devin went to sleep" });
   return nodes;
 }
 
