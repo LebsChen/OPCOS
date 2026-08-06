@@ -10854,10 +10854,10 @@ function AppContent() {
                           setHomeModel(
                             content.model && content.model !== "auto"
                               ? content.model
-                              : models.find((model) => !model.likely_non_chat)
+                              : (models.find((model) => !model.likely_non_chat)
                                   ?.id ??
                                   models[0]?.id ??
-                                  "auto",
+                                  "auto"),
                           );
                           setHomeHarness(content.harness || "builtin");
                           setHomeMode(content.mode || "Auto");
