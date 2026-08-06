@@ -1221,6 +1221,8 @@ function ProjectConfigPanel({
   const [secrets, setSecrets] = useState<SecretMetadata[]>([]);
   const [kind, setKind] = useState<
     | "agents"
+    | "experts"
+    | "teams"
     | "knowledge"
     | "playbook"
     | "mcp"
@@ -1337,6 +1339,8 @@ function ProjectConfigPanel({
         <div className="flex flex-wrap gap-2">
           {[
             ["agents", "规则"],
+            ["experts", "专家"],
+            ["teams", "团队"],
             ["knowledge", "Knowledge"],
             ["playbook", "Playbook"],
             ["mcp", "MCP"],
@@ -1363,147 +1367,181 @@ function ProjectConfigPanel({
             全局预设（项目选择）
           </legend>
           <div className="grid gap-2">
-            {configurationTemplates.map((template) => (
-              <div
-                key={template.template_id}
-                className="flex items-center gap-2 text-sm"
-              >
-                <label className="flex min-w-0 flex-1 items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={template.applied}
-                    onChange={(event) =>
-                      void toggleConfigurationTemplate(
-                        template,
-                        event.target.checked,
-                      )
-                    }
-                  />
-                  <span>
-                    {template.name} · {template.source} ·{" "}
-                    {template.overridden ? "项目已覆盖" : "继承自全局预设"}
-                    {template.modified ? " · 已本地修改" : ""}
-                    {template.overridden ? " · 可在下方编辑" : ""}
-                  </span>
-                </label>
-                <div className="flex shrink-0 gap-2">
-                  {template.overridden && (
-                    <button
-                      type="button"
-                      className="btn"
-                      onClick={() => {
-                        if (
-                          window.confirm(
-                            `将删除项目覆盖「${template.name}」，恢复继承全局预设。确定继续吗？`,
-                          )
-                        ) {
-                          void command("restore_project_configuration", {
+            {configurationTemplates
+              .filter((template) => {
+                const selectedKind = {
+                  agents: "rules",
+                  experts: "agent-template",
+                  teams: "team-template",
+                  knowledge: "knowledge",
+                  playbook: "runbook",
+                  mcp: "mcp",
+                  "acp-agent": "acp-agent",
+                  connectors: "connector",
+                  blueprint: "blueprint",
+                }[kind];
+                return template.kind === selectedKind;
+              })
+              .map((template) => (
+                <div
+                  key={template.template_id}
+                  className="grid grid-cols-[auto,minmax(0,1fr),auto] items-start gap-3 rounded-md border border-line/70 px-3 py-2 text-sm"
+                >
+                  <label className="flex items-center gap-2 pt-1">
+                    <input
+                      type="checkbox"
+                      checked={template.applied}
+                      onChange={(event) =>
+                        void toggleConfigurationTemplate(
+                          template,
+                          event.target.checked,
+                        )
+                      }
+                    />
+                  </label>
+                  <div className="min-w-0">
+                    <strong className="block break-words text-ink">
+                      {template.name}
+                    </strong>
+                    <small className="mt-1 block break-words text-faint">
+                      {template.source} ·{" "}
+                      {template.overridden ? "项目已覆盖" : "继承自全局预设"}
+                      {template.modified ? " · 已本地修改" : ""}
+                      {template.overridden ? " · 可在下方编辑" : ""}
+                    </small>
+                  </div>
+                  <div className="flex shrink-0 gap-2">
+                    {template.overridden && (
+                      <button
+                        type="button"
+                        className="btn"
+                        onClick={() => {
+                          if (
+                            window.confirm(
+                              `将删除项目覆盖「${template.name}」，恢复继承全局预设。确定继续吗？`,
+                            )
+                          ) {
+                            void command("restore_project_configuration", {
+                              projectId: project.id,
+                              templateId: template.template_id,
+                            })
+                              .then(load)
+                              .then(onRefresh)
+                              .catch(onError);
+                          }
+                        }}
+                      >
+                        恢复继承
+                      </button>
+                    )}
+                    {!template.overridden && (
+                      <button
+                        type="button"
+                        className="btn"
+                        onClick={() => {
+                          void command("override_project_configuration", {
                             projectId: project.id,
                             templateId: template.template_id,
                           })
                             .then(load)
                             .then(onRefresh)
                             .catch(onError);
-                        }
-                      }}
-                    >
-                      恢复继承
-                    </button>
-                  )}
-                  {!template.overridden && (
-                    <button
-                      type="button"
-                      className="btn"
-                      onClick={() => {
-                        void command("override_project_configuration", {
-                          projectId: project.id,
-                          templateId: template.template_id,
-                        })
-                          .then(load)
-                          .then(onRefresh)
-                          .catch(onError);
-                      }}
-                    >
-                      创建项目覆盖
-                    </button>
-                  )}
+                        }}
+                      >
+                        创建项目覆盖
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            {!configurationTemplates.some((template) => {
+              const selectedKind = {
+                agents: "rules",
+                experts: "agent-template",
+                teams: "team-template",
+                knowledge: "knowledge",
+                playbook: "runbook",
+                mcp: "mcp",
+                "acp-agent": "acp-agent",
+                connectors: "connector",
+                blueprint: "blueprint",
+              }[kind];
+              return template.kind === selectedKind;
+            }) && <span className="text-xs text-faint">暂无可用配置模板</span>}
+          </div>
+        </fieldset>
+        {!["experts", "teams"].includes(kind) &&
+          assets
+            .filter((asset) => asset.kind === kind)
+            .map((asset) => (
+              <div
+                className="flex items-start justify-between gap-3 rounded-lg border border-line p-3"
+                key={asset.id}
+              >
+                <div className="min-w-0">
+                  <strong className="text-ink">{asset.title}</strong>
+                  <p className="mt-1 whitespace-pre-wrap break-words text-xs text-faint">
+                    {asset.body}
+                  </p>
+                </div>
+                <div className="flex shrink-0 gap-2">
+                  <button
+                    className="btn"
+                    onClick={() => {
+                      setEditingId(asset.id);
+                      setTitle(asset.title);
+                      setBody(asset.body);
+                    }}
+                  >
+                    编辑
+                  </button>
+                  <button
+                    className="btn"
+                    onClick={() =>
+                      command("delete_asset", { id: asset.id })
+                        .then(load)
+                        .catch(onError)
+                    }
+                  >
+                    删除
+                  </button>
                 </div>
               </div>
             ))}
-            {!configurationTemplates.length && (
-              <span className="text-xs text-faint">暂无可用配置模板</span>
-            )}
-          </div>
-        </fieldset>
-        {assets
-          .filter((asset) => asset.kind === kind)
-          .map((asset) => (
-            <div
-              className="flex items-start justify-between gap-3 rounded-lg border border-line p-3"
-              key={asset.id}
-            >
-              <div className="min-w-0">
-                <strong className="text-ink">{asset.title}</strong>
-                <p className="mt-1 whitespace-pre-wrap break-words text-xs text-faint">
-                  {asset.body}
-                </p>
-              </div>
-              <div className="flex shrink-0 gap-2">
-                <button
-                  className="btn"
-                  onClick={() => {
-                    setEditingId(asset.id);
-                    setTitle(asset.title);
-                    setBody(asset.body);
-                  }}
-                >
-                  编辑
-                </button>
-                <button
-                  className="btn"
-                  onClick={() =>
-                    command("delete_asset", { id: asset.id })
-                      .then(load)
-                      .catch(onError)
-                  }
-                >
-                  删除
-                </button>
-              </div>
-            </div>
-          ))}
-        <div className="grid gap-3 rounded-lg border border-line p-4">
-          <label className="field-label">
-            名称
-            <input
-              value={title}
-              onChange={(event) => setTitle(event.target.value)}
-              placeholder="配置名称"
-            />
-          </label>
-          <label className="field-label">
-            内容
-            <textarea
-              value={body}
-              onChange={(event) => setBody(event.target.value)}
-              placeholder={
-                kind === "blueprint"
-                  ? "clone:\n  - git fetch"
-                  : "项目级配置内容"
-              }
-            />
-          </label>
-          <div>
-            <button className="btn approval-primary" onClick={save}>
-              {editingId ? "保存更改" : "新增配置"}
-            </button>
-            {editingId && (
-              <button className="btn ml-2" onClick={reset}>
-                取消编辑
+        {!["experts", "teams"].includes(kind) && (
+          <div className="grid gap-3 rounded-lg border border-line p-4">
+            <label className="field-label">
+              名称
+              <input
+                value={title}
+                onChange={(event) => setTitle(event.target.value)}
+                placeholder="配置名称"
+              />
+            </label>
+            <label className="field-label">
+              内容
+              <textarea
+                value={body}
+                onChange={(event) => setBody(event.target.value)}
+                placeholder={
+                  kind === "blueprint"
+                    ? "clone:\n  - git fetch"
+                    : "项目级配置内容"
+                }
+              />
+            </label>
+            <div>
+              <button className="btn approval-primary" onClick={save}>
+                {editingId ? "保存更改" : "新增配置"}
               </button>
-            )}
+              {editingId && (
+                <button className="btn ml-2" onClick={reset}>
+                  取消编辑
+                </button>
+              )}
+            </div>
           </div>
-        </div>
+        )}
       </div>
       <div className="mt-6 border-t border-line pt-5">
         <div className="flex items-center justify-between">
@@ -5109,86 +5147,92 @@ function ManageSections({
         )}
         {(tab === "library" || tab === "experts" || tab === "teams") && (
           <div className="space-y-4">
-            <div className="flex flex-wrap items-center gap-2 rounded-lg border border-line p-3">
-              <select
-                className="input"
-                value={libraryProjectId}
-                onChange={(event) => setLibraryProjectId(event.target.value)}
-              >
-                <option value="">选择项目进行仓库同步</option>
-                {projects.map((project) => (
-                  <option key={project.id} value={project.id}>
-                    {project.name}
-                  </option>
-                ))}
-              </select>
-              <button
-                type="button"
-                className="btn"
-                disabled={!libraryProjectId}
-                onClick={() =>
-                  void command("import_repository_templates", {
-                    projectId: libraryProjectId,
-                  })
-                    .then((result) =>
-                      setTemplateDraftStatus(
-                        `导入结果：${JSON.stringify(result)}`,
-                      ),
-                    )
-                    .then(() =>
-                      command<LibraryEntry[]>("list_configured_library").then(
-                        setLibraryEntries,
-                      ),
-                    )
-                    .catch(onError)
-                }
-              >
-                从仓库导入
-              </button>
-              <button
-                type="button"
-                className="btn"
-                disabled={!libraryProjectId}
-                onClick={() =>
-                  void command("save_project_as_team_template", {
-                    projectId: libraryProjectId,
-                  })
-                    .then(() =>
-                      setTemplateDraftStatus("项目已另存为 Team 模板"),
-                    )
-                    .then(() =>
-                      command<LibraryEntry[]>("list_configured_library").then(
-                        setLibraryEntries,
-                      ),
-                    )
-                    .catch(onError)
-                }
-              >
-                当前项目另存为 Team
-              </button>
-            </div>
-            <div className="flex gap-2 border-b border-line pb-2">
-              {(
-                [
-                  ["agent-template", "专家"],
-                  ["team-template", "团队"],
-                  ["config", "配置模板"],
-                ] as const
-              ).map(([value, label]) => (
-                <button
-                  key={value}
-                  type="button"
-                  className={`px-3 py-1.5 rounded-md text-sm ${
-                    libraryKind === value
-                      ? "bg-paper text-accent font-medium"
-                      : "text-muted"
-                  }`}
-                  onClick={() => setLibraryKind(value)}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
+            {tab === "library" && (
+              <>
+                <div className="flex flex-wrap items-center gap-2 rounded-lg border border-line p-3">
+                  <select
+                    className="input"
+                    value={libraryProjectId}
+                    onChange={(event) =>
+                      setLibraryProjectId(event.target.value)
+                    }
+                  >
+                    <option value="">选择项目进行仓库同步</option>
+                    {projects.map((project) => (
+                      <option key={project.id} value={project.id}>
+                        {project.name}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={!libraryProjectId}
+                    onClick={() =>
+                      void command("import_repository_templates", {
+                        projectId: libraryProjectId,
+                      })
+                        .then((result) =>
+                          setTemplateDraftStatus(
+                            `导入结果：${JSON.stringify(result)}`,
+                          ),
+                        )
+                        .then(() =>
+                          command<LibraryEntry[]>(
+                            "list_configured_library",
+                          ).then(setLibraryEntries),
+                        )
+                        .catch(onError)
+                    }
+                  >
+                    从仓库导入
+                  </button>
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={!libraryProjectId}
+                    onClick={() =>
+                      void command("save_project_as_team_template", {
+                        projectId: libraryProjectId,
+                      })
+                        .then(() =>
+                          setTemplateDraftStatus("项目已另存为 Team 模板"),
+                        )
+                        .then(() =>
+                          command<LibraryEntry[]>(
+                            "list_configured_library",
+                          ).then(setLibraryEntries),
+                        )
+                        .catch(onError)
+                    }
+                  >
+                    当前项目另存为 Team
+                  </button>
+                </div>
+                <div className="flex gap-2 border-b border-line pb-2">
+                  {(
+                    [
+                      ["agent-template", "专家"],
+                      ["team-template", "团队"],
+                      ["config", "配置模板"],
+                    ] as const
+                  ).map(([value, label]) => (
+                    <button
+                      key={value}
+                      type="button"
+                      className={`rounded-md px-3 py-1.5 text-sm ${
+                        libraryKind === value
+                          ? "bg-paper font-medium text-accent"
+                          : "text-muted"
+                      }`}
+                      onClick={() => setLibraryKind(value)}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
             <section className="rounded-lg border border-line p-4 space-y-3">
               <strong>创建自定义模板</strong>
               <div className="grid gap-2 md:grid-cols-2">
@@ -5255,7 +5299,7 @@ function ManageSections({
                 </button>
               </div>
             </section>
-            <div className="grid gap-3 md:grid-cols-2">
+            <div className="grid gap-3 xl:grid-cols-2">
               {libraryEntries
                 .filter((template) =>
                   activeLibraryKind === "config"
@@ -5266,12 +5310,14 @@ function ManageSections({
                 )
                 .map((template) => (
                   <article
-                    className="rounded-lg border border-line p-4"
+                    className="min-w-0 overflow-hidden rounded-lg border border-line p-4"
                     key={template.id}
                   >
                     <div className="flex items-start justify-between gap-2">
-                      <div>
-                        <strong>{template.name}</strong>
+                      <div className="min-w-0">
+                        <strong className="block break-words">
+                          {template.name}
+                        </strong>
                         <small className="block text-muted">
                           {template.source ||
                             (template.status === "builtin"
@@ -5280,14 +5326,14 @@ function ManageSections({
                           · v{template.version}
                         </small>
                       </div>
-                      <span className="text-xs text-muted">
+                      <span className="max-w-[45%] break-words text-right text-xs text-muted">
                         {template.kind}
                       </span>
                     </div>
-                    <p className="mt-2 text-sm text-muted">
+                    <p className="mt-2 break-words text-sm text-muted">
                       {template.description || "无描述"}
                     </p>
-                    <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap text-xs text-muted">
+                    <pre className="mt-2 max-h-28 max-w-full overflow-auto whitespace-pre-wrap break-words text-xs text-muted">
                       {template.content}
                     </pre>
                     {template.readonly && (
