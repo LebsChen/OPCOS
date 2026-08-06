@@ -21,6 +21,18 @@ pub struct AssetBundle {
     pub skills: Vec<SkillEntry>,
     pub commands: Vec<CommandEntry>,
     pub mcp_servers: Vec<McpServerEntry>,
+    #[serde(default)]
+    pub permissions: Option<PermissionRules>,
+    #[serde(default)]
+    pub permission_errors: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PermissionRules {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -584,6 +596,17 @@ pub async fn discover<R: RemoteAssetReader>(
             bundle.agents.push(InstructionSource { path, content });
         }
     }
+    for name in [".agents/permissions.json", ".agents/permissions.local.json"] {
+        let path = join_remote_path(workspace, name);
+        if let Ok(content) = reader.read(&path).await {
+            match serde_json::from_str::<PermissionRules>(&content) {
+                Ok(rules) => bundle.permissions = Some(rules),
+                Err(error) => bundle
+                    .permission_errors
+                    .push(format!("{path}: invalid permission rules: {error}")),
+            }
+        }
+    }
     for path in [
         ".cursor/rules",
         ".agents/rules",
@@ -696,6 +719,8 @@ mod tests {
             }],
             commands: Vec::new(),
             mcp_servers: Vec::new(),
+            permissions: None,
+            permission_errors: Vec::new(),
         };
         let rendered = bundle.system_instructions();
         assert!(rendered.find("global").unwrap() < rendered.find("agents").unwrap());
@@ -938,6 +963,9 @@ mod tests {
                 "/repo/.agents/skills/foo/data/docs/b.md" => Ok("# B".into()),
                 "/repo/.agents/rules/x.md" => Ok("# Rule".into()),
                 "/repo/.cursor/rules/project.mdc" => Ok("# Cursor rule".into()),
+                "/repo/.agents/permissions.json" => {
+                    Ok(r#"{"allow":["Exec(git status)"],"deny":["Exec(sudo)"]}"#.into())
+                }
                 _ => Err(AssetError::Invalid("missing".into())),
             }
         }
@@ -987,5 +1015,82 @@ mod tests {
                 .any(|source| source.path == "/repo/.cursor/rules/project.mdc")
         );
         assert!(bundle.system_instructions().contains("# Cursor rule"));
+    }
+
+    #[tokio::test]
+    async fn discovers_permission_rules_without_affecting_other_assets() {
+        let bundle = discover(&AssetTreeReader, "/repo").await.unwrap();
+        assert_eq!(
+            bundle.permissions,
+            Some(PermissionRules {
+                allow: vec!["Exec(git status)".into()],
+                deny: vec!["Exec(sudo)".into()],
+            })
+        );
+        assert!(bundle.permission_errors.is_empty());
+        assert_eq!(bundle.skills.len(), 1);
+        assert!(
+            bundle
+                .agents
+                .iter()
+                .any(|source| source.path.ends_with("x.md"))
+        );
+    }
+
+    struct InvalidPermissionReader;
+
+    #[async_trait]
+    impl RemoteAssetReader for InvalidPermissionReader {
+        async fn read(&self, path: &str) -> Result<String, AssetError> {
+            match path {
+                "/repo/.agents/permissions.json" => Ok("{not-json".into()),
+                "/repo/.agents/rules/x.md" => Ok("# Rule".into()),
+                _ => Err(AssetError::Invalid("missing".into())),
+            }
+        }
+
+        async fn list(&self, path: Option<&str>) -> Result<Vec<(String, bool)>, AssetError> {
+            match path {
+                Some("/repo/.agents/rules") => Ok(vec![("x.md".into(), false)]),
+                _ => Err(AssetError::Invalid("missing".into())),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_permission_rules_are_recorded_without_blocking_discovery() {
+        let bundle = discover(&InvalidPermissionReader, "/repo").await.unwrap();
+        assert!(bundle.permissions.is_none());
+        assert_eq!(bundle.permission_errors.len(), 1);
+        assert_eq!(bundle.agents[0].path, "/repo/.agents/rules/x.md");
+    }
+
+    struct PermissionOverrideReader;
+
+    #[async_trait]
+    impl RemoteAssetReader for PermissionOverrideReader {
+        async fn read(&self, path: &str) -> Result<String, AssetError> {
+            match path {
+                "/repo/.agents/permissions.json" => Ok(r#"{"allow":["Exec(git status)"]}"#.into()),
+                "/repo/.agents/permissions.local.json" => Ok(r#"{"deny":["Exec(sudo)"]}"#.into()),
+                _ => Err(AssetError::Invalid("missing".into())),
+            }
+        }
+
+        async fn list(&self, _path: Option<&str>) -> Result<Vec<(String, bool)>, AssetError> {
+            Err(AssetError::Invalid("missing".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn local_permission_rules_override_project_rules() {
+        let bundle = discover(&PermissionOverrideReader, "/repo").await.unwrap();
+        assert_eq!(
+            bundle.permissions,
+            Some(PermissionRules {
+                allow: Vec::new(),
+                deny: vec!["Exec(sudo)".into()],
+            })
+        );
     }
 }

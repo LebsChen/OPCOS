@@ -3782,6 +3782,12 @@ impl ToolExecutor for RemoteExecutor {
     fn policy_target(&self, name: &str, arguments: &Value) -> String {
         if name == "git_push" {
             git_push_policy_target(&self.store, self.project_id.as_deref(), arguments)
+        } else if matches!(name, "run_shell" | "exec") {
+            arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or(name)
+                .to_owned()
         } else {
             name.to_owned()
         }
@@ -4135,6 +4141,12 @@ impl ToolExecutor for DesktopExecutor {
                         executor.project_id.as_deref(),
                         arguments,
                     )
+                } else if matches!(name, "run_shell" | "exec") {
+                    arguments
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .unwrap_or(name)
+                        .to_owned()
                 } else {
                     name.to_owned()
                 }
@@ -9313,6 +9325,14 @@ async fn engine_for_with_context(
     }
     engine
         .set_system_instructions(Some(bundle.system_instructions()))
+        .await;
+    engine
+        .set_permission_rules(bundle.permissions.as_ref().map(|rules| {
+            opcos_policy::PermissionRules {
+                allow: rules.allow.clone(),
+                deny: rules.deny.clone(),
+            }
+        }))
         .await;
     let mut events = engine.events();
     let handle = app.clone();
