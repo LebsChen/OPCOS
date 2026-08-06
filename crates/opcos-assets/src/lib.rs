@@ -107,6 +107,9 @@ pub struct McpCatalogEntry {
 
 const MCP_CATALOG_JSON: &str = include_str!("../data/mcp_catalog.json");
 
+pub const MAX_SYSTEM_INSTRUCTION_BYTES: usize = 256 * 1024;
+pub const MAX_ASSET_FILE_BYTES: usize = 64 * 1024;
+
 pub const BUILTIN_AGENT_INSTRUCTIONS: &str = r#"You are an autonomous software and business agent working in the assigned workspace and host.
 
 For complex tasks, first use propose_plan, then maintain the approved plan with plan_update. The persisted plan is authoritative; do not announce plan status in prose.
@@ -118,6 +121,14 @@ Choose tools deliberately: use repo_index_* and lsp_* for repository navigation 
 Use ask_user only for a genuine blocker such as missing credentials or a required human decision. Do not stop merely because work is lengthy or repetitive.
 
 Never print or commit secrets. Use the existing secret-reference mechanisms and keep credentials out of files, logs, transcripts, and tool results.
+
+Be honest about evidence and outcomes. Never invent data or fake tests, mock over a real failure just to make it pass, or describe broken code as working; report blockers that cannot be resolved.
+
+Keep all import and use statements at the top of the file rather than nesting them inside functions or classes.
+
+When given a URL, open and read it before describing its contents; do not infer page content from the URL alone.
+
+Reply in the same language the user uses.
 
 Before editing a file, understand its surrounding code, imports, conventions, and existing abstractions. Match the local style, reuse established libraries and helpers, and follow nearby patterns. Before adding a component, inspect comparable components and their framework, naming, and type conventions.
 
@@ -257,28 +268,127 @@ impl AssetBundle {
             "[Built-in Agent Instructions]\n{BUILTIN_AGENT_INSTRUCTIONS}"
         )];
         if let Some(instructions) = &self.instructions {
-            sections.push(format!("[Global Instructions]\n{}", instructions.content));
+            sections.push(format_asset_section(
+                "[Global Instructions]",
+                &instructions.content,
+            ));
         }
         for source in &self.agents {
-            sections.push(format!(
-                "[AGENTS source: {}]\n{}",
-                source.path, source.content
+            sections.push(format_asset_section(
+                &format!("[AGENTS source: {}]", source.path),
+                &source.content,
             ));
         }
         for entry in self.knowledge.iter().filter(|entry| entry.enabled) {
-            sections.push(format!(
-                "[Knowledge: {} | trigger: {} | scope: {}]\n{}",
-                entry.title, entry.trigger, entry.scope, entry.body
+            sections.push(format_asset_section(
+                &format!(
+                    "[Knowledge: {} | trigger: {} | scope: {}]",
+                    entry.title, entry.trigger, entry.scope
+                ),
+                &entry.body,
             ));
         }
         if let Some(playbook) = &self.playbook {
-            sections.push(format!("[Playbook: {}]\n{}", playbook.title, playbook.body));
+            sections.push(format_asset_section(
+                &format!("[Playbook: {}]", playbook.title),
+                &playbook.body,
+            ));
         }
         for skill in self.skills.iter().filter(|skill| skill.active) {
-            sections.push(format!("[Skill: {}]\n{}", skill.name, skill.content));
+            sections.push(format_asset_section(
+                &format!("[Skill: {}]", skill.name),
+                &skill.content,
+            ));
         }
-        sections.join("\n\n")
+        apply_system_instruction_budget(sections)
     }
+}
+
+const OMITTED_SECTIONS_MARKER: &str =
+    "[{count} asset sections omitted: system instruction budget exceeded]";
+const TRUNCATED_SECTION_MARKER: &str =
+    "[Asset section truncated: system instruction budget exceeded]";
+const TRUNCATED_FILE_MARKER: &str = "[Asset file truncated: file size limit exceeded]";
+
+fn format_asset_section(header: &str, content: &str) -> String {
+    format!("{header}\n{}", truncate_asset_file(content))
+}
+
+fn truncate_asset_file(content: &str) -> String {
+    if content.len() <= MAX_ASSET_FILE_BYTES {
+        return content.to_owned();
+    }
+    let keep = MAX_ASSET_FILE_BYTES.saturating_sub(TRUNCATED_FILE_MARKER.len() + 1);
+    format!(
+        "{}\n{}",
+        truncate_utf8(content, keep),
+        TRUNCATED_FILE_MARKER
+    )
+}
+
+fn truncate_utf8(content: &str, max_bytes: usize) -> &str {
+    if content.len() <= max_bytes {
+        return content;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    &content[..end]
+}
+
+fn apply_system_instruction_budget(sections: Vec<String>) -> String {
+    let mut rendered = Vec::new();
+    let mut used = 0;
+    let section_count = sections.len();
+    for (index, section) in sections.into_iter().enumerate() {
+        let separator = if rendered.is_empty() { 0 } else { 2 };
+        if used + separator + section.len() <= MAX_SYSTEM_INSTRUCTION_BYTES {
+            used += separator + section.len();
+            rendered.push(section);
+            continue;
+        }
+
+        let partially_retained_omitted = section_count - index - 1;
+        let marker =
+            OMITTED_SECTIONS_MARKER.replace("{count}", &partially_retained_omitted.to_string());
+        let prefix = if rendered.is_empty() {
+            String::new()
+        } else {
+            rendered.join("\n\n")
+        };
+        let separator = if prefix.is_empty() { 0 } else { 2 };
+        let remaining = MAX_SYSTEM_INSTRUCTION_BYTES
+            .saturating_sub(prefix.len() + separator + marker.len() + 2);
+        let truncated = if remaining > TRUNCATED_SECTION_MARKER.len() + 1 {
+            let keep = remaining - TRUNCATED_SECTION_MARKER.len() - 1;
+            format!(
+                "{}\n{}",
+                truncate_utf8(&section, keep),
+                TRUNCATED_SECTION_MARKER
+            )
+        } else {
+            String::new()
+        };
+        let marker = if truncated.is_empty() {
+            OMITTED_SECTIONS_MARKER.replace("{count}", &(section_count - index).to_string())
+        } else {
+            marker
+        };
+        let mut output = prefix;
+        if !truncated.is_empty() {
+            if !output.is_empty() {
+                output.push_str("\n\n");
+            }
+            output.push_str(&truncated);
+        }
+        if !output.is_empty() {
+            output.push_str("\n\n");
+        }
+        output.push_str(&marker);
+        return output;
+    }
+    rendered.join("\n\n")
 }
 
 pub fn parse_knowledge(path: &str, markdown: &str) -> Result<KnowledgeEntry, AssetError> {
@@ -476,6 +586,7 @@ pub async fn discover<R: RemoteAssetReader>(
     }
     for path in [
         ".cursor/rules",
+        ".agents/rules",
         ".agents/skills",
         ".agents/knowledge",
         ".agents/playbooks",
@@ -538,7 +649,7 @@ async fn discover_tree<R: RemoteAssetReader>(
                     enabled: false,
                 });
             } else if (child.replace('\\', "/").contains("/.cursor/rules/")
-                || name.ends_with(".md"))
+                || (child.replace('\\', "/").contains("/.agents/rules/") && name.ends_with(".md")))
                 && let Ok(content) = reader.read(&child).await
             {
                 bundle.agents.push(InstructionSource {
@@ -601,6 +712,10 @@ mod tests {
         assert!(rendered.contains("Do not change tests merely to make them pass"));
         assert!(rendered.contains("Never assume a library is available"));
         assert!(rendered.contains("Pause for a self-review"));
+        assert!(rendered.contains("Be honest about evidence and outcomes"));
+        assert!(rendered.contains("import and use statements at the top"));
+        assert!(rendered.contains("open and read it before describing its contents"));
+        assert!(rendered.contains("same language the user uses"));
     }
 
     #[test]
@@ -618,6 +733,54 @@ mod tests {
             rendered.find(BUILTIN_AGENT_INSTRUCTIONS).unwrap()
                 < rendered.find("User-specific instructions").unwrap()
         );
+    }
+
+    #[test]
+    fn system_instruction_budget_preserves_builtin_and_reports_omissions() {
+        let bundle = AssetBundle {
+            agents: (0..8)
+                .map(|index| InstructionSource {
+                    path: format!("agent-{index}"),
+                    content: "agent ".repeat(MAX_ASSET_FILE_BYTES),
+                })
+                .collect(),
+            ..AssetBundle::default()
+        };
+        let rendered = bundle.system_instructions();
+        assert!(rendered.len() <= MAX_SYSTEM_INSTRUCTION_BYTES);
+        assert!(rendered.contains(BUILTIN_AGENT_INSTRUCTIONS));
+        assert!(rendered.contains("asset sections omitted"));
+    }
+
+    #[test]
+    fn budget_counts_only_fully_omitted_sections() {
+        let rendered = apply_system_instruction_budget(vec![
+            "a".repeat(MAX_SYSTEM_INSTRUCTION_BYTES - 1_000),
+            "b".repeat(5_000),
+            "later".into(),
+        ]);
+        assert!(rendered.contains(TRUNCATED_SECTION_MARKER));
+        assert!(
+            rendered.contains("[1 asset sections omitted: system instruction budget exceeded]")
+        );
+        assert!(
+            !rendered.contains("[2 asset sections omitted: system instruction budget exceeded]")
+        );
+        assert!(rendered.len() <= MAX_SYSTEM_INSTRUCTION_BYTES);
+    }
+
+    #[test]
+    fn oversized_asset_file_is_truncated_and_marked() {
+        let bundle = AssetBundle {
+            instructions: Some(InstructionSource {
+                path: "global".into(),
+                content: "x".repeat(MAX_ASSET_FILE_BYTES + 1),
+            }),
+            ..AssetBundle::default()
+        };
+        let rendered = bundle.system_instructions();
+        assert!(rendered.contains(TRUNCATED_FILE_MARKER));
+        assert!(rendered.contains("[Global Instructions]"));
     }
 
     #[test]
@@ -762,5 +925,67 @@ mod tests {
         assert_eq!(bundle.skills.len(), 1);
         assert_eq!(bundle.skills[0].name, "demo");
         assert!(bundle.agents.is_empty());
+    }
+
+    struct AssetTreeReader;
+
+    #[async_trait]
+    impl RemoteAssetReader for AssetTreeReader {
+        async fn read(&self, path: &str) -> Result<String, AssetError> {
+            match path {
+                "/repo/.agents/skills/foo/SKILL.md" => Ok("# Skill".into()),
+                "/repo/.agents/skills/foo/data/docs/a.md" => Ok("# A".into()),
+                "/repo/.agents/skills/foo/data/docs/b.md" => Ok("# B".into()),
+                "/repo/.agents/rules/x.md" => Ok("# Rule".into()),
+                "/repo/.cursor/rules/project.mdc" => Ok("# Cursor rule".into()),
+                _ => Err(AssetError::Invalid("missing".into())),
+            }
+        }
+
+        async fn list(&self, path: Option<&str>) -> Result<Vec<(String, bool)>, AssetError> {
+            match path {
+                Some("/repo/.cursor/rules") => Ok(vec![("project.mdc".into(), false)]),
+                Some("/repo/.agents/rules") => Ok(vec![("x.md".into(), false)]),
+                Some("/repo/.agents/skills") => Ok(vec![("foo".into(), true)]),
+                Some("/repo/.agents/skills/foo") => {
+                    Ok(vec![("SKILL.md".into(), false), ("data".into(), true)])
+                }
+                Some("/repo/.agents/skills/foo/data") => Ok(vec![("docs".into(), true)]),
+                Some("/repo/.agents/skills/foo/data/docs") => {
+                    Ok(vec![("a.md".into(), false), ("b.md".into(), false)])
+                }
+                _ => Err(AssetError::Invalid("missing".into())),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ignores_skill_supporting_markdown_and_discovers_agents_rules() {
+        let bundle = discover(&AssetTreeReader, "/repo").await.unwrap();
+        assert_eq!(bundle.skills.len(), 1);
+        assert_eq!(bundle.skills[0].path, "/repo/.agents/skills/foo/SKILL.md");
+        assert_eq!(bundle.agents.len(), 2);
+        assert!(
+            bundle
+                .agents
+                .iter()
+                .any(|source| source.path == "/repo/.agents/rules/x.md")
+        );
+        assert!(bundle.system_instructions().contains("# Rule"));
+        let serialized = serde_json::to_string(&bundle).unwrap();
+        assert!(!serialized.contains("data/docs/a.md"));
+        assert!(!serialized.contains("data/docs/b.md"));
+    }
+
+    #[tokio::test]
+    async fn discovers_cursor_mdc_rules_as_always_on_instructions() {
+        let bundle = discover(&AssetTreeReader, "/repo").await.unwrap();
+        assert!(
+            bundle
+                .agents
+                .iter()
+                .any(|source| source.path == "/repo/.cursor/rules/project.mdc")
+        );
+        assert!(bundle.system_instructions().contains("# Cursor rule"));
     }
 }
