@@ -850,7 +850,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
     }
   }
   flush(workEnded || events.at(-1)?.created_at_ms || workStarted);
-  if (sleepPending) nodes.push({ kind: "sleep", text: "Devin went to sleep" });
+  if (sleepPending) nodes.push({ kind: "sleep", text: "OPCOS went to sleep" });
   return nodes;
 }
 
