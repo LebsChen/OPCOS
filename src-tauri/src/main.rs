@@ -7412,9 +7412,11 @@ fn project_root(project_id: &str) -> Result<String, String> {
         .ok_or_else(|| "project path is not valid UTF-8".to_owned())
 }
 
-fn worktree_branch(role: &str, sequence: u32) -> String {
+fn worktree_branch(role: &str, sequence: u32, project_id: &str) -> String {
     let role = role.trim().to_ascii_lowercase().replace(' ', "-");
-    format!("agent/{role}-{sequence}")
+    let tail = project_id.rsplit('-').next().unwrap_or(project_id);
+    let project_suffix = &tail[tail.len().saturating_sub(8)..];
+    format!("agent/{role}-{sequence}-{project_suffix}")
 }
 
 #[tauri::command]
@@ -7921,8 +7923,7 @@ async fn create_project_from_team_template(
     project_record.workflow_json =
         serde_json::to_string(&workflow).map_err(|error| error.to_string())?;
     if let Err(error) = state.store.save_project(&project_record) {
-        let _ = delete_project(state.clone(), project_id.clone(), Some(true)).await;
-        return Err(error.to_string());
+        return Err(rollback_project_creation(state.clone(), &project_id, error.to_string()).await);
     }
     let mut config_ids = team
         .get("config_template_ids")
@@ -7936,8 +7937,7 @@ async fn create_project_from_team_template(
     config_ids.sort();
     config_ids.dedup();
     if let Err(error) = copy_config_templates_to_project(&state, &project_id, &config_ids) {
-        let _ = delete_project(state.clone(), project_id.clone(), Some(true)).await;
-        return Err(error);
+        return Err(rollback_project_creation(state.clone(), &project_id, error).await);
     }
     for (sort_order, member) in members.into_iter().enumerate() {
         let mut values = member;
@@ -7946,13 +7946,18 @@ async fn create_project_from_team_template(
                 match load_template_content(&state, template_id) {
                     Ok(value) => value,
                     Err(error) => {
-                        let _ = delete_project(state.clone(), project_id.clone(), Some(true)).await;
-                        return Err(error);
+                        return Err(
+                            rollback_project_creation(state.clone(), &project_id, error).await
+                        );
                     }
                 };
             if agent_kind != "agent-template" {
-                let _ = delete_project(state.clone(), project_id.clone(), Some(true)).await;
-                return Err(format!("{template_id} is not an agent template"));
+                return Err(rollback_project_creation(
+                    state.clone(),
+                    &project_id,
+                    format!("{template_id} is not an agent template"),
+                )
+                .await);
             }
             let template: TeamTemplateAgent = serde_json::from_str(&agent_content)
                 .map_err(|error| format!("invalid agent template: {error}"))?;
@@ -7985,8 +7990,7 @@ async fn create_project_from_team_template(
         )
         .await
         {
-            let _ = delete_project(state.clone(), project_id.clone(), Some(true)).await;
-            return Err(error);
+            return Err(rollback_project_creation(state.clone(), &project_id, error).await);
         }
     }
     list_projects(state)
@@ -7994,6 +7998,19 @@ async fn create_project_from_team_template(
         .into_iter()
         .find(|item| item.project.id == project_id)
         .ok_or_else(|| "created project could not be reloaded".to_owned())
+}
+
+async fn rollback_project_creation(
+    state: State<'_, DesktopState>,
+    project_id: &str,
+    error: String,
+) -> String {
+    match delete_project(state, project_id.to_owned(), Some(true)).await {
+        Ok(_) => error,
+        Err(cleanup_error) => {
+            format!("{error}; project cleanup failed: {cleanup_error}")
+        }
+    }
 }
 
 #[tauri::command]
@@ -8183,6 +8200,7 @@ fn clear_project_configuration(state: &DesktopState, project_id: &str) -> Result
             [project_id],
         )
         .map_err(|error| error.to_string())?;
+    drop(connection);
     refresh_secret_values(state)?;
     Ok(())
 }
@@ -8334,7 +8352,7 @@ async fn create_project_agent(
     let branch = if sort_order == 0 {
         project.default_branch.clone()
     } else {
-        branch.unwrap_or_else(|| worktree_branch(&role, sort_order))
+        branch.unwrap_or_else(|| worktree_branch(&role, sort_order, &project.id))
     };
     let host = project_host(&state, &project).await?;
     if !project_host_contains(&host, &project.repo_root)
@@ -24223,6 +24241,18 @@ agents:
         assert_eq!(
             git_branch_name("GitHub Workflow", 123).unwrap(),
             "devin/123-github-workflow"
+        );
+    }
+
+    #[test]
+    fn project_agent_branches_are_scoped_to_the_project() {
+        assert_eq!(
+            worktree_branch("Code", 1, "project-1786051024651411911"),
+            "agent/code-1-51411911"
+        );
+        assert_ne!(
+            worktree_branch("Code", 1, "project-1786051024651411911"),
+            worktree_branch("Code", 1, "project-1786048179578068371")
         );
     }
 
