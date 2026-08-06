@@ -133,6 +133,58 @@ describe("single event-log timeline", () => {
       isMajorAction: true,
     });
   });
+  it("marks resolved approvals and denied calls without process completion", () => {
+    const nodes = buildTimeline([
+      {
+        type: "approval_pending",
+        event_id: "approval",
+        created_at_ms: 1,
+        working_event: {
+          event_type: "approval_pending",
+          payload: {
+            call_id: "shell-denied",
+            tool: "run_shell",
+            arguments: { command: "rm -rf output" },
+          },
+        },
+      },
+      {
+        type: "approval_resolved",
+        event_id: "resolved",
+        created_at_ms: 2,
+        working_event: {
+          event_type: "approval_resolved",
+          payload: { call_id: "shell-denied", approved: false },
+        },
+      },
+      {
+        type: "tool_call_denied",
+        event_id: "denied",
+        created_at_ms: 3,
+        working_event: {
+          event_type: "tool_call_denied",
+          payload: {
+            call_id: "queued-shell",
+            tool: "run_shell",
+            reason: "canceled after approval denial",
+          },
+        },
+      },
+    ] as TimelineEvent[]);
+    expect(nodes[0]).toMatchObject({
+      kind: "approval",
+      callId: "shell-denied",
+      resolved: "deny",
+    });
+    const denied = nodes
+      .filter((node) => node.kind === "work")
+      .flatMap((node) => node.rows)
+      .find((row) => row.callId === "queued-shell");
+    expect(denied).toMatchObject({
+      label: "Not run: run_shell",
+      denied: true,
+    });
+  });
   it("keeps legacy events without parity fields renderable", () => {
     const nodes = buildTimeline([
       {

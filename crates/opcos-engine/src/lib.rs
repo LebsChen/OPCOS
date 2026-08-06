@@ -1265,74 +1265,89 @@ where
             })
             .map(|message| message.sequence)
             .ok_or_else(|| EngineError::Store("approval assistant message not found".into()))?;
-        let mut calls = Vec::new();
         let target = self
             .store
             .take_pending(&self.session_id, call_id)
             .map_err(|error| EngineError::Store(error.to_string()))?
             .ok_or_else(|| EngineError::ApprovalAlreadyProcessed(call_id.to_owned()))?;
-        let mut pending = vec![target];
-        pending.extend(
-            self.store
-                .load_pending(&self.session_id)
-                .map_err(|error| EngineError::Store(error.to_string()))?,
-        );
-        let active = self.track_tool_calls(
-            &pending
-                .iter()
-                .map(|item| ToolCall {
-                    id: item.call_id.clone(),
-                    name: item.tool.clone(),
-                    arguments: item.arguments.clone(),
-                })
-                .collect::<Vec<_>>(),
-        );
-        for (index, item) in pending.into_iter().enumerate() {
-            let result = if item.call_id == call_id && outcome == ApprovalOutcome::Approve {
-                if item.tool == "ask_user" {
-                    // Questions remain engine-owned pending input. Never execute one
-                    // synchronously through an approval path or fabricate an answer.
-                    json!({"error":"ask_user must be handled by the engine pending mechanism"})
-                } else {
-                    self.execute_tool_streaming(&ToolCall {
-                        id: item.call_id.clone(),
-                        name: item.tool.clone(),
-                        arguments: item.arguments.clone(),
-                    })
-                    .await
-                }
-            } else if item.call_id == call_id {
-                json!({"error":"tool call denied by user"})
+        let assistant_call_ids = self
+            .store
+            .load_messages(&self.session_id)
+            .map_err(|error| EngineError::Store(error.to_string()))?
+            .into_iter()
+            .find(|message| message.sequence == message_sequence)
+            .and_then(|message| message.content.get("tool_calls").cloned())
+            .and_then(|calls| calls.as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|call| call.get("id").and_then(Value::as_str).map(str::to_owned))
+            .collect::<Vec<_>>();
+        let pending_by_id = self
+            .store
+            .load_pending(&self.session_id)
+            .map_err(|error| EngineError::Store(error.to_string()))?
+            .into_iter()
+            .filter(|pending| assistant_call_ids.iter().any(|id| id == &pending.call_id))
+            .map(|pending| (pending.call_id.clone(), pending))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        let target_call = ToolCall {
+            id: target.call_id.clone(),
+            name: target.tool.clone(),
+            arguments: target.arguments.clone(),
+        };
+        let _active = self.track_tool_calls(std::slice::from_ref(&target_call));
+        let result = if outcome == ApprovalOutcome::Approve {
+            if target.tool == "ask_user" {
+                // Questions remain engine-owned pending input. Never execute one
+                // synchronously through an approval path or fabricate an answer.
+                json!({"error":"ask_user must be handled by the engine pending mechanism"})
+            } else if target.tool == "propose_plan" {
+                self.execute_proposed_plan(&target.arguments)
             } else {
-                json!({"error":"tool call denied pending another approval"})
-            };
-            calls.push((
-                ToolCall {
-                    id: item.call_id.clone(),
-                    name: item.tool,
-                    arguments: item.arguments,
-                },
-                result,
-            ));
-            if index > 0 {
-                self.store
-                    .delete_pending(&self.session_id, &item.call_id)
-                    .map_err(|error| EngineError::Store(error.to_string()))?;
+                self.execute_tool_streaming(&target_call).await
             }
-        }
-        for (call, result) in calls {
-            let value = json!({"role":"tool","content":[{"type":"tool_result",
-                "tool_use_id":call.id,"content":[{"type":"text","text":result.to_string()}]}]});
-            self.append("tool", value).await?;
-            self.store
-                .complete_tool_call(&self.session_id, message_sequence, &call.id, &result)
-                .map_err(|error| EngineError::Store(error.to_string()))?;
-            let category = tool_event_category(&call.name);
-            if call.name == "run_shell" {
-                let result_payload = tool_result_payload(&result);
-                let output = result
+        } else {
+            json!({"error":"tool call denied by user"})
+        };
+        self.append(
+            "tool",
+            json!({"role":"tool","content":[{"type":"tool_result",
+            "tool_use_id":target.call_id,"content":[{"type":"text","text":result.to_string()}]}]}),
+        )
+        .await?;
+        self.store
+            .complete_tool_call(&self.session_id, message_sequence, &target.call_id, &result)
+            .map_err(|error| EngineError::Store(error.to_string()))?;
+        let _ = self
+            .working_event(
+                "approval_resolved",
+                "message",
+                json!({
+                    "call_id": target.call_id,
+                    "tool": target.tool,
+                    "approved": outcome == ApprovalOutcome::Approve,
+                }),
+            )
+            .await;
+        if outcome == ApprovalOutcome::Deny {
+            let _ = self
+                .working_event(
+                    "tool_call_denied",
+                    "message",
+                    json!({
+                        "call_id": target.call_id,
+                        "tool": target.tool,
+                        "reason": "denied by user",
+                    }),
+                )
+                .await;
+        } else {
+            let result_payload = tool_result_payload(&result);
+            let category = tool_event_category(&target.tool);
+            if target.tool == "run_shell" {
+                let output = result_payload
                     .get("output")
-                    .or_else(|| result_payload.get("output"))
                     .or_else(|| result_payload.get("stdout"))
                     .map(Value::to_string)
                     .unwrap_or_else(|| result.to_string());
@@ -1342,44 +1357,105 @@ where
                         "shell",
                         json!({
                             "shell_id": shell_id_for_session(&self.session_id),
-                            "process_id": call.id,
-                            "exit_code": result_payload.get("exit_code").and_then(Value::as_i64).unwrap_or_else(|| if result_payload.get("error").is_some() { 1 } else { 0 }),
-                            "duration_ms": result.get("duration_ms").and_then(Value::as_u64).or_else(|| result_payload.get("duration_ms").and_then(Value::as_u64)),
+                            "process_id": target.call_id,
+                            "exit_code": result_payload
+                                .get("exit_code")
+                                .and_then(Value::as_i64)
+                                .unwrap_or_else(|| if result_payload.get("error").is_some() { 1 } else { 0 }),
+                            "duration_ms": result
+                                .get("duration_ms")
+                                .and_then(Value::as_u64)
+                                .or_else(|| result_payload.get("duration_ms").and_then(Value::as_u64)),
                             "output_trunc": output.chars().take(4000).collect::<String>(),
                         }),
                     )
                     .await;
             } else {
-                let result_payload = tool_result_payload(&result);
                 let _ = self
                     .working_event(
-                        &format!("{}_completed", call.name),
+                        &format!("{}_completed", target.tool),
                         category,
                         json!({
-                            "call_id":call.id,
-                            "tool":call.name,
-                            "path": call.arguments.get("path").or_else(|| call.arguments.get("target")),
-                            "ok":result_payload.get("error").is_none(),
-                            "result_type":if result.is_object() {"object"} else if result.is_array() {"array"} else {"value"},
-                            "result_bytes":result.to_string().len(),
+                            "call_id": target.call_id,
+                            "tool": target.tool,
+                            "path": target.arguments.get("path").or_else(|| target.arguments.get("target")),
+                            "ok": result_payload.get("error").is_none(),
+                            "result_type": if result.is_object() { "object" } else if result.is_array() { "array" } else { "value" },
+                            "result_bytes": result.to_string().len(),
                         }),
                     )
                     .await;
             }
-            let _ = self.emit_event(
-                "tool_result",
-                StreamChunk {
-                    tool_result: Some(ToolResult {
-                        call_id: call.id,
-                        name: call.name,
-                        arguments: call.arguments,
-                        result,
-                    }),
-                    ..StreamChunk::default()
-                },
-            );
         }
-        drop(active);
+        let _ = self.emit_event(
+            "tool_result",
+            StreamChunk {
+                tool_result: Some(ToolResult {
+                    call_id: target.call_id.clone(),
+                    name: target.tool.clone(),
+                    arguments: target.arguments.clone(),
+                    result: result.clone(),
+                }),
+                ..StreamChunk::default()
+            },
+        );
+
+        let remaining = assistant_call_ids
+            .iter()
+            .filter_map(|id| pending_by_id.get(id))
+            .filter(|pending| pending.call_id != call_id)
+            .collect::<Vec<_>>();
+        if outcome == ApprovalOutcome::Approve {
+            if !remaining.is_empty() {
+                let queued_calls = remaining
+                    .iter()
+                    .map(|pending| ToolCall {
+                        id: pending.call_id.clone(),
+                        name: pending.tool.clone(),
+                        arguments: pending.arguments.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                for pending in &remaining {
+                    self.store
+                        .delete_pending(&self.session_id, &pending.call_id)
+                        .map_err(|error| EngineError::Store(error.to_string()))?;
+                }
+                match self.execute_tools(message_sequence, &queued_calls).await {
+                    Ok(_) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            return self.run_loop(self.provider_messages()?).await;
+        }
+
+        for pending in remaining {
+            let denied = json!({"error":"tool call canceled after approval denial"});
+            self.store
+                .delete_pending(&self.session_id, &pending.call_id)
+                .map_err(|error| EngineError::Store(error.to_string()))?;
+            self.append("tool", json!({"role":"tool","content":[{"type":"tool_result",
+                "tool_use_id":pending.call_id,"content":[{"type":"text","text":denied.to_string()}]}]}))
+                .await?;
+            self.store
+                .complete_tool_call(
+                    &self.session_id,
+                    message_sequence,
+                    &pending.call_id,
+                    &denied,
+                )
+                .map_err(|error| EngineError::Store(error.to_string()))?;
+            let _ = self
+                .working_event(
+                    "tool_call_denied",
+                    "message",
+                    json!({
+                        "call_id": pending.call_id,
+                        "tool": pending.tool,
+                        "reason": "canceled after approval denial",
+                    }),
+                )
+                .await;
+        }
         self.run_loop(self.provider_messages()?).await
     }
 
@@ -4447,6 +4523,23 @@ mod tests {
         }
     }
 
+    struct ApprovalQueueTools;
+
+    #[async_trait]
+    impl ToolExecutor for ApprovalQueueTools {
+        async fn execute(&self, _: &str, _: Value) -> Result<Value, String> {
+            Ok(json!("ok"))
+        }
+
+        async fn preflight(&self, name: &str, _: &Value) -> Result<PreflightDecision, String> {
+            if name == "run_shell" {
+                Ok(PreflightDecision::NeedsUser("shell approval".into()))
+            } else {
+                Ok(PreflightDecision::Allow)
+            }
+        }
+    }
+
     struct StreamingTools {
         output: String,
     }
@@ -6344,6 +6437,78 @@ mod tests {
                 .any(|event| event == "propose_plan_completed")
         );
         assert!(event_types.iter().any(|event| event == "todo_update"));
+    }
+
+    #[tokio::test]
+    async fn approval_queue_preserves_plan_after_an_earlier_approval() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let calls = vec![
+            ToolCall {
+                id: "shell-needs-approval".into(),
+                name: "run_shell".into(),
+                arguments: json!({"command":"echo ok"}),
+            },
+            ToolCall {
+                id: "plan-after-shell".into(),
+                name: "propose_plan".into(),
+                arguments: json!({
+                    "title": "Fix the harness",
+                    "summary": "Preserve plans in mixed approval batches",
+                    "steps": ["Queue approvals", "Verify persistence"],
+                }),
+            },
+        ];
+        store
+            .append_message(&StoredMessage {
+                session_id: "approval-queue".into(),
+                sequence: 1,
+                role: "assistant".into(),
+                content: json!({
+                    "tool_calls": calls.iter().map(|call| json!({
+                        "id": call.id,
+                        "name": call.name,
+                        "arguments": call.arguments,
+                    })).collect::<Vec<_>>()
+                }),
+                display_only: false,
+            })
+            .unwrap();
+        for call in &calls {
+            store
+                .append_tool_call(&opcos_store::ToolCallRecord {
+                    session_id: "approval-queue".into(),
+                    message_sequence: 1,
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    result: None,
+                })
+                .unwrap();
+        }
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(ApprovalQueueTools),
+            "approval-queue",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let pending = engine.execute_tools(1, &calls).await;
+        assert!(matches!(
+            pending,
+            Err(EngineError::ApprovalPending(id)) if id == "shell-needs-approval"
+        ));
+        let next = engine
+            .resolve_approval("shell-needs-approval", ApprovalOutcome::Approve)
+            .await;
+        assert!(next.is_ok(), "approval resolution failed: {next:?}");
+        let plan = store
+            .load_plan("approval-queue")
+            .unwrap()
+            .expect("mixed batch plan persisted");
+        assert_eq!(plan.title, "Fix the harness");
+        assert_eq!(plan.steps.len(), 2);
     }
 
     #[tokio::test]

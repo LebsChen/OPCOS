@@ -51,6 +51,7 @@ export type TimelineNode =
         processId?: string;
         exitCode?: number;
         durationMs?: number;
+        denied?: boolean;
         isMajorAction?: boolean;
         artifactId?: string;
         artifactKind?: string;
@@ -119,6 +120,10 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
     | { row: Extract<TimelineNode, { kind: "work" }>["rows"][number] }
     | undefined;
   const planSteps = new Map<string, Array<Record<string, unknown>>>();
+  const approvalNodes = new Map<
+    string,
+    Extract<TimelineNode, { kind: "approval" }>
+  >();
   const pendingTerminal = new Map<
     string,
     { output: string; truncated: boolean; totalBytes?: number }
@@ -136,6 +141,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
       processId?: string;
       exitCode?: number;
       durationMs?: number;
+      denied?: boolean;
       isMajorAction?: boolean;
       startedAt?: number;
     }
@@ -218,15 +224,21 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
             : undefined,
         });
       } else {
-        nodes.push({
+        const node = {
           kind: "approval",
           callId,
           name: String(data.tool ?? "tool"),
           args: data.arguments,
-        });
+        } as Extract<TimelineNode, { kind: "approval" }>;
+        nodes.push(node);
+        if (callId) approvalNodes.set(callId, node);
       }
       workStarted = 0;
       workEnded = 0;
+    } else if (type === "approval_resolved") {
+      const callId = String(data.call_id ?? "");
+      const node = approvalNodes.get(callId);
+      if (node) node.resolved = data.approved === true ? "allow" : "deny";
     } else if (type === "compacted") {
       const activeWork = ensureWork(event.created_at_ms);
       activeWork.rows.push({ label: "Earlier context compacted" });
@@ -352,6 +364,22 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
             processId: callId,
             exitCode,
             durationMs,
+          });
+        }
+      } else if (type === "tool_call_denied") {
+        const callId =
+          typeof data.call_id === "string" ? data.call_id : undefined;
+        const shellRow = callId ? shellRows.get(callId) : undefined;
+        if (shellRow) {
+          shellRow.denied = true;
+          shellRow.detail = String(data.reason ?? "Tool call was not run");
+        } else {
+          activeWork.rows.push({
+            label: `Not run: ${String(data.tool ?? "tool")}`,
+            detail: String(data.reason ?? "Tool call was not run"),
+            callId,
+            isMajorAction: true,
+            denied: true,
           });
         }
       } else if (type === "terminal_update") {

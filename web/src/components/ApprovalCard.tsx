@@ -78,6 +78,7 @@ export function scopeNote(
   name: string,
   args: ApprovalArgs | null | undefined,
   category?: string,
+  hostName?: string,
 ): { text: string; external: boolean } {
   if (category === "connector")
     return { text: "acts on a connected service", external: true };
@@ -93,9 +94,10 @@ export function scopeNote(
     };
   }
   const overwrite = name === "write_file" && args?.overwrite;
+  const location = hostName || "the bound host";
   return {
     text:
-      "runs on the bound remote host" +
+      `runs on ${location}` +
       (overwrite ? " · overwrites the existing file" : ""),
     external: false,
   };
@@ -188,6 +190,7 @@ export function ApprovalCard({
   onApprove,
   runTask,
   compact = false,
+  hostName,
 }: {
   item: ApprovalItem;
   onApprove: (decision: ApprovalDecision) => void;
@@ -195,10 +198,11 @@ export function ApprovalCard({
   // task-persistent "Allow every time" (in-app only, §25).
   runTask?: { id: string; title: string } | null;
   compact?: boolean;
+  hostName?: string;
 }) {
   const [peek, setPeek] = useState(false);
   const title = humanizeApprovalTitle(item.name, item.args);
-  const scope = scopeNote(item.name, item.args, item.category);
+  const scope = scopeNote(item.name, item.args, item.category, hostName);
   const grants =
     item.name === "create_scheduled_task" ? permissionLines(item.args) : [];
   // "requires approval" is the engine's default boilerplate — only surface a real reason.
