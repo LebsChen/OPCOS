@@ -39,7 +39,7 @@ use opcos_engine::{
         restore_login_state as engine_restore_login_state,
     },
     orchestration::{BoardPhase, BoardTask},
-    orchestration::{CoordinationRuntime, Envelope, Role},
+    orchestration::{CoordinationRuntime, Envelope, Role, RoleState},
     planner::{parse_planner_output, planner_dedup_key, planning_prompt},
 };
 use opcos_hosts::{
@@ -7127,6 +7127,13 @@ async fn project_host(
     state: &State<'_, DesktopState>,
     project: &ProjectRecord,
 ) -> Result<Arc<dyn Host>, String> {
+    project_host_inner(state, project).await
+}
+
+async fn project_host_inner(
+    state: &DesktopState,
+    project: &ProjectRecord,
+) -> Result<Arc<dyn Host>, String> {
     if project.host_id == "local" {
         let root = dirs::home_dir().ok_or_else(|| "home directory is unavailable".to_owned())?;
         return Ok(Arc::new(
@@ -8375,6 +8382,38 @@ async fn create_project_agent(
     system_prompt: Option<String>,
     branch: Option<String>,
 ) -> Result<ProjectAgentRecord, String> {
+    create_project_agent_inner(
+        &state,
+        project_id,
+        template_id,
+        name,
+        role,
+        sort_order,
+        provider,
+        model,
+        harness,
+        mode,
+        system_prompt,
+        branch,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_project_agent_inner(
+    state: &DesktopState,
+    project_id: String,
+    template_id: Option<String>,
+    name: String,
+    role: String,
+    sort_order: Option<u32>,
+    provider: Option<String>,
+    model: Option<String>,
+    harness: Option<String>,
+    mode: Option<String>,
+    system_prompt: Option<String>,
+    branch: Option<String>,
+) -> Result<ProjectAgentRecord, String> {
     let project = state
         .store
         .load_project(&project_id)
@@ -8404,7 +8443,7 @@ async fn create_project_agent(
             worktree_branch(&role, sort_order, project_suffix)
         })
     };
-    let host = project_host(&state, &project).await?;
+    let host = project_host_inner(state, &project).await?;
     if !project_host_contains(&host, &project.repo_root)
         || !project_host_contains(&host, &worktree_path)
     {
@@ -10083,12 +10122,28 @@ async fn engine_for_with_context(
         })
         .or_else(|| initial_task.map(str::to_owned))
         .unwrap_or_default();
+    let mut system_instructions = bundle.system_instructions_for(KnowledgeContext {
+        task: &task_text,
+        repository: Some(&workspace),
+        project: session.project_id.as_deref(),
+    });
+    if session.project_id.is_some()
+        && let Ok(Some(agent)) = state.store.load_project_agent_by_session(session_id)
+        && agent.sort_order == 0
+        && agent.role.eq_ignore_ascii_case("lead")
+        && state.store.load_plan(session_id).ok().flatten().is_some()
+    {
+        system_instructions.push_str(
+            "\n\nAutonomous project routing policy: you are the Lead orchestrator. \
+             Internal worker routing is automatic and is never a user question. \
+             Do not ask whether to execute in-session or dispatch workers, and do not \
+             present that choice as an option. Sequence, synthesize, and verify; workers \
+             execute their assigned steps. Ask the user only about genuine product \
+             ambiguity or risky external actions requiring approval.",
+        );
+    }
     engine
-        .set_system_instructions(Some(bundle.system_instructions_for(KnowledgeContext {
-            task: &task_text,
-            repository: Some(&workspace),
-            project: session.project_id.as_deref(),
-        })))
+        .set_system_instructions(Some(system_instructions))
         .await;
     if !bundle.knowledge.is_empty() {
         let working_event = json!({
@@ -12310,6 +12365,14 @@ pub(crate) async fn submit_turn_inner_with_context(
     match engine.submit_text(request.text).await {
         Ok(_) => {
             let _ = coordination_ingest_session_inner(state, &request.session_id, false).await;
+            if let Err(error) = auto_route_project_plan(&app, state, &request.session_id).await {
+                audit(
+                    state,
+                    &request.session_id,
+                    "coordination_auto_route_error",
+                    json!({"error": error}),
+                );
+            }
             let calls = state
                 .store
                 .load_tool_calls_after(&request.session_id, sequence_before)
@@ -19104,6 +19167,387 @@ async fn coordination_start_project(
     }))
 }
 
+async fn ensure_project_worker_session(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    project: &ProjectRecord,
+    leader: &ProjectAgentRecord,
+    role: &str,
+) -> Result<ProjectAgentRecord, String> {
+    let mut agent = state
+        .store
+        .load_project_agents(&project.id)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|candidate| candidate.role.eq_ignore_ascii_case(role));
+    if agent.is_none() {
+        agent = Some(
+            create_project_agent_inner(
+                state,
+                project.id.clone(),
+                None,
+                role.to_owned(),
+                role.to_owned(),
+                None,
+                leader.provider.clone(),
+                Some(leader.model.clone()),
+                Some("builtin".into()),
+                Some("Auto".into()),
+                Some(format!(
+                    "You are the {role} Worker. Execute only the assigned coordination task, \
+                     report concrete results and blockers to the Lead, and do not ask how work \
+                     should be routed."
+                )),
+                None,
+            )
+            .await?,
+        );
+    }
+    let mut agent = agent.expect("worker agent created");
+    if !agent.harness.eq_ignore_ascii_case("builtin") {
+        return Err(format!(
+            "{role} worker uses unsupported {} harness",
+            agent.harness
+        ));
+    }
+    let session_id = if let Some(session_id) = agent.session_id.clone() {
+        session_id
+    } else {
+        let session_id = format!(
+            "session-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let now = Utc::now();
+        save_session_via_factory(
+            state,
+            SessionRecord {
+                session_id: session_id.clone(),
+                workspace: agent.worktree_path.clone(),
+                model: if agent.model == "auto" {
+                    leader.model.clone()
+                } else {
+                    agent.model.clone()
+                },
+                mode: permission_mode_name(parse_permission_mode(&agent.mode)?).to_owned(),
+                harness: "builtin".into(),
+                title: format!("{role} Worker"),
+                extra_roots: vec![],
+                grants: json!({}),
+                pinned: false,
+                archived: false,
+                origin: None,
+                origin_label: None,
+                compaction: json!({}),
+                host_id: project.host_id.clone(),
+                provider: agent.provider.clone().or_else(|| leader.provider.clone()),
+                external_session_id: None,
+                run_state: "idle".into(),
+                stop_reason: "none".into(),
+                created_at: now,
+                updated_at: now,
+                project_id: Some(project.id.clone()),
+                agent_id: Some(agent.id.clone()),
+            },
+            false,
+        )?;
+        state
+            .store
+            .update_project_agent_session(&agent.id, Some(&session_id))
+            .map_err(|error| error.to_string())?;
+        agent.session_id = Some(session_id.clone());
+        session_id
+    };
+    engine_for(app, state, &session_id, ToolOrigin::User).await?;
+    Ok(agent)
+}
+
+async fn ensure_project_coordination(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    project_id: &str,
+    leader_session_id: &str,
+) -> Result<Value, String> {
+    let project = state
+        .store
+        .load_project(project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    let leader = state
+        .store
+        .load_project_agent_by_session(leader_session_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project Lead session is not bound to a project role".to_owned())?;
+    if leader.sort_order != 0 || !leader.role.eq_ignore_ascii_case("lead") {
+        return Err("project session is not the Lead".into());
+    }
+    let mut roles = vec![Role {
+        project_id: project_id.into(),
+        id: leader.id.clone(),
+        sort_order: leader.sort_order,
+        session_id: leader_session_id.into(),
+        state: RoleState::Active,
+    }];
+    let mut unavailable = Vec::new();
+    for (sort_order, role) in ["Code", "Review"].into_iter().enumerate() {
+        match ensure_project_worker_session(app, state, &project, &leader, role).await {
+            Ok(agent) => roles.push(Role {
+                project_id: project_id.into(),
+                id: agent.id,
+                sort_order: (sort_order + 1) as u32,
+                session_id: agent.session_id.unwrap_or_default(),
+                state: RoleState::Active,
+            }),
+            Err(reason) => unavailable.push(json!({"role": role, "reason": reason})),
+        }
+    }
+    let task_id = format!("project-board:{project_id}");
+    let mut runtimes = state.coordination.lock().await;
+    if !runtimes.contains_key(&task_id) {
+        let runtime = CoordinationRuntime::new(roles).map_err(|error| error.to_string())?;
+        let persisted = {
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            load_persisted_coord_messages(&connection, &task_id)?
+        };
+        let mut runtime = runtime;
+        runtime
+            .restore_messages(persisted)
+            .map_err(|error| format!("stored coordination history is invalid: {error}"))?;
+        runtimes.insert(task_id.clone(), runtime);
+    }
+    drop(runtimes);
+    Ok(json!({
+        "project_id": project_id,
+        "task_id": task_id,
+        "unavailable_workers": unavailable,
+        "started": true
+    }))
+}
+
+fn worker_role_for_plan_step(step: &opcos_store::PlanStepRecord) -> &'static str {
+    let description = step.description.to_ascii_lowercase();
+    if ["review", "audit", "verify", "test ", "tests", "validation"]
+        .iter()
+        .any(|marker| description.contains(marker))
+    {
+        "Review"
+    } else {
+        "Code"
+    }
+}
+
+async fn record_local_plan_execution(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    leader_session_id: &str,
+    step: &opcos_store::PlanStepRecord,
+    reason: &str,
+) -> Result<(), String> {
+    let payload = json!({
+        "step_id": step.step_id,
+        "description": step.description,
+        "reason": reason,
+        "execution": "lead_local",
+    });
+    audit(
+        state,
+        leader_session_id,
+        "coordination_local_execution",
+        payload.clone(),
+    );
+    emit(
+        app,
+        "coordination_local_execution",
+        Some(leader_session_id),
+        payload,
+    );
+    state
+        .store
+        .update_plan_step(
+            leader_session_id,
+            &step.step_id,
+            Some("in_progress"),
+            None,
+            Some(reason),
+        )
+        .map_err(|error| error.to_string())?;
+    let engine = engine_for(app, state, leader_session_id, ToolOrigin::User).await?;
+    engine
+        .submit_text(format!(
+            "Execute this plan step locally as the Lead because worker dispatch was unavailable: \
+             {}. Do not ask the user how to route it; perform the step and verify the result.",
+            step.description
+        ))
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+async fn auto_route_project_plan(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    leader_session_id: &str,
+) -> Result<(), String> {
+    let Some(session) = state
+        .store
+        .load_session(leader_session_id)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    let Some(project_id) = session.project_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(plan) = state
+        .store
+        .load_plan(leader_session_id)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    let setup = ensure_project_coordination(app, state, project_id, leader_session_id).await?;
+    let unavailable = setup
+        .get("unavailable_workers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let serial = state
+        .store
+        .load_project(project_id)
+        .ok()
+        .flatten()
+        .and_then(|project| serde_json::from_str::<Value>(&project.workflow_json).ok())
+        .and_then(|workflow| workflow.get("serial").and_then(Value::as_bool))
+        .unwrap_or(true);
+    let steps = plan
+        .steps
+        .into_iter()
+        .filter(|step| step.status == "not_started");
+    for step in if serial {
+        steps.take(1).collect::<Vec<_>>()
+    } else {
+        steps.collect::<Vec<_>>()
+    } {
+        let role_name = worker_role_for_plan_step(&step);
+        let worker = state
+            .store
+            .load_project_agents(project_id)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|agent| agent.role.eq_ignore_ascii_case(role_name));
+        let Some(worker) = worker.filter(|agent| {
+            agent.session_id.is_some() && agent.harness.eq_ignore_ascii_case("builtin")
+        }) else {
+            let reason = unavailable
+                .iter()
+                .find(|item| item["role"].as_str() == Some(role_name))
+                .and_then(|item| item["reason"].as_str())
+                .unwrap_or("worker session is unavailable");
+            record_local_plan_execution(app, state, leader_session_id, &step, reason).await?;
+            continue;
+        };
+        let task_id = format!("plan-step:{}", step.step_id);
+        let existing = {
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            connection
+                .query_row("SELECT 1 FROM coord_tasks WHERE id=?1", [&task_id], |_| {
+                    Ok(true)
+                })
+                .optional()
+                .map_err(|error| error.to_string())?
+                .unwrap_or(false)
+        };
+        if existing {
+            continue;
+        }
+        state
+            .store
+            .update_plan_step(
+                leader_session_id,
+                &step.step_id,
+                Some("in_progress"),
+                None,
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+        {
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            save_coord_task(
+                &connection,
+                &BoardTask {
+                    project_id: project_id.into(),
+                    id: task_id.clone(),
+                    title: step.description.clone(),
+                    phase: BoardPhase::Open,
+                    assignee: None,
+                    lease_generation: 0,
+                    lease_until: None,
+                    require_acceptance: true,
+                    verified_pr_url: None,
+                    branch: Some(worker.branch.clone()),
+                    pr: None,
+                    dispatch_count: 0,
+                    dispatch_limit: 8,
+                },
+            )?;
+        }
+        let message = format!(
+            "Execute assigned plan step {}: {}. Work only in your assigned workspace, \
+             report concrete results or blockers to the Lead using the coordination protocol.",
+            step.step_id, step.description
+        );
+        let result = execute_coordination_tool(
+            &state.store,
+            &state.database,
+            &state.engines,
+            &state.coordination,
+            leader_session_id,
+            "coordination_dispatch",
+            &json!({
+                "task_id": task_id,
+                "worker_role_id": worker.id,
+                "message": message,
+            }),
+        )
+        .await;
+        match result {
+            Ok(dispatch) => {
+                audit(
+                    state,
+                    leader_session_id,
+                    "coordination_auto_dispatch",
+                    json!({"step_id": step.step_id, "worker_role": role_name, "dispatch": dispatch}),
+                );
+                let worker_session = worker.session_id.expect("filtered worker session");
+                let engine = engine_for(app, state, &worker_session, ToolOrigin::User).await?;
+                engine
+                    .submit_text(message)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            Err(reason) => {
+                record_local_plan_execution(
+                    app,
+                    state,
+                    leader_session_id,
+                    &step,
+                    &format!("automatic dispatch failed: {reason}"),
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn coordination_message(
     state: State<'_, DesktopState>,
@@ -22750,6 +23194,28 @@ mod m7_tests {
             worktree_branch("Code", 1, "second")
         );
         assert_eq!(worktree_branch("Code", 1, "first"), "agent/code-1-first");
+    }
+
+    #[test]
+    fn autonomous_plan_routing_assigns_implementation_and_review_steps() {
+        let implementation = opcos_store::PlanStepRecord {
+            step_id: "step-code".into(),
+            plan_id: "plan".into(),
+            position: 0,
+            description: "Implement the checkout flow".into(),
+            status: "not_started".into(),
+            failure_reason: None,
+            abandoned_reason: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let review = opcos_store::PlanStepRecord {
+            description: "Review and verify the checkout flow".into(),
+            step_id: "step-review".into(),
+            ..implementation.clone()
+        };
+        assert_eq!(worker_role_for_plan_step(&implementation), "Code");
+        assert_eq!(worker_role_for_plan_step(&review), "Review");
     }
 
     #[test]
