@@ -21796,10 +21796,22 @@ fn reset_slash_commands(
 
 #[tauri::command]
 fn provider_configurations(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
-    let connection = state
-        .database
-        .lock()
-        .map_err(|_| "database lock poisoned".to_owned())?;
+    let settings = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned".to_owned())?;
+        let mut statement = connection
+            .prepare("SELECT key,value FROM settings WHERE key LIKE 'provider.%'")
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<HashMap<_, _>, _>>()
+            .map_err(|error| error.to_string())?
+    };
     registry::descriptors()
         .into_iter()
         .map(|descriptor| {
@@ -21811,13 +21823,13 @@ fn provider_configurations(state: State<'_, DesktopState>) -> Result<Vec<Value>,
                 .is_some()
                 || descriptor.name == "ollama";
             let key = format!("provider.base_url.{}", descriptor.name);
-            let base_url = connection
-                .query_row("SELECT value FROM settings WHERE key=?1", [&key], |row| {
-                    row.get::<_, String>(0)
-                })
-                .ok()
+            let base_url = settings
+                .get(&key)
+                .cloned()
                 .or(descriptor.default_base_url.clone());
-            let model = provider_model_setting_exact(&connection, &descriptor.name);
+            let model = settings
+                .get(&format!("provider.model.{}", descriptor.name))
+                .cloned();
             Ok(json!({
                 "provider": descriptor.name,
                 "base_url": base_url,
