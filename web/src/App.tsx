@@ -23,6 +23,7 @@ import {
   hostStatusLabel,
   errorMessage,
   effectiveRunningState,
+  mergeSessionsPreservingOptimistic,
   pendingQuestionFromPayload,
   reconcileRunningState,
   redactApproval,
@@ -9620,6 +9621,8 @@ function AppContent() {
   const [hosts, setHosts] = useState<Host[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const selectedIdRef = useRef<string | undefined>(undefined);
+  const optimisticSessionIdsRef = useRef(new Set<string>());
   const selected = useMemo(
     () => selectedSessionFromList(sessions, selectedId),
     [sessions, selectedId],
@@ -9629,12 +9632,16 @@ function AppContent() {
   ) => {
     const resolved = typeof next === "function" ? next(selected) : next;
     if (!resolved) {
+      selectedIdRef.current = undefined;
       setSelectedId(null);
       return;
     }
+    selectedIdRef.current = resolved.id;
     setSelectedId(resolved.id);
+    const exists = sessions.some((item) => item.id === resolved.id);
+    if (!exists) optimisticSessionIdsRef.current.add(resolved.id);
+    else optimisticSessionIdsRef.current.delete(resolved.id);
     setSessions((items) => {
-      const exists = items.some((item) => item.id === resolved.id);
       return exists
         ? items.map((item) =>
             item.id === resolved.id ? { ...item, ...resolved } : item,
@@ -9659,10 +9666,9 @@ function AppContent() {
   const [error, setError] = useState("");
   const errorTimer = useRef<number | undefined>(undefined);
   const [running, setRunning] = useState(false);
-  const selectedIdRef = useRef<string | undefined>(undefined);
   useEffect(() => {
-    selectedIdRef.current = selected?.id;
-  }, [selected?.id]);
+    selectedIdRef.current = selectedId ?? undefined;
+  }, [selectedId]);
   const effectiveRunning = effectiveRunningState(
     pendingQuestion !== null,
     selected?.run_state,
@@ -9804,11 +9810,20 @@ function AppContent() {
       command<InboxRecord[]>("list_inbox"),
     ]);
     setHosts(nextHosts);
-    setSessions(nextSessions);
+    const optimisticSessionIds = new Set(optimisticSessionIdsRef.current);
+    setSessions((current) =>
+      mergeSessionsPreservingOptimistic(
+        current,
+        nextSessions,
+        optimisticSessionIds,
+      ),
+    );
     setAssets(nextAssets);
     setProviders(nextProviders);
     setSecrets(nextSecrets);
     setInbox(nextInbox);
+    for (const session of nextSessions)
+      optimisticSessionIdsRef.current.delete(session.id);
     const nextProjects = await command<Project[]>("list_projects");
     setProjects(nextProjects);
     if (selectedProject) {

@@ -11,6 +11,7 @@ import {
   pendingQuestionFromPayload,
   reconcileRunningState,
   effectiveRunningState,
+  mergeSessionsPreservingOptimistic,
   selectedSessionFromList,
 } from "./gui";
 
@@ -142,6 +143,40 @@ describe("GUI boundary behavior", () => {
     expect(selectedSessionFromList([running], "s")?.run_state).toBe("running");
     const idle = { ...running, run_state: "idle" };
     expect(selectedSessionFromList([idle], "s")?.run_state).toBe("idle");
+  });
+
+  it("keeps an optimistic created session through a refresh race", () => {
+    const created = {
+      id: "new",
+      title: "new task",
+      host_id: "h",
+      host_name: "host",
+      model: "model",
+      mode: "Auto",
+      harness: "builtin",
+      run_state: "running",
+      stop_reason: "none",
+    };
+    const optimistic = new Set([created.id]);
+    const afterMissingRefresh = mergeSessionsPreservingOptimistic(
+      [created],
+      [],
+      optimistic,
+    );
+    expect(selectedSessionFromList(afterMissingRefresh, created.id)).toEqual(
+      created,
+    );
+    const refreshed = { ...created, run_state: "idle" };
+    expect(
+      selectedSessionFromList(
+        mergeSessionsPreservingOptimistic(
+          afterMissingRefresh,
+          [refreshed],
+          optimistic,
+        ),
+        created.id,
+      ),
+    ).toEqual(refreshed);
   });
 
   it("does not contain the retired private gateway address", () => {

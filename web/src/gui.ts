@@ -132,6 +132,18 @@ export function selectedSessionFromList(
   return sessions.find((session) => session.id === selectedId) ?? null;
 }
 
+export function mergeSessionsPreservingOptimistic(
+  current: Session[],
+  refreshed: Session[],
+  optimisticIds: ReadonlySet<string>,
+): Session[] {
+  const refreshedIds = new Set(refreshed.map((session) => session.id));
+  const preserved = current.filter(
+    (session) => optimisticIds.has(session.id) && !refreshedIds.has(session.id),
+  );
+  return preserved.length > 0 ? [...refreshed, ...preserved] : refreshed;
+}
+
 export function submissionRoute(
   running: boolean,
   canSteer: boolean,
