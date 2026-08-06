@@ -1161,3 +1161,47 @@ references something "we use elsewhere in our codebase" that does not exist.
   overlay swallows the click). Click somewhere neutral first, re-type, then click the send arrow — and
   check the store/transcript that the message actually landed before waiting on it.
 
+
+## Session-specific reliability notes (2026-08)
+
+### Long project paths and GUI input
+
+The project dialog can silently truncate long repository paths when text is entered character by
+character. Prefer clipboard paste (`Ctrl+V`) or create a fixture repository under a short path
+inside the containment-approved workspace. After creation, verify the exact `repo_root` and
+member worktree paths in sqlite and with `git -C <repo> worktree list`; never treat the visible
+field or project board alone as proof of the path that was submitted. Use ASCII prompts when
+possible: computer-use typing can silently drop CJK text in the WebView.
+
+### Workspace containment
+
+Project and session paths must remain under the explicitly approved workspace or the user's home
+for the built-in local host. Do not use `/tmp`, arbitrary host paths, or a path copied from an
+untrusted transcript as a fixture. Before a run, confirm the project repository and session
+workspace are the intended paths; after a run, verify that files and worktrees were created only
+under that boundary.
+
+### Diagnosing a hard freeze
+
+A stuck spinner is not sufficient evidence of a UI problem. Capture process state and every thread
+while the app is hung:
+
+```bash
+ps -o pid,stat,pcpu,wchan:32,cmd -p <pid>
+gdb -q -p <pid> -batch -ex 'thread apply all bt' > /tmp/opcos-freeze.bt
+```
+
+Check whether the process is sleeping in `futex_wait_queue_me` (lock/deadlock) or consuming CPU.
+For SQLite-related hangs, inspect stacks for a recursive `Mutex<rusqlite::Connection>::lock` and
+trace the synchronous call chain. In particular, never hold a database mutex guard while calling
+a state-taking helper that acquires the same mutex; finish the SQL work, drop the guard, then call
+the helper. Reproduce against a clean revision before attributing a freeze to local changes.
+
+### Approval verification discipline
+
+For an approval continuation, record the exact sequence of persisted `approval_pending` and
+`approval_resolved` events by `call_id`. The next pending call must be selected by the engine's
+returned `next_call_id`, never by taking the first database row. A card that says Approved is not
+engine evidence: verify the corresponding persisted resolution event and that the next tool or
+approval actually starts. When several gated writes are needed, use fresh marker filenames and
+verify the remote file state after each Allow/Deny decision.

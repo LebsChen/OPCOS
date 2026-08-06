@@ -1,0 +1,2266 @@
+[
+  {
+    "slug": "figma-remote",
+    "name": "Figma",
+    "description": "Complete Figma API integration: get files/nodes/images, manage comments and reactions, handle components/styles, create webhooks, and access library analytics with full API functionality",
+    "links": {
+      "Documentation": "https://developers.figma.com/docs/figma-mcp-server/remote-server-installation/",
+      "Website": "https://www.figma.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.figma.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "atlassian",
+    "name": "Atlassian",
+    "description": "Official Atlassian integration for Jira and Confluence - access enterprise knowledge, manage issues, and create documentation",
+    "links": {
+      "Documentation": "https://www.atlassian.com/platform/remote-mcp-server",
+      "Website": "https://www.atlassian.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.atlassian.com/v1/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "linear",
+    "name": "Linear",
+    "description": "List, create, update, and query Linear objects—issues, projects, initiatives, cycles, comments, and more",
+    "links": {
+      "Documentation": "https://linear.app/changelog/2025-05-01-mcp",
+      "Website": "https://linear.app/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.linear.app/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "notion",
+    "name": "Notion",
+    "description": "Retrieve and manage Notion pages, databases, and comments; search across your workspace; create, update, move, and duplicate pages and databases.",
+    "links": {
+      "Documentation": "https://developers.notion.com/docs/mcp",
+      "Website": "https://www.notion.so/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.notion.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "sentry",
+    "name": "Sentry",
+    "description": "Retrieve detailed Sentry issue data and full stack traces. Also search and filter issues, update issue status, assignments, tags, bookmarks, and alerts.",
+    "links": {
+      "Documentation": "https://mcp.sentry.dev/",
+      "Website": "https://sentry.io/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.sentry.dev/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "context7",
+    "name": "Context7",
+    "description": "Access up-to-date documentation for 1000+ npm packages and frameworks",
+    "links": {
+      "Documentation": "https://github.com/upstash/context7",
+      "Website": "https://upstash.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.context7.com/mcp",
+    "auth": "none"
+  },
+  {
+    "slug": "playwright",
+    "name": "Playwright",
+    "description": "Automate browser interactions and inspect pages: navigate URLs, handle dialogs, upload files, and intercept network requests. Also take snapshots, evaluate JavaScript, resize windows, and more",
+    "links": {
+      "Documentation": "https://hub.docker.com/r/mcp/playwright",
+      "Website": "https://playwright.dev/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "stdio",
+    "command": "docker",
+    "args": [
+      "run",
+      "--rm",
+      "-i",
+      "mcp/playwright"
+    ],
+    "env": {},
+    "auth": "none"
+  },
+  {
+    "slug": "aws-redshift",
+    "name": "Amazon Redshift (IAM Auth)",
+    "description": "Amazon Redshift integration for data warehouse operations and analytics",
+    "links": {
+      "Documentation": "https://awslabs.github.io/mcp/servers/redshift-mcp-server/",
+      "Website": "https://aws.amazon.com/redshift/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "stdio",
+    "command": "uvx",
+    "args": [
+      "awslabs.redshift-mcp-server@latest"
+    ],
+    "env": {
+      "AWS_PROFILE": "",
+      "AWS_REGION": ""
+    },
+    "auth": "none",
+    "required_inputs": [
+      "AWS_PROFILE",
+      "AWS_REGION"
+    ]
+  },
+  {
+    "slug": "amplitude",
+    "name": "Amplitude",
+    "description": "Analyze product data, experiments, and user behavior in Amplitude: query and create charts, dashboards, experiments, cohorts, and session replays using natural language.",
+    "links": {
+      "Documentation": "https://amplitude.com/docs/amplitude-ai/amplitude-mcp",
+      "Website": "https://amplitude.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.amplitude.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "graphos-tools",
+    "name": "Apollo GraphOS",
+    "description": "Apollo GraphOS integration to search Apollo docs, specs, and best practices",
+    "links": {
+      "Documentation": "https://www.apollographql.com/docs/graphos/platform/graphos-mcp-tools",
+      "Website": "https://www.apollographql.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.apollographql.com",
+    "auth": "none"
+  },
+  {
+    "slug": "apollo-io",
+    "name": "Apollo.io",
+    "description": "Apollo.io integration to search prospects, enrich contacts, and manage sales sequences",
+    "links": {
+      "Documentation": "https://docs.apollo.io/docs/apollo-mcp",
+      "Website": "https://www.apollo.io/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.apollo.io/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "asana",
+    "name": "Asana",
+    "description": "Official Asana integration for task management, project tracking, and team collaboration",
+    "links": {
+      "Documentation": "https://developers.asana.com/docs/mcp-server",
+      "Website": "https://asana.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.asana.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "attio",
+    "name": "Attio",
+    "description": "Attio CRM integration for managing contacts, companies, deals, tasks, notes, and pipeline data through natural language",
+    "links": {
+      "Documentation": "https://docs.attio.com/mcp/overview",
+      "Website": "https://attio.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.attio.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "aura",
+    "name": "Aura",
+    "description": "Aura integration for company intelligence and workforce analytics",
+    "links": {
+      "Documentation": "https://docs.getaura.ai/",
+      "Website": "https://www.getaura.ai/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.auraintelligence.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "aws-marketplace",
+    "name": "AWS Marketplace",
+    "description": "AWS Marketplace integration to discover, evaluate, and buy cloud solutions",
+    "links": {
+      "Documentation": "https://docs.aws.amazon.com/marketplace/latest/APIReference/marketplace-mcp-server.html",
+      "Website": "https://aws.amazon.com/marketplace"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://marketplace-mcp.us-east-1.api.aws/",
+    "auth": "none"
+  },
+  {
+    "slug": "axiom-api-key",
+    "name": "Axiom (API key)",
+    "description": "Query logs, traces, and events in Axiom using APL. List datasets, explore schemas, and monitor alerts via the official Axiom MCP server.",
+    "links": {
+      "Documentation": "https://axiom.co/docs/console/intelligence/mcp-server",
+      "Website": "https://axiom.co/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.axiom.co/mcp",
+    "auth": "none",
+    "required_inputs": [
+      "Authorization",
+      "x-axiom-org-id"
+    ],
+    "credential_inputs": [
+      "Authorization"
+    ]
+  },
+  {
+    "slug": "browserless",
+    "name": "Browserless",
+    "description": "Browser automation in the cloud: smart scraping, web search, crawling, Lighthouse audits, and custom Puppeteer code execution with no infrastructure required.",
+    "links": {
+      "Documentation": "https://docs.browserless.io/mcp/browserless-mcp-server",
+      "Website": "https://www.browserless.io/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.browserless.io/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "calendly",
+    "name": "Calendly",
+    "description": "Calendly integration for scheduling meetings, managing events, and automating calendar workflows",
+    "links": {
+      "Documentation": "https://developer.calendly.com/",
+      "Website": "https://calendly.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.calendly.com",
+    "auth": "oauth"
+  },
+  {
+    "slug": "cdata-connect-ai",
+    "name": "CData Connect AI",
+    "description": "CData Connect AI integration for querying 350+ data sources through a managed MCP platform",
+    "links": {
+      "Documentation": "https://cloud.cdata.com/docs/Claude-Client.html",
+      "Website": "https://www.cdata.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.cloud.cdata.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "circleci",
+    "name": "CircleCI",
+    "description": "Retrieve detailed build failure logs, identify flaky tests, and fetch the status of your latest pipelines and workflows in CircleCI projects. Also get job test results, trigger pipelines, validate configs, analyze git diffs, and more.",
+    "links": {
+      "Documentation": "https://www.npmjs.com/package/@circleci/mcp-server-circleci",
+      "Website": "https://circleci.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "stdio",
+    "command": "npx",
+    "args": [
+      "-y",
+      "@circleci/mcp-server-circleci"
+    ],
+    "env": {
+      "CIRCLECI_BASE_URL": "",
+      "CIRCLECI_TOKEN": ""
+    },
+    "auth": "api_key",
+    "required_inputs": [
+      "CIRCLECI_BASE_URL",
+      "CIRCLECI_TOKEN"
+    ],
+    "credential_inputs": [
+      "CIRCLECI_TOKEN"
+    ]
+  },
+  {
+    "slug": "clerk",
+    "name": "Clerk",
+    "description": "Clerk integration to add authentication, organizations, and billing",
+    "links": {
+      "Documentation": "https://clerk.com/docs/guides/ai/mcp/clerk-mcp-server",
+      "Website": "https://clerk.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.clerk.com/mcp",
+    "auth": "none"
+  },
+  {
+    "slug": "cloudflare-ai-gateway",
+    "name": "Cloudflare AI Gateway",
+    "description": "Search your logs, get details about the prompts and responses",
+    "links": {
+      "Documentation": "https://developers.cloudflare.com/agents/model-context-protocol/mcp-servers-for-cloudflare/",
+      "Website": "https://www.cloudflare.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://ai-gateway.mcp.cloudflare.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "cloudflare-audit-logs",
+    "name": "Cloudflare Audit Logs",
+    "description": "Query audit logs and generate reports for review",
+    "links": {
+      "Documentation": "https://developers.cloudflare.com/agents/model-context-protocol/mcp-servers-for-cloudflare/",
+      "Website": "https://www.cloudflare.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://auditlogs.mcp.cloudflare.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "cloudflare-autorag",
+    "name": "Cloudflare AutoRAG",
+    "description": "List and search documents on your AutoRAGs",
+    "links": {
+      "Documentation": "https://developers.cloudflare.com/agents/model-context-protocol/mcp-servers-for-cloudflare/",
+      "Website": "https://www.cloudflare.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://autorag.mcp.cloudflare.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "cloudflare-browser-rendering",
+    "name": "Cloudflare Browser Rendering",
+    "description": "Fetch web pages, convert them to markdown and take screenshots",
+    "links": {
+      "Documentation": "https://developers.cloudflare.com/agents/model-context-protocol/mcp-servers-for-cloudflare/",
+      "Website": "https://www.cloudflare.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://browser.mcp.cloudflare.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "cloudflare-container",
+    "name": "Cloudflare Container",
+    "description": "Spin up a sandbox development environment",
+    "links": {
+      "Documentation": "https://developers.cloudflare.com/agents/model-context-protocol/mcp-servers-for-cloudflare/",
+      "Website": "https://www.cloudflare.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://containers.mcp.cloudflare.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "cloudflare-dex",
+    "name": "Cloudflare Digital Experience Monitoring",
+    "description": "Get quick insight on critical applications for your organization",
+    "links": {
+      "Documentation": "https://developers.cloudflare.com/agents/model-context-protocol/mcp-servers-for-cloudflare/",
+      "Website": "https://www.cloudflare.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://dex.mcp.cloudflare.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "cloudflare-dns-analytics",
+    "name": "Cloudflare DNS Analytics",
+    "description": "Optimize DNS performance and debug issues based on current set up",
+    "links": {
+      "Documentation": "https://developers.cloudflare.com/agents/model-context-protocol/mcp-servers-for-cloudflare/",
+      "Website": "https://www.cloudflare.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://dns-analytics.mcp.cloudflare.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "cloudflare-docs",
+    "name": "Cloudflare Documentation",
+    "description": "Access up-to-date Cloudflare reference information via MCP",
+    "links": {
+      "Documentation": "https://developers.cloudflare.com/agents/model-context-protocol/mcp-servers-for-cloudflare/",
+      "Website": "https://www.cloudflare.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://docs.mcp.cloudflare.com/mcp",
+    "auth": "none"
+  },
+  {
+    "slug": "cloudflare-graphql",
+    "name": "Cloudflare GraphQL",
+    "description": "Get analytics data using Cloudflare's GraphQL API",
+    "links": {
+      "Documentation": "https://developers.cloudflare.com/agents/model-context-protocol/mcp-servers-for-cloudflare/",
+      "Website": "https://www.cloudflare.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://graphql.mcp.cloudflare.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "cloudflare-logpush",
+    "name": "Cloudflare Logpush",
+    "description": "Get quick summaries for Logpush job health",
+    "links": {
+      "Documentation": "https://developers.cloudflare.com/agents/model-context-protocol/mcp-servers-for-cloudflare/",
+      "Website": "https://www.cloudflare.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://logs.mcp.cloudflare.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "cloudflare-observability",
+    "name": "Cloudflare Observability",
+    "description": "Debug and get insights into application logs and analytics via Cloudflare MCP",
+    "links": {
+      "Documentation": "https://developers.cloudflare.com/agents/model-context-protocol/mcp-servers-for-cloudflare/",
+      "Website": "https://www.cloudflare.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://observability.mcp.cloudflare.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "cloudflare-casb",
+    "name": "Cloudflare One CASB",
+    "description": "Quickly identify any security misconfigurations for SaaS applications to safeguard users & data",
+    "links": {
+      "Documentation": "https://developers.cloudflare.com/agents/model-context-protocol/mcp-servers-for-cloudflare/",
+      "Website": "https://www.cloudflare.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://casb.mcp.cloudflare.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "cloudflare-radar",
+    "name": "Cloudflare Radar",
+    "description": "Get global Internet traffic insights, trends, URL scans, and other utilities via Cloudflare Radar MCP",
+    "links": {
+      "Documentation": "https://developers.cloudflare.com/agents/model-context-protocol/mcp-servers-for-cloudflare/",
+      "Website": "https://www.cloudflare.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://radar.mcp.cloudflare.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "cloudflare-workers-bindings",
+    "name": "Cloudflare Workers Bindings",
+    "description": "Build Workers applications with storage, AI, and compute primitives",
+    "links": {
+      "Documentation": "https://developers.cloudflare.com/agents/model-context-protocol/mcp-servers-for-cloudflare/",
+      "Website": "https://www.cloudflare.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://bindings.mcp.cloudflare.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "cloudflare-workers-builds",
+    "name": "Cloudflare Workers Builds",
+    "description": "Get insights and manage your Cloudflare Workers Builds",
+    "links": {
+      "Documentation": "https://developers.cloudflare.com/agents/model-context-protocol/mcp-servers-for-cloudflare/",
+      "Website": "https://www.cloudflare.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://builds.mcp.cloudflare.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "cloudinary",
+    "name": "Cloudinary",
+    "description": "Cloudinary integration to manage, transform, and deliver images and videos",
+    "links": {
+      "Documentation": "https://cloudinary.com/documentation/cloudinary_llm_mcp#available_mcp_servers",
+      "Website": "https://cloudinary.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://asset-management.mcp.cloudinary.com/sse",
+    "auth": "oauth"
+  },
+  {
+    "slug": "contentsquare",
+    "name": "Contentsquare",
+    "description": "Contentsquare integration for digital experience analytics",
+    "links": {
+      "Documentation": "https://support.contentsquare.com/hc/en-us/articles/41563169756945-Model-Context-Protocol-MCP",
+      "Website": "https://www.contentsquare.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://api.contentsquare.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "corridor",
+    "name": "Corridor",
+    "description": "Corridor adds AI code security guardrails directly into your development workflow, helping to identify and fix security vulnerabilities as you code.",
+    "links": {
+      "Documentation": "https://docs.corridor.dev/",
+      "Website": "https://corridor.dev/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://app.corridor.dev/api/mcp",
+    "auth": "api_key",
+    "required_inputs": [
+      "Authorization"
+    ],
+    "credential_inputs": [
+      "Authorization"
+    ]
+  },
+  {
+    "slug": "cortex",
+    "name": "Cortex",
+    "description": "Cortex integration for service catalog, scorecards, and engineering insights",
+    "links": {
+      "Documentation": "https://docs.cortex.io/mcp",
+      "Website": "https://www.cortex.io/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "stdio",
+    "command": "docker",
+    "args": [
+      "run",
+      "--rm",
+      "-i",
+      "--env",
+      "CORTEX_API_TOKEN",
+      "--env",
+      "CORTEX_API_BASE_URL",
+      "ghcr.io/cortexapps/cortex-mcp:latest"
+    ],
+    "env": {
+      "CORTEX_API_BASE_URL": "",
+      "CORTEX_API_TOKEN": ""
+    },
+    "auth": "api_key",
+    "required_inputs": [
+      "CORTEX_API_BASE_URL",
+      "CORTEX_API_TOKEN"
+    ],
+    "credential_inputs": [
+      "CORTEX_API_TOKEN"
+    ]
+  },
+  {
+    "slug": "datadog",
+    "name": "Datadog (API key)",
+    "description": "Retrieve telemetry insights and manage Datadog platform features including incidents, monitors, logs, dashboards, metrics, traces, hosts, and more.",
+    "links": {
+      "Documentation": "https://docs.datadoghq.com/bits_ai/mcp_server/",
+      "Website": "https://www.datadoghq.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp",
+    "auth": "none",
+    "required_inputs": [
+      "DD-API-KEY",
+      "DD-APPLICATION-KEY"
+    ],
+    "credential_inputs": [
+      "DD-API-KEY",
+      "DD-APPLICATION-KEY"
+    ]
+  },
+  {
+    "slug": "datadog-remote",
+    "name": "Datadog (OAuth)",
+    "description": "Retrieve telemetry insights and manage Datadog platform features including incidents, monitors, logs, dashboards, metrics, traces, hosts, and more.",
+    "links": {
+      "Documentation": "https://docs.datadoghq.com/bits_ai/mcp_server/",
+      "Website": "https://www.datadoghq.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "datahub",
+    "name": "DataHub",
+    "description": "DataHub integration to connect AI agents to enterprise data and context",
+    "links": {
+      "Documentation": "https://docs.datahub.com/docs/features/feature-guides/mcp",
+      "Website": "https://datahub.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.datahub.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "dbt",
+    "name": "dbt",
+    "description": "Supports two setup modes: (1) CLI-only with DBT_PROJECT_DIR and DBT_PATH for local dbt projects, or (2) dbt Platform with DBT_HOST and DBT_TOKEN for Discovery API, Semantic Layer, and Admin API access. Join #tools-dbt-mcp in the dbt Community Slack (https://www.getdbt.com/community/join-the-community) for support.",
+    "links": {
+      "Documentation": "https://docs.getdbt.com/docs/dbt-ai/setup-local-mcp",
+      "Website": "https://www.getdbt.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "stdio",
+    "command": "uvx",
+    "args": [
+      "dbt-mcp"
+    ],
+    "env": {
+      "DBT_ACCOUNT_ID": "",
+      "DBT_DEV_ENV_ID": "",
+      "DBT_HOST": "",
+      "DBT_PATH": "",
+      "DBT_PROD_ENV_ID": "",
+      "DBT_PROJECT_DIR": "",
+      "DBT_TOKEN": "",
+      "DBT_USER_ID": "",
+      "MULTICELL_ACCOUNT_PREFIX": ""
+    },
+    "auth": "api_key",
+    "required_inputs": [
+      "DBT_ACCOUNT_ID",
+      "DBT_DEV_ENV_ID",
+      "DBT_HOST",
+      "DBT_PATH",
+      "DBT_PROD_ENV_ID",
+      "DBT_PROJECT_DIR",
+      "DBT_TOKEN",
+      "DBT_USER_ID",
+      "MULTICELL_ACCOUNT_PREFIX"
+    ],
+    "credential_inputs": [
+      "DBT_TOKEN"
+    ]
+  },
+  {
+    "slug": "dockerhub",
+    "name": "Docker Hub",
+    "description": "Retrieve and manage Docker Hub repositories and tags with ease: check repo/tag existence, list namespaces, repositories, tags, and Docker Hardened Images and more.",
+    "links": {
+      "Documentation": "https://hub.docker.com/r/mcp/dockerhub",
+      "Website": "https://hub.docker.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "stdio",
+    "command": "docker",
+    "args": [
+      "run",
+      "-i",
+      "--rm",
+      "-e",
+      "HUB_PAT_TOKEN",
+      "mcp/dockerhub",
+      "--transport=stdio",
+      "--username={{dockerhub.username}}"
+    ],
+    "env": {
+      "HUB_PAT_TOKEN": ""
+    },
+    "auth": "api_key",
+    "required_inputs": [
+      "HUB_PAT_TOKEN"
+    ],
+    "credential_inputs": [
+      "HUB_PAT_TOKEN"
+    ]
+  },
+  {
+    "slug": "elasticsearch",
+    "name": "Elasticsearch",
+    "description": "Retrieve detailed information about Elasticsearch indices, field mappings, shard distribution, and ES|QL search results. Also perform Query DSL searches and inspect shards via natural‑language MCP calls.",
+    "links": {
+      "Documentation": "https://hub.docker.com/r/mcp/elasticsearch",
+      "Website": "https://www.elastic.co/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "stdio",
+    "command": "docker",
+    "args": [
+      "run",
+      "-i",
+      "--rm",
+      "-e",
+      "ES_URL",
+      "-e",
+      "ES_API_KEY",
+      "mcp/elasticsearch",
+      "stdio"
+    ],
+    "env": {
+      "ES_API_KEY": "",
+      "ES_URL": ""
+    },
+    "auth": "api_key",
+    "required_inputs": [
+      "ES_API_KEY",
+      "ES_URL"
+    ],
+    "credential_inputs": [
+      "ES_API_KEY"
+    ]
+  },
+  {
+    "slug": "enterpret",
+    "name": "Enterpret",
+    "description": "Enterpret integration to get answers from unified customer feedback",
+    "links": {
+      "Documentation": "https://helpcenter.enterpret.com/en/articles/12665166-wisdom-mcp-server",
+      "Website": "https://www.enterpret.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://wisdom-api.enterpret.com/server/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "eraser",
+    "name": "Eraser",
+    "description": "Eraser integration to generate, manage, and update diagrams and docs",
+    "links": {
+      "Documentation": "https://docs.eraser.io/docs/mcp",
+      "Website": "https://www.eraser.io/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://app.eraser.io/api/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "exa",
+    "name": "Exa",
+    "description": "Exa web search for AI agents — search the web, run advanced filtered searches, and fetch full page content as clean markdown",
+    "links": {
+      "Documentation": "https://exa.ai/docs/reference/exa-mcp",
+      "Website": "https://exa.ai/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.exa.ai/mcp",
+    "auth": "none",
+    "required_inputs": [
+      "x-api-key"
+    ],
+    "credential_inputs": [
+      "x-api-key"
+    ]
+  },
+  {
+    "slug": "fathom",
+    "name": "Fathom",
+    "description": "Fathom integration for meeting data retrieval and analysis—such as recordings, transcripts, AI summaries, action items, and team activity",
+    "links": {
+      "Documentation": "https://developers.fathom.ai/mcp-docs",
+      "Website": "https://fathom.video/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://api.fathom.ai/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "firecrawl",
+    "name": "Firecrawl",
+    "description": "Discover and extract web content at scale with Firecrawl's MCP server: map sites, scrape single or multiple URLs, perform web search and deep research, and extract structured data.",
+    "links": {
+      "Documentation": "https://docs.firecrawl.dev/mcp",
+      "Website": "https://firecrawl.dev/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "stdio",
+    "command": "npx",
+    "args": [
+      "-y",
+      "firecrawl-mcp"
+    ],
+    "env": {
+      "FIRECRAWL_API_KEY": ""
+    },
+    "auth": "api_key",
+    "required_inputs": [
+      "FIRECRAWL_API_KEY"
+    ],
+    "credential_inputs": [
+      "FIRECRAWL_API_KEY"
+    ]
+  },
+  {
+    "slug": "fireflies",
+    "name": "Fireflies",
+    "description": "Fireflies integration for meeting data retrieval and analysis—such as transcripts, summaries, action items, and more metadata",
+    "links": {
+      "Documentation": "https://fireflies.ai/blog/fireflies-mcp-server",
+      "Website": "https://fireflies.ai/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://api.fireflies.ai/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "gitlab",
+    "name": "GitLab",
+    "description": "GitLab integration to securely connect AI tools to your GitLab data",
+    "links": {
+      "Documentation": "https://docs.gitlab.com/user/gitlab_duo/model_context_protocol/mcp_server/",
+      "Website": "https://gitlab.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://gitlab.com/api/v4/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "google-drive",
+    "name": "Google Drive",
+    "description": "Official Google Drive remote MCP server for searching, reading, and creating files in Drive. Configure the required OAuth client in Google Cloud Console according to the provider documentation.",
+    "links": {
+      "Documentation": "https://developers.google.com/workspace/drive/api/guides/configure-mcp-server",
+      "Website": "https://drive.google.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://drivemcp.googleapis.com/mcp/v1",
+    "auth": "oauth"
+  },
+  {
+    "slug": "grafana",
+    "name": "Grafana",
+    "description": "Grafana integration for monitoring dashboards and visualization",
+    "links": {
+      "Documentation": "https://github.com/grafana/mcp-grafana",
+      "Website": "https://grafana.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "stdio",
+    "command": "docker",
+    "args": [
+      "run",
+      "--rm",
+      "-i",
+      "-e",
+      "GRAFANA_URL",
+      "-e",
+      "GRAFANA_API_KEY",
+      "mcp/grafana",
+      "-t",
+      "stdio"
+    ],
+    "env": {
+      "GRAFANA_API_KEY": "",
+      "GRAFANA_URL": ""
+    },
+    "auth": "api_key",
+    "required_inputs": [
+      "GRAFANA_API_KEY",
+      "GRAFANA_URL"
+    ],
+    "credential_inputs": [
+      "GRAFANA_API_KEY"
+    ]
+  },
+  {
+    "slug": "granola",
+    "name": "Granola",
+    "description": "Connect your AI tools to your Granola meeting notes - search meetings, find topics, extract action items, and answer questions from your meeting history",
+    "links": {
+      "Documentation": "https://docs.granola.ai/help-center/sharing/integrations/mcp",
+      "Website": "https://granola.ai/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.granola.ai/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "hex",
+    "name": "Hex",
+    "description": "Hex integration to answer questions about your data with the Hex agent",
+    "links": {
+      "Documentation": "https://learn.hex.tech/docs/administration/mcp-server",
+      "Website": "https://hex.tech/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://app.hex.tech/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "honeycomb",
+    "name": "Honeycomb",
+    "description": "Honeycomb integration to query and explore observability data and SLOs",
+    "links": {
+      "Documentation": "https://docs.honeycomb.io/troubleshoot/product-lifecycle/beta/mcp/",
+      "Website": "https://www.honeycomb.io/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.honeycomb.io/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "hubspot",
+    "name": "HubSpot",
+    "description": "List, retrieve, create, and update HubSpot CRM objects; manage associations, properties, and schemas; create notes and tasks; list workflows; fetch user or account context and more.",
+    "links": {
+      "Documentation": "https://www.npmjs.com/package/@hubspot/mcp-server",
+      "Website": "https://www.hubspot.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "stdio",
+    "command": "npx",
+    "args": [
+      "-y",
+      "@hubspot/mcp-server"
+    ],
+    "env": {
+      "PRIVATE_APP_ACCESS_TOKEN": ""
+    },
+    "auth": "api_key",
+    "required_inputs": [
+      "PRIVATE_APP_ACCESS_TOKEN"
+    ],
+    "credential_inputs": [
+      "PRIVATE_APP_ACCESS_TOKEN"
+    ]
+  },
+  {
+    "slug": "hugging-face",
+    "name": "Hugging Face",
+    "description": "Hugging Face integration to access the Hub and thousands of Gradio apps",
+    "links": {
+      "Documentation": "https://huggingface.co/settings/mcp",
+      "Website": "https://huggingface.co/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://huggingface.co/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "incident-io",
+    "name": "incident.io",
+    "description": "incident.io integration to see and manage everything in incident.io",
+    "links": {
+      "Documentation": "https://docs.incident.io/ai/remote-mcp",
+      "Website": "https://incident.io/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.incident.io/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "jam",
+    "name": "Jam",
+    "description": "Debug faster with Jam recordings - automatically load video, user events, console logs, errors and network requests into AI context for bug analysis",
+    "links": {
+      "Documentation": "https://jam.dev/docs/debug-a-jam/mcp",
+      "Website": "https://jam.dev/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.jam.dev/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "jotform",
+    "name": "Jotform",
+    "description": "Jotform integration to create forms and analyze submissions",
+    "links": {
+      "Documentation": "https://www.jotform.com/developers/mcp",
+      "Website": "https://www.jotform.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.jotform.com/mcp-app",
+    "auth": "oauth"
+  },
+  {
+    "slug": "klaviyo",
+    "name": "Klaviyo",
+    "description": "Klaviyo integration to manage email and SMS marketing campaigns, flows, and audiences",
+    "links": {
+      "Documentation": "https://developers.klaviyo.com/en/docs/klaviyo_mcp_server",
+      "Website": "https://www.klaviyo.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.klaviyo.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "kpler",
+    "name": "Kpler",
+    "description": "Kpler integration to explore maritime and commodities intelligence",
+    "links": {
+      "Documentation": "https://developers.kpler.com/tutorials/mcp/what-is-kpler-mcp",
+      "Website": "https://www.kpler.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://claude.mcp.kpler.com/v1/mcp/",
+    "auth": "oauth"
+  },
+  {
+    "slug": "launchdarkly",
+    "name": "LaunchDarkly",
+    "description": "Manage LaunchDarkly feature flags: list, create, update, and delete flags, check flag status across environments, manage AI Configs, and inspect code references and audit log entries",
+    "links": {
+      "Documentation": "https://launchdarkly.com/docs/home/getting-started/mcp-hosted",
+      "Website": "https://launchdarkly.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.launchdarkly.com/mcp/launchdarkly",
+    "auth": "oauth"
+  },
+  {
+    "slug": "lunarcrush",
+    "name": "LunarCrush",
+    "description": "LunarCrush integration to add real-time social media data to your searches",
+    "links": {
+      "Documentation": "https://lunarcrush.com/developers/api/ai",
+      "Website": "https://lunarcrush.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://lunarcrush.ai/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "mercury",
+    "name": "Mercury",
+    "description": "Mercury integration to access banking balances, transactions, and cash flow data",
+    "links": {
+      "Documentation": "https://docs.mercury.com/docs/connecting-mercury-mcp",
+      "Website": "https://mercury.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.mercury.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "microsoft-learn",
+    "name": "Microsoft Learn",
+    "description": "Microsoft Learn integration to search trusted Microsoft documentation",
+    "links": {
+      "Documentation": "https://learn.microsoft.com/en-us/training/support/mcp",
+      "Website": "https://learn.microsoft.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://learn.microsoft.com/api/mcp",
+    "auth": "none"
+  },
+  {
+    "slug": "mintlify",
+    "name": "Mintlify",
+    "description": "Mintlify integration to search, read, and edit your documentation",
+    "links": {
+      "Documentation": "https://www.mintlify.com/docs/ai/mintlify-mcp",
+      "Website": "https://mintlify.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.mintlify.com",
+    "auth": "oauth"
+  },
+  {
+    "slug": "miro",
+    "name": "Miro",
+    "description": "Miro integration to build boards, visualize ideas, and act on feedback",
+    "links": {
+      "Documentation": "https://developers.miro.com/docs/miro-mcp/?utm_campaign=glb-27q1-nsp-pn-c2_akc-miro-mcp-launch-no-sl&utm_source=partner-sourced&utm_medium=partner&utm_term=claude-connectors&src=-partner_glb",
+      "Website": "https://miro.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.miro.com/",
+    "auth": "oauth"
+  },
+  {
+    "slug": "mixpanel",
+    "name": "Mixpanel",
+    "description": "Mixpanel integration to analyze, query, and manage your product analytics data",
+    "links": {
+      "Documentation": "https://docs.mixpanel.com/docs/features/mcp",
+      "Website": "https://mixpanel.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.mixpanel.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "mobbin",
+    "name": "Mobbin",
+    "description": "Mobbin integration giving AI agents design reference from 600,000+ real product screens to search apps, flows, and UI patterns",
+    "links": {
+      "Documentation": "https://mobbin.com/mcp",
+      "Website": "https://mobbin.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://api.mobbin.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "monday",
+    "name": "monday.com",
+    "description": "monday.com integration to manage boards, items, and work-management workflows",
+    "links": {
+      "Documentation": "https://developer.monday.com/apps/docs/mondaycom-mcp-integration",
+      "Website": "https://monday.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.monday.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "monte-carlo",
+    "name": "Monte Carlo",
+    "description": "Monte Carlo integration for data and AI observability",
+    "links": {
+      "Documentation": "https://docs.getmontecarlo.com/docs/mcp-server",
+      "Website": "https://www.montecarlodata.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://integrations.getmontecarlo.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "motherduck",
+    "name": "MotherDuck",
+    "description": "MotherDuck integration to get answers from your data with DuckDB",
+    "links": {
+      "Documentation": "https://motherduck.com/docs/sql-reference/mcp/",
+      "Website": "https://motherduck.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://api.motherduck.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "motion",
+    "name": "Motion Creative Analytics",
+    "description": "Motion integration to analyze ad creative and competitor ad libraries",
+    "links": {
+      "Documentation": "https://help.motionapp.com/en/articles/14315735-motion-mcp",
+      "Website": "https://motionapp.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://projects.motionapp.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "neon",
+    "name": "Neon",
+    "description": "List, create, and delete Neon Postgres projects and branches; execute SQL queries, inspect tables and schemas. Also perform safe schema migrations, manage compute endpoints, and provision Neon Auth.",
+    "links": {
+      "Documentation": "https://github.com/neondatabase-labs/mcp-server-neon",
+      "Website": "https://neon.tech/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.neon.tech/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "netlify",
+    "name": "Netlify",
+    "description": "Create, manage, and deploy Netlify projects; modify access controls; manage Netlify extensions. Also enable and manage form submissions, and create env variables and secrets.",
+    "links": {
+      "Documentation": "https://docs.netlify.com/welcome/build-with-ai/netlify-mcp-server/",
+      "Website": "https://www.netlify.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "stdio",
+    "command": "npx",
+    "args": [
+      "-y",
+      "@netlify/mcp"
+    ],
+    "env": {
+      "NETLIFY_PERSONAL_ACCESS_TOKEN": ""
+    },
+    "auth": "api_key",
+    "required_inputs": [
+      "NETLIFY_PERSONAL_ACCESS_TOKEN"
+    ],
+    "credential_inputs": [
+      "NETLIFY_PERSONAL_ACCESS_TOKEN"
+    ]
+  },
+  {
+    "slug": "omni-analytics",
+    "name": "Omni Analytics",
+    "description": "Omni integration to query your data using natural language",
+    "links": {
+      "Documentation": "https://docs.omni.co/ai/mcp",
+      "Website": "https://omni.co/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://callbacks.omniapp.co/callback/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "orion",
+    "name": "Orion by Gravity",
+    "description": "Orion by Gravity integration to get insights from an autonomous AI analyst",
+    "links": {
+      "Documentation": "http://docs.runorion.com/",
+      "Website": "https://runorion.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://g.runorion.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "parallel",
+    "name": "Parallel",
+    "description": "AI-powered web search and research capabilities through Parallel's MCP server",
+    "links": {
+      "Documentation": "https://docs.parallel.ai/features/remote-mcp",
+      "Website": "https://parallel.ai/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.parallel.ai/alpha/search_mcp/",
+    "auth": "api_key",
+    "required_inputs": [
+      "x-api-key"
+    ],
+    "credential_inputs": [
+      "x-api-key"
+    ]
+  },
+  {
+    "slug": "paypal",
+    "name": "PayPal",
+    "description": "Manage PayPal commerce operations; handle disputes; issue and send invoices; create orders, captures, and refunds; list transactions; track shipments; and manage subscriptions.",
+    "links": {
+      "Documentation": "https://developer.paypal.com/tools/mcp-server/",
+      "Website": "https://www.paypal.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.paypal.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "peec-ai",
+    "name": "Peec AI",
+    "description": "Peec AI integration to analyze your brand's visibility across LLMs",
+    "links": {
+      "Documentation": "https://docs.peec.ai/mcp/introduction",
+      "Website": "https://peec.ai/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://api.peec.ai/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "pendo",
+    "name": "Pendo",
+    "description": "Pendo integration for product and user insights",
+    "links": {
+      "Documentation": "https://support.pendo.io/hc/en-us/articles/41102236924955",
+      "Website": "https://www.pendo.io/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://app.pendo.io/mcp/v0/shttp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "pg-aiguide",
+    "name": "pg-aiguide",
+    "description": "pg-aiguide integration to search Postgres and Tiger docs and learn database skills",
+    "links": {
+      "Documentation": "https://github.com/timescale/pg-aiguide",
+      "Website": "https://www.tigerdata.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.tigerdata.com/docs",
+    "auth": "none"
+  },
+  {
+    "slug": "phoenix",
+    "name": "Phoenix by HG Insights",
+    "description": "Phoenix by HG Insights integration for B2B data intelligence and analytics",
+    "links": {
+      "Documentation": "https://phoenix.hginsights.com/docs/intro",
+      "Website": "https://hginsights.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://phoenix.hginsights.com/api/ai/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "pinecone",
+    "name": "Pinecone",
+    "description": "Pinecone vector database integration for semantic search and AI applications",
+    "links": {
+      "Documentation": "https://docs.pinecone.io/guides/operations/mcp-server",
+      "Website": "https://www.pinecone.io/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "stdio",
+    "command": "npx",
+    "args": [
+      "-y",
+      "@pinecone-database/mcp"
+    ],
+    "env": {
+      "PINECONE_API_KEY": ""
+    },
+    "auth": "api_key",
+    "required_inputs": [
+      "PINECONE_API_KEY"
+    ],
+    "credential_inputs": [
+      "PINECONE_API_KEY"
+    ]
+  },
+  {
+    "slug": "plaid",
+    "name": "Plaid",
+    "description": "Plaid integration for financial data management and transaction analysis",
+    "links": {
+      "Documentation": "https://plaid.com/docs/resources/mcp",
+      "Website": "https://plaid.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://api.dashboard.plaid.com/mcp",
+    "auth": "api_key",
+    "required_inputs": [
+      "Authorization"
+    ],
+    "credential_inputs": [
+      "Authorization"
+    ]
+  },
+  {
+    "slug": "planetscale",
+    "name": "PlanetScale",
+    "description": "PlanetScale integration for authenticated access to your Postgres and MySQL databases",
+    "links": {
+      "Documentation": "https://planetscale.com/docs/connect/mcp",
+      "Website": "https://planetscale.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.pscale.dev/mcp/planetscale",
+    "auth": "oauth"
+  },
+  {
+    "slug": "posthog",
+    "name": "PostHog",
+    "description": "PostHog product analytics integration for querying insights, dashboards, feature flags, experiments, error tracking, and event data through natural language",
+    "links": {
+      "Documentation": "https://posthog.com/docs/model-context-protocol",
+      "Website": "https://posthog.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.posthog.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "postman",
+    "name": "Postman",
+    "description": "Postman integration to give API context to your coding agents",
+    "links": {
+      "Documentation": "https://github.com/postmanlabs/postman-mcp-server",
+      "Website": "https://www.postman.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.postman.com/minimal",
+    "auth": "oauth"
+  },
+  {
+    "slug": "prisma",
+    "name": "Prisma",
+    "description": "Manage Prisma Postgres databases; create, list, and restore backups; generate and revoke connection strings; execute SQL queries and introspect schemas.",
+    "links": {
+      "Documentation": "https://www.prisma.io/docs/postgres/integrations/mcp-server",
+      "Website": "https://www.prisma.io/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.prisma.io/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "pulumi",
+    "name": "Pulumi",
+    "description": "Manage cloud infrastructure with Pulumi using MCP tools; preview and update stacks and manage configs across AWS and more.",
+    "links": {
+      "Documentation": "https://www.pulumi.com/docs/iac/using-pulumi/mcp-server/",
+      "Website": "https://www.pulumi.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "stdio",
+    "command": "npx",
+    "args": [
+      "-y",
+      "@pulumi/mcp-server",
+      "stdio"
+    ],
+    "env": {
+      "AWS_ACCESS_KEY_ID": "",
+      "AWS_SECRET_ACCESS_KEY": "",
+      "AWS_SESSION_TOKEN": "",
+      "PULUMI_ACCESS_TOKEN": ""
+    },
+    "auth": "api_key",
+    "required_inputs": [
+      "AWS_ACCESS_KEY_ID",
+      "AWS_SECRET_ACCESS_KEY",
+      "AWS_SESSION_TOKEN",
+      "PULUMI_ACCESS_TOKEN"
+    ],
+    "credential_inputs": [
+      "AWS_ACCESS_KEY_ID",
+      "AWS_SECRET_ACCESS_KEY",
+      "AWS_SESSION_TOKEN",
+      "PULUMI_ACCESS_TOKEN"
+    ]
+  },
+  {
+    "slug": "quicknode",
+    "name": "QuickNode",
+    "description": "QuickNode integration to manage your blockchain infrastructure",
+    "links": {
+      "Documentation": "https://www.quicknode.com/docs/build-with-ai/quicknode-mcp",
+      "Website": "https://www.quicknode.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.quicknode.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "raindrop-ai",
+    "name": "Raindrop",
+    "description": "Raindrop observability platform for AI agents — investigate issues, search events, inspect traces, and quantify signals through natural language",
+    "links": {
+      "Documentation": "https://www.raindrop.ai/docs/mcp/overview/",
+      "Website": "https://raindrop.ai/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.raindrop.ai/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "ramp",
+    "name": "Ramp",
+    "description": "Ramp integration to access corporate cards, transactions, and spend data",
+    "links": {
+      "Documentation": "https://docs.ramp.com/developer-api/v1/mcp",
+      "Website": "https://ramp.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.ramp.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "replicate",
+    "name": "Replicate",
+    "description": "Run and deploy AI models from thousands of community-contributed models",
+    "links": {
+      "Documentation": "https://replicate.com/docs/reference/mcp",
+      "Website": "https://replicate.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "stdio",
+    "command": "npx",
+    "args": [
+      "-y",
+      "replicate-mcp"
+    ],
+    "env": {
+      "REPLICATE_API_TOKEN": ""
+    },
+    "auth": "api_key",
+    "required_inputs": [
+      "REPLICATE_API_TOKEN"
+    ],
+    "credential_inputs": [
+      "REPLICATE_API_TOKEN"
+    ]
+  },
+  {
+    "slug": "sanity",
+    "name": "Sanity",
+    "description": "Sanity integration to create, query, and manage structured content",
+    "links": {
+      "Documentation": "https://www.sanity.io/docs/ai/mcp-server",
+      "Website": "https://www.sanity.io/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.sanity.io",
+    "auth": "oauth"
+  },
+  {
+    "slug": "similarweb",
+    "name": "Similarweb",
+    "description": "Similarweb integration for real-time web, mobile app, and market data",
+    "links": {
+      "Documentation": "https://docs.similarweb.com/api-v5/mcp/mcp-setup",
+      "Website": "https://www.similarweb.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.similarweb.com",
+    "auth": "oauth"
+  },
+  {
+    "slug": "slack-remote",
+    "name": "Slack",
+    "description": "Search channels and messages, send and read messages, manage canvases, and access user profiles via the official Slack MCP server. Uses user-level OAuth — if connected with organization-wide access, all org members share the same user identity. We recommend using personal access.",
+    "links": {
+      "Documentation": "https://docs.slack.dev/ai/slack-mcp-server",
+      "Website": "https://slack.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.slack.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "sonarqube",
+    "name": "SonarQube",
+    "description": "SonarQube integration for code quality analysis and issue management",
+    "links": {
+      "Documentation": "https://github.com/SonarSource/sonarqube-mcp-server",
+      "Website": "https://www.sonarsource.com/products/sonarqube/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "stdio",
+    "command": "docker",
+    "args": [
+      "run",
+      "--rm",
+      "-i",
+      "-e",
+      "SONARQUBE_TOKEN",
+      "-e",
+      "SONARQUBE_ORG",
+      "-e",
+      "SONARQUBE_URL",
+      "mcp/sonarqube"
+    ],
+    "env": {
+      "SONARQUBE_ORG": "",
+      "SONARQUBE_TOKEN": "",
+      "SONARQUBE_URL": ""
+    },
+    "auth": "api_key",
+    "required_inputs": [
+      "SONARQUBE_ORG",
+      "SONARQUBE_TOKEN",
+      "SONARQUBE_URL"
+    ],
+    "credential_inputs": [
+      "SONARQUBE_TOKEN"
+    ]
+  },
+  {
+    "slug": "square",
+    "name": "Square",
+    "description": "Manage payments, orders, inventory, customers, invoices, subscriptions, and loyalty programs in Square; fetch service and type metadata to discover and structure API calls.",
+    "links": {
+      "Documentation": "https://developer.squareup.com/docs/mcp",
+      "Website": "https://squareup.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.squareup.com/mcp",
+    "auth": "api_key",
+    "required_inputs": [
+      "Authorization"
+    ],
+    "credential_inputs": [
+      "Authorization"
+    ]
+  },
+  {
+    "slug": "stripe",
+    "name": "Stripe",
+    "description": "Create and manage customers, products, prices, subscriptions, invoices, coupons, payment links, payouts, and refunds in Stripe; read balances, disputes, docs and more.",
+    "links": {
+      "Documentation": "https://docs.stripe.com/mcp",
+      "Website": "https://stripe.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.stripe.com",
+    "auth": "oauth"
+  },
+  {
+    "slug": "stytch",
+    "name": "Stytch",
+    "description": "Stytch integration to manage your Stytch project",
+    "links": {
+      "Documentation": "https://stytch.com/docs/workspace-management/stytch-mcp",
+      "Website": "https://stytch.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.stytch.dev/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "supermetrics",
+    "name": "Supermetrics",
+    "description": "Supermetrics integration to access 200+ marketing data sources",
+    "links": {
+      "Documentation": "https://mcp.supermetrics.com/docs",
+      "Website": "https://supermetrics.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.supermetrics.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "swagger",
+    "name": "Swagger",
+    "description": "Swagger integration to build, govern, and document APIs",
+    "links": {
+      "Documentation": "https://developer.smartbear.com/smartbear-mcp/docs/remote-swagger",
+      "Website": "https://swagger.io/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://swagger.mcp.smartbear.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "tavily",
+    "name": "Tavily",
+    "description": "Real-time web search and content extraction optimized for AI agents",
+    "links": {
+      "Documentation": "https://docs.tavily.com/documentation/mcp",
+      "Website": "https://tavily.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.tavily.com/mcp",
+    "auth": "oauth"
+  },
+  {
+    "slug": "trellis",
+    "name": "Trellis",
+    "description": "Trellis integration for trial court litigation research",
+    "links": {
+      "Documentation": "https://support.trellis.law/",
+      "Website": "https://trellis.law/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.trellis.law/anthropic",
+    "auth": "oauth"
+  },
+  {
+    "slug": "unleash",
+    "name": "Unleash",
+    "description": "Manage Unleash feature flags: evaluate code changes for flag usage, create flags with best-practice validation, configure rollouts, toggle environments, and wrap code in flag checks",
+    "links": {
+      "Documentation": "https://docs.getunleash.io/integrate/mcp",
+      "Website": "https://www.getunleash.io/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "stdio",
+    "command": "npx",
+    "args": [
+      "-y",
+      "@unleash/mcp@latest",
+      "--log-level",
+      "error"
+    ],
+    "env": {
+      "UNLEASH_BASE_URL": "",
+      "UNLEASH_DEFAULT_PROJECT": "",
+      "UNLEASH_PAT": ""
+    },
+    "auth": "none",
+    "required_inputs": [
+      "UNLEASH_BASE_URL",
+      "UNLEASH_DEFAULT_PROJECT",
+      "UNLEASH_PAT"
+    ]
+  },
+  {
+    "slug": "vercel",
+    "name": "Vercel",
+    "description": "Search and navigate Vercel documentation, manage projects and deployments, analyze deployment logs and handle your Vercel infrastructure",
+    "links": {
+      "Documentation": "https://vercel.com/docs/mcp/vercel-mcp",
+      "Website": "https://vercel.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.vercel.com",
+    "auth": "oauth"
+  },
+  {
+    "slug": "windsor-ai",
+    "name": "Windsor.ai",
+    "description": "Windsor.ai integration to connect 320+ marketing data sources",
+    "links": {
+      "Documentation": "https://windsor.ai/introducing-windsor-mcp",
+      "Website": "https://windsor.ai/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.windsor.ai/",
+    "auth": "oauth"
+  },
+  {
+    "slug": "wolfram",
+    "name": "Wolfram",
+    "description": "Wolfram integration to inject precise, real-time computation and knowledge",
+    "links": {
+      "Documentation": "https://www.wolfram.com/artificial-intelligence/mcp-service/",
+      "Website": "https://www.wolfram.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://agenttools.wolfram.com/mcp",
+    "auth": "none"
+  },
+  {
+    "slug": "zapier",
+    "name": "Zapier",
+    "description": "Trigger actions across 8,000+ apps with Zapier: send Slack messages, update Sheets, create calendar events, tasks, and more.",
+    "links": {
+      "Documentation": "https://zapier.com/mcp",
+      "Website": "https://zapier.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "streamable-http",
+    "url": "https://mcp.zapier.com/api/mcp/mcp",
+    "auth": "api_key",
+    "required_inputs": [
+      "Authorization"
+    ],
+    "credential_inputs": [
+      "Authorization"
+    ]
+  },
+  {
+    "slug": "google-maps",
+    "name": "Google Maps",
+    "description": "Access Google Maps feature using natural‑language queries: geocode and reverse‑geocode addresses, search places, fetch place details, calculate distances and directions, and retrieve elevation data.",
+    "links": {
+      "Documentation": "https://www.npmjs.com/package/@modelcontextprotocol/server-google-maps",
+      "Website": "https://maps.google.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "stdio",
+    "command": "npx",
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-google-maps"
+    ],
+    "env": {
+      "GOOGLE_MAPS_API_KEY": ""
+    },
+    "auth": "api_key",
+    "required_inputs": [
+      "GOOGLE_MAPS_API_KEY"
+    ],
+    "credential_inputs": [
+      "GOOGLE_MAPS_API_KEY"
+    ]
+  },
+  {
+    "slug": "looker",
+    "name": "Looker",
+    "description": "Looker integration for BI queries and content management",
+    "links": {
+      "Documentation": "https://googleapis.github.io/genai-toolbox/resources/sources/looker/",
+      "Website": "https://github.com/googleapis/genai-toolbox"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "stdio",
+    "command": "docker",
+    "args": [
+      "run",
+      "--rm",
+      "-i",
+      "-e",
+      "LOOKER_BASE_URL",
+      "-e",
+      "LOOKER_CLIENT_ID",
+      "-e",
+      "LOOKER_CLIENT_SECRET",
+      "us-central1-docker.pkg.dev/database-toolbox/toolbox/toolbox:latest",
+      "--prebuilt",
+      "looker",
+      "--stdio"
+    ],
+    "env": {
+      "LOOKER_BASE_URL": "",
+      "LOOKER_CLIENT_ID": "",
+      "LOOKER_CLIENT_SECRET": ""
+    },
+    "auth": "api_key",
+    "required_inputs": [
+      "LOOKER_BASE_URL",
+      "LOOKER_CLIENT_ID",
+      "LOOKER_CLIENT_SECRET"
+    ],
+    "credential_inputs": [
+      "LOOKER_CLIENT_SECRET"
+    ]
+  },
+  {
+    "slug": "mysql",
+    "name": "MySQL",
+    "description": "MySQL integration for data management and SQL operations",
+    "links": {
+      "Documentation": "https://googleapis.github.io/genai-toolbox/resources/sources/mysql/",
+      "Website": "https://github.com/googleapis/genai-toolbox"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "stdio",
+    "command": "docker",
+    "args": [
+      "run",
+      "--rm",
+      "-i",
+      "-e",
+      "MYSQL_HOST",
+      "-e",
+      "MYSQL_DATABASE",
+      "-e",
+      "MYSQL_USER",
+      "-e",
+      "MYSQL_PASSWORD",
+      "-e",
+      "MYSQL_PORT",
+      "us-central1-docker.pkg.dev/database-toolbox/toolbox/toolbox:latest",
+      "--prebuilt",
+      "mysql",
+      "--stdio"
+    ],
+    "env": {
+      "MYSQL_DATABASE": "",
+      "MYSQL_HOST": "",
+      "MYSQL_PASSWORD": "",
+      "MYSQL_PORT": "",
+      "MYSQL_USER": ""
+    },
+    "auth": "api_key",
+    "required_inputs": [
+      "MYSQL_DATABASE",
+      "MYSQL_HOST",
+      "MYSQL_PASSWORD",
+      "MYSQL_PORT",
+      "MYSQL_USER"
+    ],
+    "credential_inputs": [
+      "MYSQL_PASSWORD"
+    ]
+  },
+  {
+    "slug": "perplexity-ask",
+    "name": "Perplexity Ask",
+    "description": "Perplexity Ask MCP server: web-wide research via the Perplexity API",
+    "links": {
+      "Documentation": "https://github.com/ppl-ai/modelcontextprotocol/tree/main/perplexity-ask",
+      "Website": "https://perplexity.ai/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "stdio",
+    "command": "npx",
+    "args": [
+      "-y",
+      "server-perplexity-ask"
+    ],
+    "env": {
+      "PERPLEXITY_API_KEY": ""
+    },
+    "auth": "api_key",
+    "required_inputs": [
+      "PERPLEXITY_API_KEY"
+    ],
+    "credential_inputs": [
+      "PERPLEXITY_API_KEY"
+    ]
+  },
+  {
+    "slug": "postgres",
+    "name": "PostgreSQL",
+    "description": "PostgreSQL integration for data management and SQL operations",
+    "links": {
+      "Documentation": "https://googleapis.github.io/genai-toolbox/resources/sources/postgres/",
+      "Website": "https://github.com/googleapis/genai-toolbox"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "stdio",
+    "command": "docker",
+    "args": [
+      "run",
+      "--rm",
+      "-i",
+      "-e",
+      "POSTGRES_HOST",
+      "-e",
+      "POSTGRES_DATABASE",
+      "-e",
+      "POSTGRES_USER",
+      "-e",
+      "POSTGRES_PASSWORD",
+      "-e",
+      "POSTGRES_PORT",
+      "us-central1-docker.pkg.dev/database-toolbox/toolbox/toolbox:latest",
+      "--prebuilt",
+      "postgres",
+      "--stdio"
+    ],
+    "env": {
+      "POSTGRES_DATABASE": "",
+      "POSTGRES_HOST": "",
+      "POSTGRES_PASSWORD": "",
+      "POSTGRES_PORT": "",
+      "POSTGRES_USER": ""
+    },
+    "auth": "api_key",
+    "required_inputs": [
+      "POSTGRES_DATABASE",
+      "POSTGRES_HOST",
+      "POSTGRES_PASSWORD",
+      "POSTGRES_PORT",
+      "POSTGRES_USER"
+    ],
+    "credential_inputs": [
+      "POSTGRES_PASSWORD"
+    ]
+  },
+  {
+    "slug": "redis",
+    "name": "Redis",
+    "description": "Interact with Redis using natural language: get/set keys, manage strings, hashes, lists, sets, streams, keys and JSON data; perform pub/sub operations; and retrieve server stats and client info.",
+    "links": {
+      "Documentation": "https://redis.io/docs/latest/integrate/redis-mcp/client-conf/",
+      "Website": "https://redis.io/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "stdio",
+    "command": "docker",
+    "args": [
+      "run",
+      "--rm",
+      "--name",
+      "redis-mcp-server",
+      "-i",
+      "-e",
+      "REDIS_HOST",
+      "-e",
+      "REDIS_PORT",
+      "-e",
+      "REDIS_USERNAME",
+      "-e",
+      "REDIS_PWD",
+      "mcp/redis"
+    ],
+    "env": {
+      "REDIS_HOST": "",
+      "REDIS_PORT": "",
+      "REDIS_PWD": "",
+      "REDIS_USERNAME": ""
+    },
+    "auth": "none",
+    "required_inputs": [
+      "REDIS_HOST",
+      "REDIS_PORT",
+      "REDIS_PWD",
+      "REDIS_USERNAME"
+    ]
+  },
+  {
+    "slug": "ref-tools",
+    "name": "Ref.tools",
+    "description": "Agentic search for documentation with intelligent context filtering and minimal token usage",
+    "links": {
+      "Documentation": "https://ref.tools/mcp",
+      "Website": "https://ref.tools/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "stdio",
+    "command": "npx",
+    "args": [
+      "ref-tools-mcp@latest"
+    ],
+    "env": {
+      "REF_API_KEY": ""
+    },
+    "auth": "api_key",
+    "required_inputs": [
+      "REF_API_KEY"
+    ],
+    "credential_inputs": [
+      "REF_API_KEY"
+    ]
+  },
+  {
+    "slug": "mssql",
+    "name": "SQL Server",
+    "description": "SQL Server integration for data management and T-SQL operations",
+    "links": {
+      "Documentation": "https://googleapis.github.io/genai-toolbox/resources/sources/mssql/",
+      "Website": "https://github.com/googleapis/genai-toolbox"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "stdio",
+    "command": "docker",
+    "args": [
+      "run",
+      "--rm",
+      "-i",
+      "-e",
+      "MSSQL_HOST",
+      "-e",
+      "MSSQL_DATABASE",
+      "-e",
+      "MSSQL_USER",
+      "-e",
+      "MSSQL_PASSWORD",
+      "-e",
+      "MSSQL_PORT",
+      "us-central1-docker.pkg.dev/database-toolbox/toolbox/toolbox:latest",
+      "--prebuilt",
+      "mssql",
+      "--stdio"
+    ],
+    "env": {
+      "MSSQL_DATABASE": "",
+      "MSSQL_HOST": "",
+      "MSSQL_PASSWORD": "",
+      "MSSQL_PORT": "",
+      "MSSQL_USER": ""
+    },
+    "auth": "api_key",
+    "required_inputs": [
+      "MSSQL_DATABASE",
+      "MSSQL_HOST",
+      "MSSQL_PASSWORD",
+      "MSSQL_PORT",
+      "MSSQL_USER"
+    ],
+    "credential_inputs": [
+      "MSSQL_PASSWORD"
+    ]
+  },
+  {
+    "slug": "supabase",
+    "name": "Supabase",
+    "description": "List, create, pause, and restore Supabase projects; execute SQL, apply migrations, deploy Edge Functions, handle branching, update storage buckets and configs; get URLs or API Keys for projects and more.",
+    "links": {
+      "Documentation": "https://mcpservers.org/servers/supabase-community/supabase-mcp",
+      "Website": "https://supabase.com/"
+    },
+    "enabled": false,
+    "requires_approval": true,
+    "transport": "stdio",
+    "command": "npx",
+    "args": [
+      "-y",
+      "@supabase/mcp-server-supabase@latest",
+      "--read-only"
+    ],
+    "env": {
+      "SUPABASE_ACCESS_TOKEN": ""
+    },
+    "auth": "api_key",
+    "required_inputs": [
+      "SUPABASE_ACCESS_TOKEN"
+    ],
+    "credential_inputs": [
+      "SUPABASE_ACCESS_TOKEN"
+    ]
+  }
+]

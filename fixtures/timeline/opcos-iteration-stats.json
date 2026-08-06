@@ -1,0 +1,85 @@
+[
+  {
+    "type": "context_growth_update",
+    "event_id": "context-1",
+    "created_at_ms": 1,
+    "working_event": {
+      "event_type": "context_growth_update",
+      "payload": {
+        "estimated_context_tokens": 1000,
+        "current_context_bytes": 4000,
+        "iteration_count": 1
+      }
+    }
+  },
+  {
+    "type": "iteration_stats",
+    "event_id": "stats-1",
+    "created_at_ms": 2,
+    "working_event": {
+      "event_type": "iteration_stats",
+      "payload": {
+        "iteration": 1,
+        "num_tool_calls": 2,
+        "duration_ms": 1200,
+        "inference_ms": 700,
+        "tool_exec_ms": 400,
+        "harness_ms": 100,
+        "input_tokens": 1000,
+        "output_tokens": 100,
+        "retry_count": 0,
+        "compaction_count": 1
+      }
+    }
+  },
+  {
+    "type": "iteration_checkpoint",
+    "event_id": "checkpoint-1",
+    "created_at_ms": 3,
+    "working_event": {
+      "event_type": "iteration_checkpoint",
+      "payload": {
+        "iteration": 1,
+        "num_tool_calls": 2,
+        "last_processed_incoming_event_id": "user-1"
+      }
+    }
+  },
+  {
+    "type": "iteration_stats",
+    "event_id": "stats-legacy",
+    "created_at_ms": 4,
+    "working_event": {
+      "event_type": "iteration_stats",
+      "payload": {
+        "iteration": 2,
+        "num_tool_calls": 0,
+        "duration_ms": 500
+      }
+    }
+  },
+  {
+    "type": "compacted",
+    "event_id": "compacted-auto",
+    "created_at_ms": 5,
+    "working_event": {
+      "event_type": "compacted",
+      "payload": {
+        "message": "Earlier context compacted",
+        "source": "automatic"
+      }
+    }
+  },
+  {
+    "type": "compacted",
+    "event_id": "compacted-manual",
+    "created_at_ms": 6,
+    "working_event": {
+      "event_type": "compacted",
+      "payload": {
+        "message": "Earlier context compacted",
+        "source": "manual"
+      }
+    }
+  }
+]

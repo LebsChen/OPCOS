@@ -1,0 +1,77 @@
+[
+  {
+    "type": "todo_update",
+    "event_id": "plan-iteration-1",
+    "created_at_ms": 1000,
+    "working_event": {
+      "event_type": "todo_update",
+      "payload": {
+        "plan_id": "plan-iteration",
+        "revision": 1,
+        "steps": [
+          { "step_id": "one", "description": "Create files", "status": "not_started" },
+          { "step_id": "two", "description": "Run tests", "status": "not_started" },
+          { "step_id": "three", "description": "Review output", "status": "not_started" },
+          { "step_id": "four", "description": "Update notes", "status": "not_started" },
+          { "step_id": "five", "description": "Report result", "status": "not_started" }
+        ]
+      }
+    }
+  },
+  {
+    "type": "devin_message",
+    "event_id": "plan-iteration-message-1",
+    "created_at_ms": 2000,
+    "working_event": {
+      "event_type": "devin_message",
+      "payload": { "message": "Created the files." }
+    }
+  },
+  {
+    "type": "todo_update",
+    "event_id": "plan-iteration-2",
+    "created_at_ms": 3000,
+    "working_event": {
+      "event_type": "todo_update",
+      "payload": {
+        "plan_id": "plan-iteration",
+        "revision": 2,
+        "steps": [
+          { "step_id": "one", "description": "Create files", "status": "done" },
+          { "step_id": "two", "description": "Run tests", "status": "in_progress" },
+          { "step_id": "three", "description": "Review output", "status": "not_started" },
+          { "step_id": "four", "description": "Update notes", "status": "not_started" },
+          { "step_id": "five", "description": "Report result", "status": "not_started" }
+        ]
+      }
+    }
+  },
+  {
+    "type": "devin_message",
+    "event_id": "plan-iteration-message-2",
+    "created_at_ms": 4000,
+    "working_event": {
+      "event_type": "devin_message",
+      "payload": { "message": "Tests are running." }
+    }
+  },
+  {
+    "type": "todo_update",
+    "event_id": "plan-iteration-3",
+    "created_at_ms": 5000,
+    "working_event": {
+      "event_type": "todo_update",
+      "payload": {
+        "plan_id": "plan-iteration",
+        "revision": 3,
+        "steps": [
+          { "step_id": "one", "description": "Create files", "status": "done" },
+          { "step_id": "two", "description": "Run tests", "status": "done" },
+          { "step_id": "three", "description": "Review output", "status": "in_progress" },
+          { "step_id": "four", "description": "Update notes", "status": "not_started" },
+          { "step_id": "five", "description": "Report result", "status": "not_started" }
+        ]
+      }
+    }
+  }
+]

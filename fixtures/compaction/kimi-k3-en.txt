@@ -1,0 +1,20 @@
+**Goal**
+- Fix the rounding bug in the pricing module and add regression tests.
+
+**Completed actions and results**
+- Read `src/pricing.py`; found `price()` used `round(amount * 1.08)`.
+- Identified the bug as bankers rounding on negative amounts.
+- Patched `price()` to use `Decimal.quantize` with `ROUND_HALF_UP`, returning a float; edit applied successfully.
+- Ran `pytest tests/test_pricing.py`: 3 passed, 1 failed — `test_negative_amount` expects -1.08 but got -1.07.
+
+**Key discoveries and file paths**
+- `src/pricing.py` — contains `price(amount)`; now uses `Decimal(amount * 1.08).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)`.
+- `tests/test_pricing.py` — contains failing regression test `test_negative_amount` (expects -1.08, got -1.07).
+- The `Decimal`/`ROUND_HALF_UP` fix did not resolve the negative-amount case as expected; behavior on negatives still mismatches the test's expectation.
+
+**Unfinished next steps**
+- Diagnose why `test_negative_amount` still returns -1.07 instead of -1.08 (e.g., float-to-Decimal conversion of `amount * 1.08` introducing representation error before quantization).
+- Adjust the implementation (likely quantize from a string/`Decimal(str(amount))` or quantize before multiplication) so negative amounts round half-up away from zero.
+- Re-run `pytest tests/test_pricing.py` until all tests pass.
+- Ensure `Decimal` and `ROUND_HALF_UP` are properly imported in `src/pricing.py`.
+- Add/confirm regression tests cover the original rounding bug cases, including negative amounts.
