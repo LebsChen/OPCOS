@@ -2762,6 +2762,7 @@ fn tool_risk(name: &str) -> ToolRisk {
         "git_push" | "github_create_pull_request" => ToolRisk::External,
         "github_get_pull_request" | "github_ci_status" | "github_ci_failure_log" => ToolRisk::Read,
         "run_shell" => ToolRisk::Execute,
+        "secrets_list" => ToolRisk::Read,
         "background_job_start" | "background_job_kill" => ToolRisk::Execute,
         "background_job_status" | "background_job_output" => ToolRisk::Read,
         _ => ToolRisk::External,
@@ -3256,6 +3257,7 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"write_file","description":"Write a remote file. For changes to an existing file, prefer edit_file so unrelated content is preserved.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
         json!({"type":"function","function":{"name":"edit_file","description":"Apply one or more exact replacements to a remote UTF-8 text file. The required edits argument is an array of objects, each with old_string and new_string strings. Example: {\"path\":\"src/lib.rs\",\"edits\":[{\"old_string\":\"old code\",\"new_string\":\"new code\"}]}. Every old_string must match exactly once in the original file; ambiguous or missing matches fail with diagnostics. The whole call is atomic and preserves line endings. Prefer this over rewriting an existing file.","parameters":{"type":"object","examples":[{"path":"src/lib.rs","edits":[{"old_string":"old code","new_string":"new code"}]}],"properties":{"path":{"type":"string","description":"Remote workspace-relative file path."},"edits":{"type":"array","description":"One or more exact replacements, applied atomically.","minItems":1,"items":{"type":"object","properties":{"old_string":{"type":"string","description":"Exact existing text to replace, including whitespace and line breaks."},"new_string":{"type":"string","description":"Replacement text."}},"required":["old_string","new_string"],"additionalProperties":false}}},"required":["path","edits"],"additionalProperties":false}}}),
         json!({"type":"function","function":{"name":"run_shell","description":"Run a shell command. Use cwd to select the workspace directory. Credentials are available only by naming configured secret_names; injected values are redacted from output.","parameters":{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"},"secret_names":{"type":"array","items":{"type":"string"},"description":"Configured secret names to inject into the child environment. This is the only supported credential path; values are redacted from output."}},"required":["command"]}}}),
+        json!({"type":"function","function":{"name":"secrets_list","description":"List configured credential names available to the current session. Returns names and non-sensitive metadata only; secret values, prefixes, suffixes, and lengths are never returned. Use a returned name with secret_names for credential injection.","parameters":{"type":"object","properties":{}}}}),
         json!({"type":"function","function":{"name":"background_job_start","description":"Start a long-running shell command in the background and return a job id. Output is retained with bounded storage. Use secret_names for the only supported credential injection path; injected values are redacted.","parameters":{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"},"timeout_seconds":{"type":"integer"},"secret_names":{"type":"array","items":{"type":"string"},"description":"Configured secret names to inject into the child environment."}},"required":["command"]}}}),
         json!({"type":"function","function":{"name":"background_job_status","description":"Read a background job status, exit code, and output counters.","parameters":{"type":"object","properties":{"job_id":{"type":"string"}},"required":["job_id"]}}}),
         json!({"type":"function","function":{"name":"background_job_output","description":"Read bounded background job output. Defaults to the tail; use offset for historical lines. The result reports omitted lines and total counters.","parameters":{"type":"object","properties":{"job_id":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"},"tail":{"type":"boolean"}},"required":["job_id"]}}}),
@@ -3587,6 +3589,25 @@ mod tests {
         assert!(names.contains("background_job_status"));
         assert!(names.contains("background_job_output"));
         assert!(names.contains("background_job_kill"));
+    }
+
+    #[test]
+    fn secrets_list_is_read_only_and_defined() {
+        assert_eq!(tool_risk("secrets_list"), ToolRisk::Read);
+        let definition = tool_definitions()
+            .into_iter()
+            .find(|tool| tool["function"]["name"] == "secrets_list")
+            .unwrap();
+        assert!(
+            definition["function"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("names")
+        );
+        assert_eq!(
+            definition["function"]["parameters"]["properties"],
+            json!({})
+        );
     }
 
     #[test]

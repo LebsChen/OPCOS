@@ -3520,6 +3520,13 @@ impl ToolExecutor for RemoteExecutor {
     }
 
     async fn execute(&self, name: &str, arguments: Value) -> Result<Value, String> {
+        if name == "secrets_list" {
+            return list_resolvable_secret_metadata(
+                &self.database,
+                &self.secrets,
+                self.project_id.as_deref(),
+            );
+        }
         if name.starts_with("background_job_") {
             if name == "background_job_start" {
                 let capabilities = self
@@ -3912,6 +3919,13 @@ impl ToolExecutor for DesktopExecutor {
         match self {
             Self::Remote(executor) => executor.execute(name, arguments).await,
             Self::Local(executor) => {
+                if name == "secrets_list" {
+                    return list_resolvable_secret_metadata(
+                        &executor.database,
+                        &executor.secrets,
+                        executor.project_id.as_deref(),
+                    );
+                }
                 if name.starts_with("background_job_") {
                     return execute_background_job_tool(
                         &executor.jobs,
@@ -11627,6 +11641,7 @@ fn builtin_allowed_tools(include_local_lsp: bool, include_edit_file: bool) -> Ve
         "skill_search_learned",
         "skill_get_learned",
         "ask_user",
+        "secrets_list",
         "repo_index_find_symbol",
         "repo_index_glob",
         "repo_index_search",
@@ -20590,6 +20605,74 @@ fn create_event_rule(
         .map_err(|error| error.to_string())
 }
 
+fn list_resolvable_secret_metadata(
+    database: &Arc<Mutex<Connection>>,
+    secrets: &KeyringSecretStore,
+    project_id: Option<&str>,
+) -> Result<Value, String> {
+    let connection = database
+        .lock()
+        .map_err(|_| "database lock poisoned".to_owned())?;
+    let mut statement = connection
+        .prepare(
+            "SELECT name,scope,purpose,project_id FROM secret_records
+             WHERE project_id='' OR (?1 IS NOT NULL AND project_id=?1)
+             ORDER BY name, CASE WHEN project_id='' THEN 1 ELSE 0 END",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([project_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(statement);
+    drop(connection);
+
+    let mut listed = HashMap::<String, Value>::new();
+    for (name, scope, purpose, metadata_project_id) in rows {
+        let project_value = if let Some(id) = project_id.filter(|_| !metadata_project_id.is_empty())
+        {
+            secrets
+                .get(&project_secret_key(id, "asset-secret", &name))
+                .map_err(|error| error.to_string())?
+        } else {
+            None
+        };
+        let global_value = secrets
+            .get(&secret_key("asset-secret", &name))
+            .map_err(|error| error.to_string())?;
+        let resolves = project_value.is_some() || global_value.is_some();
+        if resolves {
+            let is_effective_project =
+                project_id.is_some() && project_value.is_some() && !metadata_project_id.is_empty();
+            listed.entry(name.clone()).or_insert_with(|| {
+                json!({
+                    "name": name,
+                    "scope": if is_effective_project { "project" } else { &scope },
+                    "purpose": purpose,
+                    "project_id": if is_effective_project {
+                        project_id.map(str::to_owned).map(Value::String).unwrap_or(Value::Null)
+                    } else if metadata_project_id.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(metadata_project_id)
+                    },
+                })
+            });
+        }
+    }
+    let mut values = listed.into_values().collect::<Vec<_>>();
+    values.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+    Ok(Value::Array(values))
+}
+
 #[tauri::command]
 fn set_event_rule_enabled(
     state: State<'_, DesktopState>,
@@ -21733,6 +21816,7 @@ mod m7_tests {
             ("action_ledger_list", "action_ledger_*"),
             ("local_gate_record", "local_gate_record"),
             ("ask_user", "ask_user"),
+            ("secrets_list", "secrets_list"),
         ];
         for (name, needle) in prompt_mentions {
             assert!(
@@ -21754,6 +21838,87 @@ mod m7_tests {
         for name in ["lsp_definition", "lsp_references", "lsp_diagnostics"] {
             assert!(!remote_allowed.contains(name));
         }
+    }
+
+    #[test]
+    fn secrets_list_exposes_only_resolvable_names_and_metadata() {
+        let root = std::env::temp_dir().join(format!("opcos-secrets-list-{}", Uuid::new_v4()));
+        let secrets = KeyringSecretStore::with_encrypted_fallback(
+            format!("opcos-test-{}", Uuid::new_v4()),
+            root.join("secrets.json"),
+        );
+        secrets
+            .set("asset-secret:global-only", "global-secret-value")
+            .unwrap();
+        secrets
+            .set(
+                &project_secret_key("project-1", "asset-secret", "project-only"),
+                "project-secret-value",
+            )
+            .unwrap();
+        secrets
+            .set(
+                &project_secret_key("project-1", "asset-secret", "shared"),
+                "project-shared-value",
+            )
+            .unwrap();
+        let database = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        database
+            .lock()
+            .unwrap()
+            .execute(
+                "CREATE TABLE secret_records (
+                    name TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    project_id TEXT NOT NULL
+                )",
+                [],
+            )
+            .unwrap();
+        let connection = database.lock().unwrap();
+        connection
+            .execute(
+                "INSERT INTO secret_records VALUES
+                 ('global-only','global','test',''),
+                 ('project-only','project','test','project-1'),
+                 ('shared','project','test','project-1'),
+                 ('unconfigured','global','test','')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let listed =
+            list_resolvable_secret_metadata(&database, &secrets, Some("project-1")).unwrap();
+        let names = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["name"].as_str().unwrap())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            names,
+            HashSet::from(["global-only", "project-only", "shared"])
+        );
+        let serialized = listed.to_string();
+        assert!(!serialized.contains("global-secret-value"));
+        assert!(!serialized.contains("project-secret-value"));
+        assert!(!serialized.contains("project-shared-value"));
+        let shared = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "shared")
+            .unwrap();
+        assert_eq!(shared["project_id"], "project-1");
+        assert_eq!(
+            scoped_secret_get_from_store(&secrets, Some("project-1"), "asset-secret", "shared",)
+                .unwrap()
+                .as_deref(),
+            Some("project-shared-value")
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
