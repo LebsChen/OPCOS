@@ -11,6 +11,11 @@ import {
   pendingQuestionFromPayload,
   reconcileRunningState,
   effectiveRunningState,
+  mergeSessionsPreservingOptimistic,
+  reconcileSelectedIdAfterRefresh,
+  selectedSessionFromList,
+  sessionViewSelection,
+  updateSessionRunState,
 } from "./gui";
 
 describe("GUI boundary behavior", () => {
@@ -120,6 +125,121 @@ describe("GUI boundary behavior", () => {
 
   it("keeps the composer enabled while a question awaits an answer", () => {
     expect(effectiveRunningState(true, "running", true)).toBe(false);
+  });
+
+  it("lets the authoritative idle state clear a stale local running flag", () => {
+    expect(effectiveRunningState(false, "idle", true)).toBe(false);
+  });
+
+  it("derives every selected surface from the refreshed session list", () => {
+    const running = {
+      id: "s",
+      title: "task",
+      host_id: "h",
+      host_name: "host",
+      model: "model",
+      mode: "Auto",
+      harness: "builtin",
+      run_state: "running",
+      stop_reason: "none",
+    };
+    expect(selectedSessionFromList([running], "s")?.run_state).toBe("running");
+    const idle = { ...running, run_state: "idle" };
+    expect(selectedSessionFromList([idle], "s")?.run_state).toBe("idle");
+  });
+
+  it("keeps an optimistic created session through a refresh race", () => {
+    const created = {
+      id: "new",
+      title: "new task",
+      host_id: "h",
+      host_name: "host",
+      model: "model",
+      mode: "Auto",
+      harness: "builtin",
+      run_state: "running",
+      stop_reason: "none",
+    };
+    const optimistic = new Set([created.id]);
+    const afterMissingRefresh = mergeSessionsPreservingOptimistic(
+      [created],
+      [],
+      optimistic,
+    );
+    expect(selectedSessionFromList(afterMissingRefresh, created.id)).toEqual(
+      created,
+    );
+    const refreshed = { ...created, run_state: "idle" };
+    expect(
+      selectedSessionFromList(
+        mergeSessionsPreservingOptimistic(
+          afterMissingRefresh,
+          [refreshed],
+          optimistic,
+        ),
+        created.id,
+      ),
+    ).toEqual(refreshed);
+  });
+
+  it("updates a running session row without changing the selected id", () => {
+    const session = {
+      id: "s",
+      title: "task",
+      host_id: "h",
+      host_name: "host",
+      model: "model",
+      mode: "Auto",
+      harness: "builtin",
+      run_state: "idle",
+      stop_reason: "none",
+    };
+    const updated = updateSessionRunState(
+      [session],
+      session.id,
+      "running",
+      "none",
+    );
+    expect(selectedSessionFromList(updated, session.id)?.run_state).toBe(
+      "running",
+    );
+    expect(selectedSessionFromList(updated, "other")).toBeNull();
+  });
+
+  it("keeps the session view target while a selected row is temporarily missing", () => {
+    const lastKnown = {
+      id: "s",
+      title: "task",
+      host_id: "h",
+      host_name: "host",
+      model: "model",
+      mode: "Auto",
+      harness: "builtin",
+      run_state: "running",
+      stop_reason: "none",
+    };
+    expect(sessionViewSelection("s", null, lastKnown)).toEqual(lastKnown);
+    expect(sessionViewSelection("other", null, lastKnown)).toBeNull();
+    expect(sessionViewSelection(null, null, lastKnown)).toBeNull();
+  });
+
+  it("clears selection when a non-optimistic selected session is deleted", () => {
+    const session = {
+      id: "s",
+      title: "task",
+      host_id: "h",
+      host_name: "host",
+      model: "model",
+      mode: "Auto",
+      harness: "builtin",
+      run_state: "idle",
+      stop_reason: "none",
+    };
+    expect(reconcileSelectedIdAfterRefresh("s", [], new Set())).toBeNull();
+    expect(reconcileSelectedIdAfterRefresh("s", [], new Set(["s"]))).toBe("s");
+    expect(reconcileSelectedIdAfterRefresh("s", [session], new Set())).toBe(
+      "s",
+    );
   });
 
   it("does not contain the retired private gateway address", () => {

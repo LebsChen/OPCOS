@@ -1,3 +1,4 @@
+use crate::matrix::limit_caps_for_model;
 use crate::{
     AssistantTurn, Caps, Provider, ProviderConfig, ProviderError, ProviderRequest, StreamChunk,
     TRANSIENT_RETRY_LIMIT, TokenUsage, ToolCall, ToolCallDelta, classify_context_error, client,
@@ -10,6 +11,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::Sender;
 
 const VERSION: &str = "2023-06-01";
+const ASSUMED_OUTPUT_TOKENS: u64 = 4096;
 
 #[derive(Clone, Debug)]
 pub struct AnthropicProvider {
@@ -26,7 +28,14 @@ impl AnthropicProvider {
         let mut body = json!({
             "model": request.model,
             "messages": request.messages,
-            "max_tokens": settings.get("max_tokens").and_then(Value::as_u64).unwrap_or(4096),
+            "max_tokens": settings
+                .get("max_tokens")
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    limit_caps_for_model("anthropic", &request.model)
+                        .and_then(|caps| caps.max_output_tokens)
+                })
+                .unwrap_or(ASSUMED_OUTPUT_TOKENS),
             "stream": stream,
         });
         if let Some(system) = settings.get("system") {
@@ -267,15 +276,25 @@ impl Provider for AnthropicProvider {
         })
     }
 
-    fn capabilities(&self, _model: &str) -> Caps {
-        Caps {
+    fn capabilities(&self, model: &str) -> Caps {
+        let mut capabilities = Caps {
             tools: true,
             vision: true,
             pdf: true,
             parallel_tool_calls: true,
             streaming: true,
             context_window: None,
+            max_output_tokens: None,
+            context_window_source: None,
+            max_output_tokens_source: None,
+        };
+        if let Some(limits) = limit_caps_for_model("anthropic", model) {
+            capabilities.context_window = limits.context_window;
+            capabilities.max_output_tokens = limits.max_output_tokens;
+            capabilities.context_window_source = limits.context_window_source;
+            capabilities.max_output_tokens_source = limits.max_output_tokens_source;
         }
+        capabilities
     }
 }
 
@@ -415,6 +434,15 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn capabilities_resolve_anthropic_model_ids() {
+        let provider = AnthropicProvider::new(ProviderConfig::new("http://localhost", ""));
+        assert_eq!(
+            provider.capabilities("claude-opus-4-8").context_window,
+            Some(200_000)
+        );
+    }
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,

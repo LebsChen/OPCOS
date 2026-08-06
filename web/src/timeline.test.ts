@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import liveEnvelopes from "../../fixtures/timeline/live-events.json";
+import opcosEvents from "../../fixtures/timeline/opcos-events.json";
+import planIterations from "../../fixtures/timeline/opcos-plan-iterations.json";
+import toolCallOnlyIteration from "../../fixtures/timeline/tool-call-only-iteration.json";
 import persisted from "../../fixtures/timeline/persisted-events.json";
 import {
   buildTimeline,
@@ -10,6 +13,7 @@ import {
 
 const live = liveEnvelopes.map((entry) => entry.payload as TimelineEvent);
 const saved = persisted as TimelineEvent[];
+const opcos = opcosEvents as TimelineEvent[];
 
 describe("single event-log timeline", () => {
   it("renders live and reloaded events identically", () => {
@@ -60,5 +64,95 @@ describe("single event-log timeline", () => {
     );
     expect(work.reduce((sum, node) => sum + node.additions, 0)).toBe(70);
     expect(work.reduce((sum, node) => sum + node.deletions, 0)).toBe(0);
+  });
+  it("renders OPCOS-native persisted events as one work group", () => {
+    const nodes = buildTimeline(opcos);
+    expect(nodes).toContainEqual({
+      kind: "user",
+      text: "Implement the change.",
+      ts: 1767225601,
+      attachments: undefined,
+    });
+    expect(nodes).toContainEqual({
+      kind: "assistant",
+      text: "The requested change is complete.",
+      ts: 1767225608,
+    });
+    const work = nodes.find((node) => node.kind === "work");
+    expect(work).toMatchObject({
+      label: "Worked for 6s",
+      additions: 6,
+      deletions: 1,
+    });
+    expect(work?.rows.map((row) => row.label)).toEqual([
+      "Thought for 5s",
+      "cargo test",
+      "Created notes.md +4",
+      "Edited lib.rs +2 −1",
+      "Created 4 Tasks",
+      "1/4#1 Implement the change",
+      "Earlier context compacted",
+    ]);
+  });
+  it("skips legacy bare working-event rows without a resolvable type", () => {
+    expect(
+      buildTimeline([
+        {
+          event_type: "shell_process_started",
+          category: "tool",
+          direction: "outgoing",
+          timestamp: "2026-01-01T00:00:01Z",
+          payload: { command: "legacy command" },
+        } as unknown as TimelineEvent,
+        ...opcos,
+      ]),
+    ).not.toContainEqual(
+      expect.objectContaining({ kind: "work", label: "Worked for 0s" }),
+    );
+  });
+  it("keeps plan progress across iteration messages", () => {
+    const nodes = buildTimeline(planIterations as TimelineEvent[]);
+    const rows = nodes
+      .filter((node) => node.kind === "work")
+      .flatMap((node) => node.rows.map((row) => row.label));
+    expect(rows.filter((label) => label === "Created 5 Tasks")).toHaveLength(1);
+    expect(rows).toContain("1/5#1 Create files");
+    expect(rows).toContain("2/5#2 Run tests");
+  });
+  it("renders control-action notices and skips empty notices", () => {
+    const nodes = buildTimeline([
+      {
+        type: "mode_changed",
+        event_id: "notice-mode",
+        created_at_ms: 1,
+        text: "Mode changed to Auto",
+      },
+      {
+        type: "slash_help",
+        event_id: "notice-help",
+        created_at_ms: 2,
+        payload: { text: "Actions: /compact, /help" },
+      },
+      {
+        type: "compaction_summary_invalid",
+        event_id: "notice-empty",
+        created_at_ms: 3,
+        payload: {},
+      },
+    ] as unknown as TimelineEvent[]);
+    expect(nodes).toContainEqual(
+      expect.objectContaining({ kind: "notice", text: "Mode changed to Auto" }),
+    );
+    expect(nodes).toContainEqual(
+      expect.objectContaining({
+        kind: "notice",
+        text: "Actions: /compact, /help",
+      }),
+    );
+    expect(nodes).not.toContainEqual(expect.objectContaining({ text: "" }));
+  });
+  it("skips empty tool-call-only assistant iterations", () => {
+    const nodes = buildTimeline(toolCallOnlyIteration as TimelineEvent[]);
+    expect(nodes).toEqual([]);
   });
 });

@@ -2,6 +2,7 @@ use crate::{Caps, matrix};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::time::Duration;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderField {
@@ -34,6 +35,98 @@ pub struct DiscoveredModel {
     pub capabilities: Caps,
     pub capabilities_known: bool,
     pub likely_non_chat: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProbedLimits {
+    pub context_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+}
+
+pub fn resolve_limit(
+    gateway: Option<u64>,
+    matrix: Option<u64>,
+    probe: Option<u64>,
+    learned: Option<u64>,
+    user: Option<u64>,
+) -> (Option<u64>, Option<&'static str>) {
+    [
+        (gateway, "gateway"),
+        (matrix, "matrix"),
+        (probe, "probe"),
+        (learned, "learned"),
+        (user, "user"),
+    ]
+    .into_iter()
+    .find_map(|(value, source)| value.map(|value| (Some(value), Some(source))))
+    .unwrap_or((None, None))
+}
+
+pub fn parse_limit_error(text: &str) -> ProbedLimits {
+    fn number_after(text: &str, markers: &[&str]) -> Option<u64> {
+        let lower = text.to_ascii_lowercase();
+        markers.iter().find_map(|marker| {
+            let start = lower.find(marker)? + marker.len();
+            let digits = lower[start..]
+                .chars()
+                .skip_while(|ch| !ch.is_ascii_digit())
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect::<String>();
+            (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+        })
+    }
+    ProbedLimits {
+        context_window: number_after(
+            text,
+            &[
+                "maximum context length is",
+                "max_model_len",
+                "max context length",
+                "context_length",
+                "context window",
+            ],
+        ),
+        max_output_tokens: number_after(
+            text,
+            &[
+                "max_tokens must be less than or equal to",
+                "max_completion_tokens must be less than or equal to",
+                "maximum output tokens is",
+                "max_output_tokens",
+            ],
+        ),
+    }
+}
+
+pub async fn probe_model_limits(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+) -> Result<(ProbedLimits, String), String> {
+    let response = tokio::time::timeout(
+        Duration::from_secs(8),
+        client
+            .post(format!(
+                "{}/chat/completions",
+                base_url.trim_end_matches('/')
+            ))
+            .bearer_auth(api_key)
+            .json(&serde_json::json!({
+                "model": model,
+                "messages": [{"role":"user","content":"x"}],
+                "max_tokens": 9_999_999_999u64
+            }))
+            .send(),
+    )
+    .await
+    .map_err(|_| "model capability probe timed out".to_owned())?
+    .map_err(|_| "model capability probe request failed".to_owned())?;
+    let body = response
+        .text()
+        .await
+        .map_err(|_| "invalid probe response".to_owned())?;
+    Ok((parse_limit_error(&body), body))
 }
 
 impl fmt::Debug for ProviderDescriptor {
@@ -389,22 +482,73 @@ fn parse_openai_models(provider: &str, body: &serde_json::Value) -> Vec<Discover
         .and_then(|data| data.as_array())
         .into_iter()
         .flatten()
-        .filter_map(|model| model.get("id").and_then(|id| id.as_str()))
-        .map(|id| model_from_id(provider, id.to_owned()))
+        .filter_map(|model| {
+            model
+                .get("id")
+                .and_then(|id| id.as_str())
+                .map(|id| apply_reported_limits(model_from_id(provider, id.to_owned()), model))
+        })
         .collect::<Vec<_>>();
     sort_discovered_models(&mut models);
     models
 }
 
+fn reported_limit(model: &serde_json::Value, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| model.get(*key).and_then(|value| value.as_u64()))
+}
+
+fn apply_reported_limits(
+    mut discovered: DiscoveredModel,
+    model: &serde_json::Value,
+) -> DiscoveredModel {
+    let context_window = reported_limit(
+        model,
+        &[
+            "context_length",
+            "context_window",
+            "max_context_length",
+            "max_model_len",
+        ],
+    )
+    .or_else(|| {
+        model
+            .get("top_provider")
+            .and_then(|provider| reported_limit(provider, &["context_length"]))
+    });
+    let max_output_tokens = reported_limit(model, &["max_output_tokens", "max_completion_tokens"])
+        .or_else(|| {
+            model.get("top_provider").and_then(|provider| {
+                provider
+                    .get("max_completion_tokens")
+                    .and_then(|v| v.as_u64())
+            })
+        });
+    if let Some(value) = context_window {
+        discovered.capabilities.context_window = Some(value);
+        discovered.capabilities.context_window_source = Some("gateway".into());
+        discovered.capabilities_known = true;
+    }
+    if let Some(value) = max_output_tokens {
+        discovered.capabilities.max_output_tokens = Some(value);
+        discovered.capabilities.max_output_tokens_source = Some("gateway".into());
+        discovered.capabilities_known = true;
+    }
+    discovered
+}
+
 fn parse_anthropic_models(body: &serde_json::Value) -> Vec<DiscoveredModel> {
-    let mut models = body
-        .get("data")
-        .and_then(|data| data.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|model| model.get("id").and_then(|id| id.as_str()))
-        .map(|id| model_from_id("anthropic", id.to_owned()))
-        .collect::<Vec<_>>();
+    let mut models =
+        body.get("data")
+            .and_then(|data| data.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|model| {
+                model.get("id").and_then(|id| id.as_str()).map(|id| {
+                    apply_reported_limits(model_from_id("anthropic", id.to_owned()), model)
+                })
+            })
+            .collect::<Vec<_>>();
     sort_discovered_models(&mut models);
     models
 }
@@ -625,6 +769,85 @@ mod tests {
         assert!(!models[1].capabilities_known);
         assert!(!models[1].capabilities.tools);
         assert!(!models[1].capabilities.vision);
+    }
+
+    #[test]
+    fn gateway_reports_are_applied_without_fabricating_missing_limits() {
+        let nextapi = parse_openai_models(
+            "openai",
+            &serde_json::json!({
+                "data":[{"id":"glm-5.2","object":"model","supported_endpoint_types":["chat.completions"]}]
+            }),
+        );
+        assert_eq!(nextapi[0].capabilities.context_window, None);
+        let openrouter = parse_openai_models(
+            "openrouter",
+            &serde_json::json!({
+                "data":[{
+                    "id":"z-ai/glm-5.2",
+                    "top_provider":{"context_length":1000000,"max_completion_tokens":65536}
+                }]
+            }),
+        );
+        assert_eq!(openrouter[0].capabilities.context_window, Some(1_000_000));
+        assert_eq!(openrouter[0].capabilities.max_output_tokens, Some(65_536));
+        assert_eq!(
+            openrouter[0].capabilities.context_window_source.as_deref(),
+            Some("gateway")
+        );
+    }
+
+    #[test]
+    fn resolves_limits_in_declared_source_order() {
+        assert_eq!(
+            resolve_limit(Some(1), Some(2), Some(3), Some(4), Some(5)),
+            (Some(1), Some("gateway"))
+        );
+        assert_eq!(
+            resolve_limit(None, Some(2), Some(3), Some(4), Some(5)),
+            (Some(2), Some("matrix"))
+        );
+        assert_eq!(
+            resolve_limit(None, None, Some(3), Some(4), Some(5)),
+            (Some(3), Some("probe"))
+        );
+        assert_eq!(
+            resolve_limit(None, None, None, Some(4), Some(5)),
+            (Some(4), Some("learned"))
+        );
+        assert_eq!(
+            resolve_limit(None, None, None, None, Some(5)),
+            (Some(5), Some("user"))
+        );
+    }
+
+    #[test]
+    fn parses_provider_limit_error_strings() {
+        assert_eq!(
+            parse_limit_error("This model's maximum context length is 131072 tokens"),
+            ProbedLimits {
+                context_window: Some(131072),
+                max_output_tokens: None
+            }
+        );
+        assert_eq!(
+            parse_limit_error("max_tokens must be less than or equal to 8192"),
+            ProbedLimits {
+                context_window: None,
+                max_output_tokens: Some(8192)
+            }
+        );
+        assert_eq!(
+            parse_limit_error("max_model_len (32768)"),
+            ProbedLimits {
+                context_window: Some(32768),
+                max_output_tokens: None
+            }
+        );
+        assert_eq!(
+            parse_limit_error("request accepted"),
+            ProbedLimits::default()
+        );
     }
 
     #[test]

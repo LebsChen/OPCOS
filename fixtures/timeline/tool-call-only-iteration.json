@@ -1,0 +1,14 @@
+[
+  {
+    "type": "devin_message",
+    "event_id": "tool-call-only-message",
+    "created_at_ms": 1000,
+    "working_event": {
+      "event_type": "devin_message",
+      "category": "message",
+      "direction": "outgoing",
+      "timestamp": "2026-01-01T00:00:01Z",
+      "payload": { "message": "   ", "tool_calls": 1 }
+    }
+  }
+]

@@ -1,3 +1,4 @@
+use crate::matrix::limit_caps_for_model;
 use crate::{
     AssistantTurn, Caps, Provider, ProviderConfig, ProviderError, ProviderRequest, StreamChunk,
     TRANSIENT_RETRY_LIMIT, TokenUsage, ToolCall, ToolCallDelta, apply_bearer_headers,
@@ -374,15 +375,25 @@ impl Provider for OpenAiProvider {
         })
     }
 
-    fn capabilities(&self, _model: &str) -> Caps {
-        Caps {
+    fn capabilities(&self, model: &str) -> Caps {
+        let mut capabilities = Caps {
             tools: true,
             vision: true,
             pdf: false,
             parallel_tool_calls: true,
             streaming: true,
             context_window: None,
+            max_output_tokens: None,
+            context_window_source: None,
+            max_output_tokens_source: None,
+        };
+        if let Some(limits) = limit_caps_for_model("", model) {
+            capabilities.context_window = limits.context_window;
+            capabilities.max_output_tokens = limits.max_output_tokens;
+            capabilities.context_window_source = limits.context_window_source;
+            capabilities.max_output_tokens_source = limits.max_output_tokens_source;
         }
+        capabilities
     }
 
     async fn stream(
@@ -562,6 +573,15 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn capabilities_resolve_bare_model_ids_through_the_matrix() {
+        let provider = OpenAiProvider::new(ProviderConfig::new("http://localhost/v1", ""));
+        assert_eq!(
+            provider.capabilities("glm-5.2").context_window,
+            Some(1_000_000)
+        );
+    }
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,

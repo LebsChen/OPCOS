@@ -41,6 +41,8 @@ const totalTokens = (value: SessionUsage) =>
 import type { Option } from "./Dropdown";
 import { Icon } from "./Icon";
 import { Toggle } from "./Toggle";
+import { expandSlashCommandValue } from "../slashCommands";
+import { submissionRoute } from "../gui";
 type DictationStatus = {
   recording?: boolean;
   supported?: boolean;
@@ -352,13 +354,7 @@ export function Composer(props: Props) {
   };
 
   const expandSlashCommand = (value: string) => {
-    const match = value.trimStart().match(/^(\/\S+)(?:\s+([\s\S]*))?$/);
-    if (!match) return value;
-    const command = props.slashCommands?.find((item) => item.name === match[1]);
-    if (!command) return value;
-    return match[2]?.trim()
-      ? `${command.body}\n\n${match[2].trim()}`
-      : command.body;
+    return expandSlashCommandValue(value, props.slashCommands ?? []);
   };
 
   const uploadFile = async (file: File) => {
@@ -396,8 +392,16 @@ export function Composer(props: Props) {
       dictationBusy
     )
       return;
-    if (props.running) {
-      props.onSteer?.(t, attachments);
+    const route = submissionRoute(props.running, Boolean(props.onSteer));
+    if (route === "blocked") {
+      showAttachNotice(
+        "The session is still running; your message was not sent.",
+      );
+      return;
+    }
+    if (route === "steer") {
+      props.onSteer!(t, attachments);
+      setSlashQuery(null);
       setText("");
       setAttachments([]);
       return;
@@ -408,6 +412,7 @@ export function Composer(props: Props) {
       return;
     }
     props.onSend(expandSlashCommand(t), attachments);
+    setSlashQuery(null);
     setText("");
     setAttachments([]);
   };

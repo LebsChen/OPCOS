@@ -103,6 +103,32 @@
 
 ## 6. Working 过程事件流对齐（当前实现）
 
+### 6.1 PR #91 / 七轮真实验证后的状态
+
+以下行为已在真实 Tauri GUI、Local host、真实 gateway `glm-5.2` 上完成验证，
+覆盖七轮 benchmark，并核对 live、重新读取和冷启动结果：
+
+| 差距 | 当前状态 | 核实结果 |
+|---|---|---|
+| working events 到达 timeline | **已关闭** | canonical envelope 含 `type`、`event_id`、`created_at_ms`；631 个事件 envelope 完整。 |
+| Devin-style 工作行 | **已关闭** | shell、Created、Edited（精确行数）、thoughts 和 `Worked for Xm Ys` 均可见。 |
+| task rows | **已关闭** | 每个 plan 只显示一次 `Created N Tasks`，后续显示 `k/n#i <task>`；读取真实 `PlanRecord.steps`。 |
+| compaction 行 | **已关闭** | `Earlier context compacted` 出现在 work group 内。 |
+| 空 assistant / 空 work group | **已关闭** | 空 artifact 已移除；有行但耗时为 0 的合法 work group 仍保留。 |
+| model-aware context / output limits | **已关闭** | 每字段按 gateway → matrix → probe → learned → user → assumed；`glm-5.2` 为 1M，来源写入 `context_growth_update`。 |
+| control slash commands | **已关闭** | `/compact` 等作为 backend action 执行，输出可见且持久化。 |
+| steering | **已关闭** | steer 作为 canonical `user_message` 持久化并渲染为 user bubble。 |
+| live / re-read / cold restart parity | **已关闭** | 95-node row list byte-identical；真实会话可冷启动复现。 |
+
+以下仍是下一批，不应写成已等价：
+
+| 未关闭差距 | 当前状态 |
+|---|---|
+| attachments / artifacts timeline | 仍开放：screenshots、recordings、file contents、citation snippets 尚未在 OPCOS timeline 等价呈现。 |
+| terminal replay / `terminal_update` panel | 仍开放：事件已持久化，但 Devin 式 terminal replay panel 尚未完成。 |
+| iteration stats surfacing | 仍开放：事件可记录，但尚未在 timeline / UI 中提供 Devin 式可见统计面。 |
+| right rail Shell / Desktop / Web IDE panes | **未核实**：七轮没有 RVM token，因此没有真实远端 pane 验证。 |
+
 ### 已实现并已通过本地验证
 
 Builtin engine 现在会把 working 过程作为结构化事件同时写入本地 audit store，

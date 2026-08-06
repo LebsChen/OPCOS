@@ -161,6 +161,8 @@ pub struct ModelDiscoveryRecord {
     pub discovered_at: String,
 }
 
+pub type LearnedModelLimits = (Option<u64>, Option<u64>);
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct LearnedSkillRecord {
     pub id: String,
@@ -1322,6 +1324,20 @@ pub trait SessionStore {
     ) -> Result<bool, StoreError>;
     fn save_compaction(&self, state: &CompactionRecord) -> Result<(), StoreError>;
     fn load_compaction(&self, session_id: &str) -> Result<Option<CompactionRecord>, StoreError>;
+    fn save_learned_model_limits(
+        &self,
+        provider: &str,
+        base_url: &str,
+        model: &str,
+        context_window: Option<u64>,
+        max_output_tokens: Option<u64>,
+    ) -> Result<(), StoreError>;
+    fn learned_model_limits(
+        &self,
+        provider: &str,
+        base_url: &str,
+        model: &str,
+    ) -> Result<Option<LearnedModelLimits>, StoreError>;
     fn create_plan(
         &self,
         session_id: &str,
@@ -4112,6 +4128,15 @@ impl SqliteStore {
                discovered_at TEXT NOT NULL,
                PRIMARY KEY(provider,base_url)
              );
+             CREATE TABLE IF NOT EXISTS learned_model_limits (
+               provider TEXT NOT NULL,
+               base_url TEXT NOT NULL,
+               model TEXT NOT NULL,
+               context_window INTEGER,
+               max_output_tokens INTEGER,
+               updated_at TEXT NOT NULL,
+               PRIMARY KEY(provider,base_url,model)
+             );
              CREATE TABLE IF NOT EXISTS learned_skills (
                id TEXT PRIMARY KEY,
                repository_identity TEXT NOT NULL,
@@ -5528,6 +5553,14 @@ impl SqliteStore {
         }
         Ok(())
     }
+
+    pub fn reconcile_running_sessions(&self) -> Result<usize, StoreError> {
+        let changed = self.connection.lock().expect("sqlite mutex poisoned").execute(
+            "UPDATE sessions SET run_state='interrupted', stop_reason='interrupted_by_crash', updated_at=?1 WHERE run_state='running'",
+            [Utc::now().to_rfc3339()],
+        )?;
+        Ok(changed)
+    }
 }
 
 impl SessionStore for SqliteStore {
@@ -5911,6 +5944,60 @@ impl SessionStore for SqliteStore {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn save_learned_model_limits(
+        &self,
+        provider: &str,
+        base_url: &str,
+        model: &str,
+        context_window: Option<u64>,
+        max_output_tokens: Option<u64>,
+    ) -> Result<(), StoreError> {
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "INSERT INTO learned_model_limits
+                 (provider,base_url,model,context_window,max_output_tokens,updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(provider,base_url,model) DO UPDATE SET
+                 context_window=COALESCE(excluded.context_window,context_window),
+                 max_output_tokens=COALESCE(excluded.max_output_tokens,max_output_tokens),
+                 updated_at=excluded.updated_at",
+                params![
+                    provider,
+                    base_url,
+                    model,
+                    context_window.map(|value| value as i64),
+                    max_output_tokens.map(|value| value as i64),
+                    Utc::now().to_rfc3339()
+                ],
+            )?;
+        Ok(())
+    }
+
+    fn learned_model_limits(
+        &self,
+        provider: &str,
+        base_url: &str,
+        model: &str,
+    ) -> Result<Option<LearnedModelLimits>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .query_row(
+                "SELECT context_window,max_output_tokens FROM learned_model_limits
+                 WHERE provider=?1 AND base_url=?2 AND model=?3",
+                params![provider, base_url, model],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?.map(|value| value as u64),
+                        row.get::<_, Option<i64>>(1)?.map(|value| value as u64),
+                    ))
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
     }
 
     fn create_plan(
@@ -6361,6 +6448,49 @@ mod tests {
         let session = store.load_session("status-session").unwrap().unwrap();
         assert_eq!(session.run_state, "error");
         assert_eq!(session.stop_reason, "host_unavailable");
+    }
+
+    #[test]
+    fn startup_reconciliation_interrupts_orphaned_running_sessions() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let now = Utc::now();
+        for id in ["running", "idle"] {
+            store
+                .save_session(&SessionRecord {
+                    session_id: id.into(),
+                    workspace: "/workspace".into(),
+                    model: "test".into(),
+                    mode: "Interactive".into(),
+                    harness: "builtin".into(),
+                    title: id.into(),
+                    extra_roots: vec![],
+                    grants: serde_json::json!({}),
+                    pinned: false,
+                    archived: false,
+                    origin: None,
+                    origin_label: None,
+                    compaction: serde_json::json!({}),
+                    host_id: "host".into(),
+                    provider: None,
+                    external_session_id: None,
+                    run_state: if id == "running" { "running" } else { "idle" }.into(),
+                    stop_reason: "none".into(),
+                    created_at: now,
+                    updated_at: now,
+                    project_id: None,
+                    agent_id: None,
+                })
+                .unwrap();
+        }
+
+        assert_eq!(store.reconcile_running_sessions().unwrap(), 1);
+        let running = store.load_session("running").unwrap().unwrap();
+        assert_eq!(running.run_state, "interrupted");
+        assert_eq!(running.stop_reason, "interrupted_by_crash");
+        assert_eq!(
+            store.load_session("idle").unwrap().unwrap().run_state,
+            "idle"
+        );
     }
 
     #[test]
@@ -7878,6 +8008,26 @@ mod tests {
         );
         assert!(saved.is_fresh(Utc::now(), 300));
         assert!(!saved.is_fresh(Utc::now() + chrono::Duration::seconds(301), 300));
+    }
+
+    #[test]
+    fn learned_model_limits_are_persistent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .save_learned_model_limits(
+                "openai",
+                "https://gateway.test/v1",
+                "glm-5.2",
+                Some(131_072),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .learned_model_limits("openai", "https://gateway.test/v1", "glm-5.2")
+                .unwrap(),
+            Some((Some(131_072), None))
+        );
     }
 
     #[test]

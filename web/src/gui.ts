@@ -125,6 +125,68 @@ export function effectiveRunningState(
   return backendRunState ? backendRunState === "running" : localRunning;
 }
 
+export function selectedSessionFromList(
+  sessions: Session[],
+  selectedId: string | null | undefined,
+): Session | null {
+  return sessions.find((session) => session.id === selectedId) ?? null;
+}
+
+export function sessionViewSelection(
+  selectedId: string | null,
+  selected: Session | null,
+  lastKnown: Session | null,
+): Session | null {
+  return selected ?? (lastKnown?.id === selectedId ? lastKnown : null);
+}
+
+export function reconcileSelectedIdAfterRefresh(
+  selectedId: string | null,
+  refreshed: Session[],
+  optimisticIds: ReadonlySet<string>,
+): string | null {
+  if (
+    !selectedId ||
+    refreshed.some((session) => session.id === selectedId) ||
+    optimisticIds.has(selectedId)
+  )
+    return selectedId;
+  return null;
+}
+
+export function mergeSessionsPreservingOptimistic(
+  current: Session[],
+  refreshed: Session[],
+  optimisticIds: ReadonlySet<string>,
+): Session[] {
+  const refreshedIds = new Set(refreshed.map((session) => session.id));
+  const preserved = current.filter(
+    (session) => optimisticIds.has(session.id) && !refreshedIds.has(session.id),
+  );
+  return preserved.length > 0 ? [...refreshed, ...preserved] : refreshed;
+}
+
+export function updateSessionRunState(
+  sessions: Session[],
+  sessionId: string,
+  runState: string | undefined,
+  stopReason: string | undefined,
+): Session[] {
+  return sessions.map((session) =>
+    session.id === sessionId
+      ? { ...session, run_state: runState, stop_reason: stopReason }
+      : session,
+  );
+}
+
+export function submissionRoute(
+  running: boolean,
+  canSteer: boolean,
+): "send" | "steer" | "blocked" {
+  if (!running) return "send";
+  return canSteer ? "steer" : "blocked";
+}
+
 export function hostStatusLabel(host: Host): string {
   if (host.online === true) return "Online";
   if (host.online === false) return "Offline";

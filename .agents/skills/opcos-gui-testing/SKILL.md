@@ -361,8 +361,292 @@ in the report — it is the host's UI, not something OPCOS leaks.
   `worktree has uncommitted changes…` with a 强制删除 button, and force must remove the directory
   from disk, not just the card.
 
+## Testing the working-event timeline (`buildTimeline`)
+
+The React timeline is built by `web/src/timeline.ts::buildTimeline` from persisted `session_events`.
+Its unit fixtures were originally captured from **Devin's** event stream, not OPCOS', so green unit
+tests prove nothing about the real app. Always drive a real session.
+
+### Replay `buildTimeline` over real events instead of counting rows by eye
+
+This is the single highest-value technique for this surface — it gives an exact, complete row list
+including things that are invisible in the UI (empty bubbles, zero-row groups):
+
+```bash
+# 1. dump the session's persisted events (after a clean shutdown; copy the WAL, see below)
+python3 -c "
+import sqlite3,json
+c=sqlite3.connect('/tmp/snapshot.db')
+rows=[json.loads(r[0]) for r in c.execute(
+  'select event_json from session_events where session_id=? order by created_at_ms,sequence',(SID,))]
+open('/tmp/ev.json','w').write(json.dumps(rows))"
+# 2. replay the real implementation
+cat > /tmp/replay.ts <<'EOF'
+import { readFileSync } from "node:fs";
+import { buildTimeline } from "/home/ubuntu/repos/OPCOS/web/src/timeline";
+const nodes = buildTimeline(JSON.parse(readFileSync("/tmp/ev.json","utf8")) as any);
+nodes.forEach((n: any, i: number) => {
+  if (n.kind === "work") { console.log(`[${i}] WORK ${n.label} rows=${n.rows.length}`);
+    n.rows.forEach((r: any) => console.log(`        - ${r.label}`)); }
+  else console.log(`[${i}] ${n.kind.toUpperCase()} ${JSON.stringify(n.text ?? "").slice(0,70)}`);
+});
+EOF
+(cd /home/ubuntu/repos/OPCOS/web && npx tsx /tmp/replay.ts)
+```
+
+Flag as **empty artifacts**: any `work` node with `rows.length === 0`, any `assistant`/`notice` node
+whose text is empty/whitespace. The historical cause was the engine emitting `devin_message` with
+`message: ""` on tool-call-only iterations, producing blank assistant bubbles and `Worked for 0s`
+zero-row groups.
+
+When empty-artifact guards are added, **prove nothing legitimate was dropped** as well as that the
+empties are gone — a guard that is too aggressive looks identical to a passing test otherwise:
+
+- rendered assistant-node count **==** persisted `devin_message` count with non-empty `message`
+- at least one `Worked for 0s` group **that has rows** still renders (0s duration is legitimate)
+- work-node count is unchanged apart from the genuinely empty ones
+
+Beware a false positive when two consecutive assistant bubbles have identical short text (e.g. two
+`4`s): check the persisted timestamps before calling it a rendering duplicate — the model does
+sometimes answer twice across iterations.
+
+### Composer and app-bring-up nits that cost time
+
+- After an **action** slash command is submitted the autocomplete popup can stay open even though the
+  textarea clears. The next click at the "usual" textarea position then lands on the popup.
+  Re-screenshot after every send; the textarea is the line showing the `Ask OPCOS…` placeholder.
+- The composer's vertical position moves as the transcript grows (roughly y≈645 vs y≈673 on a
+  maximized 1024×768 window). Do not reuse coordinates between steps.
+- The Home composer's **Workspace field is not cleared between session creations** — typing into it
+  appends to the old value and silently produces a mangled path. Always `ctrl+a` first, then verify
+  the resulting `sessions.workspace` in the DB.
+- Pick the **model** explicitly on the Home composer; the default is `auto`, which fails the turn with
+  `Provider request failed` and surfaces no error on the Home screen at all.
+- Kill stray Vite servers before starting (`pkill -f vite`, then confirm with `ps`); if :1420 is taken
+  Vite silently moves to :1421 and the Tauri window keeps loading the **old** server. `pkill` can need
+  a follow-up `kill -9` on the `sh -c vite` wrapper.
+
+### Force all row families in one prompt
+
+> Plan this out as a task list first, then do it. In this workspace: 1) create `X.py` with two
+> functions; 2) create `README_X.md` documenting them; 3) run `python3 X.py`; 4) add a `--flag` and
+> re-run. Update the task list as you finish each step.
+
+Step 4 is what produces an **edit** (`action_type:"edit"`); a task the model gets right first time
+only ever yields `create` rows. Cross-check the numbers: sum
+`multi_edit_result.file_updates[].lines_added - lines_removed` per file and compare with `wc -l` —
+they have matched exactly every round, so drift is a real bug.
+
+### Task rows: `steps`, not `todos`; and watch the reset scope
+
+`todo_update` payloads are serialized `PlanRecord`s: `{plan_id, title, status, revision,
+steps:[{step_id, position, description, status}]}`. There is **no `todos` key**.
+
+Plan state must be keyed by `plan_id`, not reset at every work-group flush — when it was
+work-group-scoped, the interleaved `devin_message` per iteration reset it and you got
+`Created N Tasks` repeated once per group with **zero** `k/n#i` rows. Correct output looks like
+`Created 5 Tasks` once followed by `0/5#1 …`, `1/5#1 …`, `1/5#2 …` … `5/5#5 …` (two rows per
+`plan_update` is normal: "previous step done" + "next step in progress").
+
+### Slash commands: action vs prompt
+
+`builtin_control_slash_commands()` (`/compact`, `/mode`, `/model`, `/ls`, `/help`) are
+`execution:"action"`; `builtin_slash_commands()` (`/implement`, `/plan`, `/review`, `/test`,
+`/think-hard`, `/deploy`, `/pull-project`) are `execution:"prompt"`. The composer autocomplete labels
+them `ACTION` / `PROMPT` — use that as the quick visual check. Test both kinds every round: an action
+must produce **no user prose bubble** plus a backend effect and a rendered notice
+(`session_list`, `mode_current`, `mode_changed`, `model_current`, `model_switch`, `slash_help`);
+a prompt must expand into its body text in the user bubble.
+
+**Composer click-target trap:** the slash autocomplete popup sits directly under the textarea and
+shifts the layout, so clicking where the textarea "usually" is often hits the popup and silently
+drops your typing. Screenshot first, click the `Ask OPCOS…` placeholder line specifically, and press
+`Escape` to dismiss the popup before clicking send.
+
+### Compaction
+
+`/compact` on the Builtin harness calls `engine.compact_now()`. Expect exactly one persisted
+`compacted` event, `Earlier context compacted` as a **row inside** a `Worked for …` group (not a
+standalone notice), and a real non-empty summary in the `compaction_state` table:
+
+```sql
+select state from compaction_state where session_id=?;   -- JSON with a "summary" field
+```
+
+Assert `len(summary) > 0` — a `compaction_summary_invalid` event means the model's summary was
+rejected (`response_too_large`) and compaction was lossy. Note the summary length varies a lot run to
+run (1.9k–14k chars observed), so if you are testing a size cap, check the actual length before
+claiming the cap was exercised.
+
+### Stuck `Running` header
+
+The header can stay `Running`/`Working` indefinitely while `sessions.run_state` is already `idle` —
+**always cross-check the DB before believing the UI**:
+
+```sql
+select run_state, updated_at from sessions where session_id=?;
+```
+
+Several causes have been fixed over time (listener re-subscription on `selected?.id`; missing terminal
+event after `/compact` itself; the session *list* not converging on the authoritative `run_state`).
+Test this whole matrix separately every round — the sub-cases behave differently and a fix can land
+for some and not others:
+
+| Situation | Expected |
+|---|---|
+| Normal turn, no prior `/compact` | terminal unattended |
+| Immediately after `/compact` | terminal unattended |
+| Turn *following* a `/compact`, same mount | terminal unattended |
+| Turn after navigating out and back in | terminal unattended |
+| `⏹ Stop` mid-turn (incl. after a `/compact`) | clears to Ready / `Turn interrupted` |
+| `⏹ Stop` on an already-stuck header | clears |
+
+When the natural cases all pass and no header sticks, the last row is not reachable by normal use.
+The way to manufacture the crash case is to `pkill -9` the app mid-turn and relaunch. Always confirm
+the **precondition** in the DB between the kill and the relaunch (`run_state` should be `running`
+/ `none` at that point) — otherwise a passing result after relaunch proves nothing, because you
+cannot tell reconciliation from "the turn had already finished".
+
+Status strings are the cheapest on-screen assertion here, and they are rendered in the **session
+header subtitle** (`本机 · <workspace> · <model> · <status>`, `App.tsx` → `sessionStatusLabel`), *not*
+in the Info pane, whose `STATUS` field reads only `run_state` and still shows `Ready` for interrupted
+and error sessions. Zoom the subtitle line and assert the exact string:
+
+| stop_reason | header subtitle |
+|---|---|
+| `interrupted_by_user` (⏹ Stop) | `已中断` |
+| `interrupted_by_crash` (startup reconciliation) | `已中断（应用退出）` |
+
+After any reconciliation change, also check the **negative** case: a session already terminal for
+another reason must not be rewritten — e.g. `interrupted_by_user` must survive a restart rather than
+becoming `interrupted_by_crash`. And check that the recovered session is *usable*: send a message in
+it immediately, with no navigation or restart.
+
+Historical note worth keeping: a `⏹ Stop` implementation that "clears the local flag and then
+refreshes" cannot fix an orphaned row, because the refresh reads `running` straight back out of the
+DB — the interrupt has to write the terminal state itself.
+
+Two things that make this worth chasing rather than dismissing as cosmetic:
+
+- **It can block the user.** While the flag is stuck the composer's send button is a Stop button, so
+  Enter may do nothing and no `user_message` is persisted. Always try to send a follow-up message from
+  a stuck header and check the DB — if the message never appears, report it as blocking, not cosmetic.
+- **Localise which surface is stale.** The sidebar row's running dot, the Info-pane `STATUS` and the
+  composer button read from different places. When the sidebar converges but the header does not, the
+  session *list* refresh is working and the cached selected-session object is the culprit. Zoom the
+  sidebar and the Info pane separately rather than reporting "the UI is stuck".
+
+### Selection / refresh races (the `selected` derivation)
+
+`selected` is derived from the `sessions` list by id. Any change to how that list is refreshed can
+break *selection* rather than the transcript, and the symptom is always the same: **the app silently
+falls back to the Home screen**. Because the agent keeps working in the background, this is easy to
+miss unless you look. Check all of these after any selection/refresh change:
+
+- create a session from the Home composer → it must navigate immediately **and still be selected
+  30–60 s later**, while the turn is running (a race can hold it for only the first few seconds);
+- with a session already open and idle, send a message → you must **stay** in the session when it
+  transitions to `running`;
+- click a **currently running** session's card on Home and its row in the sidebar → both must open it;
+- issue an action command such as `/compact` → must not navigate away;
+- switch between sessions, and delete one, watching for selection loss.
+
+On session deletion: as of this branch the app exposes **no delete affordance at all** (the
+`deleteQuestion` / `sessionActions` i18n keys are unused and there is no `delete_session` command in
+the frontend or `src-tauri`). Don't waste time hunting for a menu. If you must exercise
+deleted-session handling, delete the row from the live `sessions` table with `python3 -c` (there is no
+`sqlite3` binary on the box, despite the blueprint) and then trigger a refresh — but label the result
+as indicative, since it isn't a product path. Refresh is triggered by a terminal `turn_done`, by
+`interrupt`, and on project/session creation — not by plain session switching.
+
+Isolate with the DB: if `sessions.run_state='running'` and `session_events` is climbing while the UI
+shows Home, the run is fine and only selection is broken. A useful discriminator is idle vs running —
+if idle sessions open and running ones do not, the bug is in the list/derivation race, not in the
+transcript.
+
+Note this failure mode also **blocks most of the rest of the GUI matrix** (stuck-`Running`, `⏹ Stop`,
+steering, blocked-submission notices all need a visible running session), so test selection first and
+escalate immediately if it fails.
+
+### Steering and blocked submission: the composer can eat your message
+
+Sending while a turn is running is routed by `submissionRoute(running, canSteer)`. Test it and check
+the DB, because the UI gives you almost nothing:
+
+- A steer should render a **user bubble** within a couple of seconds and persist exactly **one**
+  `user_message` event whose payload carries `"source": "steering"` (normal prompts carry no
+  `source` key). Assert the count, not just presence — an earlier version appended the steer twice
+  (once when queued, once when consumed mid-loop), so **two** events per steer is a regression.
+- Always use a distinctive marker string (`STEER ONE:` / `POST CRASH:`) so DB greps are unambiguous,
+  and always reconcile **messages you submitted through the GUI** against
+  `select count(*) ... where type='user_message'`. That single number caught both a silent drop and
+  a duplicate append in different rounds.
+- Don't conclude "silently dropped" from a missing `user_message` alone: a steer can be delivered to
+  the model without being persisted. Grep the whole event JSON — it shows up inside `turn` /
+  `devin_thoughts` payloads if it really reached the model — and check whether the agent acted on it.
+- The `blocked` branch and its notice (`The session is still running; your message was not sent.`)
+  may be unreachable with the Builtin harness, since `canSteer` is true there. If you never see it,
+  say so rather than marking it passed.
+
+### Parity recipe: live == in-app re-read == cold restart
+
+Replay dumps: dump the **whole `event_json` row**, not `working_event` — a large fraction of rows
+(178 of 699 in one run) have `working_event: null` and `buildTimeline` throws on them.
+
+When a round touches Rust, don't trust `cargo build` saying "Finished" or the binary mtime (a rebase
+can leave the commit date *after* a perfectly current binary). Verify the change is in the artifact:
+`strings target/debug/opcos | grep -c <new_symbol_or_literal>`, and also grep for a literal the
+commit **removed** — seeing the new string and a zero count for the old one is conclusive.
+
+Also check for a stray second app instance before recording (`wmctrl -l` showing `OPCOS <2>`): two
+windows share one SQLite file and make every DB assertion ambiguous.
+
+1. Capture the ordered row labels while the turn streams (expand every `<details>` group).
+2. **`Ctrl+R` does not reload the Tauri webview.** Navigate to another view and back into the session
+   to force a `read_transcript`.
+3. `pkill -f target/debug/opcos`, relaunch, reopen the session.
+
+Expand groups by clicking their summary rows **bottom-up** — expanding a group pushes everything
+below it down, so top-down clicking hits the wrong targets.
+
+### Context window resolution
+
+The nextapi gateway reports no `context_length` for `glm-5.2` (`capabilities_known=false` in
+`model_discovery_cache`), so a `context_growth_update` with `resolved_context_window=1000000` and
+`context_window_source='matrix'` proves the matrix fallback rather than a gateway value. Assert over
+**every** such event.
+
+"No auto-compaction" is only decisive if `max(estimated_context_tokens)` actually exceeded the *old*
+threshold of 24,000 (32k × ¾) — short runs stay under it anyway and prove nothing. A 6–9 step task
+with file creation, edits, a CLI flag and lint/commit gates reaches ~32–40k tokens, which is enough;
+a 4-step one peaks around 22–25k, which is not.
+
+### Envelope integrity one-liner
+
+After a clean shutdown, assert on every persisted event: non-empty `type`, non-empty `event_id`,
+integer `created_at_ms`, unique ids, monotonic `created_at_ms`; plus zero empty `devin_thoughts`
+bodies and no two consecutive identical thoughts.
+
+### Provider bring-up on a gateway
+
+Settings → Provider → OpenAI: base URL, paste key into the password field, Validate, pick the model.
+After first configuring a provider the **home composer's model list stays on the built-in matrix
+models until a full app restart** — restart before concluding the model is unavailable. Once
+restarted the picker opens in <1 s; a multi-second `Loading models…` means something is probing every
+model.
+
+### Known-failing unit test (not a headless artifact)
+
+`opcos-hosts::local_desktop::tests::x11_capture_and_input_are_real_when_display_is_available` fails
+**even with `DISPLAY=:0` on a real X server that has XTEST**. The screenshot half passes; only
+`Enigo::new()` / `computer_use(MouseMove …)` fails with
+`local input unavailable: could not initialize the X11 input backend`. Treat it as an enigo backend /
+feature-flag gap, not a headless artifact, and do not "fix" it by re-running with a display.
+
 ## Devin secrets needed
 
 - `RVM_WIN_TOKEN` — valid for DevBox `https://devbox.windevos.com` only (Antec `win.windevos.com`
   answers 401 for everything except `/api/health`).
 - `OPCOS_PROVIDER_KEY` — OpenAI-compatible gateway `https://ai.yaoshen.de5.net/v1`.
+- `nextapi_token` — OpenAI-compatible gateway `https://api.nextapi.store/v1` (serves `glm-5.2`;
+  reports no context length, which is what makes it useful for testing matrix fallback).

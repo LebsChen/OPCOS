@@ -8,7 +8,7 @@ fn bedrock_provider_error(error: impl std::fmt::Display) -> ProviderError {
     if message.to_ascii_lowercase().contains("validationexception")
         && message.to_ascii_lowercase().contains("token")
     {
-        ProviderError::ContextOverflow
+        ProviderError::ContextOverflow { limit: None }
     } else {
         ProviderError::Protocol(message)
     }
@@ -737,6 +737,9 @@ impl Provider for BedrockProvider {
             parallel_tool_calls: true,
             streaming: true,
             context_window: None,
+            max_output_tokens: None,
+            context_window_source: None,
+            max_output_tokens_source: None,
         }
     }
 }

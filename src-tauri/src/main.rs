@@ -75,7 +75,7 @@ use std::path::{Path as FsPath, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 mod browser;
@@ -6317,21 +6317,16 @@ async fn execute_control_slash_action(
             }
             let engine = engine_for(app, state, &session.session_id, ToolOrigin::User).await?;
             engine.compact_now().await.map_err(engine_error_message)?;
-            emit(
-                app,
-                "notice",
-                Some(&session.session_id),
-                json!({"kind":"compacted","text":"Session context compacted"}),
-            );
         }
         "/mode" => {
             if remainder.is_empty() {
-                emit(
+                emit_control_timeline_notice(
                     app,
-                    "notice",
-                    Some(&session.session_id),
-                    json!({"kind":"mode_current","text":format!("Current mode: {}", session.mode)}),
-                );
+                    state,
+                    &session.session_id,
+                    "mode_current",
+                    json!({"text":format!("Current mode: {}", session.mode)}),
+                )?;
                 return Ok(true);
             }
             let mode = parse_permission_mode(remainder)?;
@@ -6343,22 +6338,24 @@ async fn execute_control_slash_action(
                 .store
                 .update_session_mode(&session.session_id, &mode_name)
                 .map_err(|error| error.to_string())?;
-            emit(
+            emit_control_timeline_notice(
                 app,
+                state,
+                &session.session_id,
                 "mode_changed",
-                Some(&session.session_id),
-                json!({"mode": mode_name}),
-            );
+                json!({"mode": mode_name, "text":format!("Mode changed to {mode_name}")}),
+            )?;
         }
         "/model" => {
             let model = remainder.trim();
             if model.is_empty() {
-                emit(
+                emit_control_timeline_notice(
                     app,
-                    "notice",
-                    Some(&session.session_id),
-                    json!({"kind":"model_current","text":format!("Current model: {}", session.model)}),
-                );
+                    state,
+                    &session.session_id,
+                    "model_current",
+                    json!({"text":format!("Current model: {}", session.model)}),
+                )?;
                 return Ok(true);
             }
             if model.split_whitespace().count() != 1 {
@@ -6375,12 +6372,14 @@ async fn execute_control_slash_action(
                 .store
                 .update_session_model(&session.session_id, model)
                 .map_err(|error| error.to_string())?;
-            emit(
+            state.engines.lock().await.remove(&session.session_id);
+            emit_control_timeline_notice(
                 app,
-                "notice",
-                Some(&session.session_id),
-                json!({"kind":"model_switch","text":format!("Switched to {model}")}),
-            );
+                state,
+                &session.session_id,
+                "model_switch",
+                json!({"text":format!("Switched to {model}")}),
+            )?;
         }
         "/ls" => {
             if !remainder.is_empty() {
@@ -6412,12 +6411,13 @@ async fn execute_control_slash_action(
                     .collect::<Vec<_>>()
                     .join("\n")
             };
-            emit(
+            emit_control_timeline_notice(
                 app,
-                "notice",
-                Some(&session.session_id),
-                json!({"kind":"session_list","text":text}),
-            );
+                state,
+                &session.session_id,
+                "session_list",
+                json!({"text":text}),
+            )?;
         }
         "/help" => {
             if !remainder.is_empty() {
@@ -6436,12 +6436,13 @@ async fn execute_control_slash_action(
                     .collect::<Vec<_>>()
                     .join(", ")
             );
-            emit(
+            emit_control_timeline_notice(
                 app,
-                "notice",
-                Some(&session.session_id),
-                json!({"kind":"slash_help","text":text}),
-            );
+                state,
+                &session.session_id,
+                "slash_help",
+                json!({"text":text}),
+            )?;
         }
         _ => unreachable!(),
     }
@@ -6452,6 +6453,38 @@ async fn execute_control_slash_action(
         json!({"command": command_name}),
     );
     Ok(true)
+}
+
+fn emit_control_timeline_notice(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    session_id: &str,
+    event_type: &str,
+    payload: Value,
+) -> Result<(), String> {
+    let created_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_millis() as i64;
+    let event = json!({
+        "type": event_type,
+        "event_id": format!("event-{}", uuid::Uuid::new_v4()),
+        "created_at_ms": created_at_ms,
+        "timestamp": Utc::now().to_rfc3339(),
+        "working_event": {
+            "event_type": event_type,
+            "category": "notice",
+            "direction": "outgoing",
+            "timestamp": Utc::now().to_rfc3339(),
+            "payload": payload,
+        },
+    });
+    state
+        .store
+        .append_session_event(session_id, &event)
+        .map_err(|error| error.to_string())?;
+    emit(app, "stream", Some(session_id), event);
+    Ok(())
 }
 
 fn expand_slash_command(
@@ -9156,6 +9189,17 @@ async fn engine_for(
     engine_for_with_context(app, state, session_id, origin, None, None).await
 }
 
+fn limit_source_value(
+    caps: &opcos_provider::Caps,
+    source: &str,
+    value: fn(&opcos_provider::Caps) -> Option<u64>,
+    source_of: fn(&opcos_provider::Caps) -> Option<&str>,
+) -> Option<u64> {
+    (source_of(caps) == Some(source))
+        .then(|| value(caps))
+        .flatten()
+}
+
 async fn engine_for_with_context(
     app: &tauri::AppHandle,
     state: &DesktopState,
@@ -9463,7 +9507,7 @@ async fn engine_for_with_context(
             .ok_or_else(|| {
                 "provider key is not configured; open Provider settings first".to_owned()
             })?;
-            Box::new(AnthropicProvider::new(ProviderConfig::new(base_url, key)))
+            Box::new(AnthropicProvider::new(ProviderConfig::new(&base_url, key)))
         }
         _name if descriptor.openai_compatible => {
             let stored_key = scoped_secret_get(
@@ -9481,10 +9525,11 @@ async fn engine_for_with_context(
                 }
                 None => String::new(),
             };
-            Box::new(OpenAiProvider::new(ProviderConfig::new(base_url, key)))
+            Box::new(OpenAiProvider::new(ProviderConfig::new(&base_url, key)))
         }
         name => return Err(format!("provider {name} is not supported for sessions")),
     };
+    let provider_defaults = provider.capabilities(&model);
     let permission_mode = parse_permission_mode(&mode).unwrap_or(PermissionMode::Interactive);
     let mut engine = TurnEngine::new(
         provider,
@@ -9495,6 +9540,90 @@ async fn engine_for_with_context(
         permission_mode,
         model.clone(),
     );
+    let discovered_caps = provider_models_for_state(
+        state,
+        provider_id.clone(),
+        Some(false),
+        Some(model.as_str()),
+    )
+    .await
+    .ok()
+    .and_then(|discovery| {
+        discovery
+            .models
+            .into_iter()
+            .find(|entry| entry.id.eq_ignore_ascii_case(&model))
+            .map(|entry| entry.capabilities)
+    })
+    .unwrap_or_default();
+    let matrix_caps =
+        opcos_provider::matrix::limit_caps_for_model(&provider_id, &model).unwrap_or_default();
+    let learned_limits = state
+        .store
+        .learned_model_limits(&provider_id, &base_url, &model)
+        .map_err(|error| error.to_string())?
+        .unwrap_or((None, None));
+    let gateway_window = limit_source_value(
+        &discovered_caps,
+        "gateway",
+        |caps| caps.context_window,
+        |caps| caps.context_window_source.as_deref(),
+    );
+    let matrix_window = limit_source_value(
+        &matrix_caps,
+        "matrix",
+        |caps| caps.context_window,
+        |caps| caps.context_window_source.as_deref(),
+    );
+    let probe_window = limit_source_value(
+        &discovered_caps,
+        "probe",
+        |caps| caps.context_window,
+        |caps| caps.context_window_source.as_deref(),
+    );
+    let gateway_output = limit_source_value(
+        &discovered_caps,
+        "gateway",
+        |caps| caps.max_output_tokens,
+        |caps| caps.max_output_tokens_source.as_deref(),
+    );
+    let matrix_output = limit_source_value(
+        &matrix_caps,
+        "matrix",
+        |caps| caps.max_output_tokens,
+        |caps| caps.max_output_tokens_source.as_deref(),
+    );
+    let probe_output = limit_source_value(
+        &discovered_caps,
+        "probe",
+        |caps| caps.max_output_tokens,
+        |caps| caps.max_output_tokens_source.as_deref(),
+    );
+    let user_window = settings.get("context_window").and_then(Value::as_u64);
+    let user_output = settings.get("max_output_tokens").and_then(Value::as_u64);
+    let (window, window_source) = opcos_provider::registry::resolve_limit(
+        gateway_window,
+        matrix_window,
+        probe_window,
+        learned_limits.0,
+        user_window,
+    );
+    let (output, output_source) = opcos_provider::registry::resolve_limit(
+        gateway_output,
+        matrix_output,
+        probe_output,
+        learned_limits.1,
+        user_output,
+    );
+    let mut resolved_caps = provider_defaults;
+    resolved_caps.context_window = window;
+    resolved_caps.context_window_source = window_source.map(str::to_owned);
+    resolved_caps.max_output_tokens = output;
+    resolved_caps.max_output_tokens_source = output_source.map(str::to_owned);
+    engine.set_resolved_capabilities(resolved_caps).await;
+    engine
+        .set_limit_identity(provider_id.clone(), base_url.clone())
+        .await;
     engine.set_secret_scrubber(Arc::new(KnownSecretScrubber {
         values: Arc::clone(&state.secret_values),
     }));
@@ -12401,8 +12530,14 @@ async fn interrupt(
         harness.interrupt();
         state
             .store
-            .update_session_status(&session_id, "interrupted", "user_interrupt")
+            .update_session_status(&session_id, "interrupted", "interrupted_by_user")
             .map_err(|error| error.to_string())?;
+        emit(
+            &app,
+            "turn_done",
+            Some(&session_id),
+            session_status_payload(&state, &session_id),
+        );
         return Ok(());
     }
     if session_for(&state, &session_id)?.harness == "acp" {
@@ -12410,12 +12545,22 @@ async fn interrupt(
         harness.interrupt();
         state
             .store
-            .update_session_status(&session_id, "interrupted", "user_interrupt")
+            .update_session_status(&session_id, "interrupted", "interrupted_by_user")
             .map_err(|error| error.to_string())?;
+        emit(
+            &app,
+            "turn_done",
+            Some(&session_id),
+            session_status_payload(&state, &session_id),
+        );
         return Ok(());
     }
     let engine = engine_for(&app, &state, &session_id, ToolOrigin::User).await?;
     engine.interrupt();
+    state
+        .store
+        .update_session_status(&session_id, "interrupted", "interrupted_by_user")
+        .map_err(|error| error.to_string())?;
     audit(
         &state,
         &session_id,
@@ -12427,6 +12572,12 @@ async fn interrupt(
         "notice",
         Some(&session_id),
         json!({"kind":"interrupted","text":"Turn interrupted"}),
+    );
+    emit(
+        &app,
+        "turn_done",
+        Some(&session_id),
+        session_status_payload(&state, &session_id),
     );
     Ok(())
 }
@@ -12768,6 +12919,7 @@ async fn change_model(
         .store
         .update_session_model(&session_id, &model)
         .map_err(|error| error.to_string())?;
+    state.engines.lock().await.remove(&session_id);
     emit(
         &app,
         "notice",
@@ -12826,6 +12978,7 @@ async fn provider_models_for_state(
     state: &DesktopState,
     provider: String,
     refresh: Option<bool>,
+    target_model: Option<&str>,
 ) -> Result<ProviderModelsResponse, String> {
     const CACHE_TTL_SECONDS: i64 = 300;
     let descriptor = registry::descriptors()
@@ -12877,6 +13030,19 @@ async fn provider_models_for_state(
             .model_discovery(&provider, &cache_base_url)
             .map_err(|error| error.to_string())?
         && cached.is_fresh(chrono::Utc::now(), CACHE_TTL_SECONDS)
+        && (target_model.is_none() || {
+            serde_json::from_str::<Vec<ModelDescriptor>>(&cached.models_json)
+                .ok()
+                .and_then(|models| {
+                    models.into_iter().find(|model| {
+                        target_model.is_some_and(|target| model.id.eq_ignore_ascii_case(target))
+                    })
+                })
+                .is_some_and(|model| {
+                    model.capabilities.context_window_source.is_some()
+                        && model.capabilities.max_output_tokens_source.is_some()
+                })
+        })
     {
         let models = serde_json::from_str(&cached.models_json)
             .map_err(|_| "cached model discovery is invalid".to_owned())?;
@@ -12912,7 +13078,39 @@ async fn provider_models_for_state(
         .await
     };
     let (models, source, fallback_reason) = match discovered {
-        Ok(models) => (models, "live".to_owned(), None),
+        Ok(mut models) => {
+            if descriptor.openai_compatible
+                && let Some(target_model) = target_model
+            {
+                let client = reqwest::Client::new();
+                if let Some(model) = models
+                    .iter_mut()
+                    .find(|model| model.id.eq_ignore_ascii_case(target_model))
+                    && (model.capabilities.context_window_source.is_none()
+                        || model.capabilities.max_output_tokens_source.is_none())
+                    && let Ok((limits, _raw)) = opcos_provider::registry::probe_model_limits(
+                        &client,
+                        &base_url,
+                        key.as_deref().unwrap_or_default(),
+                        &model.id,
+                    )
+                    .await
+                {
+                    if model.capabilities.context_window_source.is_none() {
+                        model.capabilities.context_window = limits.context_window;
+                        model.capabilities.context_window_source = Some("probe".into());
+                    }
+                    if model.capabilities.max_output_tokens_source.is_none() {
+                        model.capabilities.max_output_tokens = limits.max_output_tokens;
+                        model.capabilities.max_output_tokens_source = Some("probe".into());
+                    }
+                    if limits.context_window.is_some() || limits.max_output_tokens.is_some() {
+                        model.capabilities_known = true;
+                    }
+                }
+            }
+            (models, "live".to_owned(), None)
+        }
         Err(error) => (
             registry::descriptors()
                 .into_iter()
@@ -12975,7 +13173,7 @@ async fn provider_models(
     provider: String,
     refresh: Option<bool>,
 ) -> Result<ProviderModelsResponse, String> {
-    provider_models_for_state(&state, provider, refresh).await
+    provider_models_for_state(&state, provider, refresh, None).await
 }
 
 async fn current_session_provider(
@@ -13005,7 +13203,7 @@ async fn validate_session_model(
     model: &str,
 ) -> Result<(), String> {
     let provider = current_session_provider(state, session).await?;
-    let discovery = provider_models_for_state(state, provider.clone(), Some(false)).await?;
+    let discovery = provider_models_for_state(state, provider.clone(), Some(false), None).await?;
     if discovery.models.iter().any(|item| item.id == model) {
         Ok(())
     } else {
@@ -21502,6 +21700,11 @@ fn main() {
                     Box::new(std::io::Error::other(error.to_string()));
                 tauri::Error::Setup(cause.into())
             })?);
+            store.reconcile_running_sessions().map_err(|error| {
+                let cause: Box<dyn std::error::Error> =
+                    Box::new(std::io::Error::other(error.to_string()));
+                tauri::Error::Setup(cause.into())
+            })?;
             let database = init_database(path.clone()).map_err(|error| {
                 let cause: Box<dyn std::error::Error> = Box::new(std::io::Error::other(error));
                 tauri::Error::Setup(cause.into())
@@ -24574,6 +24777,44 @@ agents:
         assert_eq!(
             expand_slash_command(&connection, None, None, "/compact").unwrap(),
             "/compact"
+        );
+    }
+
+    #[test]
+    fn mixed_limit_sources_use_their_own_field_sources() {
+        let caps = opcos_provider::Caps {
+            context_window: Some(1_000_000),
+            context_window_source: Some("gateway".into()),
+            max_output_tokens: Some(65_536),
+            max_output_tokens_source: Some("probe".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            limit_source_value(
+                &caps,
+                "gateway",
+                |caps| caps.context_window,
+                |caps| caps.context_window_source.as_deref()
+            ),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            limit_source_value(
+                &caps,
+                "probe",
+                |caps| caps.max_output_tokens,
+                |caps| caps.max_output_tokens_source.as_deref()
+            ),
+            Some(65_536)
+        );
+        assert_eq!(
+            limit_source_value(
+                &caps,
+                "gateway",
+                |caps| caps.max_output_tokens,
+                |caps| caps.max_output_tokens_source.as_deref()
+            ),
+            None
         );
     }
 }

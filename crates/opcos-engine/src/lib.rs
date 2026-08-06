@@ -38,6 +38,9 @@ pub mod planner;
 pub use acp::{AcpHarness, AcpHarnessConfig};
 pub use opencode::{OpenCodeHarness, OpenCodeHarnessConfig};
 
+const ASSUMED_CONTEXT_WINDOW: u64 = 128_000;
+const ASSUMED_OUTPUT_TOKENS: u64 = 4096;
+
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error("provider: {0}")]
@@ -444,6 +447,8 @@ pub struct TurnEngine<P, S, E> {
     workspace: String,
     mode: Mutex<PermissionMode>,
     model: Mutex<String>,
+    resolved_caps: Mutex<Option<Caps>>,
+    limit_identity: Mutex<Option<(String, String, String)>>,
     interrupted: AtomicBool,
     steering: Mutex<Vec<String>>,
     steering_waiters: SteeringWaiters,
@@ -475,6 +480,13 @@ pub struct TurnEngine<P, S, E> {
     policy_denied: AtomicBool,
     mutating_api_gate_enabled: AtomicBool,
     secret_scrubber: Arc<dyn SecretScrubber>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResolvedLimits {
+    context_window: u64,
+    context_window_source: &'static str,
+    max_output_tokens: u64,
 }
 
 pub trait SecretScrubber: Send + Sync {
@@ -588,6 +600,8 @@ where
             workspace: workspace.into(),
             mode: Mutex::new(mode),
             model: Mutex::new(model.into()),
+            resolved_caps: Mutex::new(None),
+            limit_identity: Mutex::new(None),
             interrupted: AtomicBool::new(false),
             steering: Mutex::new(Vec::new()),
             steering_waiters: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -856,36 +870,42 @@ where
         self.interrupted.store(false, Ordering::SeqCst);
         self.policy_denied.store(false, Ordering::SeqCst);
         self.set_session_status("running", "none");
-        let value = json!({"role":"user","content":[{"type":"text","text":text.into()}]});
         let result = async {
-            let text = value
-                .get("content")
-                .and_then(Value::as_array)
-                .and_then(|parts| parts.first())
-                .and_then(|part| part.get("text"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let event = WorkingEvent {
-                event_type: "user_message".into(),
-                category: "message".into(),
-                direction: "incoming".into(),
-                timestamp: Utc::now().to_rfc3339(),
-                payload: json!({"message":text}),
-            };
-            self.emit_event(
-                "user_message",
-                StreamChunk {
-                    working_event: Some(event),
-                    ..StreamChunk::default()
-                },
-            )?;
-            self.append("user", value).await?;
+            self.append_user_message(text.into(), None).await?;
             self.run_loop(self.provider_messages()?).await
         }
         .await;
         self.finish_turn(&result);
         result
+    }
+
+    async fn append_user_message(
+        &self,
+        text: String,
+        source: Option<&str>,
+    ) -> Result<Value, EngineError> {
+        let mut payload =
+            serde_json::Map::from_iter([("message".to_owned(), Value::String(text.clone()))]);
+        if let Some(source) = source {
+            payload.insert("source".to_owned(), Value::String(source.to_owned()));
+        }
+        let event = WorkingEvent {
+            event_type: "user_message".into(),
+            category: "message".into(),
+            direction: "incoming".into(),
+            timestamp: Utc::now().to_rfc3339(),
+            payload: Value::Object(payload),
+        };
+        self.emit_event(
+            "user_message",
+            StreamChunk {
+                working_event: Some(event),
+                ..StreamChunk::default()
+            },
+        )?;
+        let value = json!({"role":"user","content":[{"type":"text","text":text}]});
+        self.append("user", value.clone()).await?;
+        Ok(value)
     }
 
     pub async fn retry(&self) -> Result<AssistantTurn, EngineError> {
@@ -1040,6 +1060,8 @@ where
         text: impl Into<String>,
     ) -> Result<oneshot::Receiver<(String, String)>, EngineError> {
         let text = text.into();
+        self.append_user_message(text.clone(), Some("steering"))
+            .await?;
         let (sender, receiver) = oneshot::channel();
         self.steering_waiters
             .lock()
@@ -1313,6 +1335,10 @@ where
     pub async fn change_model(&self, model: impl Into<String>) -> Result<(), EngineError> {
         let model = model.into();
         *self.model.lock().await = model.clone();
+        *self.resolved_caps.lock().await = None;
+        if let Some(identity) = self.limit_identity.lock().await.as_mut() {
+            identity.2 = model.clone();
+        }
         self.notice("model_switch", format!("Switched to model {model}"))
             .await
     }
@@ -1344,7 +1370,24 @@ where
         )
     }
     pub fn capabilities(&self, model: &str) -> Caps {
-        self.provider.capabilities(model)
+        self.resolved_caps
+            .try_lock()
+            .ok()
+            .and_then(|caps| caps.clone())
+            .unwrap_or_else(|| self.provider.capabilities(model))
+    }
+
+    pub async fn set_resolved_capabilities(&self, caps: Caps) {
+        *self.resolved_caps.lock().await = Some(caps);
+    }
+
+    pub async fn set_limit_identity(
+        &self,
+        provider: impl Into<String>,
+        base_url: impl Into<String>,
+    ) {
+        let model = self.model.lock().await.clone();
+        *self.limit_identity.lock().await = Some((provider.into(), base_url.into(), model));
     }
     pub fn workspace(&self) -> &str {
         &self.workspace
@@ -1376,6 +1419,7 @@ where
 
     async fn run_loop(&self, mut messages: Vec<Value>) -> Result<AssistantTurn, EngineError> {
         let mut usage: Option<TokenUsage> = None;
+        let mut context_overflow_retries = 0;
         let mut stop_vetoes = 0;
         let max_iterations = self.max_iterations.load(Ordering::SeqCst);
         for iteration in 0..max_iterations {
@@ -1397,11 +1441,16 @@ where
                 .iter()
                 .map(|message| message.to_string().len() as u64 / 4)
                 .sum::<u64>();
+            let limits = self.resolved_caps_for_model();
             let _ = self
                 .working_event(
                     "context_growth_update",
                     "other",
-                    json!({"estimated_context_tokens":context_tokens}),
+                    json!({
+                        "estimated_context_tokens":context_tokens,
+                        "resolved_context_window": limits.context_window,
+                        "context_window_source": limits.context_window_source,
+                    }),
                 )
                 .await;
             if self.interrupted.load(Ordering::SeqCst) {
@@ -1476,7 +1525,7 @@ where
                         partial.reasoning.as_deref().or(turn.reasoning.as_deref())
                     {
                         let message = reasoning.chars().take(4000).collect::<String>();
-                        if !message.is_empty() {
+                        if !message.trim().is_empty() {
                             let _ = self
                                 .working_event(
                                     "devin_thoughts",
@@ -1524,18 +1573,20 @@ where
                             .await;
                     }
                     let assistant = json!({"role":"assistant","content":turn.text.clone().unwrap_or_default(),
-                        "tool_calls":turn.tool_calls,"reasoning":turn.reasoning});
+            "tool_calls":turn.tool_calls,"reasoning":turn.reasoning});
                     self.append("assistant", assistant.clone()).await?;
-                    let _ = self
-                        .working_event(
-                            "devin_message",
-                            "message",
-                            json!({
-                                "message": turn.text.clone().unwrap_or_default(),
-                                "tool_calls": turn.tool_calls.len()
-                            }),
-                        )
-                        .await;
+                    if !turn.text.as_deref().unwrap_or_default().trim().is_empty() {
+                        let _ = self
+                            .working_event(
+                                "devin_message",
+                                "message",
+                                json!({
+                                    "message": turn.text.clone().unwrap_or_default(),
+                                    "tool_calls": turn.tool_calls.len()
+                                }),
+                            )
+                            .await;
+                    }
                     if !partial.turn_emitted {
                         let _ = self.emit_event(
                             "turn",
@@ -1589,7 +1640,6 @@ where
                         for text in steering {
                             let value =
                                 json!({"role":"user","content":[{"type":"text","text":text}]});
-                            self.append("user", value.clone()).await?;
                             messages.push(value);
                         }
                     } else {
@@ -1639,7 +1689,28 @@ where
                     }
                     self.notice("error", "Provider request failed".into())
                         .await?;
-                    if matches!(error, ProviderError::ContextOverflow) {
+                    if matches!(error, ProviderError::ContextOverflow { .. })
+                        && context_overflow_retries == 0
+                    {
+                        if let ProviderError::ContextOverflow { limit: Some(limit) } = &error {
+                            let mut caps =
+                                self.resolved_caps.lock().await.clone().unwrap_or_default();
+                            caps.context_window = Some(*limit);
+                            caps.context_window_source = Some("learned".into());
+                            *self.resolved_caps.lock().await = Some(caps);
+                            if let Some((provider, base_url, model)) =
+                                self.limit_identity.lock().await.clone()
+                            {
+                                let _ = self.recorder.store().save_learned_model_limits(
+                                    &provider,
+                                    &base_url,
+                                    &model,
+                                    Some(*limit),
+                                    None,
+                                );
+                            }
+                        }
+                        context_overflow_retries += 1;
                         messages = self
                             .compact_context(messages)
                             .await
@@ -1660,18 +1731,44 @@ where
     }
 
     fn should_compact(&self, messages: &[Value], usage: Option<&TokenUsage>) -> bool {
-        let model = self.model.try_lock().ok();
-        let caps = model
-            .as_deref()
-            .map(|model| self.provider.capabilities(model))
-            .unwrap_or_default();
-        let budget = caps.context_window.unwrap_or(32_000).saturating_mul(3) / 4;
+        let budget = self
+            .resolved_caps_for_model()
+            .context_window
+            .saturating_mul(3)
+            / 4;
         let estimated = usage.map(TokenUsage::context_tokens).unwrap_or_else(|| {
             serde_json::to_string(messages)
                 .map(|value| value.len() as u64 / 4)
                 .unwrap_or(u64::MAX)
         });
         estimated >= budget
+    }
+
+    fn resolved_caps_for_model(&self) -> ResolvedLimits {
+        let model = self.model.try_lock().ok();
+        let caps = self
+            .resolved_caps
+            .try_lock()
+            .ok()
+            .and_then(|caps| caps.clone())
+            .or_else(|| {
+                model
+                    .as_deref()
+                    .map(|model| self.provider.capabilities(model))
+            })
+            .unwrap_or_default();
+        ResolvedLimits {
+            context_window: caps.context_window.unwrap_or(ASSUMED_CONTEXT_WINDOW),
+            context_window_source: match caps.context_window_source.as_deref() {
+                Some("gateway") => "gateway",
+                Some("matrix") => "matrix",
+                Some("probe") => "probe",
+                Some("learned") => "learned",
+                Some("user") => "user",
+                _ => "assumed",
+            },
+            max_output_tokens: caps.max_output_tokens.unwrap_or(ASSUMED_OUTPUT_TOKENS),
+        }
     }
 
     async fn stream_turn(
@@ -2511,24 +2608,18 @@ where
             )
             .await;
         if let Some(rejection) = summary_issue {
-            self.notice(
+            self.notice_with_payload(
                 "compaction_summary_invalid",
                 format!(
                     "Compaction summary was not stored as model output: {}",
                     rejection.reason
                 ),
+                json!({
+                    "reason": rejection.reason,
+                    "diagnostics": rejection.diagnostics,
+                }),
             )
             .await?;
-            let _ = self
-                .working_event(
-                    "compaction_summary_invalid",
-                    "lifecycle",
-                    json!({
-                        "reason": rejection.reason,
-                        "diagnostics": rejection.diagnostics,
-                    }),
-                )
-                .await;
         }
         self.notice("compacted", "Earlier context compacted".into())
             .await?;
@@ -2562,7 +2653,10 @@ where
                     json!({"role":"user","content":context}),
                 ],
                 tools: Vec::new(),
-                settings: json!({"max_tokens":8192,"temperature":0.2}),
+                settings: json!({
+                    "max_tokens": self.resolved_caps_for_model().max_output_tokens,
+                    "temperature": 0.2
+                }),
             })
             .await
             .map_err(|_| CompactionSummaryRejection::without_text("provider_request_failed"))?;
@@ -2572,9 +2666,16 @@ where
             .or(response.reasoning)
             .filter(|text| !text.trim().is_empty())
             .ok_or_else(|| CompactionSummaryRejection::without_text("empty_response"))?;
-        Self::validate_compaction_summary(&text).map_err(|reason| CompactionSummaryRejection {
-            reason,
-            diagnostics: Self::compaction_summary_diagnostics(&text),
+        let max_chars = self
+            .resolved_caps_for_model()
+            .max_output_tokens
+            .saturating_mul(4)
+            .max(12_000) as usize;
+        Self::validate_compaction_summary(&text, max_chars).map_err(|reason| {
+            CompactionSummaryRejection {
+                reason,
+                diagnostics: Self::compaction_summary_diagnostics(&text),
+            }
         })?;
         Ok(text.trim().to_owned())
     }
@@ -2629,13 +2730,13 @@ where
         })
     }
 
-    fn validate_compaction_summary(text: &str) -> Result<(), String> {
+    fn validate_compaction_summary(text: &str, max_chars: usize) -> Result<(), String> {
         let without_reasoning = strip_reasoning_blocks(text);
         let trimmed = without_reasoning.trim();
         if trimmed.is_empty() {
             return Err("empty_response".into());
         }
-        if trimmed.len() > 12_000 {
+        if trimmed.chars().count() > max_chars {
             return Err("response_too_large".into());
         }
         if let Ok(value) = serde_json::from_str::<Value>(trimmed)
@@ -2712,6 +2813,15 @@ where
     }
 
     async fn notice(&self, kind: &str, content: String) -> Result<(), EngineError> {
+        self.notice_with_payload(kind, content, json!({})).await
+    }
+
+    async fn notice_with_payload(
+        &self,
+        kind: &str,
+        content: String,
+        extra_payload: Value,
+    ) -> Result<(), EngineError> {
         let mut safe_content = Value::String(content);
         self.secret_scrubber.scrub(&mut safe_content);
         let content = safe_content.as_str().unwrap_or_default().to_owned();
@@ -2730,7 +2840,14 @@ where
             category: "notice".into(),
             direction: "outgoing".into(),
             timestamp: Utc::now().to_rfc3339(),
-            payload: json!({"message": content}),
+            payload: {
+                let mut payload =
+                    serde_json::Map::from_iter([("message".to_owned(), Value::String(content))]);
+                if let Value::Object(extra) = extra_payload {
+                    payload.extend(extra);
+                }
+                Value::Object(payload)
+            },
         };
         self.emit_event(
             kind,
@@ -2767,7 +2884,15 @@ where
             serde_json::to_value(&event).map_err(|error| EngineError::Store(error.to_string()))?;
         self.secret_scrubber.scrub(&mut event_value);
         self.recorder.append_audit("working_event", &event_value)?;
-        self.persist_event_value(event_value)
+        let event = serde_json::from_value(event_value)
+            .map_err(|error| EngineError::Store(error.to_string()))?;
+        self.emit_event(
+            event_type,
+            StreamChunk {
+                working_event: Some(event),
+                ..StreamChunk::default()
+            },
+        )
     }
 
     fn emit_event(&self, event_type: &str, mut chunk: StreamChunk) -> Result<(), EngineError> {
@@ -5220,6 +5345,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn working_events_use_canonical_envelopes_for_persistence_and_live_delivery() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "envelope-session",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let mut receiver = engine.events_receiver().await.unwrap();
+
+        engine.submit_text("run the turn").await.unwrap();
+
+        let persisted = store
+            .load_session_events("envelope-session")
+            .unwrap()
+            .into_iter()
+            .map(|record| record.event)
+            .collect::<Vec<_>>();
+        assert!(!persisted.is_empty());
+        let ids = persisted
+            .iter()
+            .map(|event| event["event_id"].as_str().unwrap_or_default())
+            .collect::<HashSet<_>>();
+        assert_eq!(ids.len(), persisted.len());
+        assert!(persisted.iter().all(|event| {
+            event["type"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+                && event["event_id"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
+                && event["created_at_ms"].as_i64().is_some()
+        }));
+        assert!(persisted.windows(2).all(|events| {
+            events[0]["created_at_ms"].as_i64().unwrap()
+                <= events[1]["created_at_ms"].as_i64().unwrap()
+        }));
+        for event_type in ["user_message", "status_update", "devin_message"] {
+            assert!(persisted.iter().any(|event| event["type"] == event_type));
+        }
+
+        let mut live = Vec::new();
+        while let Ok(chunk) = receiver.try_recv() {
+            live.push(serde_json::to_value(chunk).unwrap());
+        }
+        for event in persisted {
+            let event_type = event["type"].as_str().unwrap();
+            if event_type == "user_message" || event_type == "devin_message" {
+                let live_event = live
+                    .iter()
+                    .find(|candidate| candidate["type"] == event_type)
+                    .expect("working event delivered live");
+                assert_eq!(live_event["event_id"], event["event_id"]);
+                assert_eq!(live_event["type"], event["type"]);
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct ReasoningProvider {
+        reasoning: Option<String>,
+    }
+
+    #[async_trait]
+    impl Provider for ReasoningProvider {
+        async fn complete(&self, _: ProviderRequest) -> Result<AssistantTurn, ProviderError> {
+            Ok(AssistantTurn {
+                text: Some("done".into()),
+                reasoning: self.reasoning.clone(),
+                ..Default::default()
+            })
+        }
+
+        async fn stream(
+            &self,
+            _: ProviderRequest,
+            output: mpsc::Sender<StreamChunk>,
+        ) -> Result<AssistantTurn, ProviderError> {
+            if let Some(reasoning) = &self.reasoning {
+                output
+                    .send(StreamChunk {
+                        reasoning_delta: Some(reasoning.clone()),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+            }
+            output
+                .send(StreamChunk {
+                    text_delta: Some("done".into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            Ok(AssistantTurn {
+                text: Some("done".into()),
+                reasoning: self.reasoning.clone(),
+                ..Default::default()
+            })
+        }
+
+        fn capabilities(&self, _: &str) -> Caps {
+            Caps::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn reasoning_is_persisted_as_nonempty_thoughts_only() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            ReasoningProvider {
+                reasoning: Some("Inspect the workspace before making changes.".into()),
+            },
+            store.clone(),
+            Arc::new(FakeTools),
+            "reasoning-session",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine.submit_text("inspect").await.unwrap();
+        let thoughts = store
+            .load_session_events("reasoning-session")
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event["type"] == "devin_thoughts")
+            .collect::<Vec<_>>();
+        assert_eq!(thoughts.len(), 1);
+        assert_eq!(
+            thoughts[0].event["working_event"]["payload"]["message"],
+            "Inspect the workspace before making changes."
+        );
+        assert!(
+            thoughts[0].event["working_event"]["payload"]["thinking_duration_ms"]
+                .as_u64()
+                .is_some()
+        );
+
+        let empty_store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let empty_engine = TurnEngine::new(
+            ReasoningProvider {
+                reasoning: Some(" \n\t".into()),
+            },
+            empty_store.clone(),
+            Arc::new(FakeTools),
+            "empty-reasoning-session",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        empty_engine.submit_text("inspect").await.unwrap();
+        assert!(
+            !empty_store
+                .load_session_events("empty-reasoning-session")
+                .unwrap()
+                .into_iter()
+                .any(|event| event.event["type"] == "devin_thoughts")
+        );
+    }
+
+    #[tokio::test]
     async fn plan_and_ask_user_are_durable_pending_turns() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let provider = ApprovalProvider {
@@ -5468,12 +5757,77 @@ mod tests {
         assert!(engine.should_compact(
             &small,
             Some(&TokenUsage {
-                input: 30_000,
+                input: 96_000,
                 output: 0,
                 cache_read: 0,
                 cache_write: 0
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn compaction_uses_resolved_million_token_window() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "glm-5.2",
+        );
+        engine
+            .set_resolved_capabilities(Caps {
+                context_window: Some(1_000_000),
+                context_window_source: Some("matrix".into()),
+                ..Default::default()
+            })
+            .await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        assert!(!engine.should_compact(
+            &messages,
+            Some(&TokenUsage {
+                input: 24_000,
+                output: 0,
+                cache_read: 0,
+                cache_write: 0,
+            })
+        ));
+        assert!(engine.should_compact(
+            &messages,
+            Some(&TokenUsage {
+                input: 750_000,
+                output: 0,
+                cache_read: 0,
+                cache_write: 0,
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn changing_model_clears_resolved_capabilities() {
+        let engine = TurnEngine::new(
+            FakeProvider,
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "glm-5.2",
+        );
+        engine
+            .set_resolved_capabilities(Caps {
+                context_window: Some(1_000_000),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(
+            engine.capabilities("glm-5.2").context_window,
+            Some(1_000_000)
+        );
+        engine.change_model("smaller-model").await.unwrap();
+        assert_eq!(engine.capabilities("smaller-model").context_window, None);
     }
 
     #[tokio::test]
@@ -5871,7 +6225,7 @@ mod tests {
         ] {
             assert!(
                 TurnEngine::<SummaryProvider, SqliteStore, FakeTools>::validate_compaction_summary(
-                    text
+                    text, 12_000
                 )
                 .is_err(),
                 "{name} should be rejected"
@@ -5908,7 +6262,7 @@ mod tests {
         ] {
             assert!(
                 TurnEngine::<SummaryProvider, SqliteStore, FakeTools>::validate_compaction_summary(
-                    text
+                    text, 12_000
                 )
                 .is_ok(),
                 "observed summary shape was rejected: {text}"
@@ -5933,13 +6287,33 @@ mod tests {
             let text = std::fs::read_to_string(entry.path()).unwrap();
             assert!(
                 TurnEngine::<SummaryProvider, SqliteStore, FakeTools>::validate_compaction_summary(
-                    &text
+                    &text, 12_000
                 )
                 .is_ok(),
                 "real model fixture was rejected: {:?}",
                 entry.path()
             );
         }
+    }
+
+    #[test]
+    fn compaction_summary_limit_tracks_output_budget() {
+        let text = format!(
+            "Goal\nCompleted actions and results\nKey discoveries and file paths\nUnfinished next steps\n{}",
+            "x".repeat(13_000)
+        );
+        assert!(
+            TurnEngine::<SummaryProvider, SqliteStore, FakeTools>::validate_compaction_summary(
+                &text, 16_384
+            )
+            .is_ok()
+        );
+        assert!(
+            TurnEngine::<SummaryProvider, SqliteStore, FakeTools>::validate_compaction_summary(
+                &text, 12_000
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -5986,6 +6360,18 @@ mod tests {
                 .and_then(Value::as_str)
                 .is_some_and(|text| text == summary)
         }));
+        let invalid_events = store
+            .load_session_events("s")
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event["type"] == "compaction_summary_invalid")
+            .collect::<Vec<_>>();
+        assert_eq!(invalid_events.len(), 1);
+        assert!(
+            invalid_events[0].event["working_event"]["payload"]["message"]
+                .as_str()
+                .is_some_and(|message| !message.trim().is_empty())
+        );
     }
 
     #[tokio::test]
@@ -6383,7 +6769,9 @@ mod tests {
             _: mpsc::Sender<StreamChunk>,
         ) -> Result<AssistantTurn, ProviderError> {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                Err(ProviderError::ContextOverflow)
+                Err(ProviderError::ContextOverflow {
+                    limit: Some(131_072),
+                })
             } else {
                 Ok(AssistantTurn {
                     text: Some("retried".into()),
@@ -6428,6 +6816,17 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(store.load_compaction("s").unwrap().is_some());
+        assert!(
+            store
+                .load_session_events("s")
+                .unwrap()
+                .into_iter()
+                .any(|event| {
+                    event.event["type"] == "context_growth_update"
+                        && event.event["working_event"]["payload"]["context_window_source"]
+                            == "learned"
+                })
+        );
     }
 
     struct InterruptProvider {
@@ -6566,6 +6965,32 @@ mod tests {
         assert_eq!(messages.iter().filter(|m| m.display_only).count(), 0);
         assert!(messages.iter().any(|m| m.role == "user"));
         assert!(messages.iter().any(|m| m.role == "assistant"));
+    }
+
+    #[tokio::test]
+    async fn steering_is_persisted_as_a_user_message_event() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let _completion = engine.queue_steering("follow-up direction").await.unwrap();
+
+        let messages = store.load_messages("s").unwrap();
+        assert!(messages.iter().any(|message| {
+            message.role == "user" && message.content["content"][0]["text"] == "follow-up direction"
+        }));
+        let events = store.load_session_events("s").unwrap();
+        assert!(events.iter().any(|event| {
+            event.event["type"] == "user_message"
+                && event.event["working_event"]["payload"]["message"] == "follow-up direction"
+                && event.event["working_event"]["payload"]["source"] == "steering"
+        }));
     }
 
     #[test]
