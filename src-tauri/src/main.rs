@@ -76,7 +76,7 @@ use std::path::{Path as FsPath, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 mod browser;
@@ -4170,6 +4170,7 @@ impl ToolExecutor for DesktopExecutor {
                         .map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
                         .map_err(|error| error.to_string()),
                     "run_shell" | "exec" => {
+                        let started_at = Instant::now();
                         let names = arguments
                             .get("secret_names")
                             .and_then(Value::as_array)
@@ -4205,6 +4206,12 @@ impl ToolExecutor for DesktopExecutor {
                             .await
                             .map_err(|error| error.to_string())?;
                         let mut output = serde_json::to_value(result).unwrap_or(Value::Null);
+                        if let Some(object) = output.as_object_mut() {
+                            object.insert(
+                                "duration_ms".into(),
+                                json!(started_at.elapsed().as_millis() as u64),
+                            );
+                        }
                         bound_shell_output(&mut output);
                         for value in values {
                             redact_json_strings(&mut output, &value);
@@ -4362,12 +4369,19 @@ impl ToolExecutor for DesktopExecutor {
             env: Some(Value::Object(env)),
         };
         let forward_output = |chunk: &str| on_output(chunk);
+        let started_at = Instant::now();
         let result = executor
             .host
             .exec_persistent_streaming(request, &forward_output)
             .await
             .map_err(|error| error.to_string())?;
         let mut result = serde_json::to_value(result).unwrap_or(Value::Null);
+        if let Some(object) = result.as_object_mut() {
+            object.insert(
+                "duration_ms".into(),
+                json!(started_at.elapsed().as_millis() as u64),
+            );
+        }
         bound_shell_output(&mut result);
         for value in values {
             redact_json_strings(&mut result, &value);

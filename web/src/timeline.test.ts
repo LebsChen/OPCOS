@@ -3,6 +3,7 @@ import liveEnvelopes from "../../fixtures/timeline/live-events.json";
 import opcosEvents from "../../fixtures/timeline/opcos-events.json";
 import planIterations from "../../fixtures/timeline/opcos-plan-iterations.json";
 import terminalReplay from "../../fixtures/timeline/opcos-terminal-replay.json";
+import parityEvents from "../../fixtures/timeline/opcos-devin-parity.json";
 import toolCallOnlyIteration from "../../fixtures/timeline/tool-call-only-iteration.json";
 import persisted from "../../fixtures/timeline/persisted-events.json";
 import {
@@ -29,17 +30,189 @@ describe("single event-log timeline", () => {
         terminalTotalBytes: 100,
       }),
     );
-    expect(rows).toContainEqual({
+    expect(rows).toContainEqual(expect.objectContaining({
       label: "true",
       callId: "call-terminal-empty",
       terminalOutput: undefined,
       terminalTruncated: undefined,
       terminalTotalBytes: undefined,
-    });
+    }));
   });
 
   it("renders live and reloaded events identically", () => {
     expect(buildTimeline(live)).toEqual(buildTimeline(saved));
+  });
+  it("uses Devin-style group labels, attached thoughts, and shell results", () => {
+    const nodes = buildTimeline(parityEvents as TimelineEvent[]);
+    const work = nodes.find((node) => node.kind === "work");
+    expect(work).toMatchObject({ label: "Worked for 2s" });
+    expect(work?.rows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          label: "Listing files",
+          activityLabel: true,
+        }),
+        expect.objectContaining({
+          label: "Thought for 1s",
+          thoughtForCallId: "call-shell",
+        }),
+        expect.objectContaining({
+          label: "cargo test",
+          shellId: "shell-session",
+          processId: "call-shell",
+          exitCode: 0,
+          durationMs: 500,
+          isMajorAction: true,
+        }),
+      ]),
+    );
+    expect(work?.rows.some((row) => row.isMajorAction === false)).toBe(true);
+  });
+  it("keeps every one-line label without replacing the finished group header", () => {
+    const nodes = buildTimeline([
+      {
+        type: "one_line_thoughts",
+        event_id: "label-1",
+        created_at_ms: 1000,
+        working_event: {
+          event_type: "one_line_thoughts",
+          payload: { short: "Listing files" },
+        },
+      },
+      {
+        type: "browser_status_started",
+        event_id: "minor-1",
+        created_at_ms: 1100,
+        working_event: {
+          event_type: "browser_status_started",
+          payload: { tool: "browser_status", is_major_action: false },
+        },
+      },
+      {
+        type: "one_line_thoughts",
+        event_id: "label-2",
+        created_at_ms: 2000,
+        working_event: {
+          event_type: "one_line_thoughts",
+          payload: { short: "Running tests" },
+        },
+      },
+      {
+        type: "shell_process_started",
+        event_id: "shell-label",
+        created_at_ms: 3000,
+        working_event: {
+          event_type: "shell_process_started",
+          payload: { call_id: "label-call", command: "cargo test" },
+        },
+      },
+    ] as TimelineEvent[]);
+    const work = nodes.find((node) => node.kind === "work");
+    expect(work?.label).toBe("Worked for 2s");
+    expect(work?.rows.map((row) => row.label)).toEqual([
+      "Listing files",
+      "browser_status",
+      "Running tests",
+      "cargo test",
+    ]);
+  });
+  it("defaults legacy generic actions to major", () => {
+    const [work] = buildTimeline([
+      {
+        type: "browser_status_started",
+        event_id: "legacy-generic",
+        created_at_ms: 1,
+        working_event: {
+          event_type: "browser_status_started",
+          payload: { tool: "browser_status" },
+        },
+      },
+    ] as TimelineEvent[]).filter((node) => node.kind === "work");
+    expect(work?.rows[0]).toMatchObject({
+      label: "browser_status",
+      isMajorAction: true,
+    });
+  });
+  it("keeps legacy events without parity fields renderable", () => {
+    const nodes = buildTimeline([
+      {
+        type: "shell_process_started",
+        event_id: "legacy-start",
+        created_at_ms: 1,
+        working_event: {
+          event_type: "shell_process_started",
+          payload: { call_id: "legacy-call", command: "echo legacy" },
+        },
+      },
+      {
+        type: "shell_process_completed",
+        event_id: "legacy-end",
+        created_at_ms: 4,
+        working_event: {
+          event_type: "shell_process_completed",
+          payload: { process_id: "legacy-call", exit_code: 0 },
+        },
+      },
+    ] as TimelineEvent[]);
+    expect(nodes).toContainEqual(
+      expect.objectContaining({
+        kind: "work",
+        rows: [
+          expect.objectContaining({
+            label: "echo legacy",
+            exitCode: 0,
+            durationMs: 3,
+          }),
+        ],
+      }),
+    );
+  });
+  it("keeps thoughts visible when the next action starts a later work group", () => {
+    const nodes = buildTimeline([
+      {
+        type: "devin_thoughts",
+        event_id: "thought-before-message",
+        created_at_ms: 1000,
+        working_event: {
+          event_type: "devin_thoughts",
+          payload: {
+            message: "I should inspect the repository first.",
+            thinking_duration_ms: 3000,
+          },
+        },
+      },
+      {
+        type: "devin_message",
+        event_id: "message-between-groups",
+        created_at_ms: 1100,
+        working_event: {
+          event_type: "devin_message",
+          payload: { message: "I will inspect the repository." },
+        },
+      },
+      {
+        type: "shell_process_started",
+        event_id: "action-later",
+        created_at_ms: 1200,
+        working_event: {
+          event_type: "shell_process_started",
+          payload: { call_id: "later-call", command: "ls" },
+        },
+      },
+    ] as TimelineEvent[]);
+    const thoughtRows = nodes
+      .filter((node) => node.kind === "work")
+      .flatMap((node) =>
+        node.rows.filter((row) => row.label.startsWith("Thought for ")),
+      );
+    expect(thoughtRows).toHaveLength(1);
+    expect(thoughtRows[0].thoughtForCallId).toBeUndefined();
+    expect(
+      nodes
+        .filter((node) => node.kind === "work")
+        .flatMap((node) => node.rows)
+        .filter((row) => row.label.startsWith("Thought for ")),
+    ).toHaveLength(1);
   });
   it("deduplicates replayed chunks across arbitrary reconnect boundaries", () => {
     let events: TimelineEvent[] = [];
@@ -181,13 +354,13 @@ describe("single event-log timeline", () => {
         terminalTotalBytes: 100,
       }),
     );
-    expect(rows).toContainEqual({
+    expect(rows).toContainEqual(expect.objectContaining({
       label: "true",
       callId: "call-empty",
       terminalOutput: undefined,
       terminalTruncated: undefined,
       terminalTotalBytes: undefined,
-    });
+    }));
   });
   it("renders terminal chunks that arrive before a shell row without a sequence field", () => {
     const nodes = buildTimeline([

@@ -41,10 +41,17 @@ export type TimelineNode =
       rows: Array<{
         label: string;
         detail?: string;
+        thoughtForCallId?: string;
+        activityLabel?: boolean;
         callId?: string;
         terminalOutput?: string;
         terminalTruncated?: boolean;
         terminalTotalBytes?: number;
+        shellId?: string;
+        processId?: string;
+        exitCode?: number;
+        durationMs?: number;
+        isMajorAction?: boolean;
         artifactId?: string;
         artifactKind?: string;
         artifactMime?: string;
@@ -108,6 +115,9 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
   let work: Extract<TimelineNode, { kind: "work" }> | null = null;
   let workStarted = 0;
   let workEnded = 0;
+  let pendingThought:
+    | { row: Extract<TimelineNode, { kind: "work" }>["rows"][number] }
+    | undefined;
   const planSteps = new Map<string, Array<Record<string, unknown>>>();
   const pendingTerminal = new Map<
     string,
@@ -118,13 +128,42 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
     {
       label: string;
       callId?: string;
+      detail?: string;
       terminalOutput?: string;
       terminalTruncated?: boolean;
       terminalTotalBytes?: number;
+      shellId?: string;
+      processId?: string;
+      exitCode?: number;
+      durationMs?: number;
+      isMajorAction?: boolean;
+      startedAt?: number;
     }
   >();
+  const pendingShellCompletions = new Map<
+    string,
+    { processId?: string; exitCode?: number; durationMs?: number }
+  >();
+  const ensureWork = (startedAt: number) => {
+    if (!work) {
+      work = {
+        kind: "work",
+        label: "Worked for 0s",
+        rows: [],
+        additions: 0,
+        deletions: 0,
+      };
+    }
+    if (!workStarted) workStarted = startedAt;
+    workEnded = startedAt;
+    return work;
+  };
   const flush = (endedAt = workEnded) => {
     if (!work) return;
+    if (pendingThought) {
+      pendingThought.row.thoughtForCallId = undefined;
+      pendingThought = undefined;
+    }
     if (work.rows.length === 0) {
       work = null;
       return;
@@ -189,17 +228,18 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
       workStarted = 0;
       workEnded = 0;
     } else if (type === "compacted") {
-      if (!work)
-        work = {
-          kind: "work",
-          label: "Worked for 0s",
-          rows: [],
-          additions: 0,
-          deletions: 0,
-        };
-      if (!workStarted) workStarted = event.created_at_ms;
-      workEnded = event.created_at_ms;
-      work.rows.push({ label: "Earlier context compacted" });
+      const activeWork = ensureWork(event.created_at_ms);
+      activeWork.rows.push({ label: "Earlier context compacted" });
+    } else if (type === "one_line_thoughts") {
+      const activeWork = ensureWork(event.created_at_ms);
+      const short = String(data.short ?? data.summary ?? "").trim();
+      if (short) {
+        activeWork.rows.push({
+          label: short,
+          activityLabel: true,
+          isMajorAction: true,
+        });
+      }
     } else if (
       [
         "error",
@@ -249,37 +289,70 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
     ) {
       continue;
     } else {
-      if (!work)
-        work = {
-          kind: "work",
-          label: "Worked for 0s",
-          rows: [],
-          additions: 0,
-          deletions: 0,
-        };
-      if (!workStarted) workStarted = event.created_at_ms;
-      workEnded = event.created_at_ms;
+      const activeWork = ensureWork(event.created_at_ms);
       if (type === "devin_thoughts") {
         const duration = Number(data.thinking_duration_ms ?? 0);
-        work.rows.push({
+        const row = {
           label: `Thought for ${Math.round(duration / 1000)}s`,
           detail: String(data.message ?? ""),
-        });
+          thoughtForCallId: undefined as string | undefined,
+          isMajorAction: true,
+        };
+        activeWork.rows.push(row);
+        pendingThought = { row };
       } else if (type === "shell_process_started") {
         const callId =
           typeof data.call_id === "string" ? data.call_id : undefined;
         const pending = callId ? pendingTerminal.get(callId) : undefined;
+        const completion = callId
+          ? pendingShellCompletions.get(callId)
+          : undefined;
         const row = {
           label: String(data.command ?? ""),
           callId,
+          detail: undefined as string | undefined,
+          shellId:
+            typeof data.shell_id === "string" ? data.shell_id : undefined,
+          isMajorAction:
+            data.is_major_action === false ? false : true,
+          startedAt: event.created_at_ms,
           terminalOutput: pending?.output || undefined,
           terminalTruncated: pending?.truncated || undefined,
           terminalTotalBytes: pending?.totalBytes,
+          ...completion,
         };
-        work.rows.push(row);
+        if (pendingThought) {
+          pendingThought.row.thoughtForCallId = callId;
+          pendingThought = undefined;
+        }
+        activeWork.rows.push(row);
         if (callId) {
           shellRows.set(callId, row);
           pendingTerminal.delete(callId);
+          pendingShellCompletions.delete(callId);
+        }
+      } else if (type === "shell_process_completed") {
+        const callId =
+          typeof data.process_id === "string" ? data.process_id : undefined;
+        const exitCode =
+          typeof data.exit_code === "number" ? data.exit_code : undefined;
+        const durationMs =
+          typeof data.duration_ms === "number" ? data.duration_ms : undefined;
+        const row = callId ? shellRows.get(callId) : undefined;
+        if (row) {
+          row.processId = callId;
+          row.exitCode = exitCode;
+          row.durationMs =
+            durationMs ??
+            (row.startedAt === undefined
+              ? undefined
+              : Math.max(0, event.created_at_ms - row.startedAt));
+        } else if (callId) {
+          pendingShellCompletions.set(callId, {
+            processId: callId,
+            exitCode,
+            durationMs,
+          });
         }
       } else if (type === "terminal_update") {
         const callId = String(data.call_id ?? "");
@@ -312,17 +385,20 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
           const item = update as Record<string, unknown>;
           const added = Number(item.lines_added ?? 0);
           const removed = Number(item.lines_removed ?? 0);
-          work.additions += added;
-          work.deletions += removed;
+          activeWork.additions += added;
+          activeWork.deletions += removed;
           const basename =
             String(item.file_path ?? "")
               .split(/[\\/]/)
               .pop() ?? "";
-          work.rows.push({
+          activeWork.rows.push({
+            callId:
+              typeof data.call_id === "string" ? data.call_id : undefined,
             label:
               item.action_type === "create"
                 ? `Created ${basename} +${added}`
                 : `Edited ${basename} +${added} −${removed}`,
+            isMajorAction: true,
             artifactId:
               typeof item.artifact_id === "string"
                 ? item.artifact_id
@@ -332,16 +408,20 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
             artifactMime:
               typeof item.artifact_id === "string" ? "text/x-diff" : undefined,
           });
+          if (pendingThought) {
+            pendingThought.row.thoughtForCallId =
+              typeof data.call_id === "string" ? data.call_id : undefined;
+          }
+          pendingThought = undefined;
         }
       } else if (type === "computer_use") {
-        const currentWork = work;
         const keys = Array.isArray(data.screenshot_keys)
           ? data.screenshot_keys.filter(
               (key): key is string => typeof key === "string",
             )
           : [];
         keys.forEach((artifactId) => {
-          currentWork?.rows.push({
+          activeWork.rows.push({
             label: "Screenshot",
             artifactId,
             artifactKind: "screenshot",
@@ -366,10 +446,9 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
         const completed = todos.filter((todo) =>
           ["done", "completed"].includes(String(todo.status)),
         ).length;
-        if ((!previousTodos || todos.length > previousTodos.length) && work) {
-          work.rows.push({ label: `Created ${todos.length} Tasks` });
-        } else if (work && previousTodos) {
-          const currentWork = work;
+        if (!previousTodos || todos.length > previousTodos.length) {
+          activeWork.rows.push({ label: `Created ${todos.length} Tasks` });
+        } else if (previousTodos) {
           todos.forEach((item, index) => {
             const previous = previousTodos[index];
             if (
@@ -379,14 +458,13 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
               previous.description === item.description
             )
               return;
-            currentWork.rows.push({
+            activeWork.rows.push({
               label: `${completed}/${todos.length}#${index + 1} ${String(item.content ?? item.title ?? "")}`,
             });
           });
         }
         planSteps.set(planId, todos);
       } else if (
-        type === "shell_process_completed" ||
         type === "read_file_started" ||
         type === "list_dir_started"
       ) {
@@ -396,12 +474,13 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
         type === "list_dir_completed"
       ) {
         const target = String(data.path ?? data.target ?? data.file_path ?? "");
-        work.rows.push({
+        activeWork.rows.push({
           label: target
             ? `${type.startsWith("read_file") ? "Read" : "Listed"} ${target}`
             : type.startsWith("read_file")
               ? "Read file"
               : "Listed directory",
+          isMajorAction: true,
         });
       } else if (type.endsWith("_started")) {
         if (
@@ -414,7 +493,21 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
           type !== "write_file_started" &&
           type !== "edit_file_started"
         ) {
-          work.rows.push({ label: String(data.command ?? data.tool ?? type) });
+          const row = {
+            label: String(data.command ?? data.tool ?? type),
+            callId:
+              typeof data.call_id === "string" ? data.call_id : undefined,
+            isMajorAction:
+              typeof data.is_major_action === "boolean"
+                ? data.is_major_action
+                : true,
+          };
+          if (pendingThought) {
+            pendingThought.row.thoughtForCallId =
+              typeof data.call_id === "string" ? data.call_id : undefined;
+            pendingThought = undefined;
+          }
+          activeWork.rows.push(row);
         }
       }
     }

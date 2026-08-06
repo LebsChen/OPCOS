@@ -1,0 +1,90 @@
+[
+  {
+    "type": "one_line_thoughts",
+    "event_id": "parity-thought-summary",
+    "created_at_ms": 1000,
+    "working_event": {
+      "event_type": "one_line_thoughts",
+      "payload": {
+        "short": "Listing files",
+        "summary": "Inspect the workspace before editing."
+      }
+    }
+  },
+  {
+    "type": "devin_thoughts",
+    "event_id": "parity-thought",
+    "created_at_ms": 1001,
+    "working_event": {
+      "event_type": "devin_thoughts",
+      "payload": {
+        "message": "Inspect the workspace before editing.",
+        "thinking_duration_ms": 1200
+      }
+    }
+  },
+  {
+    "type": "shell_process_started",
+    "event_id": "parity-shell-start",
+    "created_at_ms": 2000,
+    "working_event": {
+      "event_type": "shell_process_started",
+      "payload": {
+        "call_id": "call-shell",
+        "shell_id": "shell-session",
+        "command": "cargo test",
+        "starting_dir": "/workspace",
+        "is_major_action": true
+      }
+    }
+  },
+  {
+    "type": "browser_status_started",
+    "event_id": "parity-list",
+    "created_at_ms": 2600,
+    "working_event": {
+      "event_type": "browser_status_started",
+      "payload": {
+        "tool": "browser_status",
+        "is_major_action": false
+      }
+    }
+  },
+  {
+    "type": "terminal_update",
+    "event_id": "parity-terminal",
+    "created_at_ms": 2100,
+    "working_event": {
+      "event_type": "terminal_update",
+      "payload": {
+        "call_id": "call-shell",
+        "contents": "ok\n"
+      }
+    }
+  },
+  {
+    "type": "shell_process_completed",
+    "event_id": "parity-shell-complete",
+    "created_at_ms": 2500,
+    "working_event": {
+      "event_type": "shell_process_completed",
+      "payload": {
+        "shell_id": "shell-session",
+        "process_id": "call-shell",
+        "exit_code": 0
+      }
+    }
+  },
+  {
+    "type": "edit_file_started",
+    "event_id": "parity-edit",
+    "created_at_ms": 3000,
+    "working_event": {
+      "event_type": "edit_file_started",
+      "payload": {
+        "tool": "edit_file",
+        "is_major_action": true
+      }
+    }
+  }
+]

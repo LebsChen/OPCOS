@@ -10023,7 +10023,17 @@ function AppContent() {
     void command<ProviderModelsResponse>("provider_models", {
       provider: homeProvider || "openai",
     })
-      .then((response) => setModels(response.models))
+      .then((response) => {
+        setModels(response.models);
+        setHomeModel((current) => {
+          if (current !== "auto") return current;
+          return (
+            response.models.find((model) => !model.likely_non_chat)?.id ??
+            response.models[0]?.id ??
+            current
+          );
+        });
+      })
       .catch((reason) => {
         if (
           (window as Window & { __TAURI_INTERNALS__?: unknown })
@@ -10796,7 +10806,14 @@ function AppContent() {
                           };
                           setHomeRole(content.role || "");
                           setHomeProvider(content.provider || "");
-                          setHomeModel(content.model || "auto");
+                          setHomeModel(
+                            content.model && content.model !== "auto"
+                              ? content.model
+                              : models.find((model) => !model.likely_non_chat)
+                                  ?.id ??
+                                  models[0]?.id ??
+                                  "auto",
+                          );
                           setHomeHarness(content.harness || "builtin");
                           setHomeMode(content.mode || "Auto");
                           setHomeSystemPrompt(content.system_prompt || "");
