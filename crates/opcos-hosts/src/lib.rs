@@ -2922,37 +2922,47 @@ impl LocalHost {
             .transpose()?
             .unwrap_or_else(|| self.root.clone());
         let change_cwd = request.cwd.is_some();
-        #[cfg(windows)]
-        {
-            let result = self
-                .exec_persistent(
-                    session,
-                    &request.command,
-                    &cwd,
-                    request.timeout_seconds,
-                    change_cwd,
-                    request.env.as_ref(),
-                )
-                .await?;
-            on_output(&result.result.stdout);
-            return Ok(result);
-        }
-        #[cfg(not(windows))]
-        {
-            let mut sessions = self.sessions.lock().await;
-            let marker = format!("{}-{}__", "OPCOS_LOCAL_COMMAND", Uuid::new_v4().simple());
-            let output_path = std::env::temp_dir()
-                .join(format!("opcos-shell-output-{}", Uuid::new_v4().simple()));
-            let staging_path = PathBuf::from(format!("{}.working", output_path.display()));
-            if !sessions.contains_key(session) {
-                let (child, stdin, stdout, interpreter) =
-                    spawn_persistent_shell(&cwd, &self.secret_values).await?;
-                let mut shell = LocalShell {
-                    _child: child,
-                    stdin,
-                    stdout: BufReader::new(stdout),
-                    interpreter,
-                };
+        let mut sessions = self.sessions.lock().await;
+        let marker = format!("{}-{}__", "OPCOS_LOCAL_COMMAND", Uuid::new_v4().simple());
+        let output_path =
+            std::env::temp_dir().join(format!("opcos-shell-output-{}", Uuid::new_v4().simple()));
+        let staging_path = PathBuf::from(format!("{}.working", output_path.display()));
+        if !sessions.contains_key(session) {
+            let (child, stdin, stdout, interpreter) =
+                spawn_persistent_shell(&cwd, &self.secret_values).await?;
+            let mut shell = LocalShell {
+                _child: child,
+                stdin,
+                stdout: BufReader::new(stdout),
+                interpreter,
+            };
+            let shell_command = persistent_streaming_command(
+                &request.command,
+                request.env.as_ref(),
+                &marker,
+                &output_path,
+                &cwd,
+                change_cwd,
+            )?;
+            let write_result = match shell
+                .stdin
+                .write_all(format!("{shell_command}\n").as_bytes())
+                .await
+            {
+                Ok(()) => shell.stdin.flush().await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = write_result {
+                let _ = shell._child.kill().await;
+                let _ = shell._child.wait().await;
+                let _ = tokio::fs::remove_file(&output_path).await;
+                let _ = tokio::fs::remove_file(&staging_path).await;
+                return Err(HostError::Io(error));
+            }
+            sessions.insert(session.to_owned(), shell);
+        } else {
+            let write_result = {
+                let shell = sessions.get_mut(session).expect("session exists");
                 let shell_command = persistent_streaming_command(
                     &request.command,
                     request.env.as_ref(),
@@ -2961,53 +2971,26 @@ impl LocalHost {
                     &cwd,
                     change_cwd,
                 )?;
-                let write_result = match shell
+                match shell
                     .stdin
                     .write_all(format!("{shell_command}\n").as_bytes())
                     .await
                 {
                     Ok(()) => shell.stdin.flush().await,
                     Err(error) => Err(error),
-                };
-                if let Err(error) = write_result {
+                }
+            };
+            if let Err(error) = write_result {
+                if let Some(mut shell) = sessions.remove(session) {
                     let _ = shell._child.kill().await;
                     let _ = shell._child.wait().await;
-                    let _ = tokio::fs::remove_file(&output_path).await;
-                    let _ = tokio::fs::remove_file(&staging_path).await;
-                    return Err(HostError::Io(error));
                 }
-                sessions.insert(session.to_owned(), shell);
-            } else {
-                let write_result = {
-                    let shell = sessions.get_mut(session).expect("session exists");
-                    let shell_command = persistent_streaming_command(
-                        &request.command,
-                        request.env.as_ref(),
-                        &marker,
-                        &output_path,
-                        &cwd,
-                        change_cwd,
-                    )?;
-                    match shell
-                        .stdin
-                        .write_all(format!("{shell_command}\n").as_bytes())
-                        .await
-                    {
-                        Ok(()) => shell.stdin.flush().await,
-                        Err(error) => Err(error),
-                    }
-                };
-                if let Err(error) = write_result {
-                    if let Some(mut shell) = sessions.remove(session) {
-                        let _ = shell._child.kill().await;
-                        let _ = shell._child.wait().await;
-                    }
-                    let _ = tokio::fs::remove_file(&output_path).await;
-                    let _ = tokio::fs::remove_file(&staging_path).await;
-                    return Err(HostError::Io(error));
-                }
+                let _ = tokio::fs::remove_file(&output_path).await;
+                let _ = tokio::fs::remove_file(&staging_path).await;
+                return Err(HostError::Io(error));
             }
-            let command_result: Result<(String, i32, String), HostError> = async {
+        }
+        let command_result: Result<(String, i32, String), HostError> = async {
                 let shell = sessions.get_mut(session).expect("session exists");
                 let marker = format!("{}:", marker);
                 let mut output = Vec::new();
@@ -3022,9 +3005,23 @@ impl LocalHost {
                             read = shell.stdout.read_line(&mut marker_line) => {
                                 let read = read?;
                                 if read == 0 {
+                                    tail_output_file(
+                                        &staging_path,
+                                        &mut file_offset,
+                                        &mut output,
+                                        &mut decoder,
+                                        on_output,
+                                    )
+                                    .await?;
+                                    if let Some(text) = decoder.finish() {
+                                        on_output(&text);
+                                    }
                                     return Err(HostError::Io(std::io::Error::new(
                                         std::io::ErrorKind::BrokenPipe,
-                                        "local shell exited",
+                                        shell_exit_diagnostic(
+                                            &shell.interpreter,
+                                            &output,
+                                        ),
                                     )));
                                 }
                                 if let Some(marker_start) = marker_line.find(&marker) {
@@ -3075,38 +3072,37 @@ impl LocalHost {
                     marker_result.1,
                 ))
             }
-            .await;
-            let (stdout, exit_code, actual_cwd) = match command_result {
-                Ok(result) => result,
-                Err(error) => {
-                    if let Some(mut shell) = sessions.remove(session) {
-                        let _ = shell._child.kill().await;
-                        let _ = shell._child.wait().await;
-                    }
-                    let _ = tokio::fs::remove_file(&output_path).await;
-                    let _ = tokio::fs::remove_file(&staging_path).await;
-                    return Err(error);
+        .await;
+        let (stdout, exit_code, actual_cwd) = match command_result {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(mut shell) = sessions.remove(session) {
+                    let _ = shell._child.kill().await;
+                    let _ = shell._child.wait().await;
                 }
-            };
-            let interpreter = sessions
-                .get(session)
-                .map(|shell| shell.interpreter.clone())
-                .unwrap_or_else(|| "unknown".into());
-            let _ = tokio::fs::remove_file(&output_path).await;
-            let _ = tokio::fs::remove_file(&staging_path).await;
-            Ok(ExecResult {
-                status: "completed_stderr_merged".into(),
-                result: CommandResult {
-                    stdout,
-                    stderr: String::new(),
-                    exit_code,
-                    timed_out: false,
-                    session: Some(session.to_owned()),
-                    cwd: Some(actual_cwd),
-                    shell: Some(interpreter),
-                },
-            })
-        }
+                let _ = tokio::fs::remove_file(&output_path).await;
+                let _ = tokio::fs::remove_file(&staging_path).await;
+                return Err(error);
+            }
+        };
+        let interpreter = sessions
+            .get(session)
+            .map(|shell| shell.interpreter.clone())
+            .unwrap_or_else(|| "unknown".into());
+        let _ = tokio::fs::remove_file(&output_path).await;
+        let _ = tokio::fs::remove_file(&staging_path).await;
+        Ok(ExecResult {
+            status: "completed_stderr_merged".into(),
+            result: CommandResult {
+                stdout,
+                stderr: String::new(),
+                exit_code,
+                timed_out: false,
+                session: Some(session.to_owned()),
+                cwd: Some(actual_cwd),
+                shell: Some(interpreter),
+            },
+        })
     }
 
     async fn exec_persistent(
@@ -3194,7 +3190,7 @@ impl LocalHost {
                     if shell.stdout.read_line(&mut line).await? == 0 {
                         return Err(HostError::Io(std::io::Error::new(
                             std::io::ErrorKind::BrokenPipe,
-                            "local shell exited",
+                            shell_exit_diagnostic(&shell.interpreter, stdout.as_bytes()),
                         )));
                     }
                     if let Some(marker_start) = line.find(&marker) {
@@ -3445,6 +3441,18 @@ fn persistent_streaming_command(
     ))
 }
 
+#[cfg(windows)]
+fn persistent_streaming_command(
+    command: &str,
+    env: Option<&Value>,
+    marker: &str,
+    output_path: &Path,
+    cwd: &Path,
+    change_cwd: bool,
+) -> Result<String, HostError> {
+    windows_persistent_streaming_command(command, env, marker, output_path, cwd, change_cwd)
+}
+
 fn is_shell_identifier(value: &str) -> bool {
     let mut chars = value.chars();
     matches!(chars.next(), Some(first) if first == '_' || first.is_ascii_alphabetic())
@@ -3501,7 +3509,7 @@ fn windows_persistent_command(
     cwd: &Path,
     change_cwd: bool,
 ) -> Result<String, HostError> {
-    let prefix = persistent_env_prefix(env)?.unwrap_or_default();
+    let (env_setup, env_restore) = powershell_env_scope(env)?;
     let directory = if change_cwd {
         format!(
             "Set-Location -LiteralPath '{}'; ",
@@ -3511,13 +3519,22 @@ fn windows_persistent_command(
         String::new()
     };
     let output_path = powershell_single_quote(&output_path.display().to_string());
+    let payload = BASE64.encode(command.as_bytes());
     Ok(format!(
         "$OutputEncoding=[Text.Encoding]::UTF8; \
          [Console]::OutputEncoding=[Text.Encoding]::UTF8; \
          $PSDefaultParameterValues['Out-File:Encoding']='utf8'; \
          $PSDefaultParameterValues['Out-File:Width']=2147483647; \
-         {directory}$null | & {{ {prefix}{command} }} > '{output_path}' 2>&1; \
-         $opcos_exit=if ($?) {{ if ($null -eq $LASTEXITCODE) {{ 0 }} else {{ $LASTEXITCODE }} }} else {{ 1 }}; \
+         $ProgressPreference='SilentlyContinue'; \
+         $global:LASTEXITCODE=0; $opcos_exit=0; \
+         try {{ \
+             {env_setup}{directory}$null | & {{ Invoke-Expression ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{payload}'))) }} > '{output_path}' 2>&1; \
+             $opcos_exit=if ($?) {{ if ($null -eq $LASTEXITCODE) {{ 0 }} else {{ $LASTEXITCODE }} }} else {{ 1 }} \
+         }} catch {{ \
+             $opcos_exit=1; ($_ | Out-String) | Out-File -LiteralPath '{output_path}' -Append -Encoding utf8 \
+         }} finally {{ \
+             {env_restore} \
+         }}; \
          if (Test-Path -LiteralPath '{output_path}') {{ \
              $opcos_output=Get-Content -Raw -LiteralPath '{output_path}'; \
              if ($null -ne $opcos_output -and $opcos_output.Length -gt 0) {{ \
@@ -3530,52 +3547,137 @@ fn windows_persistent_command(
     ))
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_persistent_streaming_command(
+    command: &str,
+    env: Option<&Value>,
+    marker: &str,
+    output_path: &Path,
+    cwd: &Path,
+    change_cwd: bool,
+) -> Result<String, HostError> {
+    let (env_setup, env_restore) = powershell_env_scope(env)?;
+    let directory = if change_cwd {
+        format!(
+            "Set-Location -LiteralPath '{}'; ",
+            powershell_single_quote(&cwd.display().to_string())
+        )
+    } else {
+        String::new()
+    };
+    let output_path_value = output_path.display().to_string();
+    let output_path = powershell_single_quote(&output_path_value);
+    let staging_path = powershell_single_quote(&format!("{output_path_value}.working"));
+    let payload = BASE64.encode(command.as_bytes());
+    Ok(format!(
+        "$OutputEncoding=[Text.Encoding]::UTF8; \
+         [Console]::OutputEncoding=[Text.Encoding]::UTF8; \
+         $PSDefaultParameterValues['Out-File:Encoding']='utf8'; \
+         $PSDefaultParameterValues['Out-File:Width']=2147483647; \
+         $ProgressPreference='SilentlyContinue'; \
+         Remove-Item -LiteralPath '{output_path}' -Force -ErrorAction SilentlyContinue; \
+         Remove-Item -LiteralPath '{staging_path}' -Force -ErrorAction SilentlyContinue; \
+         $global:LASTEXITCODE=0; $opcos_exit=0; \
+         try {{ \
+             {env_setup}{directory}$null | & {{ Invoke-Expression ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{payload}'))) }} > '{staging_path}' 2>&1; \
+             $opcos_exit=if ($?) {{ if ($null -eq $LASTEXITCODE) {{ 0 }} else {{ $LASTEXITCODE }} }} else {{ 1 }} \
+         }} catch {{ \
+             $opcos_exit=1; ($_ | Out-String) | Out-File -LiteralPath '{staging_path}' -Append -Encoding utf8 \
+         }} finally {{ \
+             {env_restore} \
+         }}; \
+         if (Test-Path -LiteralPath '{staging_path}') {{ Copy-Item -LiteralPath '{staging_path}' -Destination '{output_path}' -Force }}; \
+         Remove-Item -LiteralPath '{staging_path}' -Force -ErrorAction SilentlyContinue; \
+         if (Test-Path -LiteralPath '{output_path}') {{ \
+             $opcos_output=Get-Content -Raw -LiteralPath '{output_path}'; \
+             if ($null -ne $opcos_output -and $opcos_output.Length -gt 0) {{ \
+                 [Console]::Out.Write($opcos_output) \
+             }} \
+         }}; \
+         Remove-Item -LiteralPath '{output_path}' -Force -ErrorAction SilentlyContinue; \
+         {}",
+        powershell_marker_line(marker)
+    ))
+}
+
+fn shell_exit_diagnostic(interpreter: &str, output: &[u8]) -> String {
+    const MAX_CAPTURED_OUTPUT_BYTES: usize = 2 * 1024;
+    let captured = if output.len() > MAX_CAPTURED_OUTPUT_BYTES {
+        format!(
+            "[earlier output omitted; showing last {MAX_CAPTURED_OUTPUT_BYTES} bytes]\n{}",
+            String::from_utf8_lossy(&output[output.len() - MAX_CAPTURED_OUTPUT_BYTES..])
+        )
+    } else {
+        String::from_utf8_lossy(output).into_owned()
+    };
+    format!(
+        "local {interpreter} shell exited; session discarded and will be respawned on the next command; captured output before shell exit: {}",
+        captured
+    )
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn powershell_env_scope(env: Option<&Value>) -> Result<(String, String), HostError> {
+    let Some(Value::Object(values)) = env else {
+        return Ok((String::new(), String::new()));
+    };
+    let mut setup = String::new();
+    let mut restore = String::new();
+    for (key, value) in values {
+        let Some(value) = value.as_str() else {
+            continue;
+        };
+        if !is_shell_identifier(key) {
+            return Err(HostError::InvalidResponse(
+                "process environment contains an invalid variable name".into(),
+            ));
+        }
+        let key = powershell_single_quote(key);
+        setup.push_str(&format!(
+            "$opcos_env_present['{key}']=Test-Path -LiteralPath 'Env:{key}'; \
+             if ($opcos_env_present['{key}']) {{ $opcos_env_restore['{key}']=$env:{key} }}; \
+             $env:{key}='{}'; ",
+            powershell_single_quote(value)
+        ));
+        restore.push_str(&format!(
+            "if ($opcos_env_present['{key}']) {{ \
+                 [Environment]::SetEnvironmentVariable('{key}', [string]$opcos_env_restore['{key}'], 'Process') \
+             }} else {{ \
+                 Remove-Item -LiteralPath 'Env:{key}' -Force -ErrorAction SilentlyContinue \
+             }}; ",
+        ));
+    }
+    if setup.is_empty() {
+        Ok((String::new(), String::new()))
+    } else {
+        Ok((
+            format!("$opcos_env_present=@{{}}; $opcos_env_restore=@{{}}; {setup}"),
+            restore,
+        ))
+    }
+}
+
+#[cfg(not(windows))]
 fn persistent_env_prefix(env: Option<&Value>) -> Result<Option<String>, HostError> {
     let Some(Value::Object(values)) = env else {
-        #[cfg(windows)]
-        {
-            return Ok(Some("setlocal EnableDelayedExpansion && ".into()));
-        }
-        #[cfg(not(windows))]
-        {
-            return Ok(None);
-        }
+        return Ok(None);
     };
     let prefix = values
         .iter()
         .filter_map(|(key, value)| value.as_str().map(|value| (key, value)))
-        .map(|(key, value)| -> Result<String, HostError> {
-            #[cfg(windows)]
-            {
-                if !is_shell_identifier(key) {
-                    return Err(HostError::InvalidResponse(
-                        "process environment contains an invalid variable name".into(),
-                    ));
-                }
-                Ok(format!("$env:{key}='{}'; ", powershell_single_quote(value)))
-            }
-            #[cfg(not(windows))]
-            {
-                Ok(format!(
-                    "{}='{}'; export {}; ",
-                    key,
-                    value.replace('\'', "'\\''"),
-                    key
-                ))
-            }
+        .map(|(key, value)| {
+            format!(
+                "{}='{}'; export {}; ",
+                key,
+                value.replace('\'', "'\\''"),
+                key
+            )
         })
-        .collect::<Result<String, _>>()?;
-    #[cfg(windows)]
-    {
-        Ok((!prefix.is_empty()).then_some(prefix))
-    }
-    #[cfg(not(windows))]
-    {
-        if prefix.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(prefix))
-        }
+        .collect::<String>();
+    if prefix.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(prefix))
     }
 }
 
@@ -3589,12 +3691,12 @@ async fn spawn_persistent_shell(
 ) -> Result<(Child, ChildStdin, ChildStdout, String), HostError> {
     #[cfg(windows)]
     let (mut process, mut interpreter) = {
-        let mut process = Command::new("powershell.exe");
+        let mut process = Command::new("pwsh.exe");
         process
             .args(["-NoProfile", "-NonInteractive", "-Command", "-"])
             .current_dir(cwd);
         configure_no_window(&mut process);
-        (process, "powershell".to_owned())
+        (process, "pwsh".to_owned())
     };
     #[cfg(not(windows))]
     let (mut process, mut interpreter) = {
@@ -3631,7 +3733,23 @@ async fn spawn_persistent_shell(
             child
         }
         #[cfg(windows)]
-        Err(error) => return Err(HostError::Io(error)),
+        Err(_) => {
+            let mut fallback = Command::new("powershell.exe");
+            fallback
+                .args(["-NoProfile", "-NonInteractive", "-Command", "-"])
+                .current_dir(cwd);
+            configure_no_window(&mut fallback);
+            let child = fallback
+                .env_clear()
+                .envs(&environment)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(HostError::Io)?;
+            interpreter = "powershell".to_owned();
+            child
+        }
     };
     let stdin = child
         .stdin
@@ -3751,6 +3869,7 @@ fn remote_capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, Write};
     static ENV_TEST_LOCK: std::sync::OnceLock<&'static tokio::sync::Mutex<()>> =
         std::sync::OnceLock::new();
 
@@ -4987,7 +5106,16 @@ mod tests {
         assert!(command.contains("[Text.Encoding]::UTF8"));
         assert!(command.contains("$PSDefaultParameterValues['Out-File:Encoding']='utf8'"));
         assert!(command.contains("$PSDefaultParameterValues['Out-File:Width']=2147483647"));
+        assert!(command.contains("$ProgressPreference='SilentlyContinue'"));
+        assert!(command.contains("$global:LASTEXITCODE=0"));
+        assert!(command.contains("Invoke-Expression"));
+        assert!(command.contains(&BASE64.encode("Write-Output '中文'")));
+        assert!(command.contains("try {"));
+        assert!(command.contains("catch {"));
+        assert!(command.contains("finally {"));
         assert!(command.contains("$null | & {"));
+        assert!(!command.contains("setlocal"));
+        assert!(!command.contains("cmd"));
         assert!(command.contains("> 'C:\\Temp\\opcos-shell-output-''test'"));
         assert!(command.contains("if (Test-Path -LiteralPath"));
         assert!(command.contains("$opcos_output=Get-Content -Raw -LiteralPath"));
@@ -5002,7 +5130,214 @@ mod tests {
         assert!(command.contains(
             "Write-Output (\"__marker__:\" + $opcos_exit + \":\" + (Get-Location).Path)"
         ));
+        assert!(persistent_env_prefix(None).unwrap().is_none());
+        let with_env = windows_persistent_command(
+            "Write-Output $env:OPCOS_TEST",
+            Some(&serde_json::json!({"OPCOS_TEST": "value"})),
+            "__marker__",
+            Path::new("C:\\Temp\\output"),
+            Path::new("."),
+            false,
+        )
+        .unwrap();
+        assert!(with_env.contains("$env:OPCOS_TEST='value'; "));
+        assert_eq!(with_env.matches("$env:OPCOS_TEST='value';").count(), 1);
+        assert!(with_env.contains("$opcos_env_present['OPCOS_TEST']"));
+        assert!(with_env.contains("[Environment]::SetEnvironmentVariable"));
+        assert!(with_env.contains("Remove-Item -LiteralPath 'Env:OPCOS_TEST'"));
+    }
+
+    #[test]
+    fn windows_persistent_streaming_command_uses_staging_output_and_safe_execution() {
+        let command = windows_persistent_streaming_command(
+            "Write-Output 'streamed'",
+            None,
+            "__marker__",
+            Path::new("C:\\Temp\\opcos-shell-output"),
+            Path::new("C:\\workspace"),
+            true,
+        )
+        .unwrap();
+        assert!(command.contains("$ProgressPreference='SilentlyContinue'"));
+        assert!(command.contains("$global:LASTEXITCODE=0"));
+        assert!(command.contains("Invoke-Expression"));
+        assert!(command.contains(&BASE64.encode("Write-Output 'streamed'")));
+        assert!(command.contains("try {"));
+        assert!(command.contains("catch {"));
+        assert!(command.contains("finally {"));
+        assert!(command.contains("Set-Location -LiteralPath 'C:\\workspace'"));
+        assert!(command.contains("Copy-Item -LiteralPath 'C:\\Temp\\opcos-shell-output.working'"));
+        assert!(
+            command.contains("Remove-Item -LiteralPath 'C:\\Temp\\opcos-shell-output.working'")
+        );
+        assert!(!command.contains("setlocal"));
         assert!(!command.contains("cmd"));
+        let copy = command.find("Copy-Item -LiteralPath").unwrap();
+        let staging_removal = command[copy..]
+            .find("Remove-Item -LiteralPath 'C:\\Temp\\opcos-shell-output.working'")
+            .map(|offset| copy + offset)
+            .unwrap();
+        let readback = command.find("$opcos_output=Get-Content").unwrap();
+        let output_removal = command[readback..]
+            .find("Remove-Item -LiteralPath 'C:\\Temp\\opcos-shell-output' ")
+            .map(|offset| readback + offset)
+            .unwrap();
+        let marker = command.find("Write-Output (\"__marker__:").unwrap();
+        assert!(copy < staging_removal && staging_removal < readback);
+        assert!(readback < output_removal && output_removal < marker);
+    }
+
+    #[test]
+    fn shell_exit_diagnostic_caps_captured_output() {
+        let output = format!("BEGIN-{}-TAIL", "x".repeat(3_000));
+        let diagnostic = shell_exit_diagnostic("pwsh", output.as_bytes());
+        assert!(diagnostic.contains("[earlier output omitted; showing last 2048 bytes]"));
+        assert!(diagnostic.ends_with("TAIL"));
+        assert!(!diagnostic.contains("BEGIN-"));
+        assert!(diagnostic.len() < 2_500);
+    }
+
+    #[test]
+    fn windows_persistent_wrapper_works_with_real_powershell() {
+        let Some(interpreter) = ["pwsh", "powershell"].iter().find_map(|candidate| {
+            std::process::Command::new(candidate)
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "$PSVersionTable.PSVersion",
+                ])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|_| (*candidate).to_owned())
+        }) else {
+            println!("skipping real PowerShell wrapper test: pwsh/powershell not found on PATH");
+            return;
+        };
+
+        let root = tempfile_dir();
+        let subdir = root.join("subdir");
+        fs::create_dir_all(&subdir).unwrap();
+        let mut child = std::process::Command::new(interpreter)
+            .args(["-NoProfile", "-NonInteractive", "-Command", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut stdout = std::io::BufReader::new(stdout);
+        let line_ending = if cfg!(windows) { "\r\n" } else { "\n" };
+
+        let mut run = |index: usize, user_command: &str, env: Option<Value>| {
+            let output_path = root.join(format!("output-{index}"));
+            let marker = format!("__REAL_PS_{index}__");
+            let wrapper = windows_persistent_streaming_command(
+                user_command,
+                env.as_ref(),
+                &marker,
+                &output_path,
+                &root,
+                false,
+            )
+            .unwrap();
+            writeln!(stdin, "{wrapper}").unwrap();
+            stdin.flush().unwrap();
+            let mut output = String::new();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                assert!(
+                    stdout.read_line(&mut line).unwrap() > 0,
+                    "PowerShell exited"
+                );
+                if let Some(marker_start) = line.find(&format!("{marker}:")) {
+                    output.push_str(&line[..marker_start]);
+                    let values = line[marker_start + marker.len() + 1..]
+                        .trim_end()
+                        .splitn(2, ':')
+                        .collect::<Vec<_>>();
+                    let exit_code = values[0].parse::<i32>().unwrap();
+                    let cwd = values.get(1).copied().unwrap_or_default().to_owned();
+                    let output = output.replace("\u{1b}[?1h", "").replace("\u{1b}[?1l", "");
+                    println!(
+                        "real PowerShell case {index}: exit_code={exit_code}, output={output:?}, cwd={cwd:?}"
+                    );
+                    return (output, exit_code, cwd);
+                }
+                output.push_str(&line);
+            }
+        };
+
+        let (output, exit_code, _) = run(0, "Write-Output plain", None);
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, format!("plain{line_ending}"));
+
+        let (_, exit_code, _) = run(
+            1,
+            "printf 'pipeline\\n' | cat; test ${PIPESTATUS[0]} -eq 0",
+            None,
+        );
+        assert_ne!(exit_code, 0);
+        let (output, exit_code, _) = run(2, "Write-Output after-bashism", None);
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, format!("after-bashism{line_ending}"));
+
+        let (_, exit_code, _) = run(3, "if (", None);
+        assert_ne!(exit_code, 0);
+        let (output, exit_code, _) = run(4, "Write-Output after-parse-error", None);
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, format!("after-parse-error{line_ending}"));
+
+        let (output, exit_code, _) = run(
+            5,
+            "Write-Output $env:OPCOS_SCOPED_TEST",
+            Some(serde_json::json!({"OPCOS_SCOPED_TEST": "only-this-command"})),
+        );
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, format!("only-this-command{line_ending}"));
+        let (output, exit_code, _) = run(6, "Write-Output $env:OPCOS_SCOPED_TEST", None);
+        assert_eq!(exit_code, 0);
+        assert!(!output.contains("only-this-command"));
+
+        let native_exit = if cfg!(windows) {
+            "& cmd.exe /c exit 3"
+        } else {
+            "& /bin/sh -c 'exit 3'"
+        };
+        let (_, exit_code, _) = run(7, native_exit, None);
+        assert_eq!(exit_code, 3);
+        let (output, exit_code, _) = run(8, "Write-Output exit-code-reset", None);
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, format!("exit-code-reset{line_ending}"));
+
+        let (output, exit_code, _) = run(9, "Write-Output '中文 ünïcødé'", None);
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, format!("中文 ünïcødé{line_ending}"));
+
+        let (output, exit_code, _) = run(10, "Write-Output line1\nWrite-Output line2", None);
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, format!("line1{line_ending}line2{line_ending}"));
+
+        let location = powershell_single_quote(&subdir.display().to_string());
+        let (output, exit_code, _) = run(
+            11,
+            &format!("Set-Location -LiteralPath '{location}'; Write-Output moved"),
+            None,
+        );
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, format!("moved{line_ending}"));
+        let (output, exit_code, cwd) = run(12, "Write-Output ((Get-Location).Path)", None);
+        assert_eq!(exit_code, 0);
+        assert_eq!(output.trim(), subdir.display().to_string());
+        assert_eq!(cwd, subdir.display().to_string());
+
+        drop(stdin);
+        let _ = child.kill();
+        let _ = child.wait();
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn tempfile_dir() -> PathBuf {
