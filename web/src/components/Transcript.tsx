@@ -69,7 +69,7 @@ function TerminalOutput({
         {open ? "Hide output" : "Show output"}
       </button>
       {open && (
-        <pre className="artifact-code whitespace-pre-wrap">
+        <pre className="artifact-code max-h-96 overflow-auto whitespace-pre-wrap break-words">
           {output}
           {truncated
             ? `\n[Output truncated: ${
@@ -281,34 +281,69 @@ export function Transcript({
               )}
             </div>
           );
+        const majorRows = node.rows.filter(
+          (row) => row.isMajorAction !== false,
+        );
+        const minorRows = node.rows.filter(
+          (row) => row.isMajorAction === false,
+        );
+        const renderRow = (row: (typeof node.rows)[number], rowIndex: number) => (
+          <div
+            className={`transcript-item${row.exitCode !== undefined && row.exitCode !== 0 ? " text-danger" : ""}`}
+            key={rowIndex}
+          >
+            <span>{row.label}</span>
+            {row.shellId && (
+              <span className="ml-2 text-xs text-muted">
+                {row.shellId}
+              </span>
+            )}
+            {row.exitCode !== undefined && (
+              <span className="ml-2 text-xs text-muted">
+                exit {row.exitCode}
+              </span>
+            )}
+            {row.durationMs !== undefined && (
+              <span className="ml-2 text-xs text-muted">
+                {row.durationMs} ms
+              </span>
+            )}
+            {row.detail && <Thought text={row.detail} />}
+            {(row.terminalOutput || row.terminalTruncated) && (
+              <TerminalOutput
+                output={row.terminalOutput ?? ""}
+                truncated={row.terminalTruncated}
+                totalBytes={row.terminalTotalBytes}
+              />
+            )}
+            {row.artifactId && (
+              <ArtifactRow
+                sessionId={sessionId}
+                artifactId={row.artifactId}
+                kind={row.artifactKind}
+                mime={row.artifactMime}
+              />
+            )}
+          </div>
+        );
         return (
-          <details className="work-segment flex flex-col gap-2" key={index}>
+          <details className="work-segment flex flex-col gap-2" open key={index}>
             <summary className="cursor-pointer text-muted">
               {node.label} {node.additions ? `+${node.additions}` : ""}{" "}
               {node.deletions ? `−${node.deletions}` : ""}
             </summary>
-            <div className="flex flex-col gap-2 text-ink">
-              {node.rows.map((row, rowIndex) => (
-                <div className="transcript-item" key={rowIndex}>
-                  {row.label}
-                  {row.detail && <Thought text={row.detail} />}
-                  {(row.terminalOutput || row.terminalTruncated) && (
-                    <TerminalOutput
-                      output={row.terminalOutput ?? ""}
-                      truncated={row.terminalTruncated}
-                      totalBytes={row.terminalTotalBytes}
-                    />
-                  )}
-                  {row.artifactId && (
-                    <ArtifactRow
-                      sessionId={sessionId}
-                      artifactId={row.artifactId}
-                      kind={row.artifactKind}
-                      mime={row.artifactMime}
-                    />
-                  )}
-                </div>
-              ))}
+            <div className="max-h-[32rem] overflow-auto flex flex-col gap-2 text-ink">
+              {majorRows.map(renderRow)}
+              {minorRows.length > 0 && (
+                <details className="rounded border border-line p-2">
+                  <summary className="cursor-pointer text-xs text-muted">
+                    {minorRows.length} minor actions
+                  </summary>
+                  <div className="mt-2 flex flex-col gap-2">
+                    {minorRows.map(renderRow)}
+                  </div>
+                </details>
+              )}
             </div>
           </details>
         );

@@ -1339,6 +1339,7 @@ where
                         "shell_process_completed",
                         "shell",
                         json!({
+                            "shell_id": shell_id_for_session(&self.session_id),
                             "process_id": call.id,
                             "exit_code": result.get("exit_code").and_then(Value::as_i64).unwrap_or_else(|| if result.get("error").is_some() { 1 } else { 0 }),
                             "output_trunc": output.chars().take(4000).collect::<String>(),
@@ -1592,6 +1593,17 @@ where
                                     json!({
                                         "message":message,
                                         "thinking_duration_ms":inference_ms,
+                                    }),
+                                )
+                                .await;
+                            let summary = thought_summary(&message);
+                            let _ = self
+                                .working_event(
+                                    "one_line_thoughts",
+                                    "other",
+                                    json!({
+                                        "short": summary,
+                                        "summary": message,
                                     }),
                                 )
                                 .await;
@@ -2049,8 +2061,10 @@ where
                         "shell",
                         json!({
                             "call_id": call.id,
+                            "shell_id": shell_id_for_session(&self.session_id),
                             "command": call.arguments.get("command").and_then(Value::as_str).unwrap_or_default(),
                             "starting_dir": self.workspace.clone(),
+                            "is_major_action": true,
                         }),
                     )
                     .await;
@@ -2063,6 +2077,7 @@ where
                             "call_id":call.id,
                             "tool":call.name,
                             "argument_keys":argument_keys,
+                            "is_major_action": is_major_tool(&call.name, category),
                         }),
                     )
                     .await;
@@ -2434,6 +2449,8 @@ where
                 "multi_edit_result",
                 "file",
                 json!({
+                    "call_id": call.id,
+                    "is_major_action": true,
                     "file_updates": [{
                         "file_path": path,
                         "action_type": if call.name == "write_file" && previous.is_none() { "create" } else { "edit" },
@@ -2542,6 +2559,7 @@ where
                         "shell_process_completed",
                         "shell",
                         json!({
+                            "shell_id": shell_id_for_session(&self.session_id),
                             "process_id": call.id,
                             "exit_code": result.get("exit_code").and_then(Value::as_i64).unwrap_or_else(|| if result.get("error").is_some() { 1 } else { 0 }),
                             "output_trunc": output.chars().take(4000).collect::<String>(),
@@ -3245,6 +3263,41 @@ fn tool_event_category(name: &str) -> &'static str {
         "todo"
     } else {
         "other"
+    }
+}
+
+fn is_major_tool(name: &str, category: &str) -> bool {
+    category == "shell"
+        || category == "search"
+        || matches!(
+            name,
+            "write_file" | "edit_file" | "replace_in_file" | "apply_patch" | "multi_edit"
+        )
+}
+
+fn shell_id_for_session(session_id: &str) -> String {
+    let short = session_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .take(8)
+        .collect::<String>();
+    if short.is_empty() {
+        "shell-local".into()
+    } else {
+        format!("shell-{short}")
+    }
+}
+
+fn thought_summary(message: &str) -> String {
+    let first_line = message.lines().next().unwrap_or_default().trim();
+    let mut summary = first_line.chars().take(120).collect::<String>();
+    if first_line.chars().count() > 120 {
+        summary.push('…');
+    }
+    if summary.is_empty() {
+        "Working".into()
+    } else {
+        summary
     }
 }
 
@@ -6041,6 +6094,17 @@ mod tests {
             thoughts[0].event["working_event"]["payload"]["thinking_duration_ms"]
                 .as_u64()
                 .is_some()
+        );
+        let summaries = store
+            .load_session_events("reasoning-session")
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event["type"] == "one_line_thoughts")
+            .collect::<Vec<_>>();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].event["working_event"]["payload"]["short"],
+            "Inspect the workspace before making changes."
         );
 
         let empty_store = Arc::new(SqliteStore::open_in_memory().unwrap());

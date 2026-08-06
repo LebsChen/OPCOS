@@ -3,6 +3,7 @@ import liveEnvelopes from "../../fixtures/timeline/live-events.json";
 import opcosEvents from "../../fixtures/timeline/opcos-events.json";
 import planIterations from "../../fixtures/timeline/opcos-plan-iterations.json";
 import terminalReplay from "../../fixtures/timeline/opcos-terminal-replay.json";
+import parityEvents from "../../fixtures/timeline/opcos-devin-parity.json";
 import toolCallOnlyIteration from "../../fixtures/timeline/tool-call-only-iteration.json";
 import persisted from "../../fixtures/timeline/persisted-events.json";
 import {
@@ -29,17 +30,73 @@ describe("single event-log timeline", () => {
         terminalTotalBytes: 100,
       }),
     );
-    expect(rows).toContainEqual({
+    expect(rows).toContainEqual(expect.objectContaining({
       label: "true",
       callId: "call-terminal-empty",
       terminalOutput: undefined,
       terminalTruncated: undefined,
       terminalTotalBytes: undefined,
-    });
+    }));
   });
 
   it("renders live and reloaded events identically", () => {
     expect(buildTimeline(live)).toEqual(buildTimeline(saved));
+  });
+  it("uses Devin-style group labels, attached thoughts, and shell results", () => {
+    const nodes = buildTimeline(parityEvents as TimelineEvent[]);
+    const work = nodes.find((node) => node.kind === "work");
+    expect(work).toMatchObject({ label: "Listing files" });
+    expect(work?.rows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          label: "Thought for 1s",
+          thoughtForCallId: "call-shell",
+        }),
+        expect.objectContaining({
+          label: "cargo test",
+          shellId: "shell-session",
+          processId: "call-shell",
+          exitCode: 0,
+          durationMs: 500,
+          isMajorAction: true,
+        }),
+      ]),
+    );
+    expect(work?.rows.some((row) => row.isMajorAction === false)).toBe(true);
+  });
+  it("keeps legacy events without parity fields renderable", () => {
+    const nodes = buildTimeline([
+      {
+        type: "shell_process_started",
+        event_id: "legacy-start",
+        created_at_ms: 1,
+        working_event: {
+          event_type: "shell_process_started",
+          payload: { call_id: "legacy-call", command: "echo legacy" },
+        },
+      },
+      {
+        type: "shell_process_completed",
+        event_id: "legacy-end",
+        created_at_ms: 4,
+        working_event: {
+          event_type: "shell_process_completed",
+          payload: { process_id: "legacy-call", exit_code: 0 },
+        },
+      },
+    ] as TimelineEvent[]);
+    expect(nodes).toContainEqual(
+      expect.objectContaining({
+        kind: "work",
+        rows: [
+          expect.objectContaining({
+            label: "echo legacy",
+            exitCode: 0,
+            durationMs: 3,
+          }),
+        ],
+      }),
+    );
   });
   it("deduplicates replayed chunks across arbitrary reconnect boundaries", () => {
     let events: TimelineEvent[] = [];
@@ -181,13 +238,13 @@ describe("single event-log timeline", () => {
         terminalTotalBytes: 100,
       }),
     );
-    expect(rows).toContainEqual({
+    expect(rows).toContainEqual(expect.objectContaining({
       label: "true",
       callId: "call-empty",
       terminalOutput: undefined,
       terminalTruncated: undefined,
       terminalTotalBytes: undefined,
-    });
+    }));
   });
   it("renders terminal chunks that arrive before a shell row without a sequence field", () => {
     const nodes = buildTimeline([
