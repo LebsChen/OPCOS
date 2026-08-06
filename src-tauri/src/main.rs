@@ -17,9 +17,9 @@ use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use notify::Watcher;
 use opcos_assets::{
-    AssetBundle, CommandArgument, CommandEntry, InstructionSource, KnowledgeEntry, Playbook,
-    SkillEntry, builtin_mcp_catalog, discover as discover_assets, expand_command, parse_blueprint,
-    parse_command,
+    AssetBundle, CommandArgument, CommandEntry, InstructionSource, KnowledgeContext,
+    KnowledgeEntry, Playbook, SkillEntry, builtin_mcp_catalog, discover as discover_assets,
+    expand_command, parse_blueprint, parse_command,
 };
 use opcos_engine::{
     AcpHarness, AcpHarnessConfig, AgentEngine, EngineError, Harness, LifecycleHook,
@@ -8847,7 +8847,7 @@ async fn engine_for(
     session_id: &str,
     origin: ToolOrigin,
 ) -> Result<Arc<GuiEngine>, String> {
-    engine_for_with_context(app, state, session_id, origin, None).await
+    engine_for_with_context(app, state, session_id, origin, None, None).await
 }
 
 async fn engine_for_with_context(
@@ -8856,6 +8856,7 @@ async fn engine_for_with_context(
     session_id: &str,
     origin: ToolOrigin,
     repair_loop: Option<RepairLoopContext>,
+    initial_task: Option<&str>,
 ) -> Result<Arc<GuiEngine>, String> {
     if origin == ToolOrigin::User {
         let engines = state.engines.lock().await;
@@ -9422,8 +9423,34 @@ async fn engine_for_with_context(
             &bundle,
         )?;
     }
+    // Knowledge matching is fixed when the engine is created: prefer the first
+    // persisted user message, falling back to the request that creates the engine.
+    let task_text = state
+        .store
+        .load_messages(session_id)
+        .ok()
+        .and_then(|messages| {
+            messages
+                .into_iter()
+                .find(|message| message.role == "user" && !message.display_only)
+        })
+        .and_then(|message| {
+            message.content.as_str().map(str::to_owned).or_else(|| {
+                message
+                    .content
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+        })
+        .or_else(|| initial_task.map(str::to_owned))
+        .unwrap_or_default();
     engine
-        .set_system_instructions(Some(bundle.system_instructions()))
+        .set_system_instructions(Some(bundle.system_instructions_for(KnowledgeContext {
+            task: &task_text,
+            repository: Some(&workspace),
+            project: session.project_id.as_deref(),
+        })))
         .await;
     engine
         .set_permission_rules(bundle.permissions.as_ref().map(|rules| {
@@ -11395,8 +11422,15 @@ pub(crate) async fn submit_turn_inner_with_context(
         .store
         .max_message_notice_sequence(&request.session_id)
         .map_err(|error| error.to_string())?;
-    let engine =
-        engine_for_with_context(&app, state, &request.session_id, origin, repair_loop).await?;
+    let engine = engine_for_with_context(
+        &app,
+        state,
+        &request.session_id,
+        origin,
+        repair_loop,
+        Some(&request.text),
+    )
+    .await?;
     emit(
         &app,
         "message",
