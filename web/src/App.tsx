@@ -1385,11 +1385,13 @@ function ProjectConfigPanel({
               .map((template) => (
                 <div
                   key={template.template_id}
-                  className="grid grid-cols-[auto,minmax(0,1fr),auto] items-start gap-3 rounded-md border border-line/70 px-3 py-2 text-sm"
+                  className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-3 rounded-md border border-line/70 px-3 py-2 text-sm"
                 >
                   <label className="flex items-center gap-2 pt-1">
                     <input
                       type="checkbox"
+                      aria-label={`启用 ${template.name}`}
+                      style={{ width: 16, height: 16 }}
                       checked={template.applied}
                       onChange={(event) =>
                         void toggleConfigurationTemplate(
