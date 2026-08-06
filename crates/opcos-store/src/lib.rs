@@ -5553,6 +5553,14 @@ impl SqliteStore {
         }
         Ok(())
     }
+
+    pub fn reconcile_running_sessions(&self) -> Result<usize, StoreError> {
+        let changed = self.connection.lock().expect("sqlite mutex poisoned").execute(
+            "UPDATE sessions SET run_state='interrupted', stop_reason='interrupted_by_crash', updated_at=?1 WHERE run_state='running'",
+            [Utc::now().to_rfc3339()],
+        )?;
+        Ok(changed)
+    }
 }
 
 impl SessionStore for SqliteStore {
@@ -6440,6 +6448,49 @@ mod tests {
         let session = store.load_session("status-session").unwrap().unwrap();
         assert_eq!(session.run_state, "error");
         assert_eq!(session.stop_reason, "host_unavailable");
+    }
+
+    #[test]
+    fn startup_reconciliation_interrupts_orphaned_running_sessions() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let now = Utc::now();
+        for id in ["running", "idle"] {
+            store
+                .save_session(&SessionRecord {
+                    session_id: id.into(),
+                    workspace: "/workspace".into(),
+                    model: "test".into(),
+                    mode: "Interactive".into(),
+                    harness: "builtin".into(),
+                    title: id.into(),
+                    extra_roots: vec![],
+                    grants: serde_json::json!({}),
+                    pinned: false,
+                    archived: false,
+                    origin: None,
+                    origin_label: None,
+                    compaction: serde_json::json!({}),
+                    host_id: "host".into(),
+                    provider: None,
+                    external_session_id: None,
+                    run_state: if id == "running" { "running" } else { "idle" }.into(),
+                    stop_reason: "none".into(),
+                    created_at: now,
+                    updated_at: now,
+                    project_id: None,
+                    agent_id: None,
+                })
+                .unwrap();
+        }
+
+        assert_eq!(store.reconcile_running_sessions().unwrap(), 1);
+        let running = store.load_session("running").unwrap().unwrap();
+        assert_eq!(running.run_state, "interrupted");
+        assert_eq!(running.stop_reason, "interrupted_by_crash");
+        assert_eq!(
+            store.load_session("idle").unwrap().unwrap().run_state,
+            "idle"
+        );
     }
 
     #[test]

@@ -12530,8 +12530,14 @@ async fn interrupt(
         harness.interrupt();
         state
             .store
-            .update_session_status(&session_id, "interrupted", "user_interrupt")
+            .update_session_status(&session_id, "interrupted", "interrupted_by_user")
             .map_err(|error| error.to_string())?;
+        emit(
+            &app,
+            "turn_done",
+            Some(&session_id),
+            session_status_payload(&state, &session_id),
+        );
         return Ok(());
     }
     if session_for(&state, &session_id)?.harness == "acp" {
@@ -12539,12 +12545,22 @@ async fn interrupt(
         harness.interrupt();
         state
             .store
-            .update_session_status(&session_id, "interrupted", "user_interrupt")
+            .update_session_status(&session_id, "interrupted", "interrupted_by_user")
             .map_err(|error| error.to_string())?;
+        emit(
+            &app,
+            "turn_done",
+            Some(&session_id),
+            session_status_payload(&state, &session_id),
+        );
         return Ok(());
     }
     let engine = engine_for(&app, &state, &session_id, ToolOrigin::User).await?;
     engine.interrupt();
+    state
+        .store
+        .update_session_status(&session_id, "interrupted", "interrupted_by_user")
+        .map_err(|error| error.to_string())?;
     audit(
         &state,
         &session_id,
@@ -12556,6 +12572,12 @@ async fn interrupt(
         "notice",
         Some(&session_id),
         json!({"kind":"interrupted","text":"Turn interrupted"}),
+    );
+    emit(
+        &app,
+        "turn_done",
+        Some(&session_id),
+        session_status_payload(&state, &session_id),
     );
     Ok(())
 }
@@ -21678,6 +21700,11 @@ fn main() {
                     Box::new(std::io::Error::other(error.to_string()));
                 tauri::Error::Setup(cause.into())
             })?);
+            store.reconcile_running_sessions().map_err(|error| {
+                let cause: Box<dyn std::error::Error> =
+                    Box::new(std::io::Error::other(error.to_string()));
+                tauri::Error::Setup(cause.into())
+            })?;
             let database = init_database(path.clone()).map_err(|error| {
                 let cause: Box<dyn std::error::Error> = Box::new(std::io::Error::other(error));
                 tauri::Error::Setup(cause.into())

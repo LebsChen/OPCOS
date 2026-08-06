@@ -501,6 +501,14 @@ for some and not others:
 | `⏹ Stop` mid-turn (incl. after a `/compact`) | clears to Ready / `Turn interrupted` |
 | `⏹ Stop` on an already-stuck header | clears |
 
+When the natural cases all pass and no header sticks, the last row is not reachable by normal use.
+The only remaining way to manufacture a stuck header is to `pkill` the app mid-turn and relaunch:
+`sessions.run_state` stays `running` (there is no startup reconciliation), so the session reopens with
+a `Running` header and a `Live` badge and no engine behind it. Note the important asymmetry when you
+report the result: a `⏹ Stop` implementation that "clears the local flag and then refreshes" cannot
+fix this state, because the refresh reads `running` straight back out of the DB. Fixing it needs the
+backend to reconcile the row (on startup, or in the interrupt handler when no engine exists).
+
 Two things that make this worth chasing rather than dismissing as cosmetic:
 
 - **It can block the user.** While the flag is stuck the composer's send button is a Stop button, so
@@ -526,6 +534,14 @@ miss unless you look. Check all of these after any selection/refresh change:
 - issue an action command such as `/compact` → must not navigate away;
 - switch between sessions, and delete one, watching for selection loss.
 
+On session deletion: as of this branch the app exposes **no delete affordance at all** (the
+`deleteQuestion` / `sessionActions` i18n keys are unused and there is no `delete_session` command in
+the frontend or `src-tauri`). Don't waste time hunting for a menu. If you must exercise
+deleted-session handling, delete the row from the live `sessions` table with `python3 -c` (there is no
+`sqlite3` binary on the box, despite the blueprint) and then trigger a refresh — but label the result
+as indicative, since it isn't a product path. Refresh is triggered by a terminal `turn_done`, by
+`interrupt`, and on project/session creation — not by plain session switching.
+
 Isolate with the DB: if `sessions.run_state='running'` and `session_events` is climbing while the UI
 shows Home, the run is fine and only selection is broken. A useful discriminator is idle vs running —
 if idle sessions open and running ones do not, the bug is in the list/derivation race, not in the
@@ -535,7 +551,27 @@ Note this failure mode also **blocks most of the rest of the GUI matrix** (stuck
 steering, blocked-submission notices all need a visible running session), so test selection first and
 escalate immediately if it fails.
 
+### Steering and blocked submission: the composer can eat your message
+
+Sending while a turn is running is routed by `submissionRoute(running, canSteer)`. Test it and check
+the DB, because the UI gives you almost nothing:
+
+- A steer during a genuinely running turn **is delivered** (the agent acts on it) but is **not**
+  persisted as `user_message` and **never renders a user bubble or notice** — the typed text just
+  disappears from the composer for minutes. Don't conclude "silently dropped" from the DB alone:
+  grep the whole event JSON for your text; it shows up inside `turn` / `devin_thoughts` payloads if
+  it was really delivered. Use a distinctive marker string (e.g. `SECOND ATTEMPT:`) so this grep is
+  unambiguous.
+- In a *stuck* `Running` state (see above) the same route sends the text to a non-existent engine:
+  composer clears, nothing persists, no notice. This is the real silent drop.
+- The `blocked` branch and its notice (`The session is still running; your message was not sent.`)
+  may be unreachable with the Builtin harness, since `canSteer` is true there. If you never see it,
+  say so rather than marking it passed.
+
 ### Parity recipe: live == in-app re-read == cold restart
+
+Replay dumps: dump the **whole `event_json` row**, not `working_event` — a large fraction of rows
+(178 of 699 in one run) have `working_event: null` and `buildTimeline` throws on them.
 
 1. Capture the ordered row labels while the turn streams (expand every `<details>` group).
 2. **`Ctrl+R` does not reload the Tauri webview.** Navigate to another view and back into the session

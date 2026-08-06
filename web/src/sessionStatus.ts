@@ -11,6 +11,8 @@ export function sessionStatusLabel(
       return "已完成";
     case "interrupted_by_user":
       return "已中断";
+    case "interrupted_by_crash":
+      return "已中断（应用退出）";
     case "host_unavailable":
       return "主机不可用";
     case "provider_error":

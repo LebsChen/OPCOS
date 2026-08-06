@@ -870,36 +870,42 @@ where
         self.interrupted.store(false, Ordering::SeqCst);
         self.policy_denied.store(false, Ordering::SeqCst);
         self.set_session_status("running", "none");
-        let value = json!({"role":"user","content":[{"type":"text","text":text.into()}]});
         let result = async {
-            let text = value
-                .get("content")
-                .and_then(Value::as_array)
-                .and_then(|parts| parts.first())
-                .and_then(|part| part.get("text"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let event = WorkingEvent {
-                event_type: "user_message".into(),
-                category: "message".into(),
-                direction: "incoming".into(),
-                timestamp: Utc::now().to_rfc3339(),
-                payload: json!({"message":text}),
-            };
-            self.emit_event(
-                "user_message",
-                StreamChunk {
-                    working_event: Some(event),
-                    ..StreamChunk::default()
-                },
-            )?;
-            self.append("user", value).await?;
+            self.append_user_message(text.into(), None).await?;
             self.run_loop(self.provider_messages()?).await
         }
         .await;
         self.finish_turn(&result);
         result
+    }
+
+    async fn append_user_message(
+        &self,
+        text: String,
+        source: Option<&str>,
+    ) -> Result<Value, EngineError> {
+        let mut payload =
+            serde_json::Map::from_iter([("message".to_owned(), Value::String(text.clone()))]);
+        if let Some(source) = source {
+            payload.insert("source".to_owned(), Value::String(source.to_owned()));
+        }
+        let event = WorkingEvent {
+            event_type: "user_message".into(),
+            category: "message".into(),
+            direction: "incoming".into(),
+            timestamp: Utc::now().to_rfc3339(),
+            payload: Value::Object(payload),
+        };
+        self.emit_event(
+            "user_message",
+            StreamChunk {
+                working_event: Some(event),
+                ..StreamChunk::default()
+            },
+        )?;
+        let value = json!({"role":"user","content":[{"type":"text","text":text}]});
+        self.append("user", value.clone()).await?;
+        Ok(value)
     }
 
     pub async fn retry(&self) -> Result<AssistantTurn, EngineError> {
@@ -1054,6 +1060,8 @@ where
         text: impl Into<String>,
     ) -> Result<oneshot::Receiver<(String, String)>, EngineError> {
         let text = text.into();
+        self.append_user_message(text.clone(), Some("steering"))
+            .await?;
         let (sender, receiver) = oneshot::channel();
         self.steering_waiters
             .lock()
@@ -1632,7 +1640,6 @@ where
                         for text in steering {
                             let value =
                                 json!({"role":"user","content":[{"type":"text","text":text}]});
-                            self.append("user", value.clone()).await?;
                             messages.push(value);
                         }
                     } else {
@@ -6958,6 +6965,32 @@ mod tests {
         assert_eq!(messages.iter().filter(|m| m.display_only).count(), 0);
         assert!(messages.iter().any(|m| m.role == "user"));
         assert!(messages.iter().any(|m| m.role == "assistant"));
+    }
+
+    #[tokio::test]
+    async fn steering_is_persisted_as_a_user_message_event() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let _completion = engine.queue_steering("follow-up direction").await.unwrap();
+
+        let messages = store.load_messages("s").unwrap();
+        assert!(messages.iter().any(|message| {
+            message.role == "user" && message.content["content"][0]["text"] == "follow-up direction"
+        }));
+        let events = store.load_session_events("s").unwrap();
+        assert!(events.iter().any(|event| {
+            event.event["type"] == "user_message"
+                && event.event["working_event"]["payload"]["message"] == "follow-up direction"
+                && event.event["working_event"]["payload"]["source"] == "steering"
+        }));
     }
 
     #[test]
