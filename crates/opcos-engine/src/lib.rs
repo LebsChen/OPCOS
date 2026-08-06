@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use base64::Engine as _;
 use chrono::Utc;
 use opcos_policy::{
     Decision, DurableGrant, PermissionMode, PermissionRules, ToolRisk, browser_click_target,
@@ -106,6 +107,30 @@ pub trait ToolExecutor: Send + Sync {
         let _ = arguments;
         name.to_owned()
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactRequest {
+    pub session_id: String,
+    pub call_id: String,
+    pub name: String,
+    pub kind: String,
+    pub mime: String,
+    pub content: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactReference {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub mime: String,
+    pub size_bytes: u64,
+}
+
+#[async_trait]
+pub trait ArtifactSink: Send + Sync {
+    async fn persist(&self, request: ArtifactRequest) -> Result<ArtifactReference, String>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -480,6 +505,7 @@ pub struct TurnEngine<P, S, E> {
     policy_denied: AtomicBool,
     mutating_api_gate_enabled: AtomicBool,
     secret_scrubber: Arc<dyn SecretScrubber>,
+    artifact_sink: Option<Arc<dyn ArtifactSink>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -633,11 +659,16 @@ where
             policy_denied: AtomicBool::new(false),
             mutating_api_gate_enabled: AtomicBool::new(true),
             secret_scrubber: Arc::new(NoopSecretScrubber),
+            artifact_sink: None,
         }
     }
 
     pub fn set_secret_scrubber(&mut self, scrubber: Arc<dyn SecretScrubber>) {
         self.secret_scrubber = scrubber;
+    }
+
+    pub fn set_artifact_sink(&mut self, sink: Arc<dyn ArtifactSink>) {
+        self.artifact_sink = Some(sink);
     }
 
     pub async fn set_system_instructions(&self, instructions: Option<String>) {
@@ -2216,6 +2247,27 @@ where
             .unwrap_or_else(|error| json!({"error":error}))
     }
 
+    async fn persist_artifact(
+        &self,
+        call: &ToolCall,
+        name: String,
+        kind: &str,
+        mime: &str,
+        content: Vec<u8>,
+    ) -> Option<ArtifactReference> {
+        let sink = self.artifact_sink.as_ref()?;
+        sink.persist(ArtifactRequest {
+            session_id: self.session_id.clone(),
+            call_id: call.id.clone(),
+            name,
+            kind: kind.to_owned(),
+            mime: mime.to_owned(),
+            content,
+        })
+        .await
+        .ok()
+    }
+
     async fn emit_file_change(&self, call: &ToolCall, previous: Option<&str>) {
         let path = call
             .arguments
@@ -2251,6 +2303,17 @@ where
             content
         };
         let (lines_added, lines_removed) = line_diff_counts(old, &new);
+        let diff = unified_diff(path, old, &new);
+        let diff_artifact_id = if diff.trim().is_empty() {
+            None
+        } else {
+            let mut value = Value::String(diff);
+            self.secret_scrubber.scrub(&mut value);
+            let content = value.as_str().unwrap_or_default().as_bytes().to_vec();
+            self.persist_artifact(call, format!("{path}.diff"), "diff", "text/x-diff", content)
+                .await
+                .map(|reference| reference.id)
+        };
         let _ = self
             .working_event(
                 "multi_edit_result",
@@ -2263,10 +2326,48 @@ where
                         "end_line": new.lines().count().max(1),
                         "lines_added": lines_added,
                         "lines_removed": lines_removed,
+                        "artifact_id": diff_artifact_id,
                     }]
                 }),
             )
             .await;
+    }
+
+    async fn emit_screenshot_artifact(&self, call: &ToolCall, result: &Value) -> Option<String> {
+        let image = result.get("image").and_then(Value::as_str)?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(image)
+            .ok()?;
+        let format = result
+            .get("format")
+            .and_then(Value::as_str)
+            .filter(|format| !format.trim().is_empty())
+            .unwrap_or("png");
+        let mime = match format {
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            _ => "image/png",
+        };
+        let reference = self
+            .persist_artifact(
+                call,
+                format!("screenshot.{format}"),
+                "screenshot",
+                mime,
+                bytes,
+            )
+            .await?;
+        let _ = self
+            .working_event(
+                "computer_use_screenshot",
+                "file",
+                json!({
+                    "call_id": call.id,
+                    "screenshot_keys": [reference.id],
+                }),
+            )
+            .await;
+        Some(reference.id)
     }
 
     async fn persist_tool_results(
@@ -2281,6 +2382,16 @@ where
                 .find(|call| call.id == call_id)
                 .ok_or_else(|| EngineError::Store(format!("tool call not found: {call_id}")))?;
             let mut safe_result = result.clone();
+            let screenshot_id = if call.name == "computer_use" {
+                self.emit_screenshot_artifact(call, &result).await
+            } else {
+                None
+            };
+            if let Some(artifact_id) = screenshot_id
+                && let Some(object) = safe_result.as_object_mut()
+            {
+                object.insert("image".into(), json!({"artifact_id": artifact_id}));
+            }
             self.secret_scrubber.scrub(&mut safe_result);
             let value = json!({"role":"tool","content":[{"type":"tool_result",
                 "tool_use_id":call.id,"content":[{"type":"text","text":safe_result.to_string()}]}]});
@@ -3055,6 +3166,46 @@ fn line_diff_counts(old: &str, new: &str) -> (usize, usize) {
     }
 }
 
+fn unified_diff(path: &str, old: &str, new: &str) -> String {
+    if old == new {
+        return String::new();
+    }
+    let old_lines = old.lines().collect::<Vec<_>>();
+    let new_lines = new.lines().collect::<Vec<_>>();
+    let mut lcs = vec![vec![0usize; new_lines.len() + 1]; old_lines.len() + 1];
+    for old_index in (0..old_lines.len()).rev() {
+        for new_index in (0..new_lines.len()).rev() {
+            lcs[old_index][new_index] = if old_lines[old_index] == new_lines[new_index] {
+                lcs[old_index + 1][new_index + 1] + 1
+            } else {
+                lcs[old_index + 1][new_index].max(lcs[old_index][new_index + 1])
+            };
+        }
+    }
+    let mut lines = vec![format!("--- {path}"), format!("+++ {path}")];
+    let (mut old_index, mut new_index) = (0, 0);
+    while old_index < old_lines.len() || new_index < new_lines.len() {
+        if old_index < old_lines.len()
+            && new_index < new_lines.len()
+            && old_lines[old_index] == new_lines[new_index]
+        {
+            lines.push(format!(" {}", old_lines[old_index]));
+            old_index += 1;
+            new_index += 1;
+        } else if new_index < new_lines.len()
+            && (old_index == old_lines.len()
+                || lcs[old_index][new_index + 1] > lcs[old_index + 1][new_index])
+        {
+            lines.push(format!("+{}", new_lines[new_index]));
+            new_index += 1;
+        } else {
+            lines.push(format!("-{}", old_lines[old_index]));
+            old_index += 1;
+        }
+    }
+    format!("{}\n", lines.join("\n"))
+}
+
 #[async_trait]
 impl<P, S, E> AgentEngine for TurnEngine<P, S, E>
 where
@@ -3795,6 +3946,14 @@ mod tests {
     #[test]
     fn file_change_counts_use_real_line_content() {
         assert_eq!(line_diff_counts("one\ntwo\n", "one\nthree\nfour\n"), (2, 1));
+    }
+
+    #[test]
+    fn unified_diff_preserves_old_and_new_file_content() {
+        assert_eq!(
+            unified_diff("src/lib.rs", "one\ntwo\n", "one\nthree\n"),
+            "--- src/lib.rs\n+++ src/lib.rs\n one\n-two\n+three\n"
+        );
     }
 
     #[test]

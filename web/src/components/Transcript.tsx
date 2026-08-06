@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import { useState } from "react";
 import { type ApprovalDecision, type Item } from "../types";
 import { buildTimeline, type TimelineEvent } from "../timeline";
@@ -45,13 +46,97 @@ function Thought({ text }: { text: string }) {
   );
 }
 
+function ArtifactRow({
+  sessionId,
+  artifactId,
+  kind,
+  mime,
+}: {
+  sessionId: string;
+  artifactId: string;
+  kind?: string;
+  mime?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [content, setContent] = useState<Record<string, unknown> | null>(null);
+  const [error, setError] = useState("");
+  const load = () => {
+    if (content || error) {
+      setOpen((value) => !value);
+      return;
+    }
+    setOpen(true);
+    void invoke<Record<string, unknown>>("read_artifact", {
+      sessionId,
+      artifactId,
+    })
+      .then(setContent)
+      .catch((reason) => setError(String(reason)));
+  };
+  const image =
+    typeof content?.content_base64 === "string"
+      ? `data:${String(content.mime ?? mime ?? "image/png")};base64,${content.content_base64}`
+      : null;
+  const diff =
+    kind === "diff" && typeof content?.content === "string"
+      ? String(content.content)
+          .split("\n")
+          .map((line, index) => (
+            <span
+              key={index}
+              className={
+                line.startsWith("+") && !line.startsWith("+++")
+                  ? "text-green-600"
+                  : line.startsWith("-") && !line.startsWith("---")
+                    ? "text-red-600"
+                    : undefined
+              }
+            >
+              {line}
+              {"\n"}
+            </span>
+          ))
+      : null;
+  return (
+    <div className="artifact-inline">
+      <button className="text-left underline" onClick={load}>
+        {kind === "screenshot" ? "View screenshot" : "View diff"}
+      </button>
+      {open && (
+        <div className="mt-1">
+          {error ? (
+            <span className="text-red-500">{error}</span>
+          ) : image ? (
+            <img
+              className="max-w-full max-h-64 cursor-zoom-in"
+              src={image}
+              alt="Screenshot artifact"
+              onClick={() =>
+                window.open(image, "_blank", "noopener,noreferrer")
+              }
+            />
+          ) : content ? (
+            <pre className="artifact-code whitespace-pre-wrap">
+              {diff ?? String(content.content ?? "")}
+            </pre>
+          ) : (
+            <span className="text-muted">Loading…</span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function Transcript({
   events,
+  sessionId,
   running,
   onApprove,
   onRetry,
 }: {
   events: TimelineEvent[];
+  sessionId: string;
   running?: boolean;
   onApprove?: (
     item: Extract<Item, { kind: "approval" }>,
@@ -150,6 +235,14 @@ export function Transcript({
                 <div className="transcript-item" key={rowIndex}>
                   {row.label}
                   {row.detail && <Thought text={row.detail} />}
+                  {row.artifactId && (
+                    <ArtifactRow
+                      sessionId={sessionId}
+                      artifactId={row.artifactId}
+                      kind={row.artifactKind}
+                      mime={row.artifactMime}
+                    />
+                  )}
                 </div>
               ))}
             </div>

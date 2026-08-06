@@ -38,7 +38,13 @@ export type TimelineNode =
   | {
       kind: "work";
       label: string;
-      rows: Array<{ label: string; detail?: string }>;
+      rows: Array<{
+        label: string;
+        detail?: string;
+        artifactId?: string;
+        artifactKind?: string;
+        artifactMime?: string;
+      }>;
       additions: number;
       deletions: number;
     };
@@ -263,8 +269,31 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
               item.action_type === "create"
                 ? `Created ${basename} +${added}`
                 : `Edited ${basename} +${added} −${removed}`,
+            artifactId:
+              typeof item.artifact_id === "string"
+                ? item.artifact_id
+                : undefined,
+            artifactKind:
+              typeof item.artifact_id === "string" ? "diff" : undefined,
+            artifactMime:
+              typeof item.artifact_id === "string" ? "text/x-diff" : undefined,
           });
         }
+      } else if (type === "computer_use_screenshot") {
+        const currentWork = work;
+        const keys = Array.isArray(data.screenshot_keys)
+          ? data.screenshot_keys.filter(
+              (key): key is string => typeof key === "string",
+            )
+          : [];
+        keys.forEach((artifactId) => {
+          currentWork?.rows.push({
+            label: "Screenshot",
+            artifactId,
+            artifactKind: "screenshot",
+            artifactMime: "image/png",
+          });
+        });
       } else if (type === "todo_update") {
         const source = Array.isArray(data.steps) ? data.steps : data.todos;
         const todos: Record<string, unknown>[] = Array.isArray(source)

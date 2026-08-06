@@ -23,9 +23,10 @@ use opcos_assets::{
 };
 use opcos_engine::SecretScrubber;
 use opcos_engine::{
-    AcpHarness, AcpHarnessConfig, AgentEngine, EngineError, Harness, LifecycleHook,
-    LifecycleHookConfig, OpenCodeHarness, OpenCodeHarnessConfig, PreflightDecision,
-    SessionRecorder, ToolExecutor, ToolOrigin, TurnEngine,
+    AcpHarness, AcpHarnessConfig, AgentEngine, ArtifactReference, ArtifactRequest, ArtifactSink,
+    EngineError, Harness, LifecycleHook, LifecycleHookConfig, OpenCodeHarness,
+    OpenCodeHarnessConfig, PreflightDecision, SessionRecorder, ToolExecutor, ToolOrigin,
+    TurnEngine,
     computer_use::{
         BestEffortScreenshotChangedVerifier, ComputerUseLoopConfig, ComputerUseStep,
         run_computer_use_loop,
@@ -371,6 +372,7 @@ struct DesktopState {
     ide_proxies: AsyncMutex<HashMap<u16, tauri::async_runtime::JoinHandle<()>>>,
     coordination: Arc<AsyncMutex<HashMap<String, CoordinationRuntime>>>,
     index_root: PathBuf,
+    artifact_root: PathBuf,
     mcp: Arc<McpManager<McpCredentialAdapter>>,
     jobs: Arc<BackgroundJobManager>,
     local_browser: Arc<dyn BrowserController>,
@@ -380,6 +382,62 @@ struct DesktopState {
     ci_monitor_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     runner_shutdown: tokio::sync::watch::Sender<bool>,
     runner_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+}
+
+struct SessionArtifactSink {
+    root: PathBuf,
+    store: Arc<SqliteStore>,
+    session_id: String,
+    host_id: String,
+}
+
+#[async_trait]
+impl ArtifactSink for SessionArtifactSink {
+    async fn persist(&self, request: ArtifactRequest) -> Result<ArtifactReference, String> {
+        if request.session_id != self.session_id {
+            return Err("artifact session mismatch".into());
+        }
+        const MAX_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
+        if request.content.len() > MAX_ARTIFACT_BYTES {
+            return Err(format!(
+                "artifact exceeds the {} MiB limit",
+                MAX_ARTIFACT_BYTES / (1024 * 1024)
+            ));
+        }
+        let id = format!("artifact-{}", Uuid::new_v4());
+        let session_root = self.root.join(&self.session_id);
+        std::fs::create_dir_all(&session_root).map_err(|error| error.to_string())?;
+        let path = session_root.join(&id);
+        std::fs::write(&path, &request.content).map_err(|error| error.to_string())?;
+        let logical_path = format!("artifact://{id}/{}", request.name);
+        let sha256 = {
+            let mut digest = Sha256::new();
+            digest.update(&request.content);
+            format!("{:x}", digest.finalize())
+        };
+        self.store
+            .upsert_artifact(&ArtifactRecord {
+                id: id.clone(),
+                session_id: self.session_id.clone(),
+                turn_id: 0,
+                call_id: request.call_id,
+                host_id: self.host_id.clone(),
+                path: logical_path,
+                size_bytes: Some(request.content.len() as i64),
+                sha256: Some(sha256),
+                mime: Some(request.mime.clone()),
+                kind: request.kind.clone(),
+                created_at: Utc::now(),
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(ArtifactReference {
+            id,
+            name: request.name,
+            kind: request.kind,
+            mime: request.mime,
+            size_bytes: request.content.len() as u64,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -9540,6 +9598,12 @@ async fn engine_for_with_context(
         permission_mode,
         model.clone(),
     );
+    engine.set_artifact_sink(Arc::new(SessionArtifactSink {
+        root: state.artifact_root.clone(),
+        store: Arc::clone(&state.store),
+        session_id: session_id.to_owned(),
+        host_id: host_id.clone(),
+    }));
     let discovered_caps = provider_models_for_state(
         state,
         provider_id.clone(),
@@ -11743,6 +11807,52 @@ async fn read_artifact(
         .ok_or_else(|| "artifact reference not found".to_owned())?;
     if artifact.host_id != host_id {
         return Err("artifact belongs to an unavailable host binding".to_owned());
+    }
+    if let Some(relative) = artifact.path.strip_prefix("artifact://") {
+        let artifact_key = relative
+            .split('/')
+            .next()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "artifact path is invalid".to_owned())?;
+        if artifact_key != artifact.id {
+            return Err("artifact path identity mismatch".into());
+        }
+        let path = state.artifact_root.join(&session_id).join(artifact_key);
+        if !path.starts_with(state.artifact_root.join(&session_id)) {
+            return Err("artifact path is outside the artifact directory".into());
+        }
+        let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+        const MAX_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
+        if bytes.len() > MAX_ARTIFACT_BYTES {
+            return Err("artifact exceeds the 8 MiB read limit".into());
+        }
+        if artifact
+            .mime
+            .as_deref()
+            .is_some_and(|mime| mime.starts_with("image/"))
+        {
+            return Ok(json!({
+                "id": artifact.id,
+                "path": artifact.path,
+                "content_base64": base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    bytes,
+                ),
+                "size": artifact.size_bytes,
+                "kind": artifact.kind,
+                "mime": artifact.mime,
+            }));
+        }
+        let content = String::from_utf8(bytes)
+            .map_err(|_| "artifact content is not valid UTF-8".to_owned())?;
+        return Ok(json!({
+            "id": artifact.id,
+            "path": artifact.path,
+            "content": content,
+            "size": artifact.size_bytes,
+            "kind": artifact.kind,
+            "mime": artifact.mime,
+        }));
     }
     let path = host
         .join(&artifact.path)
@@ -21797,6 +21907,12 @@ fn main() {
                 index_root: {
                     let mut root = path.clone();
                     root.set_file_name("repository-indexes");
+                    std::fs::create_dir_all(&root).map_err(tauri::Error::from)?;
+                    root
+                },
+                artifact_root: {
+                    let mut root = path.clone();
+                    root.set_file_name("artifacts");
                     std::fs::create_dir_all(&root).map_err(tauri::Error::from)?;
                     root
                 },

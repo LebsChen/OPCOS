@@ -8633,6 +8633,7 @@ type ArtifactRecord = {
   id: string;
   path: string;
   kind: string;
+  mime?: string | null;
   size_bytes?: number | null;
   sha256?: string | null;
   created_at: string;
@@ -8650,6 +8651,28 @@ function formatBytes(size: number | null | undefined) {
     if (value < 1024) break;
   }
   return `${value.toFixed(value >= 10 ? 0 : 1)} ${unit}`;
+}
+
+function DiffPreview({ text }: { text: string }) {
+  return (
+    <pre className="artifact-code whitespace-pre-wrap">
+      {text.split("\n").map((line, index) => (
+        <span
+          key={index}
+          className={
+            line.startsWith("+") && !line.startsWith("+++")
+              ? "text-green-600"
+              : line.startsWith("-") && !line.startsWith("---")
+                ? "text-red-600"
+                : undefined
+          }
+        >
+          {line}
+          {"\n"}
+        </span>
+      ))}
+    </pre>
+  );
 }
 
 function ArtifactsPane({ selected }: { selected: Session }) {
@@ -8708,6 +8731,14 @@ function ArtifactsPane({ selected }: { selected: Session }) {
             <div className="rail-muted">Loading…</div>
           ) : content.error ? (
             <div className="rail-error">{String(content.error)}</div>
+          ) : typeof content.content_base64 === "string" ? (
+            <img
+              className="artifact-image max-w-full"
+              src={`data:${String(content.mime ?? opened.mime ?? "image/png")};base64,${content.content_base64}`}
+              alt={opened.path}
+            />
+          ) : opened.kind === "diff" ? (
+            <DiffPreview text={String(content.content ?? "")} />
           ) : (
             <pre className="artifact-code">{String(content.content ?? "")}</pre>
           )}
@@ -10465,6 +10496,7 @@ function AppContent() {
                   <div className="main-scroll">
                     <Transcript
                       events={transcript}
+                      sessionId={selected.id}
                       running={effectiveRunning}
                       onApprove={(item, decision) => {
                         if (!item.callId) return;

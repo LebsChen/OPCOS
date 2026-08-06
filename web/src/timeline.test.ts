@@ -155,4 +155,64 @@ describe("single event-log timeline", () => {
     const nodes = buildTimeline(toolCallOnlyIteration as TimelineEvent[]);
     expect(nodes).toEqual([]);
   });
+  it("attaches diff and screenshot references without creating empty attachment rows", () => {
+    const nodes = buildTimeline([
+      {
+        type: "multi_edit_result",
+        event_id: "diff",
+        created_at_ms: 1,
+        working_event: {
+          payload: {
+            file_updates: [
+              {
+                file_path: "src/lib.rs",
+                action_type: "edit",
+                lines_added: 2,
+                lines_removed: 1,
+                artifact_id: "artifact-diff",
+              },
+              {
+                file_path: "src/empty.rs",
+                action_type: "edit",
+                lines_added: 0,
+                lines_removed: 0,
+              },
+            ],
+          },
+        },
+      },
+      {
+        type: "computer_use_screenshot",
+        event_id: "screenshot",
+        created_at_ms: 2,
+        working_event: {
+          payload: { screenshot_keys: ["artifact-image"] },
+        },
+      },
+      {
+        type: "computer_use_screenshot",
+        event_id: "empty-screenshot",
+        created_at_ms: 3,
+        working_event: {
+          payload: { screenshot_keys: [] },
+        },
+      },
+    ] as unknown as TimelineEvent[]);
+    const rows = nodes
+      .filter((node) => node.kind === "work")
+      .flatMap((node) => node.rows);
+    expect(rows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          artifactId: "artifact-diff",
+          artifactKind: "diff",
+        }),
+        expect.objectContaining({
+          artifactId: "artifact-image",
+          artifactKind: "screenshot",
+        }),
+      ]),
+    );
+    expect(rows.filter((row) => row.artifactId)).toHaveLength(2);
+  });
 });
