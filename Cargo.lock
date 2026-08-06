@@ -3580,6 +3580,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "futures-util",
+ "opcos-assets",
  "opcos-hosts",
  "opcos-policy",
  "opcos-provider",
