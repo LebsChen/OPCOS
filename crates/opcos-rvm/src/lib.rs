@@ -143,6 +143,8 @@ pub struct CommandResult {
     pub session: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
+    #[serde(default)]
+    pub shell: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2086,6 +2088,7 @@ mod tests {
                 timed_out: false,
                 session: session.map(str::to_owned),
                 cwd: cwd.map(str::to_owned),
+                shell: None,
             },
         }
     }

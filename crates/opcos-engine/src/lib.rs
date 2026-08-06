@@ -1824,9 +1824,33 @@ where
                                 .map_err(|error| EngineError::Store(error.to_string()))?;
                         }
                         let tool_started = Instant::now();
-                        let results = self
+                        let results = match self
                             .execute_tools(assistant_sequence, &turn.tool_calls)
-                            .await?;
+                            .await
+                        {
+                            Ok(results) => results,
+                            Err(error) => {
+                                let tool_exec_ms = tool_started.elapsed().as_millis() as u64;
+                                let total_ms = iteration_started.elapsed().as_millis() as u64;
+                                let harness_ms = total_ms
+                                    .saturating_sub(inference_ms)
+                                    .saturating_sub(tool_exec_ms);
+                                let _ = self
+                                    .emit_iteration_stats(IterationStatsData {
+                                        iteration: iteration + 1,
+                                        num_tool_calls: turn.tool_calls.len(),
+                                        duration_ms: total_ms,
+                                        inference_ms,
+                                        tool_exec_ms,
+                                        harness_ms,
+                                        retry_count,
+                                        compaction_count,
+                                        usage: turn.usage.as_ref(),
+                                    })
+                                    .await;
+                                return Err(error);
+                            }
+                        };
                         let tool_exec_ms = tool_started.elapsed().as_millis() as u64;
                         let total_ms = iteration_started.elapsed().as_millis() as u64;
                         let harness_ms = total_ms
@@ -5393,6 +5417,13 @@ mod tests {
             Err(EngineError::ApprovalPending(call_id)) if call_id == "call-1"
         ));
         assert_eq!(store.load_pending("s").unwrap().len(), 1);
+        assert!(
+            store
+                .load_session_events("s")
+                .unwrap()
+                .iter()
+                .any(|event| event.event["type"] == "iteration_stats")
+        );
 
         let restarted = TurnEngine::new(
             provider,

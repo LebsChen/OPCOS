@@ -2404,6 +2404,7 @@ struct LocalShell {
     _child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    interpreter: String,
 }
 
 impl LocalHost {
@@ -2640,6 +2641,7 @@ impl Host for LocalHost {
                 timed_out: false,
                 session: request.session,
                 cwd: Some(cwd.display().to_string()),
+                shell: None,
             },
         })
     }
@@ -2943,12 +2945,13 @@ impl LocalHost {
                 .join(format!("opcos-shell-output-{}", Uuid::new_v4().simple()));
             let staging_path = PathBuf::from(format!("{}.working", output_path.display()));
             if !sessions.contains_key(session) {
-                let (child, stdin, stdout) =
+                let (child, stdin, stdout, interpreter) =
                     spawn_persistent_shell(&cwd, &self.secret_values).await?;
                 let mut shell = LocalShell {
                     _child: child,
                     stdin,
                     stdout: BufReader::new(stdout),
+                    interpreter,
                 };
                 let shell_command = persistent_streaming_command(
                     &request.command,
@@ -3085,6 +3088,10 @@ impl LocalHost {
                     return Err(error);
                 }
             };
+            let interpreter = sessions
+                .get(session)
+                .map(|shell| shell.interpreter.clone())
+                .unwrap_or_else(|| "unknown".into());
             let _ = tokio::fs::remove_file(&output_path).await;
             let _ = tokio::fs::remove_file(&staging_path).await;
             Ok(ExecResult {
@@ -3096,6 +3103,7 @@ impl LocalHost {
                     timed_out: false,
                     session: Some(session.to_owned()),
                     cwd: Some(actual_cwd),
+                    shell: Some(interpreter),
                 },
             })
         }
@@ -3115,11 +3123,13 @@ impl LocalHost {
         let output_path =
             std::env::temp_dir().join(format!("opcos-shell-output-{}", Uuid::new_v4().simple()));
         if !sessions.contains_key(session) {
-            let (child, stdin, stdout) = spawn_persistent_shell(cwd, &self.secret_values).await?;
+            let (child, stdin, stdout, interpreter) =
+                spawn_persistent_shell(cwd, &self.secret_values).await?;
             let mut shell = LocalShell {
                 _child: child,
                 stdin,
                 stdout: BufReader::new(stdout),
+                interpreter,
             };
             let write_result = match shell
                 .stdin
@@ -3221,6 +3231,10 @@ impl LocalHost {
                 return Err(error);
             }
         };
+        let interpreter = sessions
+            .get(session)
+            .map(|shell| shell.interpreter.clone())
+            .unwrap_or_else(|| "unknown".into());
         Ok(ExecResult {
             status: "completed_stderr_merged".into(),
             result: CommandResult {
@@ -3230,6 +3244,7 @@ impl LocalHost {
                 timed_out: false,
                 session: Some(session.to_owned()),
                 cwd: Some(actual_cwd),
+                shell: Some(interpreter),
             },
         })
     }
@@ -3571,33 +3586,53 @@ fn shell_single_quote(value: &str) -> String {
 async fn spawn_persistent_shell(
     cwd: &Path,
     secret_values: &SecretValues,
-) -> Result<(Child, ChildStdin, ChildStdout), HostError> {
+) -> Result<(Child, ChildStdin, ChildStdout, String), HostError> {
     #[cfg(windows)]
-    let mut process = {
+    let (mut process, mut interpreter) = {
         let mut process = Command::new("powershell.exe");
         process
             .args(["-NoProfile", "-NonInteractive", "-Command", "-"])
             .current_dir(cwd);
         configure_no_window(&mut process);
-        process
+        (process, "powershell".to_owned())
     };
     #[cfg(not(windows))]
-    let mut process = {
+    let (mut process, mut interpreter) = {
         let mut process = Command::new("bash");
         process
             .args(["--noprofile", "--norc", "-s"])
             .current_dir(cwd);
         configure_no_window(&mut process);
-        process
+        (process, "bash".to_owned())
     };
-    process
-        .env_clear()
-        .envs(sanitized_environment_from_snapshot(secret_values, None));
-    let mut child = process
+    let environment = sanitized_environment_from_snapshot(secret_values, None);
+    process.env_clear().envs(&environment);
+    let mut child = match process
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .spawn()?;
+        .spawn()
+    {
+        Ok(child) => child,
+        #[cfg(not(windows))]
+        Err(_) => {
+            let mut fallback = Command::new("sh");
+            fallback.arg("-s").current_dir(cwd);
+            configure_no_window(&mut fallback);
+            let child = fallback
+                .env_clear()
+                .envs(&environment)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(HostError::Io)?;
+            interpreter = "sh".to_owned();
+            child
+        }
+        #[cfg(windows)]
+        Err(error) => return Err(HostError::Io(error)),
+    };
     let stdin = child
         .stdin
         .take()
@@ -3606,7 +3641,7 @@ async fn spawn_persistent_shell(
         .stdout
         .take()
         .ok_or_else(|| HostError::InvalidResponse("local shell stdout unavailable".into()))?;
-    Ok((child, stdin, stdout))
+    Ok((child, stdin, stdout, interpreter))
 }
 
 /// Convert an RVM `lsp` payload into LSP conventions. The RVM tool flattens
@@ -4441,6 +4476,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pipeline_status.result.exit_code, 0);
+        assert_eq!(pipeline_status.result.shell.as_deref(), Some("bash"));
         let subshell_failure = host
             .exec_persistent_streaming(request("sh -c 'exit 3'", None, None), &on_output)
             .await
