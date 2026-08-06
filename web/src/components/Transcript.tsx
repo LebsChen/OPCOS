@@ -296,16 +296,17 @@ export function Transcript({
             .filter((row) => row.thoughtForCallId)
             .map((row) => [row.thoughtForCallId, row]),
         );
-        const renderRow = (row: (typeof node.rows)[number], rowIndex: number) => (
+        const renderRow = (
+          row: (typeof node.rows)[number],
+          rowIndex: number,
+        ) => (
           <div
             className={`transcript-item${row.denied ? " text-muted" : row.exitCode !== undefined && row.exitCode !== 0 ? " text-danger" : ""}`}
             key={rowIndex}
           >
             <span>{row.label}</span>
             {row.shellId && (
-              <span className="ml-2 text-xs text-muted">
-                {row.shellId}
-              </span>
+              <span className="ml-2 text-xs text-muted">{row.shellId}</span>
             )}
             {row.exitCode !== undefined && (
               <span className="ml-2 text-xs text-muted">
@@ -384,7 +385,11 @@ export function Transcript({
           return rendered;
         };
         return (
-          <details className="work-segment flex flex-col gap-2" open key={index}>
+          <details
+            className="work-segment flex flex-col gap-2"
+            open
+            key={index}
+          >
             <summary className="cursor-pointer text-muted">
               {node.label} {node.additions ? `+${node.additions}` : ""}{" "}
               {node.deletions ? `−${node.deletions}` : ""}

@@ -30,13 +30,15 @@ describe("single event-log timeline", () => {
         terminalTotalBytes: 100,
       }),
     );
-    expect(rows).toContainEqual(expect.objectContaining({
-      label: "true",
-      callId: "call-terminal-empty",
-      terminalOutput: undefined,
-      terminalTruncated: undefined,
-      terminalTotalBytes: undefined,
-    }));
+    expect(rows).toContainEqual(
+      expect.objectContaining({
+        label: "true",
+        callId: "call-terminal-empty",
+        terminalOutput: undefined,
+        terminalTruncated: undefined,
+        terminalTotalBytes: undefined,
+      }),
+    );
   });
 
   it("renders live and reloaded events identically", () => {
@@ -406,13 +408,15 @@ describe("single event-log timeline", () => {
         terminalTotalBytes: 100,
       }),
     );
-    expect(rows).toContainEqual(expect.objectContaining({
-      label: "true",
-      callId: "call-empty",
-      terminalOutput: undefined,
-      terminalTruncated: undefined,
-      terminalTotalBytes: undefined,
-    }));
+    expect(rows).toContainEqual(
+      expect.objectContaining({
+        label: "true",
+        callId: "call-empty",
+        terminalOutput: undefined,
+        terminalTruncated: undefined,
+        terminalTotalBytes: undefined,
+      }),
+    );
   });
   it("renders terminal chunks that arrive before a shell row without a sequence field", () => {
     const nodes = buildTimeline([
