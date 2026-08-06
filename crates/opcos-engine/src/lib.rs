@@ -2774,28 +2774,44 @@ where
     }
 
     fn provider_messages(&self) -> Result<Vec<Value>, EngineError> {
-        let mut messages: Vec<Value> = self
+        let compaction = self
+            .store
+            .load_compaction(&self.session_id)
+            .map_err(|error| EngineError::Store(error.to_string()))?;
+        let stored_messages = self
             .store
             .load_resume_messages(&self.session_id)
-            .map_err(|error| EngineError::Store(error.to_string()))
-            .map(|items| {
-                items
-                    .into_iter()
-                    .filter(|item| !item.display_only && item.role != "notice")
-                    .map(|item| {
-                        let mut content = item.content;
-                        let model = self.model.try_lock().ok();
-                        if !model
-                            .as_deref()
-                            .map(|model| self.provider.capabilities(model).vision)
-                            .unwrap_or(true)
-                        {
-                            downgrade_images(&mut content);
-                        }
-                        content
-                    })
-                    .collect()
-            })?;
+            .map_err(|error| EngineError::Store(error.to_string()))?;
+        let mut messages: Vec<Value> = stored_messages
+            .into_iter()
+            .filter(|item| !item.display_only && item.role != "notice")
+            .filter(|item| {
+                compaction.as_ref().is_none_or(|state| {
+                    state.retained_from_sequence <= 0
+                        || item.sequence > state.retained_from_sequence
+                })
+            })
+            .map(|item| {
+                let mut content = item.content;
+                let model = self.model.try_lock().ok();
+                if !model
+                    .as_deref()
+                    .map(|model| self.provider.capabilities(model).vision)
+                    .unwrap_or(true)
+                {
+                    downgrade_images(&mut content);
+                }
+                content
+            })
+            .collect();
+        if let Some(compaction) = compaction
+            && compaction.retained_from_sequence > 0
+        {
+            messages.insert(
+                0,
+                json!({"role":"user","content":[{"type":"text","text":compaction.summary}]}),
+            );
+        }
         let plan = self
             .store
             .load_plan(&self.session_id)
@@ -3022,6 +3038,7 @@ where
                 session_id: self.session_id.clone(),
                 summary: summary_text,
                 retained_from: retained.len() as i64,
+                retained_from_sequence: *self.sequence.lock().await,
             })
             .map_err(|error| EngineError::Store(error.to_string()))?;
         let _ = self
@@ -4618,6 +4635,53 @@ mod tests {
                 .unwrap();
             Ok(turn)
         }
+        fn capabilities(&self, _: &str) -> Caps {
+            Caps::default()
+        }
+    }
+
+    #[derive(Clone)]
+    struct BoundedCompactionProvider;
+
+    #[async_trait]
+    impl Provider for BoundedCompactionProvider {
+        async fn complete(&self, _: ProviderRequest) -> Result<AssistantTurn, ProviderError> {
+            Ok(AssistantTurn {
+                text: Some(
+                    "Goal: inspect the checkout flow.\n\
+                     Completed actions and results: inspected checkout, shipping, tax, locale, and currency behavior.\n\
+                     Key discoveries and file paths: checkout implementation is under src/.\n\
+                     Unfinished next steps: continue after compaction."
+                        .into(),
+                ),
+                ..Default::default()
+            })
+        }
+
+        async fn stream(
+            &self,
+            _: ProviderRequest,
+            output: mpsc::Sender<StreamChunk>,
+        ) -> Result<AssistantTurn, ProviderError> {
+            output
+                .send(StreamChunk {
+                    text_delta: Some("continued after compaction".into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            Ok(AssistantTurn {
+                text: Some("continued after compaction".into()),
+                usage: Some(TokenUsage {
+                    input: 12,
+                    output: 4,
+                    cache_read: 0,
+                    cache_write: 0,
+                }),
+                ..Default::default()
+            })
+        }
+
         fn capabilities(&self, _: &str) -> Caps {
             Caps::default()
         }
@@ -6957,6 +7021,171 @@ mod tests {
                 cache_write: 0,
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn bounded_run_compacts_and_reload_preserves_compacted_context() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .save_session(&SessionRecord {
+                session_id: "bounded-compaction".into(),
+                workspace: "/workspace/shop".into(),
+                model: "bounded-test-model".into(),
+                mode: "Auto".into(),
+                harness: "builtin".into(),
+                title: "Bounded compaction".into(),
+                extra_roots: vec![],
+                grants: json!({}),
+                pinned: false,
+                archived: false,
+                origin: None,
+                origin_label: None,
+                compaction: json!({}),
+                host_id: "local".into(),
+                provider: None,
+                external_session_id: None,
+                run_state: "idle".into(),
+                stop_reason: "none".into(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                project_id: None,
+                agent_id: None,
+            })
+            .unwrap();
+        for index in 0..8 {
+            let sequence = index * 3 + 1;
+            store
+                .append_message(&StoredMessage {
+                    session_id: "bounded-compaction".into(),
+                    sequence,
+                    role: "user".into(),
+                    content: json!({
+                        "role": "user",
+                        "content": format!(
+                            "Inspect checkout flow iteration {index}: verify shipping, tax, locale, and currency behavior."
+                        ),
+                    }),
+                    display_only: false,
+                })
+                .unwrap();
+            store
+                .append_message(&StoredMessage {
+                    session_id: "bounded-compaction".into(),
+                    sequence: sequence + 1,
+                    role: "assistant".into(),
+                    content: json!({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": format!("inspect-{index}"),
+                            "name": "read_file",
+                            "arguments": {"path": format!("src/checkout-{index}.tsx")},
+                        }],
+                    }),
+                    display_only: false,
+                })
+                .unwrap();
+            store
+                .append_message(&StoredMessage {
+                    session_id: "bounded-compaction".into(),
+                    sequence: sequence + 2,
+                    role: "tool".into(),
+                    content: json!({
+                        "role": "tool",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": format!("inspect-{index}"),
+                            "content": [{
+                                "type": "text",
+                                "text": format!("checkout-{index}.tsx contains the expected implementation"),
+                            }],
+                        }],
+                    }),
+                    display_only: false,
+                })
+                .unwrap();
+        }
+
+        let engine = TurnEngine::new(
+            BoundedCompactionProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "bounded-compaction",
+            "/workspace/shop",
+            PermissionMode::Auto,
+            "bounded-test-model",
+        );
+        engine
+            .set_resolved_capabilities(Caps {
+                context_window: Some(128),
+                context_window_source: Some("user".into()),
+                ..Default::default()
+            })
+            .await;
+
+        let turn = engine.retry().await.unwrap();
+        assert_eq!(turn.text.as_deref(), Some("continued after compaction"));
+
+        let events = store
+            .load_session_events("bounded-compaction")
+            .unwrap()
+            .into_iter()
+            .map(|record| record.event)
+            .collect::<Vec<_>>();
+        assert!(
+            events
+                .iter()
+                .any(|event| event["type"] == "context_growth_update")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["type"] == "session_snapshot")
+        );
+        assert!(events.iter().any(|event| event["type"] == "compacted"));
+        assert!(events.iter().any(|event| {
+            event["type"] == "context_growth_update"
+                && event["working_event"]["payload"]["estimated_context_tokens"]
+                    .as_u64()
+                    .is_some_and(|tokens| tokens >= 96)
+                && event["working_event"]["payload"]["resolved_context_window"] == 128
+                && event["working_event"]["payload"]["context_window_source"] == "user"
+        }));
+
+        let compaction = store
+            .load_compaction("bounded-compaction")
+            .unwrap()
+            .expect("automatic compaction state");
+        assert!(compaction.summary.contains("Completed actions and results"));
+        assert!(compaction.retained_from > 0);
+        assert!(compaction.retained_from_sequence > 0);
+
+        let reloaded = TurnEngine::new(
+            BoundedCompactionProvider,
+            store,
+            Arc::new(FakeTools),
+            "bounded-compaction",
+            "/workspace/shop",
+            PermissionMode::Auto,
+            "bounded-test-model",
+        );
+        let messages = reloaded.provider_messages().unwrap();
+        assert_eq!(
+            messages[1]
+                .pointer("/content/0/text")
+                .and_then(Value::as_str),
+            Some(compaction.summary.as_str())
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| { message.to_string().contains("continued after compaction") })
+        );
+        assert!(!messages.iter().any(|message| {
+            message
+                .to_string()
+                .contains("Inspect checkout flow iteration 0")
+        }));
     }
 
     #[tokio::test]

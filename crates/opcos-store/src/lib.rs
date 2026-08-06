@@ -252,6 +252,8 @@ pub struct CompactionRecord {
     pub session_id: String,
     pub summary: String,
     pub retained_from: i64,
+    #[serde(default)]
+    pub retained_from_sequence: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
