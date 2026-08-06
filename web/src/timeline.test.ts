@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 import liveEnvelopes from "../../fixtures/timeline/live-events.json";
 import persisted from "../../fixtures/timeline/persisted-events.json";
-import { buildTimeline, mergeEvents, type TimelineEvent } from "./timeline";
+import {
+  buildTimeline,
+  mergeEvents,
+  TRANSIENT_TIMELINE_EVENT_TYPES,
+  type TimelineEvent,
+} from "./timeline";
 
 const live = liveEnvelopes.map((entry) => entry.payload as TimelineEvent);
 const saved = persisted as TimelineEvent[];
@@ -22,6 +27,24 @@ describe("single event-log timeline", () => {
     let events: TimelineEvent[] = [];
     for (const event of live) events = mergeEvents(events, event);
     expect(buildTimeline(events)).toEqual(buildTimeline(live));
+  });
+  it("produces the same timeline when token deltas are omitted from persistence", () => {
+    const persistedWithoutDeltas = live.filter(
+      (event) =>
+        !TRANSIENT_TIMELINE_EVENT_TYPES.includes(
+          event.type as (typeof TRANSIENT_TIMELINE_EVENT_TYPES)[number],
+        ),
+    );
+    expect(buildTimeline(mergeEvents([], live))).toEqual(
+      buildTimeline(persistedWithoutDeltas),
+    );
+    expect(
+      mergeEvents([], live).some((event) =>
+        TRANSIENT_TIMELINE_EVENT_TYPES.includes(
+          event.type as (typeof TRANSIENT_TIMELINE_EVENT_TYPES)[number],
+        ),
+      ),
+    ).toBe(false);
   });
   it("uses Devin wording for fixture-derived rows", () => {
     const nodes = buildTimeline(live);

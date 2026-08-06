@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
+pub const TRANSIENT_SESSION_EVENT_TYPES: &[&str] =
+    &["assistant_delta", "reasoning_delta", "tool_call_delta"];
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("sqlite error: {0}")]
@@ -2121,10 +2124,19 @@ impl SqliteStore {
         session_id: &str,
     ) -> Result<Vec<SessionEventRecord>, StoreError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let mut statement = connection.prepare(
+        let transient_types = TRANSIENT_SESSION_EVENT_TYPES
+            .iter()
+            .map(|event_type| format!("'{event_type}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
             "SELECT session_id,event_id,event_json,created_at_ms,sequence
-             FROM session_events WHERE session_id=?1 ORDER BY created_at_ms,sequence",
-        )?;
+             FROM session_events
+             WHERE session_id=?1
+               AND COALESCE(json_extract(event_json, '$.type'), '') NOT IN ({transient_types})
+             ORDER BY created_at_ms,sequence"
+        );
+        let mut statement = connection.prepare(&query)?;
         statement
             .query_map([session_id], |row| {
                 let event_json: String = row.get(2)?;
@@ -6617,6 +6629,31 @@ mod tests {
         assert!(path.exists());
         drop(store);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn loading_session_events_excludes_persisted_token_deltas() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        for (event_id, event_type) in [
+            ("assistant", "assistant_delta"),
+            ("reasoning", "reasoning_delta"),
+            ("tool", "tool_call_delta"),
+            ("message", "devin_message"),
+        ] {
+            store
+                .append_session_event(
+                    "session",
+                    &serde_json::json!({
+                        "event_id": event_id,
+                        "created_at_ms": 1,
+                        "type": event_type,
+                    }),
+                )
+                .unwrap();
+        }
+        let events = store.load_session_events("session").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event["type"], "devin_message");
     }
 
     #[test]

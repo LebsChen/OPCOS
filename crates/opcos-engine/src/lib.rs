@@ -9,7 +9,7 @@ use opcos_provider::{
 };
 use opcos_store::{
     CompactionRecord, GrantRecord, NoticeRecord, PendingRecord, SessionStore, StoredMessage,
-    ToolCallRecord, UsageRecord,
+    TRANSIENT_SESSION_EVENT_TYPES, ToolCallRecord, UsageRecord,
 };
 use regex::Regex;
 use serde_json::{Value, json};
@@ -2707,11 +2707,17 @@ where
     }
 
     fn persist_event_value(&self, event: Value) -> Result<(), EngineError> {
-        self.store
-            .append_session_event(&self.session_id, &event)
+        let chunk: StreamChunk = serde_json::from_value(event.clone())
             .map_err(|error| EngineError::Store(error.to_string()))?;
-        let chunk =
-            serde_json::from_value(event).map_err(|error| EngineError::Store(error.to_string()))?;
+        let transient = chunk
+            .event_type
+            .as_deref()
+            .is_some_and(|event_type| TRANSIENT_SESSION_EVENT_TYPES.contains(&event_type));
+        if !transient {
+            self.store
+                .append_session_event(&self.session_id, &event)
+                .map_err(|error| EngineError::Store(error.to_string()))?;
+        }
         let _ = self.events.try_send(chunk);
         Ok(())
     }

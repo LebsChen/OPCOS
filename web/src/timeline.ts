@@ -7,6 +7,12 @@ export type TimelineEvent = {
   [key: string]: unknown;
 };
 
+export const TRANSIENT_TIMELINE_EVENT_TYPES = [
+  "assistant_delta",
+  "reasoning_delta",
+  "tool_call_delta",
+] as const;
+
 export type TimelineNode =
   | {
       kind: "user";
@@ -68,6 +74,12 @@ export function mergeEvents(
   ];
   const seen = new Set<string>();
   const unique = all.filter((event) => {
+    if (
+      TRANSIENT_TIMELINE_EVENT_TYPES.includes(
+        eventType(event) as (typeof TRANSIENT_TIMELINE_EVENT_TYPES)[number],
+      )
+    )
+      return false;
     if (seen.has(event.event_id)) return false;
     seen.add(event.event_id);
     return true;
@@ -167,9 +179,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
         "iteration_checkpoint",
         "status_update",
         "turn",
-        "assistant_delta",
-        "reasoning_delta",
-        "tool_call_delta",
+        ...TRANSIENT_TIMELINE_EVENT_TYPES,
         "stream_reset",
       ].includes(type)
     ) {
