@@ -8232,6 +8232,7 @@ fn clear_project_configuration(state: &DesktopState, project_id: &str) -> Result
             [project_id],
         )
         .map_err(|error| error.to_string())?;
+    drop(connection);
     refresh_secret_values(state)?;
     Ok(())
 }
