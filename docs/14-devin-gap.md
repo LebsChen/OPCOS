@@ -124,7 +124,7 @@
 
 | 未关闭差距 | 当前状态 |
 |---|---|
-| attachments / artifacts timeline | 仍开放：screenshots、recordings、file contents、citation snippets 尚未在 OPCOS timeline 等价呈现。 |
+| attachments / artifacts timeline | **部分关闭**：截图和文件改动 diff 已作为 per-session artifacts 持久化并可在 timeline / artifact rail 按需展开；录屏、citation snippets 仍开放。截图 artifact 当前不会作为视觉输入发送给模型。 |
 | terminal replay / `terminal_update` panel | 仍开放：事件已持久化，但 Devin 式 terminal replay panel 尚未完成。 |
 | iteration stats surfacing | 仍开放：事件可记录，但尚未在 timeline / UI 中提供 Devin 式可见统计面。 |
 | right rail Shell / Desktop / Web IDE panes | **未核实**：七轮没有 RVM token，因此没有真实远端 pane 验证。 |
@@ -157,6 +157,27 @@ Builtin engine 现在会把 working 过程作为结构化事件同时写入本�
 - 对照完整 Devin stream，`terminal_update` payload 使用 `contents` 而非
   `chunk`；OPCOS 保留 `call_id` 作为本地工具关联键，当前没有通用真实
   `shell_id` 或 gzip transport，因此不伪造这两个字段。
+
+Artifacts / attachments 这一批已完成的范围是：
+
+- 显式 computer-use / browser screenshot 结果会写入
+  `<app_config_dir>/artifacts/<session_id>/<artifact_id>`，并注册现有
+  `artifacts` 表；事件只保存 artifact id，不把图片 bytes 或 base64 内联进
+  `session_events.event_json`。
+- 截图事件使用 Devin 对齐的 `computer_use` 类型，payload 带
+  `screenshot_keys: [artifact_id]`；截图 artifact 的单文件上限为 8 MiB。
+- `write_file` / `edit_file` 的 `multi_edit_result.file_updates[]` 带 diff
+  artifact id；diff 超过 5000 行时不生成 diff artifact，但仍保留
+  `lines_added` / `lines_removed` 统计。
+- timeline 和 artifact rail 只在用户展开/打开时读取 artifact 内容；图片以
+  base64 data URL 展示，diff 的新增/删除行有区别显示。
+- 当前没有自动 artifact 回收；目录按 session 分隔，可手工删除。预期单个
+  session 的截图数量约等于进入工具 transcript 的显式 screenshot 结果数；
+  computer-use loop 内部仅用于 before/after 验证的中间帧不持久化。
+- 截图虽然可作为 artifact 查看，但当前不会转换成 provider 的
+  `type: "image"` 输入 block，因此尚未进入模型的视觉输入；这是明确的后续
+  open gap。OPCOS 仍没有 Devin `recording_stopped.clean_video_url` 或
+  `citation_snippet.data.file_content` 对应能力。
 
 真实 Devin 事件样本的字段形状已依据
 `/home/ubuntu/devin_session_events_full.txt` 核对，覆盖 status、shell、file、

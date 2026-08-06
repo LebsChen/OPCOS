@@ -182,7 +182,7 @@ describe("single event-log timeline", () => {
         },
       },
       {
-        type: "computer_use_screenshot",
+        type: "computer_use",
         event_id: "screenshot",
         created_at_ms: 2,
         working_event: {
@@ -190,7 +190,7 @@ describe("single event-log timeline", () => {
         },
       },
       {
-        type: "computer_use_screenshot",
+        type: "computer_use",
         event_id: "empty-screenshot",
         created_at_ms: 3,
         working_event: {

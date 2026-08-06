@@ -279,7 +279,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
               typeof item.artifact_id === "string" ? "text/x-diff" : undefined,
           });
         }
-      } else if (type === "computer_use_screenshot") {
+      } else if (type === "computer_use") {
         const currentWork = work;
         const keys = Array.isArray(data.screenshot_keys)
           ? data.screenshot_keys.filter(

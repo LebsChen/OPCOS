@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { type ApprovalDecision, type Item } from "../types";
 import { buildTimeline, type TimelineEvent } from "../timeline";
 import { ApprovalCard } from "./ApprovalCard";
@@ -60,6 +60,15 @@ function ArtifactRow({
   const [open, setOpen] = useState(false);
   const [content, setContent] = useState<Record<string, unknown> | null>(null);
   const [error, setError] = useState("");
+  const [lightboxOpen, setLightboxOpen] = useState(false);
+  useEffect(() => {
+    if (!lightboxOpen) return;
+    const close = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setLightboxOpen(false);
+    };
+    window.addEventListener("keydown", close);
+    return () => window.removeEventListener("keydown", close);
+  }, [lightboxOpen]);
   const load = () => {
     if (content || error) {
       setOpen((value) => !value);
@@ -111,9 +120,7 @@ function ArtifactRow({
               className="max-w-full max-h-64 cursor-zoom-in"
               src={image}
               alt="Screenshot artifact"
-              onClick={() =>
-                window.open(image, "_blank", "noopener,noreferrer")
-              }
+              onClick={() => setLightboxOpen(true)}
             />
           ) : content ? (
             <pre className="artifact-code whitespace-pre-wrap">
@@ -122,6 +129,20 @@ function ArtifactRow({
           ) : (
             <span className="text-muted">Loading…</span>
           )}
+        </div>
+      )}
+      {lightboxOpen && image && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-6"
+          role="presentation"
+          onClick={() => setLightboxOpen(false)}
+        >
+          <img
+            className="max-h-full max-w-full"
+            src={image}
+            alt="Screenshot artifact enlarged"
+            onClick={(event) => event.stopPropagation()}
+          />
         </div>
       )}
     </div>

@@ -2215,9 +2215,22 @@ where
                     .map(|result| (calls[index].id.clone(), result))
             })
             .collect::<Vec<_>>();
-        self.persist_tool_results(assistant_sequence, calls, persisted)
+        let safe_results = self
+            .persist_tool_results(assistant_sequence, calls, persisted)
             .await?;
-        Ok(results.into_iter().map(Option::unwrap).collect())
+        let safe_by_id = safe_results
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        Ok(calls
+            .iter()
+            .zip(results)
+            .map(|(call, result)| {
+                safe_by_id
+                    .get(&call.id)
+                    .cloned()
+                    .unwrap_or_else(|| result.unwrap_or(Value::Null))
+            })
+            .collect())
     }
 
     async fn execute_tool_streaming(&self, call: &ToolCall) -> Value {
@@ -2359,8 +2372,8 @@ where
             .await?;
         let _ = self
             .working_event(
-                "computer_use_screenshot",
-                "file",
+                "computer_use",
+                "computer_use",
                 json!({
                     "call_id": call.id,
                     "screenshot_keys": [reference.id],
@@ -2375,24 +2388,26 @@ where
         assistant_sequence: i64,
         calls: &[ToolCall],
         results: Vec<(String, Value)>,
-    ) -> Result<(), EngineError> {
+    ) -> Result<Vec<(String, Value)>, EngineError> {
+        let mut safe_results = Vec::with_capacity(results.len());
         for (call_id, result) in results {
             let call = calls
                 .iter()
                 .find(|call| call.id == call_id)
                 .ok_or_else(|| EngineError::Store(format!("tool call not found: {call_id}")))?;
             let mut safe_result = result.clone();
-            let screenshot_id = if call.name == "computer_use" {
-                self.emit_screenshot_artifact(call, &result).await
-            } else {
-                None
-            };
-            if let Some(artifact_id) = screenshot_id
-                && let Some(object) = safe_result.as_object_mut()
-            {
-                object.insert("image".into(), json!({"artifact_id": artifact_id}));
+            let has_image = result.get("image").and_then(Value::as_str).is_some();
+            let screenshot_id = self.emit_screenshot_artifact(call, &result).await;
+            if has_image && let Some(object) = safe_result.as_object_mut() {
+                object.insert(
+                    "image".into(),
+                    screenshot_id
+                        .map(|artifact_id| json!({"artifact_id": artifact_id}))
+                        .unwrap_or_else(|| json!({"error": "image artifact unavailable"})),
+                );
             }
             self.secret_scrubber.scrub(&mut safe_result);
+            safe_results.push((call.id.clone(), safe_result.clone()));
             let value = json!({"role":"tool","content":[{"type":"tool_result",
                 "tool_use_id":call.id,"content":[{"type":"text","text":safe_result.to_string()}]}]});
             self.append("tool", value).await?;
@@ -2462,7 +2477,7 @@ where
                 },
             );
         }
-        Ok(())
+        Ok(safe_results)
     }
 
     fn provider_messages(&self) -> Result<Vec<Value>, EngineError> {
@@ -3118,8 +3133,7 @@ fn tool_event_category(name: &str) -> &'static str {
 fn line_diff_counts(old: &str, new: &str) -> (usize, usize) {
     let old_lines = old.lines().collect::<Vec<_>>();
     let new_lines = new.lines().collect::<Vec<_>>();
-    const EXACT_LINE_LIMIT: usize = 5_000;
-    if old_lines.len() > EXACT_LINE_LIMIT || new_lines.len() > EXACT_LINE_LIMIT {
+    if old_lines.len() > MAX_EXACT_DIFF_LINES || new_lines.len() > MAX_EXACT_DIFF_LINES {
         let mut old_counts = HashMap::<&str, usize>::new();
         let mut new_counts = HashMap::<&str, usize>::new();
         for line in old_lines {
@@ -3172,6 +3186,9 @@ fn unified_diff(path: &str, old: &str, new: &str) -> String {
     }
     let old_lines = old.lines().collect::<Vec<_>>();
     let new_lines = new.lines().collect::<Vec<_>>();
+    if old_lines.len() > MAX_EXACT_DIFF_LINES || new_lines.len() > MAX_EXACT_DIFF_LINES {
+        return String::new();
+    }
     let mut lcs = vec![vec![0usize; new_lines.len() + 1]; old_lines.len() + 1];
     for old_index in (0..old_lines.len()).rev() {
         for new_index in (0..new_lines.len()).rev() {
@@ -3205,6 +3222,8 @@ fn unified_diff(path: &str, old: &str, new: &str) -> String {
     }
     format!("{}\n", lines.join("\n"))
 }
+
+const MAX_EXACT_DIFF_LINES: usize = 5_000;
 
 #[async_trait]
 impl<P, S, E> AgentEngine for TurnEngine<P, S, E>
@@ -3954,6 +3973,16 @@ mod tests {
             unified_diff("src/lib.rs", "one\ntwo\n", "one\nthree\n"),
             "--- src/lib.rs\n+++ src/lib.rs\n one\n-two\n+three\n"
         );
+    }
+
+    #[test]
+    fn unified_diff_skips_files_over_the_exact_diff_limit() {
+        let old = (0..5_001)
+            .map(|index| format!("old-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new = old.replace("old-2500", "new-2500");
+        assert!(unified_diff("large.txt", &old, &new).is_empty());
     }
 
     #[test]
@@ -5406,6 +5435,73 @@ mod tests {
         let records = store.load_tool_calls("s").unwrap();
         assert_eq!(records[0].result, None);
         assert_eq!(records[1].result, Some(json!({"matched":"second"})));
+    }
+
+    #[tokio::test]
+    async fn image_tool_results_use_the_same_artifact_reference_for_storage_and_provider() {
+        struct Sink;
+        #[async_trait]
+        impl ArtifactSink for Sink {
+            async fn persist(&self, request: ArtifactRequest) -> Result<ArtifactReference, String> {
+                assert_eq!(request.content, b"hello");
+                Ok(ArtifactReference {
+                    id: "artifact-image".into(),
+                    name: request.name,
+                    kind: request.kind,
+                    mime: request.mime,
+                    size_bytes: request.content.len() as u64,
+                })
+            }
+        }
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let mut engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine.set_artifact_sink(Arc::new(Sink));
+        let call = ToolCall {
+            id: "image-call".into(),
+            name: "browser_screenshot".into(),
+            arguments: json!({}),
+        };
+        store
+            .append_tool_call(&opcos_store::ToolCallRecord {
+                session_id: "s".into(),
+                message_sequence: 1,
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+                result: None,
+            })
+            .unwrap();
+        let result = json!({"format":"png","image":"aGVsbG8="});
+        let provider_results = engine
+            .persist_tool_results(1, &[call], vec![("image-call".into(), result)])
+            .await
+            .unwrap();
+        let expected = json!({
+            "format": "png",
+            "image": {"artifact_id": "artifact-image"}
+        });
+        assert_eq!(provider_results[0].1, expected);
+        let messages = store.load_messages("s").unwrap();
+        assert_eq!(
+            messages.last().unwrap().content["content"][0]["content"][0]["text"],
+            expected.to_string()
+        );
+        assert!(
+            !messages
+                .last()
+                .unwrap()
+                .content
+                .to_string()
+                .contains("aGVsbG8=")
+        );
     }
 
     #[tokio::test]
