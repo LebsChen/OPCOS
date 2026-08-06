@@ -659,11 +659,20 @@ h3 {
   min-width: 0;
   flex-direction: column;
   gap: 8px;
-  padding-left: 23px;
-  border-left: 1px solid var(--line);
+  position: relative;
+  padding-left: 24px;
   color: var(--muted);
   font-size: 13px;
   line-height: 18px;
+}
+.transcript-worklog-body::before {
+  position: absolute;
+  top: 8px;
+  bottom: 0;
+  left: 7px;
+  width: 1px;
+  background: var(--line);
+  content: "";
 }
 .transcript-row {
   position: relative;
