@@ -198,7 +198,7 @@ type BlueprintStatus = {
   content: string;
   value: Record<string, unknown>;
 };
-type MarketTemplate = {
+type LibraryEntry = {
   id: string;
   kind: string;
   name: string;
@@ -209,7 +209,7 @@ type MarketTemplate = {
   readonly: boolean;
   source?: string;
 };
-type ProjectConfigurationTemplate = MarketTemplate & {
+type ProjectConfigurationTemplate = LibraryEntry & {
   template_id: string;
   source: string;
   applied: boolean;
@@ -809,16 +809,16 @@ function ProjectDialog({
   const [defaultBranch, setDefaultBranch] = useState("main");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
-  const [teamTemplates, setTeamTemplates] = useState<MarketTemplate[]>([]);
-  const [configTemplates, setConfigTemplates] = useState<MarketTemplate[]>([]);
+  const [teamTemplates, setTeamTemplates] = useState<LibraryEntry[]>([]);
+  const [configTemplates, setConfigTemplates] = useState<LibraryEntry[]>([]);
   const [teamTemplateId, setTeamTemplateId] = useState("");
   const [configTemplateIds, setConfigTemplateIds] = useState<string[]>([]);
   useEffect(() => {
     void Promise.all([
-      command<MarketTemplate[]>("list_template_market", {
+      command<LibraryEntry[]>("list_configured_library", {
         kind: "team-template",
       }),
-      command<MarketTemplate[]>("list_template_market"),
+      command<LibraryEntry[]>("list_configured_library"),
     ]).then(([teams, templates]) => {
       setTeamTemplates(teams);
       setConfigTemplates(
@@ -1228,6 +1228,9 @@ function ProjectConfigPanel({
   const [secrets, setSecrets] = useState<SecretMetadata[]>([]);
   const [kind, setKind] = useState<
     | "agents"
+    | "experts"
+    | "teams"
+    | "command"
     | "knowledge"
     | "playbook"
     | "mcp"
@@ -1344,6 +1347,9 @@ function ProjectConfigPanel({
         <div className="flex flex-wrap gap-2">
           {[
             ["agents", "规则"],
+            ["experts", "专家"],
+            ["teams", "团队"],
+            ["command", "Command"],
             ["knowledge", "Knowledge"],
             ["playbook", "Playbook"],
             ["mcp", "MCP"],
@@ -1370,147 +1376,185 @@ function ProjectConfigPanel({
             全局预设（项目选择）
           </legend>
           <div className="grid gap-2">
-            {configurationTemplates.map((template) => (
-              <div
-                key={template.template_id}
-                className="flex items-center gap-2 text-sm"
-              >
-                <label className="flex min-w-0 flex-1 items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={template.applied}
-                    onChange={(event) =>
-                      void toggleConfigurationTemplate(
-                        template,
-                        event.target.checked,
-                      )
-                    }
-                  />
-                  <span>
-                    {template.name} · {template.source} ·{" "}
-                    {template.overridden ? "项目已覆盖" : "继承自全局预设"}
-                    {template.modified ? " · 已本地修改" : ""}
-                    {template.overridden ? " · 可在下方编辑" : ""}
-                  </span>
-                </label>
-                <div className="flex shrink-0 gap-2">
-                  {template.overridden && (
-                    <button
-                      type="button"
-                      className="btn"
-                      onClick={() => {
-                        if (
-                          window.confirm(
-                            `将删除项目覆盖「${template.name}」，恢复继承全局预设。确定继续吗？`,
-                          )
-                        ) {
-                          void command("restore_project_configuration", {
+            {configurationTemplates
+              .filter((template) => {
+                const selectedKind = {
+                  agents: "rules",
+                  experts: "agent-template",
+                  teams: "team-template",
+                  command: "command",
+                  knowledge: "knowledge",
+                  playbook: "runbook",
+                  mcp: "mcp",
+                  "acp-agent": "acp-agent",
+                  connectors: "connector",
+                  blueprint: "blueprint",
+                }[kind];
+                return template.kind === selectedKind;
+              })
+              .map((template) => (
+                <div
+                  key={template.template_id}
+                  className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-3 rounded-md border border-line/70 px-3 py-2 text-sm"
+                >
+                  <label className="flex items-center gap-2 pt-1">
+                    <input
+                      type="checkbox"
+                      aria-label={`启用 ${template.name}`}
+                      style={{ width: 16, height: 16 }}
+                      checked={template.applied}
+                      onChange={(event) =>
+                        void toggleConfigurationTemplate(
+                          template,
+                          event.target.checked,
+                        )
+                      }
+                    />
+                  </label>
+                  <div className="min-w-0">
+                    <strong className="block break-words text-ink">
+                      {template.name}
+                    </strong>
+                    <small className="mt-1 block break-words text-faint">
+                      {template.source} ·{" "}
+                      {template.overridden ? "项目已覆盖" : "继承自全局预设"}
+                      {template.modified ? " · 已本地修改" : ""}
+                      {template.overridden ? " · 可在下方编辑" : ""}
+                    </small>
+                  </div>
+                  <div className="flex shrink-0 gap-2">
+                    {template.overridden && (
+                      <button
+                        type="button"
+                        className="btn"
+                        onClick={() => {
+                          if (
+                            window.confirm(
+                              `将删除项目覆盖「${template.name}」，恢复继承全局预设。确定继续吗？`,
+                            )
+                          ) {
+                            void command("restore_project_configuration", {
+                              projectId: project.id,
+                              templateId: template.template_id,
+                            })
+                              .then(load)
+                              .then(onRefresh)
+                              .catch(onError);
+                          }
+                        }}
+                      >
+                        恢复继承
+                      </button>
+                    )}
+                    {!template.overridden && (
+                      <button
+                        type="button"
+                        className="btn"
+                        onClick={() => {
+                          void command("override_project_configuration", {
                             projectId: project.id,
                             templateId: template.template_id,
                           })
                             .then(load)
                             .then(onRefresh)
                             .catch(onError);
-                        }
-                      }}
-                    >
-                      恢复继承
-                    </button>
-                  )}
-                  {!template.overridden && (
-                    <button
-                      type="button"
-                      className="btn"
-                      onClick={() => {
-                        void command("override_project_configuration", {
-                          projectId: project.id,
-                          templateId: template.template_id,
-                        })
-                          .then(load)
-                          .then(onRefresh)
-                          .catch(onError);
-                      }}
-                    >
-                      创建项目覆盖
-                    </button>
-                  )}
+                        }}
+                      >
+                        创建项目覆盖
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            {!configurationTemplates.some((template) => {
+              const selectedKind = {
+                agents: "rules",
+                experts: "agent-template",
+                teams: "team-template",
+                command: "command",
+                knowledge: "knowledge",
+                playbook: "runbook",
+                mcp: "mcp",
+                "acp-agent": "acp-agent",
+                connectors: "connector",
+                blueprint: "blueprint",
+              }[kind];
+              return template.kind === selectedKind;
+            }) && <span className="text-xs text-faint">暂无可用配置模板</span>}
+          </div>
+        </fieldset>
+        {!["experts", "teams", "command"].includes(kind) &&
+          assets
+            .filter((asset) => asset.kind === kind)
+            .map((asset) => (
+              <div
+                className="flex items-start justify-between gap-3 rounded-lg border border-line p-3"
+                key={asset.id}
+              >
+                <div className="min-w-0">
+                  <strong className="text-ink">{asset.title}</strong>
+                  <p className="mt-1 whitespace-pre-wrap break-words text-xs text-faint">
+                    {asset.body}
+                  </p>
+                </div>
+                <div className="flex shrink-0 gap-2">
+                  <button
+                    className="btn"
+                    onClick={() => {
+                      setEditingId(asset.id);
+                      setTitle(asset.title);
+                      setBody(asset.body);
+                    }}
+                  >
+                    编辑
+                  </button>
+                  <button
+                    className="btn"
+                    onClick={() =>
+                      command("delete_asset", { id: asset.id })
+                        .then(load)
+                        .catch(onError)
+                    }
+                  >
+                    删除
+                  </button>
                 </div>
               </div>
             ))}
-            {!configurationTemplates.length && (
-              <span className="text-xs text-faint">暂无可用配置模板</span>
-            )}
-          </div>
-        </fieldset>
-        {assets
-          .filter((asset) => asset.kind === kind)
-          .map((asset) => (
-            <div
-              className="flex items-start justify-between gap-3 rounded-lg border border-line p-3"
-              key={asset.id}
-            >
-              <div className="min-w-0">
-                <strong className="text-ink">{asset.title}</strong>
-                <p className="mt-1 whitespace-pre-wrap break-words text-xs text-faint">
-                  {asset.body}
-                </p>
-              </div>
-              <div className="flex shrink-0 gap-2">
-                <button
-                  className="btn"
-                  onClick={() => {
-                    setEditingId(asset.id);
-                    setTitle(asset.title);
-                    setBody(asset.body);
-                  }}
-                >
-                  编辑
-                </button>
-                <button
-                  className="btn"
-                  onClick={() =>
-                    command("delete_asset", { id: asset.id })
-                      .then(load)
-                      .catch(onError)
-                  }
-                >
-                  删除
-                </button>
-              </div>
-            </div>
-          ))}
-        <div className="grid gap-3 rounded-lg border border-line p-4">
-          <label className="field-label">
-            名称
-            <input
-              value={title}
-              onChange={(event) => setTitle(event.target.value)}
-              placeholder="配置名称"
-            />
-          </label>
-          <label className="field-label">
-            内容
-            <textarea
-              value={body}
-              onChange={(event) => setBody(event.target.value)}
-              placeholder={
-                kind === "blueprint"
-                  ? "clone:\n  - git fetch"
-                  : "项目级配置内容"
-              }
-            />
-          </label>
-          <div>
-            <button className="btn approval-primary" onClick={save}>
-              {editingId ? "保存更改" : "新增配置"}
-            </button>
-            {editingId && (
-              <button className="btn ml-2" onClick={reset}>
-                取消编辑
+        {!["experts", "teams", "command"].includes(kind) && (
+          <div className="grid gap-3 rounded-lg border border-line p-4">
+            <label className="field-label">
+              名称
+              <input
+                value={title}
+                onChange={(event) => setTitle(event.target.value)}
+                placeholder="配置名称"
+              />
+            </label>
+            <label className="field-label">
+              内容
+              <textarea
+                value={body}
+                onChange={(event) => setBody(event.target.value)}
+                placeholder={
+                  kind === "blueprint"
+                    ? "clone:\n  - git fetch"
+                    : "项目级配置内容"
+                }
+              />
+            </label>
+            <div>
+              <button className="btn approval-primary" onClick={save}>
+                {editingId ? "保存更改" : "新增配置"}
               </button>
-            )}
+              {editingId && (
+                <button className="btn ml-2" onClick={reset}>
+                  取消编辑
+                </button>
+              )}
+            </div>
           </div>
-        </div>
+        )}
       </div>
       <div className="mt-6 border-t border-line pt-5">
         <div className="flex items-center justify-between">
@@ -3441,15 +3485,17 @@ function ManageSections({
     null,
   );
   const [skillBrowse, setSkillBrowse] = useState<SkillRulesBrowse | null>(null);
-  const [marketTemplates, setMarketTemplates] = useState<MarketTemplate[]>([]);
-  const [marketKind, setMarketKind] = useState<
-    "agent-template" | "team-template" | "config"
+  const [libraryEntries, setLibraryEntries] = useState<LibraryEntry[]>([]);
+  const [libraryKind, setLibraryKind] = useState<
+    "agent-template" | "team-template" | "command"
   >("agent-template");
   const [templateDraftName, setTemplateDraftName] = useState("");
+  const [templateDraftId, setTemplateDraftId] = useState<string | null>(null);
   const [templateDraftDescription, setTemplateDraftDescription] = useState("");
   const [templateDraftContent, setTemplateDraftContent] = useState("{}");
   const [templateDraftStatus, setTemplateDraftStatus] = useState("");
-  const [marketProjectId, setMarketProjectId] = useState("");
+  const [templateEditorOpen, setTemplateEditorOpen] = useState(false);
+  const [libraryProjectId, setLibraryProjectId] = useState("");
   const [environmentTab, setEnvironmentTab] = useState<
     "blueprints" | "snapshots" | "advanced" | "outposts"
   >("blueprints");
@@ -3470,6 +3516,16 @@ function ManageSections({
     {},
   );
   const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
+  const [customProviderEditorOpen, setCustomProviderEditorOpen] =
+    useState(false);
+  const [customProviderId, setCustomProviderId] = useState<string | null>(null);
+  const [customProviderName, setCustomProviderName] = useState("");
+  const [customProviderDialect, setCustomProviderDialect] =
+    useState("openai-compatible");
+  const [customProviderBaseUrl, setCustomProviderBaseUrl] = useState("");
+  const [customProviderKey, setCustomProviderKey] = useState("");
+  const [customProviderModel, setCustomProviderModel] = useState("");
+  const [customProviderStatus, setCustomProviderStatus] = useState("");
   const [assetTitle, setAssetTitle] = useState("");
   const [assetBody, setAssetBody] = useState("");
   const [instructionsDraft, setInstructionsDraft] = useState("");
@@ -3665,7 +3721,9 @@ function ManageSections({
       "Environment",
       "管理 Blueprint、固定环境说明、有序仓库 setup 和长期主机。",
     ],
-    market: ["市场", "浏览和管理 Agent、Team 与配置模板。"],
+    experts: ["专家", "管理可供项目启用的专家库。"],
+    teams: ["团队", "管理可供项目启用的团队库。"],
+    command: ["Command", "管理可供项目启用的命令库。"],
   };
   const assetKinds = [
     "agents",
@@ -3679,6 +3737,14 @@ function ManageSections({
     : "knowledge";
   const assetTabVisible =
     tab !== "skill" && assetKinds.includes(tab as (typeof assetKinds)[number]);
+  const activeLibraryKind =
+    tab === "experts"
+      ? "agent-template"
+      : tab === "teams"
+        ? "team-template"
+        : tab === "command"
+          ? "command"
+          : libraryKind;
   const assetLabel =
     assetTabKind === "agents"
       ? "规则"
@@ -3728,9 +3794,9 @@ function ManageSections({
       .catch(onError);
   }, [tab, settingsProjectId, selected, onError]);
   useEffect(() => {
-    if (tab !== "market") return;
-    void command<MarketTemplate[]>("list_template_market")
-      .then(setMarketTemplates)
+    if (!["experts", "teams", "command"].includes(tab)) return;
+    void command<LibraryEntry[]>("list_configured_library")
+      .then(setLibraryEntries)
       .catch(onError);
   }, [tab, onError]);
   useEffect(() => {
@@ -3755,23 +3821,9 @@ function ManageSections({
   }, [tab, settingsProjectId, selected, onError]);
   useEffect(() => {
     void command<
-      Array<{
-        provider: string;
-        base_url?: string;
-        model?: string;
-        configured: boolean;
-      }>
+      Array<{ provider: string; base_url?: string; configured: boolean }>
     >("provider_configurations")
-      .then((items) => {
-        setProviderConfigs(items);
-        setProviderModels(
-          Object.fromEntries(
-            items
-              .filter((item) => item.model)
-              .map((item) => [item.provider, item.model as string]),
-          ),
-        );
-      })
+      .then(setProviderConfigs)
       .catch(onError);
   }, []);
   useEffect(() => {
@@ -3802,7 +3854,9 @@ function ManageSections({
           tab === "provider" ||
           tab === "blueprint" ||
           tab === "agent" ||
-          tab === "market"
+          tab === "experts" ||
+          tab === "teams" ||
+          tab === "command"
             ? "rounded-xl2 border border-line bg-panel p-5"
             : ""
         }
@@ -4453,50 +4507,86 @@ function ManageSections({
         )}
         {tab === "provider" &&
           (selectedProvider === null ? (
-            <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,440px),440px))] gap-2.5">
-              {providers.map((descriptor) => {
-                const config = providerConfigs.find(
-                  (item) => item.provider === descriptor.name,
-                );
-                return (
-                  <IntegrationCard
-                    key={descriptor.name}
-                    icon={descriptor.title.slice(0, 1)}
-                    title={descriptor.title}
-                    badge={{
-                      label:
+            <div className="space-y-3">
+              <div className="flex justify-end">
+                <Button
+                  className="primary"
+                  onClick={() => {
+                    setCustomProviderId(null);
+                    setCustomProviderName("");
+                    setCustomProviderDialect("openai-compatible");
+                    setCustomProviderBaseUrl("");
+                    setCustomProviderKey("");
+                    setCustomProviderModel("");
+                    setCustomProviderStatus("");
+                    setCustomProviderEditorOpen(true);
+                  }}
+                >
+                  添加自定义 Provider
+                </Button>
+              </div>
+              <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,440px),440px))] gap-2.5">
+                {providers.map((descriptor) => {
+                  const config = providerConfigs.find(
+                    (item) => item.provider === descriptor.name,
+                  );
+                  return (
+                    <IntegrationCard
+                      key={descriptor.name}
+                      icon={descriptor.title.slice(0, 1)}
+                      title={descriptor.title}
+                      badge={{
+                        label:
+                          descriptor.available === false
+                            ? "Not integrated"
+                            : config?.configured
+                              ? "Enabled"
+                              : "Not configured",
+                        tone:
+                          descriptor.available === false || !config?.configured
+                            ? "neutral"
+                            : "success",
+                      }}
+                      description={
                         descriptor.available === false
-                          ? "Not integrated"
+                          ? "Not integrated."
                           : config?.configured
-                            ? "Enabled"
-                            : "Not configured",
-                      tone:
-                        descriptor.available === false || !config?.configured
-                          ? "neutral"
-                          : "success",
-                    }}
-                    description={
-                      descriptor.available === false
-                        ? "Not integrated."
-                        : config?.configured
-                          ? "Configured securely."
-                          : config?.base_url || "Not configured yet."
-                    }
-                    disabled={descriptor.available === false}
-                    onClick={() =>
-                      descriptor.available !== false &&
-                      setSelectedProvider(descriptor.name)
-                    }
-                    actions={
-                      descriptor.available !== false ? (
-                        <span className="ml-auto text-faint text-[14px]">
-                          ›
-                        </span>
-                      ) : undefined
-                    }
-                  />
-                );
-              })}
+                            ? "Configured securely."
+                            : config?.base_url || "Not configured yet."
+                      }
+                      disabled={descriptor.available === false}
+                      onClick={() => {
+                        if (descriptor.available === false) return;
+                        if (descriptor.name.startsWith("custom-")) {
+                          setCustomProviderId(descriptor.name);
+                          setCustomProviderName(descriptor.title);
+                          setCustomProviderDialect("openai-compatible");
+                          setCustomProviderBaseUrl(
+                            config?.base_url ||
+                              descriptor.default_base_url ||
+                              "",
+                          );
+                          setCustomProviderKey("");
+                          setCustomProviderModel(
+                            descriptor.recommended_model || "",
+                          );
+                          setCustomProviderStatus("");
+                          setCustomProviderEditorOpen(true);
+                        } else {
+                          setSelectedProvider(descriptor.name);
+                        }
+                      }}
+                      actions={
+                        descriptor.available !== false ? (
+                          <span className="ml-auto text-faint text-[14px]">
+                            ›
+                          </span>
+                        ) : undefined
+                      }
+                    />
+                  );
+                })}
+              </div>
             </div>
           ) : (
             (() => {
@@ -4694,56 +4784,37 @@ function ManageSections({
                           model: providerModels[descriptor.name] || null,
                         })
                           .then(() =>
+                            providerKeys[descriptor.name]
+                              ? command("save_provider_key", {
+                                  provider: descriptor.name,
+                                  key: providerKeys[descriptor.name],
+                                  projectId: null,
+                                })
+                              : undefined,
+                          )
+                          .then(() =>
                             command<boolean>("validate_provider_key", {
                               provider: descriptor.name,
-                              candidateKey:
-                                providerKeys[descriptor.name] || null,
                             }),
                           )
                           .then((ok) => {
-                            if (ok && providerKeys[descriptor.name]) {
-                              return command("save_provider_key", {
-                                provider: descriptor.name,
-                                key: providerKeys[descriptor.name],
-                                projectId: null,
-                              }).then(() => {
-                                setProviderKeys((items) => ({
-                                  ...items,
-                                  [descriptor.name]: "",
-                                }));
-                                setProviderStatuses((items) => ({
-                                  ...items,
-                                  [descriptor.name]:
-                                    "Provider key validated successfully.",
-                                }));
-                                setProviderConfigs((items) =>
-                                  items.map((item) =>
-                                    item.provider === descriptor.name
-                                      ? { ...item, configured: true }
-                                      : item,
-                                  ),
-                                );
-                              });
-                            }
+                            setProviderKeys((items) => ({
+                              ...items,
+                              [descriptor.name]: "",
+                            }));
                             setProviderStatuses((items) => ({
                               ...items,
                               [descriptor.name]: ok
                                 ? "Provider key validated successfully."
                                 : "Provider key validation failed.",
                             }));
-                            if (ok) {
-                              setProviderKeys((items) => ({
-                                ...items,
-                                [descriptor.name]: "",
-                              }));
-                              setProviderConfigs((items) =>
-                                items.map((item) =>
-                                  item.provider === descriptor.name
-                                    ? { ...item, configured: true }
-                                    : item,
-                                ),
-                              );
-                            }
+                            setProviderConfigs((items) =>
+                              items.map((item) =>
+                                item.provider === descriptor.name
+                                  ? { ...item, configured: true }
+                                  : item,
+                              ),
+                            );
                           })
                           .catch((error) =>
                             setProviderStatuses((items) => ({
@@ -4845,7 +4916,6 @@ function ManageSections({
                   command("save_provider_settings", {
                     provider,
                     baseUrl: baseUrl || null,
-                    model: null,
                   })
                     .then(() =>
                       command("save_provider_key", {
@@ -4885,6 +4955,161 @@ function ManageSections({
                 {providerStatus}
               </div>
             )}
+          </div>
+        )}
+        {tab === "provider" && customProviderEditorOpen && (
+          <div
+            className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4"
+            onClick={() => setCustomProviderEditorOpen(false)}
+          >
+            <section
+              className="w-full max-w-2xl space-y-3 rounded-xl border border-line bg-panel p-5 shadow-xl"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="flex items-center justify-between">
+                <strong>
+                  {customProviderId
+                    ? "编辑自定义 Provider"
+                    : "添加自定义 Provider"}
+                </strong>
+                <button
+                  className="text-muted hover:text-ink"
+                  onClick={() => setCustomProviderEditorOpen(false)}
+                >
+                  ×
+                </button>
+              </div>
+              <div className="form-grid">
+                <label>
+                  Name
+                  <input
+                    className="input"
+                    value={customProviderName}
+                    onChange={(event) =>
+                      setCustomProviderName(event.target.value)
+                    }
+                    placeholder="NextAPI"
+                  />
+                </label>
+                <label>
+                  API dialect
+                  <select
+                    className="input"
+                    value={customProviderDialect}
+                    onChange={(event) =>
+                      setCustomProviderDialect(event.target.value)
+                    }
+                  >
+                    <option value="openai-compatible">OpenAI-compatible</option>
+                    <option value="cloudflare">Cloudflare</option>
+                  </select>
+                </label>
+                <label>
+                  Base URL
+                  <input
+                    className="input"
+                    type="url"
+                    value={customProviderBaseUrl}
+                    onChange={(event) =>
+                      setCustomProviderBaseUrl(event.target.value)
+                    }
+                    placeholder="https://api.nextapi.store/v1"
+                  />
+                </label>
+                <label>
+                  Model
+                  <input
+                    className="input"
+                    value={customProviderModel}
+                    onChange={(event) =>
+                      setCustomProviderModel(event.target.value)
+                    }
+                    placeholder="glm-5.2"
+                  />
+                </label>
+                <label className="sm:col-span-2">
+                  Key
+                  <input
+                    className="input"
+                    type="password"
+                    value={customProviderKey}
+                    onChange={(event) =>
+                      setCustomProviderKey(event.target.value)
+                    }
+                    placeholder={customProviderId ? "Stored securely" : ""}
+                  />
+                </label>
+              </div>
+              <div className="flex items-center justify-end gap-2">
+                <Button onClick={() => setCustomProviderEditorOpen(false)}>
+                  关闭
+                </Button>
+                <Button
+                  className="primary"
+                  onClick={() => {
+                    setCustomProviderStatus("Validating…");
+                    void command<string>("save_custom_provider", {
+                      id: customProviderId,
+                      name: customProviderName,
+                      dialect: customProviderDialect,
+                      baseUrl: customProviderBaseUrl,
+                      model: customProviderModel,
+                    })
+                      .then((providerId) =>
+                        command<boolean>("validate_provider_key", {
+                          provider: providerId,
+                          key: customProviderKey || null,
+                        }).then((valid) => ({ providerId, valid })),
+                      )
+                      .then(({ providerId, valid }) => {
+                        if (!valid) {
+                          throw new Error("Provider key validation failed.");
+                        }
+                        return command("save_provider_settings", {
+                          provider: providerId,
+                          baseUrl: customProviderBaseUrl,
+                          accountId: null,
+                          model: customProviderModel,
+                        })
+                          .then(() =>
+                            customProviderKey
+                              ? command("save_provider_key", {
+                                  provider: providerId,
+                                  key: customProviderKey,
+                                  projectId: null,
+                                })
+                              : undefined,
+                          )
+                          .then(() => onRefresh());
+                      })
+                      .then(() => {
+                        setCustomProviderKey("");
+                        setCustomProviderStatus(
+                          "Provider key validated successfully.",
+                        );
+                        setCustomProviderEditorOpen(false);
+                      })
+                      .catch((error) =>
+                        setCustomProviderStatus(errorMessage(error)),
+                      );
+                  }}
+                >
+                  验证并保存
+                </Button>
+              </div>
+              {customProviderStatus && (
+                <div
+                  className={
+                    customProviderStatus.includes("failed") ||
+                    customProviderStatus.includes("Failed")
+                      ? "failure"
+                      : "text-muted text-sm"
+                  }
+                >
+                  {customProviderStatus}
+                </div>
+              )}
+            </section>
           </div>
         )}
         {tab === "hosts" && (
@@ -5139,167 +5364,193 @@ function ManageSections({
             })()}
           </div>
         )}
-        {tab === "market" && (
+        {(tab === "experts" || tab === "teams" || tab === "command") && (
           <div className="space-y-4">
-            <div className="flex flex-wrap items-center gap-2 rounded-lg border border-line p-3">
-              <select
-                className="input"
-                value={marketProjectId}
-                onChange={(event) => setMarketProjectId(event.target.value)}
-              >
-                <option value="">选择项目进行仓库同步</option>
-                {projects.map((project) => (
-                  <option key={project.id} value={project.id}>
-                    {project.name}
-                  </option>
-                ))}
-              </select>
-              <button
-                type="button"
-                className="btn"
-                disabled={!marketProjectId}
-                onClick={() =>
-                  void command("import_repository_templates", {
-                    projectId: marketProjectId,
-                  })
-                    .then((result) =>
-                      setTemplateDraftStatus(
-                        `导入结果：${JSON.stringify(result)}`,
-                      ),
-                    )
-                    .then(() =>
-                      command<MarketTemplate[]>("list_template_market").then(
-                        setMarketTemplates,
-                      ),
-                    )
-                    .catch(onError)
-                }
-              >
-                从仓库导入
-              </button>
-              <button
-                type="button"
-                className="btn"
-                disabled={!marketProjectId}
-                onClick={() =>
-                  void command("save_project_as_team_template", {
-                    projectId: marketProjectId,
-                  })
-                    .then(() =>
-                      setTemplateDraftStatus("项目已另存为 Team 模板"),
-                    )
-                    .then(() =>
-                      command<MarketTemplate[]>("list_template_market").then(
-                        setMarketTemplates,
-                      ),
-                    )
-                    .catch(onError)
-                }
-              >
-                当前项目另存为 Team
-              </button>
-            </div>
-            <div className="flex gap-2 border-b border-line pb-2">
-              {(
-                [
-                  ["agent-template", "Agent 市场"],
-                  ["team-template", "Team 市场"],
-                  ["config", "配置模板"],
-                ] as const
-              ).map(([value, label]) => (
-                <button
-                  key={value}
-                  type="button"
-                  className={`px-3 py-1.5 rounded-md text-sm ${
-                    marketKind === value
-                      ? "bg-paper text-accent font-medium"
-                      : "text-muted"
-                  }`}
-                  onClick={() => setMarketKind(value)}
+            {tab === "experts" && (
+              <div className="flex flex-wrap items-center gap-2 rounded-lg border border-line p-3">
+                <select
+                  className="input"
+                  value={libraryProjectId}
+                  onChange={(event) => setLibraryProjectId(event.target.value)}
                 >
-                  {label}
-                </button>
-              ))}
-            </div>
-            <section className="rounded-lg border border-line p-4 space-y-3">
-              <strong>创建自定义模板</strong>
-              <div className="grid gap-2 md:grid-cols-2">
-                <input
-                  className="input"
-                  value={templateDraftName}
-                  onChange={(event) => setTemplateDraftName(event.target.value)}
-                  placeholder="模板名称"
-                />
-                <input
-                  className="input"
-                  value={templateDraftDescription}
-                  onChange={(event) =>
-                    setTemplateDraftDescription(event.target.value)
-                  }
-                  placeholder="描述"
-                />
-              </div>
-              <textarea
-                className="input min-h-28 font-mono text-xs"
-                value={templateDraftContent}
-                onChange={(event) =>
-                  setTemplateDraftContent(event.target.value)
-                }
-                placeholder={
-                  marketKind === "agent-template"
-                    ? '{"role":"Code","model":"auto"}'
-                    : marketKind === "team-template"
-                      ? '{"workflow":{"workflow":[]},"agents":[]}'
-                      : "模板内容"
-                }
-              />
-              <div className="flex items-center justify-between">
-                <small className="text-muted">{templateDraftStatus}</small>
+                  <option value="">选择项目进行仓库同步</option>
+                  {projects.map((project) => (
+                    <option key={project.id} value={project.id}>
+                      {project.name}
+                    </option>
+                  ))}
+                </select>
                 <button
                   type="button"
-                  className="btn approval-primary"
-                  disabled={!templateDraftName.trim()}
-                  onClick={() => {
-                    const kind =
-                      marketKind === "config" ? "blueprint" : marketKind;
-                    void command("save_template", {
-                      kind,
-                      name: templateDraftName.trim(),
-                      description: templateDraftDescription.trim(),
-                      content: templateDraftContent,
+                  className="btn"
+                  disabled={!libraryProjectId}
+                  onClick={() =>
+                    void command("import_repository_templates", {
+                      projectId: libraryProjectId,
                     })
-                      .then(() => {
-                        setTemplateDraftStatus("已保存");
-                        setTemplateDraftName("");
-                        return command<MarketTemplate[]>(
-                          "list_template_market",
-                        );
-                      })
-                      .then(setMarketTemplates)
-                      .catch(onError);
-                  }}
+                      .then(() => setTemplateDraftStatus("已从仓库导入专家"))
+                      .then(() =>
+                        command<LibraryEntry[]>("list_configured_library").then(
+                          setLibraryEntries,
+                        ),
+                      )
+                      .catch(onError)
+                  }
                 >
-                  保存模板
+                  从仓库导入专家
                 </button>
               </div>
-            </section>
-            <div className="grid gap-3 md:grid-cols-2">
-              {marketTemplates
-                .filter((template) =>
-                  marketKind === "config"
-                    ? !["agent-template", "team-template"].includes(
-                        template.kind,
+            )}
+            {tab === "teams" && (
+              <div className="flex flex-wrap items-center gap-2 rounded-lg border border-line p-3">
+                <select
+                  className="input"
+                  value={libraryProjectId}
+                  onChange={(event) => setLibraryProjectId(event.target.value)}
+                >
+                  <option value="">选择项目导入/导出团队</option>
+                  {projects.map((project) => (
+                    <option key={project.id} value={project.id}>
+                      {project.name}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  className="btn"
+                  disabled={!libraryProjectId}
+                  onClick={() =>
+                    void command("save_project_as_team_template", {
+                      projectId: libraryProjectId,
+                    })
+                      .then(() =>
+                        setTemplateDraftStatus("当前项目已另存为 Team 模板"),
                       )
-                    : template.kind === marketKind,
-                )
+                      .then(() =>
+                        command<LibraryEntry[]>("list_configured_library").then(
+                          setLibraryEntries,
+                        ),
+                      )
+                      .catch(onError)
+                  }
+                >
+                  当前项目另存为 Team
+                </button>
+              </div>
+            )}
+            <div className="flex justify-end">
+              <button
+                type="button"
+                className="btn approval-primary"
+                onClick={() => {
+                  setTemplateDraftId(null);
+                  setTemplateDraftName("");
+                  setTemplateDraftDescription("");
+                  setTemplateDraftContent("{}");
+                  setTemplateDraftStatus("");
+                  setTemplateEditorOpen(true);
+                }}
+              >
+                添加
+              </button>
+            </div>
+            {templateEditorOpen && (
+              <div
+                className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4"
+                onClick={() => setTemplateEditorOpen(false)}
+              >
+                <section
+                  className="w-full max-w-2xl space-y-3 rounded-xl border border-line bg-panel p-5 shadow-xl"
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  <div className="flex items-center justify-between">
+                    <strong>{templateDraftId ? "编辑模板" : "添加模板"}</strong>
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={() => setTemplateEditorOpen(false)}
+                    >
+                      关闭
+                    </button>
+                  </div>
+                  <div className="grid gap-2 md:grid-cols-2">
+                    <input
+                      className="input"
+                      value={templateDraftName}
+                      onChange={(event) =>
+                        setTemplateDraftName(event.target.value)
+                      }
+                      placeholder="模板名称"
+                    />
+                    <input
+                      className="input"
+                      value={templateDraftDescription}
+                      onChange={(event) =>
+                        setTemplateDraftDescription(event.target.value)
+                      }
+                      placeholder="描述"
+                    />
+                  </div>
+                  <textarea
+                    className="input min-h-28 font-mono text-xs"
+                    value={templateDraftContent}
+                    onChange={(event) =>
+                      setTemplateDraftContent(event.target.value)
+                    }
+                    placeholder={
+                      activeLibraryKind === "agent-template"
+                        ? '{"role":"Code","model":"auto"}'
+                        : activeLibraryKind === "team-template"
+                          ? '{"workflow":{"workflow":[]},"agents":[]}'
+                          : '{"name":"/review","body":"Review the current changes."}'
+                    }
+                  />
+                  <div className="flex items-center justify-between">
+                    <small className="text-muted">{templateDraftStatus}</small>
+                    <button
+                      type="button"
+                      className="btn approval-primary"
+                      disabled={!templateDraftName.trim()}
+                      onClick={() => {
+                        void command("save_template", {
+                          id: templateDraftId,
+                          kind: activeLibraryKind,
+                          name: templateDraftName.trim(),
+                          description: templateDraftDescription.trim(),
+                          content: templateDraftContent,
+                        })
+                          .then(() => {
+                            setTemplateDraftStatus("已保存");
+                            setTemplateDraftName("");
+                            setTemplateDraftId(null);
+                            setTemplateEditorOpen(false);
+                            return command<LibraryEntry[]>(
+                              "list_configured_library",
+                            );
+                          })
+                          .then(setLibraryEntries)
+                          .catch(onError);
+                      }}
+                    >
+                      保存
+                    </button>
+                  </div>
+                </section>
+              </div>
+            )}
+            <div className="grid gap-3 xl:grid-cols-2">
+              {libraryEntries
+                .filter((template) => template.kind === activeLibraryKind)
                 .map((template) => (
                   <article
-                    className="rounded-lg border border-line p-4"
+                    className="min-w-0 overflow-hidden rounded-lg border border-line p-4"
                     key={template.id}
                   >
                     <div className="flex items-start justify-between gap-2">
-                      <div>
-                        <strong>{template.name}</strong>
+                      <div className="min-w-0">
+                        <strong className="block break-words">
+                          {template.name}
+                        </strong>
                         <small className="block text-muted">
                           {template.source ||
                             (template.status === "builtin"
@@ -5308,14 +5559,14 @@ function ManageSections({
                           · v{template.version}
                         </small>
                       </div>
-                      <span className="text-xs text-muted">
+                      <span className="max-w-[45%] break-words text-right text-xs text-muted">
                         {template.kind}
                       </span>
                     </div>
-                    <p className="mt-2 text-sm text-muted">
+                    <p className="mt-2 break-words text-sm text-muted">
                       {template.description || "无描述"}
                     </p>
-                    <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap text-xs text-muted">
+                    <pre className="mt-2 max-h-28 max-w-full overflow-auto whitespace-pre-wrap break-words text-xs text-muted">
                       {template.content}
                     </pre>
                     {template.readonly && (
@@ -5326,8 +5577,10 @@ function ManageSections({
                           className="btn"
                           onClick={() => {
                             setTemplateDraftName(`${template.name} 副本`);
+                            setTemplateDraftId(null);
                             setTemplateDraftDescription(template.description);
                             setTemplateDraftContent(template.content);
+                            setTemplateEditorOpen(true);
                           }}
                         >
                           另存为
@@ -5335,7 +5588,7 @@ function ManageSections({
                       </div>
                     )}
                     {!template.readonly &&
-                      marketProjectId &&
+                      libraryProjectId &&
                       ["agent-template", "team-template"].includes(
                         template.kind,
                       ) && (
@@ -5345,7 +5598,7 @@ function ManageSections({
                           onClick={() =>
                             void command("export_template_to_repository", {
                               templateId: template.id,
-                              projectId: marketProjectId,
+                              projectId: libraryProjectId,
                             })
                               .then(() =>
                                 setTemplateDraftStatus("已导出到仓库"),
@@ -5362,7 +5615,7 @@ function ManageSections({
                                     "export_template_to_repository",
                                     {
                                       templateId: template.id,
-                                      projectId: marketProjectId,
+                                      projectId: libraryProjectId,
                                       overwrite: true,
                                     },
                                   ).then(() =>
@@ -5376,13 +5629,54 @@ function ManageSections({
                           导出到仓库
                         </button>
                       )}
+                    {!template.readonly && (
+                      <div className="mt-2 flex gap-2">
+                        <button
+                          type="button"
+                          className="btn"
+                          onClick={() => {
+                            setLibraryKind(
+                              template.kind as
+                                "agent-template" | "team-template" | "command",
+                            );
+                            setTemplateDraftName(template.name);
+                            setTemplateDraftId(template.id);
+                            setTemplateDraftDescription(
+                              template.description || "",
+                            );
+                            setTemplateDraftContent(template.content);
+                            setTemplateEditorOpen(true);
+                          }}
+                        >
+                          编辑
+                        </button>
+                        <button
+                          type="button"
+                          className="btn danger"
+                          onClick={() => {
+                            if (!window.confirm(`删除「${template.name}」？`))
+                              return;
+                            void command("delete_template", {
+                              id: template.id,
+                            })
+                              .then(() =>
+                                command<LibraryEntry[]>(
+                                  "list_configured_library",
+                                ),
+                              )
+                              .then(setLibraryEntries)
+                              .catch(onError);
+                          }}
+                        >
+                          删除
+                        </button>
+                      </div>
+                    )}
                   </article>
                 ))}
             </div>
-            {!marketTemplates.some((template) =>
-              marketKind === "config"
-                ? !["agent-template", "team-template"].includes(template.kind)
-                : template.kind === marketKind,
+            {!libraryEntries.some(
+              (template) => template.kind === activeLibraryKind,
             ) && <div className="py-8 text-sm text-muted">暂无模板</div>}
           </div>
         )}
@@ -10031,9 +10325,9 @@ function AppContent() {
   const [homeRole, setHomeRole] = useState("");
   const [homeSystemPrompt, setHomeSystemPrompt] = useState("");
   const [homeAgentTemplateId, setHomeAgentTemplateId] = useState("");
-  const [homeAgentTemplates, setHomeAgentTemplates] = useState<
-    MarketTemplate[]
-  >([]);
+  const [homeAgentTemplates, setHomeAgentTemplates] = useState<LibraryEntry[]>(
+    [],
+  );
   const [harnessOptions, setHarnessOptions] = useState<
     Array<{ id: string; label: string; available: boolean; reason?: string }>
   >([]);
@@ -10204,7 +10498,7 @@ function AppContent() {
     if (!homeProvider && providers[0]) setHomeProvider(providers[0].name);
   }, [providers, homeProvider]);
   useEffect(() => {
-    void command<MarketTemplate[]>("list_template_market", {
+    void command<LibraryEntry[]>("list_configured_library", {
       kind: "agent-template",
     })
       .then(setHomeAgentTemplates)
@@ -10659,6 +10953,10 @@ function AppContent() {
         onSelectSession={(id: string) => {
           const next = sessions.find((item) => item.id === id);
           if (!next) return;
+          const project = next.project_id
+            ? projects.find((item) => item.id === next.project_id)
+            : undefined;
+          if (project) setSelectedProject(project);
           setSelected(next);
           setSurface("session");
         }}

@@ -814,10 +814,15 @@ pub async fn discover_provider_models(
         }
         "vertex" => Err("model discovery is unsupported for Vertex AI".into()),
         _ => {
-            let descriptor = descriptors()
+            let Some(descriptor) = descriptors()
                 .into_iter()
                 .find(|descriptor| descriptor.name == provider)
-                .ok_or_else(|| "unknown provider".to_string())?;
+            else {
+                let base_url = base_url.ok_or_else(|| {
+                    "provider base URL is not configured for model discovery".to_string()
+                })?;
+                return discover_http_models(client, provider, base_url, api_key).await;
+            };
             if !descriptor.openai_compatible {
                 return Err(format!(
                     "model discovery is unsupported for provider {provider}"

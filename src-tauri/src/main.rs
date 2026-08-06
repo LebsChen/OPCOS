@@ -7424,10 +7424,8 @@ fn project_root(project_id: &str) -> Result<String, String> {
         .ok_or_else(|| "project path is not valid UTF-8".to_owned())
 }
 
-fn worktree_branch(role: &str, sequence: u32, project_id: &str) -> String {
+fn worktree_branch(role: &str, sequence: u32, project_suffix: &str) -> String {
     let role = role.trim().to_ascii_lowercase().replace(' ', "-");
-    let tail = project_id.rsplit('-').next().unwrap_or(project_id);
-    let project_suffix = &tail[tail.len().saturating_sub(8)..];
     format!("agent/{role}-{sequence}-{project_suffix}")
 }
 
@@ -7529,8 +7527,7 @@ fn copy_config_templates(
         tx.query_row(
             "SELECT id FROM config_object
                  WHERE id=?1 AND scope_kind='global'
-                   AND status <> 'deleted'
-                   AND kind NOT IN ('agent-template','team-template')",
+                   AND status <> 'deleted'",
             [template_id],
             |row| row.get::<_, String>(0),
         )
@@ -7568,7 +7565,6 @@ fn list_project_configuration_templates(
              LEFT JOIN project_config_selection selection
                ON selection.project_id=?1 AND selection.object_id=t.id
              WHERE t.scope_kind='global' AND t.status <> 'deleted'
-               AND t.kind NOT IN ('agent-template','team-template')
              ORDER BY t.name",
         )
         .map_err(|error| error.to_string())?;
@@ -7891,6 +7887,26 @@ async fn create_project(
     })
 }
 
+async fn rollback_project_creation(
+    state: tauri::State<'_, DesktopState>,
+    project_id: &str,
+    error: String,
+) -> String {
+    match delete_project(state.clone(), project_id.to_owned(), Some(true)).await {
+        Ok(_) => error,
+        Err(cleanup_error) => match state.store.delete_project(project_id) {
+            Ok(()) => format!(
+                "{error}; project worktree cleanup failed, \
+                     but database rows were removed: {cleanup_error}"
+            ),
+            Err(database_error) => format!(
+                "{error}; project cleanup failed: {cleanup_error}; \
+                     database cleanup failed: {database_error}"
+            ),
+        },
+    }
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn create_project_from_team_template(
@@ -7948,6 +7964,14 @@ async fn create_project_from_team_template(
     config_ids.extend(config_template_ids.unwrap_or_default());
     config_ids.sort();
     config_ids.dedup();
+    config_ids.push(team_template_id.clone());
+    config_ids.extend(
+        members
+            .iter()
+            .filter_map(|member| member.template_id.clone()),
+    );
+    config_ids.sort();
+    config_ids.dedup();
     if let Err(error) = copy_config_templates_to_project(&state, &project_id, &config_ids) {
         return Err(rollback_project_creation(state.clone(), &project_id, error).await);
     }
@@ -7971,8 +7995,17 @@ async fn create_project_from_team_template(
                 )
                 .await);
             }
-            let template: TeamTemplateAgent = serde_json::from_str(&agent_content)
-                .map_err(|error| format!("invalid agent template: {error}"))?;
+            let template: TeamTemplateAgent = match serde_json::from_str(&agent_content) {
+                Ok(template) => template,
+                Err(error) => {
+                    return Err(rollback_project_creation(
+                        state.clone(),
+                        &project_id,
+                        format!("invalid agent template: {error}"),
+                    )
+                    .await);
+                }
+            };
             values = TeamTemplateAgent {
                 name: values.name.or(template.name),
                 role: values.role.or(template.role),
@@ -7988,6 +8021,7 @@ async fn create_project_from_team_template(
         if let Err(error) = create_project_agent(
             state.clone(),
             project_id.clone(),
+            values.template_id,
             values
                 .name
                 .unwrap_or_else(|| format!("成员 {}", sort_order + 1)),
@@ -8005,24 +8039,22 @@ async fn create_project_from_team_template(
             return Err(rollback_project_creation(state.clone(), &project_id, error).await);
         }
     }
-    list_projects(state)
-        .await?
-        .into_iter()
-        .find(|item| item.project.id == project_id)
-        .ok_or_else(|| "created project could not be reloaded".to_owned())
-}
-
-async fn rollback_project_creation(
-    state: State<'_, DesktopState>,
-    project_id: &str,
-    error: String,
-) -> String {
-    match delete_project(state, project_id.to_owned(), Some(true)).await {
-        Ok(_) => error,
-        Err(cleanup_error) => {
-            format!("{error}; project cleanup failed: {cleanup_error}")
-        }
-    }
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let host_name = host_name(&connection, &project_record.host_id)?
+        .unwrap_or_else(|| project_record.host_id.clone());
+    let agents = state
+        .store
+        .load_project_agents(&project_id)
+        .map_err(|error| error.to_string())?;
+    Ok(ProjectView {
+        project: project_record,
+        agents,
+        host_name,
+        online: Some(true),
+    })
 }
 
 #[tauri::command]
@@ -8332,6 +8364,7 @@ fn list_project_agents(
 async fn create_project_agent(
     state: State<'_, DesktopState>,
     project_id: String,
+    template_id: Option<String>,
     name: String,
     role: String,
     sort_order: Option<u32>,
@@ -8364,7 +8397,12 @@ async fn create_project_agent(
     let branch = if sort_order == 0 {
         project.default_branch.clone()
     } else {
-        branch.unwrap_or_else(|| worktree_branch(&role, sort_order, &project.id))
+        branch.unwrap_or_else(|| {
+            let project_suffix = project_id
+                .strip_prefix("project-")
+                .unwrap_or(project_id.as_str());
+            worktree_branch(&role, sort_order, project_suffix)
+        })
     };
     let host = project_host(&state, &project).await?;
     if !project_host_contains(&host, &project.repo_root)
@@ -8414,6 +8452,7 @@ async fn create_project_agent(
     let agent = ProjectAgentRecord {
         id,
         project_id,
+        template_id,
         sort_order,
         name,
         role,
@@ -9382,15 +9421,16 @@ async fn engine_for_with_context(
             });
         (provider, base_url)
     };
-    let descriptor = registry::descriptors()
-        .into_iter()
-        .find(|item| item.name == provider_id)
-        .ok_or_else(|| "provider is not configured; open Provider settings first".to_owned())?;
+    let descriptor = provider_descriptor_for(state, &provider_id)
+        .map_err(|_| "provider is not configured; open Provider settings first".to_owned())?;
     let base_url = std::env::var("OPCOS_PROVIDER_BASE_URL")
         .ok()
         .or(configured_base_url)
         .or(descriptor.default_base_url)
         .unwrap_or_default();
+    let custom_dialect = custom_provider_dialect(state, &provider_id);
+    let is_cloudflare =
+        provider_id == "cloudflare" || custom_dialect.as_deref() == Some("cloudflare");
     let account_id = if provider_id == "cloudflare" {
         let connection = state
             .database
@@ -9627,7 +9667,7 @@ async fn engine_for_with_context(
             })?;
             Box::new(AnthropicProvider::new(ProviderConfig::new(&base_url, key)))
         }
-        "cloudflare" => {
+        _name if is_cloudflare => {
             let key = scoped_secret_get(
                 state,
                 session.project_id.as_deref(),
@@ -11075,6 +11115,7 @@ fn create_session(
         "session-{}",
         Utc::now().timestamp_nanos_opt().unwrap_or_default()
     );
+    let requested_model = model.unwrap_or_else(|| "auto".into());
     let mode = mode.unwrap_or_else(|| "Auto".into());
     let mode = permission_mode_name(parse_permission_mode(&mode)?).to_owned();
     let harness = harness.unwrap_or_else(|| "builtin".into());
@@ -11101,6 +11142,13 @@ fn create_session(
         } else {
             (host_id.unwrap_or_default(), None)
         };
+    let settings = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        load_agent_settings(&connection, project_id.as_deref())?
+    };
     let provider = {
         let connection = state
             .database
@@ -11118,19 +11166,32 @@ fn create_session(
                     .ok()
             })
     };
-    let model = {
-        let connection = state
-            .database
-            .lock()
-            .map_err(|_| "database lock poisoned")?;
-        resolve_provider_model(&connection, provider.as_deref(), model)
-    };
-    let settings = {
-        let connection = state
-            .database
-            .lock()
-            .map_err(|_| "database lock poisoned")?;
-        load_agent_settings(&connection, project_id.as_deref())?
+    let model = if requested_model == "auto" {
+        let configured_model = {
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            provider.as_deref().and_then(|provider| {
+                connection
+                    .query_row(
+                        "SELECT value FROM settings WHERE key=?1",
+                        [format!("provider.model.{provider}")],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok()
+            })
+        };
+        configured_model
+            .or_else(|| {
+                provider
+                    .as_deref()
+                    .and_then(|provider| provider_descriptor_for(&state, provider).ok())
+                    .and_then(|descriptor| descriptor.recommended_model)
+            })
+            .unwrap_or(requested_model)
+    } else {
+        requested_model
     };
     if host_id.trim().is_empty() {
         let platform = settings
@@ -13158,12 +13219,16 @@ async fn change_provider(
     session_id: String,
     provider: Option<String>,
 ) -> Result<(), String> {
-    if let Some(ref name) = provider
-        && !registry::descriptors()
+    if let Some(ref name) = provider {
+        let known = registry::descriptors()
             .iter()
             .any(|item| item.name == *name)
-    {
-        return Err("unknown provider".into());
+            || load_custom_provider_records(&state)?
+                .iter()
+                .any(|item| item.id == *name);
+        if !known {
+            return Err("unknown provider".into());
+        }
     }
     state
         .store
@@ -13174,8 +13239,101 @@ async fn change_provider(
 }
 
 #[tauri::command]
-fn provider_descriptors() -> Vec<registry::ProviderDescriptor> {
-    registry::descriptors()
+fn provider_descriptors(
+    state: State<'_, DesktopState>,
+) -> Result<Vec<registry::ProviderDescriptor>, String> {
+    let mut descriptors = registry::descriptors();
+    descriptors.extend(
+        load_custom_provider_records(&state)?
+            .into_iter()
+            .map(custom_provider_descriptor),
+    );
+    Ok(descriptors)
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CustomProviderRecord {
+    id: String,
+    name: String,
+    dialect: String,
+    base_url: String,
+    model: String,
+    #[serde(default)]
+    key_id: String,
+}
+
+fn load_custom_provider_records(state: &DesktopState) -> Result<Vec<CustomProviderRecord>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let mut statement = connection
+        .prepare(
+            "SELECT o.id,v.content
+             FROM config_object o
+             JOIN config_object_version v ON v.id=o.current_version_id
+             WHERE o.kind='provider' AND o.scope_kind='global' AND o.status <> 'deleted'",
+        )
+        .map_err(|error| error.to_string())?;
+    statement
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            let mut record: CustomProviderRecord = serde_json::from_str(&row.get::<_, String>(1)?)
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            record.id = id.clone();
+            if record.key_id.is_empty() {
+                record.key_id = secret_key("provider-key", &id);
+            }
+            Ok(record)
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+fn custom_provider_descriptor(record: CustomProviderRecord) -> registry::ProviderDescriptor {
+    registry::ProviderDescriptor {
+        name: record.id,
+        title: record.name,
+        available: true,
+        needs_key: true,
+        default_base_url: Some(record.base_url),
+        fields: vec![],
+        recommended_model: Some(record.model),
+        env_key: None,
+        openai_compatible: matches!(record.dialect.as_str(), "openai-compatible" | "cloudflare"),
+    }
+}
+
+fn custom_provider_dialect(state: &DesktopState, provider: &str) -> Option<String> {
+    load_custom_provider_records(state)
+        .ok()?
+        .into_iter()
+        .find(|record| record.id == provider)
+        .map(|record| record.dialect)
+}
+
+fn provider_descriptor_for(
+    state: &DesktopState,
+    provider: &str,
+) -> Result<registry::ProviderDescriptor, String> {
+    if let Some(descriptor) = registry::descriptors()
+        .into_iter()
+        .find(|item| item.name == provider)
+    {
+        return Ok(descriptor);
+    }
+    load_custom_provider_records(state)?
+        .into_iter()
+        .find(|item| item.id == provider)
+        .map(custom_provider_descriptor)
+        .ok_or_else(|| "unknown provider".to_owned())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -13204,10 +13362,7 @@ async fn provider_models_for_state(
     target_model: Option<&str>,
 ) -> Result<ProviderModelsResponse, String> {
     const CACHE_TTL_SECONDS: i64 = 300;
-    let descriptor = registry::descriptors()
-        .into_iter()
-        .find(|item| item.name == provider)
-        .ok_or_else(|| "unknown provider".to_owned())?;
+    let descriptor = provider_descriptor_for(state, &provider)?;
     let configured_base_url = {
         let connection = state
             .database
@@ -13381,6 +13536,21 @@ async fn provider_models_for_state(
                         })
                         .collect::<Vec<_>>()
                 })
+                .or_else(|| {
+                    descriptor.recommended_model.clone().map(|model| {
+                        vec![registry::DiscoveredModel {
+                            id: model,
+                            label: descriptor
+                                .recommended_model
+                                .clone()
+                                .unwrap_or_else(|| provider.clone()),
+                            provider: provider.clone(),
+                            capabilities: Default::default(),
+                            capabilities_known: false,
+                            likely_non_chat: false,
+                        }]
+                    })
+                })
                 .unwrap_or_default(),
             "fallback".to_owned(),
             Some(error),
@@ -13518,7 +13688,7 @@ fn list_assets(
 }
 
 #[tauri::command]
-fn list_template_market(
+fn list_configured_library(
     state: State<'_, DesktopState>,
     kind: Option<String>,
 ) -> Result<Vec<Value>, String> {
@@ -17363,16 +17533,6 @@ async fn linear_create_session_from_issue(
     let host_name = host_name(&connection, &host_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "remote host not found; session was not created".to_owned())?;
-    let provider = provider.or_else(|| {
-        connection
-            .query_row(
-                "SELECT value FROM settings WHERE key='provider.id'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .ok()
-    });
-    let model = resolve_provider_model(&connection, provider.as_deref(), model);
     drop(connection);
     let mode = mode.unwrap_or_else(|| "Auto".into());
     let mode = permission_mode_name(parse_permission_mode(&mode)?).to_owned();
@@ -17382,7 +17542,7 @@ async fn linear_create_session_from_issue(
         SessionRecord {
             session_id: session_id.clone(),
             workspace,
-            model,
+            model: model.unwrap_or_else(|| "auto".into()),
             mode,
             harness: harness.unwrap_or_else(|| "builtin".into()),
             title: title.unwrap_or_else(|| {
@@ -21635,6 +21795,87 @@ fn provider_settings(state: State<'_, DesktopState>) -> Result<Value, String> {
 }
 
 #[tauri::command]
+fn save_custom_provider(
+    state: State<'_, DesktopState>,
+    id: Option<String>,
+    name: String,
+    dialect: String,
+    base_url: String,
+    model: String,
+) -> Result<String, String> {
+    if !matches!(dialect.as_str(), "openai-compatible" | "cloudflare") {
+        return Err("unsupported provider dialect".to_owned());
+    }
+    let name = name.trim();
+    let base_url = base_url.trim();
+    let model = model.trim();
+    if name.is_empty() || base_url.is_empty() || model.is_empty() {
+        return Err("provider name, base URL, and model are required".to_owned());
+    }
+    url::Url::parse(base_url).map_err(|_| "provider base URL is invalid".to_owned())?;
+    let provider_id = id.unwrap_or_else(|| format!("custom-{}", Uuid::new_v4().simple()));
+    if registry::descriptors()
+        .iter()
+        .any(|descriptor| descriptor.name == provider_id)
+    {
+        return Err("custom provider id collides with a built-in provider".to_owned());
+    }
+    let content = serde_json::to_string(&CustomProviderRecord {
+        id: provider_id.clone(),
+        name: name.to_owned(),
+        dialect,
+        base_url: base_url.to_owned(),
+        model: model.to_owned(),
+        key_id: secret_key("provider-key", &provider_id),
+    })
+    .map_err(|error| error.to_string())?;
+    let now = Utc::now().to_rfc3339();
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let version: i64 = connection
+        .query_row(
+            "SELECT COALESCE(MAX(version),0)+1 FROM config_object_version WHERE object_id=?1",
+            [&provider_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let version_id = format!("{provider_id}:v{version}");
+    connection
+        .execute(
+            "INSERT INTO config_object
+             (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
+             VALUES (?1,'provider',?2,?3,'global',NULL,'active',?4,?5)
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name,current_version_id=excluded.current_version_id,status='active'",
+            params![
+                provider_id,
+                name,
+                stable_server_key(&provider_id),
+                now,
+                version_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "INSERT INTO config_object_version
+             (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+             VALUES (?1,?2,?3,?4,?5,?6,'custom provider','{}')",
+            params![
+                version_id,
+                provider_id,
+                version,
+                content,
+                content_hash(&content),
+                now
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(provider_id)
+}
+
+#[tauri::command]
 fn agent_settings(
     state: State<'_, DesktopState>,
     project_id: Option<String>,
@@ -21701,72 +21942,6 @@ fn save_agent_settings(
         )
         .map_err(|error| error.to_string())?;
     Ok(settings)
-}
-
-fn provider_model_setting_exact(connection: &Connection, provider: &str) -> Option<String> {
-    let scoped_key = format!("provider.model.{provider}");
-    connection
-        .query_row(
-            "SELECT value FROM settings WHERE key=?1",
-            [&scoped_key],
-            |row| row.get::<_, String>(0),
-        )
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-}
-
-fn provider_model_setting(connection: &Connection, provider: &str) -> Option<String> {
-    provider_model_setting_exact(connection, provider).or_else(|| {
-        connection
-            .query_row(
-                "SELECT value FROM settings WHERE key='provider.model'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-    })
-}
-
-fn save_provider_model_settings(
-    connection: &Connection,
-    provider: &str,
-    model: Option<&str>,
-) -> Result<(), String> {
-    let Some(model) = model.filter(|value| !value.trim().is_empty()) else {
-        return Ok(());
-    };
-    connection
-        .execute(
-            "INSERT OR REPLACE INTO settings(key,value) VALUES ('provider.model',?1)",
-            [model],
-        )
-        .map_err(|error| error.to_string())?;
-    let scoped_key = format!("provider.model.{provider}");
-    connection
-        .execute(
-            "INSERT OR REPLACE INTO settings(key,value) VALUES (?1,?2)",
-            [&scoped_key, model],
-        )
-        .map_err(|error| error.to_string())?;
-    Ok(())
-}
-
-fn resolve_provider_model(
-    connection: &Connection,
-    provider: Option<&str>,
-    requested_model: Option<String>,
-) -> String {
-    let requested_model = requested_model.filter(|value| !value.trim().is_empty());
-    if requested_model
-        .as_deref()
-        .is_some_and(|value| value != "auto")
-    {
-        return requested_model.unwrap_or_else(|| "auto".into());
-    }
-    provider_model_setting(connection, provider.unwrap_or_default())
-        .or(requested_model)
-        .unwrap_or_else(|| "auto".into())
 }
 
 #[tauri::command]
@@ -21898,6 +22073,9 @@ fn reset_slash_commands(
 
 #[tauri::command]
 fn provider_configurations(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
+    let custom_records = load_custom_provider_records(&state)?;
+    let mut descriptors = registry::descriptors();
+    descriptors.extend(custom_records.into_iter().map(custom_provider_descriptor));
     let settings = {
         let connection = state
             .database
@@ -21914,7 +22092,7 @@ fn provider_configurations(state: State<'_, DesktopState>) -> Result<Vec<Value>,
             .collect::<Result<HashMap<_, _>, _>>()
             .map_err(|error| error.to_string())?
     };
-    registry::descriptors()
+    descriptors
         .into_iter()
         .map(|descriptor| {
             let key_name = secret_key("provider-key", &descriptor.name);
@@ -21957,14 +22135,11 @@ fn save_provider_settings(
     account_id: Option<String>,
     model: Option<String>,
 ) -> Result<(), String> {
-    let descriptor = registry::descriptors()
-        .into_iter()
-        .find(|item| item.name == provider)
-        .ok_or_else(|| "unknown provider".to_owned())?;
+    let descriptor = provider_descriptor_for(&state, &provider)?;
     let account_id = if provider == "cloudflare" {
         Some(
             account_id
-                .filter(|value| !value.trim().is_empty())
+                .filter(|v| !v.trim().is_empty())
                 .ok_or_else(|| "Cloudflare account ID is required".to_owned())?,
         )
     } else {
@@ -21986,29 +22161,48 @@ fn save_provider_settings(
             "INSERT OR REPLACE INTO settings(key,value) VALUES ('provider.id',?1)",
             [&provider],
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|e| e.to_string())?;
     connection
         .execute(
             "INSERT OR REPLACE INTO settings(key,value) VALUES ('provider.base_url',?1)",
             [&base_url],
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|e| e.to_string())?;
     let scoped_key = format!("provider.base_url.{provider}");
     connection
         .execute(
             "INSERT OR REPLACE INTO settings(key,value) VALUES (?1,?2)",
             [&scoped_key, &base_url],
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|e| e.to_string())?;
     if let Some(account_id) = account_id {
-        connection
-            .execute(
-                "INSERT OR REPLACE INTO settings(key,value) VALUES ('provider.account_id.cloudflare',?1)",
-                [&account_id],
-            )
-            .map_err(|error| error.to_string())?;
+        connection.execute("INSERT OR REPLACE INTO settings(key,value) VALUES ('provider.account_id.cloudflare',?1)", [&account_id]).map_err(|e| e.to_string())?;
     }
     save_provider_model_settings(&connection, &provider, model.as_deref())?;
+    Ok(())
+}
+
+fn save_provider_model_settings(
+    connection: &Connection,
+    provider: &str,
+    model: Option<&str>,
+) -> Result<(), String> {
+    let Some(model) = model.filter(|v| !v.trim().is_empty()) else {
+        return Ok(());
+    };
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES ('provider.model',?1)",
+            [model],
+        )
+        .map_err(|e| e.to_string())?;
+    let scoped_key = format!("provider.model.{provider}");
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES (?1,?2)",
+            [&scoped_key, model],
+        )
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -22022,7 +22216,7 @@ fn provider_base_url(
         return registry::cloudflare_base_url(account_id.unwrap_or_default());
     }
     configured
-        .filter(|value| !value.trim().is_empty())
+        .filter(|v| !v.trim().is_empty())
         .or(default)
         .map(str::to_owned)
         .ok_or_else(|| "provider base URL is not configured; enter one in Provider settings".into())
@@ -22032,22 +22226,15 @@ fn provider_base_url(
 async fn validate_provider_key(
     state: State<'_, DesktopState>,
     provider: String,
-    candidate_key: Option<String>,
+    key: Option<String>,
 ) -> Result<bool, String> {
-    let descriptor = registry::descriptors()
-        .into_iter()
-        .find(|item| item.name == provider)
-        .ok_or_else(|| "unknown provider".to_owned())?;
-    let key = if candidate_key
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
-    {
-        candidate_key
-    } else {
-        state
+    let descriptor = provider_descriptor_for(&state, &provider)?;
+    let key = match key {
+        Some(key) if !key.trim().is_empty() => Some(key),
+        _ => state
             .secrets
             .get(&secret_key("provider-key", &provider))
-            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?,
     };
     if descriptor.needs_key && key.is_none() {
         return Err("provider key is not configured".to_owned());
@@ -22383,9 +22570,10 @@ fn main() {
             change_model,
             change_provider,
             provider_descriptors,
+            save_custom_provider,
             provider_models,
             list_assets,
-            list_template_market,
+            list_configured_library,
             save_template,
             delete_template,
             import_repository_templates,
@@ -22556,11 +22744,42 @@ mod m7_tests {
     use super::*;
 
     #[test]
+    fn generated_project_agent_branches_are_project_unique() {
+        assert_ne!(
+            worktree_branch("Code", 1, "first"),
+            worktree_branch("Code", 1, "second")
+        );
+        assert_eq!(worktree_branch("Code", 1, "first"), "agent/code-1-first");
+    }
+
+    #[test]
     fn cloudflare_save_url_is_composed_without_manual_base_url() {
         assert_eq!(
             provider_base_url("cloudflare", None, Some("account-123"), None).unwrap(),
             "https://api.cloudflare.com/client/v4/accounts/account-123/ai/v1"
         );
+    }
+
+    #[test]
+    fn custom_provider_dialects_use_supported_runtime_modes() {
+        let openai = custom_provider_descriptor(CustomProviderRecord {
+            id: "custom-openai".into(),
+            name: "NextAPI".into(),
+            dialect: "openai-compatible".into(),
+            base_url: "https://api.nextapi.store/v1".into(),
+            model: "glm-5.2".into(),
+            key_id: "provider-key-custom-openai".into(),
+        });
+        let cloudflare = custom_provider_descriptor(CustomProviderRecord {
+            id: "custom-cloudflare".into(),
+            name: "Workers".into(),
+            dialect: "cloudflare".into(),
+            base_url: "https://example.invalid/v1".into(),
+            model: "@cf/example/model".into(),
+            key_id: "provider-key-custom-cloudflare".into(),
+        });
+        assert!(openai.openai_compatible);
+        assert!(cloudflare.openai_compatible);
     }
 
     #[test]
@@ -24402,18 +24621,6 @@ agents:
     }
 
     #[test]
-    fn project_agent_branches_are_scoped_to_the_project() {
-        assert_eq!(
-            worktree_branch("Code", 1, "project-1786051024651411911"),
-            "agent/code-1-51411911"
-        );
-        assert_ne!(
-            worktree_branch("Code", 1, "project-1786051024651411911"),
-            worktree_branch("Code", 1, "project-1786048179578068371")
-        );
-    }
-
-    #[test]
     fn project_git_commands_quote_posix_and_windows_paths() {
         let posix = git_worktree_add_command(
             Some("linux"),
@@ -24982,39 +25189,6 @@ agents:
     }
 
     #[test]
-    fn provider_model_persists_across_reload_for_unknown_model_id() {
-        let path = std::env::temp_dir().join(format!(
-            "opcos-provider-model-{}.db",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        {
-            let connection = Connection::open(&path).unwrap();
-            connection
-                .execute(
-                    "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-                    [],
-                )
-                .unwrap();
-            save_provider_model_settings(&connection, "agnes", Some("agnes-2.5-pro-alpha"))
-                .unwrap();
-            assert_eq!(
-                provider_model_setting(&connection, "agnes").as_deref(),
-                Some("agnes-2.5-pro-alpha")
-            );
-            assert_eq!(provider_model_setting_exact(&connection, "openai"), None);
-        }
-        {
-            let connection = Connection::open(&path).unwrap();
-            assert_eq!(
-                resolve_provider_model(&connection, Some("agnes"), Some("auto".into())),
-                "agnes-2.5-pro-alpha"
-            );
-            assert_eq!(provider_model_setting_exact(&connection, "openai"), None);
-        }
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
     fn session_factory_separates_interactive_and_api_default_agents() {
         let settings = json!({
             "default_agent": "InteractiveAgent",
@@ -25049,6 +25223,7 @@ agents:
         let agent = ProjectAgentRecord {
             id: "agent-1".into(),
             project_id: project.id.clone(),
+            template_id: None,
             sort_order: 1,
             name: "Code".into(),
             role: "Code".into(),
