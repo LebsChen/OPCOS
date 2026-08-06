@@ -1223,6 +1223,7 @@ function ProjectConfigPanel({
     | "agents"
     | "experts"
     | "teams"
+    | "command"
     | "knowledge"
     | "playbook"
     | "mcp"
@@ -1341,6 +1342,7 @@ function ProjectConfigPanel({
             ["agents", "规则"],
             ["experts", "专家"],
             ["teams", "团队"],
+            ["command", "Command"],
             ["knowledge", "Knowledge"],
             ["playbook", "Playbook"],
             ["mcp", "MCP"],
@@ -1373,6 +1375,7 @@ function ProjectConfigPanel({
                   agents: "rules",
                   experts: "agent-template",
                   teams: "team-template",
+                  command: "command",
                   knowledge: "knowledge",
                   playbook: "runbook",
                   mcp: "mcp",
@@ -1461,6 +1464,7 @@ function ProjectConfigPanel({
                 agents: "rules",
                 experts: "agent-template",
                 teams: "team-template",
+                command: "command",
                 knowledge: "knowledge",
                 playbook: "runbook",
                 mcp: "mcp",
@@ -1472,7 +1476,7 @@ function ProjectConfigPanel({
             }) && <span className="text-xs text-faint">暂无可用配置模板</span>}
           </div>
         </fieldset>
-        {!["experts", "teams"].includes(kind) &&
+        {!["experts", "teams", "command"].includes(kind) &&
           assets
             .filter((asset) => asset.kind === kind)
             .map((asset) => (
@@ -1510,7 +1514,7 @@ function ProjectConfigPanel({
                 </div>
               </div>
             ))}
-        {!["experts", "teams"].includes(kind) && (
+        {!["experts", "teams", "command"].includes(kind) && (
           <div className="grid gap-3 rounded-lg border border-line p-4">
             <label className="field-label">
               名称
@@ -3475,7 +3479,7 @@ function ManageSections({
   const [skillBrowse, setSkillBrowse] = useState<SkillRulesBrowse | null>(null);
   const [libraryEntries, setLibraryEntries] = useState<LibraryEntry[]>([]);
   const [libraryKind, setLibraryKind] = useState<
-    "agent-template" | "team-template" | "config"
+    "agent-template" | "team-template" | "command"
   >("agent-template");
   const [templateDraftName, setTemplateDraftName] = useState("");
   const [templateDraftId, setTemplateDraftId] = useState<string | null>(null);
@@ -3698,9 +3702,9 @@ function ManageSections({
       "Environment",
       "管理 Blueprint、固定环境说明、有序仓库 setup 和长期主机。",
     ],
-    library: ["配置库", "管理可供项目启用的专家、团队与配置资源。"],
     experts: ["专家", "管理可供项目启用的专家库。"],
     teams: ["团队", "管理可供项目启用的团队库。"],
+    command: ["Command", "管理可供项目启用的命令库。"],
   };
   const assetKinds = [
     "agents",
@@ -3719,7 +3723,9 @@ function ManageSections({
       ? "agent-template"
       : tab === "teams"
         ? "team-template"
-        : libraryKind;
+        : tab === "command"
+          ? "command"
+          : libraryKind;
   const assetLabel =
     assetTabKind === "agents"
       ? "规则"
@@ -3769,7 +3775,7 @@ function ManageSections({
       .catch(onError);
   }, [tab, settingsProjectId, selected, onError]);
   useEffect(() => {
-    if (!["library", "experts", "teams"].includes(tab)) return;
+    if (!["experts", "teams", "command"].includes(tab)) return;
     void command<LibraryEntry[]>("list_configured_library")
       .then(setLibraryEntries)
       .catch(onError);
@@ -3829,9 +3835,9 @@ function ManageSections({
           tab === "provider" ||
           tab === "blueprint" ||
           tab === "agent" ||
-          tab === "library" ||
           tab === "experts" ||
-          tab === "teams"
+          tab === "teams" ||
+          tab === "command"
             ? "rounded-xl2 border border-line bg-panel p-5"
             : ""
         }
@@ -5147,93 +5153,79 @@ function ManageSections({
             })()}
           </div>
         )}
-        {(tab === "library" || tab === "experts" || tab === "teams") && (
+        {(tab === "experts" || tab === "teams" || tab === "command") && (
           <div className="space-y-4">
-            {tab === "library" && (
-              <>
-                <div className="flex flex-wrap items-center gap-2 rounded-lg border border-line p-3">
-                  <select
-                    className="input"
-                    value={libraryProjectId}
-                    onChange={(event) =>
-                      setLibraryProjectId(event.target.value)
-                    }
-                  >
-                    <option value="">选择项目进行仓库同步</option>
-                    {projects.map((project) => (
-                      <option key={project.id} value={project.id}>
-                        {project.name}
-                      </option>
-                    ))}
-                  </select>
-                  <button
-                    type="button"
-                    className="btn"
-                    disabled={!libraryProjectId}
-                    onClick={() =>
-                      void command("import_repository_templates", {
-                        projectId: libraryProjectId,
-                      })
-                        .then((result) =>
-                          setTemplateDraftStatus(
-                            `导入结果：${JSON.stringify(result)}`,
-                          ),
-                        )
-                        .then(() =>
-                          command<LibraryEntry[]>(
-                            "list_configured_library",
-                          ).then(setLibraryEntries),
-                        )
-                        .catch(onError)
-                    }
-                  >
-                    从仓库导入
-                  </button>
-                  <button
-                    type="button"
-                    className="btn"
-                    disabled={!libraryProjectId}
-                    onClick={() =>
-                      void command("save_project_as_team_template", {
-                        projectId: libraryProjectId,
-                      })
-                        .then(() =>
-                          setTemplateDraftStatus("项目已另存为 Team 模板"),
-                        )
-                        .then(() =>
-                          command<LibraryEntry[]>(
-                            "list_configured_library",
-                          ).then(setLibraryEntries),
-                        )
-                        .catch(onError)
-                    }
-                  >
-                    当前项目另存为 Team
-                  </button>
-                </div>
-                <div className="flex gap-2 border-b border-line pb-2">
-                  {(
-                    [
-                      ["agent-template", "专家"],
-                      ["team-template", "团队"],
-                      ["config", "配置模板"],
-                    ] as const
-                  ).map(([value, label]) => (
-                    <button
-                      key={value}
-                      type="button"
-                      className={`rounded-md px-3 py-1.5 text-sm ${
-                        libraryKind === value
-                          ? "bg-paper font-medium text-accent"
-                          : "text-muted"
-                      }`}
-                      onClick={() => setLibraryKind(value)}
-                    >
-                      {label}
-                    </button>
+            {tab === "experts" && (
+              <div className="flex flex-wrap items-center gap-2 rounded-lg border border-line p-3">
+                <select
+                  className="input"
+                  value={libraryProjectId}
+                  onChange={(event) => setLibraryProjectId(event.target.value)}
+                >
+                  <option value="">选择项目进行仓库同步</option>
+                  {projects.map((project) => (
+                    <option key={project.id} value={project.id}>
+                      {project.name}
+                    </option>
                   ))}
-                </div>
-              </>
+                </select>
+                <button
+                  type="button"
+                  className="btn"
+                  disabled={!libraryProjectId}
+                  onClick={() =>
+                    void command("import_repository_templates", {
+                      projectId: libraryProjectId,
+                    })
+                      .then(() => setTemplateDraftStatus("已从仓库导入专家"))
+                      .then(() =>
+                        command<LibraryEntry[]>("list_configured_library").then(
+                          setLibraryEntries,
+                        ),
+                      )
+                      .catch(onError)
+                  }
+                >
+                  从仓库导入专家
+                </button>
+              </div>
+            )}
+            {tab === "teams" && (
+              <div className="flex flex-wrap items-center gap-2 rounded-lg border border-line p-3">
+                <select
+                  className="input"
+                  value={libraryProjectId}
+                  onChange={(event) => setLibraryProjectId(event.target.value)}
+                >
+                  <option value="">选择项目导入/导出团队</option>
+                  {projects.map((project) => (
+                    <option key={project.id} value={project.id}>
+                      {project.name}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  className="btn"
+                  disabled={!libraryProjectId}
+                  onClick={() =>
+                    void command("save_project_as_team_template", {
+                      projectId: libraryProjectId,
+                    })
+                      .then(() =>
+                        setTemplateDraftStatus("当前项目已另存为 Team 模板"),
+                      )
+                      .then(() =>
+                        command<LibraryEntry[]>("list_configured_library").then(
+                          setLibraryEntries,
+                        ),
+                      )
+                      .catch(onError)
+                  }
+                >
+                  当前项目另存为 Team
+                </button>
+              </div>
             )}
             <section className="rounded-lg border border-line p-4 space-y-3">
               <strong>创建自定义模板</strong>
@@ -5264,7 +5256,7 @@ function ManageSections({
                     ? '{"role":"Code","model":"auto"}'
                     : activeLibraryKind === "team-template"
                       ? '{"workflow":{"workflow":[]},"agents":[]}'
-                      : "模板内容"
+                      : '{"name":"/review","body":"Review the current changes."}'
                 }
               />
               <div className="flex items-center justify-between">
@@ -5274,13 +5266,9 @@ function ManageSections({
                   className="btn approval-primary"
                   disabled={!templateDraftName.trim()}
                   onClick={() => {
-                    const kind =
-                      activeLibraryKind === "config"
-                        ? "blueprint"
-                        : activeLibraryKind;
                     void command("save_template", {
                       id: templateDraftId,
-                      kind,
+                      kind: activeLibraryKind,
                       name: templateDraftName.trim(),
                       description: templateDraftDescription.trim(),
                       content: templateDraftContent,
@@ -5303,13 +5291,7 @@ function ManageSections({
             </section>
             <div className="grid gap-3 xl:grid-cols-2">
               {libraryEntries
-                .filter((template) =>
-                  activeLibraryKind === "config"
-                    ? !["agent-template", "team-template"].includes(
-                        template.kind,
-                      )
-                    : template.kind === activeLibraryKind,
-                )
+                .filter((template) => template.kind === activeLibraryKind)
                 .map((template) => (
                   <article
                     className="min-w-0 overflow-hidden rounded-lg border border-line p-4"
@@ -5405,7 +5387,7 @@ function ManageSections({
                           onClick={() => {
                             setLibraryKind(
                               template.kind as
-                                "agent-template" | "team-template" | "config",
+                                "agent-template" | "team-template" | "command",
                             );
                             setTemplateDraftName(template.name);
                             setTemplateDraftId(template.id);
@@ -5443,10 +5425,8 @@ function ManageSections({
                   </article>
                 ))}
             </div>
-            {!libraryEntries.some((template) =>
-              activeLibraryKind === "config"
-                ? !["agent-template", "team-template"].includes(template.kind)
-                : template.kind === activeLibraryKind,
+            {!libraryEntries.some(
+              (template) => template.kind === activeLibraryKind,
             ) && <div className="py-8 text-sm text-muted">暂无模板</div>}
           </div>
         )}
