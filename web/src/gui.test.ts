@@ -13,6 +13,8 @@ import {
   effectiveRunningState,
   mergeSessionsPreservingOptimistic,
   selectedSessionFromList,
+  sessionViewSelection,
+  updateSessionRunState,
 } from "./gui";
 
 describe("GUI boundary behavior", () => {
@@ -177,6 +179,46 @@ describe("GUI boundary behavior", () => {
         created.id,
       ),
     ).toEqual(refreshed);
+  });
+
+  it("updates a running session row without changing the selected id", () => {
+    const session = {
+      id: "s",
+      title: "task",
+      host_id: "h",
+      host_name: "host",
+      model: "model",
+      mode: "Auto",
+      harness: "builtin",
+      run_state: "idle",
+      stop_reason: "none",
+    };
+    const updated = updateSessionRunState(
+      [session],
+      session.id,
+      "running",
+      "none",
+    );
+    expect(selectedSessionFromList(updated, session.id)?.run_state).toBe(
+      "running",
+    );
+    expect(selectedSessionFromList(updated, "other")).toBeNull();
+  });
+
+  it("keeps the session view target while a selected row is temporarily missing", () => {
+    const lastKnown = {
+      id: "s",
+      title: "task",
+      host_id: "h",
+      host_name: "host",
+      model: "model",
+      mode: "Auto",
+      harness: "builtin",
+      run_state: "running",
+      stop_reason: "none",
+    };
+    expect(sessionViewSelection("s", null, lastKnown)).toEqual(lastKnown);
+    expect(sessionViewSelection(null, null, lastKnown)).toBeNull();
   });
 
   it("does not contain the retired private gateway address", () => {

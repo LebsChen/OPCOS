@@ -132,6 +132,14 @@ export function selectedSessionFromList(
   return sessions.find((session) => session.id === selectedId) ?? null;
 }
 
+export function sessionViewSelection(
+  selectedId: string | null,
+  selected: Session | null,
+  lastKnown: Session | null,
+): Session | null {
+  return selected ?? (selectedId ? lastKnown : null);
+}
+
 export function mergeSessionsPreservingOptimistic(
   current: Session[],
   refreshed: Session[],
@@ -142,6 +150,19 @@ export function mergeSessionsPreservingOptimistic(
     (session) => optimisticIds.has(session.id) && !refreshedIds.has(session.id),
   );
   return preserved.length > 0 ? [...refreshed, ...preserved] : refreshed;
+}
+
+export function updateSessionRunState(
+  sessions: Session[],
+  sessionId: string,
+  runState: string | undefined,
+  stopReason: string | undefined,
+): Session[] {
+  return sessions.map((session) =>
+    session.id === sessionId
+      ? { ...session, run_state: runState, stop_reason: stopReason }
+      : session,
+  );
 }
 
 export function submissionRoute(

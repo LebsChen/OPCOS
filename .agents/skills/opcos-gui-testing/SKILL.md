@@ -395,8 +395,36 @@ EOF
 ```
 
 Flag as **empty artifacts**: any `work` node with `rows.length === 0`, any `assistant`/`notice` node
-whose text is empty/whitespace. The engine emits `devin_message` with `message: ""` on tool-call-only
-iterations, which currently produces blank assistant bubbles and a `Worked for 0s` zero-row group.
+whose text is empty/whitespace. The historical cause was the engine emitting `devin_message` with
+`message: ""` on tool-call-only iterations, producing blank assistant bubbles and `Worked for 0s`
+zero-row groups.
+
+When empty-artifact guards are added, **prove nothing legitimate was dropped** as well as that the
+empties are gone — a guard that is too aggressive looks identical to a passing test otherwise:
+
+- rendered assistant-node count **==** persisted `devin_message` count with non-empty `message`
+- at least one `Worked for 0s` group **that has rows** still renders (0s duration is legitimate)
+- work-node count is unchanged apart from the genuinely empty ones
+
+Beware a false positive when two consecutive assistant bubbles have identical short text (e.g. two
+`4`s): check the persisted timestamps before calling it a rendering duplicate — the model does
+sometimes answer twice across iterations.
+
+### Composer and app-bring-up nits that cost time
+
+- After an **action** slash command is submitted the autocomplete popup can stay open even though the
+  textarea clears. The next click at the "usual" textarea position then lands on the popup.
+  Re-screenshot after every send; the textarea is the line showing the `Ask OPCOS…` placeholder.
+- The composer's vertical position moves as the transcript grows (roughly y≈645 vs y≈673 on a
+  maximized 1024×768 window). Do not reuse coordinates between steps.
+- The Home composer's **Workspace field is not cleared between session creations** — typing into it
+  appends to the old value and silently produces a mangled path. Always `ctrl+a` first, then verify
+  the resulting `sessions.workspace` in the DB.
+- Pick the **model** explicitly on the Home composer; the default is `auto`, which fails the turn with
+  `Provider request failed` and surfaces no error on the Home screen at all.
+- Kill stray Vite servers before starting (`pkill -f vite`, then confirm with `ps`); if :1420 is taken
+  Vite silently moves to :1421 and the Tauri window keeps loading the **old** server. `pkill` can need
+  a follow-up `kill -9` on the `sh -c vite` wrapper.
 
 ### Force all row families in one prompt
 
@@ -459,10 +487,53 @@ The header can stay `Running`/`Working` indefinitely while `sessions.run_state` 
 select run_state, updated_at from sessions where session_id=?;
 ```
 
-Two causes have been fixed (listener re-subscription on `selected?.id`; missing terminal event after
-`/compact` itself), but as of `95fce9b` the **turn that follows a `/compact`** still hangs the header,
-and `⏹ Stop` does *not* clear an already-stuck header — only navigating away and back does.
-`⏹ Stop` during a genuinely streaming turn does work. Test all three situations separately.
+Several causes have been fixed over time (listener re-subscription on `selected?.id`; missing terminal
+event after `/compact` itself; the session *list* not converging on the authoritative `run_state`).
+Test this whole matrix separately every round — the sub-cases behave differently and a fix can land
+for some and not others:
+
+| Situation | Expected |
+|---|---|
+| Normal turn, no prior `/compact` | terminal unattended |
+| Immediately after `/compact` | terminal unattended |
+| Turn *following* a `/compact`, same mount | terminal unattended |
+| Turn after navigating out and back in | terminal unattended |
+| `⏹ Stop` mid-turn (incl. after a `/compact`) | clears to Ready / `Turn interrupted` |
+| `⏹ Stop` on an already-stuck header | clears |
+
+Two things that make this worth chasing rather than dismissing as cosmetic:
+
+- **It can block the user.** While the flag is stuck the composer's send button is a Stop button, so
+  Enter may do nothing and no `user_message` is persisted. Always try to send a follow-up message from
+  a stuck header and check the DB — if the message never appears, report it as blocking, not cosmetic.
+- **Localise which surface is stale.** The sidebar row's running dot, the Info-pane `STATUS` and the
+  composer button read from different places. When the sidebar converges but the header does not, the
+  session *list* refresh is working and the cached selected-session object is the culprit. Zoom the
+  sidebar and the Info pane separately rather than reporting "the UI is stuck".
+
+### Selection / refresh races (the `selected` derivation)
+
+`selected` is derived from the `sessions` list by id. Any change to how that list is refreshed can
+break *selection* rather than the transcript, and the symptom is always the same: **the app silently
+falls back to the Home screen**. Because the agent keeps working in the background, this is easy to
+miss unless you look. Check all of these after any selection/refresh change:
+
+- create a session from the Home composer → it must navigate immediately **and still be selected
+  30–60 s later**, while the turn is running (a race can hold it for only the first few seconds);
+- with a session already open and idle, send a message → you must **stay** in the session when it
+  transitions to `running`;
+- click a **currently running** session's card on Home and its row in the sidebar → both must open it;
+- issue an action command such as `/compact` → must not navigate away;
+- switch between sessions, and delete one, watching for selection loss.
+
+Isolate with the DB: if `sessions.run_state='running'` and `session_events` is climbing while the UI
+shows Home, the run is fine and only selection is broken. A useful discriminator is idle vs running —
+if idle sessions open and running ones do not, the bug is in the list/derivation race, not in the
+transcript.
+
+Note this failure mode also **blocks most of the rest of the GUI matrix** (stuck-`Running`, `⏹ Stop`,
+steering, blocked-submission notices all need a visible running session), so test selection first and
+escalate immediately if it fails.
 
 ### Parity recipe: live == in-app re-read == cold restart
 
@@ -479,8 +550,12 @@ below it down, so top-down clicking hits the wrong targets.
 The nextapi gateway reports no `context_length` for `glm-5.2` (`capabilities_known=false` in
 `model_discovery_cache`), so a `context_growth_update` with `resolved_context_window=1000000` and
 `context_window_source='matrix'` proves the matrix fallback rather than a gateway value. Assert over
-**every** such event. "No auto-compaction" alone is weak evidence — a short run stays under the old
-24k threshold anyway.
+**every** such event.
+
+"No auto-compaction" is only decisive if `max(estimated_context_tokens)` actually exceeded the *old*
+threshold of 24,000 (32k × ¾) — short runs stay under it anyway and prove nothing. A 6–9 step task
+with file creation, edits, a CLI flag and lint/commit gates reaches ~32–40k tokens, which is enough;
+a 4-step one peaks around 22–25k, which is not.
 
 ### Envelope integrity one-liner
 

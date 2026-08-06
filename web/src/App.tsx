@@ -28,8 +28,10 @@ import {
   reconcileRunningState,
   redactApproval,
   selectedSessionFromList,
+  sessionViewSelection,
   submitFailureMessage,
   type PendingQuestionData,
+  updateSessionRunState,
 } from "./gui";
 import { isErrorNotice, providerErrorPresentation } from "./transcript";
 import { buildTimeline, mergeEvents, type TimelineEvent } from "./timeline";
@@ -9622,16 +9624,34 @@ function AppContent() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const selectedIdRef = useRef<string | undefined>(undefined);
+  const sessionsRef = useRef<Session[]>(sessions);
   const optimisticSessionIdsRef = useRef(new Set<string>());
-  const selected = useMemo(
+  sessionsRef.current = sessions;
+  const selectedFromList = useMemo(
     () => selectedSessionFromList(sessions, selectedId),
     [sessions, selectedId],
+  );
+  const lastSelectedSessionRef = useRef<Session | null>(null);
+  if (selectedFromList) lastSelectedSessionRef.current = selectedFromList;
+  const selected = sessionViewSelection(
+    selectedId,
+    selectedFromList,
+    lastSelectedSessionRef.current,
   );
   const setSelected = (
     next: Session | null | ((current: Session | null) => Session | null),
   ) => {
-    const resolved = typeof next === "function" ? next(selected) : next;
+    const resolved =
+      typeof next === "function"
+        ? next(
+            selectedSessionFromList(
+              sessionsRef.current,
+              selectedIdRef.current,
+            ) ?? lastSelectedSessionRef.current,
+          )
+        : next;
     if (!resolved) {
+      if (typeof next === "function") return;
       selectedIdRef.current = undefined;
       setSelectedId(null);
       return;
@@ -9994,11 +10014,16 @@ function AppContent() {
             Object.keys(streamPayload.turn).length > 0);
         if (hasStreamingContent) {
           setRunning(true);
-          setSelected((item) =>
-            item && item.id === payload.session_id
-              ? { ...item, run_state: "running", stop_reason: "none" }
-              : item,
-          );
+          if (payload.session_id) {
+            setSessions((items) =>
+              updateSessionRunState(
+                items,
+                payload.session_id!,
+                "running",
+                "none",
+              ),
+            );
+          }
           if (streamPayload.turn) setRunning(false);
         }
       }
@@ -10016,16 +10041,12 @@ function AppContent() {
         );
         if (runState || stopReason) {
           setSessions((items) =>
-            items.map((item) =>
-              item.id === payload.session_id
-                ? { ...item, run_state: runState, stop_reason: stopReason }
-                : item,
+            updateSessionRunState(
+              items,
+              payload.session_id!,
+              runState,
+              stopReason,
             ),
-          );
-          setSelected((item) =>
-            item && item.id === payload.session_id
-              ? { ...item, run_state: runState, stop_reason: stopReason }
-              : item,
           );
           if (runState !== "running") {
             void refresh().catch(onError);
@@ -10379,152 +10400,156 @@ function AppContent() {
               setSurface("manage");
             }}
           />
-        ) : surface === "session" && selected ? (
-          <>
-            {/* OpenWorker session topbar: surfaces/gui/src/App.tsx:1365-1442.
+        ) : surface === "session" && selectedId !== null ? (
+          selected ? (
+            <>
+              {/* OpenWorker session topbar: surfaces/gui/src/App.tsx:1365-1442.
                 Only the facts and Tauri panel action are adapted to OPCOS. */}
-            <header className="main-topbar">
-              <div className="main-topbar-side">
-                {navCollapsed && (
+              <header className="main-topbar">
+                <div className="main-topbar-side">
+                  {navCollapsed && (
+                    <button
+                      className="topbar-icon-btn"
+                      onClick={toggleNav}
+                      aria-label="Show sidebar"
+                      title="Show sidebar"
+                    >
+                      <Icon name="sidebar" size={16} />
+                    </button>
+                  )}
+                </div>
+                <div className="main-title">
+                  <span className="main-title-text" title={selected.title}>
+                    {selected.title}
+                  </span>
+                  <span className="title-sub" data-testid="session-subtitle">
+                    {[
+                      selected.host_name,
+                      selected.workspace || "workspace not set",
+                      selected.model,
+                      sessionStatusLabel(
+                        selected.run_state,
+                        selected.stop_reason,
+                      ),
+                    ].join(" · ")}
+                  </span>
+                </div>
+                <div className="main-topbar-side main-topbar-actions">
+                  {secretBackend && (
+                    <span className="backend-badge">
+                      Secrets: {secretBackend}
+                    </span>
+                  )}
                   <button
                     className="topbar-icon-btn"
-                    onClick={toggleNav}
-                    aria-label="Show sidebar"
-                    title="Show sidebar"
+                    title={translate("Toggle session panel")}
+                    onClick={() => setDrawerCollapsed((value) => !value)}
                   >
-                    <Icon name="sidebar" size={16} />
+                    <Icon name="sidebarRight" size={16} />
                   </button>
-                )}
-              </div>
-              <div className="main-title">
-                <span className="main-title-text" title={selected.title}>
-                  {selected.title}
-                </span>
-                <span className="title-sub" data-testid="session-subtitle">
-                  {[
-                    selected.host_name,
-                    selected.workspace || "workspace not set",
-                    selected.model,
-                    sessionStatusLabel(
-                      selected.run_state,
-                      selected.stop_reason,
-                    ),
-                  ].join(" · ")}
-                </span>
-              </div>
-              <div className="main-topbar-side main-topbar-actions">
-                {secretBackend && (
-                  <span className="backend-badge">
-                    Secrets: {secretBackend}
-                  </span>
-                )}
-                <button
-                  className="topbar-icon-btn"
-                  title={translate("Toggle session panel")}
-                  onClick={() => setDrawerCollapsed((value) => !value)}
-                >
-                  <Icon name="sidebarRight" size={16} />
-                </button>
-              </div>
-            </header>
-            <div className="main-workspace">
-              <div className="main-chat">
-                <div className="main-scroll">
-                  <Transcript
-                    events={transcript}
+                </div>
+              </header>
+              <div className="main-workspace">
+                <div className="main-chat">
+                  <div className="main-scroll">
+                    <Transcript
+                      events={transcript}
+                      running={effectiveRunning}
+                      onApprove={(item, decision) => {
+                        if (!item.callId) return;
+                        void command("resolve_approval", {
+                          sessionId: selected.id,
+                          callId: item.callId,
+                          approve: decision === "allow",
+                        }).catch(onError);
+                      }}
+                      onRetry={() => {
+                        void command("submit_turn", {
+                          request: { session_id: selected.id, text: "" },
+                        }).catch(onError);
+                      }}
+                    />
+                  </div>
+                  {pendingQuestion && (
+                    <QuestionCard
+                      question={pendingQuestion}
+                      onAnswer={async (answer) => {
+                        const answeredQuestion = pendingQuestion;
+                        setPendingQuestion(null);
+                        setRunning(true);
+                        try {
+                          await command("resolve_inbox", {
+                            sessionId: selected.id,
+                            callId: answeredQuestion.callId,
+                            resolution: answer,
+                          });
+                        } catch (reason) {
+                          setPendingQuestion(answeredQuestion);
+                          throw reason;
+                        }
+                      }}
+                    />
+                  )}
+                  <Composer
+                    mode={selected.mode}
+                    harness={selected.harness}
+                    harnessOptions={selectedHarnessOptions}
+                    model={selected.model}
+                    models={models.map((item) => item.id)}
+                    modelLabels={Object.fromEntries(
+                      models.map((item) => [item.id, item.label]),
+                    )}
+                    connected={Boolean(selected)}
                     running={effectiveRunning}
-                    onApprove={(item, decision) => {
-                      if (!item.callId) return;
-                      void command("resolve_approval", {
+                    workspace={selected.workspace}
+                    onModeChange={(mode) => {
+                      void command("change_mode", {
                         sessionId: selected.id,
-                        callId: item.callId,
-                        approve: decision === "allow",
-                      }).catch(onError);
+                        mode,
+                      })
+                        .then(() => setSelected({ ...selected, mode }))
+                        .catch(onError);
                     }}
-                    onRetry={() => {
-                      void command("submit_turn", {
-                        request: { session_id: selected.id, text: "" },
-                      }).catch(onError);
+                    onHarnessChange={(harness) => {
+                      void command("change_harness", {
+                        sessionId: selected.id,
+                        harness,
+                      })
+                        .then(() => setSelected({ ...selected, harness }))
+                        .catch(onError);
                     }}
+                    unattended={unattended}
+                    onUnattendedChange={(on) => {
+                      void command("set_unattended", {
+                        sessionId: selected.id,
+                        unattended: on,
+                      })
+                        .then(() => setUnattended(on))
+                        .catch(onError);
+                    }}
+                    onSend={submit}
+                    onSteer={steer}
+                    onModelChange={(model) => {
+                      void command("change_model", {
+                        sessionId: selected.id,
+                        model,
+                      })
+                        .then(() => setSelected({ ...selected, model }))
+                        .catch(onError);
+                    }}
+                    onInterrupt={interrupt}
+                    assets={assets}
+                    secrets={secrets}
+                    slashCommands={slashCommands}
+                    onUploadFile={uploadTextAttachment}
+                    resetKey={selected.id}
                   />
                 </div>
-                {pendingQuestion && (
-                  <QuestionCard
-                    question={pendingQuestion}
-                    onAnswer={async (answer) => {
-                      const answeredQuestion = pendingQuestion;
-                      setPendingQuestion(null);
-                      setRunning(true);
-                      try {
-                        await command("resolve_inbox", {
-                          sessionId: selected.id,
-                          callId: answeredQuestion.callId,
-                          resolution: answer,
-                        });
-                      } catch (reason) {
-                        setPendingQuestion(answeredQuestion);
-                        throw reason;
-                      }
-                    }}
-                  />
-                )}
-                <Composer
-                  mode={selected.mode}
-                  harness={selected.harness}
-                  harnessOptions={selectedHarnessOptions}
-                  model={selected.model}
-                  models={models.map((item) => item.id)}
-                  modelLabels={Object.fromEntries(
-                    models.map((item) => [item.id, item.label]),
-                  )}
-                  connected={Boolean(selected)}
-                  running={effectiveRunning}
-                  workspace={selected.workspace}
-                  onModeChange={(mode) => {
-                    void command("change_mode", {
-                      sessionId: selected.id,
-                      mode,
-                    })
-                      .then(() => setSelected({ ...selected, mode }))
-                      .catch(onError);
-                  }}
-                  onHarnessChange={(harness) => {
-                    void command("change_harness", {
-                      sessionId: selected.id,
-                      harness,
-                    })
-                      .then(() => setSelected({ ...selected, harness }))
-                      .catch(onError);
-                  }}
-                  unattended={unattended}
-                  onUnattendedChange={(on) => {
-                    void command("set_unattended", {
-                      sessionId: selected.id,
-                      unattended: on,
-                    })
-                      .then(() => setUnattended(on))
-                      .catch(onError);
-                  }}
-                  onSend={submit}
-                  onSteer={steer}
-                  onModelChange={(model) => {
-                    void command("change_model", {
-                      sessionId: selected.id,
-                      model,
-                    })
-                      .then(() => setSelected({ ...selected, model }))
-                      .catch(onError);
-                  }}
-                  onInterrupt={interrupt}
-                  assets={assets}
-                  secrets={secrets}
-                  slashCommands={slashCommands}
-                  onUploadFile={uploadTextAttachment}
-                  resetKey={selected.id}
-                />
               </div>
-            </div>
-          </>
+            </>
+          ) : (
+            <div className="session-loading">Loading session…</div>
+          )
         ) : surface === "manage" ? (
           <SettingsView activeTab={settingsTab} onTabChange={setSettingsTab}>
             <ManageSections
