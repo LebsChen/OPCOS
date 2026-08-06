@@ -405,6 +405,10 @@ type InboxRecord = {
   created_at: string;
   resolution?: string | null;
 };
+type PendingQuestion = {
+  callId: string;
+  question: string;
+};
 
 const OPENWORKER_CONNECTORS: ConnectorCatalogEntry[] = [
   { name: "Telegram", description: "Two-way messaging with a Telegram bot." },
@@ -9218,6 +9222,43 @@ function InboxPane({
   );
 }
 
+function QuestionCard({
+  question,
+  onAnswer,
+}: {
+  question: PendingQuestion;
+  onAnswer: (answer: string) => Promise<void>;
+}) {
+  const [answer, setAnswer] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  return (
+    <div className="approval rounded-xl border border-line p-3 mb-4">
+      <strong>Question</strong>
+      <div className="approval-with mt-3">{question.question}</div>
+      <div className="approval-btns mt-3">
+        <input
+          className="ob-input flex-1"
+          value={answer}
+          disabled={submitting}
+          onChange={(event) => setAnswer(event.target.value)}
+          placeholder="Type your answer"
+          aria-label="Answer"
+        />
+        <button
+          className="btn approval-primary"
+          disabled={submitting || !answer.trim()}
+          onClick={() => {
+            setSubmitting(true);
+            void onAnswer(answer.trim()).catch(() => setSubmitting(false));
+          }}
+        >
+          {submitting ? "Sending…" : "Answer"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function AppContent() {
   const NAV_COLLAPSED_KEY = "opcos:nav-collapsed:v1";
   const [windowMaximized, setWindowMaximized] = useState(false);
@@ -9226,6 +9267,8 @@ function AppContent() {
   const [selected, setSelected] = useState<Session | null>(null);
   const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
   const [transcript, setTranscript] = useState<TranscriptViewItem[]>([]);
+  const [pendingQuestion, setPendingQuestion] =
+    useState<PendingQuestion | null>(null);
   const [surface, setSurface] = useState<
     "session" | "automations" | "manage" | "activity" | "inbox" | "project"
   >("session");
@@ -9426,6 +9469,7 @@ function AppContent() {
   useEffect(() => {
     const currentGeneration = ++generation.current;
     setTranscript([]);
+    setPendingQuestion(null);
     setRunning(false);
     if (!selected) return;
     void command<Array<{ kind: string; payload: Record<string, unknown> }>>(
@@ -9511,6 +9555,29 @@ function AppContent() {
           );
         }
       }
+      if (payload.kind === "question_requested") {
+        const args =
+          payload.payload.arguments &&
+          typeof payload.payload.arguments === "object"
+            ? (payload.payload.arguments as Record<string, unknown>)
+            : {};
+        const callId =
+          typeof payload.payload.call_id === "string"
+            ? payload.payload.call_id
+            : "";
+        if (callId) {
+          setPendingQuestion({
+            callId,
+            question:
+              typeof args.question === "string"
+                ? args.question
+                : typeof args.prompt === "string"
+                  ? args.prompt
+                  : "Answer required",
+          });
+          setRunning(false);
+        }
+      }
       if (
         payload.kind === "approval_resolved" ||
         (payload.kind === "notice" &&
@@ -9540,7 +9607,12 @@ function AppContent() {
     const runtime = (window as Window & { __TAURI_INTERNALS__?: unknown })
       .__TAURI_INTERNALS__;
     const message = errorMessage(reason);
-    if (message.includes("Approval required before this tool can continue"))
+    if (
+      message.includes("Approval required before this tool can continue") ||
+      message.includes(
+        "Question requires an answer before this tool can continue",
+      )
+    )
       return;
     if (!runtime && /invoke|tauri/i.test(message)) return;
     setError(redactApproval(message));
@@ -9912,6 +9984,20 @@ function AppContent() {
                     }}
                   />
                 </div>
+                {pendingQuestion && (
+                  <QuestionCard
+                    question={pendingQuestion}
+                    onAnswer={async (answer) => {
+                      setRunning(true);
+                      await command("resolve_inbox", {
+                        sessionId: selected.id,
+                        callId: pendingQuestion.callId,
+                        resolution: answer,
+                      });
+                      setPendingQuestion(null);
+                    }}
+                  />
+                )}
                 <Composer
                   mode={selected.mode}
                   harness={selected.harness}

@@ -5725,7 +5725,7 @@ impl SessionStore for SqliteStore {
             .query_row(
                 "SELECT session_id,call_id,kind,tool,payload,state,visibility,created_at,resolution,resolved_at
                  FROM pending
-                 WHERE visibility='inbox' AND session_id=?1 AND call_id=?2",
+                 WHERE session_id=?1 AND call_id=?2",
                 params![session_id, call_id],
                 |row| {
                     let payload: String = row.get(4)?;
@@ -6784,6 +6784,28 @@ mod tests {
         let reloaded = store.list_inbox().unwrap();
         assert_eq!(reloaded[0].resolution.as_deref(), Some("allow"));
         assert_eq!(reloaded[0].state, "resolved");
+    }
+
+    #[test]
+    fn inline_pending_items_are_resolvable_without_inbox_visibility() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .save_pending(&PendingRecord {
+                session_id: "attended".into(),
+                call_id: "question-1".into(),
+                tool: "ask_user".into(),
+                arguments: serde_json::json!({"question":"Which format?"}),
+                state: "ask_user".into(),
+            })
+            .unwrap();
+        let item = store.get_inbox("attended", "question-1").unwrap().unwrap();
+        assert_eq!(item.visibility, "inline");
+        assert_eq!(item.kind, "question");
+        assert!(
+            store
+                .resolve_inbox("attended", "question-1", "answer")
+                .unwrap()
+        );
     }
 
     #[test]

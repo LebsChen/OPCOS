@@ -81,6 +81,11 @@ struct HostAssetReader {
     host: Arc<dyn Host>,
 }
 
+enum SessionAssetReader {
+    Host(HostAssetReader),
+    Remote(HttpRvmClient),
+}
+
 #[async_trait]
 impl opcos_assets::RemoteAssetReader for HostAssetReader {
     async fn read(&self, path: &str) -> Result<String, opcos_assets::AssetError> {
@@ -382,6 +387,26 @@ impl McpCredentialStore for McpCredentialAdapter {
                 serde_json::from_str(&value).map_err(|_| opcos_mcp::McpClientError::Transport)
             })
             .transpose()
+    }
+}
+
+#[async_trait]
+impl opcos_assets::RemoteAssetReader for SessionAssetReader {
+    async fn read(&self, path: &str) -> Result<String, opcos_assets::AssetError> {
+        match self {
+            Self::Host(reader) => reader.read(path).await,
+            Self::Remote(reader) => opcos_assets::RemoteAssetReader::read(reader, path).await,
+        }
+    }
+
+    async fn list(
+        &self,
+        path: Option<&str>,
+    ) -> Result<Vec<(String, bool)>, opcos_assets::AssetError> {
+        match self {
+            Self::Host(reader) => reader.list(path).await,
+            Self::Remote(reader) => reader.list(path).await,
+        }
     }
 }
 
@@ -3579,6 +3604,9 @@ impl ToolExecutor for RemoteExecutor {
                     .into(),
             );
         }
+        if name == "ask_user" {
+            return Err("ask_user must be handled by the engine pending mechanism".into());
+        }
         let argument = |key: &str| {
             arguments
                 .get(key)
@@ -3934,6 +3962,9 @@ impl ToolExecutor for DesktopExecutor {
                         name,
                         arguments,
                     );
+                }
+                if name == "ask_user" {
+                    return Err("ask_user must be handled by the engine pending mechanism".into());
                 }
                 if matches!(
                     name,
@@ -4401,6 +4432,14 @@ fn emit(app: &tauri::AppHandle, kind: &str, session_id: Option<&str>, payload: V
 
 fn audit(state: &DesktopState, session_id: &str, kind: &str, payload: Value) {
     let _ = state.store.append_audit(session_id, kind, &payload);
+}
+
+fn attended_pending_event_kind(pending_kind: &str) -> &'static str {
+    if pending_kind == "question" {
+        "question_requested"
+    } else {
+        "approval"
+    }
 }
 
 fn emit_pending_approval(
@@ -8976,9 +9015,12 @@ async fn engine_for_with_context(
         })
         .unwrap_or_else(|| Arc::clone(&state.mcp));
     let mut remote_platform = None;
-    let (workspace, executor, remote_client, allowed_tools) = if host_id == "local" {
+    let (workspace, executor, remote_client, allowed_tools, asset_reader) = if host_id == "local" {
         let workspace = PathBuf::from(resolved_workspace.clone());
         let host = LocalHost::new(&workspace).map_err(|error| error.to_string())?;
+        let asset_reader = SessionAssetReader::Host(HostAssetReader {
+            host: Arc::new(host.clone()),
+        });
         let _ = host.health().await.map_err(|error| error.to_string())?;
         let capabilities = host
             .capabilities()
@@ -9064,6 +9106,7 @@ async fn engine_for_with_context(
             }))),
             None,
             Some(allowed_tools),
+            asset_reader,
         )
     } else {
         let client = client_for(state, &host_id)?;
@@ -9080,6 +9123,7 @@ async fn engine_for_with_context(
             session_workspace.clone()
         };
         let executor_client = client.clone().with_workspace(workspace.clone());
+        let asset_reader = SessionAssetReader::Remote(executor_client.clone());
         (
             workspace.clone(),
             Arc::new(DesktopExecutor::Remote(Box::new(RemoteExecutor {
@@ -9106,6 +9150,7 @@ async fn engine_for_with_context(
             }))),
             Some(executor_client),
             None,
+            asset_reader,
         )
     };
     let provider: Box<dyn Provider> = match descriptor.name.as_str() {
@@ -9136,7 +9181,7 @@ async fn engine_for_with_context(
         "vertex" => {
             return Err(
                 "Google Vertex AI is not connected yet: service-account authentication is not supported by the current secret store."
-                    .into(),
+                .into(),
             );
         }
         "anthropic" => {
@@ -9400,13 +9445,9 @@ async fn engine_for_with_context(
     if !independent_tools.is_empty() {
         engine.append_external_tools(independent_tools).await;
     }
-    let mut bundle = if let Some(executor_client) = &remote_client {
-        discover_assets(executor_client, &workspace)
-            .await
-            .unwrap_or_default()
-    } else {
-        AssetBundle::default()
-    };
+    let mut bundle = discover_assets(&asset_reader, &workspace)
+        .await
+        .unwrap_or_default();
     append_session_config_assets(
         &mut bundle,
         load_session_config_assets(state, session_id).unwrap_or_default(),
@@ -11510,25 +11551,46 @@ pub(crate) async fn submit_turn_inner_with_context(
                 .load_pending(&request.session_id)
                 .map(|items| items.into_iter().find(|item| item.call_id == call_id))
             {
-                emit(
-                    &app,
-                    "approval",
-                    Some(&request.session_id),
-                    json!({
-                        "call_id":pending.call_id,
-                        "tool":pending.tool,
-                        "arguments":redact_approval_value(&pending.arguments),
-                        "risk":approval_risk(&pending.tool),
-                        "reason":"Tool action requires approval"
-                    }),
-                );
+                if attended_pending_event_kind(&pending_kind) == "question_requested" {
+                    emit(
+                        &app,
+                        attended_pending_event_kind(&pending_kind),
+                        Some(&request.session_id),
+                        json!({
+                            "call_id": pending.call_id,
+                            "tool": pending.tool,
+                            "arguments": redact_approval_value(&pending.arguments),
+                        }),
+                    );
+                } else {
+                    emit(
+                        &app,
+                        "approval",
+                        Some(&request.session_id),
+                        json!({
+                            "call_id":pending.call_id,
+                            "tool":pending.tool,
+                            "arguments":redact_approval_value(&pending.arguments),
+                            "risk":approval_risk(&pending.tool),
+                            "reason":"Tool action requires approval"
+                        }),
+                    );
+                }
             }
-            let message = "Approval required before this tool can continue".to_owned();
+            let message = if pending_kind == "question" {
+                "Question requires an answer before this tool can continue".to_owned()
+            } else {
+                "Approval required before this tool can continue".to_owned()
+            };
             emit(
                 &app,
                 "notice",
                 Some(&request.session_id),
-                json!({"kind":"approval_pending","text":message}),
+                json!({"kind": if pending_kind == "question" {
+                    "question_pending"
+                } else {
+                    "approval_pending"
+                }, "text":message}),
             );
             emit(
                 &app,
@@ -21192,6 +21254,163 @@ mod m7_tests {
         for name in ["lsp_definition", "lsp_references", "lsp_diagnostics"] {
             assert!(!remote_allowed.contains(name));
         }
+    }
+
+    #[test]
+    fn attended_questions_use_question_event_not_approval_event() {
+        assert_eq!(
+            attended_pending_event_kind("question"),
+            "question_requested"
+        );
+        assert_eq!(attended_pending_event_kind("plan"), "approval");
+        assert_eq!(attended_pending_event_kind("approval"), "approval");
+    }
+
+    #[tokio::test]
+    async fn local_host_discovers_workspace_agent_assets() {
+        let root = std::env::temp_dir().join(format!("opcos-assets-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".agents/knowledge")).unwrap();
+        std::fs::write(
+            root.join(".agents/knowledge/local.md"),
+            "---\ntitle: Local knowledge\ntrigger: \"\"\nscope: global\nenabled: true\n---\n\nlocal asset body\n",
+        )
+        .unwrap();
+        let host = LocalHost::new(&root).unwrap();
+        let reader = HostAssetReader {
+            host: Arc::new(host),
+        };
+        let bundle = discover_assets(&reader, &root.display().to_string())
+            .await
+            .unwrap();
+        assert_eq!(bundle.knowledge.len(), 1);
+        assert_eq!(bundle.knowledge[0].body, "local asset body\n");
+        let rendered = bundle.system_instructions();
+        assert!(rendered.contains("local asset body"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_executor_ask_user_is_not_unavailable() {
+        let root = std::env::temp_dir().join(format!("opcos-ask-user-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let host = LocalHost::new(&root).unwrap();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let secrets = KeyringSecretStore::new(format!("opcos-test-{}", Uuid::new_v4()));
+        let mcp = Arc::new(McpManager::new(Arc::new(McpCredentialAdapter {
+            store: secrets.clone(),
+            project_id: None,
+        })));
+        let jobs = Arc::new(BackgroundJobManager::new(root.join("background-jobs")));
+        let executor = DesktopExecutor::Local(Box::new(LocalExecutor {
+            host,
+            secrets,
+            session_id: "ask-user-test".into(),
+            mcp,
+            index_root: root.join("indexes"),
+            workspace: root.display().to_string(),
+            project_id: None,
+            store,
+            jobs,
+            lsp: Arc::new(AsyncMutex::new(HashMap::new())),
+            database: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            engines: Arc::new(AsyncMutex::new(HashMap::new())),
+            coordination: Arc::new(AsyncMutex::new(HashMap::new())),
+            origin: ToolOrigin::User,
+            repair_loop: None,
+        }));
+        let result = executor
+            .execute("ask_user", json!({"question": "Which format?"}))
+            .await;
+        assert_eq!(
+            result,
+            Err("ask_user must be handled by the engine pending mechanism".into())
+        );
+        for name in builtin_allowed_tools(true, true) {
+            match name.as_str() {
+                // Starts a persistent process.
+                "background_job_start" => continue,
+                // Reads process state but requires a real job id.
+                "background_job_status" => continue,
+                // Reads process output but requires a real job id.
+                "background_job_output" => continue,
+                // Terminates a persistent process.
+                "background_job_kill" => continue,
+                _ => {}
+            }
+            let result = executor.execute(&name, json!({})).await;
+            assert!(
+                !matches!(
+                    result,
+                    Err(ref error) if error.starts_with("local tool is unavailable:")
+                ),
+                "{name} fell through local executor dispatch: {result:?}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_executor_builtin_allowlist_does_not_fall_through() {
+        let root = std::env::temp_dir().join(format!("opcos-remote-tools-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let secrets = KeyringSecretStore::new(format!("opcos-test-{}", Uuid::new_v4()));
+        let mcp = Arc::new(McpManager::new(Arc::new(McpCredentialAdapter {
+            store: secrets.clone(),
+            project_id: None,
+        })));
+        let client = HttpRvmClient::new(
+            opcos_rvm::RvmClientConfig::new(
+                url::Url::parse("http://127.0.0.1:9").unwrap(),
+                "test-token",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let executor = DesktopExecutor::Remote(Box::new(RemoteExecutor {
+            shell: AsyncMutex::new(PersistentShell::new(
+                client.clone(),
+                "remote-tool-test",
+                Some(root.display().to_string()),
+            )),
+            client,
+            secrets,
+            mcp,
+            index_root: root.join("indexes"),
+            host_id: "remote".into(),
+            workspace: root.display().to_string(),
+            project_id: None,
+            session_id: "remote-tool-test".into(),
+            store,
+            jobs: Arc::new(BackgroundJobManager::new(root.join("background-jobs"))),
+            database: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            engines: Arc::new(AsyncMutex::new(HashMap::new())),
+            coordination: Arc::new(AsyncMutex::new(HashMap::new())),
+            origin: ToolOrigin::User,
+            repair_loop: None,
+        }));
+        for name in builtin_allowed_tools(false, false) {
+            match name.as_str() {
+                // Starts a persistent remote process.
+                "background_job_start" => continue,
+                // Reads remote process state but requires a real job id.
+                "background_job_status" => continue,
+                // Reads remote process output but requires a real job id.
+                "background_job_output" => continue,
+                // Terminates a persistent remote process.
+                "background_job_kill" => continue,
+                _ => {}
+            }
+            let result = executor.execute(&name, json!({})).await;
+            assert!(
+                !matches!(
+                    result,
+                    Err(ref error) if error.starts_with("remote tool is unavailable:")
+                ),
+                "{name} fell through remote executor dispatch: {result:?}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
