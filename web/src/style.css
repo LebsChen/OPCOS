@@ -674,12 +674,13 @@ h3 {
   margin: 0;
   color: var(--muted);
   font-size: 13px;
-  line-height: 18px;
+  line-height: 20px;
 }
 .transcript-row-label {
   min-width: 0;
   flex: 1 1 auto;
   overflow-wrap: anywhere;
+  line-height: 20px;
 }
 .transcript-row-duration {
   flex: 0 0 auto;
@@ -714,7 +715,6 @@ h3 {
   flex: 0 0 16px;
   width: 16px;
   height: 16px;
-  margin-left: 0;
   transform-origin: 50% 50%;
   transition: transform 0.2s ease-out;
 }
@@ -742,6 +742,11 @@ h3 {
   color: var(--ink);
   font-size: 13px;
   font-weight: 500;
+}
+.transcript-plan-icon {
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
 }
 .transcript-plan-steps {
   display: flex;

@@ -15,6 +15,24 @@ import {
 import { ApprovalCard } from "./ApprovalCard";
 import { Markdown } from "./Markdown";
 
+const CHEVRON_PATH =
+  "M9.167 5.086 C 8.866 5.235,8.711 5.578,8.778 5.947 C 8.802 6.084,9.120 6.415,11.752 9.050 L 14.700 12.000 11.772 14.930 C 10.134 16.569,8.825 17.910,8.802 17.973 C 8.636 18.420,8.947 18.937,9.415 18.989 C 9.793 19.032,9.659 19.151,13.093 15.725 C 14.849 13.973,16.331 12.463,16.387 12.369 C 16.526 12.135,16.526 11.865,16.387 11.631 C 16.232 11.370,9.974 5.137,9.791 5.062 C 9.585 4.976,9.371 4.985,9.167 5.086 ";
+
+function TranscriptChevron({ className }: { className: string }) {
+  return (
+    <svg
+      className={className}
+      aria-hidden="true"
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+    >
+      <path d={CHEVRON_PATH} fill="currentColor" />
+    </svg>
+  );
+}
+
 function formatDuration(durationMs: number): string {
   if (durationMs < 1000) return `${Math.round(durationMs)}ms`;
   const seconds = durationMs / 1000;
@@ -62,19 +80,7 @@ function Thought({
     <details className="transcript-thought">
       <summary className="transcript-row-header">
         <span>{label}</span>
-        <svg
-          className="transcript-thought-chevron"
-          aria-hidden="true"
-          width="16"
-          height="16"
-          viewBox="0 0 24 24"
-          fill="none"
-        >
-          <path
-            d="M9.167 5.086 C 8.866 5.235,8.711 5.578,8.778 5.947 C 8.802 6.084,9.120 6.415,11.752 9.050 L 14.700 12.000 11.772 14.930 C 10.134 16.569,8.825 17.910,8.802 17.973 C 8.636 18.420,8.947 18.937,9.415 18.989 C 9.793 19.032,9.659 19.151,13.093 15.725 C 14.849 13.973,16.331 12.463,16.387 12.369 C 16.526 12.135,16.526 11.865,16.387 11.631 C 16.232 11.370,9.974 5.137,9.791 5.062 C 9.585 4.976,9.371 4.985,9.167 5.086 "
-            fill="currentColor"
-          />
-        </svg>
+        <TranscriptChevron className="transcript-thought-chevron" />
       </summary>
       <div className="transcript-thought-body">{text}</div>
     </details>
@@ -185,7 +191,21 @@ function PlanCard({
   return (
     <div className="transcript-plan">
       <div className="transcript-plan-title">
-        <span aria-hidden="true">☷</span>
+        <svg
+          className="transcript-plan-icon"
+          aria-hidden="true"
+          width="16"
+          height="16"
+          viewBox="0 0 24 24"
+          fill="none"
+        >
+          <path
+            d="M5 6h14M5 12h14M5 18h14"
+            stroke="currentColor"
+            strokeWidth="1.75"
+            strokeLinecap="round"
+          />
+        </svg>
         <span>Devin&apos;s execution plan</span>
       </div>
       <div className="transcript-plan-steps">
@@ -458,57 +478,61 @@ export function Transcript({
         const renderRow = (
           row: (typeof node.rows)[number],
           rowIndex: number,
-        ) => (
-          <div
-            className={`transcript-item transcript-row${row.denied ? " text-muted" : row.exitCode !== undefined && row.exitCode !== 0 ? " text-danger" : ""}`}
-            key={rowIndex}
-          >
-            {!row.detail && (
-              <span className="transcript-row-label">{row.label}</span>
-            )}
-            {row.shellId && (
-              <span className="transcript-row-meta">{row.shellId}</span>
-            )}
-            {row.exitCode !== undefined && row.exitCode !== 0 && (
-              <span className="transcript-row-meta">exit {row.exitCode}</span>
-            )}
-            {row.denied && (
-              <span className="ml-2 text-xs text-muted">
-                not run{row.detail ? ` · ${row.detail}` : ""}
-              </span>
-            )}
-            {row.durationMs !== undefined && (
-              <span className="transcript-row-duration">
-                {formatDuration(row.durationMs)}
-              </span>
-            )}
-            {row.detail && !row.thoughtForCallId && (
-              <Thought text={row.detail} label={thoughtLabel(row.label)} />
-            )}
-            {row.callId && thoughtByCallId.get(row.callId)?.detail && (
-              <Thought
-                text={thoughtByCallId.get(row.callId)?.detail ?? ""}
-                label={thoughtLabel(thoughtByCallId.get(row.callId)?.label)}
-              />
-            )}
-            {(row.terminalOutput || row.terminalTruncated) && (
-              <TerminalOutput
-                output={row.terminalOutput ?? ""}
-                truncated={row.terminalTruncated}
-                totalBytes={row.terminalTotalBytes}
-              />
-            )}
-            {row.artifactId && (
-              <ArtifactRow
-                sessionId={sessionId}
-                artifactId={row.artifactId}
-                kind={row.artifactKind}
-                mime={row.artifactMime}
-              />
-            )}
-            {row.plan && <PlanCard steps={row.plan.steps} />}
-          </div>
-        );
+        ) => {
+          const isThoughtRow =
+            Boolean(row.detail) && row.label.startsWith("Thought for ");
+          return (
+            <div
+              className={`transcript-item transcript-row${row.denied ? " text-muted" : row.exitCode !== undefined && row.exitCode !== 0 ? " text-danger" : ""}`}
+              key={rowIndex}
+            >
+              {!isThoughtRow && (
+                <span className="transcript-row-label">{row.label}</span>
+              )}
+              {row.shellId && (
+                <span className="transcript-row-meta">{row.shellId}</span>
+              )}
+              {row.exitCode !== undefined && row.exitCode !== 0 && (
+                <span className="transcript-row-meta">exit {row.exitCode}</span>
+              )}
+              {row.denied && (
+                <span className="ml-2 text-xs text-muted">
+                  not run{row.detail ? ` · ${row.detail}` : ""}
+                </span>
+              )}
+              {row.durationMs !== undefined && (
+                <span className="transcript-row-duration">
+                  {formatDuration(row.durationMs)}
+                </span>
+              )}
+              {row.detail && !row.thoughtForCallId && (
+                <Thought text={row.detail} label={thoughtLabel(row.label)} />
+              )}
+              {row.callId && thoughtByCallId.get(row.callId)?.detail && (
+                <Thought
+                  text={thoughtByCallId.get(row.callId)?.detail ?? ""}
+                  label={thoughtLabel(thoughtByCallId.get(row.callId)?.label)}
+                />
+              )}
+              {(row.terminalOutput || row.terminalTruncated) && (
+                <TerminalOutput
+                  output={row.terminalOutput ?? ""}
+                  truncated={row.terminalTruncated}
+                  totalBytes={row.terminalTotalBytes}
+                />
+              )}
+              {row.artifactId && (
+                <ArtifactRow
+                  sessionId={sessionId}
+                  artifactId={row.artifactId}
+                  kind={row.artifactKind}
+                  mime={row.artifactMime}
+                />
+              )}
+              {row.plan && <PlanCard steps={row.plan.steps} />}
+            </div>
+          );
+        };
         const renderRows = (rows: typeof node.rows) => {
           const rendered: ReactNode[] = [];
           let rowIndex = 0;
@@ -561,19 +585,7 @@ export function Transcript({
               className="transcript-worklog-header"
               onClick={() => worklogOverrides.current.add(index)}
             >
-              <svg
-                className="transcript-chevron"
-                aria-hidden="true"
-                width="16"
-                height="16"
-                viewBox="0 0 24 24"
-                fill="none"
-              >
-                <path
-                  d="M9.167 5.086 C 8.866 5.235,8.711 5.578,8.778 5.947 C 8.802 6.084,9.120 6.415,11.752 9.050 L 14.700 12.000 11.772 14.930 C 10.134 16.569,8.825 17.910,8.802 17.973 C 8.636 18.420,8.947 18.937,9.415 18.989 C 9.793 19.032,9.659 19.151,13.093 15.725 C 14.849 13.973,16.331 12.463,16.387 12.369 C 16.526 12.135,16.526 11.865,16.387 11.631 C 16.232 11.370,9.974 5.137,9.791 5.062 C 9.585 4.976,9.371 4.985,9.167 5.086 "
-                  fill="currentColor"
-                />
-              </svg>
+              <TranscriptChevron className="transcript-chevron" />
               <span className="transcript-worklog-label">
                 <span>{node.label}</span>
                 {!!(node.additions || node.deletions) && (
