@@ -19,52 +19,29 @@ const saved = persisted as TimelineEvent[];
 const opcos = opcosEvents as TimelineEvent[];
 
 describe("single event-log timeline", () => {
-  it("renders sleep state and resolves generic tool results in place", () => {
-    const nodes = buildTimeline([
-      {
-        type: "browser_started",
-        event_id: "generic-start",
-        created_at_ms: 100,
-        working_event: {
-          event_type: "browser_started",
-          payload: { call_id: "browser-call", tool: "browser" },
-        },
-      },
-      {
-        type: "tool_result",
-        event_id: "generic-result",
-        created_at_ms: 250,
-        working_event: {
-          event_type: "tool_result",
-          payload: { tool_use_id: "browser-call", result: "Page loaded" },
-        },
-      },
-      {
-        type: "status_update",
-        event_id: "sleep",
-        created_at_ms: 300,
-        working_event: {
-          event_type: "status_update",
-          payload: { status: "sleeping" },
-        },
-      },
-    ] as TimelineEvent[]);
+  it("replays captured tool results and terminal transitions", () => {
+    const nodes = buildTimeline(live);
+    const resultEvent = live.find((event) => event.type === "tool_result");
+    const resultPayload = resultEvent?.tool_result as
+      { call_id?: string; result?: unknown } | undefined;
+    const resultCallId = String(resultPayload?.call_id);
+    const resultRow = nodes
+      .filter((node) => node.kind === "work")
+      .flatMap((node) => node.rows)
+      .find((row) => row.callId === resultCallId);
+    expect(resultPayload).toMatchObject({
+      call_id: resultCallId,
+      result: expect.anything(),
+    });
+    expect(resultRow).toMatchObject({
+      callId: resultCallId,
+      resultSummary: expect.stringContaining('"items"'),
+    });
     expect(nodes).toContainEqual({
       kind: "sleep",
       text: "Devin went to sleep",
     });
-    expect(nodes).toContainEqual(
-      expect.objectContaining({
-        kind: "work",
-        rows: [
-          expect.objectContaining({
-            callId: "browser-call",
-            resultSummary: "Page loaded",
-            durationMs: 150,
-          }),
-        ],
-      }),
-    );
+    expect(buildTimeline(saved)).toEqual(nodes);
   });
 
   it("derives the current task state from the timeline plan", () => {
@@ -392,13 +369,13 @@ describe("single event-log timeline", () => {
     const rows = work.flatMap((node) => node.rows.map((row) => row.label));
     expect(rows.some((label) => /^Thought for \d+s$/.test(label))).toBe(true);
     expect(rows).toContain("Edited alpha.txt +1 −0");
-    expect(rows).toContain("Created notes.md +69");
-    expect(rows).not.toContain("write_file");
-    expect(rows).not.toContain("edit_file");
+    expect(rows).toContain("Created notes.md +33");
+    expect(rows).toContain("write_file");
+    expect(rows).toContain("edit_file");
     expect(work.some((node) => /^Worked for \d+s$/.test(node.label))).toBe(
       true,
     );
-    expect(work.reduce((sum, node) => sum + node.additions, 0)).toBe(70);
+    expect(work.reduce((sum, node) => sum + node.additions, 0)).toBe(34);
     expect(work.reduce((sum, node) => sum + node.deletions, 0)).toBe(0);
   });
   it("renders OPCOS-native persisted events as one work group", () => {

@@ -1090,6 +1090,14 @@ where
     fn finish_turn<T>(&self, result: &Result<T, EngineError>) {
         let (run_state, stop_reason) = self.turn_status(result);
         self.set_session_status(run_state, stop_reason);
+        let _ = self.record_working_event(
+            "turn_finished",
+            "status",
+            json!({
+                "run_state": run_state,
+                "stop_reason": stop_reason,
+            }),
+        );
         let waiters = std::mem::take(
             &mut *self
                 .steering_waiters

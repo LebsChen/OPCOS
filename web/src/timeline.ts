@@ -301,11 +301,11 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
           isMajorAction: true,
         });
       }
-    } else if (type === "status_update") {
-      const state = String(
-        data.status ?? data.state ?? data.mode ?? "",
-      ).toLowerCase();
-      if (["sleep", "sleeping", "idle"].includes(state)) {
+    } else if (type === "turn_finished") {
+      if (
+        String(data.run_state ?? "").toLowerCase() === "idle" &&
+        String(data.stop_reason ?? "").toLowerCase() === "finished"
+      ) {
         flush(event.created_at_ms);
         nodes.push({ kind: "sleep", text: "Devin went to sleep" });
       }
@@ -356,12 +356,23 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
     ) {
       continue;
     } else if (type === "tool_result") {
+      const resultEvent =
+        data.tool_result && typeof data.tool_result === "object"
+          ? (data.tool_result as Record<string, unknown>)
+          : data;
       const callId = String(
-        data.call_id ?? data.tool_use_id ?? data.tool_call_id ?? "",
+        resultEvent.call_id ??
+          resultEvent.tool_use_id ??
+          resultEvent.tool_call_id ??
+          "",
       );
       const row = callId ? genericRows.get(callId) : undefined;
       if (row) {
-        const raw = data.result ?? data.output ?? data.content ?? data.message;
+        const raw =
+          resultEvent.result ??
+          resultEvent.output ??
+          resultEvent.content ??
+          resultEvent.message;
         const summary =
           typeof raw === "string"
             ? raw
@@ -587,12 +598,23 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
         }
         planSteps.set(planId, todos);
         latestPlans.set(planId, todos);
-      } else if (type === "read_file_started" || type === "list_dir_started") {
-        continue;
       } else if (
         type === "read_file_completed" ||
         type === "list_dir_completed"
       ) {
+        const callId =
+          typeof data.call_id === "string" ? data.call_id : undefined;
+        const started = callId ? genericRows.get(callId) : undefined;
+        if (started) {
+          started.resultSummary = data.ok === false ? "Failed" : "Completed";
+          started.durationMs =
+            typeof data.duration_ms === "number"
+              ? data.duration_ms
+              : started.startedAt === undefined
+                ? undefined
+                : Math.max(0, event.created_at_ms - started.startedAt);
+          continue;
+        }
         const target = String(data.path ?? data.target ?? data.file_path ?? "");
         appendPlanProgress(activeWork);
         activeWork.rows.push({
@@ -603,6 +625,22 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
               : "Listed directory",
           isMajorAction: true,
         });
+      } else if (type.endsWith("_completed")) {
+        const callId =
+          typeof data.call_id === "string" ? data.call_id : undefined;
+        const started = callId ? genericRows.get(callId) : undefined;
+        if (started) {
+          started.resultSummary =
+            data.ok === false
+              ? "Failed"
+              : (started.resultSummary ?? "Completed");
+          started.durationMs =
+            typeof data.duration_ms === "number"
+              ? data.duration_ms
+              : started.startedAt === undefined
+                ? undefined
+                : Math.max(0, event.created_at_ms - started.startedAt);
+        }
       } else if (type.endsWith("_started")) {
         if (
           ![
@@ -610,9 +648,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
             "plan_update_started",
             "plan_get_started",
             "plan_revise_started",
-          ].includes(type) &&
-          type !== "write_file_started" &&
-          type !== "edit_file_started"
+          ].includes(type)
         ) {
           const row = {
             label: String(data.command ?? data.tool ?? type),
