@@ -356,8 +356,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
           detail: undefined as string | undefined,
           shellId:
             typeof data.shell_id === "string" ? data.shell_id : undefined,
-          isMajorAction:
-            data.is_major_action === false ? false : true,
+          isMajorAction: data.is_major_action === false ? false : true,
           startedAt: event.created_at_ms,
           terminalOutput: pending?.output || undefined,
           terminalTruncated: pending?.truncated || undefined,
@@ -453,8 +452,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
               .pop() ?? "";
           appendPlanProgress(activeWork);
           activeWork.rows.push({
-            callId:
-              typeof data.call_id === "string" ? data.call_id : undefined,
+            callId: typeof data.call_id === "string" ? data.call_id : undefined,
             label:
               item.action_type === "create"
                 ? `Created ${basename} +${added}`
@@ -526,10 +524,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
         }
         planSteps.set(planId, todos);
         latestPlans.set(planId, todos);
-      } else if (
-        type === "read_file_started" ||
-        type === "list_dir_started"
-      ) {
+      } else if (type === "read_file_started" || type === "list_dir_started") {
         continue;
       } else if (
         type === "read_file_completed" ||
@@ -558,8 +553,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
         ) {
           const row = {
             label: String(data.command ?? data.tool ?? type),
-            callId:
-              typeof data.call_id === "string" ? data.call_id : undefined,
+            callId: typeof data.call_id === "string" ? data.call_id : undefined,
             isMajorAction:
               typeof data.is_major_action === "boolean"
                 ? data.is_major_action

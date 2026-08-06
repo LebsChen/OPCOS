@@ -9738,9 +9738,14 @@ async fn engine_for_with_context(
     .into_iter()
     .filter_map(|(name, enabled)| enabled.then_some(name))
     .collect::<Vec<_>>();
+    let shell = if platform.eq_ignore_ascii_case("windows") {
+        "powershell (PowerShell syntax is required; bash constructs such as &&, POSIX-tool | pipelines, and ${PIPESTATUS[...]} are unavailable)"
+    } else {
+        "bash"
+    };
     engine
         .set_runtime_facts(Some(format!(
-            "Runtime facts:\n- Execution host: {host_id} ({host_scope})\n- Platform: {platform}\n- Architecture: {architecture}\n- Home directory: {home}\n- Workspace root: {workspace}\n- Current UTC time: {}\n- Current model: {model}\n- Enabled integrations: {}",
+            "Runtime facts:\n- Execution host: {host_id} ({host_scope})\n- Platform: {platform}\n- Shell: {shell}\n- Architecture: {architecture}\n- Home directory: {home}\n- Workspace root: {workspace}\n- Current UTC time: {}\n- Current model: {model}\n- Enabled integrations: {}",
             Utc::now().to_rfc3339(),
             if enabled_integrations.is_empty() {
                 "none".to_owned()

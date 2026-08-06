@@ -3,9 +3,16 @@ use futures_util::{SinkExt, StreamExt};
 use opcos_hosts::{BrowserController, BrowserRequest, HostError};
 use reqwest::Client;
 use serde_json::{Value, json};
-use std::{env, path::PathBuf, process::Stdio, sync::Arc, time::Duration};
+use std::{
+    env,
+    path::PathBuf,
+    process::Stdio,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tempfile::TempDir;
 use tokio::{
+    io::AsyncReadExt,
     process::{Child, Command},
     sync::Mutex,
     time::sleep,
@@ -129,6 +136,9 @@ impl LocalBrowser {
     }
 
     async fn ensure_session(&self) -> Result<(), HostError> {
+        const STARTUP_BUDGET: Duration = Duration::from_secs(30);
+        const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
+        const MAX_BACKOFF: Duration = Duration::from_millis(500);
         let mut guard = self.session.lock().await;
         if guard
             .as_ref()
@@ -144,7 +154,7 @@ impl LocalBrowser {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(HostError::Io)?;
         let port = listener.local_addr().map_err(HostError::Io)?.port();
         drop(listener);
-        let child = Command::new(binary)
+        let mut child = Command::new(binary)
             .arg(format!("--remote-debugging-port={port}"))
             .arg("--remote-allow-origins=*")
             .arg(format!("--user-data-dir={}", profile.path().display()))
@@ -157,13 +167,52 @@ impl LocalBrowser {
             .kill_on_drop(true)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(HostError::Io)?;
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        if let Some(mut stream) = child.stderr.take() {
+            let captured = Arc::clone(&stderr);
+            tokio::spawn(async move {
+                let mut buffer = [0_u8; 4096];
+                while let Ok(size) = stream.read(&mut buffer).await {
+                    if size == 0 {
+                        break;
+                    }
+                    let mut captured = captured.lock().await;
+                    captured.extend_from_slice(&buffer[..size]);
+                    if captured.len() > 8192 {
+                        let keep_from = captured.len() - 8192;
+                        captured.drain(..keep_from);
+                    }
+                }
+            });
+        }
         let version_url = format!("http://127.0.0.1:{port}/json/version");
         let mut ws_url = None;
-        for _ in 0..40 {
-            if let Ok(response) = self.http.get(&version_url).send().await
+        let started = Instant::now();
+        let mut backoff = INITIAL_BACKOFF;
+        while started.elapsed() < STARTUP_BUDGET {
+            if let Some(status) = child.try_wait().map_err(HostError::Io)? {
+                sleep(Duration::from_millis(20)).await;
+                let stderr = String::from_utf8_lossy(&stderr.lock().await)
+                    .trim()
+                    .to_owned();
+                let detail = if stderr.is_empty() {
+                    "Chrome did not write anything to stderr".to_owned()
+                } else {
+                    format!("Chrome stderr: {stderr}")
+                };
+                return Err(HostError::Unsupported(format!(
+                    "Chrome exited before CDP became ready ({status}); {detail}"
+                )));
+            }
+            if let Ok(response) = self
+                .http
+                .get(&version_url)
+                .timeout(Duration::from_millis(500))
+                .send()
+                .await
                 && let Ok(value) = response.json::<Value>().await
             {
                 ws_url = value
@@ -174,11 +223,25 @@ impl LocalBrowser {
                     break;
                 }
             }
-            sleep(Duration::from_millis(50)).await;
+            sleep(backoff).await;
+            backoff = (backoff * 2).min(MAX_BACKOFF);
         }
-        let ws_url = ws_url.ok_or_else(|| {
-            HostError::Unsupported("Chrome started but CDP endpoint did not become ready".into())
-        })?;
+        let ws_url = if let Some(ws_url) = ws_url {
+            ws_url
+        } else {
+            let stderr = String::from_utf8_lossy(&stderr.lock().await)
+                .trim()
+                .to_owned();
+            let detail = if stderr.is_empty() {
+                "Chrome did not write anything to stderr".to_owned()
+            } else {
+                format!("Chrome stderr: {stderr}")
+            };
+            return Err(HostError::Unsupported(format!(
+                "Chrome CDP endpoint did not become ready within {} seconds; {detail}",
+                STARTUP_BUDGET.as_secs()
+            )));
+        };
         let target = self
             .http
             .put(format!("http://127.0.0.1:{port}/json/new?about:blank"))
@@ -443,6 +506,29 @@ mod tests {
         assert!(error.contains("configured browser binary does not exist"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exited_browser_reports_status_and_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("fake-chrome");
+        std::fs::write(&binary, "#!/bin/sh\necho startup failed >&2\nexit 7\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let browser = LocalBrowser::new(Some(binary));
+        let error = browser
+            .execute(BrowserRequest {
+                operation: "navigate".into(),
+                arguments: json!({"url":"http://127.0.0.1:1/"}),
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Chrome exited before CDP became ready"));
+        assert!(error.contains("exit status: 7"));
+        assert!(error.contains("Chrome stderr: startup failed"));
+    }
+
     #[tokio::test]
     async fn fixture_geometry_assertions_catch_width_and_overlap() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -469,6 +555,7 @@ mod tests {
             }
         });
         let browser = LocalBrowser::new(None);
+        let started = Instant::now();
         browser
             .execute(BrowserRequest {
                 operation: "navigate".into(),
@@ -476,6 +563,27 @@ mod tests {
             })
             .await
             .unwrap();
+        eprintln!(
+            "browser cold-start reached CDP and navigated in {:?}",
+            started.elapsed()
+        );
+        for _ in 0..20 {
+            let page = browser
+                .execute(BrowserRequest {
+                    operation: "read".into(),
+                    arguments: json!({"selector":"body"}),
+                })
+                .await
+                .unwrap();
+            let html = page.get("html").and_then(Value::as_str).unwrap_or_default();
+            if ["container", "wide", "art", "hero"]
+                .iter()
+                .all(|id| html.contains(&format!("id=\"{id}\"")))
+            {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
         browser
             .execute(BrowserRequest {
                 operation: "set_viewport".into(),
