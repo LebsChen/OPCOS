@@ -3486,6 +3486,7 @@ function ManageSections({
   const [templateDraftDescription, setTemplateDraftDescription] = useState("");
   const [templateDraftContent, setTemplateDraftContent] = useState("{}");
   const [templateDraftStatus, setTemplateDraftStatus] = useState("");
+  const [templateEditorOpen, setTemplateEditorOpen] = useState(false);
   const [libraryProjectId, setLibraryProjectId] = useState("");
   const [environmentTab, setEnvironmentTab] = useState<
     "blueprints" | "snapshots" | "advanced" | "outposts"
@@ -5227,68 +5228,106 @@ function ManageSections({
                 </button>
               </div>
             )}
-            <section className="rounded-lg border border-line p-4 space-y-3">
-              <strong>创建自定义模板</strong>
-              <div className="grid gap-2 md:grid-cols-2">
-                <input
-                  className="input"
-                  value={templateDraftName}
-                  onChange={(event) => setTemplateDraftName(event.target.value)}
-                  placeholder="模板名称"
-                />
-                <input
-                  className="input"
-                  value={templateDraftDescription}
-                  onChange={(event) =>
-                    setTemplateDraftDescription(event.target.value)
-                  }
-                  placeholder="描述"
-                />
-              </div>
-              <textarea
-                className="input min-h-28 font-mono text-xs"
-                value={templateDraftContent}
-                onChange={(event) =>
-                  setTemplateDraftContent(event.target.value)
-                }
-                placeholder={
-                  activeLibraryKind === "agent-template"
-                    ? '{"role":"Code","model":"auto"}'
-                    : activeLibraryKind === "team-template"
-                      ? '{"workflow":{"workflow":[]},"agents":[]}'
-                      : '{"name":"/review","body":"Review the current changes."}'
-                }
-              />
-              <div className="flex items-center justify-between">
-                <small className="text-muted">{templateDraftStatus}</small>
-                <button
-                  type="button"
-                  className="btn approval-primary"
-                  disabled={!templateDraftName.trim()}
-                  onClick={() => {
-                    void command("save_template", {
-                      id: templateDraftId,
-                      kind: activeLibraryKind,
-                      name: templateDraftName.trim(),
-                      description: templateDraftDescription.trim(),
-                      content: templateDraftContent,
-                    })
-                      .then(() => {
-                        setTemplateDraftStatus("已保存");
-                        setTemplateDraftName("");
-                        setTemplateDraftId(null);
-                        return command<LibraryEntry[]>(
-                          "list_configured_library",
-                        );
-                      })
-                      .then(setLibraryEntries)
-                      .catch(onError);
-                  }}
+            <div className="flex justify-end">
+              <button
+                type="button"
+                className="btn approval-primary"
+                onClick={() => {
+                  setTemplateDraftId(null);
+                  setTemplateDraftName("");
+                  setTemplateDraftDescription("");
+                  setTemplateDraftContent("{}");
+                  setTemplateDraftStatus("");
+                  setTemplateEditorOpen(true);
+                }}
+              >
+                添加
+              </button>
+            </div>
+            {templateEditorOpen && (
+              <div
+                className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4"
+                onClick={() => setTemplateEditorOpen(false)}
+              >
+                <section
+                  className="w-full max-w-2xl space-y-3 rounded-xl border border-line bg-panel p-5 shadow-xl"
+                  onClick={(event) => event.stopPropagation()}
                 >
-                  保存模板
-                </button>
+                  <div className="flex items-center justify-between">
+                    <strong>{templateDraftId ? "编辑模板" : "添加模板"}</strong>
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={() => setTemplateEditorOpen(false)}
+                    >
+                      关闭
+                    </button>
+                  </div>
+                  <div className="grid gap-2 md:grid-cols-2">
+                    <input
+                      className="input"
+                      value={templateDraftName}
+                      onChange={(event) =>
+                        setTemplateDraftName(event.target.value)
+                      }
+                      placeholder="模板名称"
+                    />
+                    <input
+                      className="input"
+                      value={templateDraftDescription}
+                      onChange={(event) =>
+                        setTemplateDraftDescription(event.target.value)
+                      }
+                      placeholder="描述"
+                    />
+                  </div>
+                  <textarea
+                    className="input min-h-28 font-mono text-xs"
+                    value={templateDraftContent}
+                    onChange={(event) =>
+                      setTemplateDraftContent(event.target.value)
+                    }
+                    placeholder={
+                      activeLibraryKind === "agent-template"
+                        ? '{"role":"Code","model":"auto"}'
+                        : activeLibraryKind === "team-template"
+                          ? '{"workflow":{"workflow":[]},"agents":[]}'
+                          : '{"name":"/review","body":"Review the current changes."}'
+                    }
+                  />
+                  <div className="flex items-center justify-between">
+                    <small className="text-muted">{templateDraftStatus}</small>
+                    <button
+                      type="button"
+                      className="btn approval-primary"
+                      disabled={!templateDraftName.trim()}
+                      onClick={() => {
+                        void command("save_template", {
+                          id: templateDraftId,
+                          kind: activeLibraryKind,
+                          name: templateDraftName.trim(),
+                          description: templateDraftDescription.trim(),
+                          content: templateDraftContent,
+                        })
+                          .then(() => {
+                            setTemplateDraftStatus("已保存");
+                            setTemplateDraftName("");
+                            setTemplateDraftId(null);
+                            setTemplateEditorOpen(false);
+                            return command<LibraryEntry[]>(
+                              "list_configured_library",
+                            );
+                          })
+                          .then(setLibraryEntries)
+                          .catch(onError);
+                      }}
+                    >
+                      保存
+                    </button>
+                  </div>
+                </section>
               </div>
-            </section>
+            )}
             <div className="grid gap-3 xl:grid-cols-2">
               {libraryEntries
                 .filter((template) => template.kind === activeLibraryKind)
@@ -5331,6 +5370,7 @@ function ManageSections({
                             setTemplateDraftId(null);
                             setTemplateDraftDescription(template.description);
                             setTemplateDraftContent(template.content);
+                            setTemplateEditorOpen(true);
                           }}
                         >
                           另存为
@@ -5395,7 +5435,7 @@ function ManageSections({
                               template.description || "",
                             );
                             setTemplateDraftContent(template.content);
-                            window.scrollTo({ top: 0, behavior: "smooth" });
+                            setTemplateEditorOpen(true);
                           }}
                         >
                           编辑
