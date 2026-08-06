@@ -1,7 +1,8 @@
 use crate::{
     AssistantTurn, Caps, Provider, ProviderConfig, ProviderError, ProviderRequest, StreamChunk,
-    TokenUsage, ToolCall, ToolCallDelta, classify_context_error, client, sanitize_secret,
-    settings_object, tool_schema,
+    TRANSIENT_RETRY_LIMIT, TokenUsage, ToolCall, ToolCallDelta, classify_context_error, client,
+    is_transient_request_error, is_transient_status, retry_delay, sanitize_secret, settings_object,
+    tool_schema,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -64,30 +65,51 @@ impl AnthropicProvider {
 
     async fn send(&self, body: Value) -> Result<reqwest::Response, ProviderError> {
         let http = client(&self.config)?;
-        let mut request = http
-            .post(format!(
-                "{}/v1/messages",
-                self.config.base_url.trim_end_matches('/')
-            ))
-            .header("x-api-key", self.config.api_key.expose())
-            .header("anthropic-version", VERSION)
-            .json(&body);
-        for (name, value) in &self.config.headers {
-            request = request.header(name, value);
-        }
-        let response = request.send().await.map_err(crate::request_error)?;
-        if !response.status().is_success() {
+        let url = format!("{}/v1/messages", self.config.base_url.trim_end_matches('/'));
+        for transient_attempt in 0..=TRANSIENT_RETRY_LIMIT {
+            let mut request = http
+                .post(&url)
+                .header("x-api-key", self.config.api_key.expose())
+                .header("anthropic-version", VERSION)
+                .json(&body);
+            for (name, value) in &self.config.headers {
+                request = request.header(name, value);
+            }
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(error)
+                    if is_transient_request_error(&error)
+                        && transient_attempt < TRANSIENT_RETRY_LIMIT =>
+                {
+                    tokio::time::sleep(retry_delay(transient_attempt, None)).await;
+                    continue;
+                }
+                Err(error) => return Err(crate::request_error(error)),
+            };
+            if response.status().is_success() {
+                return Ok(response);
+            }
             let status = response.status();
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .cloned();
             let body = response.text().await.unwrap_or_default();
             if let Some(error) = classify_context_error(status, &body) {
                 return Err(error);
+            }
+            if is_transient_status(status) && transient_attempt < TRANSIENT_RETRY_LIMIT {
+                tokio::time::sleep(retry_delay(transient_attempt, retry_after.as_ref())).await;
+                continue;
             }
             return Err(ProviderError::Http {
                 status,
                 message: sanitize_secret(&body, self.config.api_key.expose()),
             });
         }
-        Ok(response)
+        Err(ProviderError::Protocol(
+            "provider transient retry exhausted".into(),
+        ))
     }
 }
 
@@ -389,6 +411,14 @@ async fn consume_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     #[test]
     fn maps_anthropic_fixture_without_leaking_thinking_wire_shape() {
@@ -425,5 +455,55 @@ mod tests {
             serde_json::from_str::<Value>(&fragments).unwrap()["path"],
             "README.md"
         );
+    }
+
+    #[tokio::test]
+    async fn retries_transient_http_response_before_success() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let task = tokio::spawn(async move {
+            for status in [429_u16, 200] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                observed.fetch_add(1, Ordering::SeqCst);
+                let body = if status == 200 {
+                    r#"{"content":[{"type":"text","text":"ok"}]}"#
+                } else {
+                    "rate limited"
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} Error\r\nContent-Length: {}\r\n\
+                     Content-Type: application/json\r\nRetry-After: 0\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let provider =
+            AnthropicProvider::new(ProviderConfig::new(format!("http://{address}"), "test-key"));
+        let turn = provider
+            .complete(ProviderRequest {
+                model: "test".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(turn.text.as_deref(), Some("ok"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        task.await.unwrap();
     }
 }

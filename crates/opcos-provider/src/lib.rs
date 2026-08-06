@@ -194,6 +194,29 @@ pub(crate) fn request_error(error: reqwest::Error) -> ProviderError {
     ProviderError::Request(sanitize_error(&error.to_string()))
 }
 
+pub(crate) const TRANSIENT_RETRY_LIMIT: usize = 3;
+
+pub(crate) fn is_transient_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+pub(crate) fn is_transient_request_error(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect()
+}
+
+pub(crate) fn retry_delay(
+    attempt: usize,
+    retry_after: Option<&header::HeaderValue>,
+) -> std::time::Duration {
+    if let Some(seconds) = retry_after
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        return std::time::Duration::from_secs(seconds.min(30));
+    }
+    std::time::Duration::from_millis(500 * 2u64.saturating_pow(attempt as u32))
+}
+
 pub(crate) fn classify_context_error(status: StatusCode, message: &str) -> Option<ProviderError> {
     let lower = message.to_ascii_lowercase();
     if status == StatusCode::PAYLOAD_TOO_LARGE
