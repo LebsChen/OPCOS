@@ -12,6 +12,7 @@ import {
   latestPlan,
   mergeEvents,
   TRANSIENT_TIMELINE_EVENT_TYPES,
+  lastActivityLabel,
   type TimelineEvent,
 } from "./timeline";
 
@@ -671,6 +672,14 @@ describe("single event-log timeline", () => {
       "3/4 #4 4. Finish by reporting every command run, each exit code, and whether the workspace changed (it should not).",
       "4/4 #4 4. Finish by reporting every command run, each exit code, and whether the workspace changed (it should not).",
     ]);
+  });
+  it("collapses identical progress separated by interleaved tool rows", () => {
+    const rows = [
+      { label: "0/4 #1 Implement", activityLabel: true },
+      { label: "Read checkoutValidation.ts" },
+      { label: "0/4 #1 Implement", activityLabel: true },
+    ];
+    expect(lastActivityLabel(rows)).toBe("0/4 #1 Implement");
   });
   it("points plan progress at the next unfinished step", () => {
     const rowsFor = (steps: Record<string, unknown>[]) =>

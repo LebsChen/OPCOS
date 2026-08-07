@@ -13,6 +13,12 @@ export const TRANSIENT_TIMELINE_EVENT_TYPES = [
   "tool_call_delta",
 ] as const;
 
+export function lastActivityLabel(
+  rows: Array<{ activityLabel?: boolean; label: string }>,
+) {
+  return [...rows].reverse().find((row) => row.activityLabel)?.label;
+}
+
 export type TimelineNode =
   | {
       kind: "user";
@@ -340,8 +346,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
     const current = plan[currentIndex];
     if (!current) return;
     const label = `${completed}/${plan.length} #${currentIndex + 1} ${String(current.content ?? current.title ?? "")}`;
-    const previous = activeWork.rows.at(-1);
-    if (previous?.activityLabel && previous.label === label) return;
+    if (lastActivityLabel(activeWork.rows) === label) return;
     activeWork.rows.push({
       label,
       activityLabel: true,
