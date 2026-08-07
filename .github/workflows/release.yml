@@ -1,0 +1,74 @@
+name: Windows release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows-bundle:
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build frontend
+        working-directory: web
+        run: npm run build
+
+      - name: Install Tauri CLI
+        shell: pwsh
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Build unsigned Windows bundles
+        shell: pwsh
+        run: cargo tauri build --bundles nsis,msi
+
+      - name: Collect unsigned Windows bundles
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          Get-ChildItem target\release\bundle\nsis\*.exe |
+            Copy-Item -Destination artifacts\OPCOS-unsigned-windows-nsis.exe
+          Get-ChildItem target\release\bundle\msi\*.msi |
+            Copy-Item -Destination artifacts\OPCOS-unsigned-windows-msi.msi
+
+      - name: Upload unsigned Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: OPCOS-unsigned-windows
+          path: artifacts/*
+          if-no-files-found: error
+
+      - name: Publish unsigned Windows release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          name: OPCOS ${{ github.ref_name }}
+          body: |
+            Unsigned Windows installers for OPCOS ${{ github.ref_name }}.
+
+            Windows SmartScreen may warn because these installers are not
+            Authenticode-signed. Signing will be added when a release
+            certificate is available.
