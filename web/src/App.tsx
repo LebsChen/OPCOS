@@ -10602,7 +10602,7 @@ function AppContent() {
         if (generation.current === currentGeneration)
           setError(errorMessage(reason));
       });
-  }, [selected?.id]);
+  }, [selected?.id, running]);
   useEffect(() => {
     if (!selected) {
       setUnattended(false);
