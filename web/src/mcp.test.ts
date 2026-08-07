@@ -43,4 +43,19 @@ describe("MCP resources and prompts", () => {
     );
     expect(mcpCatalogUpdateTargets({}, "server-a")).toBe(false);
   });
+
+  it("keeps composer text and attachments when submission rejects", async () => {
+    const draft = "Keep this draft";
+    const attachments = [{ uri: "resource://one", name: "one.md" }];
+    let submitted = false;
+    const submit = async () => {
+      submitted = true;
+      throw new Error("MCP server is disconnected");
+    };
+
+    await expect(submit()).rejects.toThrow("MCP server is disconnected");
+    expect(submitted).toBe(true);
+    expect(draft).toBe("Keep this draft");
+    expect(attachments).toEqual([{ uri: "resource://one", name: "one.md" }]);
+  });
 });

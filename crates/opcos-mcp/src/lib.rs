@@ -2916,6 +2916,7 @@ pub async fn dispatch<C: RvmClient>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct Noop;
@@ -3391,6 +3392,77 @@ mod tests {
             Some(&McpServerStatus::AuthRequired)
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn catalog_refresh_reuses_connected_client_without_reinitializing() {
+        let root = std::env::temp_dir().join(format!("opcos-mcp-refresh-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let count_path = root.join("initialize-count");
+        let script = root.join("server.py");
+        fs::write(
+            &script,
+            format!(
+                r#"
+import json, os, sys
+count_path = {count:?}
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if method == "initialize":
+        count = int(open(count_path).read() or "0") if os.path.exists(count_path) else 0
+        open(count_path, "w").write(str(count + 1))
+        result = {{"protocolVersion":"2025-06-18","capabilities":{{}}}}
+    elif method == "tools/list":
+        result = {{"tools":[{{"name":"refreshed","description":"updated","inputSchema":{{"type":"object"}}}}]}}
+    elif method in ["resources/list","resources/templates/list","prompts/list"]:
+        result = {{"resources":[],"resourceTemplates":[],"prompts":[]}}
+    else:
+        result = {{}}
+    print(json.dumps({{"jsonrpc":"2.0","id":request.get("id"),"result":result}}), flush=True)
+"#,
+                count = count_path.display().to_string()
+            ),
+        )
+        .unwrap();
+        let manager = Arc::new(McpManager::new(Arc::new(NoCredentials)));
+        let config = McpServerConfig {
+            object_id: "refresh-server".into(),
+            server_key: "refresh-key".into(),
+            name: "Refresh server".into(),
+            transport: McpTransport::Stdio,
+            command: Some("python3".into()),
+            args: vec![script.display().to_string()],
+            env: HashMap::new(),
+            cwd: None,
+            url: None,
+            headers: HashMap::new(),
+            enabled: true,
+            include_tools: None,
+            exclude_tools: None,
+            requires_approval: true,
+            auth: None,
+            oauth_client_id: None,
+        };
+        manager.connect_with_retry(&config, "v1", 0).await.unwrap();
+        assert_eq!(fs::read_to_string(&count_path).unwrap(), "1");
+        manager
+            .refresh_after_notification(
+                &config,
+                "v1",
+                "notifications/tools/list_changed",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(fs::read_to_string(&count_path).unwrap(), "1");
+        assert_eq!(manager.cached_tools("refresh-server", "v1").await.unwrap().len(), 1);
+        assert_eq!(
+            manager.cached_tools("refresh-server", "v1").await.unwrap()[0].name,
+            "refreshed"
+        );
+        manager.shutdown().await;
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
