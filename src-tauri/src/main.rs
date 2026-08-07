@@ -3682,6 +3682,14 @@ impl ToolExecutor for RemoteExecutor {
         if name == "external_ingress_sources" {
             return execute_external_ingress_tool(&self.store, name, &arguments);
         }
+        if automatic_project_routing_active(&self.store, &self.session_id)?
+            && matches!(name, "edit_file" | "write_file" | "run_shell")
+        {
+            return Err(
+                "Lead-local implementation is disabled; create a plan and let the desktop dispatch it to a Worker"
+                    .to_owned(),
+            );
+        }
         if matches!(name, "coordination_dispatch" | "coordination_status") {
             if name == "coordination_dispatch"
                 && automatic_project_routing_active(&self.store, &self.session_id)?
@@ -4094,6 +4102,14 @@ impl ToolExecutor for DesktopExecutor {
                 }
                 if name == "external_ingress_sources" {
                     return execute_external_ingress_tool(&executor.store, name, &arguments);
+                }
+                if automatic_project_routing_active(&executor.store, &executor.session_id)?
+                    && matches!(name, "edit_file" | "write_file" | "run_shell")
+                {
+                    return Err(
+                        "Lead-local implementation is disabled; create a plan and let the desktop dispatch it to a Worker"
+                            .to_owned(),
+                    );
                 }
                 if matches!(name, "coordination_dispatch" | "coordination_status") {
                     if name == "coordination_dispatch"
