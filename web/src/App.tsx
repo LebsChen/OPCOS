@@ -7122,6 +7122,9 @@ function McpManage({
   const [resourcePreview, setResourcePreview] = useState<
     Array<Record<string, unknown>>
   >([]);
+  const [contextResources, setContextResources] = useState<
+    Array<Record<string, unknown>>
+  >([]);
   const [search, setSearch] = useState("");
   useEffect(() => {
     void command<Array<Record<string, unknown>>>("list_mcp_servers")
@@ -7134,6 +7137,17 @@ function McpManage({
         .then(setTools)
         .catch(onError);
   }, [selected?.id]);
+  useEffect(() => {
+    if (!selected) {
+      setContextResources([]);
+      return;
+    }
+    void command<Array<Record<string, unknown>>>("mcp_context_resources", {
+      sessionId: selected.id,
+    })
+      .then(setContextResources)
+      .catch(onError);
+  }, [onError, selected?.id]);
   const selectedServer = servers.find(
     (server) => String(server.id) === selectedServerId,
   );
@@ -7287,8 +7301,17 @@ function McpManage({
                       command("mcp_attach_resource", {
                         sessionId: selected.id,
                         serverId: String(selectedServer.id),
+                        versionId: String(selectedServer.version_id || ""),
                         uri: String(resource.uri),
-                      }).catch(onError)
+                      })
+                        .then(() =>
+                          command<Array<Record<string, unknown>>>(
+                            "mcp_context_resources",
+                            { sessionId: selected.id },
+                          ),
+                        )
+                        .then(setContextResources)
+                        .catch(onError)
                     }
                   >
                     Add to current context
@@ -7352,6 +7375,36 @@ function McpManage({
                 {JSON.stringify(resourcePreview, null, 2)}
               </pre>
             )}
+            <h4>Current context resources ({contextResources.length})</h4>
+            {contextResources.map((resource) => (
+              <div
+                className="inline-actions"
+                key={`${String(resource.server_id)}:${String(resource.uri)}`}
+              >
+                <span>{String(resource.uri)}</span>
+                <Button
+                  onClick={() =>
+                    selected &&
+                    command("mcp_detach_resource", {
+                      sessionId: selected.id,
+                      serverId: String(resource.server_id),
+                      versionId: String(resource.version_id),
+                      uri: String(resource.uri),
+                    })
+                      .then(() =>
+                        command<Array<Record<string, unknown>>>(
+                          "mcp_context_resources",
+                          { sessionId: selected.id },
+                        ),
+                      )
+                      .then(setContextResources)
+                      .catch(onError)
+                  }
+                >
+                  Remove
+                </Button>
+              </div>
+            ))}
           </div>
         </section>
       )}

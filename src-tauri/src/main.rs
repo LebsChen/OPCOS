@@ -5237,13 +5237,14 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                enabled INTEGER NOT NULL,
                PRIMARY KEY(session_id,name)
              );
-             CREATE TABLE IF NOT EXISTS mcp_session_resources (
+CREATE TABLE IF NOT EXISTS mcp_session_resources (
                session_id TEXT NOT NULL,
                server_object_id TEXT NOT NULL,
+               config_version_id TEXT NOT NULL,
                uri TEXT NOT NULL,
                mode TEXT NOT NULL CHECK(mode IN ('preview','context','subscribed')),
                enabled INTEGER NOT NULL DEFAULT 1,
-               PRIMARY KEY(session_id,server_object_id,uri)
+               PRIMARY KEY(session_id,server_object_id,config_version_id,uri)
              );
              CREATE TABLE IF NOT EXISTS mcp_tool_cache (
                server_object_id TEXT NOT NULL,
@@ -7072,10 +7073,11 @@ fn migrate_mcp_session_resources(connection: &Connection) -> Result<(), String> 
             "CREATE TABLE IF NOT EXISTS mcp_session_resources (
                session_id TEXT NOT NULL,
                server_object_id TEXT NOT NULL,
+               config_version_id TEXT NOT NULL,
                uri TEXT NOT NULL,
                mode TEXT NOT NULL CHECK(mode IN ('preview','context','subscribed')),
                enabled INTEGER NOT NULL DEFAULT 1,
-               PRIMARY KEY(session_id,server_object_id,uri)
+               PRIMARY KEY(session_id,server_object_id,config_version_id,uri)
              );
              INSERT INTO desktop_schema_migrations(version,applied_at)
              VALUES ('p2-1-mcp-session-resources',datetime('now'));",
@@ -12614,20 +12616,24 @@ async fn session_context_attachments(
             .map_err(|_| "database lock poisoned")?;
         let mut statement = connection
             .prepare(
-                "SELECT server_object_id,uri FROM mcp_session_resources
+                "SELECT server_object_id,config_version_id,uri FROM mcp_session_resources
                  WHERE session_id=?1 AND mode='context' AND enabled=1",
             )
             .map_err(|error| error.to_string())?;
         statement
             .query_map([session_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })
             .map_err(|error| error.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?
     };
     let mut attachments = Vec::new();
-    for (server_id, uri) in resources {
+    for (server_id, _version_id, uri) in resources {
         let contents = state
             .mcp
             .read_resource(&server_id, &uri)
@@ -16288,11 +16294,11 @@ async fn mcp_resources(
     server_id: String,
     version_id: String,
 ) -> Result<Vec<opcos_mcp::McpResource>, String> {
-    Ok(state
+    state
         .mcp
         .cached_resources(&server_id, &version_id)
         .await
-        .unwrap_or_default())
+        .ok_or_else(|| "MCP server is not connected; retry the connection".to_owned())
 }
 
 #[tauri::command]
@@ -16301,11 +16307,11 @@ async fn mcp_resource_templates(
     server_id: String,
     version_id: String,
 ) -> Result<Vec<opcos_mcp::McpResourceTemplate>, String> {
-    Ok(state
+    state
         .mcp
         .cached_resource_templates(&server_id, &version_id)
         .await
-        .unwrap_or_default())
+        .ok_or_else(|| "MCP server is not connected; retry the connection".to_owned())
 }
 
 #[tauri::command]
@@ -16341,11 +16347,11 @@ async fn mcp_subscribe_resource(
     connection
         .execute(
             "INSERT INTO mcp_session_resources
-             (session_id,server_object_id,uri,mode,enabled)
-             VALUES (?1,?2,?3,'subscribed',1)
-             ON CONFLICT(session_id,server_object_id,uri)
+             (session_id,server_object_id,config_version_id,uri,mode,enabled)
+             VALUES (?1,?2,?3,?4,'subscribed',1)
+             ON CONFLICT(session_id,server_object_id,config_version_id,uri)
              DO UPDATE SET mode='subscribed',enabled=1",
-            params![session_id, server_id, uri],
+            params![session_id, server_id, version_id, uri],
         )
         .map_err(|error| error.to_string())?;
     Ok(())
@@ -16371,8 +16377,8 @@ async fn mcp_unsubscribe_resource(
     connection
         .execute(
             "DELETE FROM mcp_session_resources
-             WHERE session_id=?1 AND server_object_id=?2 AND uri=?3",
-            params![session_id, server_id, uri],
+             WHERE session_id=?1 AND server_object_id=?2 AND config_version_id=?3 AND uri=?4",
+            params![session_id, server_id, version_id, uri],
         )
         .map_err(|error| error.to_string())?;
     Ok(())
@@ -16383,6 +16389,7 @@ async fn mcp_attach_resource(
     state: State<'_, DesktopState>,
     session_id: String,
     server_id: String,
+    version_id: String,
     uri: String,
 ) -> Result<(), String> {
     let connection = state
@@ -16392,11 +16399,64 @@ async fn mcp_attach_resource(
     connection
         .execute(
             "INSERT INTO mcp_session_resources
-             (session_id,server_object_id,uri,mode,enabled)
-             VALUES (?1,?2,?3,'context',1)
-             ON CONFLICT(session_id,server_object_id,uri)
+             (session_id,server_object_id,config_version_id,uri,mode,enabled)
+             VALUES (?1,?2,?3,?4,'context',1)
+             ON CONFLICT(session_id,server_object_id,config_version_id,uri)
              DO UPDATE SET mode='context',enabled=1",
-            params![session_id, server_id, uri],
+            params![session_id, server_id, version_id, uri],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn mcp_context_resources(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let mut statement = connection
+        .prepare(
+            "SELECT server_object_id,config_version_id,uri,mode
+             FROM mcp_session_resources
+             WHERE session_id=?1 AND mode='context' AND enabled=1",
+        )
+        .map_err(|error| error.to_string())?;
+    statement
+        .query_map([session_id], |row| {
+            Ok(serde_json::json!({
+                "server_id": row.get::<_, String>(0)?,
+                "version_id": row.get::<_, String>(1)?,
+                "uri": row.get::<_, String>(2)?,
+                "mode": row.get::<_, String>(3)?,
+            }))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn mcp_detach_resource(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    server_id: String,
+    version_id: String,
+    uri: String,
+) -> Result<(), String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    connection
+        .execute(
+            "DELETE FROM mcp_session_resources
+             WHERE session_id=?1 AND server_object_id=?2
+               AND config_version_id=?3 AND uri=?4 AND mode='context'",
+            params![session_id, server_id, version_id, uri],
         )
         .map_err(|error| error.to_string())?;
     Ok(())
@@ -16408,11 +16468,11 @@ async fn mcp_prompts(
     server_id: String,
     version_id: String,
 ) -> Result<Vec<opcos_mcp::McpPrompt>, String> {
-    Ok(state
+    state
         .mcp
         .cached_prompts(&server_id, &version_id)
         .await
-        .unwrap_or_default())
+        .ok_or_else(|| "MCP server is not connected; retry the connection".to_owned())
 }
 
 #[tauri::command]
@@ -24290,6 +24350,8 @@ fn main() {
             mcp_subscribe_resource,
             mcp_unsubscribe_resource,
             mcp_attach_resource,
+            mcp_context_resources,
+            mcp_detach_resource,
             mcp_prompts,
             mcp_get_prompt,
             connector_save,

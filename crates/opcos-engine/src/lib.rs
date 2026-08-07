@@ -990,6 +990,23 @@ where
         if let Some(source) = source {
             payload.insert("source".to_owned(), Value::String(source.to_owned()));
         }
+        let summaries = attachments
+            .iter()
+            .map(|attachment| {
+                json!({
+                    "kind": "text",
+                    "name": format!(
+                        "MCP resource: {}",
+                        attachment.uri.as_deref().unwrap_or(&attachment.source)
+                    ),
+                    "mime": attachment.mime_type,
+                    "bytes": attachment.content.len(),
+                })
+            })
+            .collect::<Vec<_>>();
+        if !summaries.is_empty() {
+            payload.insert("attachments".to_owned(), Value::Array(summaries));
+        }
         let event = WorkingEvent {
             event_type: "user_message".into(),
             category: "message".into(),
@@ -1006,15 +1023,11 @@ where
         )?;
         *self.last_incoming_event_id.lock().await = Some(event_id);
         let mut content = vec![json!({"type":"text","text":text})];
-        content.extend(attachments.iter().map(|attachment| {
-            json!({
-                "type": "text",
-                "text": attachment.content,
-                "source": attachment.source,
-                "uri": attachment.uri,
-                "mime_type": attachment.mime_type,
-            })
-        }));
+        content.extend(
+            attachments
+                .iter()
+                .map(|attachment| external_context_content_block(attachment)),
+        );
         let value = json!({"role":"user","content":content});
         self.append("user", value.clone()).await?;
         Ok(value)
@@ -3488,6 +3501,16 @@ where
     }
 }
 
+fn external_context_content_block(attachment: &ExternalContextAttachment) -> Value {
+    let header = format!(
+        "[MCP resource]\nsource: {}\nuri: {}\nmime: {}\n\n",
+        attachment.source,
+        attachment.uri.as_deref().unwrap_or("unknown"),
+        attachment.mime_type.as_deref().unwrap_or("unknown"),
+    );
+    json!({"type": "text", "text": format!("{header}{}", attachment.content)})
+}
+
 fn tool_risk(name: &str) -> ToolRisk {
     match name {
         "read_file"
@@ -4455,6 +4478,25 @@ struct PartialOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_context_content_blocks_use_standard_text_fields() {
+        let block = external_context_content_block(&ExternalContextAttachment {
+            source: "mcp:server".into(),
+            uri: Some("resource://docs".into()),
+            mime_type: Some("text/plain".into()),
+            content: "body".into(),
+        });
+        let keys = block
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec!["type", "text"]);
+        assert_eq!(block["type"], "text");
+        assert!(block["text"].as_str().unwrap().contains("resource://docs"));
+    }
     use async_trait::async_trait;
     use opcos_provider::ToolCallDelta;
     use opcos_store::{SessionRecord, SessionStore, SqliteStore};
