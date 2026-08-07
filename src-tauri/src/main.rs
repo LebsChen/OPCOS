@@ -20056,7 +20056,7 @@ async fn execute_coordination_tool(
             "total_messages": total_messages,
             "omitted_messages": total_messages.saturating_sub(messages.len()),
             "truncated": total_messages > messages.len(),
-            "completion_note": "Worker self-reports never establish completion; branch, push, PR, and GitHub API verification are required"
+            "completion_note": "Worker self-reports never establish completion; forge-backed tasks require branch, push, PR, and GitHub API checks, while local-only tasks require a local branch, clean worktree, and result envelope"
         }));
     }
     Err(format!("unsupported coordination tool: {name}"))
@@ -20754,14 +20754,22 @@ async fn coordination_complete_task(
         };
         (task, project)
     };
-    if let Some(project) = project.as_ref() {
-        verify_task_delivery(&state, project, &initial_task, verified_pr_url.as_deref()).await?;
-    }
+    let forge_backed = if let Some(project) = project.as_ref() {
+        Some(
+            verify_task_delivery(&state, project, &initial_task, verified_pr_url.as_deref())
+                .await?,
+        )
+    } else {
+        None
+    };
     let connection = state
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?;
     let mut task = load_coord_task(&connection, &id)?;
+    if forge_backed == Some(false) {
+        task.require_acceptance = false;
+    }
     task.complete(&worker, Utc::now(), verified_pr_url)
         .map_err(|error| error.to_string())?;
     save_coord_task(&connection, &task)?;
@@ -20773,11 +20781,93 @@ async fn verify_task_delivery(
     project: &ProjectRecord,
     task: &BoardTask,
     verified_pr_url: Option<&str>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let branch = task
         .branch
         .as_deref()
         .ok_or_else(|| "completion requires a branch".to_owned())?;
+    let host = project_host(state, project).await?;
+    let platform = host.health().await.ok().and_then(|health| health.platform);
+    let remote_result = host
+        .exec(ExecRequest {
+            command: format!(
+                "git -C {} remote",
+                quote_for(platform.as_deref(), &project.repo_root)
+            ),
+            cwd: None,
+            timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+            session: None,
+            env: None,
+        })
+        .await
+        .map_err(|error| format!("completion remote inspection failed: {error}"))?;
+    if remote_result.result.exit_code != 0 {
+        return Err("completion remote inspection failed".to_owned());
+    }
+    let forge_backed =
+        !project.repo_url.trim().is_empty() || !remote_result.result.stdout.trim().is_empty();
+    if !forge_backed {
+        let result_message = {
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            connection
+                .query_row(
+                    "SELECT 1 FROM coord_messages WHERE task_id=?1 AND kind='result' LIMIT 1",
+                    [task.id.as_str()],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .unwrap_or(false)
+        };
+        if !result_message {
+            return Err(
+                "local completion requires a Worker result coordination envelope".to_owned(),
+            );
+        }
+        let worker_workspace = state
+            .store
+            .load_project_agents(&project.id)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|agent| agent.branch == branch)
+            .map(|agent| agent.worktree_path)
+            .unwrap_or_else(|| project.repo_root.clone());
+        let commands = [
+            format!(
+                "git -C {} rev-parse --verify refs/heads/{}",
+                quote_for(platform.as_deref(), &worker_workspace),
+                quote_for(platform.as_deref(), branch)
+            ),
+            format!(
+                "git -C {} status --porcelain",
+                quote_for(platform.as_deref(), &worker_workspace)
+            ),
+        ];
+        for (index, command) in commands.into_iter().enumerate() {
+            let result = host
+                .exec(ExecRequest {
+                    command,
+                    cwd: None,
+                    timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+                    session: None,
+                    env: None,
+                })
+                .await
+                .map_err(|error| format!("local completion verification failed: {error}"))?;
+            if result.result.exit_code != 0
+                || (index == 1 && !result.result.stdout.trim().is_empty())
+            {
+                return Err(
+                    "local completion verification failed: branch is missing or worktree is dirty"
+                        .into(),
+                );
+            }
+        }
+        return Ok(false);
+    }
     let pr_url = verified_pr_url
         .or(task.verified_pr_url.as_deref())
         .or(task.pr.as_deref())
@@ -20789,8 +20879,6 @@ async fn verify_task_delivery(
         return Err("pull request repository does not match the project repository".into());
     }
     let pr_repo = pr_target.repo.clone();
-    let host = project_host(state, project).await?;
-    let platform = host.health().await.ok().and_then(|health| health.platform);
     for command in [
         format!(
             "git -C {} rev-parse --verify refs/heads/{}",
@@ -20868,7 +20956,7 @@ async fn verify_task_delivery(
     {
         return Err("completion verification failed: pull request is closed without merge".into());
     }
-    Ok(())
+    Ok(true)
 }
 
 #[tauri::command]
