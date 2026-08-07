@@ -13478,6 +13478,35 @@ async fn resolve_inbox(
             );
             Ok(())
         }
+        Err(opcos_engine::EngineError::ApprovalPending(next_call_id)) => {
+            state
+                .store
+                .set_pending_visibility(&session_id, &next_call_id, "inbox")
+                .map_err(|error| error.to_string())?;
+            if let Some(payload) =
+                coordination_approval_payload(&state, &session_id, &next_call_id)?
+            {
+                audit(
+                    &state,
+                    &session_id,
+                    "coordination_approval_wait",
+                    payload.clone(),
+                );
+                emit(&app, "coordination_approval_pending", None, payload.clone());
+                emit(
+                    &app,
+                    "notice",
+                    Some(&session_id),
+                    json!({
+                        "kind": "approval_pending",
+                        "text": "Approval required; delivered to the Inbox",
+                        "task_id": payload["task_id"],
+                        "call_id": next_call_id,
+                    }),
+                );
+            }
+            Ok(())
+        }
         Err(error) => Err(engine_error_message(error)),
     }
 }
@@ -20994,6 +21023,43 @@ fn resume_coordination_after_approval(
         json!({"task_id": task_id, "worker_id": agent.id, "phase": "Claimed"}),
     );
     Ok(Some(task_id))
+}
+
+fn coordination_approval_payload(
+    state: &DesktopState,
+    session_id: &str,
+    call_id: &str,
+) -> Result<Option<Value>, String> {
+    let Some(agent) = state
+        .store
+        .load_project_agent_by_session(session_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let task_id = connection
+        .query_row(
+            "SELECT id FROM coord_tasks
+             WHERE assignee=?1 AND phase='AwaitingApproval'
+             ORDER BY id LIMIT 1",
+            [&agent.id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    Ok(task_id.map(|task_id| {
+        json!({
+            "task_id": task_id,
+            "worker_id": agent.id,
+            "worker_session_id": session_id,
+            "call_id": call_id,
+            "phase": "AwaitingApproval",
+        })
+    }))
 }
 
 #[tauri::command]
