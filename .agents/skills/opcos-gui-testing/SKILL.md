@@ -1205,3 +1205,60 @@ returned `next_call_id`, never by taking the first database row. A card that say
 engine evidence: verify the corresponding persisted resolution event and that the next tool or
 approval actually starts. When several gated writes are needed, use fresh marker filenames and
 verify the remote file state after each Allow/Deny decision.
+
+## Testing transcript CSS/layout fixes (chevrons, row wrapping)
+
+Style-only fixes in `web/src/style.css` are picked up by **Vite HMR** in the running Tauri window, so no
+rebuild/restart is needed — but the app must have been started against a Vite instance serving the branch
+checkout. A screenshot of the fixed state alone proves nothing; use a **broken control**:
+
+1. Screenshot the fixed rows (full-resolution `zoom` on the row strip, window maximized).
+2. Temporarily edit `style.css` back to the pre-fix values, wait ~3 s for HMR, screenshot again.
+3. `git checkout -- web/src/style.css` and screenshot once more to show the fix returning.
+
+Report the measured pixel geometry (gap label→chevron, chevron→row right edge) rather than "looks right".
+All collapsible transcript rows come from one component, `TranscriptDisclosure`
+(`web/src/components/Transcript.tsx`), rendering `<details class="transcript-thought">`: `Thought for Ns`
+(labelled), and the *bare* variants `Show output` (shell rows) and `View diff` / `View screenshot`
+(artifact rows). One prompt covers three of the four families:
+
+> 1) run: `echo <150 identical-ish chars>` ; 2) use write_file to create
+> `src/routes/deep/nested/categories.js` with some content ; 3) run: `ls -R src`
+
+The long `echo` gives the wrapping-label case, the write gives the `View diff` chevron and doubles as the
+nested-directory local-write test. `View screenshot` needs a browser/screenshot artifact — if none is
+produced, report it as untested instead of assuming parity with `View diff`.
+
+## Faking a "stuck running" session (steering / recovery fixes)
+
+`sessions.run_state` is read straight from sqlite by `list_sessions`, but:
+
+- A `running` value **does not survive a restart**: startup recovery rewrites it to
+  `interrupted` / `interrupted_by_crash` (frontend label `已中断（应用退出）`).
+- Editing the DB while the app runs works (WAL, cross-process), but the frontend keeps its cached session
+  list; navigating between views does *not* refetch. What does refetch is a full `refresh()` — the cheapest
+  UI trigger is **creating another session from the home composer** (`submitHome` awaits `refresh()`), or
+  any `turn_done` with `runState !== "running"`.
+
+Recipe: stop the app → set `run_state='running', stop_reason='none'` → relaunch → set it again while live →
+create a throwaway session → reopen the target session; it now shows `STATUS Running` / `Working for Ns`
+with no engine turn active. Typing and sending there routes through the `steering` command
+(`gui.ts::submissionRoute` + `App.tsx` `steer`), which is the path to exercise.
+
+## Cheap Lead-local / project-routing fixture
+
+`automatic_project_routing_active` is true only for the project member with `sort_order == 0` **and** role
+`Lead`. Fastest fixture (no remote host): `git init -b main ~/opcos-test/<repo>` with one commit → sidebar
+项目 `+` → name + 仓库路径 → 添加成员 with 名称 + 角色 `Lead` + Provider/Model set explicitly → 保存 →
+card `启动会话` (click it twice: the first click creates the session, the button then becomes `打开会话`).
+The member dialog's Provider/Model default to 默认/Auto, which fails on a box with only Cloudflare
+configured — always set them in the dialog.
+
+## Judging "a write failed" from the transcript
+
+A failed local write renders as a single tool row
+`Wrote <path>  Nms  failed · local host path rejected: path is outside local workspace`.
+The presence/absence of a **separate** `Created <path> +N` row (a `multi_edit_result` event) is the real
+signal for `emit_file_change` regressions. Cross-check in sqlite after a clean shutdown: search
+`session_events.event_json` for `"multi_edit_result"` and confirm none mentions the failed path (the
+column is `event_json`, and `session_events` has no `kind` column — `audit_events` does).
