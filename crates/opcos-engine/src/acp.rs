@@ -1,6 +1,6 @@
 use crate::{
-    ApprovalOutcome, Harness, HarnessApprovalRequest, HarnessError, HarnessEvent, HarnessKind,
-    HarnessResumeInput, HarnessTurnInput, SessionRecorder, TurnHandle,
+    AcpAuthMethod, ApprovalOutcome, Harness, HarnessApprovalRequest, HarnessError, HarnessEvent,
+    HarnessKind, HarnessResumeInput, HarnessTurnInput, SessionRecorder, TurnHandle,
 };
 use async_trait::async_trait;
 use opcos_hosts::{Host, HostProcess, HostStdioProcess, SpawnRequest, StdioEvent};
@@ -106,7 +106,7 @@ where
     external_session_id: Mutex<String>,
     workspace: String,
     events: mpsc::Sender<HarnessEvent>,
-    pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
+    pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, AcpRpcError>>>>,
     prompt_pending: Mutex<HashMap<u64, String>>,
     permissions: Mutex<HashMap<String, PendingPermission>>,
     turns: Mutex<HashMap<String, Arc<AcpTurn>>>,
@@ -119,6 +119,13 @@ where
     auth_methods: Mutex<Vec<Value>>,
     auth_required: Mutex<bool>,
     mcp_servers: Mutex<Vec<Value>>,
+}
+
+#[derive(Clone, Debug)]
+struct AcpRpcError {
+    code: i64,
+    message: String,
+    data: Option<Value>,
 }
 
 pub struct AcpHarness<S>
@@ -208,21 +215,24 @@ where
             .await?;
         let protocol_version = init
             .get("protocolVersion")
-            .and_then(|value| {
-                value
-                    .as_str()
-                    .map(str::to_owned)
-                    .or_else(|| value.as_u64().map(|number| number.to_string()))
-            })
+            .cloned()
             .ok_or_else(|| {
                 HarnessError::External("ACP initialize response omitted protocolVersion".into())
+            })
+            .and_then(|value| {
+                serde_json::from_value::<agent_client_protocol::schema::ProtocolVersion>(value)
+                    .map_err(|error| {
+                        HarnessError::External(format!(
+                            "ACP protocol version is incompatible: {error}"
+                        ))
+                    })
             })?;
-        if !matches!(protocol_version.as_str(), "1" | "2" | "v1" | "v2") {
+        if protocol_version != agent_client_protocol::schema::ProtocolVersion::V1 {
             return Err(HarnessError::External(format!(
                 "ACP protocol version is incompatible: {protocol_version}"
             )));
         }
-        *state.protocol_version.lock().await = protocol_version;
+        *state.protocol_version.lock().await = protocol_version.to_string();
         let auth_methods = init
             .get("authMethods")
             .and_then(Value::as_array)
@@ -269,6 +279,27 @@ where
 
     pub async fn advertised_auth_methods(&self) -> Vec<Value> {
         self.state.auth_methods.lock().await.clone()
+    }
+
+    async fn advertised_auth_method_records(&self) -> Vec<AcpAuthMethod> {
+        self.state
+            .auth_methods
+            .lock()
+            .await
+            .iter()
+            .filter_map(|method| {
+                method
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(|id| AcpAuthMethod {
+                        id: id.to_owned(),
+                        description: method
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                    })
+            })
+            .collect()
     }
 
     pub async fn authenticate(&self, method_id: &str) -> Result<(), HarnessError> {
@@ -343,8 +374,7 @@ where
     async fn start_turn(&self, input: HarnessTurnInput) -> Result<TurnHandle, HarnessError> {
         if *self.state.auth_required.lock().await {
             return Err(HarnessError::AcpAuthenticationRequired(
-                serde_json::to_string(&self.advertised_auth_methods().await)
-                    .unwrap_or_else(|_| "[]".into()),
+                self.advertised_auth_method_records().await,
             ));
         }
         let (turn_id, turn, handle) = self.new_turn();
@@ -485,7 +515,11 @@ where
         receiver
             .await
             .map_err(|_| HarnessError::External("ACP response channel closed".into()))?
-            .map_err(HarnessError::External)
+            .map_err(|error| HarnessError::AcpRpc {
+                code: error.code,
+                message: error.message,
+                data: error.data,
+            })
     }
 
     async fn notify(&self, method: &str, params: Value) -> Result<(), HarnessError> {
@@ -569,12 +603,7 @@ where
     if let Some(id) = message.get("id").and_then(Value::as_u64) {
         if message.get("method").is_none() {
             if let Some(turn_id) = state.prompt_pending.lock().await.remove(&id) {
-                let result = message.get("result").cloned().ok_or_else(|| {
-                    message.get("error").map_or_else(
-                        || "ACP prompt response omitted result".to_owned(),
-                        |error| error.to_string(),
-                    )
-                });
+                let result = rpc_result(&message);
                 let turn = state.turns.lock().await.remove(&turn_id);
                 *state.active_turn.lock().await = None;
                 if let Some(turn) = turn {
@@ -612,19 +641,14 @@ where
                         }
                         Err(error) => {
                             if let Some(sender) = turn.sender.lock().await.take() {
-                                let _ = sender.send(Err(HarnessError::External(error)));
+                                let _ = sender.send(Err(error.into()));
                             }
                         }
                     }
                 }
             }
             if let Some(sender) = state.pending.lock().await.remove(&id) {
-                let result = message.get("result").cloned().ok_or_else(|| {
-                    message.get("error").map_or_else(
-                        || "ACP response omitted result".to_owned(),
-                        |error| error.to_string(),
-                    )
-                });
+                let result = rpc_result(&message);
                 let _ = sender.send(result);
             }
             return Ok(());
@@ -647,6 +671,38 @@ where
             .await;
     }
     Ok(())
+}
+
+fn rpc_result(message: &Value) -> Result<Value, AcpRpcError> {
+    if let Some(result) = message.get("result") {
+        return Ok(result.clone());
+    }
+    let Some(error) = message.get("error") else {
+        return Err(AcpRpcError {
+            code: -32603,
+            message: "ACP response omitted result".into(),
+            data: None,
+        });
+    };
+    Err(AcpRpcError {
+        code: error.get("code").and_then(Value::as_i64).unwrap_or(-32603),
+        message: error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("ACP JSON-RPC request failed")
+            .to_owned(),
+        data: error.get("data").cloned(),
+    })
+}
+
+impl From<AcpRpcError> for HarnessError {
+    fn from(error: AcpRpcError) -> Self {
+        Self::AcpRpc {
+            code: error.code,
+            message: error.message,
+            data: error.data,
+        }
+    }
 }
 
 async fn handle_session_update<S>(
@@ -690,14 +746,7 @@ where
             }
         }
         "user_message_chunk" => {
-            if let Some(text) = content_text(update.get("content")) {
-                let _ = state
-                    .events
-                    .send(HarnessEvent::AssistantTextDelta {
-                        text: format!("[user] {text}"),
-                    })
-                    .await;
-            }
+            // The ACP user message is already recorded by the desktop submit path.
         }
         "tool_call" | "tool_call_update" => {
             let _ = state
@@ -756,10 +805,7 @@ where
                 .unwrap_or_default();
             match state.host.read(path).await {
                 Ok(file) => {
-                    let line = params
-                        .get("line")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(1);
+                    let line = params.get("line").and_then(Value::as_u64).unwrap_or(1);
                     if line == 0 {
                         return state.error(id, "ACP line must be 1-based").await;
                     }
@@ -1054,18 +1100,17 @@ fn config_workspace(workspace: &str) -> &str {
 }
 
 fn is_authentication_error(error: &HarnessError) -> bool {
-    error.to_string().to_ascii_lowercase().contains("auth")
+    matches!(
+        error,
+        HarnessError::AcpRpc { code, .. } if matches!(*code, -32001 | -32002 | -32003 | 401 | 403)
+    )
 }
 
 fn map_stop_reason(reason: &str) -> &'static str {
     match reason {
         "max_tokens" => "length",
-        "refusal" => "refusal",
-        "max_turn_requests" => "max_turn_requests",
-        other => match other {
-            "cancelled" => "cancelled",
-            _ => "stop",
-        },
+        "cancelled" => "cancelled",
+        _ => "stop",
     }
 }
 

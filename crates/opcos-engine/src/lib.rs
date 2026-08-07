@@ -448,8 +448,20 @@ pub enum HarnessError {
     PendingNotFound(String),
     #[error("external harness: {0}")]
     External(String),
-    #[error("ACP authentication required; available methods: {0}")]
-    AcpAuthenticationRequired(String),
+    #[error("ACP authentication required")]
+    AcpAuthenticationRequired(Vec<AcpAuthMethod>),
+    #[error("ACP JSON-RPC error {code}: {message}")]
+    AcpRpc {
+        code: i64,
+        message: String,
+        data: Option<Value>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcpAuthMethod {
+    pub id: String,
+    pub description: Option<String>,
 }
 
 #[async_trait]
