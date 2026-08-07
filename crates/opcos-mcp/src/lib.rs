@@ -27,6 +27,7 @@ fn configure_no_window(_command: &mut tokio::process::Command) {}
 
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
 pub const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
+pub const MAX_DISCOVERY_PAGES: usize = 128;
 
 pub fn reconnect_delay(attempt: u32) -> Duration {
     if attempt == 0 {
@@ -108,7 +109,7 @@ pub enum McpServerStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct McpTool {
     pub name: String,
     #[serde(default)]
@@ -128,6 +129,134 @@ pub struct McpToolResult {
     pub is_error: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct McpResource {
+    pub uri: String,
+    pub name: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(rename = "mimeType", default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub annotations: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct McpResourceTemplate {
+    #[serde(rename = "uriTemplate")]
+    pub uri_template: String,
+    pub name: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(rename = "mimeType", default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub annotations: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct McpResourceContent {
+    pub uri: String,
+    #[serde(rename = "mimeType", default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub blob: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct McpPromptArgument {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct McpPrompt {
+    pub name: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub arguments: Vec<McpPromptArgument>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpPromptMessage {
+    pub role: String,
+    pub content: Value,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct McpPromptResult {
+    #[serde(default)]
+    pub description: Option<String>,
+    pub messages: Vec<McpPromptMessage>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpResourceCapabilities {
+    #[serde(rename = "subscribe", default)]
+    pub subscribe: bool,
+    #[serde(rename = "listChanged", default)]
+    pub list_changed: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpPromptCapabilities {
+    #[serde(rename = "listChanged", default)]
+    pub list_changed: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpToolCapabilities {
+    #[serde(rename = "listChanged", default)]
+    pub list_changed: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServerCapabilities {
+    #[serde(default)]
+    pub resources: Option<McpResourceCapabilities>,
+    #[serde(default)]
+    pub prompts: Option<McpPromptCapabilities>,
+    #[serde(default)]
+    pub tools: Option<McpToolCapabilities>,
+    #[serde(default)]
+    pub roots: Option<Value>,
+    #[serde(default)]
+    pub sampling: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct McpNegotiatedInfo {
+    #[serde(rename = "protocolVersion", default)]
+    pub protocol_version: String,
+    #[serde(default)]
+    pub capabilities: McpServerCapabilities,
+    #[serde(rename = "serverInfo", default)]
+    pub server_info: Value,
+    #[serde(default)]
+    pub instructions: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct McpServerCatalog {
+    pub negotiated: McpNegotiatedInfo,
+    pub tools: Vec<McpTool>,
+    pub resources: Vec<McpResource>,
+    pub resource_templates: Vec<McpResourceTemplate>,
+    pub prompts: Vec<McpPrompt>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerSnapshot {
     pub object_id: String,
@@ -136,6 +265,12 @@ pub struct McpServerSnapshot {
     pub last_error: Option<String>,
     pub retry_attempt: u32,
     pub tool_count: usize,
+    #[serde(default)]
+    pub resource_count: usize,
+    #[serde(default)]
+    pub prompt_count: usize,
+    #[serde(default)]
+    pub capabilities: McpServerCapabilities,
 }
 
 #[derive(Debug, Error)]
@@ -168,6 +303,20 @@ pub trait McpCredentialStore: Send + Sync {
 pub trait McpTransportClient: Send {
     async fn initialize(&mut self) -> Result<(), McpClientError>;
     async fn list_tools(&mut self) -> Result<Vec<McpTool>, McpClientError>;
+    async fn list_resources(&mut self) -> Result<Vec<McpResource>, McpClientError>;
+    async fn list_resource_templates(&mut self)
+    -> Result<Vec<McpResourceTemplate>, McpClientError>;
+    async fn read_resource(&mut self, uri: &str)
+    -> Result<Vec<McpResourceContent>, McpClientError>;
+    async fn subscribe_resource(&mut self, uri: &str) -> Result<(), McpClientError>;
+    async fn unsubscribe_resource(&mut self, uri: &str) -> Result<(), McpClientError>;
+    async fn list_prompts(&mut self) -> Result<Vec<McpPrompt>, McpClientError>;
+    async fn get_prompt(
+        &mut self,
+        name: &str,
+        arguments: HashMap<String, String>,
+    ) -> Result<McpPromptResult, McpClientError>;
+    fn negotiated_info(&self) -> McpNegotiatedInfo;
     async fn call_tool(
         &mut self,
         name: &str,
@@ -264,11 +413,28 @@ fn qualify_tools(server_key: &str, tools: &mut [McpTool]) {
     }
 }
 
+fn parse_page<T: for<'de> Deserialize<'de>>(
+    value: &Value,
+    key: &str,
+) -> Result<Vec<T>, McpClientError> {
+    serde_json::from_value(value.get(key).cloned().unwrap_or_else(|| json!([])))
+        .map_err(|_| McpClientError::InvalidResponse)
+}
+
+fn next_cursor(value: &Value) -> Result<Option<String>, McpClientError> {
+    match value.get("nextCursor") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(cursor)) if !cursor.is_empty() => Ok(Some(cursor.clone())),
+        _ => Err(McpClientError::InvalidResponse),
+    }
+}
+
 struct StdioClient {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
+    negotiated: McpNegotiatedInfo,
 }
 
 impl StdioClient {
@@ -319,6 +485,7 @@ impl StdioClient {
             stdin,
             stdout: BufReader::new(stdout),
             next_id: 1,
+            negotiated: McpNegotiatedInfo::default(),
         })
     }
 
@@ -380,7 +547,7 @@ impl StdioClient {
 #[async_trait]
 impl McpTransportClient for StdioClient {
     async fn initialize(&mut self) -> Result<(), McpClientError> {
-        tokio::time::timeout(
+        let value = tokio::time::timeout(
             Duration::from_secs(DEFAULT_EXEC_TIMEOUT_SECONDS),
             self.request(
                 "initialize",
@@ -393,18 +560,81 @@ impl McpTransportClient for StdioClient {
         )
         .await
         .map_err(|_| McpClientError::Timeout)??;
+        self.negotiated =
+            serde_json::from_value(value).map_err(|_| McpClientError::InvalidResponse)?;
         self.notify("notifications/initialized", json!({})).await
     }
 
     async fn list_tools(&mut self) -> Result<Vec<McpTool>, McpClientError> {
-        let value = tokio::time::timeout(
-            Duration::from_secs(DEFAULT_EXEC_TIMEOUT_SECONDS),
-            self.request("tools/list", json!({})),
-        )
-        .await
-        .map_err(|_| McpClientError::Timeout)??;
-        serde_json::from_value(value.get("tools").cloned().unwrap_or_else(|| json!([])))
+        let mut cursor = None;
+        let mut tools = Vec::new();
+        for _ in 0..MAX_DISCOVERY_PAGES {
+            let mut params = json!({});
+            if let Some(cursor) = &cursor {
+                params["cursor"] = json!(cursor);
+            }
+            let value = self.request_with_timeout("tools/list", params).await?;
+            tools.extend(parse_page::<McpTool>(&value, "tools")?);
+            cursor = next_cursor(&value)?;
+            if cursor.is_none() {
+                return Ok(tools);
+            }
+        }
+        Err(McpClientError::InvalidResponse)
+    }
+
+    async fn list_resources(&mut self) -> Result<Vec<McpResource>, McpClientError> {
+        self.list_paged("resources/list", "resources").await
+    }
+
+    async fn list_resource_templates(
+        &mut self,
+    ) -> Result<Vec<McpResourceTemplate>, McpClientError> {
+        self.list_paged("resources/templates/list", "resourceTemplates")
+            .await
+    }
+
+    async fn read_resource(
+        &mut self,
+        uri: &str,
+    ) -> Result<Vec<McpResourceContent>, McpClientError> {
+        let value = self
+            .request_with_timeout("resources/read", json!({"uri": uri}))
+            .await?;
+        serde_json::from_value(value.get("contents").cloned().unwrap_or_else(|| json!([])))
             .map_err(|_| McpClientError::InvalidResponse)
+    }
+
+    async fn subscribe_resource(&mut self, uri: &str) -> Result<(), McpClientError> {
+        self.request_with_timeout("resources/subscribe", json!({"uri": uri}))
+            .await
+            .map(|_| ())
+    }
+
+    async fn unsubscribe_resource(&mut self, uri: &str) -> Result<(), McpClientError> {
+        self.request_with_timeout("resources/unsubscribe", json!({"uri": uri}))
+            .await
+            .map(|_| ())
+    }
+
+    async fn list_prompts(&mut self) -> Result<Vec<McpPrompt>, McpClientError> {
+        self.list_paged("prompts/list", "prompts").await
+    }
+
+    async fn get_prompt(
+        &mut self,
+        name: &str,
+        arguments: HashMap<String, String>,
+    ) -> Result<McpPromptResult, McpClientError> {
+        serde_json::from_value(
+            self.request_with_timeout("prompts/get", json!({"name": name, "arguments": arguments}))
+                .await?,
+        )
+        .map_err(|_| McpClientError::InvalidResponse)
+    }
+
+    fn negotiated_info(&self) -> McpNegotiatedInfo {
+        self.negotiated.clone()
     }
 
     async fn call_tool(
@@ -438,12 +668,50 @@ impl McpTransportClient for StdioClient {
     }
 }
 
+impl StdioClient {
+    async fn request_with_timeout(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, McpClientError> {
+        tokio::time::timeout(
+            Duration::from_secs(DEFAULT_EXEC_TIMEOUT_SECONDS),
+            self.request(method, params),
+        )
+        .await
+        .map_err(|_| McpClientError::Timeout)?
+    }
+
+    async fn list_paged<T: for<'de> Deserialize<'de>>(
+        &mut self,
+        method: &str,
+        key: &str,
+    ) -> Result<Vec<T>, McpClientError> {
+        let mut cursor = None;
+        let mut values = Vec::new();
+        for _ in 0..MAX_DISCOVERY_PAGES {
+            let mut params = json!({});
+            if let Some(cursor) = &cursor {
+                params["cursor"] = json!(cursor);
+            }
+            let value = self.request_with_timeout(method, params).await?;
+            values.extend(parse_page::<T>(&value, key)?);
+            cursor = next_cursor(&value)?;
+            if cursor.is_none() {
+                return Ok(values);
+            }
+        }
+        Err(McpClientError::InvalidResponse)
+    }
+}
+
 struct HttpClient {
     client: reqwest::Client,
     url: String,
     headers: HeaderMap,
     next_id: u64,
     session_id: Option<String>,
+    negotiated: McpNegotiatedInfo,
 }
 
 impl HttpClient {
@@ -489,6 +757,7 @@ impl HttpClient {
             headers,
             next_id: 1,
             session_id: None,
+            negotiated: McpNegotiatedInfo::default(),
         })
     }
 
@@ -589,21 +858,65 @@ impl HttpClient {
 #[async_trait]
 impl McpTransportClient for HttpClient {
     async fn initialize(&mut self) -> Result<(), McpClientError> {
-        self.request(
-            "initialize",
-            json!({
-                "protocolVersion": PROTOCOL_VERSION, "capabilities": {},
-                "clientInfo": {"name": "OPCOS", "version": env!("CARGO_PKG_VERSION")}
-            }),
+        self.negotiated = serde_json::from_value(
+            self.request(
+                "initialize",
+                json!({
+                    "protocolVersion": PROTOCOL_VERSION, "capabilities": {},
+                    "clientInfo": {"name": "OPCOS", "version": env!("CARGO_PKG_VERSION")}
+                }),
+            )
+            .await?,
         )
-        .await
-        .map(|_| ())?;
+        .map_err(|_| McpClientError::InvalidResponse)?;
         self.notify("notifications/initialized", json!({})).await
     }
     async fn list_tools(&mut self) -> Result<Vec<McpTool>, McpClientError> {
-        let value = self.request("tools/list", json!({})).await?;
-        serde_json::from_value(value.get("tools").cloned().unwrap_or_else(|| json!([])))
+        self.list_paged("tools/list", "tools").await
+    }
+    async fn list_resources(&mut self) -> Result<Vec<McpResource>, McpClientError> {
+        self.list_paged("resources/list", "resources").await
+    }
+    async fn list_resource_templates(
+        &mut self,
+    ) -> Result<Vec<McpResourceTemplate>, McpClientError> {
+        self.list_paged("resources/templates/list", "resourceTemplates")
+            .await
+    }
+    async fn read_resource(
+        &mut self,
+        uri: &str,
+    ) -> Result<Vec<McpResourceContent>, McpClientError> {
+        let value = self.request("resources/read", json!({"uri": uri})).await?;
+        serde_json::from_value(value.get("contents").cloned().unwrap_or_else(|| json!([])))
             .map_err(|_| McpClientError::InvalidResponse)
+    }
+    async fn subscribe_resource(&mut self, uri: &str) -> Result<(), McpClientError> {
+        self.request("resources/subscribe", json!({"uri": uri}))
+            .await
+            .map(|_| ())
+    }
+    async fn unsubscribe_resource(&mut self, uri: &str) -> Result<(), McpClientError> {
+        self.request("resources/unsubscribe", json!({"uri": uri}))
+            .await
+            .map(|_| ())
+    }
+    async fn list_prompts(&mut self) -> Result<Vec<McpPrompt>, McpClientError> {
+        self.list_paged("prompts/list", "prompts").await
+    }
+    async fn get_prompt(
+        &mut self,
+        name: &str,
+        arguments: HashMap<String, String>,
+    ) -> Result<McpPromptResult, McpClientError> {
+        serde_json::from_value(
+            self.request("prompts/get", json!({"name": name, "arguments": arguments}))
+                .await?,
+        )
+        .map_err(|_| McpClientError::InvalidResponse)
+    }
+    fn negotiated_info(&self) -> McpNegotiatedInfo {
+        self.negotiated.clone()
     }
     async fn call_tool(
         &mut self,
@@ -623,10 +936,35 @@ impl McpTransportClient for HttpClient {
     async fn close(&mut self) {}
 }
 
+impl HttpClient {
+    async fn list_paged<T: for<'de> Deserialize<'de>>(
+        &mut self,
+        method: &str,
+        key: &str,
+    ) -> Result<Vec<T>, McpClientError> {
+        let mut cursor = None;
+        let mut values = Vec::new();
+        for _ in 0..MAX_DISCOVERY_PAGES {
+            let mut params = json!({});
+            if let Some(cursor) = &cursor {
+                params["cursor"] = json!(cursor);
+            }
+            let value = self.request(method, params).await?;
+            values.extend(parse_page::<T>(&value, key)?);
+            cursor = next_cursor(&value)?;
+            if cursor.is_none() {
+                return Ok(values);
+            }
+        }
+        Err(McpClientError::InvalidResponse)
+    }
+}
+
 pub struct McpManager<S> {
     credentials: Arc<S>,
     clients: Mutex<HashMap<String, SharedMcpClient>>,
-    tools: Mutex<HashMap<(String, String), Vec<McpTool>>>,
+    catalogs: Mutex<HashMap<(String, String), McpServerCatalog>>,
+    subscriptions: Mutex<HashMap<(String, String), std::collections::HashSet<String>>>,
     active_versions: Mutex<HashMap<String, String>>,
     statuses: Mutex<HashMap<String, McpServerSnapshot>>,
     watchers: Mutex<HashMap<String, JoinHandle<()>>>,
@@ -637,7 +975,8 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
         Self {
             credentials,
             clients: Mutex::new(HashMap::new()),
-            tools: Mutex::new(HashMap::new()),
+            catalogs: Mutex::new(HashMap::new()),
+            subscriptions: Mutex::new(HashMap::new()),
             active_versions: Mutex::new(HashMap::new()),
             statuses: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
@@ -672,6 +1011,9 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
                     last_error: None,
                     retry_attempt: 0,
                     tool_count: 0,
+                    resource_count: 0,
+                    prompt_count: 0,
+                    capabilities: McpServerCapabilities::default(),
                 },
             );
             return Ok(Vec::new());
@@ -683,9 +1025,9 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             .get(&config.object_id)
             .is_some_and(|active| active == version_id)
             && self.clients.lock().await.contains_key(&config.object_id)
-            && let Some(tools) = self.cached_tools(&config.object_id, version_id).await
+            && let Some(catalog) = self.cached_catalog(&config.object_id, version_id).await
         {
-            return Ok(tools);
+            return Ok(catalog.tools);
         }
         self.statuses.lock().await.insert(
             config.object_id.clone(),
@@ -696,6 +1038,9 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
                 last_error: None,
                 retry_attempt: 0,
                 tool_count: 0,
+                resource_count: 0,
+                prompt_count: 0,
+                capabilities: McpServerCapabilities::default(),
             },
         );
         let credentials = self.credentials.get(&config.object_id).await?;
@@ -707,12 +1052,17 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             client.close().await;
             return Err(error);
         }
-        let mut tools = match client.list_tools().await {
-            Ok(tools) => tools,
-            Err(error) => {
-                client.close().await;
-                return Err(error);
+        let negotiated = client.negotiated_info();
+        let mut tools = if negotiated.capabilities.tools.is_some() {
+            match client.list_tools().await {
+                Ok(tools) => tools,
+                Err(error) => {
+                    client.close().await;
+                    return Err(error);
+                }
             }
+        } else {
+            Vec::new()
         };
         for tool in &mut tools {
             tool.server_id = config.object_id.clone();
@@ -723,9 +1073,31 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             config.include_tools.as_deref(),
             config.exclude_tools.as_deref(),
         );
-        self.tools.lock().await.insert(
+        let resources = if negotiated.capabilities.resources.is_some() {
+            client.list_resources().await?
+        } else {
+            Vec::new()
+        };
+        let resource_templates = if negotiated.capabilities.resources.is_some() {
+            client.list_resource_templates().await?
+        } else {
+            Vec::new()
+        };
+        let prompts = if negotiated.capabilities.prompts.is_some() {
+            client.list_prompts().await?
+        } else {
+            Vec::new()
+        };
+        let catalog = McpServerCatalog {
+            negotiated: negotiated.clone(),
+            tools: tools.clone(),
+            resources,
+            resource_templates,
+            prompts,
+        };
+        self.catalogs.lock().await.insert(
             (config.object_id.clone(), version_id.to_owned()),
-            tools.clone(),
+            catalog.clone(),
         );
         self.active_versions
             .lock()
@@ -749,6 +1121,9 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
                 last_error: None,
                 retry_attempt: 0,
                 tool_count: tools.len(),
+                resource_count: catalog.resources.len(),
+                prompt_count: catalog.prompts.len(),
+                capabilities: negotiated.capabilities,
             },
         );
         Ok(tools)
@@ -779,6 +1154,9 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
                             last_error: Some(error.to_string()),
                             retry_attempt: attempt,
                             tool_count: 0,
+                            resource_count: 0,
+                            prompt_count: 0,
+                            capabilities: McpServerCapabilities::default(),
                         },
                     );
                     if attempt >= max_attempts {
@@ -791,6 +1169,9 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
                                 last_error: Some(error.to_string()),
                                 retry_attempt: attempt,
                                 tool_count: 0,
+                                resource_count: 0,
+                                prompt_count: 0,
+                                capabilities: McpServerCapabilities::default(),
                             },
                         );
                         return Err(error);
@@ -805,6 +1186,9 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
                             last_error: Some(error.to_string()),
                             retry_attempt: attempt + 1,
                             tool_count: 0,
+                            resource_count: 0,
+                            prompt_count: 0,
+                            capabilities: McpServerCapabilities::default(),
                         },
                     );
                     tokio::time::sleep(delay).await;
@@ -814,19 +1198,41 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
         }
     }
 
-    pub async fn cached_tools(&self, object_id: &str, version_id: &str) -> Option<Vec<McpTool>> {
-        self.tools
+    pub async fn cached_catalog(
+        &self,
+        object_id: &str,
+        version_id: &str,
+    ) -> Option<McpServerCatalog> {
+        self.catalogs
             .lock()
             .await
             .get(&(object_id.to_owned(), version_id.to_owned()))
             .cloned()
     }
 
+    pub async fn cached_tools(&self, object_id: &str, version_id: &str) -> Option<Vec<McpTool>> {
+        self.cached_catalog(object_id, version_id)
+            .await
+            .map(|catalog| catalog.tools)
+    }
+
     pub async fn seed_cached_tools(&self, object_id: &str, version_id: &str, tools: Vec<McpTool>) {
-        self.tools
+        let key = (object_id.to_owned(), version_id.to_owned());
+        let mut catalogs = self.catalogs.lock().await;
+        let catalog = catalogs.entry(key).or_default();
+        catalog.tools = tools;
+    }
+
+    pub async fn seed_cached_catalog(
+        &self,
+        object_id: &str,
+        version_id: &str,
+        catalog: McpServerCatalog,
+    ) {
+        self.catalogs
             .lock()
             .await
-            .insert((object_id.to_owned(), version_id.to_owned()), tools);
+            .insert((object_id.to_owned(), version_id.to_owned()), catalog);
     }
 
     pub async fn call(
@@ -869,12 +1275,13 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
         arguments: Value,
     ) -> Result<McpToolResult, McpClientError> {
         let active_versions = self.active_versions.lock().await;
-        let catalog = self.tools.lock().await;
+        let catalog = self.catalogs.lock().await;
         let (server_id, original_name) = active_versions
             .iter()
             .filter_map(|(server_id, version_id)| {
                 catalog
                     .get(&(server_id.clone(), version_id.clone()))?
+                    .tools
                     .iter()
                     .find(|tool| tool.qualified_name == qualified_name)
                     .map(|tool| (server_id.clone(), tool.name.clone()))
@@ -883,6 +1290,179 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             .ok_or(McpClientError::Disconnected)?;
         drop(catalog);
         self.call(&server_id, &original_name, arguments).await
+    }
+
+    pub async fn cached_resources(
+        &self,
+        object_id: &str,
+        version_id: &str,
+    ) -> Option<Vec<McpResource>> {
+        self.cached_catalog(object_id, version_id)
+            .await
+            .map(|catalog| catalog.resources)
+    }
+
+    pub async fn cached_resource_templates(
+        &self,
+        object_id: &str,
+        version_id: &str,
+    ) -> Option<Vec<McpResourceTemplate>> {
+        self.cached_catalog(object_id, version_id)
+            .await
+            .map(|catalog| catalog.resource_templates)
+    }
+
+    pub async fn cached_prompts(
+        &self,
+        object_id: &str,
+        version_id: &str,
+    ) -> Option<Vec<McpPrompt>> {
+        self.cached_catalog(object_id, version_id)
+            .await
+            .map(|catalog| catalog.prompts)
+    }
+
+    pub async fn invalidate_catalog(&self, object_id: &str, version_id: &str) {
+        self.catalogs
+            .lock()
+            .await
+            .remove(&(object_id.to_owned(), version_id.to_owned()));
+    }
+
+    pub async fn handle_notification(
+        &self,
+        object_id: &str,
+        version_id: &str,
+        method: &str,
+        resource_uri: Option<&str>,
+    ) -> bool {
+        let recognized = matches!(
+            method,
+            "notifications/tools/list_changed"
+                | "notifications/resources/list_changed"
+                | "notifications/prompts/list_changed"
+                | "notifications/resources/updated"
+        );
+        if !recognized {
+            return false;
+        }
+        self.invalidate_catalog(object_id, version_id).await;
+        if method == "notifications/resources/updated"
+            && let Some(uri) = resource_uri
+        {
+            self.subscriptions
+                .lock()
+                .await
+                .entry((object_id.to_owned(), version_id.to_owned()))
+                .or_default()
+                .insert(uri.to_owned());
+        }
+        true
+    }
+
+    pub async fn subscribe_resource(
+        &self,
+        object_id: &str,
+        version_id: &str,
+        uri: &str,
+    ) -> Result<(), McpClientError> {
+        let client = self
+            .clients
+            .lock()
+            .await
+            .get(object_id)
+            .cloned()
+            .ok_or(McpClientError::Disconnected)?;
+        client.lock().await.subscribe_resource(uri).await?;
+        self.subscriptions
+            .lock()
+            .await
+            .entry((object_id.to_owned(), version_id.to_owned()))
+            .or_default()
+            .insert(uri.to_owned());
+        Ok(())
+    }
+
+    pub async fn unsubscribe_resource(
+        &self,
+        object_id: &str,
+        version_id: &str,
+        uri: &str,
+    ) -> Result<(), McpClientError> {
+        let client = self
+            .clients
+            .lock()
+            .await
+            .get(object_id)
+            .cloned()
+            .ok_or(McpClientError::Disconnected)?;
+        client.lock().await.unsubscribe_resource(uri).await?;
+        if let Some(values) = self
+            .subscriptions
+            .lock()
+            .await
+            .get_mut(&(object_id.to_owned(), version_id.to_owned()))
+        {
+            values.remove(uri);
+        }
+        Ok(())
+    }
+
+    pub async fn subscriptions(&self, object_id: &str, version_id: &str) -> Vec<String> {
+        self.subscriptions
+            .lock()
+            .await
+            .get(&(object_id.to_owned(), version_id.to_owned()))
+            .map(|values| values.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub async fn refresh_after_notification(
+        self: &Arc<Self>,
+        config: &McpServerConfig,
+        version_id: &str,
+        method: &str,
+        resource_uri: Option<&str>,
+    ) -> Result<bool, McpClientError> {
+        if !self
+            .handle_notification(&config.object_id, version_id, method, resource_uri)
+            .await
+        {
+            return Ok(false);
+        }
+        self.connect_inner(config, version_id).await?;
+        Ok(true)
+    }
+
+    pub async fn read_resource(
+        &self,
+        object_id: &str,
+        uri: &str,
+    ) -> Result<Vec<McpResourceContent>, McpClientError> {
+        let client = self
+            .clients
+            .lock()
+            .await
+            .get(object_id)
+            .cloned()
+            .ok_or(McpClientError::Disconnected)?;
+        client.lock().await.read_resource(uri).await
+    }
+
+    pub async fn get_prompt(
+        &self,
+        object_id: &str,
+        name: &str,
+        arguments: HashMap<String, String>,
+    ) -> Result<McpPromptResult, McpClientError> {
+        let client = self
+            .clients
+            .lock()
+            .await
+            .get(object_id)
+            .cloned()
+            .ok_or(McpClientError::Disconnected)?;
+        client.lock().await.get_prompt(name, arguments).await
     }
 
     pub async fn statuses(&self) -> Vec<McpServerSnapshot> {
@@ -897,6 +1477,14 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             let mut client = client.lock().await;
             client.close().await;
         }
+        self.catalogs
+            .lock()
+            .await
+            .retain(|(server_id, _), _| server_id != object_id);
+        self.subscriptions
+            .lock()
+            .await
+            .retain(|(server_id, _), _| server_id != object_id);
     }
 
     pub async fn shutdown(&self) {
@@ -915,6 +1503,8 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             let mut client = client.lock().await;
             client.close().await;
         }
+        self.catalogs.lock().await.clear();
+        self.subscriptions.lock().await.clear();
     }
 
     async fn start_liveness(self: &Arc<Self>, config: McpServerConfig, version_id: String) {
@@ -1010,7 +1600,14 @@ pub async fn dispatch<C: RvmClient>(
             "capabilities": {},
             "serverInfo": {"name": "OPCOS", "version": env!("CARGO_PKG_VERSION")}
         }),
-        "tools/list" => {
+        "tools/list"
+        | "resources/list"
+        | "resources/templates/list"
+        | "resources/read"
+        | "resources/subscribe"
+        | "resources/unsubscribe"
+        | "prompts/list"
+        | "prompts/get" => {
             let response = client
                 .mcp(serde_json::json!({
                     "jsonrpc": "2.0",
@@ -1163,6 +1760,102 @@ mod tests {
         }];
         assert!(filter_tools(tools, None, None).len() == 1);
         assert!(filter_tools(Vec::new(), None, None).is_empty());
+    }
+
+    #[test]
+    fn mcp_resource_and_prompt_models_match_server_shapes() {
+        let resource: McpResource = serde_json::from_value(json!({
+            "uri": "ui://github/me",
+            "name": "get_me_ui",
+            "mimeType": "text/html"
+        }))
+        .unwrap();
+        assert_eq!(resource.mime_type.as_deref(), Some("text/html"));
+
+        let prompt: McpPrompt = serde_json::from_value(json!({
+            "name": "issue_to_fix_workflow",
+            "description": "Turn an issue into a workflow",
+            "arguments": [{"name": "issue_number", "required": true}]
+        }))
+        .unwrap();
+        assert!(prompt.arguments[0].required);
+    }
+
+    #[test]
+    fn paginated_discovery_follows_cursor_and_rejects_malformed_cursor() {
+        let first = json!({
+            "tools": [{"name": "one", "inputSchema": {"type": "object"}}],
+            "nextCursor": "page-2"
+        });
+        let second = json!({
+            "tools": [{"name": "two", "inputSchema": {"type": "object"}}]
+        });
+        let mut tools = parse_page::<McpTool>(&first, "tools").unwrap();
+        let cursor = next_cursor(&first).unwrap();
+        assert_eq!(cursor.as_deref(), Some("page-2"));
+        tools.extend(parse_page::<McpTool>(&second, "tools").unwrap());
+        assert_eq!(tools.len(), 2);
+        assert!(matches!(
+            next_cursor(&json!({"nextCursor": 42})),
+            Err(McpClientError::InvalidResponse)
+        ));
+    }
+
+    #[test]
+    fn capability_gating_treats_undeclared_catalogs_as_empty() {
+        let capabilities = McpServerCapabilities::default();
+        assert!(capabilities.resources.is_none());
+        assert!(capabilities.prompts.is_none());
+        assert!(capabilities.tools.is_none());
+        let catalog = McpServerCatalog {
+            negotiated: McpNegotiatedInfo {
+                capabilities,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(catalog.tools.is_empty());
+        assert!(catalog.resources.is_empty());
+        assert!(catalog.prompts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn notification_handler_invalidates_catalog_and_tracks_resource_updates() {
+        let manager = McpManager::new(Arc::new(NoCredentials));
+        manager
+            .seed_cached_catalog(
+                "server-a",
+                "v1",
+                McpServerCatalog {
+                    resources: vec![McpResource {
+                        uri: "file:///a".into(),
+                        name: "a".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            manager
+                .handle_notification(
+                    "server-a",
+                    "v1",
+                    "notifications/resources/updated",
+                    Some("file:///a")
+                )
+                .await
+        );
+        assert!(manager.cached_catalog("server-a", "v1").await.is_none());
+        assert_eq!(
+            manager.subscriptions("server-a", "v1").await,
+            vec!["file:///a".to_owned()]
+        );
+        assert!(
+            !manager
+                .handle_notification("server-a", "v1", "notifications/unknown", None)
+                .await
+        );
     }
 
     #[test]
