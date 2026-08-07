@@ -19502,15 +19502,29 @@ async fn record_local_plan_execution(
         )
         .map_err(|error| error.to_string())?;
     let engine = engine_for(app, state, leader_session_id, ToolOrigin::User).await?;
-    engine
-        .queue_steering(format!(
-            "Execute this plan step locally as the Lead because worker dispatch was unavailable: \
-             {}. Do not ask the user how to route it; perform the step and verify the result.",
-            step.description
-        ))
-        .await
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    let prompt = format!(
+        "Execute this plan step locally as the Lead because worker dispatch was unavailable: \
+         {}. Do not ask the user how to route it; perform the step and verify the result.",
+        step.description
+    );
+    let run_state = state
+        .store
+        .load_session(leader_session_id)
+        .map_err(|error| error.to_string())?
+        .map(|session| session.run_state);
+    if run_state.as_deref() == Some("running") {
+        engine
+            .queue_steering(prompt)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    } else {
+        engine
+            .submit_text(prompt)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
 }
 
 async fn auto_route_project_plan(
