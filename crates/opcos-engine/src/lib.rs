@@ -66,6 +66,14 @@ pub enum EngineError {
     ApprovalAlreadyProcessed(String),
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ExternalContextAttachment {
+    pub source: String,
+    pub uri: Option<String>,
+    pub mime_type: Option<String>,
+    pub content: String,
+}
+
 // Deadlock safeguard for streams that produce transport bytes but no parsed chunks.
 const DEFAULT_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -922,12 +930,21 @@ where
     }
 
     pub async fn submit_text(&self, text: impl Into<String>) -> Result<AssistantTurn, EngineError> {
+        self.submit_text_with_attachments(text, Vec::new()).await
+    }
+
+    pub async fn submit_text_with_attachments(
+        &self,
+        text: impl Into<String>,
+        attachments: Vec<ExternalContextAttachment>,
+    ) -> Result<AssistantTurn, EngineError> {
         self.begin_turn()?;
         self.interrupted.store(false, Ordering::SeqCst);
         self.policy_denied.store(false, Ordering::SeqCst);
         self.set_session_status("running", "none");
         let result = async {
-            self.append_user_message(text.into(), None).await?;
+            self.append_user_message_with_attachments(text.into(), None, &attachments)
+                .await?;
             self.run_loop(self.provider_messages()?).await
         }
         .await;
@@ -958,6 +975,16 @@ where
         text: String,
         source: Option<&str>,
     ) -> Result<Value, EngineError> {
+        self.append_user_message_with_attachments(text, source, &[])
+            .await
+    }
+
+    async fn append_user_message_with_attachments(
+        &self,
+        text: String,
+        source: Option<&str>,
+        attachments: &[ExternalContextAttachment],
+    ) -> Result<Value, EngineError> {
         let mut payload =
             serde_json::Map::from_iter([("message".to_owned(), Value::String(text.clone()))]);
         if let Some(source) = source {
@@ -978,7 +1005,17 @@ where
             },
         )?;
         *self.last_incoming_event_id.lock().await = Some(event_id);
-        let value = json!({"role":"user","content":[{"type":"text","text":text}]});
+        let mut content = vec![json!({"type":"text","text":text})];
+        content.extend(attachments.iter().map(|attachment| {
+            json!({
+                "type": "text",
+                "text": attachment.content,
+                "source": attachment.source,
+                "uri": attachment.uri,
+                "mime_type": attachment.mime_type,
+            })
+        }));
+        let value = json!({"role":"user","content":content});
         self.append("user", value.clone()).await?;
         Ok(value)
     }

@@ -24,9 +24,9 @@ use opcos_assets::{
 use opcos_engine::SecretScrubber;
 use opcos_engine::{
     AcpHarness, AcpHarnessConfig, AgentEngine, ArtifactReference, ArtifactRequest, ArtifactSink,
-    EngineError, Harness, LifecycleHook, LifecycleHookConfig, OpenCodeHarness,
-    OpenCodeHarnessConfig, PreflightDecision, SessionRecorder, ToolExecutor, ToolOrigin,
-    TurnEngine,
+    EngineError, ExternalContextAttachment, Harness, LifecycleHook, LifecycleHookConfig,
+    OpenCodeHarness, OpenCodeHarnessConfig, PreflightDecision, SessionRecorder, ToolExecutor,
+    ToolOrigin, TurnEngine,
     computer_use::{
         BestEffortScreenshotChangedVerifier, ComputerUseLoopConfig, ComputerUseStep,
         run_computer_use_loop,
@@ -4837,6 +4837,8 @@ struct ProjectView {
 struct SubmitRequest {
     session_id: String,
     text: String,
+    #[serde(default)]
+    attachments: Vec<ExternalContextAttachment>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -5235,6 +5237,14 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                enabled INTEGER NOT NULL,
                PRIMARY KEY(session_id,name)
              );
+             CREATE TABLE IF NOT EXISTS mcp_session_resources (
+               session_id TEXT NOT NULL,
+               server_object_id TEXT NOT NULL,
+               uri TEXT NOT NULL,
+               mode TEXT NOT NULL CHECK(mode IN ('preview','context','subscribed')),
+               enabled INTEGER NOT NULL DEFAULT 1,
+               PRIMARY KEY(session_id,server_object_id,uri)
+             );
              CREATE TABLE IF NOT EXISTS mcp_tool_cache (
                server_object_id TEXT NOT NULL,
                config_version_id TEXT NOT NULL,
@@ -5364,6 +5374,7 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
     migrate_agent_settings(&connection)?;
     migrate_mcp_session_tools(&connection)?;
     migrate_mcp_catalog_cache(&connection)?;
+    migrate_mcp_session_resources(&connection)?;
     migrate_config_objects(&mut connection)?;
     migrate_config_scope_model(&connection)?;
     migrate_removed_organization_presets(&connection)?;
@@ -7034,6 +7045,40 @@ fn migrate_mcp_catalog_cache(connection: &Connection) -> Result<(), String> {
              );
              INSERT INTO desktop_schema_migrations(version,applied_at)
              VALUES ('p1-2-mcp-catalog-cache',datetime('now'));",
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn migrate_mcp_session_resources(connection: &Connection) -> Result<(), String> {
+    let already_applied = connection
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM desktop_schema_migrations
+               WHERE version='p2-1-mcp-session-resources'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if already_applied {
+        return Ok(());
+    }
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS mcp_session_resources (
+               session_id TEXT NOT NULL,
+               server_object_id TEXT NOT NULL,
+               uri TEXT NOT NULL,
+               mode TEXT NOT NULL CHECK(mode IN ('preview','context','subscribed')),
+               enabled INTEGER NOT NULL DEFAULT 1,
+               PRIMARY KEY(session_id,server_object_id,uri)
+             );
+             INSERT INTO desktop_schema_migrations(version,applied_at)
+             VALUES ('p2-1-mcp-session-resources',datetime('now'));",
         )
         .map_err(|error| error.to_string())?;
     transaction.commit().map_err(|error| error.to_string())
@@ -12549,10 +12594,63 @@ async fn submit_engine_turn_with_coordination_ingest(
     state: &DesktopState,
     session_id: &str,
     text: String,
+    attachments: Vec<ExternalContextAttachment>,
 ) -> Result<(), EngineError> {
-    engine.submit_text(text).await?;
+    engine
+        .submit_text_with_attachments(text, attachments)
+        .await?;
     let _ = coordination_ingest_session_inner(state, session_id, false).await;
     Ok(())
+}
+
+async fn session_context_attachments(
+    state: &DesktopState,
+    session_id: &str,
+) -> Result<Vec<ExternalContextAttachment>, String> {
+    let resources = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let mut statement = connection
+            .prepare(
+                "SELECT server_object_id,uri FROM mcp_session_resources
+                 WHERE session_id=?1 AND mode='context' AND enabled=1",
+            )
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map([session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+    let mut attachments = Vec::new();
+    for (server_id, uri) in resources {
+        let contents = state
+            .mcp
+            .read_resource(&server_id, &uri)
+            .await
+            .map_err(|error| error.to_string())?;
+        for content in contents {
+            let text = content
+                .text
+                .or_else(|| {
+                    content
+                        .blob
+                        .map(|blob| format!("[binary resource: {blob}]"))
+                })
+                .unwrap_or_default();
+            attachments.push(ExternalContextAttachment {
+                source: format!("mcp:{server_id}"),
+                uri: Some(content.uri),
+                mime_type: content.mime_type,
+                content: text,
+            });
+        }
+    }
+    Ok(attachments)
 }
 
 async fn submit_turn_inner(
@@ -12729,11 +12827,14 @@ pub(crate) async fn submit_turn_inner_with_context(
             json!({"error": error}),
         );
     }
+    let mut attachments = request.attachments;
+    attachments.extend(session_context_attachments(state, &request.session_id).await?);
     match submit_engine_turn_with_coordination_ingest(
         &engine,
         state,
         &request.session_id,
         request.text,
+        attachments,
     )
     .await
     {
@@ -16181,6 +16282,153 @@ async fn mcp_tools(
     Ok(tools)
 }
 
+#[tauri::command]
+async fn mcp_resources(
+    state: State<'_, DesktopState>,
+    server_id: String,
+    version_id: String,
+) -> Result<Vec<opcos_mcp::McpResource>, String> {
+    Ok(state
+        .mcp
+        .cached_resources(&server_id, &version_id)
+        .await
+        .unwrap_or_default())
+}
+
+#[tauri::command]
+async fn mcp_resource_templates(
+    state: State<'_, DesktopState>,
+    server_id: String,
+    version_id: String,
+) -> Result<Vec<opcos_mcp::McpResourceTemplate>, String> {
+    Ok(state
+        .mcp
+        .cached_resource_templates(&server_id, &version_id)
+        .await
+        .unwrap_or_default())
+}
+
+#[tauri::command]
+async fn mcp_read_resource(
+    state: State<'_, DesktopState>,
+    server_id: String,
+    uri: String,
+) -> Result<Vec<opcos_mcp::McpResourceContent>, String> {
+    state
+        .mcp
+        .read_resource(&server_id, &uri)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn mcp_subscribe_resource(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    server_id: String,
+    version_id: String,
+    uri: String,
+) -> Result<(), String> {
+    state
+        .mcp
+        .subscribe_resource(&server_id, &version_id, &uri)
+        .await
+        .map_err(|error| error.to_string())?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    connection
+        .execute(
+            "INSERT INTO mcp_session_resources
+             (session_id,server_object_id,uri,mode,enabled)
+             VALUES (?1,?2,?3,'subscribed',1)
+             ON CONFLICT(session_id,server_object_id,uri)
+             DO UPDATE SET mode='subscribed',enabled=1",
+            params![session_id, server_id, uri],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn mcp_unsubscribe_resource(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    server_id: String,
+    version_id: String,
+    uri: String,
+) -> Result<(), String> {
+    state
+        .mcp
+        .unsubscribe_resource(&server_id, &version_id, &uri)
+        .await
+        .map_err(|error| error.to_string())?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    connection
+        .execute(
+            "DELETE FROM mcp_session_resources
+             WHERE session_id=?1 AND server_object_id=?2 AND uri=?3",
+            params![session_id, server_id, uri],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn mcp_attach_resource(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    server_id: String,
+    uri: String,
+) -> Result<(), String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    connection
+        .execute(
+            "INSERT INTO mcp_session_resources
+             (session_id,server_object_id,uri,mode,enabled)
+             VALUES (?1,?2,?3,'context',1)
+             ON CONFLICT(session_id,server_object_id,uri)
+             DO UPDATE SET mode='context',enabled=1",
+            params![session_id, server_id, uri],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn mcp_prompts(
+    state: State<'_, DesktopState>,
+    server_id: String,
+    version_id: String,
+) -> Result<Vec<opcos_mcp::McpPrompt>, String> {
+    Ok(state
+        .mcp
+        .cached_prompts(&server_id, &version_id)
+        .await
+        .unwrap_or_default())
+}
+
+#[tauri::command]
+async fn mcp_get_prompt(
+    state: State<'_, DesktopState>,
+    server_id: String,
+    name: String,
+    arguments: HashMap<String, String>,
+) -> Result<opcos_mcp::McpPromptResult, String> {
+    state
+        .mcp
+        .get_prompt(&server_id, &name, arguments)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 async fn linear_graphql(
     state: &DesktopState,
     query: &str,
@@ -18186,6 +18434,9 @@ async fn list_mcp_servers(state: State<'_, DesktopState>) -> Result<Vec<Value>, 
                     }),
                 "last_error": snapshot.and_then(|value| value.last_error.clone()),
                 "tool_count": snapshot.map(|value| value.tool_count).unwrap_or_default(),
+                "resource_count": snapshot.map(|value| value.resource_count).unwrap_or_default(),
+                "prompt_count": snapshot.map(|value| value.prompt_count).unwrap_or_default(),
+                "capabilities": snapshot.map(|value| json!(value.capabilities)).unwrap_or_else(|| json!({})),
                 "version_id": row.get::<_, String>(4)?,
                 "transport": content.get("transport").or_else(|| content.get("type")),
                 "url": content.get("url"),
@@ -20174,6 +20425,7 @@ async fn auto_route_project_plan(
                     state,
                     worker_session,
                     message,
+                    Vec::new(),
                 )
                 .await
                 {
@@ -24032,6 +24284,14 @@ fn main() {
             import_assets,
             discover_remote_assets,
             mcp_tools,
+            mcp_resources,
+            mcp_resource_templates,
+            mcp_read_resource,
+            mcp_subscribe_resource,
+            mcp_unsubscribe_resource,
+            mcp_attach_resource,
+            mcp_prompts,
+            mcp_get_prompt,
             connector_save,
             connector_status,
             connector_validate,
@@ -27017,5 +27277,30 @@ agents:
             .unwrap();
         assert!(applied);
         migrate_mcp_catalog_cache(&connection).unwrap();
+    }
+
+    #[test]
+    fn mcp_session_resources_migration_is_idempotent() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE desktop_schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                )",
+                [],
+            )
+            .unwrap();
+        migrate_mcp_session_resources(&connection).unwrap();
+        migrate_mcp_session_resources(&connection).unwrap();
+        let columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(mcp_session_resources)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(columns.contains(&"mode".to_owned()));
+        assert!(columns.contains(&"enabled".to_owned()));
     }
 }

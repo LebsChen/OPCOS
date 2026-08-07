@@ -350,6 +350,7 @@ async fn run_item(
             serde_json::to_string(&item.payload).map_err(|error| error.to_string())?,
             item.lease_generation
         ),
+        attachments: Vec::new(),
     };
     let repair_loop = (item.task_type == "ci_repair_loop").then(|| RepairLoopContext {
         loop_id: item
