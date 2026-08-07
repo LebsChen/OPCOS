@@ -707,6 +707,15 @@ h3 {
   font-size: 13px;
   line-height: 20px;
 }
+.transcript-shell-row .transcript-output {
+  flex: 0 0 auto;
+  width: auto;
+  margin-left: 0;
+}
+.transcript-shell-row .transcript-output[open] {
+  flex-basis: 100%;
+  width: 100%;
+}
 .transcript-row-label {
   min-width: 0;
   flex: 1 1 auto;
@@ -715,19 +724,21 @@ h3 {
 }
 .transcript-row-duration {
   flex: 0 0 auto;
+  margin-left: 8px;
   color: var(--muted);
   font-size: 12px;
   line-height: 18px;
 }
 .transcript-row-meta {
   flex: 0 0 auto;
+  margin-left: 8px;
   color: var(--muted);
   font-size: 12px;
   line-height: 18px;
 }
 .transcript-row-header {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: 4px;
   justify-content: flex-start;
   color: var(--muted);
@@ -747,7 +758,9 @@ h3 {
   padding: 2px;
 }
 .transcript-thought {
-  display: contents;
+  display: block;
+  flex: 0 0 100%;
+  width: 100%;
 }
 .transcript-thought-chevron {
   flex: 0 0 16px;
@@ -867,6 +880,33 @@ h3 {
 }
 .transcript-item {
   margin: 0 0 18px;
+}
+.transcript-shell-row {
+  display: flex;
+}
+.transcript-terminal-output {
+  display: block;
+  margin: 4px 0 0;
+  padding-left: 0;
+}
+.transcript-terminal-output .artifact-code {
+  margin-left: 0;
+}
+.work-segment > summary,
+.thinking > summary,
+.thinking-head {
+  width: max-content;
+  max-width: 100%;
+  align-items: center;
+}
+.work-segment > summary {
+  display: inline-flex;
+}
+.thinking > summary {
+  display: inline-flex;
+}
+.selected-session-row {
+  background: var(--panel);
 }
 .work-segment .transcript-item {
   margin: 0;

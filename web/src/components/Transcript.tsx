@@ -561,7 +561,7 @@ export function Transcript({
             Boolean(row.detail) && row.label.startsWith("Thought for ");
           return (
             <div
-              className={`transcript-item transcript-row${row.denied ? " text-muted" : row.resultError || (row.exitCode !== undefined && row.exitCode !== 0) ? " text-danger" : ""}`}
+              className={`transcript-item transcript-row${row.shellId ? " transcript-shell-row" : ""}${row.denied ? " text-muted" : row.resultError || (row.exitCode !== undefined && row.exitCode !== 0) ? " text-danger" : ""}`}
               key={rowIndex}
             >
               {!isThoughtRow && (
@@ -608,19 +608,12 @@ export function Transcript({
               )}
               {row.plan && <PlanCard steps={row.plan.steps} />}
               {row.detail && !row.thoughtForCallId && (
-                <Thought
-                  text={row.detail}
-                  label={thoughtLabel(row.label)}
-                  bare
-                />
+                <Thought text={row.detail} label={thoughtLabel(row.label)} />
               )}
               {row.callId && thoughtByCallId.get(row.callId)?.detail && (
                 <Thought
                   text={thoughtByCallId.get(row.callId)?.detail ?? ""}
                   label={thoughtLabel(thoughtByCallId.get(row.callId)?.label)}
-                  forceSummaryBreak={Boolean(
-                    row.terminalOutput || row.terminalTruncated,
-                  )}
                 />
               )}
             </div>
