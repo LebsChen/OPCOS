@@ -481,7 +481,7 @@ pub struct TurnEngine<P, S, E> {
     resolved_caps: Mutex<Option<Caps>>,
     limit_identity: Mutex<Option<(String, String, String)>>,
     interrupted: AtomicBool,
-    steering: Mutex<Vec<String>>,
+    steering: std::sync::Mutex<Vec<String>>,
     last_incoming_event_id: Mutex<Option<String>>,
     steering_waiters: SteeringWaiters,
     events: mpsc::Sender<StreamChunk>,
@@ -650,7 +650,7 @@ where
             resolved_caps: Mutex::new(None),
             limit_identity: Mutex::new(None),
             interrupted: AtomicBool::new(false),
-            steering: Mutex::new(Vec::new()),
+            steering: std::sync::Mutex::new(Vec::new()),
             last_incoming_event_id: Mutex::new(None),
             steering_waiters: Arc::new(std::sync::Mutex::new(Vec::new())),
             events,
@@ -923,6 +923,7 @@ where
 
     pub async fn submit_text(&self, text: impl Into<String>) -> Result<AssistantTurn, EngineError> {
         self.begin_turn()?;
+        self.clear_steering_queue();
         self.interrupted.store(false, Ordering::SeqCst);
         self.policy_denied.store(false, Ordering::SeqCst);
         self.set_session_status("running", "none");
@@ -940,6 +941,7 @@ where
         text: impl Into<String>,
     ) -> Result<AssistantTurn, EngineError> {
         self.begin_turn()?;
+        self.clear_steering_queue();
         self.interrupted.store(false, Ordering::SeqCst);
         self.policy_denied.store(false, Ordering::SeqCst);
         self.set_session_status("running", "none");
@@ -985,6 +987,7 @@ where
 
     pub async fn retry(&self) -> Result<AssistantTurn, EngineError> {
         self.begin_turn()?;
+        self.clear_steering_queue();
         self.interrupted.store(false, Ordering::SeqCst);
         self.policy_denied.store(false, Ordering::SeqCst);
         self.set_session_status("running", "none");
@@ -995,6 +998,7 @@ where
 
     pub async fn resume_pending_turn(&self) -> Result<Option<AssistantTurn>, EngineError> {
         self.begin_turn()?;
+        self.clear_steering_queue();
         self.set_session_status("running", "none");
         self.policy_denied.store(false, Ordering::SeqCst);
         let _ = self
@@ -1121,9 +1125,7 @@ where
 
     fn finish_turn<T>(&self, result: &Result<T, EngineError>) {
         self.turn_active.store(false, Ordering::SeqCst);
-        if let Ok(mut steering) = self.steering.try_lock() {
-            steering.clear();
-        }
+        self.clear_steering_queue();
         let (run_state, stop_reason) = self.turn_status(result);
         self.set_session_status(run_state, stop_reason);
         let _ = self.record_working_event(
@@ -1159,8 +1161,18 @@ where
             .lock()
             .expect("steering waiters mutex poisoned")
             .push(sender);
-        self.steering.lock().await.push(text);
+        self.steering
+            .lock()
+            .expect("steering mutex poisoned")
+            .push(text);
         Ok(receiver)
+    }
+
+    fn clear_steering_queue(&self) {
+        self.steering
+            .lock()
+            .expect("steering mutex poisoned")
+            .clear();
     }
 
     pub fn has_active_turn(&self) -> bool {
@@ -1632,7 +1644,7 @@ where
         messages: &mut Vec<Value>,
         next_iteration: u64,
     ) -> Result<bool, EngineError> {
-        let steering = std::mem::take(&mut *self.steering.lock().await);
+        let steering = std::mem::take(&mut *self.steering.lock().expect("steering mutex poisoned"));
         if steering.is_empty() {
             return Ok(false);
         }
@@ -8606,6 +8618,65 @@ mod tests {
                 && event.event["working_event"]["payload"]["message"] == "follow-up direction"
                 && event.event["working_event"]["payload"]["source"] == "steering"
         }));
+    }
+
+    #[derive(Clone)]
+    struct CaptureProvider {
+        requests: Arc<std::sync::Mutex<Vec<Vec<Value>>>>,
+    }
+
+    #[async_trait]
+    impl Provider for CaptureProvider {
+        async fn complete(&self, _: ProviderRequest) -> Result<AssistantTurn, ProviderError> {
+            unreachable!()
+        }
+
+        async fn stream(
+            &self,
+            request: ProviderRequest,
+            _: mpsc::Sender<StreamChunk>,
+        ) -> Result<AssistantTurn, ProviderError> {
+            self.requests
+                .lock()
+                .expect("request mutex poisoned")
+                .push(request.messages);
+            Ok(AssistantTurn {
+                text: Some("done".into()),
+                ..Default::default()
+            })
+        }
+
+        fn capabilities(&self, _: &str) -> Caps {
+            Caps::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn inactive_steering_queue_is_not_injected_again_on_next_turn() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = TurnEngine::new(
+            CaptureProvider {
+                requests: requests.clone(),
+            },
+            store,
+            Arc::new(FakeTools),
+            "stale-steering",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+
+        let completion = engine.queue_steering("stale direction").await.unwrap();
+        engine.submit_text("new turn").await.unwrap();
+        assert_eq!(completion.await.unwrap().0, "idle");
+
+        let requests = requests.lock().expect("request mutex poisoned");
+        let stale_count = requests[0]
+            .iter()
+            .filter(|message| message["content"][0]["text"] == "stale direction")
+            .count();
+        assert_eq!(stale_count, 1);
     }
 
     #[derive(Clone)]
