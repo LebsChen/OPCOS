@@ -608,11 +608,7 @@ export function Transcript({
               )}
               {row.plan && <PlanCard steps={row.plan.steps} />}
               {row.detail && !row.thoughtForCallId && (
-                <Thought
-                  text={row.detail}
-                  label={thoughtLabel(row.label)}
-                  bare
-                />
+                <Thought text={row.detail} label={thoughtLabel(row.label)} />
               )}
               {row.callId && thoughtByCallId.get(row.callId)?.detail && (
                 <Thought
