@@ -9455,10 +9455,7 @@ fn acp_agent_config(
     })
 }
 
-fn acp_mcp_servers(
-    state: &DesktopState,
-    session: &SessionRecord,
-) -> Result<Vec<Value>, String> {
+fn acp_mcp_servers(state: &DesktopState, session: &SessionRecord) -> Result<Vec<Value>, String> {
     let connection = state
         .database
         .lock()

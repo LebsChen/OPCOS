@@ -773,9 +773,7 @@ where
                 .send(HarnessEvent::ToolCallDelta {
                     call_id: Some(call_id.clone()),
                     tool: Some(tool.clone()),
-                    arguments_fragment: update
-                        .get("rawInput")
-                        .map(Value::to_string),
+                    arguments_fragment: update.get("rawInput").map(Value::to_string),
                 })
                 .await;
             let _ = state
@@ -850,9 +848,7 @@ where
             persist_plan_update(state, &entries).await?;
             let _ = state
                 .events
-                .send(HarnessEvent::PlanUpdate {
-                    entries,
-                })
+                .send(HarnessEvent::PlanUpdate { entries })
                 .await;
         }
         _ => {}
@@ -1614,7 +1610,10 @@ for line in sys.stdin:
         )
         .await
         .unwrap();
-        let error = harness.start_turn(HarnessTurnInput::default()).await.unwrap_err();
+        let error = harness
+            .start_turn(HarnessTurnInput::default())
+            .await
+            .unwrap_err();
         assert!(matches!(
             error,
             HarnessError::AcpAuthenticationRequired(methods)
@@ -1717,16 +1716,8 @@ for line in sys.stdin:
     #[tokio::test]
     async fn incompatible_or_missing_protocol_version_fails_start() {
         for (name, initialize, needle) in [
-            (
-                "incompatible",
-                r#"{"protocolVersion":99}"#,
-                "99",
-            ),
-            (
-                "missing",
-                r#"{}"#,
-                "omitted protocolVersion",
-            ),
+            ("incompatible", r#"{"protocolVersion":99}"#, "99"),
+            ("missing", r#"{}"#, "omitted protocolVersion"),
         ] {
             let root =
                 std::env::temp_dir().join(format!("opcos-acp-{name}-{}", uuid::Uuid::new_v4()));
@@ -1962,8 +1953,16 @@ for line in sys.stdin:
                     .is_some_and(|value| value.to_string().contains("\"diff\""))
                 && !locations.is_empty()
         }));
-        assert!(updates.iter().any(|(id, status, _, _)| id == "call-2" && status == "failed"));
-        assert!(results.iter().any(|(id, result)| id == "call-1" && result.to_string().contains("diff")));
+        assert!(
+            updates
+                .iter()
+                .any(|(id, status, _, _)| id == "call-2" && status == "failed")
+        );
+        assert!(
+            results
+                .iter()
+                .any(|(id, result)| id == "call-1" && result.to_string().contains("diff"))
+        );
         let persisted = store.load_plan("session").unwrap().unwrap();
         assert_eq!(persisted.steps.len(), 5);
         assert_eq!(persisted.steps[0].status, "not_started");
@@ -1971,7 +1970,11 @@ for line in sys.stdin:
         assert_eq!(persisted.steps[2].status, "done");
         assert_eq!(persisted.steps[3].status, "failed");
         assert_eq!(persisted.steps[4].status, "abandoned");
-        assert!(errors.iter().any(|message| message.contains("failed steps cannot silently become done")));
+        assert!(
+            errors
+                .iter()
+                .any(|message| message.contains("failed steps cannot silently become done"))
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2027,21 +2030,27 @@ for line in sys.stdin:
         assert!(params.contains("\"type\": \"http\""));
         assert!(params.contains("Authorization"));
         assert!(params.contains(token));
-        assert!(store
-            .load_messages("session")
-            .unwrap()
-            .iter()
-            .all(|message| !message.content.to_string().contains(token)));
-        assert!(store
-            .load_session_events("session")
-            .unwrap()
-            .iter()
-            .all(|event| !event.event.to_string().contains(token)));
-        assert!(store
-            .load_transcript("session")
-            .unwrap()
-            .iter()
-            .all(|entry| !entry.payload.to_string().contains(token)));
+        assert!(
+            store
+                .load_messages("session")
+                .unwrap()
+                .iter()
+                .all(|message| !message.content.to_string().contains(token))
+        );
+        assert!(
+            store
+                .load_session_events("session")
+                .unwrap()
+                .iter()
+                .all(|event| !event.event.to_string().contains(token))
+        );
+        assert!(
+            store
+                .load_transcript("session")
+                .unwrap()
+                .iter()
+                .all(|entry| !entry.payload.to_string().contains(token))
+        );
         drop(harness);
         let _ = fs::remove_dir_all(root);
     }
