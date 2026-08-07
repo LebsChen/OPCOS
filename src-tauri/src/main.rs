@@ -19503,7 +19503,7 @@ async fn record_local_plan_execution(
         .map_err(|error| error.to_string())?;
     let engine = engine_for(app, state, leader_session_id, ToolOrigin::User).await?;
     engine
-        .submit_text(format!(
+        .queue_steering(format!(
             "Execute this plan step locally as the Lead because worker dispatch was unavailable: \
              {}. Do not ask the user how to route it; perform the step and verify the result.",
             step.description
