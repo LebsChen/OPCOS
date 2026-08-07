@@ -1936,7 +1936,11 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             else {
                 return;
             };
-            let mut values = credentials.get(&server_id).await.unwrap_or_default().unwrap_or_default();
+            let mut values = credentials
+                .get(&server_id)
+                .await
+                .unwrap_or_default()
+                .unwrap_or_default();
             values.insert("bearer_token".to_owned(), tokens.access_token);
             if let Some(refresh) = tokens.refresh_token {
                 values.insert("refresh_token".to_owned(), refresh);
@@ -2056,8 +2060,8 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             while let Some((method, params)) = notification_rx.recv().await {
                 let uri = params.get("uri").and_then(Value::as_str).map(str::to_owned);
                 let _ = manager
-                    .handle_notification(
-                        &notification_config.object_id,
+                    .refresh_after_notification(
+                        &notification_config,
                         &notification_version,
                         &method,
                         uri.as_deref(),
@@ -2585,9 +2589,99 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             return Ok(false);
         }
         if method != "notifications/resources/updated" {
-            self.connect_inner(config, version_id).await?;
+            self.refresh_catalog(&config.object_id, version_id).await?;
         }
         Ok(true)
+    }
+
+    async fn refresh_catalog(
+        &self,
+        object_id: &str,
+        version_id: &str,
+    ) -> Result<(), McpClientError> {
+        let config = self
+            .configs
+            .lock()
+            .await
+            .get(&(object_id.to_owned(), version_id.to_owned()))
+            .cloned()
+            .ok_or(McpClientError::Disconnected)?;
+        let client = self
+            .clients
+            .lock()
+            .await
+            .get(object_id)
+            .cloned()
+            .ok_or(McpClientError::Disconnected)?;
+        let mut client = client.lock().await;
+        let negotiated = client.negotiated_info();
+        let capabilities_are_empty = negotiated.capabilities.tools.is_none()
+            && negotiated.capabilities.resources.is_none()
+            && negotiated.capabilities.prompts.is_none();
+        let mut tools = if negotiated.capabilities.tools.is_some() || capabilities_are_empty {
+            match client.list_tools().await {
+                Ok(tools) => tools,
+                Err(McpClientError::MethodNotFound) => Vec::new(),
+                Err(error) => return Err(error),
+            }
+        } else {
+            Vec::new()
+        };
+        for tool in &mut tools {
+            tool.server_id = object_id.to_owned();
+        }
+        qualify_tools(&config.server_key, &mut tools);
+        let tools = filter_tools(
+            tools,
+            config.include_tools.as_deref(),
+            config.exclude_tools.as_deref(),
+        );
+        let resources = if negotiated.capabilities.resources.is_some() {
+            match client.list_resources().await {
+                Ok(resources) => resources,
+                Err(McpClientError::MethodNotFound) => Vec::new(),
+                Err(error) => return Err(error),
+            }
+        } else {
+            Vec::new()
+        };
+        let resource_templates = if negotiated.capabilities.resources.is_some() {
+            match client.list_resource_templates().await {
+                Ok(templates) => templates,
+                Err(McpClientError::MethodNotFound) => Vec::new(),
+                Err(error) => return Err(error),
+            }
+        } else {
+            Vec::new()
+        };
+        let prompts = if negotiated.capabilities.prompts.is_some() {
+            match client.list_prompts().await {
+                Ok(prompts) => prompts,
+                Err(McpClientError::MethodNotFound) => Vec::new(),
+                Err(error) => return Err(error),
+            }
+        } else {
+            Vec::new()
+        };
+        self.catalogs.lock().await.insert(
+            (object_id.to_owned(), version_id.to_owned()),
+            McpServerCatalog {
+                negotiated: negotiated.clone(),
+                tools: tools.clone(),
+                resources: resources.clone(),
+                resource_templates,
+                prompts: prompts.clone(),
+            },
+        );
+        if let Some(snapshot) = self.statuses.lock().await.get_mut(object_id) {
+            snapshot.status = McpServerStatus::Connected;
+            snapshot.last_error = None;
+            snapshot.tool_count = tools.len();
+            snapshot.resource_count = resources.len();
+            snapshot.prompt_count = prompts.len();
+            snapshot.capabilities = negotiated.capabilities;
+        }
+        Ok(())
     }
 
     pub async fn read_resource(

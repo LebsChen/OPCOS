@@ -876,6 +876,13 @@ where
         result
     }
 
+    async fn execute_tool_interruptible(&self, call: &ToolCall) -> Value {
+        tokio::select! {
+            result = self.execute_tool_with_hooks(call) => result,
+            _ = self.interrupt_notify.notified() => json!({"error":"tool call interrupted"}),
+        }
+    }
+
     fn execute_proposed_plan(&self, arguments: &Value) -> Value {
         let object = arguments.as_object();
         let title = object
@@ -2279,7 +2286,7 @@ where
                 })?;
                 let completed_reads = futures_util::future::join_all(readonly.drain(..).map(
                     |(read_index, read_call): (usize, &ToolCall)| async move {
-                        let result = self.execute_tool_with_hooks(read_call).await;
+                        let result = self.execute_tool_interruptible(read_call).await;
                         (read_index, result)
                     },
                 ))
@@ -2503,7 +2510,7 @@ where
                     let result = if call.name == "propose_plan" {
                         self.execute_proposed_plan(&call.arguments)
                     } else {
-                        self.execute_tool_with_hooks(call).await
+                        self.execute_tool_interruptible(call).await
                     };
                     if matches!(call.name.as_str(), "write_file" | "edit_file")
                         && result.get("error").is_none()
@@ -2543,7 +2550,7 @@ where
                         .await;
                     let completed_reads = futures_util::future::join_all(readonly.drain(..).map(
                         |(read_index, read_call): (usize, &ToolCall)| async move {
-                            let result = self.execute_tool_with_hooks(read_call).await;
+                            let result = self.execute_tool_interruptible(read_call).await;
                             (read_index, result)
                         },
                     ))
@@ -2588,7 +2595,7 @@ where
         }
         let readonly_results =
             futures_util::future::join_all(readonly.into_iter().map(|(index, call)| async move {
-                let result = self.execute_tool_with_hooks(call).await;
+                let result = self.execute_tool_interruptible(call).await;
                 (index, result)
             }))
             .await;
@@ -8328,6 +8335,41 @@ mod tests {
             Err(EngineError::MaxIterations)
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn interrupting_a_hanging_tool_finishes_turn_for_next_submission() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let engine = Arc::new(TurnEngine::new(
+            LoopProvider {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                stop_after: Some(1),
+            },
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+            Arc::new(BlockingTools {
+                started: started.clone(),
+                release: Arc::new(tokio::sync::Notify::new()),
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+            "interrupt-tool",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        ));
+        let first = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.submit_text("hang").await })
+        };
+        started.notified().await;
+        engine.interrupt();
+        let first = tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(first, Err(EngineError::Interrupted)));
+        assert!(!engine.has_active_turn());
+        let second = engine.submit_text("next").await.unwrap();
+        assert_eq!(second.text.as_deref(), Some("done"));
     }
 
     #[tokio::test]
