@@ -119,6 +119,7 @@ where
     auth_methods: Mutex<Vec<Value>>,
     auth_required: Mutex<bool>,
     mcp_servers: Mutex<Vec<Value>>,
+    plan_id: Mutex<Option<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -187,6 +188,7 @@ where
             auth_methods: Mutex::new(Vec::new()),
             auth_required: Mutex::new(false),
             mcp_servers: Mutex::new(config.mcp_servers.clone()),
+            plan_id: Mutex::new(None),
         });
         let harness = Arc::new(Self {
             state: state.clone(),
@@ -748,42 +750,161 @@ where
         "user_message_chunk" => {
             // The ACP user message is already recorded by the desktop submit path.
         }
-        "tool_call" | "tool_call_update" => {
+        "tool_call" => {
+            let call_id = update
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let tool = update
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("ACP tool")
+                .to_owned();
             let _ = state
                 .events
                 .send(HarnessEvent::ToolCallDelta {
-                    call_id: update
-                        .get("toolCallId")
+                    call_id: Some(call_id.clone()),
+                    tool: Some(tool.clone()),
+                    arguments_fragment: update
+                        .get("rawInput")
+                        .map(Value::to_string),
+                })
+                .await;
+            let _ = state
+                .events
+                .send(HarnessEvent::ToolCallUpdate {
+                    call_id,
+                    tool,
+                    status: update
+                        .get("status")
                         .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    tool: update
-                        .get("title")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    arguments_fragment: Some(
-                        json!({
-                            "rawInput": update.get("rawInput"),
-                            "status": update.get("status"),
-                            "kind": update.get("kind"),
-                            "locations": update.get("locations"),
-                            "content": update.get("content"),
-                        })
-                        .to_string(),
-                    ),
+                        .unwrap_or("pending")
+                        .to_owned(),
+                    content: update.get("content").cloned(),
+                    locations: update
+                        .get("locations")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default(),
                 })
                 .await;
         }
-        "plan" | "plan_update" => {
+        "tool_call_update" => {
+            let call_id = update
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let tool = update
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("ACP tool")
+                .to_owned();
+            let status = update
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("in_progress")
+                .to_owned();
+            let content = update.get("content").cloned();
             let _ = state
                 .events
-                .send(HarnessEvent::ToolCallDelta {
-                    call_id: Some("acp-plan".into()),
-                    tool: Some("plan_update".into()),
-                    arguments_fragment: Some(update.to_string()),
+                .send(HarnessEvent::ToolCallUpdate {
+                    call_id: call_id.clone(),
+                    tool: tool.clone(),
+                    status: status.clone(),
+                    content: content.clone(),
+                    locations: update
+                        .get("locations")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default(),
+                })
+                .await;
+            if matches!(status.as_str(), "completed" | "failed") {
+                let _ = state
+                    .events
+                    .send(HarnessEvent::ToolResult {
+                        call_id,
+                        tool,
+                        arguments: update.get("rawInput").cloned().unwrap_or_else(|| json!({})),
+                        result: content.unwrap_or_else(|| update.clone()),
+                    })
+                    .await;
+            }
+        }
+        "plan" | "plan_update" => {
+            let entries = update
+                .get("entries")
+                .or_else(|| update.get("plan"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            persist_plan_update(state, &entries).await?;
+            let _ = state
+                .events
+                .send(HarnessEvent::PlanUpdate {
+                    entries,
                 })
                 .await;
         }
         _ => {}
+    }
+    Ok(())
+}
+
+async fn persist_plan_update<S>(
+    state: &Arc<AcpState<S>>,
+    entries: &[Value],
+) -> Result<(), HarnessError>
+where
+    S: SessionStore + Send + Sync + 'static,
+{
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut plan_id = state.plan_id.lock().await;
+    if plan_id.is_none() {
+        let steps = entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .get("content")
+                    .or_else(|| entry.get("title"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("ACP plan step")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        let plan = state
+            .recorder
+            .store()
+            .create_plan(&state.session_id, None, "ACP plan", "", &steps)
+            .map_err(|error| HarnessError::External(error.to_string()))?;
+        *plan_id = Some(plan.plan_id);
+    }
+    let Some(_plan_id) = plan_id.as_deref() else {
+        return Ok(());
+    };
+    for (index, entry) in entries.iter().enumerate() {
+        let status = match entry.get("status").and_then(Value::as_str) {
+            Some("completed" | "done") => "done",
+            Some("in_progress" | "active") => "in_progress",
+            Some("failed") => "failed",
+            Some("cancelled" | "abandoned") => "abandoned",
+            _ => "not_started",
+        };
+        state
+            .recorder
+            .store()
+            .update_plan_step(
+                &state.session_id,
+                &(index + 1).to_string(),
+                Some(status),
+                None,
+                None,
+            )
+            .map_err(|error| HarnessError::External(error.to_string()))?;
     }
     Ok(())
 }
@@ -1134,6 +1255,26 @@ mod tests {
             content_text(Some(&json!({"type": "text", "text": "hello"}))),
             Some("hello".into())
         );
+    }
+
+    #[test]
+    fn preserves_structured_rpc_errors() {
+        let error = rpc_result(&json!({
+            "jsonrpc": "2.0",
+            "error": {"code": -32001, "message": "login required", "data": {"method": "oauth"}}
+        }))
+        .unwrap_err();
+        assert_eq!(error.code, -32001);
+        assert_eq!(error.data, Some(json!({"method": "oauth"})));
+        assert!(is_authentication_error(&HarnessError::from(error)));
+    }
+
+    #[test]
+    fn maps_acp_stop_reasons_to_supported_engine_reasons() {
+        assert_eq!(map_stop_reason("end_turn"), "stop");
+        assert_eq!(map_stop_reason("max_tokens"), "length");
+        assert_eq!(map_stop_reason("cancelled"), "cancelled");
+        assert_eq!(map_stop_reason("refusal"), "stop");
     }
 
     #[test]

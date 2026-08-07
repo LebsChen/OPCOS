@@ -287,6 +287,16 @@ pub enum HarnessEvent {
         tool: Option<String>,
         arguments_fragment: Option<String>,
     },
+    ToolCallUpdate {
+        call_id: String,
+        tool: String,
+        status: String,
+        content: Option<Value>,
+        locations: Vec<Value>,
+    },
+    PlanUpdate {
+        entries: Vec<Value>,
+    },
     ToolResult {
         call_id: String,
         tool: String,

@@ -9519,7 +9519,7 @@ fn acp_mcp_servers(
                     "env": config.env.into_iter().map(|(name, value)| json!({"name": name, "value": value})).collect::<Vec<_>>(),
                 }));
             }
-            opcos_mcp::McpTransport::StreamableHttp => {
+            _ => {
                 let url = config
                     .url
                     .ok_or_else(|| "enabled ACP MCP HTTP server has no URL".to_owned())?;
@@ -12878,6 +12878,24 @@ async fn submit_opencode_turn_inner(
                         Some(&event_session),
                         json!({"tool_result":{"call_id":call_id,"tool":tool,"arguments":redact_approval_value(&arguments),"result":redact_approval_value(&result)}}),
                     ),
+                    opcos_engine::HarnessEvent::ToolCallUpdate {
+                        call_id,
+                        tool,
+                        status,
+                        content,
+                        locations,
+                    } => emit(
+                        &event_app,
+                        "stream",
+                        Some(&event_session),
+                        json!({"tool_call_update":{"id":call_id,"name":tool,"status":status,"content":content.map(|value| redact_approval_value(&value)),"locations":locations}}),
+                    ),
+                    opcos_engine::HarnessEvent::PlanUpdate { entries } => emit(
+                        &event_app,
+                        "stream",
+                        Some(&event_session),
+                        json!({"plan_update":{"entries":entries}}),
+                    ),
                     opcos_engine::HarnessEvent::ApprovalRequested(request) => {
                         let unattended = event_store.is_unattended(&event_session).unwrap_or(false);
                         if unattended {
@@ -13034,6 +13052,24 @@ async fn submit_acp_turn_inner(
                         "stream",
                         Some(&event_session),
                         json!({"tool_call_delta":{"id":call_id,"name":tool,"arguments_fragment":arguments_fragment}}),
+                    ),
+                    opcos_engine::HarnessEvent::ToolCallUpdate {
+                        call_id,
+                        tool,
+                        status,
+                        content,
+                        locations,
+                    } => emit(
+                        &event_app,
+                        "stream",
+                        Some(&event_session),
+                        json!({"tool_call_update":{"id":call_id,"name":tool,"status":status,"content":content.map(|value| redact_approval_value(&value)),"locations":locations}}),
+                    ),
+                    opcos_engine::HarnessEvent::PlanUpdate { entries } => emit(
+                        &event_app,
+                        "stream",
+                        Some(&event_session),
+                        json!({"plan_update":{"entries":entries}}),
                     ),
                     opcos_engine::HarnessEvent::ApprovalRequested(request) => {
                         let unattended = event_store.is_unattended(&event_session).unwrap_or(false);
