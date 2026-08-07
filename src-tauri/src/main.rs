@@ -1223,7 +1223,7 @@ async fn preflight_git_push(
         .ok_or("git_push requires cwd")?;
     let Some(project_id) = project_id else {
         return Ok(match origin {
-            ToolOrigin::User => PreflightDecision::NeedsUser(
+            ToolOrigin::User | ToolOrigin::System => PreflightDecision::NeedsUser(
                 "push diff inspection unavailable: no bound project".into(),
             ),
             ToolOrigin::RepairLoop => PreflightDecision::Deny(
@@ -1236,7 +1236,7 @@ async fn preflight_git_push(
         .map_err(|error| error.to_string())?
     else {
         return Ok(match origin {
-            ToolOrigin::User => PreflightDecision::NeedsUser(
+            ToolOrigin::User | ToolOrigin::System => PreflightDecision::NeedsUser(
                 "push diff inspection unavailable: bound project could not be loaded".into(),
             ),
             ToolOrigin::RepairLoop => PreflightDecision::Deny(
@@ -1256,7 +1256,7 @@ fn push_diff_preflight(
 ) -> PreflightDecision {
     match inspection {
         Err(error) => match origin {
-            ToolOrigin::User => {
+            ToolOrigin::User | ToolOrigin::System => {
                 PreflightDecision::NeedsUser(format!("push requires approval: {error}"))
             }
             ToolOrigin::RepairLoop => {
@@ -1265,7 +1265,7 @@ fn push_diff_preflight(
         },
         Ok(reasons) if reasons.is_empty() => PreflightDecision::Allow,
         Ok(reasons) => match origin {
-            ToolOrigin::User => PreflightDecision::NeedsUser(format!(
+            ToolOrigin::User | ToolOrigin::System => PreflightDecision::NeedsUser(format!(
                 "push requires approval: diff enters protected repair boundary ({})",
                 reasons.join("; ")
             )),
@@ -3682,7 +3682,8 @@ impl ToolExecutor for RemoteExecutor {
         if name == "external_ingress_sources" {
             return execute_external_ingress_tool(&self.store, name, &arguments);
         }
-        if automatic_project_routing_active(&self.store, &self.session_id)?
+        if self.origin == ToolOrigin::User
+            && automatic_project_routing_active(&self.store, &self.session_id)?
             && matches!(name, "edit_file" | "write_file" | "run_shell")
         {
             return Err(
@@ -3692,6 +3693,7 @@ impl ToolExecutor for RemoteExecutor {
         }
         if matches!(name, "coordination_dispatch" | "coordination_status") {
             if name == "coordination_dispatch"
+                && self.origin == ToolOrigin::User
                 && automatic_project_routing_active(&self.store, &self.session_id)?
             {
                 return Err(
@@ -4103,7 +4105,8 @@ impl ToolExecutor for DesktopExecutor {
                 if name == "external_ingress_sources" {
                     return execute_external_ingress_tool(&executor.store, name, &arguments);
                 }
-                if automatic_project_routing_active(&executor.store, &executor.session_id)?
+                if executor.origin == ToolOrigin::User
+                    && automatic_project_routing_active(&executor.store, &executor.session_id)?
                     && matches!(name, "edit_file" | "write_file" | "run_shell")
                 {
                     return Err(
@@ -4113,6 +4116,7 @@ impl ToolExecutor for DesktopExecutor {
                 }
                 if matches!(name, "coordination_dispatch" | "coordination_status") {
                     if name == "coordination_dispatch"
+                        && executor.origin == ToolOrigin::User
                         && automatic_project_routing_active(&executor.store, &executor.session_id)?
                     {
                         return Err(
@@ -19592,7 +19596,7 @@ async fn record_local_plan_execution(
             Some(reason),
         )
         .map_err(|error| error.to_string())?;
-    let engine = engine_for(app, state, leader_session_id, ToolOrigin::User).await?;
+    let engine = engine_for(app, state, leader_session_id, ToolOrigin::System).await?;
     let prompt = format!(
         "Execute this plan step locally as the Lead because worker dispatch was unavailable: \
          {}. Do not ask the user how to route it; perform the step and verify the result.",

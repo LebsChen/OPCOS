@@ -136,6 +136,7 @@ pub trait ArtifactSink: Send + Sync {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolOrigin {
     User,
+    System,
     RepairLoop,
 }
 
