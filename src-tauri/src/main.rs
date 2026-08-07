@@ -19229,6 +19229,17 @@ async fn ensure_project_worker_session(
             agent.harness
         ));
     }
+    if agent.model == "auto" {
+        agent.model = leader.model.clone();
+    }
+    if agent.provider.is_none() {
+        agent.provider = leader.provider.clone();
+    }
+    agent.updated_at = Utc::now();
+    state
+        .store
+        .save_project_agent(&agent)
+        .map_err(|error| error.to_string())?;
     let session_id = if let Some(session_id) = agent.session_id.clone() {
         session_id
     } else {
@@ -19276,6 +19287,19 @@ async fn ensure_project_worker_session(
         agent.session_id = Some(session_id.clone());
         session_id
     };
+    if let Some(mut worker_session) = state
+        .store
+        .load_session(&session_id)
+        .map_err(|error| error.to_string())?
+    {
+        worker_session.model = agent.model.clone();
+        worker_session.provider = agent.provider.clone();
+        worker_session.updated_at = Utc::now();
+        state
+            .store
+            .save_session(&worker_session)
+            .map_err(|error| error.to_string())?;
+    }
     engine_for(app, state, &session_id, ToolOrigin::User).await?;
     Ok(agent)
 }
