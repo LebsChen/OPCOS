@@ -10435,6 +10435,7 @@ async fn engine_for_with_context(
         .await;
     let mut events = engine.events();
     let handle = app.clone();
+    let event_app = app.clone();
     let session = session_id.to_owned();
     tauri::async_runtime::spawn(async move {
         while let Some(chunk) = events.recv().await {
@@ -10442,8 +10443,13 @@ async fn engine_for_with_context(
                 &handle,
                 "stream",
                 Some(&session),
-                serde_json::to_value(chunk).unwrap_or(Value::Null),
+                serde_json::to_value(&chunk).unwrap_or(Value::Null),
             );
+            if chunk.event_type.as_deref() == Some("turn_finished")
+                && let Some(state) = event_app.try_state::<DesktopState>()
+            {
+                let _ = coordination_ingest_session_inner(&state, &session, false).await;
+            }
         }
     });
     if origin == ToolOrigin::RepairLoop {
@@ -13244,6 +13250,7 @@ async fn resolve_approval(
         .max_message_notice_sequence(&session_id)
         .map_err(|error| error.to_string())?;
     let engine = engine_for(&app, &state, &session_id, ToolOrigin::User).await?;
+    let resumed_task = resume_coordination_after_approval(&state, &session_id)?;
     let result = engine
         .resolve_approval(
             &call_id,
@@ -13257,8 +13264,7 @@ async fn resolve_approval(
         .map(|_| ());
     match result {
         Ok(()) => {
-            let resumed_task = resume_coordination_after_approval(&state, &session_id)?;
-            ingest_coordination_after_resume(&state, &session_id, resumed_task.as_deref()).await;
+            let _ = coordination_ingest_session_inner(&state, &session_id, false).await;
             emit_approval_decision(&app, &state, &session_id, &call_id, approve);
             let calls = approval_artifact_calls(&state, &session_id, &call_id, sequence_before)?;
             record_artifacts_best_effort(&app, &state, &session_id, &host_id, calls).await;
@@ -13280,6 +13286,9 @@ async fn resolve_approval(
             Ok(())
         }
         Err(opcos_engine::EngineError::ApprovalPending(next_call_id)) => {
+            if let Some(task_id) = resumed_task.as_deref() {
+                await_coordination_after_approval(&state, &session_id, task_id)?;
+            }
             state
                 .store
                 .set_pending_visibility(&session_id, &next_call_id, "inbox")
@@ -13308,6 +13317,7 @@ async fn resolve_approval(
             Ok(())
         }
         Err(opcos_engine::EngineError::ApprovalAlreadyProcessed(_)) => {
+            let _ = coordination_ingest_session_inner(&state, &session_id, false).await;
             emit_pending_approval(&app, &state, &session_id)?;
             emit(&app, "turn_done", Some(&session_id), json!({}));
             Ok(())
@@ -13435,11 +13445,12 @@ async fn resolve_inbox(
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "inbox item not found".to_owned())?;
     if item.state == "resolved" || item.state == "expired" {
-        let resumed_task = resume_coordination_after_approval(&state, &session_id)?;
-        ingest_coordination_after_resume(&state, &session_id, resumed_task.as_deref()).await;
+        let _ = resume_coordination_after_approval(&state, &session_id)?;
+        let _ = coordination_ingest_session_inner(&state, &session_id, false).await;
         return Ok(());
     }
     let engine = engine_for(&app, &state, &session_id, ToolOrigin::User).await?;
+    let resumed_task = resume_coordination_after_approval(&state, &session_id)?;
     let result = if matches!(item.kind.as_str(), "approval" | "plan") {
         engine
             .resolve_approval(
@@ -13463,8 +13474,7 @@ async fn resolve_inbox(
             let _ = state
                 .store
                 .resolve_inbox(&session_id, &call_id, &resolution);
-            let resumed_task = resume_coordination_after_approval(&state, &session_id)?;
-            ingest_coordination_after_resume(&state, &session_id, resumed_task.as_deref()).await;
+            let _ = coordination_ingest_session_inner(&state, &session_id, false).await;
             audit(
                 &state,
                 &session_id,
@@ -13498,6 +13508,9 @@ async fn resolve_inbox(
             Ok(())
         }
         Err(opcos_engine::EngineError::ApprovalPending(next_call_id)) => {
+            if let Some(task_id) = resumed_task.as_deref() {
+                await_coordination_after_approval(&state, &session_id, task_id)?;
+            }
             state
                 .store
                 .set_pending_visibility(&session_id, &next_call_id, "inbox")
@@ -21044,36 +21057,34 @@ fn resume_coordination_after_approval(
     Ok(Some(task_id))
 }
 
-async fn ingest_coordination_after_resume(
+fn await_coordination_after_approval(
     state: &DesktopState,
     session_id: &str,
-    task_id: Option<&str>,
-) {
-    for _ in 0..120 {
-        let _ = coordination_ingest_session_inner(state, session_id, false).await;
-        if task_id.is_some_and(|id| coordination_task_done(state, id)) {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-}
-
-fn coordination_task_done(state: &DesktopState, task_id: &str) -> bool {
-    let Ok(connection) = state.database.lock() else {
-        return false;
+    task_id: &str,
+) -> Result<(), String> {
+    let Some(agent) = state
+        .store
+        .load_project_agent_by_session(session_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(());
     };
-    connection
-        .query_row(
-            "SELECT 1 FROM coord_tasks
-             WHERE id=?1 AND phase='Done'
-             LIMIT 1",
-            [task_id],
-            |_| Ok(true),
-        )
-        .optional()
-        .ok()
-        .flatten()
-        .is_some()
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let mut task = load_coord_task(&connection, task_id)?;
+    task.await_approval(&agent.id)
+        .map_err(|error| error.to_string())?;
+    save_coord_task(&connection, &task)?;
+    drop(connection);
+    audit(
+        state,
+        session_id,
+        "coordination_approval_wait",
+        json!({"task_id": task_id, "worker_id": agent.id, "phase": "AwaitingApproval"}),
+    );
+    Ok(())
 }
 
 fn coordination_approval_payload(
