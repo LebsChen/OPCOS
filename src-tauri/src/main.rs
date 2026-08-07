@@ -19739,6 +19739,7 @@ async fn auto_route_project_plan(
                     .await
                     .map_err(|error| error.to_string())?;
                 let _ = coordination_ingest_session_inner(state, worker_session, false).await;
+                coordination_complete_task_inner(state, &task_id, &worker.id, None).await?;
             }
             Err(reason) => {
                 return Err(format!(
@@ -20733,12 +20734,21 @@ async fn coordination_complete_task(
     worker: String,
     verified_pr_url: Option<String>,
 ) -> Result<Value, String> {
+    coordination_complete_task_inner(&state, &id, &worker, verified_pr_url.as_deref()).await
+}
+
+async fn coordination_complete_task_inner(
+    state: &DesktopState,
+    id: &str,
+    worker: &str,
+    verified_pr_url: Option<&str>,
+) -> Result<Value, String> {
     let (initial_task, project) = {
         let connection = state
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?;
-        let task = load_coord_task(&connection, &id)?;
+        let task = load_coord_task(&connection, id)?;
         let project = if task.project_id.is_empty() {
             None
         } else {
@@ -20753,10 +20763,7 @@ async fn coordination_complete_task(
         (task, project)
     };
     let forge_backed = if let Some(project) = project.as_ref() {
-        Some(
-            verify_task_delivery(&state, project, &initial_task, verified_pr_url.as_deref())
-                .await?,
-        )
+        Some(verify_task_delivery(state, project, &initial_task, verified_pr_url).await?)
     } else {
         None
     };
@@ -20764,18 +20771,18 @@ async fn coordination_complete_task(
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?;
-    let mut task = load_coord_task(&connection, &id)?;
+    let mut task = load_coord_task(&connection, id)?;
     if forge_backed == Some(false) {
         task.require_acceptance = false;
     }
-    task.complete(&worker, Utc::now(), verified_pr_url)
+    task.complete(worker, Utc::now(), verified_pr_url.map(str::to_owned))
         .map_err(|error| error.to_string())?;
     save_coord_task(&connection, &task)?;
     serde_json::to_value(task).map_err(|error| error.to_string())
 }
 
 async fn verify_task_delivery(
-    state: &State<'_, DesktopState>,
+    state: &DesktopState,
     project: &ProjectRecord,
     task: &BoardTask,
     verified_pr_url: Option<&str>,
@@ -20784,7 +20791,7 @@ async fn verify_task_delivery(
         .branch
         .as_deref()
         .ok_or_else(|| "completion requires a branch".to_owned())?;
-    let host = project_host(state, project).await?;
+    let host = project_host_inner(state, project).await?;
     let platform = host.health().await.ok().and_then(|health| health.platform);
     let remote_result = host
         .exec(ExecRequest {
