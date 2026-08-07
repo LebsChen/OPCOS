@@ -328,10 +328,12 @@ function PlanCard({
 }
 
 function TerminalOutput({
+  label,
   output,
   truncated,
   totalBytes,
 }: {
+  label: string;
   output: string;
   truncated?: boolean;
   totalBytes?: number;
@@ -341,11 +343,7 @@ function TerminalOutput({
       ? undefined
       : Math.max(0, totalBytes - new TextEncoder().encode(output).length);
   return (
-    <TranscriptDisclosure
-      label="Show output"
-      className="transcript-output"
-      bare
-    >
+    <TranscriptDisclosure label={label} className="transcript-output">
       <pre className="artifact-code max-h-96 overflow-auto whitespace-pre-wrap break-words">
         {output}
         {truncated
@@ -359,11 +357,13 @@ function TerminalOutput({
 }
 
 function ArtifactRow({
+  label,
   sessionId,
   artifactId,
   kind,
   mime,
 }: {
+  label: string;
   sessionId: string;
   artifactId: string;
   kind?: string;
@@ -414,11 +414,10 @@ function ArtifactRow({
           ))
       : null;
   return (
-    <div className="artifact-inline">
+    <>
       <TranscriptDisclosure
-        label={kind === "screenshot" ? "View screenshot" : "View diff"}
+        label={label}
         className="transcript-artifact"
-        bare
         onToggle={(open) => {
           if (open) load();
         }}
@@ -454,7 +453,7 @@ function ArtifactRow({
           />
         </div>
       )}
-    </div>
+    </>
   );
 }
 
@@ -559,12 +558,15 @@ export function Transcript({
         ) => {
           const isThoughtRow =
             Boolean(row.detail) && row.label.startsWith("Thought for ");
+          const hasTerminalOutput = Boolean(
+            row.terminalOutput || row.terminalTruncated,
+          );
           return (
             <div
               className={`transcript-item transcript-row${row.shellId ? " transcript-shell-row" : ""}${row.denied ? " text-muted" : row.resultError || (row.exitCode !== undefined && row.exitCode !== 0) ? " text-danger" : ""}`}
               key={rowIndex}
             >
-              {!isThoughtRow && (
+              {!isThoughtRow && !row.artifactId && !hasTerminalOutput && (
                 <span className="transcript-row-label">{row.label}</span>
               )}
               {row.shellId && (
@@ -593,6 +595,7 @@ export function Transcript({
               )}
               {(row.terminalOutput || row.terminalTruncated) && (
                 <TerminalOutput
+                  label={row.label}
                   output={row.terminalOutput ?? ""}
                   truncated={row.terminalTruncated}
                   totalBytes={row.terminalTotalBytes}
@@ -600,6 +603,7 @@ export function Transcript({
               )}
               {row.artifactId && (
                 <ArtifactRow
+                  label={row.label}
                   sessionId={sessionId}
                   artifactId={row.artifactId}
                   kind={row.artifactKind}

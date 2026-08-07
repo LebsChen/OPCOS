@@ -779,10 +779,6 @@ h3 {
   flex: 0 1 auto;
   width: auto;
 }
-.transcript-row > .artifact-inline:has(> .transcript-artifact[open]) {
-  flex: 0 0 100%;
-  min-width: 0;
-}
 .transcript-thought-chevron {
   flex: 0 0 16px;
   width: 16px;
