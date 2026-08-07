@@ -19419,7 +19419,7 @@ async fn ensure_project_coordination(
 
 fn worker_role_for_plan_step(step: &opcos_store::PlanStepRecord) -> &'static str {
     let description = step.description.to_ascii_lowercase();
-    if ["review", "audit", "verify", "test ", "tests", "validation"]
+    if ["review", "audit", "test ", "tests", "validation"]
         .iter()
         .any(|marker| description.contains(marker))
     {
