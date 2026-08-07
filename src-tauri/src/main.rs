@@ -13435,6 +13435,7 @@ async fn resolve_inbox(
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "inbox item not found".to_owned())?;
     if item.state == "resolved" || item.state == "expired" {
+        let _ = resume_coordination_after_approval(&state, &session_id)?;
         return Ok(());
     }
     let engine = engine_for(&app, &state, &session_id, ToolOrigin::User).await?;
