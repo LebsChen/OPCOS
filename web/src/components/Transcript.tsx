@@ -72,12 +72,14 @@ function TranscriptDisclosure({
   children,
   className = "",
   summaryClassName = "",
+  bare = false,
   onToggle,
 }: {
   label: string;
   children: ReactNode;
   className?: string;
   summaryClassName?: string;
+  bare?: boolean;
   onToggle?: (open: boolean) => void;
 }) {
   return (
@@ -85,8 +87,11 @@ function TranscriptDisclosure({
       className={`transcript-thought ${className}`}
       onToggle={(event) => onToggle?.(event.currentTarget.open)}
     >
-      <summary className={`transcript-row-header ${summaryClassName}`}>
-        <span>{label}</span>
+      <summary
+        className={`transcript-row-header ${bare ? "transcript-disclosure-bare" : ""} ${summaryClassName}`}
+        aria-label={bare ? label : undefined}
+      >
+        {!bare && <span>{label}</span>}
         <TranscriptChevron className="transcript-thought-chevron" />
       </summary>
       <span className="transcript-disclosure-break" aria-hidden="true" />
@@ -107,6 +112,7 @@ function Thought({
   return (
     <TranscriptDisclosure
       label={label}
+      bare={label === "Thought details"}
       summaryClassName={
         forceSummaryBreak ? "transcript-disclosure-summary-break" : ""
       }
@@ -333,7 +339,11 @@ function TerminalOutput({
       ? undefined
       : Math.max(0, totalBytes - new TextEncoder().encode(output).length);
   return (
-    <TranscriptDisclosure label="Show output" className="transcript-output">
+    <TranscriptDisclosure
+      label="Show output"
+      className="transcript-output"
+      bare
+    >
       <pre className="artifact-code max-h-96 overflow-auto whitespace-pre-wrap break-words">
         {output}
         {truncated
@@ -406,6 +416,7 @@ function ArtifactRow({
       <TranscriptDisclosure
         label={kind === "screenshot" ? "View screenshot" : "View diff"}
         className="transcript-artifact"
+        bare
         onToggle={(open) => {
           if (open) load();
         }}

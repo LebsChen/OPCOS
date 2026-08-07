@@ -739,6 +739,13 @@ h3 {
 .transcript-row-header::-webkit-details-marker {
   display: none;
 }
+.transcript-disclosure-bare {
+  width: 24px;
+  min-height: 24px;
+  align-items: center;
+  justify-content: center;
+  padding: 2px;
+}
 .transcript-thought {
   display: contents;
 }
