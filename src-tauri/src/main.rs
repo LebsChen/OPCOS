@@ -9568,7 +9568,7 @@ async fn engine_for_with_context(
     let model = session.model;
     let mode = session.mode;
     let session_workspace = session.workspace;
-    let session_provider = session.provider;
+    let session_provider = session.provider.clone();
     let resolved_workspace = if !session_workspace.is_empty() {
         session_workspace.clone()
     } else if host_id == "local" {
@@ -9595,20 +9595,29 @@ async fn engine_for_with_context(
             .map_err(|_| "database lock poisoned")?;
         load_agent_settings(&connection, session.project_id.as_deref())?
     };
+    let agent_provider = session
+        .agent_id
+        .as_deref()
+        .and_then(|agent_id| state.store.load_project_agent(agent_id).ok().flatten())
+        .and_then(|agent| agent.provider);
     let (provider_id, configured_base_url) = {
         let connection = state
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?;
-        let provider = session_provider.unwrap_or_else(|| {
-            connection
-                .query_row(
-                    "SELECT value FROM settings WHERE key='provider.id'",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .unwrap_or_else(|_| "openai".into())
-        });
+        let provider = session_provider
+            .clone()
+            .or(agent_provider)
+            .or_else(|| {
+                connection
+                    .query_row(
+                        "SELECT value FROM settings WHERE key='provider.id'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok()
+            })
+            .ok_or_else(|| "no provider is configured for this session".to_owned())?;
         let base_url = connection
             .query_row(
                 &format!(
