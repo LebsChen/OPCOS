@@ -19749,7 +19749,7 @@ async fn auto_route_project_plan(
                     }
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
-                let _ = coordination_ingest_session_inner(state, worker_session, false).await;
+                let _ = coordination_ingest_session_inner(state, worker_session, true).await;
                 coordination_complete_task_inner(state, &task_id, &worker.id, None).await?;
             }
             Err(reason) => {
