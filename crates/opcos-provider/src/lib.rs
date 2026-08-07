@@ -203,6 +203,8 @@ pub enum ProviderError {
     Http { status: StatusCode, message: String },
     #[error("provider response was invalid: {0}")]
     Protocol(String),
+    #[error("provider stream produced no chunk for {seconds} seconds")]
+    ChunkIdleTimeout { seconds: u64 },
     #[error("provider context window exceeded")]
     ContextOverflow { limit: Option<u64> },
     #[error("provider capability is unavailable: {0}")]

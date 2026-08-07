@@ -46,6 +46,8 @@ const ASSUMED_OUTPUT_TOKENS: u64 = 4096;
 pub enum EngineError {
     #[error("provider: {0}")]
     Provider(#[from] ProviderError),
+    #[error("a turn is already running")]
+    TurnAlreadyRunning,
     #[error("store: {0}")]
     Store(String),
     #[error("tool preflight: {0}")]
@@ -63,6 +65,9 @@ pub enum EngineError {
     #[error("approval already processed: {0}")]
     ApprovalAlreadyProcessed(String),
 }
+
+// Deadlock safeguard for streams that produce transport bytes but no parsed chunks.
+const DEFAULT_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
@@ -503,6 +508,8 @@ pub struct TurnEngine<P, S, E> {
     stripe_tools_enabled: AtomicBool,
     message_usage_limit: AtomicU64,
     max_iterations: AtomicU64,
+    turn_active: AtomicBool,
+    chunk_idle_timeout: Duration,
     active_tool_calls: StdMutex<HashSet<String>>,
     policy_denied: AtomicBool,
     mutating_api_gate_enabled: AtomicBool,
@@ -670,6 +677,8 @@ where
             stripe_tools_enabled: AtomicBool::new(false),
             message_usage_limit: AtomicU64::new(0),
             max_iterations: AtomicU64::new(256),
+            turn_active: AtomicBool::new(false),
+            chunk_idle_timeout: DEFAULT_CHUNK_IDLE_TIMEOUT,
             active_tool_calls: StdMutex::new(HashSet::new()),
             policy_denied: AtomicBool::new(false),
             mutating_api_gate_enabled: AtomicBool::new(true),
@@ -913,11 +922,30 @@ where
     }
 
     pub async fn submit_text(&self, text: impl Into<String>) -> Result<AssistantTurn, EngineError> {
+        self.begin_turn()?;
         self.interrupted.store(false, Ordering::SeqCst);
         self.policy_denied.store(false, Ordering::SeqCst);
         self.set_session_status("running", "none");
         let result = async {
             self.append_user_message(text.into(), None).await?;
+            self.run_loop(self.provider_messages()?).await
+        }
+        .await;
+        self.finish_turn(&result);
+        result
+    }
+
+    pub async fn submit_steering(
+        &self,
+        text: impl Into<String>,
+    ) -> Result<AssistantTurn, EngineError> {
+        self.begin_turn()?;
+        self.interrupted.store(false, Ordering::SeqCst);
+        self.policy_denied.store(false, Ordering::SeqCst);
+        self.set_session_status("running", "none");
+        let result = async {
+            self.append_user_message(text.into(), Some("steering"))
+                .await?;
             self.run_loop(self.provider_messages()?).await
         }
         .await;
@@ -956,6 +984,7 @@ where
     }
 
     pub async fn retry(&self) -> Result<AssistantTurn, EngineError> {
+        self.begin_turn()?;
         self.interrupted.store(false, Ordering::SeqCst);
         self.policy_denied.store(false, Ordering::SeqCst);
         self.set_session_status("running", "none");
@@ -965,6 +994,7 @@ where
     }
 
     pub async fn resume_pending_turn(&self) -> Result<Option<AssistantTurn>, EngineError> {
+        self.begin_turn()?;
         self.set_session_status("running", "none");
         self.policy_denied.store(false, Ordering::SeqCst);
         let _ = self
@@ -1081,6 +1111,7 @@ where
             Err(EngineError::MaxIterations) => ("error", "max_iterations"),
             Err(EngineError::MessageUsageLimitReached) => ("error", "usage_limit"),
             Err(EngineError::ApprovalAlreadyProcessed(_)) => ("idle", "waiting_for_approval"),
+            Err(EngineError::TurnAlreadyRunning) => ("error", "turn_already_running"),
         };
         if result.is_ok() && self.policy_denied.load(Ordering::SeqCst) {
             return ("idle", "policy_denied");
@@ -1089,6 +1120,7 @@ where
     }
 
     fn finish_turn<T>(&self, result: &Result<T, EngineError>) {
+        self.turn_active.store(false, Ordering::SeqCst);
         let (run_state, stop_reason) = self.turn_status(result);
         self.set_session_status(run_state, stop_reason);
         let _ = self.record_working_event(
@@ -1124,6 +1156,21 @@ where
             .push(sender);
         self.steering.lock().await.push(text);
         Ok(receiver)
+    }
+
+    pub fn has_active_turn(&self) -> bool {
+        self.turn_active.load(Ordering::SeqCst)
+    }
+
+    pub fn set_chunk_idle_timeout(&mut self, timeout: Duration) {
+        self.chunk_idle_timeout = timeout.max(Duration::from_millis(1));
+    }
+
+    fn begin_turn(&self) -> Result<(), EngineError> {
+        self.turn_active
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|_| ())
+            .map_err(|_| EngineError::TurnAlreadyRunning)
     }
 
     pub fn save_grant(
@@ -1690,6 +1737,15 @@ where
             let inference_started = Instant::now();
             let (provider_result, partial) = self.stream_turn(request).await;
             let inference_ms = inference_started.elapsed().as_millis() as u64;
+            if let Err(ProviderError::ChunkIdleTimeout { seconds }) = &provider_result {
+                self.notice(
+                    "provider_stream_timeout",
+                    format!(
+                        "Inference produced no response chunks for {seconds} seconds and was aborted"
+                    ),
+                )
+                .await?;
+            }
             match provider_result {
                 Ok(turn) => {
                     if let Some(reasoning) =
@@ -2034,10 +2090,22 @@ where
         let mut receiver = Some(receiver);
         let provider = self.provider.stream(request, sender);
         tokio::pin!(provider);
+        let idle_timeout = self.chunk_idle_timeout;
+        let idle_deadline = tokio::time::Instant::now() + idle_timeout;
+        let idle_timer = tokio::time::sleep_until(idle_deadline);
+        tokio::pin!(idle_timer);
         let mut partial = PartialOutput::default();
         loop {
             tokio::select! {
                 result = &mut provider => return (result, partial),
+                _ = &mut idle_timer => {
+                    return (
+                        Err(ProviderError::ChunkIdleTimeout {
+                            seconds: idle_timeout.as_secs(),
+                        }),
+                        partial,
+                    );
+                }
                 chunk = async {
                     match receiver.as_mut() {
                         Some(receiver) => receiver.recv().await,
@@ -2048,6 +2116,7 @@ where
                         receiver = None;
                         continue;
                     };
+                    idle_timer.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
                     if self.interrupted.load(Ordering::SeqCst) {
                         return (Err(ProviderError::Protocol("interrupted".into())), partial);
                     }
@@ -2390,7 +2459,9 @@ where
                     } else {
                         self.execute_tool_with_hooks(call).await
                     };
-                    if matches!(call.name.as_str(), "write_file" | "edit_file") {
+                    if matches!(call.name.as_str(), "write_file" | "edit_file")
+                        && result.get("error").is_none()
+                    {
                         self.emit_file_change(call, previous.as_deref()).await;
                     }
                     results[index] = Some(result);
@@ -4693,6 +4764,40 @@ mod tests {
     impl ToolExecutor for FakeTools {
         async fn execute(&self, _: &str, _: Value) -> Result<Value, String> {
             Ok(json!("ok"))
+        }
+    }
+
+    struct FailingWriteTools;
+    #[async_trait]
+    impl ToolExecutor for FailingWriteTools {
+        async fn execute(&self, name: &str, _: Value) -> Result<Value, String> {
+            if name == "write_file" {
+                Err("write failed".into())
+            } else {
+                Ok(json!("ok"))
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct StalledProvider;
+
+    #[async_trait]
+    impl Provider for StalledProvider {
+        async fn complete(&self, _: ProviderRequest) -> Result<AssistantTurn, ProviderError> {
+            Ok(AssistantTurn::default())
+        }
+
+        async fn stream(
+            &self,
+            _: ProviderRequest,
+            _: mpsc::Sender<StreamChunk>,
+        ) -> Result<AssistantTurn, ProviderError> {
+            std::future::pending().await
+        }
+
+        fn capabilities(&self, _: &str) -> Caps {
+            Caps::default()
         }
     }
 
@@ -7885,6 +7990,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_file_writes_do_not_emit_file_updates() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FailingWriteTools),
+            "failed-write",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+
+        let result = engine
+            .execute_tools(
+                1,
+                &[ToolCall {
+                    id: "failed-write-call".into(),
+                    name: "write_file".into(),
+                    arguments: json!({"path":"src/routes/categories.js","content":"broken"}),
+                }],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result, vec![json!({"error":"write failed"})]);
+        let updates = store
+            .load_audit(Some("failed-write"))
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "working_event")
+            .filter(|event| event.payload["event_type"] == "multi_edit_result")
+            .collect::<Vec<_>>();
+        assert!(updates.is_empty(), "{updates:?}");
+    }
+
+    #[tokio::test]
     async fn mutating_external_http_shell_calls_require_approval_but_gets_do_not() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let engine = TurnEngine::new(
@@ -8275,6 +8416,69 @@ mod tests {
         assert!(store.load_messages("s").unwrap().iter().any(|message| {
             message.role == "assistant" && message.content.to_string().contains("partial")
         }));
+    }
+
+    #[tokio::test]
+    async fn chunk_idle_timeout_aborts_stalled_provider_and_finishes_turn() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let mut engine = TurnEngine::new(
+            StalledProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "stalled",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine.set_chunk_idle_timeout(Duration::from_millis(10));
+
+        let result = tokio::time::timeout(Duration::from_secs(1), engine.submit_text("hello"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(EngineError::Provider(
+                ProviderError::ChunkIdleTimeout { .. }
+            ))
+        ));
+        assert!(!engine.has_active_turn());
+        let events = store.load_session_events("stalled").unwrap();
+        assert!(events.iter().any(|event| {
+            event.event["working_event"]["event_type"] == "provider_stream_timeout"
+                && event.event["working_event"]["category"] == "notice"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event["working_event"]["event_type"] == "turn_finished"
+                && event.event["working_event"]["payload"]["run_state"] == "error"
+        }));
+    }
+
+    #[tokio::test]
+    async fn inactive_steering_starts_one_turn_without_duplicate_user_message() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "inactive-steering",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+
+        engine.submit_steering("follow-up direction").await.unwrap();
+
+        let steering_messages = store
+            .load_session_events("inactive-steering")
+            .unwrap()
+            .into_iter()
+            .filter(|event| {
+                event.event["working_event"]["event_type"] == "user_message"
+                    && event.event["working_event"]["payload"]["source"] == "steering"
+            })
+            .count();
+        assert_eq!(steering_messages, 1);
+        assert!(!engine.has_active_turn());
     }
 
     struct FailingRemoteTools;

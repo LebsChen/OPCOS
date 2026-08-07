@@ -2470,19 +2470,37 @@ impl LocalHost {
         } else {
             self.root.join(candidate)
         };
-        let canonical = if candidate.exists() {
-            std::fs::canonicalize(candidate)?
-        } else {
-            let parent = candidate
-                .parent()
+        let mut ancestor = candidate.clone();
+        let mut tail = Vec::new();
+        while !ancestor.exists() {
+            let name = ancestor
+                .file_name()
+                .ok_or_else(|| HostError::Path("path has no file name".into()))?;
+            tail.push(name.to_owned());
+            ancestor
+                .pop()
+                .then_some(())
                 .ok_or_else(|| HostError::Path("path has no parent".into()))?;
-            let parent = std::fs::canonicalize(parent)?;
-            parent.join(
-                candidate
-                    .file_name()
-                    .ok_or_else(|| HostError::Path("path has no file name".into()))?,
-            )
-        };
+        }
+        let mut canonical = std::fs::canonicalize(ancestor)?;
+        for component in tail
+            .iter()
+            .rev()
+            .flat_map(|name| Path::new(name).components())
+        {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    if !canonical.pop() {
+                        return Err(HostError::Path("path is outside local workspace".into()));
+                    }
+                }
+                std::path::Component::Normal(name) => canonical.push(name),
+                std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                    return Err(HostError::Path("path is outside local workspace".into()));
+                }
+            }
+        }
         let temp_root = std::env::temp_dir();
         let is_opcos_temp = canonical.parent().is_some_and(|parent| parent == temp_root)
             && canonical
@@ -2859,6 +2877,9 @@ impl Host for LocalHost {
 
     async fn write(&self, path: &str, content: &str) -> Result<Value, HostError> {
         let path = self.secure_path(path)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
         fs::write(&path, content).await?;
         Ok(serde_json::json!({
             "ok": true,
@@ -4035,6 +4056,50 @@ mod tests {
                 .items
                 .iter()
                 .any(|item| item.name == "vnc" && !item.available)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_host_write_creates_nested_missing_directories() {
+        let root = tempfile_dir();
+        let host = LocalHost::new(&root).unwrap();
+
+        host.write("src/routes/categories.js", "export default {};")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join("src/routes/categories.js")).unwrap(),
+            "export default {};"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_host_rejects_parent_escape_for_missing_paths() {
+        let root = tempfile_dir();
+        let host = LocalHost::new(&root).unwrap();
+
+        let error = host.write("../outside.txt", "nope").await.unwrap_err();
+        assert!(matches!(error, HostError::Path(_)));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_host_existing_file_write_preserves_secure_path_behavior() {
+        let root = tempfile_dir();
+        fs::create_dir_all(root.join("src/routes")).unwrap();
+        fs::write(root.join("src/routes/categories.js"), "old").unwrap();
+        let host = LocalHost::new(&root).unwrap();
+
+        host.write("./src/routes/../routes/categories.js", "new")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join("src/routes/categories.js")).unwrap(),
+            "new"
         );
         fs::remove_dir_all(root).unwrap();
     }

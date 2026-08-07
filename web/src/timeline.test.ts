@@ -813,10 +813,12 @@ describe("single event-log timeline", () => {
     expect(rows).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
+          label: "Edited lib.rs +2 −1",
           artifactId: "artifact-diff",
           artifactKind: "diff",
         }),
         expect.objectContaining({
+          label: "Screenshot",
           artifactId: "artifact-image",
           artifactKind: "screenshot",
         }),
