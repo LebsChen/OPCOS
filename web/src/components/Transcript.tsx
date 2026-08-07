@@ -103,16 +103,18 @@ function TranscriptDisclosure({
 function Thought({
   text,
   label = "Thought details",
+  bare = false,
   forceSummaryBreak = false,
 }: {
   text: string;
   label?: string;
+  bare?: boolean;
   forceSummaryBreak?: boolean;
 }) {
   return (
     <TranscriptDisclosure
       label={label}
-      bare={label === "Thought details"}
+      bare={bare}
       summaryClassName={
         forceSummaryBreak ? "transcript-disclosure-summary-break" : ""
       }
@@ -606,7 +608,11 @@ export function Transcript({
               )}
               {row.plan && <PlanCard steps={row.plan.steps} />}
               {row.detail && !row.thoughtForCallId && (
-                <Thought text={row.detail} label={thoughtLabel(row.label)} />
+                <Thought
+                  text={row.detail}
+                  label={thoughtLabel(row.label)}
+                  bare
+                />
               )}
               {row.callId && thoughtByCallId.get(row.callId)?.detail && (
                 <Thought
