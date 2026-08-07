@@ -472,7 +472,7 @@ export function Sidebar(props: SidebarProps) {
         key={s.session_id}
         className={
           "group flex items-center gap-2 px-2 py-1.5 rounded-lg text-left cursor-pointer " +
-          (active ? "bg-ink/[0.055]" : "hover:bg-panel")
+          (active ? "selected-session-row" : "hover:bg-panel")
         }
         onClick={() => {
           if (!editing) onSelectSession(s.session_id, s.workspace, s.agent);
@@ -546,7 +546,7 @@ export function Sidebar(props: SidebarProps) {
         key={s.session_id}
         className={
           "group w-full flex items-center gap-2.5 px-2 py-2 rounded-lg cursor-pointer text-left " +
-          (active ? "bg-ink/[0.055]" : "hover:bg-paper")
+          (active ? "selected-session-row" : "hover:bg-paper")
         }
         title={editing ? undefined : title}
         onClick={() => {
