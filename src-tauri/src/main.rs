@@ -19734,6 +19734,20 @@ async fn auto_route_project_plan(
                     json!({"step_id": step.step_id, "worker_role": role_name, "dispatch": dispatch}),
                 );
                 let engine = engine_for(app, state, worker_session, ToolOrigin::User).await?;
+                let turn_finished_before = {
+                    let connection = state
+                        .database
+                        .lock()
+                        .map_err(|_| "database lock poisoned")?;
+                    connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM session_events
+                             WHERE session_id=?1 AND json_extract(event_json, '$.type')='turn_finished'",
+                            [worker_session],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map_err(|error| error.to_string())?
+                };
                 engine
                     .submit_text(message)
                     .await
@@ -19745,7 +19759,23 @@ async fn auto_route_project_plan(
                         .map_err(|error| error.to_string())?
                         .is_some_and(|session| session.run_state != "running");
                     if worker_idle {
-                        break;
+                        let turn_finished_after = {
+                            let connection = state
+                                .database
+                                .lock()
+                                .map_err(|_| "database lock poisoned")?;
+                            connection
+                                .query_row(
+                                    "SELECT COUNT(*) FROM session_events
+                                     WHERE session_id=?1 AND json_extract(event_json, '$.type')='turn_finished'",
+                                    [worker_session],
+                                    |row| row.get::<_, i64>(0),
+                                )
+                                .map_err(|error| error.to_string())?
+                        };
+                        if turn_finished_after > turn_finished_before {
+                            break;
+                        }
                     }
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
