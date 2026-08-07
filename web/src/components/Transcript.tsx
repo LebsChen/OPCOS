@@ -261,7 +261,7 @@ function PlanCard({
             strokeLinecap="round"
           />
         </svg>
-        <span>Devin&apos;s execution plan</span>
+        <span>OPCOS execution plan</span>
       </div>
       <div className="transcript-plan-steps">
         {steps.map((step, index) => {
