@@ -19685,7 +19685,7 @@ async fn auto_route_project_plan(
                     phase: BoardPhase::Claimed,
                     assignee: Some(worker.id.clone()),
                     lease_generation: 1,
-                    lease_until: Some(Utc::now() + ChronoDuration::minutes(1)),
+                    lease_until: Some(Utc::now() + ChronoDuration::hours(24)),
                     require_acceptance: true,
                     verified_pr_url: None,
                     branch: Some(worker.branch.clone()),
