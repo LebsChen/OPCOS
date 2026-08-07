@@ -561,7 +561,7 @@ export function Transcript({
             Boolean(row.detail) && row.label.startsWith("Thought for ");
           return (
             <div
-              className={`transcript-item transcript-row${row.denied ? " text-muted" : row.resultError || (row.exitCode !== undefined && row.exitCode !== 0) ? " text-danger" : ""}`}
+              className={`transcript-item transcript-row${row.shellId ? " transcript-shell-row" : ""}${row.denied ? " text-muted" : row.resultError || (row.exitCode !== undefined && row.exitCode !== 0) ? " text-danger" : ""}`}
               key={rowIndex}
             >
               {!isThoughtRow && (
