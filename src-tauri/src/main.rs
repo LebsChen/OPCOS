@@ -13,7 +13,7 @@ use axum::{
     routing::any,
 };
 use base64::Engine;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures_util::{SinkExt, StreamExt};
 use notify::Watcher;
 use opcos_assets::{
@@ -19682,10 +19682,10 @@ async fn auto_route_project_plan(
                     project_id: project_id.into(),
                     id: task_id.clone(),
                     title: step.description.clone(),
-                    phase: BoardPhase::Open,
-                    assignee: None,
-                    lease_generation: 0,
-                    lease_until: None,
+                    phase: BoardPhase::Claimed,
+                    assignee: Some(worker.id.clone()),
+                    lease_generation: 1,
+                    lease_until: Some(Utc::now() + ChronoDuration::minutes(1)),
                     require_acceptance: true,
                     verified_pr_url: None,
                     branch: Some(worker.branch.clone()),
