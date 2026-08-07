@@ -3447,16 +3447,18 @@ for line in sys.stdin:
         manager.connect_with_retry(&config, "v1", 0).await.unwrap();
         assert_eq!(fs::read_to_string(&count_path).unwrap(), "1");
         manager
-            .refresh_after_notification(
-                &config,
-                "v1",
-                "notifications/tools/list_changed",
-                None,
-            )
+            .refresh_after_notification(&config, "v1", "notifications/tools/list_changed", None)
             .await
             .unwrap();
         assert_eq!(fs::read_to_string(&count_path).unwrap(), "1");
-        assert_eq!(manager.cached_tools("refresh-server", "v1").await.unwrap().len(), 1);
+        assert_eq!(
+            manager
+                .cached_tools("refresh-server", "v1")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(
             manager.cached_tools("refresh-server", "v1").await.unwrap()[0].name,
             "refreshed"
