@@ -13,7 +13,7 @@ use axum::{
     routing::any,
 };
 use base64::Engine;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures_util::{SinkExt, StreamExt};
 use notify::Watcher;
 use opcos_assets::{
@@ -39,7 +39,7 @@ use opcos_engine::{
         restore_login_state as engine_restore_login_state,
     },
     orchestration::{BoardPhase, BoardTask},
-    orchestration::{CoordinationRuntime, Envelope, Role},
+    orchestration::{CoordinationRuntime, Envelope, Role, RoleState},
     planner::{parse_planner_output, planner_dedup_key, planning_prompt},
 };
 use opcos_hosts::{
@@ -1223,7 +1223,7 @@ async fn preflight_git_push(
         .ok_or("git_push requires cwd")?;
     let Some(project_id) = project_id else {
         return Ok(match origin {
-            ToolOrigin::User => PreflightDecision::NeedsUser(
+            ToolOrigin::User | ToolOrigin::System => PreflightDecision::NeedsUser(
                 "push diff inspection unavailable: no bound project".into(),
             ),
             ToolOrigin::RepairLoop => PreflightDecision::Deny(
@@ -1236,7 +1236,7 @@ async fn preflight_git_push(
         .map_err(|error| error.to_string())?
     else {
         return Ok(match origin {
-            ToolOrigin::User => PreflightDecision::NeedsUser(
+            ToolOrigin::User | ToolOrigin::System => PreflightDecision::NeedsUser(
                 "push diff inspection unavailable: bound project could not be loaded".into(),
             ),
             ToolOrigin::RepairLoop => PreflightDecision::Deny(
@@ -1256,7 +1256,7 @@ fn push_diff_preflight(
 ) -> PreflightDecision {
     match inspection {
         Err(error) => match origin {
-            ToolOrigin::User => {
+            ToolOrigin::User | ToolOrigin::System => {
                 PreflightDecision::NeedsUser(format!("push requires approval: {error}"))
             }
             ToolOrigin::RepairLoop => {
@@ -1265,7 +1265,7 @@ fn push_diff_preflight(
         },
         Ok(reasons) if reasons.is_empty() => PreflightDecision::Allow,
         Ok(reasons) => match origin {
-            ToolOrigin::User => PreflightDecision::NeedsUser(format!(
+            ToolOrigin::User | ToolOrigin::System => PreflightDecision::NeedsUser(format!(
                 "push requires approval: diff enters protected repair boundary ({})",
                 reasons.join("; ")
             )),
@@ -3682,7 +3682,25 @@ impl ToolExecutor for RemoteExecutor {
         if name == "external_ingress_sources" {
             return execute_external_ingress_tool(&self.store, name, &arguments);
         }
+        if self.origin == ToolOrigin::User
+            && automatic_project_routing_active(&self.store, &self.session_id)?
+            && matches!(name, "edit_file" | "write_file")
+        {
+            return Err(
+                "Lead-local implementation is disabled; create a plan and let the desktop dispatch it to a Worker"
+                    .to_owned(),
+            );
+        }
         if matches!(name, "coordination_dispatch" | "coordination_status") {
+            if name == "coordination_dispatch"
+                && self.origin == ToolOrigin::User
+                && automatic_project_routing_active(&self.store, &self.session_id)?
+            {
+                return Err(
+                    "routing is system-managed; planned steps are dispatched automatically"
+                        .to_owned(),
+                );
+            }
             return execute_coordination_tool(
                 &self.store,
                 &self.database,
@@ -4087,7 +4105,25 @@ impl ToolExecutor for DesktopExecutor {
                 if name == "external_ingress_sources" {
                     return execute_external_ingress_tool(&executor.store, name, &arguments);
                 }
+                if executor.origin == ToolOrigin::User
+                    && automatic_project_routing_active(&executor.store, &executor.session_id)?
+                    && matches!(name, "edit_file" | "write_file")
+                {
+                    return Err(
+                        "Lead-local implementation is disabled; create a plan and let the desktop dispatch it to a Worker"
+                            .to_owned(),
+                    );
+                }
                 if matches!(name, "coordination_dispatch" | "coordination_status") {
+                    if name == "coordination_dispatch"
+                        && executor.origin == ToolOrigin::User
+                        && automatic_project_routing_active(&executor.store, &executor.session_id)?
+                    {
+                        return Err(
+                            "routing is system-managed; planned steps are dispatched automatically"
+                                .to_owned(),
+                        );
+                    }
                     return execute_coordination_tool(
                         &executor.store,
                         &executor.database,
@@ -7127,6 +7163,13 @@ async fn project_host(
     state: &State<'_, DesktopState>,
     project: &ProjectRecord,
 ) -> Result<Arc<dyn Host>, String> {
+    project_host_inner(state, project).await
+}
+
+async fn project_host_inner(
+    state: &DesktopState,
+    project: &ProjectRecord,
+) -> Result<Arc<dyn Host>, String> {
     if project.host_id == "local" {
         let root = dirs::home_dir().ok_or_else(|| "home directory is unavailable".to_owned())?;
         return Ok(Arc::new(
@@ -7244,6 +7287,7 @@ fn git_worktree_add_command(
     worktree_path: &str,
     branch: &str,
     existing_branch: bool,
+    base_ref: Option<&str>,
 ) -> String {
     let quote = |value: &str| quote_for(platform, value);
     if existing_branch {
@@ -7254,11 +7298,15 @@ fn git_worktree_add_command(
             quote(branch)
         )
     } else {
+        let start = base_ref
+            .map(|value| format!(" {}", quote(value)))
+            .unwrap_or_default();
         format!(
-            "git -C {} worktree add {} -b {}",
+            "git -C {} worktree add {} -b {}{}",
             quote(repo_root),
             quote(worktree_path),
-            quote(branch)
+            quote(branch),
+            start
         )
     }
 }
@@ -8375,6 +8423,38 @@ async fn create_project_agent(
     system_prompt: Option<String>,
     branch: Option<String>,
 ) -> Result<ProjectAgentRecord, String> {
+    create_project_agent_inner(
+        &state,
+        project_id,
+        template_id,
+        name,
+        role,
+        sort_order,
+        provider,
+        model,
+        harness,
+        mode,
+        system_prompt,
+        branch,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_project_agent_inner(
+    state: &DesktopState,
+    project_id: String,
+    template_id: Option<String>,
+    name: String,
+    role: String,
+    sort_order: Option<u32>,
+    provider: Option<String>,
+    model: Option<String>,
+    harness: Option<String>,
+    mode: Option<String>,
+    system_prompt: Option<String>,
+    branch: Option<String>,
+) -> Result<ProjectAgentRecord, String> {
     let project = state
         .store
         .load_project(&project_id)
@@ -8404,14 +8484,43 @@ async fn create_project_agent(
             worktree_branch(&role, sort_order, project_suffix)
         })
     };
-    let host = project_host(&state, &project).await?;
+    let host = project_host_inner(state, &project).await?;
     if !project_host_contains(&host, &project.repo_root)
         || !project_host_contains(&host, &worktree_path)
     {
         return Err("project worktree path is outside the bound host workspace".to_owned());
     }
+    let platform = host.health().await.ok().and_then(|health| health.platform);
+    let lead_base_ref = if sort_order == 0 {
+        None
+    } else {
+        let lead_workspace = agents
+            .iter()
+            .find(|agent| agent.sort_order == 0)
+            .map(|agent| agent.worktree_path.as_str())
+            .unwrap_or(project.repo_root.as_str());
+        let result = host
+            .exec(ExecRequest {
+                command: format!(
+                    "git -C {} rev-parse --verify HEAD",
+                    quote_for(platform.as_deref(), lead_workspace)
+                ),
+                cwd: None,
+                timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+                session: None,
+                env: None,
+            })
+            .await
+            .map_err(|error| format!("Lead workspace revision check failed: {error}"))?;
+        if result.result.exit_code != 0 {
+            return Err(format!(
+                "Lead workspace revision check failed: {}",
+                result.result.stderr
+            ));
+        }
+        Some(result.result.stdout.trim().to_owned())
+    };
     if sort_order != 0 {
-        let platform = host.health().await.ok().and_then(|health| health.platform);
         let probe = host
             .exec(ExecRequest {
                 command: format!(
@@ -8434,6 +8543,7 @@ async fn create_project_agent(
                     &worktree_path,
                     &branch,
                     probe.result.exit_code == 0,
+                    lead_base_ref.as_deref(),
                 ),
                 cwd: None,
                 timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
@@ -9894,6 +10004,11 @@ async fn engine_for_with_context(
             .map_err(|error| error.to_string())?,
     );
     let mut allowed_tools = allowed_tools;
+    if automatic_project_routing_active(&state.store, session_id)?
+        && let Some(allowed_tools) = allowed_tools.as_mut()
+    {
+        allowed_tools.retain(|tool| tool != "coordination_dispatch");
+    }
     if let Some(executor_client) = &remote_client
         && let Ok(response) = executor_client
             .mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
@@ -10083,12 +10198,31 @@ async fn engine_for_with_context(
         })
         .or_else(|| initial_task.map(str::to_owned))
         .unwrap_or_default();
+    let mut system_instructions = bundle.system_instructions_for(KnowledgeContext {
+        task: &task_text,
+        repository: Some(&workspace),
+        project: session.project_id.as_deref(),
+    });
+    if session.project_id.is_some()
+        && let Ok(Some(agent)) = state.store.load_project_agent_by_session(session_id)
+        && agent.sort_order == 0
+        && agent.role.eq_ignore_ascii_case("lead")
+        && state.store.load_plan(session_id).ok().flatten().is_some()
+    {
+        system_instructions.push_str(
+             "\n\nAutonomous project routing policy: you are the Lead orchestrator. \
+             Internal worker routing is automatic and is never a user question. \
+             Do not call coordination_dispatch; the desktop dispatches saved plan steps \
+             automatically. Do not ask whether to execute in-session or dispatch workers, and do not \
+             present that choice as an option. Do not open or edit implementation files or \
+             execute implementation work in the Lead workspace. For implementation requests, \
+             create or revise the plan and stop; the desktop dispatches the saved step. \
+             Sequence, synthesize, and verify; workers execute their assigned steps. Ask the user only about genuine product \
+             ambiguity or risky external actions requiring approval.",
+        );
+    }
     engine
-        .set_system_instructions(Some(bundle.system_instructions_for(KnowledgeContext {
-            task: &task_text,
-            repository: Some(&workspace),
-            project: session.project_id.as_deref(),
-        })))
+        .set_system_instructions(Some(system_instructions))
         .await;
     if !bundle.knowledge.is_empty() {
         let working_event = json!({
@@ -12145,6 +12279,17 @@ async fn submit_turn(
     submit_turn_inner(app, &state, request).await
 }
 
+async fn submit_engine_turn_with_coordination_ingest(
+    engine: &GuiEngine,
+    state: &DesktopState,
+    session_id: &str,
+    text: String,
+) -> Result<(), EngineError> {
+    engine.submit_text(text).await?;
+    let _ = coordination_ingest_session_inner(state, session_id, false).await;
+    Ok(())
+}
+
 async fn submit_turn_inner(
     app: tauri::AppHandle,
     state: &DesktopState,
@@ -12301,15 +12446,48 @@ pub(crate) async fn submit_turn_inner_with_context(
         Some(&request.text),
     )
     .await?;
+    let plan_before_turn = state
+        .store
+        .load_plan(&request.session_id)
+        .map_err(|error| error.to_string())?;
     emit(
         &app,
         "message",
         Some(&request.session_id),
         json!({"role":"user","text":request.text}),
     );
-    match engine.submit_text(request.text).await {
+    if let Err(error) = auto_route_project_plan(&app, state, &request.session_id).await {
+        audit(
+            state,
+            &request.session_id,
+            "coordination_auto_route_error",
+            json!({"error": error}),
+        );
+    }
+    match submit_engine_turn_with_coordination_ingest(
+        &engine,
+        state,
+        &request.session_id,
+        request.text,
+    )
+    .await
+    {
         Ok(_) => {
-            let _ = coordination_ingest_session_inner(state, &request.session_id, false).await;
+            if let Err(error) = auto_route_project_plan(&app, state, &request.session_id).await {
+                audit(
+                    state,
+                    &request.session_id,
+                    "coordination_auto_route_error",
+                    json!({"error": error}),
+                );
+            }
+            record_unrouted_completed_plan_steps(
+                &app,
+                state,
+                &request.session_id,
+                plan_before_turn.as_ref(),
+            )
+            .await?;
             let calls = state
                 .store
                 .load_tool_calls_after(&request.session_id, sequence_before)
@@ -19104,6 +19282,539 @@ async fn coordination_start_project(
     }))
 }
 
+async fn ensure_project_worker_session(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    project: &ProjectRecord,
+    leader: &ProjectAgentRecord,
+    role: &str,
+) -> Result<ProjectAgentRecord, String> {
+    let leader_session = leader
+        .session_id
+        .as_deref()
+        .and_then(|session_id| state.store.load_session(session_id).ok().flatten());
+    let leader_model = leader_session
+        .as_ref()
+        .map(|session| session.model.clone())
+        .filter(|model| model != "auto")
+        .unwrap_or_else(|| leader.model.clone());
+    let leader_provider = leader_session
+        .as_ref()
+        .and_then(|session| session.provider.clone())
+        .or_else(|| leader.provider.clone());
+    let mut agent = state
+        .store
+        .load_project_agents(&project.id)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|candidate| candidate.role.eq_ignore_ascii_case(role));
+    if agent.is_none() {
+        agent = Some(
+            create_project_agent_inner(
+                state,
+                project.id.clone(),
+                None,
+                role.to_owned(),
+                role.to_owned(),
+                None,
+                leader_provider.clone(),
+                Some(leader_model.clone()),
+                Some("builtin".into()),
+                Some("Auto".into()),
+                Some(format!(
+                    "You are the {role} Worker. Execute only the assigned coordination task, \
+                     report concrete results and blockers to the Lead, and do not ask how work \
+                     should be routed."
+                )),
+                None,
+            )
+            .await?,
+        );
+    }
+    let mut agent = agent.expect("worker agent created");
+    if !agent.harness.eq_ignore_ascii_case("builtin") {
+        return Err(format!(
+            "{role} worker uses unsupported {} harness",
+            agent.harness
+        ));
+    }
+    if agent.model == "auto" {
+        agent.model = leader_model;
+    }
+    if agent.provider.is_none() {
+        agent.provider = leader_provider;
+    }
+    agent.updated_at = Utc::now();
+    state
+        .store
+        .save_project_agent(&agent)
+        .map_err(|error| error.to_string())?;
+    let session_id = if let Some(session_id) = agent.session_id.clone() {
+        session_id
+    } else {
+        let session_id = format!(
+            "session-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let now = Utc::now();
+        save_session_via_factory(
+            state,
+            SessionRecord {
+                session_id: session_id.clone(),
+                workspace: agent.worktree_path.clone(),
+                model: if agent.model == "auto" {
+                    leader.model.clone()
+                } else {
+                    agent.model.clone()
+                },
+                mode: permission_mode_name(parse_permission_mode(&agent.mode)?).to_owned(),
+                harness: "builtin".into(),
+                title: format!("{role} Worker"),
+                extra_roots: vec![],
+                grants: json!({}),
+                pinned: false,
+                archived: false,
+                origin: None,
+                origin_label: None,
+                compaction: json!({}),
+                host_id: project.host_id.clone(),
+                provider: agent.provider.clone().or_else(|| leader.provider.clone()),
+                external_session_id: None,
+                run_state: "idle".into(),
+                stop_reason: "none".into(),
+                created_at: now,
+                updated_at: now,
+                project_id: Some(project.id.clone()),
+                agent_id: Some(agent.id.clone()),
+            },
+            false,
+        )?;
+        state
+            .store
+            .update_project_agent_session(&agent.id, Some(&session_id))
+            .map_err(|error| error.to_string())?;
+        agent.session_id = Some(session_id.clone());
+        session_id
+    };
+    if let Some(mut worker_session) = state
+        .store
+        .load_session(&session_id)
+        .map_err(|error| error.to_string())?
+    {
+        worker_session.model = agent.model.clone();
+        worker_session.provider = agent.provider.clone();
+        worker_session.updated_at = Utc::now();
+        state
+            .store
+            .save_session(&worker_session)
+            .map_err(|error| error.to_string())?;
+    }
+    engine_for(app, state, &session_id, ToolOrigin::User).await?;
+    Ok(agent)
+}
+
+async fn ensure_project_coordination(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    project_id: &str,
+    leader_session_id: &str,
+) -> Result<Value, String> {
+    let project = state
+        .store
+        .load_project(project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    let leader = state
+        .store
+        .load_project_agent_by_session(leader_session_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project Lead session is not bound to a project role".to_owned())?;
+    if leader.sort_order != 0 || !leader.role.eq_ignore_ascii_case("lead") {
+        return Err("project session is not the Lead".into());
+    }
+    let mut roles = vec![Role {
+        project_id: project_id.into(),
+        id: leader.id.clone(),
+        sort_order: leader.sort_order,
+        session_id: leader_session_id.into(),
+        state: RoleState::Active,
+    }];
+    let mut unavailable = Vec::new();
+    for (sort_order, role) in ["Code", "Review"].into_iter().enumerate() {
+        match ensure_project_worker_session(app, state, &project, &leader, role).await {
+            Ok(agent) => roles.push(Role {
+                project_id: project_id.into(),
+                id: agent.id,
+                sort_order: (sort_order + 1) as u32,
+                session_id: agent.session_id.unwrap_or_default(),
+                state: RoleState::Active,
+            }),
+            Err(reason) => unavailable.push(json!({"role": role, "reason": reason})),
+        }
+    }
+    let task_id = format!("project-board:{project_id}");
+    let mut runtimes = state.coordination.lock().await;
+    if !runtimes.contains_key(&task_id) {
+        let runtime = CoordinationRuntime::new(roles).map_err(|error| error.to_string())?;
+        let persisted = {
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            load_persisted_coord_messages(&connection, &task_id)?
+        };
+        let mut runtime = runtime;
+        runtime
+            .restore_messages(persisted)
+            .map_err(|error| format!("stored coordination history is invalid: {error}"))?;
+        runtimes.insert(task_id.clone(), runtime);
+    }
+    drop(runtimes);
+    Ok(json!({
+        "project_id": project_id,
+        "task_id": task_id,
+        "unavailable_workers": unavailable,
+        "started": true
+    }))
+}
+
+fn worker_role_for_plan_step(step: &opcos_store::PlanStepRecord) -> &'static str {
+    let description = step.description.to_ascii_lowercase();
+    if description.trim_start().starts_with("review")
+        || description.trim_start().starts_with("audit")
+    {
+        "Review"
+    } else {
+        "Code"
+    }
+}
+
+fn step_has_routing_audit(
+    state: &DesktopState,
+    session_id: &str,
+    step_id: &str,
+) -> Result<bool, String> {
+    let events = state
+        .store
+        .load_audit(Some(session_id))
+        .map_err(|error| error.to_string())?;
+    Ok(events.iter().any(|event| {
+        matches!(
+            event.kind.as_str(),
+            "coordination_auto_dispatch" | "coordination_local_execution"
+        ) && event.payload["step_id"].as_str() == Some(step_id)
+    }))
+}
+
+async fn record_unrouted_completed_plan_steps(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    leader_session_id: &str,
+    plan_before_turn: Option<&opcos_store::PlanRecord>,
+) -> Result<(), String> {
+    let Some(plan_before_turn) = plan_before_turn else {
+        return Ok(());
+    };
+    let before = plan_before_turn
+        .steps
+        .iter()
+        .filter(|step| step.status == "not_started")
+        .map(|step| step.step_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    if before.is_empty() {
+        return Ok(());
+    }
+    let Some(plan_after_turn) = state
+        .store
+        .load_plan(leader_session_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(());
+    };
+    for step in plan_after_turn
+        .steps
+        .into_iter()
+        .filter(|step| before.contains(step.step_id.as_str()) && step.status == "done")
+    {
+        if step_has_routing_audit(state, leader_session_id, &step.step_id)? {
+            continue;
+        }
+        let payload = json!({
+            "step_id": step.step_id,
+            "description": step.description,
+            "reason": "Lead completed the plan step before autonomous dispatch recorded a worker route",
+            "execution": "lead_local",
+        });
+        audit(
+            state,
+            leader_session_id,
+            "coordination_local_execution",
+            payload.clone(),
+        );
+        emit(
+            app,
+            "coordination_local_execution",
+            Some(leader_session_id),
+            payload,
+        );
+    }
+    Ok(())
+}
+
+async fn record_local_plan_execution(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    leader_session_id: &str,
+    step: &opcos_store::PlanStepRecord,
+    reason: &str,
+) -> Result<(), String> {
+    let payload = json!({
+        "step_id": step.step_id,
+        "description": step.description,
+        "reason": reason,
+        "execution": "lead_local",
+    });
+    audit(
+        state,
+        leader_session_id,
+        "coordination_local_execution",
+        payload.clone(),
+    );
+    emit(
+        app,
+        "coordination_local_execution",
+        Some(leader_session_id),
+        payload,
+    );
+    state
+        .store
+        .update_plan_step(
+            leader_session_id,
+            &step.step_id,
+            Some("in_progress"),
+            None,
+            Some(reason),
+        )
+        .map_err(|error| error.to_string())?;
+    let engine = engine_for(app, state, leader_session_id, ToolOrigin::System).await?;
+    let prompt = format!(
+        "Execute this plan step locally as the Lead because worker dispatch was unavailable: \
+         {}. Do not ask the user how to route it; perform the step and verify the result.",
+        step.description
+    );
+    let run_state = state
+        .store
+        .load_session(leader_session_id)
+        .map_err(|error| error.to_string())?
+        .map(|session| session.run_state);
+    if run_state.as_deref() == Some("running") {
+        engine
+            .queue_steering(prompt)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    } else {
+        engine
+            .submit_text(prompt)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+async fn auto_route_project_plan(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    leader_session_id: &str,
+) -> Result<(), String> {
+    let Some(session) = state
+        .store
+        .load_session(leader_session_id)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    let Some(project_id) = session.project_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(plan) = state
+        .store
+        .load_plan(leader_session_id)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    let setup = ensure_project_coordination(app, state, project_id, leader_session_id).await?;
+    let unavailable = setup
+        .get("unavailable_workers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let serial = state
+        .store
+        .load_project(project_id)
+        .ok()
+        .flatten()
+        .and_then(|project| serde_json::from_str::<Value>(&project.workflow_json).ok())
+        .and_then(|workflow| workflow.get("serial").and_then(Value::as_bool))
+        .unwrap_or(true);
+    let steps = plan
+        .steps
+        .into_iter()
+        .filter(|step| step.status == "not_started");
+    for step in if serial {
+        steps.take(1).collect::<Vec<_>>()
+    } else {
+        steps.collect::<Vec<_>>()
+    } {
+        if step_has_routing_audit(state, leader_session_id, &step.step_id)? {
+            continue;
+        }
+        let role_name = worker_role_for_plan_step(&step);
+        let worker = state
+            .store
+            .load_project_agents(project_id)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|agent| agent.role.eq_ignore_ascii_case(role_name));
+        let Some(worker) = worker.filter(|agent| {
+            agent.session_id.is_some() && agent.harness.eq_ignore_ascii_case("builtin")
+        }) else {
+            let reason = unavailable
+                .iter()
+                .find(|item| item["role"].as_str() == Some(role_name))
+                .and_then(|item| item["reason"].as_str())
+                .unwrap_or("worker session is unavailable");
+            record_local_plan_execution(app, state, leader_session_id, &step, reason).await?;
+            continue;
+        };
+        let task_id = format!("plan-step:{}", step.step_id);
+        let existing = {
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            connection
+                .query_row("SELECT 1 FROM coord_tasks WHERE id=?1", [&task_id], |_| {
+                    Ok(true)
+                })
+                .optional()
+                .map_err(|error| error.to_string())?
+                .unwrap_or(false)
+        };
+        if existing {
+            continue;
+        }
+        state
+            .store
+            .update_plan_step(
+                leader_session_id,
+                &step.step_id,
+                Some("in_progress"),
+                None,
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+        {
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            save_coord_task(
+                &connection,
+                &BoardTask {
+                    project_id: project_id.into(),
+                    id: task_id.clone(),
+                    title: step.description.clone(),
+                    phase: BoardPhase::Claimed,
+                    assignee: Some(worker.id.clone()),
+                    lease_generation: 1,
+                    lease_until: Some(Utc::now() + ChronoDuration::hours(24)),
+                    require_acceptance: true,
+                    verified_pr_url: None,
+                    branch: Some(worker.branch.clone()),
+                    pr: None,
+                    dispatch_count: 0,
+                    dispatch_limit: 8,
+                },
+            )?;
+        }
+        {
+            let agents = state
+                .store
+                .load_project_agents(project_id)
+                .map_err(|e| e.to_string())?;
+            let roles = agents
+                .into_iter()
+                .filter_map(|agent| {
+                    Some(Role {
+                        project_id: project_id.into(),
+                        id: agent.id,
+                        sort_order: agent.sort_order,
+                        session_id: agent.session_id?,
+                        state: RoleState::Active,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let runtime = CoordinationRuntime::new(roles).map_err(|e| e.to_string())?;
+            let mut runtimes = state.coordination.lock().await;
+            runtimes.entry(task_id.clone()).or_insert(runtime);
+        }
+        let message = format!(
+            "Execute assigned plan step {} (coordination task {}): {}. Work only in your assigned \
+             workspace. When finished, send the Lead a coordination envelope with taskId exactly \
+             '{}', kind='result', and a concrete report of the work and verification; do not \
+             substitute a prose report for the envelope.",
+            step.step_id, task_id, step.description, task_id
+        );
+        let worker_session = worker
+            .session_id
+            .as_deref()
+            .ok_or_else(|| "coordination target Worker session is not started".to_owned())?;
+        engine_for(app, state, worker_session, ToolOrigin::User).await?;
+        let result = execute_coordination_tool(
+            &state.store,
+            &state.database,
+            &state.engines,
+            &state.coordination,
+            leader_session_id,
+            "coordination_dispatch",
+            &json!({
+                "task_id": task_id,
+                "worker_role_id": worker.id,
+                "message": message,
+            }),
+        )
+        .await;
+        match result {
+            Ok(dispatch) => {
+                audit(
+                    state,
+                    leader_session_id,
+                    "coordination_auto_dispatch",
+                    json!({"step_id": step.step_id, "worker_role": role_name, "dispatch": dispatch}),
+                );
+                let engine = engine_for(app, state, worker_session, ToolOrigin::User).await?;
+                submit_engine_turn_with_coordination_ingest(
+                    &engine,
+                    state,
+                    worker_session,
+                    message,
+                )
+                .await
+                .map_err(engine_error_message)?;
+            }
+            Err(reason) => {
+                return Err(format!(
+                    "automatic dispatch failed for plan step {}: {reason}",
+                    step.step_id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn coordination_message(
     state: State<'_, DesktopState>,
@@ -19133,7 +19844,7 @@ async fn coordination_message(
         }
     };
     let project_id = connection_project_for_task(&state, &task_id)?;
-    persist_coord_message(&state, &project_id, &task_id, &envelope)?;
+    persist_coord_message(&state, &project_id, &task_id, &envelope).await?;
     if let Some(worker_session) = worker_session {
         let engine = state
             .engines
@@ -19350,11 +20061,12 @@ async fn execute_coordination_tool(
         let messages = statement
             .query_map(params![task_id, limit as i64], |row| {
                 let payload: String = row.get(4)?;
+                let kind: String = row.get(3)?;
                 Ok(json!({
                     "msg_id": row.get::<_, String>(0)?,
                     "from": row.get::<_, String>(1)?,
                     "to": row.get::<_, String>(2)?,
-                    "kind": row.get::<_, String>(3)?,
+                    "kind": normalize_coordination_kind(&kind),
                     "payload": serde_json::from_str::<Value>(&payload).unwrap_or(Value::Null),
                     "created_at": row.get::<_, String>(5)?
                 }))
@@ -19407,7 +20119,7 @@ async fn execute_coordination_tool(
             "total_messages": total_messages,
             "omitted_messages": total_messages.saturating_sub(messages.len()),
             "truncated": total_messages > messages.len(),
-            "completion_note": "Worker self-reports never establish completion; branch, push, PR, and GitHub API verification are required"
+            "completion_note": "Worker self-reports never establish completion; forge-backed tasks require branch, push, PR, and GitHub API checks, while local-only tasks require a local branch, clean worktree, and result envelope"
         }));
     }
     Err(format!("unsupported coordination tool: {name}"))
@@ -19426,34 +20138,66 @@ fn connection_project_for_task(state: &DesktopState, task_id: &str) -> Result<St
         .map_err(|error| error.to_string())
 }
 
-fn persist_coord_message(
+async fn persist_coord_message(
     state: &DesktopState,
     project_id: &str,
     task_id: &str,
     envelope: &Envelope,
 ) -> Result<(), String> {
-    state
-        .database
-        .lock()
-        .map_err(|_| "database lock poisoned")?
-        .execute(
-            "INSERT INTO coord_messages
-             (project_id,task_id,msg_id,from_role,to_role,kind,reply_to,payload,created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            params![
-                project_id,
-                task_id,
-                envelope.msg_id,
-                envelope.from,
-                envelope.to,
-                serde_json::to_string(&envelope.kind).map_err(|error| error.to_string())?,
-                envelope.reply_to,
-                envelope.payload.to_string(),
-                Utc::now().to_rfc3339(),
-            ],
-        )
-        .map_err(|error| error.to_string())?;
+    {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        if connection
+            .query_row(
+                "SELECT 1 FROM coord_messages WHERE msg_id=?1 LIMIT 1",
+                params![envelope.msg_id],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Ok(());
+        }
+        connection
+            .execute(
+                "INSERT INTO coord_messages
+                 (project_id,task_id,msg_id,from_role,to_role,kind,reply_to,payload,created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    project_id,
+                    task_id,
+                    envelope.msg_id,
+                    envelope.from,
+                    envelope.to,
+                    serde_json::to_value(&envelope.kind)
+                        .map_err(|error| error.to_string())?
+                        .as_str()
+                        .ok_or_else(|| "invalid coordination envelope kind".to_owned())?,
+                    envelope.reply_to,
+                    envelope.payload.to_string(),
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    if envelope.kind == opcos_engine::orchestration::EnvelopeKind::Result {
+        coordination_complete_task_inner(state, task_id, &envelope.from, None).await?;
+    }
     Ok(())
+}
+
+fn normalize_coordination_kind(kind: &str) -> &str {
+    kind.trim_matches('"')
+}
+
+fn automatic_project_routing_active(store: &SqliteStore, session_id: &str) -> Result<bool, String> {
+    Ok(store
+        .load_project_agent_by_session(session_id)
+        .map_err(|error| error.to_string())?
+        .is_some_and(|agent| agent.sort_order == 0 && agent.role.eq_ignore_ascii_case("lead")))
 }
 
 fn load_persisted_coord_messages(
@@ -19469,6 +20213,7 @@ fn load_persisted_coord_messages(
     let rows = statement
         .query_map([task_id], |row| {
             let kind: String = row.get(3)?;
+            let kind = normalize_coordination_kind(&kind);
             let payload: String = row.get(6)?;
             let created_at: String = row.get(7)?;
             Ok((
@@ -19682,12 +20427,13 @@ fn load_project_messages(connection: &Connection, project_id: &str) -> Result<Ve
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map([project_id], |row| {
+            let kind: String = row.get(4)?;
             Ok(json!({
                 "task_id": row.get::<_, String>(0)?,
                 "msg_id": row.get::<_, String>(1)?,
                 "from": row.get::<_, String>(2)?,
                 "to": row.get::<_, String>(3)?,
-                "kind": row.get::<_, String>(4)?,
+                "kind": normalize_coordination_kind(&kind),
                 "reply_to": row.get::<_, Option<String>>(5)?,
                 "payload": serde_json::from_str::<Value>(&row.get::<_, String>(6)?).unwrap_or(Value::Null),
                 "created_at": row.get::<_, String>(7)?
@@ -19813,7 +20559,8 @@ async fn coordination_ingest_session_inner(
             }));
             continue;
         }
-        if let Err(error) = persist_coord_message(state, &project_id, &envelope.task_id, &envelope)
+        if let Err(error) =
+            persist_coord_message(state, &project_id, &envelope.task_id, &envelope).await
         {
             rejected.push(json!({"msgId": envelope.msg_id, "reason": error}));
         } else {
@@ -20086,12 +20833,28 @@ async fn coordination_complete_task(
     worker: String,
     verified_pr_url: Option<String>,
 ) -> Result<Value, String> {
+    coordination_complete_task_inner(&state, &id, &worker, verified_pr_url.as_deref()).await
+}
+
+async fn coordination_complete_task_inner(
+    state: &DesktopState,
+    id: &str,
+    worker: &str,
+    verified_pr_url: Option<&str>,
+) -> Result<Value, String> {
     let (initial_task, project) = {
         let connection = state
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?;
-        let task = load_coord_task(&connection, &id)?;
+        let task = load_coord_task(&connection, id)?;
+        if matches!(
+            task.phase,
+            opcos_engine::orchestration::BoardPhase::Done
+                | opcos_engine::orchestration::BoardPhase::AwaitingAcceptance
+        ) {
+            return serde_json::to_value(task).map_err(|error| error.to_string());
+        }
         let project = if task.project_id.is_empty() {
             None
         } else {
@@ -20105,30 +20868,135 @@ async fn coordination_complete_task(
         };
         (task, project)
     };
-    if let Some(project) = project.as_ref() {
-        verify_task_delivery(&state, project, &initial_task, verified_pr_url.as_deref()).await?;
-    }
+    let forge_backed = if let Some(project) = project.as_ref() {
+        Some(verify_task_delivery(state, project, &initial_task, verified_pr_url).await?)
+    } else {
+        None
+    };
     let connection = state
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?;
-    let mut task = load_coord_task(&connection, &id)?;
-    task.complete(&worker, Utc::now(), verified_pr_url)
+    let mut task = load_coord_task(&connection, id)?;
+    if forge_backed == Some(false) {
+        task.require_acceptance = false;
+    }
+    task.complete(worker, Utc::now(), verified_pr_url.map(str::to_owned))
         .map_err(|error| error.to_string())?;
     save_coord_task(&connection, &task)?;
     serde_json::to_value(task).map_err(|error| error.to_string())
 }
 
 async fn verify_task_delivery(
-    state: &State<'_, DesktopState>,
+    state: &DesktopState,
     project: &ProjectRecord,
     task: &BoardTask,
     verified_pr_url: Option<&str>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let branch = task
         .branch
         .as_deref()
         .ok_or_else(|| "completion requires a branch".to_owned())?;
+    let host = project_host_inner(state, project).await?;
+    let platform = host.health().await.ok().and_then(|health| health.platform);
+    let remote_result = host
+        .exec(ExecRequest {
+            command: format!(
+                "git -C {} remote",
+                quote_for(platform.as_deref(), &project.repo_root)
+            ),
+            cwd: None,
+            timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+            session: None,
+            env: None,
+        })
+        .await
+        .map_err(|error| format!("completion remote inspection failed: {error}"))?;
+    if remote_result.result.exit_code != 0 {
+        return Err("completion remote inspection failed".to_owned());
+    }
+    let forge_backed =
+        !project.repo_url.trim().is_empty() || !remote_result.result.stdout.trim().is_empty();
+    if !forge_backed {
+        let worker = state
+            .store
+            .load_project_agents(&project.id)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|agent| agent.branch == branch)
+            .ok_or_else(|| {
+                "local completion requires a registered Worker for the task branch".to_owned()
+            })?;
+        {
+            let runtimes = state.coordination.lock().await;
+            let runtime = runtimes.get(&task.id).ok_or_else(|| {
+                "local completion requires a started coordination runtime".to_owned()
+            })?;
+            let role = runtime.role(&worker.id).ok_or_else(|| {
+                "local completion requires the task runtime to include the Worker role".to_owned()
+            })?;
+            if role.session_id != worker.session_id.clone().unwrap_or_default() {
+                return Err(
+                    "local completion requires the task runtime Worker session to match".to_owned(),
+                );
+            }
+        }
+        let result_message = {
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            connection
+                .query_row(
+                    r#"SELECT 1 FROM coord_messages
+                     WHERE task_id=?1 AND kind IN ('result','"result"') AND from_role=?2
+                     LIMIT 1"#,
+                    params![task.id.as_str(), worker.id.as_str()],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .unwrap_or(false)
+        };
+        if !result_message {
+            return Err(
+                "local completion requires a Worker result coordination envelope".to_owned(),
+            );
+        }
+        let worker_workspace = worker.worktree_path;
+        let commands = [
+            format!(
+                "git -C {} rev-parse --verify refs/heads/{}",
+                quote_for(platform.as_deref(), &worker_workspace),
+                quote_for(platform.as_deref(), branch)
+            ),
+            format!(
+                "git -C {} status --porcelain",
+                quote_for(platform.as_deref(), &worker_workspace)
+            ),
+        ];
+        for (index, command) in commands.into_iter().enumerate() {
+            let result = host
+                .exec(ExecRequest {
+                    command,
+                    cwd: None,
+                    timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+                    session: None,
+                    env: None,
+                })
+                .await
+                .map_err(|error| format!("local completion verification failed: {error}"))?;
+            if result.result.exit_code != 0
+                || (index == 1 && !result.result.stdout.trim().is_empty())
+            {
+                return Err(
+                    "local completion verification failed: branch is missing or worktree is dirty"
+                        .into(),
+                );
+            }
+        }
+        return Ok(false);
+    }
     let pr_url = verified_pr_url
         .or(task.verified_pr_url.as_deref())
         .or(task.pr.as_deref())
@@ -20140,8 +21008,6 @@ async fn verify_task_delivery(
         return Err("pull request repository does not match the project repository".into());
     }
     let pr_repo = pr_target.repo.clone();
-    let host = project_host(state, project).await?;
-    let platform = host.health().await.ok().and_then(|health| health.platform);
     for command in [
         format!(
             "git -C {} rev-parse --verify refs/heads/{}",
@@ -20219,7 +21085,7 @@ async fn verify_task_delivery(
     {
         return Err("completion verification failed: pull request is closed without merge".into());
     }
-    Ok(())
+    Ok(true)
 }
 
 #[tauri::command]
@@ -22753,6 +23619,28 @@ mod m7_tests {
     }
 
     #[test]
+    fn autonomous_plan_routing_assigns_implementation_and_review_steps() {
+        let implementation = opcos_store::PlanStepRecord {
+            step_id: "step-code".into(),
+            plan_id: "plan".into(),
+            position: 0,
+            description: "Implement the checkout flow".into(),
+            status: "not_started".into(),
+            failure_reason: None,
+            abandoned_reason: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let review = opcos_store::PlanStepRecord {
+            description: "Review and verify the checkout flow".into(),
+            step_id: "step-review".into(),
+            ..implementation.clone()
+        };
+        assert_eq!(worker_role_for_plan_step(&implementation), "Code");
+        assert_eq!(worker_role_for_plan_step(&review), "Review");
+    }
+
+    #[test]
     fn cloudflare_save_url_is_composed_without_manual_base_url() {
         assert_eq!(
             provider_base_url("cloudflare", None, Some("account-123"), None).unwrap(),
@@ -24628,10 +25516,23 @@ agents:
             "/workspace/my repo/worktrees/agent one",
             "agent/code/review-1",
             false,
+            None,
         );
         assert_eq!(
             posix,
             "git -C '/workspace/my repo' worktree add '/workspace/my repo/worktrees/agent one' -b 'agent/code/review-1'"
+        );
+        let posix_with_base = git_worktree_add_command(
+            Some("linux"),
+            "/workspace/repo",
+            "/workspace/repo/worktrees/agent",
+            "agent/code-1",
+            false,
+            Some("lead-head"),
+        );
+        assert_eq!(
+            posix_with_base,
+            "git -C '/workspace/repo' worktree add '/workspace/repo/worktrees/agent' -b 'agent/code-1' 'lead-head'"
         );
         let windows = git_worktree_add_command(
             Some("windows"),
@@ -24639,6 +25540,7 @@ agents:
             r"C:\workspace\my repo\worktrees\agent one",
             "agent/code/review-1",
             true,
+            None,
         );
         assert_eq!(
             windows,
