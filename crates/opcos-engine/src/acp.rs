@@ -571,7 +571,14 @@ where
                     let line = buffer.drain(..=index).collect::<Vec<_>>();
                     match serde_json::from_slice::<Value>(&line[..line.len() - 1]) {
                         Ok(message) => {
-                            let _ = dispatch_message(&state, message).await;
+                            if let Err(error) = dispatch_message(&state, message).await {
+                                let _ = state
+                                    .events
+                                    .send(HarnessEvent::Error {
+                                        message: error.to_string(),
+                                    })
+                                    .await;
+                            }
                         }
                         Err(error) => {
                             let _ = state
@@ -894,6 +901,20 @@ where
             Some("cancelled" | "abandoned") => "abandoned",
             _ => "not_started",
         };
+        let reason = if matches!(status, "failed" | "abandoned") {
+            Some(
+                entry
+                    .get("reason")
+                    .or_else(|| entry.get("description"))
+                    .or_else(|| entry.get("content"))
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("ACP agent reported this plan step as failed or abandoned")
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
         state
             .recorder
             .store()
@@ -902,7 +923,7 @@ where
                 &(index + 1).to_string(),
                 Some(status),
                 None,
-                None,
+                reason.as_deref(),
             )
             .map_err(|error| HarnessError::External(error.to_string()))?;
     }
@@ -1249,6 +1270,35 @@ mod tests {
     use std::sync::Arc;
     use tokio::time::{Duration, timeout};
 
+    fn save_test_session(store: &SqliteStore, root: &std::path::Path) {
+        store
+            .save_session(&SessionRecord {
+                session_id: "session".into(),
+                workspace: root.display().to_string(),
+                model: "test".into(),
+                mode: "interactive".into(),
+                harness: "acp".into(),
+                title: "ACP".into(),
+                extra_roots: vec![],
+                grants: json!({}),
+                pinned: false,
+                archived: false,
+                origin: None,
+                origin_label: None,
+                compaction: json!({}),
+                host_id: "local".into(),
+                provider: None,
+                external_session_id: None,
+                run_state: "idle".into(),
+                stop_reason: "none".into(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                project_id: None,
+                agent_id: None,
+            })
+            .unwrap();
+    }
+
     #[test]
     fn maps_acp_text_content() {
         assert_eq!(
@@ -1514,6 +1564,485 @@ for line in sys.stdin:
         }
         assert!(saw_text);
         assert!(saw_finished);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn authentication_required_can_authenticate_and_retry_session() {
+        let root = std::env::temp_dir().join(format!("opcos-acp-auth-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let script = root.join("auth-agent.py");
+        fs::write(
+            &script,
+            r#"
+import json, sys
+authenticated = False
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": 1, "authMethods": [{"id": "oauth", "description": "OAuth"}]}
+    elif method == "session/new" and not authenticated:
+        print(json.dumps({"jsonrpc":"2.0","id":message["id"],"error":{"code":-32001,"message":"login required"}}), flush=True)
+        continue
+    elif method == "authenticate":
+        authenticated = message["params"]["methodId"] == "oauth"
+        result = {}
+    elif method == "session/new":
+        result = {"sessionId":"auth-session"}
+    elif method == "session/prompt":
+        print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"authenticated"}}}}), flush=True)
+        result = {"stopReason":"end_turn"}
+    else:
+        continue
+    print(json.dumps({"jsonrpc":"2.0","id":message["id"],"result":result}), flush=True)
+"#,
+        )
+        .unwrap();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        save_test_session(&store, &root);
+        let harness = AcpHarness::start(
+            Arc::new(LocalHost::new(&root).unwrap()),
+            Arc::new(SessionRecorder::new(store, "session")),
+            "session",
+            AcpHarnessConfig {
+                workspace: root.display().to_string(),
+                command: format!("python3 {}", shell_quote(&script.display().to_string())),
+                env: None,
+                mcp_servers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let error = harness.start_turn(HarnessTurnInput::default()).await.unwrap_err();
+        assert!(matches!(
+            error,
+            HarnessError::AcpAuthenticationRequired(methods)
+                if methods == vec![AcpAuthMethod { id: "oauth".into(), description: Some("OAuth".into()) }]
+        ));
+        assert!(harness.authenticate("unknown").await.is_err());
+        harness.authenticate("oauth").await.unwrap();
+        let turn = harness
+            .start_turn(HarnessTurnInput {
+                text: "hello".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let result = timeout(Duration::from_secs(5), turn.await_finished())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.text.as_deref(), Some("authenticated"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn stop_reasons_are_preserved_in_turn_results() {
+        let root = std::env::temp_dir().join(format!("opcos-acp-stop-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let script = root.join("stop-agent.py");
+        fs::write(
+            &script,
+            r#"
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": 1}
+    elif method == "session/new":
+        result = {"sessionId":"stop-session"}
+    elif method == "session/prompt":
+        prompt = message["params"]["prompt"][0]["text"]
+        result = {"stopReason": prompt}
+    else:
+        continue
+    print(json.dumps({"jsonrpc":"2.0","id":message["id"],"result":result}), flush=True)
+"#,
+        )
+        .unwrap();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        save_test_session(&store, &root);
+        let harness = AcpHarness::start(
+            Arc::new(LocalHost::new(&root).unwrap()),
+            Arc::new(SessionRecorder::new(store, "session")),
+            "session",
+            AcpHarnessConfig {
+                workspace: root.display().to_string(),
+                command: format!("python3 {}", shell_quote(&script.display().to_string())),
+                env: None,
+                mcp_servers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        for (reason, expected) in [
+            ("end_turn", "stop"),
+            ("max_tokens", "length"),
+            ("refusal", "stop"),
+        ] {
+            let turn = harness
+                .start_turn(HarnessTurnInput {
+                    text: reason.into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let result = timeout(Duration::from_secs(5), turn.await_finished())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.finish_reason.as_deref(), Some(expected));
+        }
+        let turn = harness
+            .start_turn(HarnessTurnInput {
+                text: "cancelled".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(5), turn.await_finished())
+                .await
+                .unwrap()
+                .unwrap_err(),
+            HarnessError::Engine(crate::EngineError::Interrupted)
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn incompatible_or_missing_protocol_version_fails_start() {
+        for (name, initialize, needle) in [
+            (
+                "incompatible",
+                r#"{"protocolVersion":99}"#,
+                "99",
+            ),
+            (
+                "missing",
+                r#"{}"#,
+                "omitted protocolVersion",
+            ),
+        ] {
+            let root =
+                std::env::temp_dir().join(format!("opcos-acp-{name}-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&root).unwrap();
+            let script = root.join("agent.py");
+            fs::write(
+                &script,
+                format!(
+                    r#"
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get("method") == "initialize":
+        print(json.dumps({{"jsonrpc":"2.0","id":message["id"],"result":{initialize}}}), flush=True)
+"#
+                ),
+            )
+            .unwrap();
+            let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+            save_test_session(&store, &root);
+            let result = AcpHarness::start(
+                Arc::new(LocalHost::new(&root).unwrap()),
+                Arc::new(SessionRecorder::new(store, "session")),
+                "session",
+                AcpHarnessConfig {
+                    workspace: root.display().to_string(),
+                    command: format!("python3 {}", shell_quote(&script.display().to_string())),
+                    env: None,
+                    mcp_servers: Vec::new(),
+                },
+            )
+            .await;
+            let error = match result {
+                Ok(_) => panic!("incompatible protocol unexpectedly succeeded"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains(needle), "{error}");
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn fs_read_text_file_supports_line_limits_and_boundaries() {
+        let root = std::env::temp_dir().join(format!("opcos-acp-fs-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("lines.txt");
+        fs::write(&file, "one\ntwo\nthree").unwrap();
+        let script = root.join("fs-agent.py");
+        fs::write(
+            &script,
+            format!(
+                r#"
+import json, sys
+path = {path:?}
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        result = {{"protocolVersion": 1}}
+    elif method == "session/new":
+        result = {{"sessionId":"fs-session"}}
+    elif method == "session/prompt":
+        name = message["params"]["prompt"][0]["text"]
+        params = {{"path": path}}
+        if name == "normal": params.update(line=2, limit=2)
+        if name == "out": params.update(line=9, limit=2)
+        if name == "zero": params.update(line=0, limit=2)
+        if name == "limit": params.update(line=2, limit=9)
+        if name == "notrail": params = {{"path": path, "line": 3}}
+        print(json.dumps({{"jsonrpc":"2.0","id":90,"method":"fs/read_text_file","params":params}}), flush=True)
+        response = json.loads(sys.stdin.readline())
+        text = response.get("result", response.get("error", {{}}))
+        print(json.dumps({{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":json.dumps(text)}}}}}}}}), flush=True)
+        result = {{"stopReason":"end_turn"}}
+    else:
+        continue
+    print(json.dumps({{"jsonrpc":"2.0","id":message["id"],"result":result}}), flush=True)
+"#,
+                path = file.display().to_string()
+            ),
+        )
+        .unwrap();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        save_test_session(&store, &root);
+        let harness = AcpHarness::start(
+            Arc::new(LocalHost::new(&root).unwrap()),
+            Arc::new(SessionRecorder::new(store, "session")),
+            "session",
+            AcpHarnessConfig {
+                workspace: root.display().to_string(),
+                command: format!("python3 {}", shell_quote(&script.display().to_string())),
+                env: None,
+                mcp_servers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        for (name, expected) in [
+            ("normal", "two\nthree"),
+            ("out", ""),
+            ("limit", "two\nthree"),
+            ("notrail", "three"),
+        ] {
+            let turn = harness
+                .start_turn(HarnessTurnInput {
+                    text: name.into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let result = timeout(Duration::from_secs(5), turn.await_finished())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let payload: Value = serde_json::from_str(result.text.as_deref().unwrap()).unwrap();
+            assert_eq!(payload["content"].as_str(), Some(expected));
+        }
+        let turn = harness
+            .start_turn(HarnessTurnInput {
+                text: "zero".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let result = timeout(Duration::from_secs(5), turn.await_finished())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(result.text.unwrap_or_default().contains("1-based"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn tool_and_plan_updates_emit_structured_events_and_persist_plan() {
+        let root = std::env::temp_dir().join(format!("opcos-acp-events-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let script = root.join("events-agent.py");
+        fs::write(
+            &script,
+            r#"
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": 1}
+    elif method == "session/new":
+        result = {"sessionId":"events-session"}
+    elif method == "session/prompt":
+        def update(value):
+            print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{"update":value}}), flush=True)
+        update({"sessionUpdate":"tool_call","toolCallId":"call-1","title":"edit","status":"pending","rawInput":{"path":"a"}})
+        update({"sessionUpdate":"tool_call_update","toolCallId":"call-1","title":"edit","status":"in_progress","locations":[{"path":"a","line":1}]})
+        update({"sessionUpdate":"tool_call_update","toolCallId":"call-1","title":"edit","status":"completed","content":[{"type":"diff","path":"a","oldText":"a","newText":"b"}],"locations":[{"path":"a","line":1}]})
+        update({"sessionUpdate":"tool_call_update","toolCallId":"call-2","title":"read","status":"failed","content":[{"type":"text","text":"failed"}]})
+        update({"sessionUpdate":"plan","entries":[
+            {"content":"one","status":"not_started"},
+            {"content":"two","status":"in_progress"},
+            {"content":"three","status":"completed"},
+            {"content":"four","status":"failed"},
+            {"content":"five","status":"abandoned"}]})
+        update({"sessionUpdate":"plan_update","entries":[
+            {"content":"one","status":"not_started"},
+            {"content":"two","status":"in_progress"},
+            {"content":"three","status":"completed"},
+            {"content":"four","status":"completed"},
+            {"content":"five","status":"abandoned"}]})
+        result = {"stopReason":"end_turn"}
+    else:
+        continue
+    print(json.dumps({"jsonrpc":"2.0","id":message["id"],"result":result}), flush=True)
+"#,
+        )
+        .unwrap();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        save_test_session(&store, &root);
+        let harness = AcpHarness::start(
+            Arc::new(LocalHost::new(&root).unwrap()),
+            Arc::new(SessionRecorder::new(store.clone(), "session")),
+            "session",
+            AcpHarnessConfig {
+                workspace: root.display().to_string(),
+                command: format!("python3 {}", shell_quote(&script.display().to_string())),
+                env: None,
+                mcp_servers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut events = harness.events().unwrap();
+        let turn = harness
+            .start_turn(HarnessTurnInput {
+                text: "events".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let _ = timeout(Duration::from_secs(5), turn.await_finished())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut updates = Vec::new();
+        let mut results = Vec::new();
+        let mut errors = Vec::new();
+        for _ in 0..30 {
+            let Ok(Some(event)) = timeout(Duration::from_millis(100), events.recv()).await else {
+                continue;
+            };
+            match event {
+                HarnessEvent::ToolCallUpdate {
+                    call_id,
+                    status,
+                    content,
+                    locations,
+                    ..
+                } => updates.push((call_id, status, content, locations)),
+                HarnessEvent::ToolResult {
+                    call_id, result, ..
+                } => results.push((call_id, result)),
+                HarnessEvent::PlanUpdate { .. } => {}
+                HarnessEvent::Error { message } => errors.push(message),
+                HarnessEvent::TurnFinished { .. } => {}
+                _ => {}
+            }
+        }
+        assert!(updates.iter().any(|(_, status, _, _)| status == "pending"));
+        assert!(updates.iter().any(|(_, status, content, locations)| {
+            status == "completed"
+                && content
+                    .as_ref()
+                    .is_some_and(|value| value.to_string().contains("\"diff\""))
+                && !locations.is_empty()
+        }));
+        assert!(updates.iter().any(|(id, status, _, _)| id == "call-2" && status == "failed"));
+        assert!(results.iter().any(|(id, result)| id == "call-1" && result.to_string().contains("diff")));
+        let persisted = store.load_plan("session").unwrap().unwrap();
+        assert_eq!(persisted.steps.len(), 5);
+        assert_eq!(persisted.steps[0].status, "not_started");
+        assert_eq!(persisted.steps[1].status, "in_progress");
+        assert_eq!(persisted.steps[2].status, "done");
+        assert_eq!(persisted.steps[3].status, "failed");
+        assert_eq!(persisted.steps[4].status, "abandoned");
+        assert!(errors.iter().any(|message| message.contains("failed steps cannot silently become done")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn mcp_server_params_are_forwarded_without_token_in_store_records() {
+        let root = std::env::temp_dir().join(format!("opcos-acp-mcp-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let captured = root.join("session-new.json");
+        let token = "acp-secret-token";
+        let script = root.join("mcp-agent.py");
+        fs::write(
+            &script,
+            format!(
+                r#"
+import json, sys
+capture = {capture:?}
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        result = {{"protocolVersion": 1}}
+    elif method == "session/new":
+        open(capture, "w").write(json.dumps(message["params"]))
+        result = {{"sessionId":"mcp-session"}}
+    else:
+        result = {{}}
+    print(json.dumps({{"jsonrpc":"2.0","id":message["id"],"result":result}}), flush=True)
+"#,
+                capture = captured.display().to_string()
+            ),
+        )
+        .unwrap();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        save_test_session(&store, &root);
+        let harness = AcpHarness::start(
+            Arc::new(LocalHost::new(&root).unwrap()),
+            Arc::new(SessionRecorder::new(store.clone(), "session")),
+            "session",
+            AcpHarnessConfig {
+                workspace: root.display().to_string(),
+                command: format!("python3 {}", shell_quote(&script.display().to_string())),
+                env: None,
+                mcp_servers: vec![
+                    json!({"type":"stdio","name":"local","command":"agent","args":[]}),
+                    json!({"type":"http","name":"remote","url":"https://mcp.example/mcp","headers":[{"name":"Authorization","value":format!("Bearer {token}")}]}),
+                ],
+            },
+        )
+        .await
+        .unwrap();
+        let params = fs::read_to_string(&captured).unwrap();
+        assert!(params.contains("\"type\": \"stdio\""));
+        assert!(params.contains("\"type\": \"http\""));
+        assert!(params.contains("Authorization"));
+        assert!(params.contains(token));
+        assert!(store
+            .load_messages("session")
+            .unwrap()
+            .iter()
+            .all(|message| !message.content.to_string().contains(token)));
+        assert!(store
+            .load_session_events("session")
+            .unwrap()
+            .iter()
+            .all(|event| !event.event.to_string().contains(token)));
+        assert!(store
+            .load_transcript("session")
+            .unwrap()
+            .iter()
+            .all(|entry| !entry.payload.to_string().contains(token)));
+        drop(harness);
         let _ = fs::remove_dir_all(root);
     }
 }
