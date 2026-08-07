@@ -19504,6 +19504,11 @@ async fn auto_route_project_plan(
              report concrete results or blockers to the Lead using the coordination protocol.",
             step.step_id, step.description
         );
+        let worker_session = worker
+            .session_id
+            .as_deref()
+            .ok_or_else(|| "coordination target Worker session is not started".to_owned())?;
+        engine_for(app, state, worker_session, ToolOrigin::User).await?;
         let result = execute_coordination_tool(
             &state.store,
             &state.database,
@@ -19526,8 +19531,7 @@ async fn auto_route_project_plan(
                     "coordination_auto_dispatch",
                     json!({"step_id": step.step_id, "worker_role": role_name, "dispatch": dispatch}),
                 );
-                let worker_session = worker.session_id.expect("filtered worker session");
-                let engine = engine_for(app, state, &worker_session, ToolOrigin::User).await?;
+                let engine = engine_for(app, state, worker_session, ToolOrigin::User).await?;
                 engine
                     .submit_text(message)
                     .await
