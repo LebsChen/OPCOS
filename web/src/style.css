@@ -740,12 +740,7 @@ h3 {
   display: none;
 }
 .transcript-thought {
-  flex: 0 0 auto;
-  min-width: 0;
-}
-.transcript-output,
-.transcript-artifact {
-  margin-left: auto;
+  display: contents;
 }
 .transcript-thought-chevron {
   flex: 0 0 16px;
@@ -757,10 +752,25 @@ h3 {
 .transcript-thought[open] .transcript-thought-chevron {
   transform: rotate(90deg);
 }
+.transcript-disclosure-break {
+  flex: 0 0 calc(100% + 1px);
+  height: 0;
+}
 .transcript-thought-body {
+  flex: 0 0 calc(100% + 1px);
+  width: calc(100% + 1px);
+  min-width: 0;
   margin: 4px 0 0;
   color: var(--muted);
   white-space: pre-wrap;
+}
+.transcript-thought-body .artifact-code {
+  margin: 0;
+  padding: 0;
+  color: inherit;
+}
+.transcript-disclosure-summary-break {
+  flex-basis: 100%;
 }
 .transcript-interaction-card {
   flex: none;
