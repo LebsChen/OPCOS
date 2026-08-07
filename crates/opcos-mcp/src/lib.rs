@@ -96,6 +96,8 @@ pub struct McpServerConfig {
     pub requires_approval: bool,
     #[serde(default)]
     pub auth: Option<String>,
+    #[serde(default)]
+    pub oauth_client_id: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -307,6 +309,10 @@ pub struct McpAuthorizationServerMetadata {
     pub registration_endpoint: Option<String>,
     #[serde(default)]
     pub code_challenge_methods_supported: Vec<String>,
+    #[serde(default)]
+    pub scopes_supported: Vec<String>,
+    #[serde(default)]
+    pub resource_parameter_supported: bool,
 }
 
 #[derive(Debug, Error)]
@@ -359,23 +365,54 @@ pub fn oauth_state() -> String {
 pub fn resource_metadata_url(resource: &Url) -> Result<Url, McpClientError> {
     let mut url = resource.clone();
     url.set_query(None);
-    let path = url.path().trim_end_matches('/');
-    url.set_path(&format!("{path}/.well-known/oauth-protected-resource"));
+    let path = url.path().trim_start_matches('/');
+    let well_known = if path.is_empty() {
+        "/.well-known/oauth-protected-resource".to_owned()
+    } else {
+        format!("/.well-known/oauth-protected-resource/{path}")
+    };
+    url.set_path(&well_known);
     Ok(url)
 }
 
 pub fn authorization_server_metadata_url(issuer: &str) -> Result<Url, McpClientError> {
     let mut url = Url::parse(issuer).map_err(|_| McpClientError::InvalidConfig)?;
     url.set_query(None);
-    let path = url.path().trim_end_matches('/');
-    url.set_path(&format!("{path}/.well-known/oauth-authorization-server"));
+    let path = url.path().trim_matches('/');
+    let well_known = if path.is_empty() {
+        "/.well-known/oauth-authorization-server".to_owned()
+    } else {
+        format!("/.well-known/oauth-authorization-server/{path}")
+    };
+    url.set_path(&well_known);
     Ok(url)
+}
+
+fn resource_metadata_fallback_url(resource: &Url) -> Result<Url, McpClientError> {
+    let mut url = resource.clone();
+    url.set_query(None);
+    url.set_path("/.well-known/oauth-protected-resource");
+    Ok(url)
+}
+
+fn authorization_server_metadata_candidates(issuer: &str) -> Result<Vec<Url>, McpClientError> {
+    let primary = authorization_server_metadata_url(issuer)?;
+    let mut root = Url::parse(issuer).map_err(|_| McpClientError::InvalidConfig)?;
+    root.set_query(None);
+    root.set_path("/.well-known/oauth-authorization-server");
+    let mut openid = root.clone();
+    openid.set_path("/.well-known/openid-configuration");
+    Ok(vec![primary, root, openid])
 }
 
 pub fn parse_resource_metadata_challenge(value: &str) -> Option<Url> {
     value.split(',').find_map(|part| {
         let (key, value) = part.trim().split_once('=')?;
-        if key.trim().eq_ignore_ascii_case("resource_metadata") {
+        if key
+            .split_whitespace()
+            .last()
+            .is_some_and(|key| key.eq_ignore_ascii_case("resource_metadata"))
+        {
             Url::parse(value.trim().trim_matches('"')).ok()
         } else {
             None
@@ -388,27 +425,34 @@ pub async fn discover_oauth_metadata(
     resource: &Url,
     www_authenticate: Option<&str>,
 ) -> Result<(McpProtectedResourceMetadata, McpAuthorizationServerMetadata), McpClientError> {
-    let protected_url = parse_resource_metadata_challenge(www_authenticate.unwrap_or_default())
-        .unwrap_or(resource_metadata_url(resource)?);
-    let protected = client
-        .get(protected_url)
-        .send()
-        .await
-        .map_err(|_| McpClientError::Disconnected)?;
-    let protected = if protected.status().is_success() {
-        serde_json::from_slice::<McpProtectedResourceMetadata>(
-            &protected
-                .bytes()
-                .await
-                .map_err(|_| McpClientError::InvalidResponse)?,
-        )
-        .map_err(|_| McpClientError::InvalidResponse)?
-    } else {
-        McpProtectedResourceMetadata {
-            resource: Some(resource.to_string()),
-            authorization_servers: Vec::new(),
+    let protected_candidates =
+        parse_resource_metadata_challenge(www_authenticate.unwrap_or_default())
+            .map(|url| vec![url])
+            .unwrap_or(vec![
+                resource_metadata_url(resource)?,
+                resource_metadata_fallback_url(resource)?,
+            ]);
+    let mut protected_metadata = None;
+    for protected_url in protected_candidates {
+        let response = client
+            .get(protected_url)
+            .send()
+            .await
+            .map_err(|_| McpClientError::Disconnected)?;
+        if response.status().is_success() {
+            protected_metadata = Some(
+                response
+                    .json::<McpProtectedResourceMetadata>()
+                    .await
+                    .map_err(|_| McpClientError::InvalidResponse)?,
+            );
+            break;
         }
-    };
+    }
+    let protected = protected_metadata.unwrap_or_else(|| McpProtectedResourceMetadata {
+        resource: Some(resource.to_string()),
+        authorization_servers: Vec::new(),
+    });
     let issuer = protected
         .authorization_servers
         .first()
@@ -420,19 +464,24 @@ pub async fn discover_oauth_metadata(
             Some(fallback.to_string())
         })
         .ok_or(McpClientError::InvalidConfig)?;
-    let metadata_url = authorization_server_metadata_url(&issuer)?;
-    let response = client
-        .get(metadata_url)
-        .send()
-        .await
-        .map_err(|_| McpClientError::Disconnected)?;
-    if !response.status().is_success() {
-        return Err(McpClientError::Transport);
+    let mut metadata = None;
+    for metadata_url in authorization_server_metadata_candidates(&issuer)? {
+        let response = client
+            .get(metadata_url)
+            .send()
+            .await
+            .map_err(|_| McpClientError::Disconnected)?;
+        if response.status().is_success() {
+            metadata = Some(
+                response
+                    .json::<McpAuthorizationServerMetadata>()
+                    .await
+                    .map_err(|_| McpClientError::InvalidResponse)?,
+            );
+            break;
+        }
     }
-    let metadata = response
-        .json::<McpAuthorizationServerMetadata>()
-        .await
-        .map_err(|_| McpClientError::InvalidResponse)?;
+    let metadata = metadata.ok_or(McpClientError::Transport)?;
     Ok((protected, metadata))
 }
 
@@ -443,6 +492,7 @@ pub async fn exchange_oauth_code(
     redirect_uri: &str,
     verifier: &str,
     client_id: &str,
+    resource: &str,
 ) -> Result<McpOAuthTokens, McpClientError> {
     let body = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("grant_type", "authorization_code")
@@ -450,6 +500,7 @@ pub async fn exchange_oauth_code(
         .append_pair("redirect_uri", redirect_uri)
         .append_pair("code_verifier", verifier)
         .append_pair("client_id", client_id)
+        .append_pair("resource", resource)
         .finish();
     let response = client
         .post(&metadata.token_endpoint)
@@ -472,11 +523,13 @@ pub async fn refresh_oauth_token(
     metadata: &McpAuthorizationServerMetadata,
     refresh_token: &str,
     client_id: &str,
+    resource: &str,
 ) -> Result<McpOAuthTokens, McpClientError> {
     let body = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("grant_type", "refresh_token")
         .append_pair("refresh_token", refresh_token)
         .append_pair("client_id", client_id)
+        .append_pair("resource", resource)
         .finish();
     let response = client
         .post(&metadata.token_endpoint)
@@ -492,6 +545,64 @@ pub async fn refresh_oauth_token(
         .json()
         .await
         .map_err(|_| McpClientError::InvalidResponse)
+}
+
+async fn accept_oauth_callback(
+    listener: tokio::net::TcpListener,
+    expected_state: &str,
+    timeout: Duration,
+) -> Result<String, McpClientError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let (mut stream, _) = tokio::time::timeout_at(deadline, listener.accept())
+            .await
+            .map_err(|_| McpClientError::Timeout)?
+            .map_err(|_| McpClientError::Disconnected)?;
+        let mut buffer = [0_u8; 8192];
+        let size = stream
+            .read(&mut buffer)
+            .await
+            .map_err(|_| McpClientError::Disconnected)?;
+        let request = String::from_utf8_lossy(&buffer[..size]);
+        let Some(target) = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| Url::parse(&format!("http://localhost{value}")).ok())
+        else {
+            continue;
+        };
+        if target.path() != "/oauth/callback" {
+            let body = "Waiting for OAuth callback.";
+            let response = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            continue;
+        }
+        let returned_state = target
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .map(|(_, value)| value.into_owned());
+        if returned_state.as_deref() != Some(expected_state) {
+            return Err(McpClientError::AuthRequired);
+        }
+        let code = target
+            .query_pairs()
+            .find(|(key, _)| key == "code")
+            .map(|(_, value)| value.into_owned())
+            .ok_or(McpClientError::InvalidResponse)?;
+        let body = "Authorization received. You can return to OPCOS.";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        return Ok(code);
+    }
 }
 
 #[async_trait]
@@ -517,6 +628,9 @@ pub trait McpTransportClient: Send {
         name: &str,
         arguments: Value,
     ) -> Result<McpToolResult, McpClientError>;
+    fn oauth_credentials(&self) -> Option<HashMap<String, String>> {
+        None
+    }
     async fn is_alive(&mut self) -> bool {
         true
     }
@@ -919,6 +1033,7 @@ struct HttpClient {
     refresh_token: Option<String>,
     oauth_client_id: Option<String>,
     oauth_retry_attempted: bool,
+    oauth_credentials: HashMap<String, String>,
 }
 
 impl HttpClient {
@@ -940,6 +1055,7 @@ impl HttpClient {
             .as_ref()
             .and_then(|value| value.get("client_id"))
             .cloned();
+        let oauth_credentials = credentials.clone().unwrap_or_default();
         let mut headers = HeaderMap::new();
         headers.insert(
             reqwest::header::ACCEPT,
@@ -977,6 +1093,7 @@ impl HttpClient {
             refresh_token,
             oauth_client_id,
             oauth_retry_attempted: false,
+            oauth_credentials,
         })
     }
 
@@ -993,14 +1110,25 @@ impl HttpClient {
             .unwrap_or_else(|| "opcos".to_owned());
         let (_, metadata) =
             discover_oauth_metadata(&self.client, &self.resource_url, challenge).await?;
-        let tokens =
-            refresh_oauth_token(&self.client, &metadata, &refresh_token, &client_id).await?;
+        let tokens = refresh_oauth_token(
+            &self.client,
+            &metadata,
+            &refresh_token,
+            &client_id,
+            self.resource_url.as_str(),
+        )
+        .await?;
         let value = HeaderValue::from_str(&format!("Bearer {}", tokens.access_token))
             .map_err(|_| McpClientError::InvalidConfig)?;
         self.headers.insert(reqwest::header::AUTHORIZATION, value);
+        self.oauth_credentials
+            .insert("bearer_token".to_owned(), tokens.access_token.clone());
         if let Some(refresh) = tokens.refresh_token {
-            self.refresh_token = Some(refresh);
+            self.refresh_token = Some(refresh.clone());
+            self.oauth_credentials
+                .insert("refresh_token".to_owned(), refresh);
         }
+        self.oauth_retry_attempted = false;
         Ok(())
     }
 
@@ -1493,6 +1621,7 @@ impl McpTransportClient for HttpSseClient {
         )
         .map_err(|_| McpClientError::InvalidResponse)
     }
+
     async fn close(&mut self) {
         if let Some(sender) = self.shutdown.take() {
             let _ = sender.send(());
@@ -1579,6 +1708,10 @@ impl McpTransportClient for HttpClient {
         .map_err(|_| McpClientError::InvalidResponse)
     }
 
+    fn oauth_credentials(&self) -> Option<HashMap<String, String>> {
+        Some(self.oauth_credentials.clone())
+    }
+
     async fn is_alive(&mut self) -> bool {
         true
     }
@@ -1653,7 +1786,19 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| McpClientError::InvalidConfig)?;
-        let (_, metadata) = discover_oauth_metadata(&client, &resource, None).await?;
+        let (protected, metadata) = discover_oauth_metadata(&client, &resource, None).await?;
+        let canonical_resource = protected
+            .resource
+            .clone()
+            .unwrap_or_else(|| resource_url.to_owned());
+        if !metadata.code_challenge_methods_supported.is_empty()
+            && !metadata
+                .code_challenge_methods_supported
+                .iter()
+                .any(|method| method.eq_ignore_ascii_case("S256"))
+        {
+            return Err(McpClientError::InvalidConfig);
+        }
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .map_err(|_| McpClientError::Transport)?;
@@ -1663,12 +1808,20 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             .port();
         let redirect_uri = format!("http://127.0.0.1:{port}/oauth/callback");
         let existing = self.credentials.get(server_id).await?;
+        let configured_client_id = self
+            .configs
+            .lock()
+            .await
+            .get(&(server_id.to_owned(), version_id.to_owned()))
+            .and_then(|config| config.oauth_client_id.clone());
         let client_id = if let Some(existing) = existing
             .as_ref()
             .and_then(|values| values.get("client_id"))
             .cloned()
         {
             existing
+        } else if let Some(configured) = configured_client_id {
+            configured
         } else if let Some(endpoint) = &metadata.registration_endpoint {
             let response = client
                 .post(endpoint)
@@ -1682,24 +1835,24 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
                 .send()
                 .await
                 .map_err(|_| McpClientError::Disconnected)?;
-            if response.status().is_success() {
-                response
-                    .json::<Value>()
-                    .await
-                    .ok()
-                    .and_then(|value| {
-                        value
-                            .get("client_id")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .unwrap_or_else(|| "opcos".to_owned())
-            } else {
-                "opcos".to_owned()
+            if !response.status().is_success() {
+                return Err(McpClientError::Transport);
             }
+            let value = response
+                .json::<Value>()
+                .await
+                .map_err(|_| McpClientError::InvalidResponse)?;
+            value
+                .get("client_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or(McpClientError::InvalidResponse)?
         } else {
-            "opcos".to_owned()
+            return Err(McpClientError::InvalidConfig);
         };
+        let mut persisted = existing.unwrap_or_default();
+        persisted.insert("client_id".to_owned(), client_id.clone());
+        self.credentials.set(server_id, persisted).await?;
         let (verifier, challenge) = pkce_verifier_and_challenge();
         let state = oauth_state();
         let mut authorization = Url::parse(&metadata.authorization_endpoint)
@@ -1709,7 +1862,7 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             .append_pair("response_type", "code")
             .append_pair("client_id", &client_id)
             .append_pair("redirect_uri", &redirect_uri)
-            .append_pair("scope", "mcp")
+            .append_pair("resource", &canonical_resource)
             .append_pair("state", &state)
             .append_pair("code_challenge", &challenge)
             .append_pair("code_challenge_method", "S256");
@@ -1718,54 +1871,21 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
         let version_id = version_id.to_owned();
         let server_id = server_id.to_owned();
         tokio::spawn(async move {
-            let Ok(Ok((mut stream, _))) =
-                tokio::time::timeout(Duration::from_secs(300), listener.accept()).await
-            else {
-                return;
+            let code = match accept_oauth_callback(listener, &state, Duration::from_secs(300)).await
+            {
+                Ok(code) => code,
+                Err(_) => {
+                    return;
+                }
             };
-            let mut buffer = [0_u8; 8192];
-            let Ok(size) = stream.read(&mut buffer).await else {
-                return;
-            };
-            let request = String::from_utf8_lossy(&buffer[..size]);
-            let Some(target) = request
-                .lines()
-                .next()
-                .and_then(|line| line.split_whitespace().nth(1))
-                .and_then(|value| Url::parse(&format!("http://localhost{value}")).ok())
-            else {
-                return;
-            };
-            let code = target
-                .query_pairs()
-                .find(|(key, _)| key == "code")
-                .map(|(_, value)| value.into_owned());
-            let returned_state = target
-                .query_pairs()
-                .find(|(key, _)| key == "state")
-                .map(|(_, value)| value.into_owned());
-            let valid = returned_state.as_deref() == Some(state.as_str());
-            let response_body = if valid && code.is_some() {
-                "Authorization received. You can return to OPCOS."
-            } else {
-                "Authorization failed."
-            };
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                response_body.len(),
-                response_body
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-            if !valid {
-                return;
-            }
             let Ok(tokens) = exchange_oauth_code(
                 &client,
                 &metadata,
-                code.as_deref().unwrap_or_default(),
+                &code,
                 &redirect_uri,
                 &verifier,
                 &client_id,
+                &canonical_resource,
             )
             .await
             else {
@@ -1898,6 +2018,9 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             client.close().await;
             return Err(error);
         }
+        let oauth_credentials = client.oauth_credentials();
+        self.persist_oauth_credentials(&config.object_id, oauth_credentials)
+            .await?;
         let negotiated = client.negotiated_info();
         let capabilities_are_empty = negotiated.capabilities.tools.is_none()
             && negotiated.capabilities.resources.is_none()
@@ -1999,6 +2122,17 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             },
         );
         Ok(tools)
+    }
+
+    async fn persist_oauth_credentials(
+        &self,
+        server_id: &str,
+        values: Option<HashMap<String, String>>,
+    ) -> Result<(), McpClientError> {
+        if let Some(values) = values {
+            self.credentials.set(server_id, values).await?;
+        }
+        Ok(())
     }
 
     pub async fn connect_with_retry(
@@ -2253,7 +2387,12 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             .get(object_id)
             .cloned()
             .ok_or(McpClientError::Disconnected)?;
-        client.lock().await.subscribe_resource(uri).await?;
+        let mut client_guard = client.lock().await;
+        let result = client_guard.subscribe_resource(uri).await;
+        let oauth_credentials = client_guard.oauth_credentials();
+        self.persist_oauth_credentials(object_id, oauth_credentials)
+            .await?;
+        result?;
         self.subscriptions
             .lock()
             .await
@@ -2276,7 +2415,12 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             .get(object_id)
             .cloned()
             .ok_or(McpClientError::Disconnected)?;
-        client.lock().await.unsubscribe_resource(uri).await?;
+        let mut client_guard = client.lock().await;
+        let result = client_guard.unsubscribe_resource(uri).await;
+        let oauth_credentials = client_guard.oauth_credentials();
+        self.persist_oauth_credentials(object_id, oauth_credentials)
+            .await?;
+        result?;
         if let Some(values) = self
             .subscriptions
             .lock()
@@ -2345,7 +2489,12 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             .get(object_id)
             .cloned()
             .ok_or(McpClientError::Disconnected)?;
-        client.lock().await.read_resource(uri).await
+        let mut client_guard = client.lock().await;
+        let result = client_guard.read_resource(uri).await;
+        let oauth_credentials = client_guard.oauth_credentials();
+        self.persist_oauth_credentials(object_id, oauth_credentials)
+            .await?;
+        result
     }
 
     pub async fn get_prompt(
@@ -2361,7 +2510,12 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             .get(object_id)
             .cloned()
             .ok_or(McpClientError::Disconnected)?;
-        client.lock().await.get_prompt(name, arguments).await
+        let mut client_guard = client.lock().await;
+        let result = client_guard.get_prompt(name, arguments).await;
+        let oauth_credentials = client_guard.oauth_credentials();
+        self.persist_oauth_credentials(object_id, oauth_credentials)
+            .await?;
+        result
     }
 
     pub async fn statuses(&self) -> Vec<McpServerSnapshot> {
@@ -2828,6 +2982,7 @@ mod tests {
             exclude_tools: None,
             requires_approval: true,
             auth: None,
+            oauth_client_id: None,
         };
         assert!(matches!(
             HttpClient::new(&config, None),
@@ -2853,6 +3008,7 @@ mod tests {
             exclude_tools: None,
             requires_approval: true,
             auth: None,
+            oauth_client_id: None,
         };
         let mut client = StdioClient::spawn(&config).await.unwrap();
         client.close().await;
@@ -2880,6 +3036,7 @@ mod tests {
             exclude_tools: None,
             requires_approval: true,
             auth: None,
+            oauth_client_id: None,
         };
         let mut client = StdioClient::spawn(&config).await.unwrap();
         client.initialize().await.unwrap();
@@ -2905,6 +3062,7 @@ mod tests {
             exclude_tools: None,
             requires_approval: true,
             auth: None,
+            oauth_client_id: None,
         };
         let mut client = StdioClient::spawn(&config).await.unwrap();
         assert!(client.initialize().await.is_err());
@@ -2930,6 +3088,7 @@ mod tests {
             exclude_tools: None,
             requires_approval: true,
             auth: None,
+            oauth_client_id: None,
         };
         let manager = Arc::new(McpManager::new(Arc::new(NoCredentials)));
         assert!(manager.connect(&config, "v1").await.is_err());
@@ -3041,17 +3200,23 @@ mod tests {
     }
 
     #[test]
-    fn oauth_resource_metadata_challenge_and_fallback_paths_are_safe() {
+    fn oauth_resource_metadata_paths_follow_rfc_insertion_and_fallbacks() {
         let resource = Url::parse("https://mcp.example/resource").unwrap();
         assert_eq!(
             resource_metadata_url(&resource).unwrap().as_str(),
-            "https://mcp.example/resource/.well-known/oauth-protected-resource"
+            "https://mcp.example/.well-known/oauth-protected-resource/resource"
         );
         assert_eq!(
             authorization_server_metadata_url("https://issuer.example/")
                 .unwrap()
                 .as_str(),
             "https://issuer.example/.well-known/oauth-authorization-server"
+        );
+        assert_eq!(
+            authorization_server_metadata_url("https://issuer.example/tenant")
+                .unwrap()
+                .as_str(),
+            "https://issuer.example/.well-known/oauth-authorization-server/tenant"
         );
         assert_eq!(
             parse_resource_metadata_challenge(
@@ -3063,12 +3228,238 @@ mod tests {
         );
     }
 
-    #[test]
-    fn oauth_tokens_are_not_in_debuggable_error_shapes() {
-        let error = McpClientError::AuthRequired.to_string();
-        assert!(!error.contains("access"));
-        assert!(!error.contains("refresh"));
-        let url = Url::parse("https://mcp.example/authorize").unwrap();
-        assert!(!url.as_str().contains("token"));
+    #[tokio::test]
+    async fn oauth_exchange_and_refresh_send_resource_without_exposing_tokens() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for access_token in ["access-one", "access-two"] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = [0_u8; 4096];
+                let size = stream.read(&mut buffer).await.unwrap();
+                let request = String::from_utf8_lossy(&buffer[..size]);
+                assert!(request.contains("resource=https%3A%2F%2Fmcp.example%2Fresource"));
+                assert!(!request.contains("access-one"));
+                let body = format!(
+                    "{{\"access_token\":\"{access_token}\",\"refresh_token\":\"refresh-two\"}}"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let client = reqwest::Client::new();
+        let metadata = McpAuthorizationServerMetadata {
+            authorization_endpoint: format!("http://{address}/authorize"),
+            token_endpoint: format!("http://{address}/token"),
+            ..Default::default()
+        };
+        let first = exchange_oauth_code(
+            &client,
+            &metadata,
+            "code",
+            "http://127.0.0.1/callback",
+            "verifier",
+            "client",
+            "https://mcp.example/resource",
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.access_token, "access-one");
+        let second = refresh_oauth_token(
+            &client,
+            &metadata,
+            "refresh-one",
+            "client",
+            "https://mcp.example/resource",
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.access_token, "access-two");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oauth_refresh_failure_is_auth_required() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let body = "{}";
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let metadata = McpAuthorizationServerMetadata {
+            authorization_endpoint: format!("http://{address}/authorize"),
+            token_endpoint: format!("http://{address}/token"),
+            ..Default::default()
+        };
+        assert!(matches!(
+            refresh_oauth_token(
+                &client,
+                &metadata,
+                "refresh-test-value",
+                "client",
+                "https://mcp.example/resource",
+            )
+            .await,
+            Err(McpClientError::AuthRequired)
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oauth_401_refreshes_and_retries_the_original_request() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let metadata_url = format!("http://{address}/meta");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 4096];
+            let size = stream.read(&mut buffer).await.unwrap();
+            let request = String::from_utf8_lossy(&buffer[..size]);
+            assert!(request.starts_with("POST /mcp "));
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer resource_metadata=\"{metadata_url}\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let size = stream.read(&mut buffer).await.unwrap();
+            assert!(String::from_utf8_lossy(&buffer[..size]).starts_with("GET /meta "));
+            let body = format!(
+                "{{\"resource\":\"http://{address}/mcp\",\"authorization_servers\":[\"http://{address}\"]}}"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let size = stream.read(&mut buffer).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&buffer[..size])
+                    .starts_with("GET /.well-known/oauth-authorization-server ")
+            );
+            let body = format!(
+                "{{\"authorization_endpoint\":\"http://{address}/authorize\",\"token_endpoint\":\"http://{address}/token\"}}"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let size = stream.read(&mut buffer).await.unwrap();
+            assert!(String::from_utf8_lossy(&buffer[..size]).starts_with("POST /token "));
+            let body =
+                "{\"access_token\":\"access-test-value\",\"refresh_token\":\"refresh-test-value\"}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let size = stream.read(&mut buffer).await.unwrap();
+            let request = String::from_utf8_lossy(&buffer[..size]);
+            assert!(request.starts_with("POST /mcp "));
+            assert!(request.contains("Bearer access-test-value"));
+            let body = "{\"result\":{\"ok\":true}}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let config = McpServerConfig {
+            object_id: "oauth-test".into(),
+            server_key: "oauth-test".into(),
+            name: "OAuth test".into(),
+            transport: McpTransport::StreamableHttp,
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            url: Some(format!("http://{address}/mcp")),
+            headers: HashMap::new(),
+            enabled: true,
+            include_tools: None,
+            exclude_tools: None,
+            requires_approval: true,
+            auth: None,
+            oauth_client_id: Some("client".into()),
+        };
+        let credentials = HashMap::from([
+            ("bearer_token".to_owned(), "expired-test-value".to_owned()),
+            ("refresh_token".to_owned(), "refresh-old-value".to_owned()),
+            ("client_id".to_owned(), "client".to_owned()),
+        ]);
+        let mut client = HttpClient::new(&config, Some(credentials)).unwrap();
+        let value = client.request("ping", json!({})).await.unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(
+            client.oauth_credentials().unwrap()["refresh_token"],
+            "refresh-test-value"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_rejects_state_mismatch_and_ignores_non_callback_requests() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let callback = tokio::spawn(accept_oauth_callback(
+            listener,
+            "expected-state",
+            Duration::from_secs(2),
+        ));
+        let mut favicon = tokio::net::TcpStream::connect(address).await.unwrap();
+        favicon
+            .write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut callback_request = tokio::net::TcpStream::connect(address).await.unwrap();
+        callback_request
+            .write_all(
+                b"GET /oauth/callback?code=secret-code&state=wrong-state HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            callback.await.unwrap(),
+            Err(McpClientError::AuthRequired)
+        ));
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_timeout_closes_listener() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let result = accept_oauth_callback(listener, "state", Duration::from_millis(20)).await;
+        assert!(matches!(result, Err(McpClientError::Timeout)));
     }
 }

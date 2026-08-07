@@ -471,8 +471,10 @@ impl McpCredentialStore for McpCredentialAdapter {
         server_id: &str,
         credentials: HashMap<String, String>,
     ) -> Result<(), opcos_mcp::McpClientError> {
-        let value = serde_json::to_string(&credentials)
-            .map_err(|_| opcos_mcp::McpClientError::Transport)?;
+        let mut merged = self.get(server_id).await?.unwrap_or_default();
+        merged.extend(credentials);
+        let value =
+            serde_json::to_string(&merged).map_err(|_| opcos_mcp::McpClientError::Transport)?;
         let key = self
             .project_id
             .as_deref()
