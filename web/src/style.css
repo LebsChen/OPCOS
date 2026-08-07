@@ -708,9 +708,13 @@ h3 {
   line-height: 20px;
 }
 .transcript-shell-row .transcript-output {
-  flex: 0 0 100%;
-  width: 100%;
+  flex: 0 0 auto;
+  width: auto;
   margin-left: 0;
+}
+.transcript-shell-row .transcript-output[open] {
+  flex-basis: 100%;
+  width: 100%;
 }
 .transcript-row-label {
   min-width: 0;
@@ -720,12 +724,14 @@ h3 {
 }
 .transcript-row-duration {
   flex: 0 0 auto;
+  margin-left: 8px;
   color: var(--muted);
   font-size: 12px;
   line-height: 18px;
 }
 .transcript-row-meta {
   flex: 0 0 auto;
+  margin-left: 8px;
   color: var(--muted);
   font-size: 12px;
   line-height: 18px;
@@ -752,7 +758,9 @@ h3 {
   padding: 2px;
 }
 .transcript-thought {
-  display: contents;
+  display: block;
+  flex: 0 0 100%;
+  width: 100%;
 }
 .transcript-thought-chevron {
   flex: 0 0 16px;

@@ -618,9 +618,6 @@ export function Transcript({
                 <Thought
                   text={thoughtByCallId.get(row.callId)?.detail ?? ""}
                   label={thoughtLabel(thoughtByCallId.get(row.callId)?.label)}
-                  forceSummaryBreak={Boolean(
-                    row.terminalOutput || row.terminalTruncated,
-                  )}
                 />
               )}
             </div>
