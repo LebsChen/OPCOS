@@ -1023,11 +1023,7 @@ where
         )?;
         *self.last_incoming_event_id.lock().await = Some(event_id);
         let mut content = vec![json!({"type":"text","text":text})];
-        content.extend(
-            attachments
-                .iter()
-                .map(|attachment| external_context_content_block(attachment)),
-        );
+        content.extend(attachments.iter().map(external_context_content_block));
         let value = json!({"role":"user","content":content});
         self.append("user", value.clone()).await?;
         Ok(value)
