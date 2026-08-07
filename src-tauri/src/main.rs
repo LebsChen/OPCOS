@@ -3821,6 +3821,17 @@ impl ToolExecutor for RemoteExecutor {
                 for value in values {
                     redact_json_strings(&mut output, &value);
                 }
+                audit_routed_lead_shell(
+                    &self.store,
+                    &self.session_id,
+                    &self.origin,
+                    argument("command")?,
+                    arguments
+                        .get("cwd")
+                        .and_then(Value::as_str)
+                        .or(Some(&self.workspace)),
+                    &output,
+                );
                 Ok(output)
             }
             "git_status" => self
@@ -4252,6 +4263,17 @@ impl ToolExecutor for DesktopExecutor {
                         for value in values {
                             redact_json_strings(&mut output, &value);
                         }
+                        audit_routed_lead_shell(
+                            &executor.store,
+                            &executor.session_id,
+                            &executor.origin,
+                            argument("command")?,
+                            arguments
+                                .get("cwd")
+                                .and_then(Value::as_str)
+                                .or(Some(&executor.workspace)),
+                            &output,
+                        );
                         Ok(output)
                     }
                     "git_status" => execute_local_git_read(&executor.host, "status", &arguments).await,
@@ -4422,6 +4444,17 @@ impl ToolExecutor for DesktopExecutor {
         for value in values {
             redact_json_strings(&mut result, &value);
         }
+        audit_routed_lead_shell(
+            &executor.store,
+            &executor.session_id,
+            &executor.origin,
+            command,
+            arguments
+                .get("cwd")
+                .and_then(Value::as_str)
+                .or(Some(&executor.workspace)),
+            &result,
+        );
         Ok(result)
     }
 
@@ -4535,6 +4568,72 @@ fn redact_json_strings(value: &mut Value, secret: &str) {
             .for_each(|item| redact_json_strings(item, secret)),
         _ => {}
     }
+}
+
+fn shell_likely_mutating(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    [
+        " >",
+        ">>",
+        "<<",
+        "heredoc",
+        "tee ",
+        "sed -i",
+        "perl -i",
+        "python -c",
+        "python3 -c",
+        "ruby -e",
+        "node -e",
+        "cp ",
+        "mv ",
+        "rm ",
+        "git apply",
+        "git add",
+        "git commit",
+        "git push",
+        "git checkout",
+        "git restore",
+        "git reset",
+        "chmod ",
+        "mkdir ",
+        "touch ",
+        "truncate ",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn audit_routed_lead_shell(
+    store: &SqliteStore,
+    session_id: &str,
+    origin: &ToolOrigin,
+    command: &str,
+    cwd: Option<&str>,
+    result: &Value,
+) {
+    if *origin != ToolOrigin::User
+        || !automatic_project_routing_active(store, session_id).unwrap_or(false)
+    {
+        return;
+    }
+    let exit_code = result
+        .get("exit_code")
+        .or_else(|| {
+            result
+                .get("result")
+                .and_then(|value| value.get("exit_code"))
+        })
+        .and_then(Value::as_i64);
+    let _ = store.append_audit(
+        session_id,
+        "routed_lead_shell",
+        &json!({
+            "workspace": cwd,
+            "command": redact_secret_patterns(command),
+            "likely_mutating": shell_likely_mutating(command),
+            "exit_code": exit_code,
+        }),
+    );
 }
 
 async fn initialize_mcp(app: &tauri::AppHandle) {
@@ -13158,10 +13257,19 @@ async fn resolve_approval(
         .map(|_| ());
     match result {
         Ok(()) => {
+            let resumed_task = resume_coordination_after_approval(&state, &session_id)?;
             emit_approval_decision(&app, &state, &session_id, &call_id, approve);
             let calls = approval_artifact_calls(&state, &session_id, &call_id, sequence_before)?;
             record_artifacts_best_effort(&app, &state, &session_id, &host_id, calls).await;
             let _ = emit_pending_approval(&app, &state, &session_id)?;
+            if let Some(task_id) = resumed_task {
+                emit(
+                    &app,
+                    "coordination_approval_resumed",
+                    Some(&session_id),
+                    json!({"task_id": task_id, "call_id": call_id}),
+                );
+            }
             emit(
                 &app,
                 "turn_done",
@@ -13337,6 +13445,7 @@ async fn resolve_inbox(
             let _ = state
                 .store
                 .resolve_inbox(&session_id, &call_id, &resolution);
+            let resumed_task = resume_coordination_after_approval(&state, &session_id)?;
             audit(
                 &state,
                 &session_id,
@@ -13353,6 +13462,14 @@ async fn resolve_inbox(
                 Some(&session_id),
                 json!({"call_id": call_id, "resolution": resolution}),
             );
+            if let Some(task_id) = resumed_task {
+                emit(
+                    &app,
+                    "coordination_approval_resumed",
+                    Some(&session_id),
+                    json!({"task_id": task_id, "call_id": call_id}),
+                );
+            }
             emit(
                 &app,
                 "turn_done",
@@ -19795,14 +19912,29 @@ async fn auto_route_project_plan(
                     json!({"step_id": step.step_id, "worker_role": role_name, "dispatch": dispatch}),
                 );
                 let engine = engine_for(app, state, worker_session, ToolOrigin::User).await?;
-                submit_engine_turn_with_coordination_ingest(
+                match submit_engine_turn_with_coordination_ingest(
                     &engine,
                     state,
                     worker_session,
                     message,
                 )
                 .await
-                .map_err(engine_error_message)?;
+                {
+                    Ok(()) => {}
+                    Err(EngineError::ApprovalPending(call_id)) => {
+                        mark_worker_approval_pending(
+                            app,
+                            state,
+                            &task_id,
+                            &worker.id,
+                            worker_session,
+                            leader_session_id,
+                            &call_id,
+                        )
+                        .await?;
+                    }
+                    Err(error) => return Err(engine_error_message(error)),
+                }
             }
             Err(reason) => {
                 return Err(format!(
@@ -20746,6 +20878,122 @@ fn save_coord_task(connection: &Connection, task: &BoardTask) -> Result<(), Stri
         )
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+async fn mark_worker_approval_pending(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    task_id: &str,
+    worker_id: &str,
+    worker_session: &str,
+    leader_session: &str,
+    call_id: &str,
+) -> Result<(), String> {
+    {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let mut task = load_coord_task(&connection, task_id)?;
+        task.await_approval(worker_id)
+            .map_err(|error| error.to_string())?;
+        save_coord_task(&connection, &task)?;
+    }
+    state
+        .store
+        .set_pending_visibility(worker_session, call_id, "inbox")
+        .map_err(|error| error.to_string())?;
+    let payload = json!({
+        "task_id": task_id,
+        "worker_id": worker_id,
+        "worker_session_id": worker_session,
+        "call_id": call_id,
+        "phase": "AwaitingApproval",
+    });
+    audit(
+        state,
+        worker_session,
+        "coordination_approval_wait",
+        payload.clone(),
+    );
+    audit(
+        state,
+        leader_session,
+        "coordination_approval_wait",
+        payload.clone(),
+    );
+    emit(
+        app,
+        "coordination_approval_pending",
+        Some(leader_session),
+        payload.clone(),
+    );
+    emit(
+        app,
+        "notice",
+        Some(leader_session),
+        json!({
+            "kind": "coordination_approval_pending",
+            "text": "A dispatched Worker needs approval; open the Inbox to continue.",
+            "task_id": task_id,
+            "worker_session_id": worker_session,
+            "call_id": call_id,
+        }),
+    );
+    emit(
+        app,
+        "notice",
+        Some(worker_session),
+        json!({
+            "kind": "approval_pending",
+            "text": "Approval required; delivered to the Inbox",
+            "task_id": task_id,
+            "call_id": call_id,
+        }),
+    );
+    Ok(())
+}
+
+fn resume_coordination_after_approval(
+    state: &DesktopState,
+    session_id: &str,
+) -> Result<Option<String>, String> {
+    let Some(agent) = state
+        .store
+        .load_project_agent_by_session(session_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let task_id = connection
+        .query_row(
+            "SELECT id FROM coord_tasks
+             WHERE assignee=?1 AND phase='AwaitingApproval'
+             ORDER BY id LIMIT 1",
+            [&agent.id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some(task_id) = task_id else {
+        return Ok(None);
+    };
+    let mut task = load_coord_task(&connection, &task_id)?;
+    task.resume_after_approval(&agent.id, Utc::now())
+        .map_err(|error| error.to_string())?;
+    save_coord_task(&connection, &task)?;
+    drop(connection);
+    audit(
+        state,
+        session_id,
+        "coordination_approval_resumed",
+        json!({"task_id": task_id, "worker_id": agent.id, "phase": "Claimed"}),
+    );
+    Ok(Some(task_id))
 }
 
 #[tauri::command]
@@ -23608,6 +23856,17 @@ fn main() {
 #[cfg(test)]
 mod m7_tests {
     use super::*;
+
+    #[test]
+    fn routed_shell_audit_flags_writes_and_redacts_credentials() {
+        assert!(shell_likely_mutating("cat <<'EOF' > config.txt"));
+        assert!(shell_likely_mutating("git push origin main"));
+        assert!(!shell_likely_mutating("git diff HEAD^..HEAD"));
+        assert_eq!(
+            redact_secret_patterns("curl -H 'Authorization: Bearer secret-value'"),
+            "curl -H 'Authorization: Bearer [redacted]'"
+        );
+    }
 
     #[test]
     fn generated_project_agent_branches_are_project_unique() {

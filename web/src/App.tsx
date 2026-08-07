@@ -10774,6 +10774,9 @@ function AppContent() {
           current?.callId === callId ? null : current,
         );
       }
+      if (payload.kind === "coordination_approval_pending") {
+        void command<InboxRecord[]>("list_inbox").then(setInbox).catch(onError);
+      }
       if (
         payload.kind === "approval_resolved" ||
         (payload.kind === "notice" &&
