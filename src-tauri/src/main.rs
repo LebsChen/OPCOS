@@ -19701,9 +19701,11 @@ async fn auto_route_project_plan(
             runtimes.entry(task_id.clone()).or_insert(runtime);
         }
         let message = format!(
-            "Execute assigned plan step {}: {}. Work only in your assigned workspace, \
-             report concrete results or blockers to the Lead using the coordination protocol.",
-            step.step_id, step.description
+            "Execute assigned plan step {} (coordination task {}): {}. Work only in your assigned \
+             workspace. When finished, send the Lead a coordination envelope with taskId exactly \
+             '{}', kind='result', and a concrete report of the work and verification; do not \
+             substitute a prose report for the envelope.",
+            step.step_id, task_id, step.description, task_id
         );
         let worker_session = worker
             .session_id
@@ -19739,14 +19741,10 @@ async fn auto_route_project_plan(
                     .map_err(|error| error.to_string())?;
             }
             Err(reason) => {
-                record_local_plan_execution(
-                    app,
-                    state,
-                    leader_session_id,
-                    &step,
-                    &format!("automatic dispatch failed: {reason}"),
-                )
-                .await?;
+                return Err(format!(
+                    "automatic dispatch failed for plan step {}: {reason}",
+                    step.step_id
+                ));
             }
         }
     }
@@ -20807,6 +20805,29 @@ async fn verify_task_delivery(
     let forge_backed =
         !project.repo_url.trim().is_empty() || !remote_result.result.stdout.trim().is_empty();
     if !forge_backed {
+        let worker = state
+            .store
+            .load_project_agents(&project.id)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|agent| agent.branch == branch)
+            .ok_or_else(|| {
+                "local completion requires a registered Worker for the task branch".to_owned()
+            })?;
+        {
+            let runtimes = state.coordination.lock().await;
+            let runtime = runtimes.get(&task.id).ok_or_else(|| {
+                "local completion requires a started coordination runtime".to_owned()
+            })?;
+            let role = runtime.role(&worker.id).ok_or_else(|| {
+                "local completion requires the task runtime to include the Worker role".to_owned()
+            })?;
+            if role.session_id != worker.session_id.clone().unwrap_or_default() {
+                return Err(
+                    "local completion requires the task runtime Worker session to match".to_owned(),
+                );
+            }
+        }
         let result_message = {
             let connection = state
                 .database
@@ -20814,8 +20835,10 @@ async fn verify_task_delivery(
                 .map_err(|_| "database lock poisoned")?;
             connection
                 .query_row(
-                    "SELECT 1 FROM coord_messages WHERE task_id=?1 AND kind='result' LIMIT 1",
-                    [task.id.as_str()],
+                    "SELECT 1 FROM coord_messages
+                     WHERE task_id=?1 AND kind='result' AND from_role=?2
+                     LIMIT 1",
+                    params![task.id.as_str(), worker.id.as_str()],
                     |_| Ok(true),
                 )
                 .optional()
@@ -20827,14 +20850,7 @@ async fn verify_task_delivery(
                 "local completion requires a Worker result coordination envelope".to_owned(),
             );
         }
-        let worker_workspace = state
-            .store
-            .load_project_agents(&project.id)
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .find(|agent| agent.branch == branch)
-            .map(|agent| agent.worktree_path)
-            .unwrap_or_else(|| project.repo_root.clone());
+        let worker_workspace = worker.worktree_path;
         let commands = [
             format!(
                 "git -C {} rev-parse --verify refs/heads/{}",
