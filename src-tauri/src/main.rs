@@ -13257,8 +13257,8 @@ async fn resolve_approval(
         .map(|_| ());
     match result {
         Ok(()) => {
-            let _ = coordination_ingest_session_inner(&state, &session_id, false).await;
             let resumed_task = resume_coordination_after_approval(&state, &session_id)?;
+            let _ = coordination_ingest_session_inner(&state, &session_id, false).await;
             emit_approval_decision(&app, &state, &session_id, &call_id, approve);
             let calls = approval_artifact_calls(&state, &session_id, &call_id, sequence_before)?;
             record_artifacts_best_effort(&app, &state, &session_id, &host_id, calls).await;
@@ -13458,11 +13458,11 @@ async fn resolve_inbox(
     };
     match result {
         Ok(()) | Err(opcos_engine::EngineError::ApprovalAlreadyProcessed(_)) => {
-            let _ = coordination_ingest_session_inner(&state, &session_id, false).await;
             let _ = state
                 .store
                 .resolve_inbox(&session_id, &call_id, &resolution);
             let resumed_task = resume_coordination_after_approval(&state, &session_id)?;
+            let _ = coordination_ingest_session_inner(&state, &session_id, false).await;
             audit(
                 &state,
                 &session_id,
