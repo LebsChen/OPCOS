@@ -67,21 +67,52 @@ function BubbleMeta({ text, ts }: { text: string; ts?: number }) {
   );
 }
 
-function Thought({
-  text,
-  label = "Thought details",
+function TranscriptDisclosure({
+  label,
+  children,
+  className = "",
+  summaryClassName = "",
+  onToggle,
 }: {
-  text: string;
-  label?: string;
+  label: string;
+  children: ReactNode;
+  className?: string;
+  summaryClassName?: string;
+  onToggle?: (open: boolean) => void;
 }) {
   return (
-    <details className="transcript-thought">
-      <summary className="transcript-row-header">
+    <details
+      className={`transcript-thought ${className}`}
+      onToggle={(event) => onToggle?.(event.currentTarget.open)}
+    >
+      <summary className={`transcript-row-header ${summaryClassName}`}>
         <span>{label}</span>
         <TranscriptChevron className="transcript-thought-chevron" />
       </summary>
-      <div className="transcript-thought-body">{text}</div>
+      <span className="transcript-disclosure-break" aria-hidden="true" />
+      <div className="transcript-thought-body">{children}</div>
     </details>
+  );
+}
+
+function Thought({
+  text,
+  label = "Thought details",
+  forceSummaryBreak = false,
+}: {
+  text: string;
+  label?: string;
+  forceSummaryBreak?: boolean;
+}) {
+  return (
+    <TranscriptDisclosure
+      label={label}
+      summaryClassName={
+        forceSummaryBreak ? "transcript-disclosure-summary-break" : ""
+      }
+    >
+      {text}
+    </TranscriptDisclosure>
   );
 }
 
@@ -261,7 +292,7 @@ function PlanCard({
             strokeLinecap="round"
           />
         </svg>
-        <span>Devin&apos;s execution plan</span>
+        <span>OPCOS execution plan</span>
       </div>
       <div className="transcript-plan-steps">
         {steps.map((step, index) => {
@@ -302,22 +333,16 @@ function TerminalOutput({
       ? undefined
       : Math.max(0, totalBytes - new TextEncoder().encode(output).length);
   return (
-    <details className="transcript-thought transcript-output">
-      <summary className="transcript-row-header">
-        <span>Show output</span>
-        <TranscriptChevron className="transcript-thought-chevron" />
-      </summary>
-      <div className="transcript-thought-body">
-        <pre className="artifact-code max-h-96 overflow-auto whitespace-pre-wrap break-words">
-          {output}
-          {truncated
-            ? `\n[Output truncated: ${
-                omittedBytes === undefined ? "some" : omittedBytes
-              } bytes omitted; the model saw the tail]`
-            : ""}
-        </pre>
-      </div>
-    </details>
+    <TranscriptDisclosure label="Show output" className="transcript-output">
+      <pre className="artifact-code max-h-96 overflow-auto whitespace-pre-wrap break-words">
+        {output}
+        {truncated
+          ? `\n[Output truncated: ${
+              omittedBytes === undefined ? "some" : omittedBytes
+            } bytes omitted; the model saw the tail]`
+          : ""}
+      </pre>
+    </TranscriptDisclosure>
   );
 }
 
@@ -378,35 +403,30 @@ function ArtifactRow({
       : null;
   return (
     <div className="artifact-inline">
-      <details
-        className="transcript-thought transcript-artifact"
-        onToggle={(event) => {
-          if (event.currentTarget.open) load();
+      <TranscriptDisclosure
+        label={kind === "screenshot" ? "View screenshot" : "View diff"}
+        className="transcript-artifact"
+        onToggle={(open) => {
+          if (open) load();
         }}
       >
-        <summary className="transcript-row-header">
-          <span>{kind === "screenshot" ? "View screenshot" : "View diff"}</span>
-          <TranscriptChevron className="transcript-thought-chevron" />
-        </summary>
-        <div className="transcript-thought-body">
-          {error ? (
-            <span className="text-red-500">{error}</span>
-          ) : image ? (
-            <img
-              className="max-w-full max-h-64 cursor-zoom-in"
-              src={image}
-              alt="Screenshot artifact"
-              onClick={() => setLightboxOpen(true)}
-            />
-          ) : content ? (
-            <pre className="artifact-code whitespace-pre-wrap">
-              {diff ?? String(content.content ?? "")}
-            </pre>
-          ) : (
-            <span className="text-muted">Loading…</span>
-          )}
-        </div>
-      </details>
+        {error ? (
+          <span className="text-red-500">{error}</span>
+        ) : image ? (
+          <img
+            className="max-w-full max-h-64 cursor-zoom-in"
+            src={image}
+            alt="Screenshot artifact"
+            onClick={() => setLightboxOpen(true)}
+          />
+        ) : content ? (
+          <pre className="artifact-code whitespace-pre-wrap">
+            {diff ?? String(content.content ?? "")}
+          </pre>
+        ) : (
+          <span className="text-muted">Loading…</span>
+        )}
+      </TranscriptDisclosure>
       {lightboxOpen && image && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-6"
@@ -581,6 +601,9 @@ export function Transcript({
                 <Thought
                   text={thoughtByCallId.get(row.callId)?.detail ?? ""}
                   label={thoughtLabel(thoughtByCallId.get(row.callId)?.label)}
+                  forceSummaryBreak={Boolean(
+                    row.terminalOutput || row.terminalTruncated,
+                  )}
                 />
               )}
             </div>

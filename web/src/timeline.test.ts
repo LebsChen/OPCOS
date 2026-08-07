@@ -40,7 +40,7 @@ describe("single event-log timeline", () => {
     });
     expect(nodes).toContainEqual({
       kind: "sleep",
-      text: "Devin went to sleep",
+      text: "OPCOS went to sleep",
     });
     expect(buildTimeline(saved)).toEqual(nodes);
     const resumed = buildTimeline([
