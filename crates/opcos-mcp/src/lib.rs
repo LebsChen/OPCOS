@@ -311,8 +311,6 @@ pub struct McpAuthorizationServerMetadata {
     pub code_challenge_methods_supported: Vec<String>,
     #[serde(default)]
     pub scopes_supported: Vec<String>,
-    #[serde(default)]
-    pub resource_parameter_supported: bool,
 }
 
 #[derive(Debug, Error)]
@@ -628,7 +626,7 @@ pub trait McpTransportClient: Send {
         name: &str,
         arguments: Value,
     ) -> Result<McpToolResult, McpClientError>;
-    fn oauth_credentials(&self) -> Option<HashMap<String, String>> {
+    fn take_oauth_credentials(&mut self) -> Option<HashMap<String, String>> {
         None
     }
     async fn is_alive(&mut self) -> bool {
@@ -1034,6 +1032,7 @@ struct HttpClient {
     oauth_client_id: Option<String>,
     oauth_retry_attempted: bool,
     oauth_credentials: HashMap<String, String>,
+    oauth_credentials_dirty: bool,
 }
 
 impl HttpClient {
@@ -1094,6 +1093,7 @@ impl HttpClient {
             oauth_client_id,
             oauth_retry_attempted: false,
             oauth_credentials,
+            oauth_credentials_dirty: false,
         })
     }
 
@@ -1104,10 +1104,9 @@ impl HttpClient {
         let Some(refresh_token) = self.refresh_token.clone() else {
             return Err(McpClientError::AuthRequired);
         };
-        let client_id = self
-            .oauth_client_id
-            .clone()
-            .unwrap_or_else(|| "opcos".to_owned());
+        let Some(client_id) = self.oauth_client_id.clone() else {
+            return Err(McpClientError::AuthRequired);
+        };
         let (_, metadata) =
             discover_oauth_metadata(&self.client, &self.resource_url, challenge).await?;
         let tokens = refresh_oauth_token(
@@ -1128,6 +1127,7 @@ impl HttpClient {
             self.oauth_credentials
                 .insert("refresh_token".to_owned(), refresh);
         }
+        self.oauth_credentials_dirty = true;
         self.oauth_retry_attempted = false;
         Ok(())
     }
@@ -1708,8 +1708,11 @@ impl McpTransportClient for HttpClient {
         .map_err(|_| McpClientError::InvalidResponse)
     }
 
-    fn oauth_credentials(&self) -> Option<HashMap<String, String>> {
-        Some(self.oauth_credentials.clone())
+    fn take_oauth_credentials(&mut self) -> Option<HashMap<String, String>> {
+        self.oauth_credentials_dirty.then(|| {
+            self.oauth_credentials_dirty = false;
+            self.oauth_credentials.clone()
+        })
     }
 
     async fn is_alive(&mut self) -> bool {
@@ -1866,6 +1869,9 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             .append_pair("state", &state)
             .append_pair("code_challenge", &challenge)
             .append_pair("code_challenge_method", "S256");
+        if let Some(scope) = metadata.scopes_supported.first() {
+            authorization.query_pairs_mut().append_pair("scope", scope);
+        }
         let credentials = Arc::clone(&self.credentials);
         let manager = Arc::clone(self);
         let version_id = version_id.to_owned();
@@ -2018,7 +2024,7 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             client.close().await;
             return Err(error);
         }
-        let oauth_credentials = client.oauth_credentials();
+        let oauth_credentials = client.take_oauth_credentials();
         self.persist_oauth_credentials(&config.object_id, oauth_credentials)
             .await?;
         let negotiated = client.negotiated_info();
@@ -2389,7 +2395,7 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             .ok_or(McpClientError::Disconnected)?;
         let mut client_guard = client.lock().await;
         let result = client_guard.subscribe_resource(uri).await;
-        let oauth_credentials = client_guard.oauth_credentials();
+        let oauth_credentials = client_guard.take_oauth_credentials();
         self.persist_oauth_credentials(object_id, oauth_credentials)
             .await?;
         result?;
@@ -2417,7 +2423,7 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             .ok_or(McpClientError::Disconnected)?;
         let mut client_guard = client.lock().await;
         let result = client_guard.unsubscribe_resource(uri).await;
-        let oauth_credentials = client_guard.oauth_credentials();
+        let oauth_credentials = client_guard.take_oauth_credentials();
         self.persist_oauth_credentials(object_id, oauth_credentials)
             .await?;
         result?;
@@ -2491,7 +2497,7 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             .ok_or(McpClientError::Disconnected)?;
         let mut client_guard = client.lock().await;
         let result = client_guard.read_resource(uri).await;
-        let oauth_credentials = client_guard.oauth_credentials();
+        let oauth_credentials = client_guard.take_oauth_credentials();
         self.persist_oauth_credentials(object_id, oauth_credentials)
             .await?;
         result
@@ -2512,7 +2518,7 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             .ok_or(McpClientError::Disconnected)?;
         let mut client_guard = client.lock().await;
         let result = client_guard.get_prompt(name, arguments).await;
-        let oauth_credentials = client_guard.oauth_credentials();
+        let oauth_credentials = client_guard.take_oauth_credentials();
         self.persist_oauth_credentials(object_id, oauth_credentials)
             .await?;
         result
@@ -2701,10 +2707,27 @@ pub async fn dispatch<C: RvmClient>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct Noop;
 
     struct NoCredentials;
+
+    struct CountingCredentials {
+        writes: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl McpCredentialStore for CountingCredentials {
+        async fn get(&self, _: &str) -> Result<Option<HashMap<String, String>>, McpClientError> {
+            Ok(None)
+        }
+
+        async fn set(&self, _: &str, _: HashMap<String, String>) -> Result<(), McpClientError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
 
     #[async_trait::async_trait]
     impl McpCredentialStore for NoCredentials {
@@ -3321,6 +3344,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oauth_credentials_are_not_persisted_without_a_refresh() {
+        let writes = Arc::new(AtomicUsize::new(0));
+        let manager = McpManager::new(Arc::new(CountingCredentials {
+            writes: Arc::clone(&writes),
+        }));
+        let config = McpServerConfig {
+            object_id: "oauth-test".into(),
+            server_key: "oauth-test".into(),
+            name: "OAuth test".into(),
+            transport: McpTransport::StreamableHttp,
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            url: Some("http://127.0.0.1:1/mcp".into()),
+            headers: HashMap::new(),
+            enabled: true,
+            include_tools: None,
+            exclude_tools: None,
+            requires_approval: true,
+            auth: None,
+            oauth_client_id: None,
+        };
+        let mut client = HttpClient::new(
+            &config,
+            Some(HashMap::from([(
+                "bearer_token".to_owned(),
+                "manual-test-value".to_owned(),
+            )])),
+        )
+        .unwrap();
+        let values = client.take_oauth_credentials();
+        manager
+            .persist_oauth_credentials("oauth-test", values)
+            .await
+            .unwrap();
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn oauth_refresh_requires_a_persisted_client_id() {
+        let config = McpServerConfig {
+            object_id: "oauth-test".into(),
+            server_key: "oauth-test".into(),
+            name: "OAuth test".into(),
+            transport: McpTransport::StreamableHttp,
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            url: Some("http://127.0.0.1:1/mcp".into()),
+            headers: HashMap::new(),
+            enabled: true,
+            include_tools: None,
+            exclude_tools: None,
+            requires_approval: true,
+            auth: None,
+            oauth_client_id: None,
+        };
+        let mut client = HttpClient::new(
+            &config,
+            Some(HashMap::from([(
+                "refresh_token".to_owned(),
+                "refresh-test-value".to_owned(),
+            )])),
+        )
+        .unwrap();
+        assert!(matches!(
+            client.refresh_access_token(None).await,
+            Err(McpClientError::AuthRequired)
+        ));
+    }
+
+    #[tokio::test]
     async fn oauth_401_refreshes_and_retries_the_original_request() {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -3419,7 +3516,7 @@ mod tests {
         let value = client.request("ping", json!({})).await.unwrap();
         assert_eq!(value["ok"], true);
         assert_eq!(
-            client.oauth_credentials().unwrap()["refresh_token"],
+            client.take_oauth_credentials().unwrap()["refresh_token"],
             "refresh-test-value"
         );
         server.await.unwrap();
