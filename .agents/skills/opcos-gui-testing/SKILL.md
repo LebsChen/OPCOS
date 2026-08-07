@@ -1205,3 +1205,113 @@ returned `next_call_id`, never by taking the first database row. A card that say
 engine evidence: verify the corresponding persisted resolution event and that the next tool or
 approval actually starts. When several gated writes are needed, use fresh marker filenames and
 verify the remote file state after each Allow/Deny decision.
+
+## Testing transcript CSS/layout fixes (chevrons, row wrapping)
+
+Style-only fixes in `web/src/style.css` are picked up by **Vite HMR** in the running Tauri window, so no
+rebuild/restart is needed — but the app must have been started against a Vite instance serving the branch
+checkout. A screenshot of the fixed state alone proves nothing; use a **broken control**:
+
+1. Screenshot the fixed rows (full-resolution `zoom` on the row strip, window maximized).
+2. Temporarily edit `style.css` back to the pre-fix values, wait ~3 s for HMR, screenshot again.
+3. `git checkout -- web/src/style.css` and screenshot once more to show the fix returning.
+
+Report the measured pixel geometry (gap label→chevron, chevron→row right edge) rather than "looks right".
+All collapsible transcript rows come from one component, `TranscriptDisclosure`
+(`web/src/components/Transcript.tsx`), rendering `<details class="transcript-thought">`: `Thought for Ns`
+(labelled), and the *bare* variants `Show output` (shell rows) and `View diff` / `View screenshot`
+(artifact rows). One prompt covers three of the four families:
+
+> 1) run: `echo <150 identical-ish chars>` ; 2) use write_file to create
+> `src/routes/deep/nested/categories.js` with some content ; 3) run: `ls -R src`
+
+The long `echo` gives the wrapping-label case, the write gives the `View diff` chevron and doubles as the
+nested-directory local-write test. `View screenshot` needs a browser/screenshot artifact — if none is
+produced, report it as untested instead of assuming parity with `View diff`.
+
+## Faking a "stuck running" session (steering / recovery fixes)
+
+`sessions.run_state` is read straight from sqlite by `list_sessions`, but:
+
+- A `running` value **does not survive a restart**: startup recovery rewrites it to
+  `interrupted` / `interrupted_by_crash` (frontend label `已中断（应用退出）`).
+- Editing the DB while the app runs works (WAL, cross-process), but the frontend keeps its cached session
+  list; navigating between views does *not* refetch. What does refetch is a full `refresh()` — the cheapest
+  UI trigger is **creating another session from the home composer** (`submitHome` awaits `refresh()`), or
+  any `turn_done` with `runState !== "running"`.
+
+Recipe: stop the app → set `run_state='running', stop_reason='none'` → relaunch → set it again while live →
+create a throwaway session → reopen the target session; it now shows `STATUS Running` / `Working for Ns`
+with no engine turn active. Typing and sending there routes through the `steering` command
+(`gui.ts::submissionRoute` + `App.tsx` `steer`), which is the path to exercise.
+
+## Cheap Lead-local / project-routing fixture
+
+`automatic_project_routing_active` is true only for the project member with `sort_order == 0` **and** role
+`Lead`. Fastest fixture (no remote host): `git init -b main ~/opcos-test/<repo>` with one commit → sidebar
+项目 `+` → name + 仓库路径 → 添加成员 with 名称 + 角色 `Lead` + Provider/Model set explicitly → 保存 →
+card `启动会话` (click it twice: the first click creates the session, the button then becomes `打开会话`).
+The member dialog's Provider/Model default to 默认/Auto, which fails on a box with only Cloudflare
+configured — always set them in the dialog.
+
+## Judging "a write failed" from the transcript
+
+A failed local write renders as a single tool row
+`Wrote <path>  Nms  failed · local host path rejected: path is outside local workspace`.
+The presence/absence of a **separate** `Created <path> +N` row (a `multi_edit_result` event) is the real
+signal for `emit_file_change` regressions. Cross-check in sqlite after a clean shutdown: search
+`session_events.event_json` for `"multi_edit_result"` and confirm none mentions the failed path (the
+column is `event_json`, and `session_events` has no `kind` column — `audit_events` does).
+
+## Testing the MCP client (panel, catalogs, credentials, transports)
+
+Route reality check before planning:
+
+- The **only** UI that creates an MCP server config is project board → 项目配置 → **MCP** tab (名称 + 内容
+  JSON → 新增配置). Content is validated and credential-ish keys are rejected, so credentials must go
+  through 项目运行凭据 → `MCP credential` (`MCP server ID` = the config object id, `Credential JSON` =
+  `{"bearer_token": "…"}`; the field is `type=password` and shows dots).
+- Settings → **MCP** panel (`McpManage`) lists *server cards* (status, `Authorize` when
+  status == `auth_required`, `Resources / prompts`, `Retry`). The per-tool rows/toggles in the same panel
+  come from `mcp_tools`, which **errors for local-host sessions** (`本机 host 不提供远程 MCP tools`) — you
+  need a bound remote RVM host to test tool toggles/approval at all.
+- Two different credential scopes exist: the panel's manager reads the **global** key
+  `mcp-credential:<object_id>`, while project sessions build their own manager reading
+  `project:<pid>/mcp-credential:<object_id>`. A UI-entered credential therefore fixes agent/session calls
+  but may not fix the Settings panel; if you must, inject the global key into
+  `~/.config/com.opcos.desktop/secrets.enc` (header `OCS1` + 12-byte nonce + AES-GCM, key =
+  `sha256("opcos-secret-store\0" + /etc/machine-id)`) — never print the value.
+- Credentials are only read **at connect time**. Deleting/adding a credential does not affect an already
+  connected client; restart the app (or `Retry` for the panel's manager) to force a fresh connect.
+
+Useful oracles (setup, not UI evidence): the UI prints no tool count, so read
+`mcp_tool_cache` / `mcp_resource_cache` / `mcp_prompt_cache` / `mcp_session_resources` from
+`~/.config/com.opcos.desktop/opcos.db`, and probe the endpoint with curl beforehand
+(`initialize` → `mcp-session-id` header → `tools/list`) to know the expected counts. Remote catalogs drift
+(mcp.devin.ai returned 18 tools where a doc said 17) — treat exact counts as soft expectations.
+
+Real endpoints that work anonymously: `https://mcp.context7.com/mcp` (2 tools, 0 resources/prompts),
+`https://mcp.devin.ai/mcp` (`/sse` is gone — do not use it). `https://api.githubcopilot.com/mcp/` returns
+401 + `WWW-Authenticate` with resource metadata, which is the way to exercise `auth_required`.
+
+Legacy `http-sse` needs a local mock; a minimal one is enough (`GET /sse` → `event: endpoint` +
+`data: /message?s=<id>`, `POST /message` → 202 with the reply pushed on the stream, plus a `/flip` route
+that pushes `notifications/tools/list_changed` and adds a tool). Gotchas:
+- Restarting the mock leaves the session runtime with a dead client: every tool call returns
+  `MCP server is disconnected` until the whole app restarts (`resources/read` still works because it goes
+  through the global manager). Start the mock **before** the app and leave it alone.
+- `notifications/*/list_changed` only *drops* the cached catalog. There is no frontend listener for
+  `mcp-catalog-updated`, so the panel shows `MCP server is not connected; retry the connection` until you
+  click `Retry`. Expect an error toast in the middle of that flow, not an auto-refresh.
+
+`Load into composer` (prompt → draft) may look like a no-op: the draft lands in `homeInput`, but the only
+navigation to the Home composer (`openNewSessionHome`) clears it. If a draft never appears, check that path
+before blaming `prompts/get` (verify the request really happened via the mock log or a direct curl probe).
+
+Attached resources: the transcript intentionally shows only a chip `MCP resource: <uri>` (mime + bytes);
+the body goes to the model. To prove the model really received it, attach a resource with a unique marker
+string in the body and ask the agent to quote its first line. Also ask the agent to list its `mcp__*` tools
+— that is the cheapest UI-level proof that resources/prompts are **not** registered as tools.
+
+Devin Secrets Needed: `GH_PAT` (GitHub MCP bearer), `Devin_MCP_COG` (mcp.devin.ai bearer),
+`CF_TOKEN`/`CF_ID` for the Cloudflare provider the agent runs on.
