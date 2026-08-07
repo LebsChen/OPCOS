@@ -1,0 +1,14 @@
+Goal: Fix the rounding bug in the pricing module and add regression tests.
+
+Completed actions and results:
+- Read `src/pricing.py`, which contained `def price(amount): return round(amount * 1.08)`.
+- Edited `src/pricing.py`, replacing the return line with `return float(Decimal(amount * 1.08).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))`; the edit was applied.
+- Ran `pytest tests/test_pricing.py`: 3 passed, 1 failed. The failing test is `test_negative_amount`, which expects `-1.08` but got `-1.07`.
+
+Key discoveries and file paths:
+- Pricing logic is in `src/pricing.py`.
+- Tests exist in `tests/test_pricing.py`; test suite currently has 3 passing tests and 1 failing negative-amount test.
+
+Unfinished next steps:
+- Fix the negative-amount rounding failure (current output for the failing case is `-1.07` instead of expected `-1.08`).
+- Add regression tests for the rounding behavior.

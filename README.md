@@ -1,1 +1,280 @@
 # OPCOS
+
+OPCOS 是一个 provider-neutral、local-first 的桌面 agent 工作台。它在本机运行
+agent loop、会话状态、审批和 SQLite 持久化；通过统一 Host trait 在 LocalHost
+或 RVM Host 上执行工作。OPCOS 不是任何单一 agent 云的客户端，也不代理任何
+外部 agent 服务。
+
+## 项目总结
+
+一句话：**LLM + Harness + VM**。OPCOS 把三者装进一个桌面应用——模型来自可插拔
+的 provider，harness 是本仓库自己的 agent 运行时，VM 既可以是本机也可以是远程
+RVM 主机。
+
+- **LLM**：`opcos-provider` 提供 provider registry、动态模型发现、能力（context
+  window / max output）解析和多方言适配（OpenAI 兼容、Cloudflare Workers AI
+  等）；模型可按 global/project/session 覆盖。
+- **Harness**：`opcos-engine` 的 `TurnEngine` 是主执行路径——迭代式 agent loop、
+  工具目录、审批、压缩、steering、生命周期 hook、iteration stats 和结构化事件
+  流。`Harness` trait 让 OpenCode 和 ACP 作为并列 harness 接入，而不是分叉出
+  第二套 runtime。
+- **VM**：`opcos-hosts` 的 Host trait 统一 LocalHost 与 RVM Host——文件、shell、
+  持久 shell/PTY、进程、后台 job、repository index、LSP、浏览器/CDP、
+  Computer Use、VNC 的可用性都由 Host 声明的 capability 决定，远端不可用时报错
+  而不是静默回落到本机。
+
+围绕这三层的是让它能「自主跑」的部分：`opcos-store` 的 SQLite 持久化
+（会话、消息、审批、审计、action ledger、work queue、plan、events）、
+`opcos-policy` 的风险分级与审批策略、`opcos-assets` 的 Instructions/Agents/
+Knowledge/Playbooks/Skills/Commands/MCP 声明发现、`opcos-mcp` 的 MCP 生命周期，
+以及 event rule → work queue → planner 的事件驱动通路。
+
+### Agent 工作流程
+
+单个 turn 的执行路径（`TurnEngine::run_loop`，`crates/opcos-engine/src/lib.rs`）：
+
+```mermaid
+flowchart TD
+    U[用户消息 / steering / 事件唤醒] --> LOOP{{"迭代 (上限 max_iterations)"}}
+    LOOP --> CTX["估算 context，必要时压缩<br/>should_compact → compact_context"]
+    CTX --> INF["provider 推理<br/>text / reasoning / tool_call 增量流"]
+    INF --> TC{有 tool call?}
+    TC -- 否 --> STOP["Stop hook<br/>(可 veto，最多 3 次)"]
+    STOP --> DONE[AssistantTurn 收口]
+    TC -- 是 --> PRE["preflight + policy<br/>风险分级 / 路径边界 / grant"]
+    PRE -- Deny --> RES
+    PRE -- NeedsUser --> APV["ApprovalSurface<br/>pending approval → UI / Inbox"]
+    APV -- 拒绝 --> RES
+    APV -- 批准 --> EXEC
+    PRE -- Allow --> EXEC["ToolExecutor 执行<br/>(可流式，输出有界截断)"]
+    EXEC --> HOST["Host / MCP / GitHub / connector"]
+    HOST --> ART["产物落 ArtifactSink<br/>凭据经 SecretScrubber 洗掉"]
+    ART --> RES[tool result 回写 messages + SQLite]
+    RES --> STATS["iteration stats 事件<br/>inference / tool / harness 耗时"]
+    STATS --> LOOP
+    DONE --> EV
+    STATS --> EV["结构化事件流<br/>status_update / one_line_thoughts /<br/>devin_message / context_growth_update"]
+    EV --> UI[Tauri event channel → transcript]
+```
+
+事件驱动（无人值守）通路与上面的 turn 循环相接：
+
+```mermaid
+flowchart LR
+    EXT["外部事件<br/>(GitHub / connector / 定时 / 手工)"] --> RULE["event rule 匹配<br/>event_bus::dispatch_event"]
+    RULE -->|Enqueue| Q["durable work_queue<br/>claim / lease / renew / retry / dead-letter"]
+    RULE -->|PlanGoal| PL["planner<br/>goal → PlannedWorkItem[]"]
+    PL --> Q
+    Q --> S["session turn<br/>(上图的 agent loop)"]
+    S --> LEDGER["action ledger<br/>幂等 key + 状态 + 结果摘要"]
+    S --> COORD["coordination_dispatch<br/>Leader → 已存在的 Worker session"]
+    COORD --> VERIFY["交付核验<br/>branch / push / PR / CI，而不是 Worker 自述"]
+```
+
+### Harness 架构
+
+```mermaid
+flowchart TB
+    subgraph FE["web (React / TS / Vite)"]
+        T[Transcript / Composer / Settings]
+    end
+    T <-->|Tauri invoke + event channel| ADP
+
+    subgraph ADP["src-tauri (desktop adapter)"]
+        D[命令分发 / Host dispatch / connector dispatch]
+        SEC[SecretStore]
+        SQL[(SQLite)]
+    end
+
+    D --> H{{"Harness trait<br/>start_turn / events / interrupt /<br/>reply_approval / reply_question / resume"}}
+    H --> BI["Builtin TurnEngine<br/>(opcos-engine)"]
+    H --> OC["OpenCode harness<br/>(经 Host 启动)"]
+    H --> ACP["ACP harness<br/>(独立路径，不共享工具目录)"]
+
+    BI --> PROV["opcos-provider<br/>registry / 模型发现 / 方言适配"]
+    PROV --> LLM["LLM 端点<br/>OpenAI 兼容 / Cloudflare Workers AI / …"]
+
+    BI --> TE["ToolExecutor"]
+    TE --> HOSTS["opcos-hosts<br/>Host trait"]
+    HOSTS --> LH["LocalHost"]
+    HOSTS --> RVM["RVM Host<br/>(opcos-rvm wire client)"]
+    LH --> CAP["文件 / shell / PTY / job /<br/>index / LSP / CDP / Computer Use / VNC<br/>(按 capability 声明)"]
+    RVM --> CAP
+    TE --> MCP["opcos-mcp<br/>server 生命周期 / 工具发现"]
+    TE --> GH["GitHub / Linear / Notion / …<br/>connector 工具"]
+
+    BI --> POL["opcos-policy<br/>风险 / 路径 / 审批策略"]
+    BI --> ST["opcos-store<br/>会话 / 审批 / ledger / queue / plan / events"]
+    BI --> AS["opcos-assets<br/>Instructions / Agents / Knowledge /<br/>Playbooks / Skills / Commands / MCP"]
+    ST --> SQL
+    TE --> SEC
+    RVM -->|Authorization: Bearer| SEC
+```
+
+分层约束由 `AGENTS.md` 固定：`opcos-rvm` 不依赖 `opcos-engine`，
+`opcos-engine` 不依赖 Tauri/前端，`src-tauri` 只是 adapter。
+
+## 当前边界
+
+- 本地 agent loop 是主要执行路径；OpenCode harness 也可通过 Host 启动。
+- ACP 是独立 harness 路径，不经过 builtin `TurnEngine` 的工具目录和
+  `ToolExecutor`，因此 ACP session 当前不能使用 OPCOS 协同工具。
+- 远端 Host 不可用时返回明确错误，不回退到本机。
+- RVM host 端不在本仓库修改；RVM token 只通过 SecretStore 注入
+  `Authorization: Bearer` header。
+- Git push 的凭据路径只允许 `github.com` 和已登记的 GitHub Enterprise Server
+  实例；GitHub API/PR 与 CI 工具也只实现 GitHub 路径，没有其他 forge。
+
+## GitHub 实例（github.com 与 GitHub Enterprise Server）
+
+GitHub 只有一个领域模型，多实例差异体现在「实例身份」上：
+
+- `github.com` 是默认实例，API base 固定为 `https://api.github.com`，行为与
+  以前完全一致，无需任何配置。
+- GHES 实例需要先在 项目配置 → Connectors 面板登记 host（可选显式 API
+  base）。API base 归一化为 `https://<host>/api/v3`；显式 API base 必须是
+  同一 host 的 HTTPS 地址。
+- 未登记的非 `github.com` host 一律报错，不回退到 `github.com`，也不回退到
+  其他实例。
+- 凭据按实例绑定：`github.com` 继续使用 connector kind `github`，GHES 使用
+  `github@<host>`。两个实例上的同名 `owner/repo` 不会互相借用凭据。
+- 仓库身份、push 授权 target、action 幂等键和事件 subject 都带实例，形如
+  `git_push:<project>:<host>/<owner>/<repo>:<branch>`。
+- push、PR 创建/读取/评论/reviewer、checks、CI 失败日志、交付核验和事件
+  ingress 都路由到解析出的实例。
+
+## Architecture
+
+### Workspace crates
+
+- `opcos-engine`：agent loop、harness、工具定义、审批和执行器抽象。
+- `opcos-provider`：provider registry、模型发现和 provider 适配。
+- `opcos-rvm`：RVM wire-protocol client。
+- `opcos-hosts`：LocalHost/RVM Host、能力查询、文件、进程和路径边界。
+- `opcos-mcp`：MCP server 生命周期、工具发现、缓存和 SecretStore 适配。
+- `opcos-store`：SQLite 会话、消息、审批、审计、动作账本、队列、计划、
+  learned skills、事件和项目实体。
+- `opcos-assets`：Instructions、Agents、Knowledge、Playbooks、Skills、
+  Commands 和 MCP 声明发现/解析。
+- `opcos-policy`：工具风险、路径和审批策略。
+- `src-tauri`：Tauri adapter、SQLite adapter、Host dispatch、GitHub/connector
+  dispatch 和前端桥接。
+- `web`：React/TypeScript/Vite UI。
+
+分层约束：
+
+- `opcos-rvm` 不依赖 `opcos-engine`；
+- `opcos-engine` 不依赖 Tauri 或前端；
+- `src-tauri` 是 adapter，不是另一套 agent runtime；
+- 前端只通过 Tauri invoke/event channel 与桌面端通信。
+
+## 已实现能力
+
+### 会话、模型和资产
+
+- builtin TurnEngine 会话、transcript、pending approval、Inbox、暂停/恢复和
+  结构化事件；
+- OpenCode harness；ACP harness 独立接入；
+- provider registry 和 API 动态模型发现/缓存；
+- global/project/repo/host/session 配置对象和 builtin preset；
+- `.agents/commands/*.md` 参数化 prompt command：只做纯文本展开，不执行
+  shell/Git/MCP，只有用户/UI/slash command 能显式触发，模型不能自行调用；
+- `.agents/mcp/` 的 JSON/YAML/YML 发现；发现结果默认 disabled，不自动连接；
+- learned skill 显式保存、检索、版本关系、stale/conflict 标记和凭据拒绝。
+
+### Host 与代码工作流
+
+- LocalHost 与 RVM Host；
+- Host health/capability 查询；
+- 文件读写、目录列举、shell 执行；
+- `edit_file` 精确、原子、多替换编辑；
+- repository index 的 symbol/glob/content 查询；
+- LSP definition、references、diagnostics：LocalHost 用本地 stdio language
+  server，远程 Host 用它自己的 LSP 服务；
+- Git status/diff/log/rev-parse、建分支、显式文件 commit、受限 push；
+- GitHub PR 创建、读取、评论、reviewer 操作和交付核验；
+- GitHub CI status 与失败 job log 读取；
+- 本地和远程 background job，输出有界截断；
+- Desktop/VNC/CDP surface 取决于绑定 Host capability。
+
+### 计划、队列和协同
+
+- durable `work_queue`：claim、lease、renew、bounded retry、dead-letter 和
+  手工 requeue；
+- tracked execution plan：`propose_plan`、`plan_get`、`plan_update`、
+  `plan_revise`；
+- autonomous goal/planning round 持久化和事件规则；
+- action ledger：外部动作的幂等 key、状态、结果摘要和历史；
+- `coordination_dispatch` / `coordination_status`：仅 builtin Leader session
+  可派发给已存在 Worker；不创建 session、不递归派生；状态保持
+  `worker_reported`、`awaiting_verification`、`verified_delivery`、
+  `awaiting_acceptance`、`done` 等区别，Worker 自述不是完成证据。
+
+### 外部连接器
+
+Provider 和 connector catalog 覆盖多种 API/OAuth/IMAP 配置；agent tool 只对
+少数已实现路径开放，例如 GitHub、Linear、Notion、GitLab、Jira 和 Stripe 的
+部分读写操作。catalog、连接验证和完整 agent business tools 不是同一件事；
+未列出的操作不能视为已经支持。
+
+## 已知限制
+
+- 远程 LSP 依赖远程主机自带的 LSP 服务（RVM 在 `/mcp` 上暴露 `lsp` tool），
+  由主机负责 language server 生命周期和文档同步；OPCOS 只在探测到该 tool 后
+  才启用，探测不到就不声明能力，也不会退回本地 language server。
+- OPCOS 仍然没有远程原始 stdio 通道；远程 `stdio` capability 保持不可用。
+- background job 依赖当前 Host 的进程流/PTY capability；job 状态保存在当前
+  adapter/job manager 路径，不能承诺跨应用重启恢复。远程进程受远程 PTY/进程
+  流生命周期限制，不能承诺孤儿进程可被重新接管。
+- Git push credential validation 只允许 `github.com` 和已登记的 GHES 实例；
+  其他 forge 不可用。
+- CI 工具只查询 GitHub Actions；没有通用 CI provider，也没有“CI 挂了自动修
+  到绿”的闭环。CI 工具返回状态和有界失败日志，后续修复仍由 agent loop
+  再次编辑/验证。
+- 协同工具只对 builtin TurnEngine 生效；ACP/OpenCode 不自动获得同一工具目录。
+- coordination Worker result 不会自动推进 Done；真实交付必须经过 branch、
+  push、PR repository/head 和 GitHub API 核验，再按 acceptance 规则收口。
+- Commands 不执行动作；MCP repository discovery 不等于 enable/connect。
+- Browser/Computer-use 不是通用确定性业务 actuator；必须依赖 Host 声明的
+  capability，当前没有完整截图→定位→动作→校验业务循环。
+- connector catalog 不代表每个 connector 都有完整读写 agent tools；OAuth
+  application credentials 由用户提供。
+- 没有 Devin Cloud v3 API、账号自动创建/切换或 Devin runtime dependency。
+
+## 安全边界
+
+- 凭据进入 SecretStore，不进入 URL、日志、transcript、工具返回或 UI 展示；
+- remote→local 不做静默 fallback；
+- remote path 使用 Host/RVM containment/path algebra，不使用本机
+  `canonicalize` 绕过边界；
+- 外部写操作按工具风险进入审批/Inbox；
+- Commands 纯展开，展开后产生的 shell/Git/MCP 请求仍走普通工具与审批；
+- MCP credentials 只能引用 SecretStore 名称，仓库声明的 server 默认不启用。
+
+## 开发和验证
+
+需要 stable Rust；不要固定 Rust 1.83。完整门禁：
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test
+cargo build
+(cd web && npx tsc --noEmit && npm run build && npm run format:check)
+git diff --check
+```
+
+Node/Vite 的版本提示或 chunk-size warning 不是成功构建的替代条件；应以命令
+退出码为准。
+
+## 发布
+
+发布产物在本地构建，由维护者上传 GitHub Releases。GitHub Actions 目前只是
+可查询的 CI 信号，不是发布路径。Linux 和 Windows 的 Tauri 构建命令以及产物
+路径见 `docs/` 和 `AGENTS.md`。
+
+## 文档状态
+
+`todos.md` 是当前实现状态和下一步阻塞项的事实清单。旧的 gap/roadmap 文档
+保留历史设计和对比，但每份相关文档开头都标注了当前代码事实，避免把目标态
+误读为已实现能力。

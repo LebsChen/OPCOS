@@ -1,0 +1,1 @@
+{"status":"ok","service":"dev-agent","version":"1.0.25","platform":"win32","host":"Antec","workspace":"C:\\Users\\Team","ide_port":9877,"capabilities":["exec","pty","screenshot","computer_use","vnc","code_server"]}

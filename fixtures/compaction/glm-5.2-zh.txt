@@ -1,0 +1,16 @@
+## Goal
+修复定价模块的舍入 bug，并补充回归测试。
+
+## Completed actions and results
+- 读取 `src/pricing.py`，发现 `price()` 使用 `round(amount * 1.08)`，存在负数金额下的银行家舍入问题。
+- 将 `price()` 修改为使用 `Decimal.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)`。
+- 运行 `pytest tests/test_pricing.py`：3 通过，1 失败（`test_negative_amount` 期望 -1.08，实际 -1.07）。
+
+## Key discoveries and file paths
+- `src/pricing.py`：定价模块，包含 `price()` 函数。
+- `tests/test_pricing.py`：现有测试文件。
+- 修改后仍有负数金额舍入偏差，说明 Decimal 转换或逻辑仍需调整。
+
+## Unfinished next steps
+- 修复 `test_negative_amount` 失败，确保负数金额正确舍入为 -1.08。
+- 补充更多回归测试覆盖边界情况（如零、正数、小数位多的金额）。

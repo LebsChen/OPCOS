@@ -1,0 +1,11 @@
+[package]
+name = "opcos-computer-use"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+png.workspace = true
+serde.workspace = true
+thiserror.workspace = true
