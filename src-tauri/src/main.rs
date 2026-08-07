@@ -19193,6 +19193,19 @@ async fn ensure_project_worker_session(
     leader: &ProjectAgentRecord,
     role: &str,
 ) -> Result<ProjectAgentRecord, String> {
+    let leader_session = leader
+        .session_id
+        .as_deref()
+        .and_then(|session_id| state.store.load_session(session_id).ok().flatten());
+    let leader_model = leader_session
+        .as_ref()
+        .map(|session| session.model.clone())
+        .filter(|model| model != "auto")
+        .unwrap_or_else(|| leader.model.clone());
+    let leader_provider = leader_session
+        .as_ref()
+        .and_then(|session| session.provider.clone())
+        .or_else(|| leader.provider.clone());
     let mut agent = state
         .store
         .load_project_agents(&project.id)
@@ -19208,8 +19221,8 @@ async fn ensure_project_worker_session(
                 role.to_owned(),
                 role.to_owned(),
                 None,
-                leader.provider.clone(),
-                Some(leader.model.clone()),
+                leader_provider.clone(),
+                Some(leader_model.clone()),
                 Some("builtin".into()),
                 Some("Auto".into()),
                 Some(format!(
@@ -19230,10 +19243,10 @@ async fn ensure_project_worker_session(
         ));
     }
     if agent.model == "auto" {
-        agent.model = leader.model.clone();
+        agent.model = leader_model;
     }
     if agent.provider.is_none() {
-        agent.provider = leader.provider.clone();
+        agent.provider = leader_provider;
     }
     agent.updated_at = Utc::now();
     state
