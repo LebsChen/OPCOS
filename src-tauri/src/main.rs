@@ -3683,6 +3683,14 @@ impl ToolExecutor for RemoteExecutor {
             return execute_external_ingress_tool(&self.store, name, &arguments);
         }
         if matches!(name, "coordination_dispatch" | "coordination_status") {
+            if name == "coordination_dispatch"
+                && automatic_project_routing_active(&self.store, &self.session_id)?
+            {
+                return Err(
+                    "routing is system-managed; planned steps are dispatched automatically"
+                        .to_owned(),
+                );
+            }
             return execute_coordination_tool(
                 &self.store,
                 &self.database,
@@ -4088,6 +4096,14 @@ impl ToolExecutor for DesktopExecutor {
                     return execute_external_ingress_tool(&executor.store, name, &arguments);
                 }
                 if matches!(name, "coordination_dispatch" | "coordination_status") {
+                    if name == "coordination_dispatch"
+                        && automatic_project_routing_active(&executor.store, &executor.session_id)?
+                    {
+                        return Err(
+                            "routing is system-managed; planned steps are dispatched automatically"
+                                .to_owned(),
+                        );
+                    }
                     return execute_coordination_tool(
                         &executor.store,
                         &executor.database,
@@ -9968,6 +9984,11 @@ async fn engine_for_with_context(
             .map_err(|error| error.to_string())?,
     );
     let mut allowed_tools = allowed_tools;
+    if automatic_project_routing_active(&state.store, session_id)?
+        && let Some(allowed_tools) = allowed_tools.as_mut()
+    {
+        allowed_tools.retain(|tool| tool != "coordination_dispatch");
+    }
     if let Some(executor_client) = &remote_client
         && let Ok(response) = executor_client
             .mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
@@ -10171,7 +10192,8 @@ async fn engine_for_with_context(
         system_instructions.push_str(
             "\n\nAutonomous project routing policy: you are the Lead orchestrator. \
              Internal worker routing is automatic and is never a user question. \
-             Do not ask whether to execute in-session or dispatch workers, and do not \
+             Do not call coordination_dispatch; the desktop dispatches saved plan steps \
+             automatically. Do not ask whether to execute in-session or dispatch workers, and do not \
              present that choice as an option. Sequence, synthesize, and verify; workers \
              execute their assigned steps. Ask the user only about genuine product \
              ambiguity or risky external actions requiring approval.",
@@ -20147,6 +20169,13 @@ async fn persist_coord_message(
 
 fn normalize_coordination_kind(kind: &str) -> &str {
     kind.trim_matches('"')
+}
+
+fn automatic_project_routing_active(store: &SqliteStore, session_id: &str) -> Result<bool, String> {
+    Ok(store
+        .load_project_agent_by_session(session_id)
+        .map_err(|error| error.to_string())?
+        .is_some_and(|agent| agent.sort_order == 0 && agent.role.eq_ignore_ascii_case("lead")))
 }
 
 fn load_persisted_coord_messages(
