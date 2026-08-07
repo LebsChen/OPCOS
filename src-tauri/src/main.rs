@@ -12235,6 +12235,17 @@ async fn submit_turn(
     submit_turn_inner(app, &state, request).await
 }
 
+async fn submit_engine_turn_with_coordination_ingest(
+    engine: &GuiEngine,
+    state: &DesktopState,
+    session_id: &str,
+    text: String,
+) -> Result<(), EngineError> {
+    engine.submit_text(text).await?;
+    let _ = coordination_ingest_session_inner(state, session_id, false).await;
+    Ok(())
+}
+
 async fn submit_turn_inner(
     app: tauri::AppHandle,
     state: &DesktopState,
@@ -12409,9 +12420,15 @@ pub(crate) async fn submit_turn_inner_with_context(
             json!({"error": error}),
         );
     }
-    match engine.submit_text(request.text).await {
+    match submit_engine_turn_with_coordination_ingest(
+        &engine,
+        state,
+        &request.session_id,
+        request.text,
+    )
+    .await
+    {
         Ok(_) => {
-            let _ = coordination_ingest_session_inner(state, &request.session_id, false).await;
             if let Err(error) = auto_route_project_plan(&app, state, &request.session_id).await {
                 audit(
                     state,
@@ -19734,10 +19751,14 @@ async fn auto_route_project_plan(
                     json!({"step_id": step.step_id, "worker_role": role_name, "dispatch": dispatch}),
                 );
                 let engine = engine_for(app, state, worker_session, ToolOrigin::User).await?;
-                engine
-                    .submit_text(message)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                submit_engine_turn_with_coordination_ingest(
+                    &engine,
+                    state,
+                    worker_session,
+                    message,
+                )
+                .await
+                .map_err(engine_error_message)?;
             }
             Err(reason) => {
                 return Err(format!(
@@ -20083,18 +20104,15 @@ async fn persist_coord_message(
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?;
-        if envelope.kind == opcos_engine::orchestration::EnvelopeKind::Result
-            && connection
-                .query_row(
-                    "SELECT 1 FROM coord_messages
-                     WHERE task_id=?1 AND from_role=?2 AND kind='result'
-                     LIMIT 1",
-                    params![task_id, envelope.from],
-                    |_| Ok(true),
-                )
-                .optional()
-                .map_err(|error| error.to_string())?
-                .is_some()
+        if connection
+            .query_row(
+                "SELECT 1 FROM coord_messages WHERE msg_id=?1 LIMIT 1",
+                params![envelope.msg_id],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .is_some()
         {
             return Ok(());
         }
@@ -20769,6 +20787,13 @@ async fn coordination_complete_task_inner(
             .lock()
             .map_err(|_| "database lock poisoned")?;
         let task = load_coord_task(&connection, id)?;
+        if matches!(
+            task.phase,
+            opcos_engine::orchestration::BoardPhase::Done
+                | opcos_engine::orchestration::BoardPhase::AwaitingAcceptance
+        ) {
+            return serde_json::to_value(task).map_err(|error| error.to_string());
+        }
         let project = if task.project_id.is_empty() {
             None
         } else {
