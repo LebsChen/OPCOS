@@ -19738,6 +19738,17 @@ async fn auto_route_project_plan(
                     .submit_text(message)
                     .await
                     .map_err(|error| error.to_string())?;
+                for _ in 0..180 {
+                    let worker_idle = state
+                        .store
+                        .load_session(worker_session)
+                        .map_err(|error| error.to_string())?
+                        .is_some_and(|session| session.run_state != "running");
+                    if worker_idle {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
                 let _ = coordination_ingest_session_inner(state, worker_session, false).await;
                 coordination_complete_task_inner(state, &task_id, &worker.id, None).await?;
             }
