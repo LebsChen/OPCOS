@@ -12356,6 +12356,10 @@ pub(crate) async fn submit_turn_inner_with_context(
         Some(&request.text),
     )
     .await?;
+    let plan_before_turn = state
+        .store
+        .load_plan(&request.session_id)
+        .map_err(|error| error.to_string())?;
     emit(
         &app,
         "message",
@@ -12381,6 +12385,13 @@ pub(crate) async fn submit_turn_inner_with_context(
                     json!({"error": error}),
                 );
             }
+            record_unrouted_completed_plan_steps(
+                &app,
+                state,
+                &request.session_id,
+                plan_before_turn.as_ref(),
+            )
+            .await?;
             let calls = state
                 .store
                 .load_tool_calls_after(&request.session_id, sequence_before)
@@ -19346,6 +19357,78 @@ fn worker_role_for_plan_step(step: &opcos_store::PlanStepRecord) -> &'static str
     }
 }
 
+fn step_has_routing_audit(
+    state: &DesktopState,
+    session_id: &str,
+    step_id: &str,
+) -> Result<bool, String> {
+    let events = state
+        .store
+        .load_audit(Some(session_id))
+        .map_err(|error| error.to_string())?;
+    Ok(events.iter().any(|event| {
+        matches!(
+            event.kind.as_str(),
+            "coordination_auto_dispatch" | "coordination_local_execution"
+        ) && event.payload["step_id"].as_str() == Some(step_id)
+    }))
+}
+
+async fn record_unrouted_completed_plan_steps(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    leader_session_id: &str,
+    plan_before_turn: Option<&opcos_store::PlanRecord>,
+) -> Result<(), String> {
+    let Some(plan_before_turn) = plan_before_turn else {
+        return Ok(());
+    };
+    let before = plan_before_turn
+        .steps
+        .iter()
+        .filter(|step| step.status == "not_started")
+        .map(|step| step.step_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    if before.is_empty() {
+        return Ok(());
+    }
+    let Some(plan_after_turn) = state
+        .store
+        .load_plan(leader_session_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(());
+    };
+    for step in plan_after_turn
+        .steps
+        .into_iter()
+        .filter(|step| before.contains(step.step_id.as_str()) && step.status == "done")
+    {
+        if step_has_routing_audit(state, leader_session_id, &step.step_id)? {
+            continue;
+        }
+        let payload = json!({
+            "step_id": step.step_id,
+            "description": step.description,
+            "reason": "Lead completed the plan step before autonomous dispatch recorded a worker route",
+            "execution": "lead_local",
+        });
+        audit(
+            state,
+            leader_session_id,
+            "coordination_local_execution",
+            payload.clone(),
+        );
+        emit(
+            app,
+            "coordination_local_execution",
+            Some(leader_session_id),
+            payload,
+        );
+    }
+    Ok(())
+}
+
 async fn record_local_plan_execution(
     app: &tauri::AppHandle,
     state: &DesktopState,
@@ -19438,6 +19521,9 @@ async fn auto_route_project_plan(
     } else {
         steps.collect::<Vec<_>>()
     } {
+        if step_has_routing_audit(state, leader_session_id, &step.step_id)? {
+            continue;
+        }
         let role_name = worker_role_for_plan_step(&step);
         let worker = state
             .store
