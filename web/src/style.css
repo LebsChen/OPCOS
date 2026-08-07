@@ -676,6 +676,10 @@ h3 {
   font-size: 12px;
   font-weight: 500;
 }
+.transcript-row-label > .transcript-diff-badges,
+.transcript-artifact .transcript-diff-badges {
+  margin-left: 8px;
+}
 .transcript-additions {
   color: var(--ok);
 }
