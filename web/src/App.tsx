@@ -804,7 +804,6 @@ function ProjectDialog({
     repoRoot: string;
     defaultBranch: string;
     teamTemplateId: string;
-    configTemplateIds: string[];
   }) => Promise<void>;
 }) {
   const [name, setName] = useState("");
@@ -815,24 +814,11 @@ function ProjectDialog({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [teamTemplates, setTeamTemplates] = useState<LibraryEntry[]>([]);
-  const [configTemplates, setConfigTemplates] = useState<LibraryEntry[]>([]);
   const [teamTemplateId, setTeamTemplateId] = useState("");
-  const [configTemplateIds, setConfigTemplateIds] = useState<string[]>([]);
   useEffect(() => {
-    void Promise.all([
-      command<LibraryEntry[]>("list_configured_library", {
-        kind: "team-template",
-      }),
-      command<LibraryEntry[]>("list_configured_library"),
-    ]).then(([teams, templates]) => {
-      setTeamTemplates(teams);
-      setConfigTemplates(
-        templates.filter(
-          (template) =>
-            !["agent-template", "team-template"].includes(template.kind),
-        ),
-      );
-    });
+    void command<LibraryEntry[]>("list_configured_library", {
+      kind: "team-template",
+    }).then(setTeamTemplates);
   }, []);
   const selectedTeam = teamTemplates.find((item) => item.id === teamTemplateId);
   const selectedTeamContent = selectedTeam
@@ -863,7 +849,6 @@ function ProjectDialog({
         repoRoot: repoRoot.trim(),
         defaultBranch: defaultBranch.trim() || "main",
         teamTemplateId,
-        configTemplateIds,
       });
     } catch (reason) {
       setError(errorMessage(reason));
@@ -965,32 +950,6 @@ function ProjectDialog({
                   Workflow：{JSON.stringify(selectedTeamContent.workflow)}
                 </small>
               </div>
-            )}
-            {configTemplates.length > 0 && (
-              <fieldset className="rounded-lg border border-line p-3">
-                <legend className="px-1 text-sm font-medium">
-                  配置模板（可勾选）
-                </legend>
-                {configTemplates.map((template) => (
-                  <label
-                    key={template.id}
-                    className="flex items-center gap-2 text-sm"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={configTemplateIds.includes(template.id)}
-                      onChange={(event) =>
-                        setConfigTemplateIds((ids) =>
-                          event.target.checked
-                            ? [...ids, template.id]
-                            : ids.filter((id) => id !== template.id),
-                        )
-                      }
-                    />
-                    {template.name} · {template.kind}
-                  </label>
-                ))}
-              </fieldset>
             )}
           </div>
         </div>
@@ -11608,7 +11567,6 @@ function AppContent() {
                   repoUrl: values.repoUrl || null,
                   repoRoot: values.repoRoot || null,
                   defaultBranch: values.defaultBranch,
-                  configTemplateIds: values.configTemplateIds,
                 })
               : await command<Project>("create_project", {
                   name: values.name,

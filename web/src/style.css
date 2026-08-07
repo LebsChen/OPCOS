@@ -445,8 +445,13 @@ select:focus {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   overflow-anchor: auto;
   padding: 20px 22px;
+}
+.main-scroll > * {
+  min-width: 0;
+  max-width: 100%;
 }
 .transcript-jump-bottom {
   position: absolute;
@@ -548,11 +553,13 @@ h3 {
   flex: none;
   overflow: visible;
   max-width: none;
+  min-width: 0;
   width: 100%;
   margin: 0;
   padding: 0;
 }
 .transcript-content {
+  min-width: 0;
   width: 100%;
   max-width: none;
   margin: 0;
@@ -879,10 +886,13 @@ h3 {
   margin: 0 0 2px;
 }
 .transcript-item {
+  min-width: 0;
+  max-width: 100%;
   margin: 0 0 18px;
 }
 .transcript-shell-row {
   display: flex;
+  max-width: 100%;
 }
 .transcript-terminal-output {
   display: block;
@@ -1544,11 +1554,13 @@ h3 {
 .artifact-code {
   margin: 0;
   padding: 18px;
+  max-width: 100%;
   color: var(--color-ink);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
   line-height: 1.55;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .rail-section h3 {
   margin-bottom: 11px;
