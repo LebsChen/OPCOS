@@ -10238,6 +10238,7 @@ function AppContent() {
   const [error, setError] = useState("");
   const errorTimer = useRef<number | undefined>(undefined);
   const [running, setRunning] = useState(false);
+  const previousRunningRef = useRef(false);
   useEffect(() => {
     selectedIdRef.current = selectedId ?? undefined;
   }, [selectedId]);
@@ -10602,7 +10603,24 @@ function AppContent() {
         if (generation.current === currentGeneration)
           setError(errorMessage(reason));
       });
-  }, [selected?.id, running]);
+  }, [selected?.id]);
+  useEffect(() => {
+    const wasRunning = previousRunningRef.current;
+    previousRunningRef.current = running;
+    if (!wasRunning || running || !selected) return;
+    const currentGeneration = generation.current;
+    void command<TimelineEvent[]>("read_session_events", {
+      sessionId: selected.id,
+    })
+      .then((items) => {
+        if (generation.current !== currentGeneration) return;
+        setTranscript((current) => mergeEvents(current, items));
+      })
+      .catch((reason) => {
+        if (generation.current === currentGeneration)
+          setError(errorMessage(reason));
+      });
+  }, [running, selected?.id]);
   useEffect(() => {
     if (!selected) {
       setUnattended(false);
