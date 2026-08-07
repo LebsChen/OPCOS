@@ -13279,10 +13279,25 @@ async fn resolve_approval(
             Ok(())
         }
         Err(opcos_engine::EngineError::ApprovalPending(next_call_id)) => {
+            state
+                .store
+                .set_pending_visibility(&session_id, &next_call_id, "inbox")
+                .map_err(|error| error.to_string())?;
             emit_approval_decision(&app, &state, &session_id, &call_id, approve);
             let calls = approval_artifact_calls(&state, &session_id, &call_id, sequence_before)?;
             record_artifacts_best_effort(&app, &state, &session_id, &host_id, calls).await;
             emit_pending_approval_for(&app, &state, &session_id, Some(&next_call_id))?;
+            if let Some(payload) =
+                coordination_approval_payload(&state, &session_id, &next_call_id)?
+            {
+                audit(
+                    &state,
+                    &session_id,
+                    "coordination_approval_wait",
+                    payload.clone(),
+                );
+                emit(&app, "coordination_approval_pending", None, payload);
+            }
             emit(
                 &app,
                 "turn_done",
