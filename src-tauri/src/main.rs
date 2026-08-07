@@ -3684,7 +3684,7 @@ impl ToolExecutor for RemoteExecutor {
         }
         if self.origin == ToolOrigin::User
             && automatic_project_routing_active(&self.store, &self.session_id)?
-            && matches!(name, "edit_file" | "write_file" | "run_shell")
+            && matches!(name, "edit_file" | "write_file")
         {
             return Err(
                 "Lead-local implementation is disabled; create a plan and let the desktop dispatch it to a Worker"
@@ -4107,7 +4107,7 @@ impl ToolExecutor for DesktopExecutor {
                 }
                 if executor.origin == ToolOrigin::User
                     && automatic_project_routing_active(&executor.store, &executor.session_id)?
-                    && matches!(name, "edit_file" | "write_file" | "run_shell")
+                    && matches!(name, "edit_file" | "write_file")
                 {
                     return Err(
                         "Lead-local implementation is disabled; create a plan and let the desktop dispatch it to a Worker"
