@@ -13258,7 +13258,7 @@ async fn resolve_approval(
     match result {
         Ok(()) => {
             let resumed_task = resume_coordination_after_approval(&state, &session_id)?;
-            let _ = coordination_ingest_session_inner(&state, &session_id, false).await;
+            ingest_coordination_after_resume(&state, &session_id, resumed_task.as_deref()).await;
             emit_approval_decision(&app, &state, &session_id, &call_id, approve);
             let calls = approval_artifact_calls(&state, &session_id, &call_id, sequence_before)?;
             record_artifacts_best_effort(&app, &state, &session_id, &host_id, calls).await;
@@ -13435,7 +13435,8 @@ async fn resolve_inbox(
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "inbox item not found".to_owned())?;
     if item.state == "resolved" || item.state == "expired" {
-        let _ = resume_coordination_after_approval(&state, &session_id)?;
+        let resumed_task = resume_coordination_after_approval(&state, &session_id)?;
+        ingest_coordination_after_resume(&state, &session_id, resumed_task.as_deref()).await;
         return Ok(());
     }
     let engine = engine_for(&app, &state, &session_id, ToolOrigin::User).await?;
@@ -13463,7 +13464,7 @@ async fn resolve_inbox(
                 .store
                 .resolve_inbox(&session_id, &call_id, &resolution);
             let resumed_task = resume_coordination_after_approval(&state, &session_id)?;
-            let _ = coordination_ingest_session_inner(&state, &session_id, false).await;
+            ingest_coordination_after_resume(&state, &session_id, resumed_task.as_deref()).await;
             audit(
                 &state,
                 &session_id,
@@ -21041,6 +21042,38 @@ fn resume_coordination_after_approval(
         json!({"task_id": task_id, "worker_id": agent.id, "phase": "Claimed"}),
     );
     Ok(Some(task_id))
+}
+
+async fn ingest_coordination_after_resume(
+    state: &DesktopState,
+    session_id: &str,
+    task_id: Option<&str>,
+) {
+    for _ in 0..120 {
+        let _ = coordination_ingest_session_inner(state, session_id, false).await;
+        if task_id.is_some_and(|id| coordination_task_done(state, id)) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+fn coordination_task_done(state: &DesktopState, task_id: &str) -> bool {
+    let Ok(connection) = state.database.lock() else {
+        return false;
+    };
+    connection
+        .query_row(
+            "SELECT 1 FROM coord_tasks
+             WHERE id=?1 AND phase='Done'
+             LIMIT 1",
+            [task_id],
+            |_| Ok(true),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 fn coordination_approval_payload(
