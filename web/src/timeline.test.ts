@@ -474,6 +474,41 @@ describe("single event-log timeline", () => {
       ),
     ).toBe(false);
   });
+  it("shows steering receipt and application in work activity", () => {
+    const nodes = buildTimeline([
+      {
+        type: "steering_received",
+        event_id: "steering-received",
+        created_at_ms: 10,
+        working_event: {
+          event_type: "steering_received",
+          payload: { queued: true },
+        },
+      },
+      {
+        type: "steering_applied",
+        event_id: "steering-applied",
+        created_at_ms: 20,
+        working_event: {
+          event_type: "steering_applied",
+          payload: { iteration: 2, count: 2 },
+        },
+      },
+    ]);
+    const rows = nodes
+      .filter((node) => node.kind === "work")
+      .flatMap((node) => node.rows);
+    expect(rows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ label: "Steering received" }),
+        expect.objectContaining({
+          label: "Steering applied",
+          detail: "Before iteration 2",
+        }),
+      ]),
+    );
+  });
+
   it("uses Devin wording for fixture-derived rows", () => {
     const nodes = buildTimeline(live);
     const work = nodes.filter((node) => node.kind === "work");
