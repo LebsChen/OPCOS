@@ -935,6 +935,12 @@ impl HttpSseClient {
                     continue;
                 };
                 if !response.status().is_success() {
+                    if let Some(error) = sse_http_status_error(response.status()) {
+                        if let Some(sender) = first_endpoint.take() {
+                            let _ = sender.send(Err(error));
+                        }
+                        break;
+                    }
                     if shutdown_rx.try_recv().is_ok() {
                         break;
                     }
@@ -953,7 +959,7 @@ impl HttpSseClient {
                                 if let Ok(endpoint_url) = resolve_sse_endpoint(&url, &event.data) {
                                     *endpoint.lock().await = Some(endpoint_url.clone());
                                     if let Some(sender) = first_endpoint.take() {
-                                        let _ = sender.send(endpoint_url);
+                                        let _ = sender.send(Ok(endpoint_url));
                                     }
                                 }
                             }
@@ -998,7 +1004,7 @@ impl HttpSseClient {
         )
         .await
         .map_err(|_| McpClientError::Timeout)?
-        .map_err(|_| McpClientError::Disconnected)?;
+        .map_err(|_| McpClientError::Disconnected)??;
         Ok(())
     }
 
@@ -1091,16 +1097,33 @@ struct SseEvent {
 #[derive(Default)]
 struct SseParser {
     buffer: String,
+    pending_cr: bool,
+    search_from: usize,
 }
 
 impl SseParser {
     fn push(&mut self, bytes: &[u8]) -> Vec<SseEvent> {
-        self.buffer.push_str(&String::from_utf8_lossy(bytes));
-        self.buffer = self.buffer.replace("\r\n", "\n");
+        for character in String::from_utf8_lossy(bytes).chars() {
+            if self.pending_cr {
+                self.pending_cr = false;
+                if character == '\n' {
+                    self.buffer.push('\n');
+                    continue;
+                }
+                self.buffer.push('\r');
+            }
+            if character == '\r' {
+                self.pending_cr = true;
+            } else {
+                self.buffer.push(character);
+            }
+        }
         let mut events = Vec::new();
-        while let Some(index) = self.buffer.find("\n\n") {
+        while let Some(relative_index) = self.buffer[self.search_from..].find("\n\n") {
+            let index = self.search_from + relative_index;
             let frame = self.buffer[..index].to_owned();
             self.buffer.drain(..index + 2);
+            self.search_from = 0;
             let mut event = SseEvent::default();
             for line in frame.lines() {
                 if let Some(value) = line.strip_prefix("event:") {
@@ -1116,6 +1139,7 @@ impl SseParser {
                 events.push(event);
             }
         }
+        self.search_from = self.buffer.len().saturating_sub(1);
         events
     }
 }
@@ -1139,6 +1163,16 @@ fn resolve_sse_endpoint(base: &Url, value: &str) -> Result<Url, McpClientError> 
         return Err(McpClientError::InvalidConfig);
     }
     Ok(endpoint)
+}
+
+fn sse_http_status_error(status: reqwest::StatusCode) -> Option<McpClientError> {
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        Some(McpClientError::AuthRequired)
+    } else if status.is_client_error() {
+        Some(McpClientError::Transport)
+    } else {
+        None
+    }
 }
 
 #[async_trait]
@@ -2559,5 +2593,37 @@ mod tests {
         let transport: McpTransport = serde_json::from_str("\"http-sse\"").unwrap();
         assert_eq!(transport, McpTransport::HttpSse);
         assert_eq!(serde_json::to_string(&transport).unwrap(), "\"http-sse\"");
+    }
+
+    #[test]
+    fn http_sse_server_config_accepts_transport_and_type_keys() {
+        for key in ["transport", "type"] {
+            let config: McpServerConfig = serde_json::from_value(json!({
+                key: "http-sse",
+                "object_id": "server-a",
+                "server_key": "abc123",
+                "name": "SSE",
+                "url": "https://example.test/mcp"
+            }))
+            .unwrap();
+            assert_eq!(config.transport, McpTransport::HttpSse);
+        }
+    }
+
+    #[test]
+    fn http_sse_initial_get_statuses_distinguish_auth_and_retryable_failures() {
+        assert!(matches!(
+            sse_http_status_error(reqwest::StatusCode::UNAUTHORIZED),
+            Some(McpClientError::AuthRequired)
+        ));
+        assert!(matches!(
+            sse_http_status_error(reqwest::StatusCode::FORBIDDEN),
+            Some(McpClientError::AuthRequired)
+        ));
+        assert!(matches!(
+            sse_http_status_error(reqwest::StatusCode::BAD_REQUEST),
+            Some(McpClientError::Transport)
+        ));
+        assert!(sse_http_status_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR).is_none());
     }
 }
