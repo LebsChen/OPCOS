@@ -19734,83 +19734,10 @@ async fn auto_route_project_plan(
                     json!({"step_id": step.step_id, "worker_role": role_name, "dispatch": dispatch}),
                 );
                 let engine = engine_for(app, state, worker_session, ToolOrigin::User).await?;
-                let turn_finished_before = {
-                    let connection = state
-                        .database
-                        .lock()
-                        .map_err(|_| "database lock poisoned")?;
-                    connection
-                        .query_row(
-                            "SELECT COUNT(*) FROM session_events
-                             WHERE session_id=?1 AND json_extract(event_json, '$.type')='turn_finished'",
-                            [worker_session],
-                            |row| row.get::<_, i64>(0),
-                        )
-                        .map_err(|error| error.to_string())?
-                };
                 engine
                     .submit_text(message)
                     .await
                     .map_err(|error| error.to_string())?;
-                for _ in 0..180 {
-                    let worker_idle = state
-                        .store
-                        .load_session(worker_session)
-                        .map_err(|error| error.to_string())?
-                        .is_some_and(|session| session.run_state != "running");
-                    if worker_idle {
-                        let turn_finished_after = {
-                            let connection = state
-                                .database
-                                .lock()
-                                .map_err(|_| "database lock poisoned")?;
-                            connection
-                                .query_row(
-                                    "SELECT COUNT(*) FROM session_events
-                                     WHERE session_id=?1 AND json_extract(event_json, '$.type')='turn_finished'",
-                                    [worker_session],
-                                    |row| row.get::<_, i64>(0),
-                                )
-                                .map_err(|error| error.to_string())?
-                        };
-                        if turn_finished_after > turn_finished_before {
-                            break;
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
-                let mut result_persisted = false;
-                for _ in 0..30 {
-                    let _ = coordination_ingest_session_inner(state, worker_session, true).await;
-                    result_persisted = {
-                        let connection = state
-                            .database
-                            .lock()
-                            .map_err(|_| "database lock poisoned")?;
-                        connection
-                            .query_row(
-                                "SELECT 1 FROM coord_messages
-                                 WHERE task_id=?1 AND kind='result' AND from_role=?2
-                                 LIMIT 1",
-                                params![task_id, worker.id],
-                                |_| Ok(true),
-                            )
-                            .optional()
-                            .map_err(|error| error.to_string())?
-                            .is_some()
-                    };
-                    if result_persisted {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-                if !result_persisted {
-                    return Err(
-                        "Worker result envelope was not persisted after transcript completion"
-                            .to_owned(),
-                    );
-                }
-                coordination_complete_task_inner(state, &task_id, &worker.id, None).await?;
             }
             Err(reason) => {
                 return Err(format!(
@@ -19852,7 +19779,7 @@ async fn coordination_message(
         }
     };
     let project_id = connection_project_for_task(&state, &task_id)?;
-    persist_coord_message(&state, &project_id, &task_id, &envelope)?;
+    persist_coord_message(&state, &project_id, &task_id, &envelope).await?;
     if let Some(worker_session) = worker_session {
         let engine = state
             .engines
@@ -20145,33 +20072,54 @@ fn connection_project_for_task(state: &DesktopState, task_id: &str) -> Result<St
         .map_err(|error| error.to_string())
 }
 
-fn persist_coord_message(
+async fn persist_coord_message(
     state: &DesktopState,
     project_id: &str,
     task_id: &str,
     envelope: &Envelope,
 ) -> Result<(), String> {
-    state
-        .database
-        .lock()
-        .map_err(|_| "database lock poisoned")?
-        .execute(
-            "INSERT INTO coord_messages
-             (project_id,task_id,msg_id,from_role,to_role,kind,reply_to,payload,created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            params![
-                project_id,
-                task_id,
-                envelope.msg_id,
-                envelope.from,
-                envelope.to,
-                serde_json::to_string(&envelope.kind).map_err(|error| error.to_string())?,
-                envelope.reply_to,
-                envelope.payload.to_string(),
-                Utc::now().to_rfc3339(),
-            ],
-        )
-        .map_err(|error| error.to_string())?;
+    {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        if envelope.kind == opcos_engine::orchestration::EnvelopeKind::Result
+            && connection
+                .query_row(
+                    "SELECT 1 FROM coord_messages
+                     WHERE task_id=?1 AND from_role=?2 AND kind='result'
+                     LIMIT 1",
+                    params![task_id, envelope.from],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .is_some()
+        {
+            return Ok(());
+        }
+        connection
+            .execute(
+                "INSERT INTO coord_messages
+                 (project_id,task_id,msg_id,from_role,to_role,kind,reply_to,payload,created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    project_id,
+                    task_id,
+                    envelope.msg_id,
+                    envelope.from,
+                    envelope.to,
+                    serde_json::to_string(&envelope.kind).map_err(|error| error.to_string())?,
+                    envelope.reply_to,
+                    envelope.payload.to_string(),
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    if envelope.kind == opcos_engine::orchestration::EnvelopeKind::Result {
+        coordination_complete_task_inner(state, task_id, &envelope.from, None).await?;
+    }
     Ok(())
 }
 
@@ -20532,7 +20480,8 @@ async fn coordination_ingest_session_inner(
             }));
             continue;
         }
-        if let Err(error) = persist_coord_message(state, &project_id, &envelope.task_id, &envelope)
+        if let Err(error) =
+            persist_coord_message(state, &project_id, &envelope.task_id, &envelope).await
         {
             rejected.push(json!({"msgId": envelope.msg_id, "reason": error}));
         } else {
