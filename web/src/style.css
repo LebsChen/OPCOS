@@ -752,8 +752,13 @@ h3 {
 .transcript-thought[open] .transcript-thought-chevron {
   transform: rotate(90deg);
 }
+.transcript-disclosure-break {
+  flex: 0 0 calc(100% + 1px);
+  height: 0;
+}
 .transcript-thought-body {
-  flex: 0 0 100%;
+  flex: 0 0 calc(100% + 1px);
+  width: calc(100% + 1px);
   min-width: 0;
   margin: 4px 0 0;
   color: var(--muted);
@@ -763,6 +768,9 @@ h3 {
   margin: 0;
   padding: 0;
   color: inherit;
+}
+.transcript-disclosure-summary-break {
+  flex-basis: 100%;
 }
 .transcript-interaction-card {
   flex: none;

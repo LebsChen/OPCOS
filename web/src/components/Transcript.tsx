@@ -71,11 +71,13 @@ function TranscriptDisclosure({
   label,
   children,
   className = "",
+  summaryClassName = "",
   onToggle,
 }: {
   label: string;
   children: ReactNode;
   className?: string;
+  summaryClassName?: string;
   onToggle?: (open: boolean) => void;
 }) {
   return (
@@ -83,10 +85,11 @@ function TranscriptDisclosure({
       className={`transcript-thought ${className}`}
       onToggle={(event) => onToggle?.(event.currentTarget.open)}
     >
-      <summary className="transcript-row-header">
+      <summary className={`transcript-row-header ${summaryClassName}`}>
         <span>{label}</span>
         <TranscriptChevron className="transcript-thought-chevron" />
       </summary>
+      <span className="transcript-disclosure-break" aria-hidden="true" />
       <div className="transcript-thought-body">{children}</div>
     </details>
   );
@@ -95,11 +98,22 @@ function TranscriptDisclosure({
 function Thought({
   text,
   label = "Thought details",
+  forceSummaryBreak = false,
 }: {
   text: string;
   label?: string;
+  forceSummaryBreak?: boolean;
 }) {
-  return <TranscriptDisclosure label={label}>{text}</TranscriptDisclosure>;
+  return (
+    <TranscriptDisclosure
+      label={label}
+      summaryClassName={
+        forceSummaryBreak ? "transcript-disclosure-summary-break" : ""
+      }
+    >
+      {text}
+    </TranscriptDisclosure>
+  );
 }
 
 function thoughtLabel(label?: string): string {
@@ -587,6 +601,9 @@ export function Transcript({
                 <Thought
                   text={thoughtByCallId.get(row.callId)?.detail ?? ""}
                   label={thoughtLabel(thoughtByCallId.get(row.callId)?.label)}
+                  forceSummaryBreak={Boolean(
+                    row.terminalOutput || row.terminalTruncated,
+                  )}
                 />
               )}
             </div>
