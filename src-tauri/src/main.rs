@@ -12628,6 +12628,7 @@ async fn session_context_attachments(
     state: &DesktopState,
     session_id: &str,
 ) -> Result<Vec<ExternalContextAttachment>, String> {
+    const MAX_CONTEXT_RESOURCE_BYTES: usize = 256 * 1024;
     let resources = {
         let connection = state
             .database
@@ -12667,6 +12668,13 @@ async fn session_context_attachments(
                         .map(|blob| format!("[binary resource: {blob}]"))
                 })
                 .unwrap_or_default();
+            if text.len() > MAX_CONTEXT_RESOURCE_BYTES {
+                return Err(format!(
+                    "MCP resource is too large to attach ({} bytes; limit {} bytes)",
+                    text.len(),
+                    MAX_CONTEXT_RESOURCE_BYTES
+                ));
+            }
             attachments.push(ExternalContextAttachment {
                 source: format!("mcp:{server_id}"),
                 uri: Some(content.uri),
@@ -12838,12 +12846,6 @@ pub(crate) async fn submit_turn_inner_with_context(
         .store
         .load_plan(&request.session_id)
         .map_err(|error| error.to_string())?;
-    emit(
-        &app,
-        "message",
-        Some(&request.session_id),
-        json!({"role":"user","text":request.text}),
-    );
     if let Err(error) = auto_route_project_plan(&app, state, &request.session_id).await {
         audit(
             state,
@@ -12854,6 +12856,12 @@ pub(crate) async fn submit_turn_inner_with_context(
     }
     let mut attachments = request.attachments;
     attachments.extend(session_context_attachments(state, &request.session_id).await?);
+    emit(
+        &app,
+        "message",
+        Some(&request.session_id),
+        json!({"role":"user","text":request.text}),
+    );
     match submit_engine_turn_with_coordination_ingest(
         &engine,
         state,
@@ -18602,6 +18610,7 @@ async fn retry_mcp_server(
     config["name"] = Value::String(name.clone());
     let parsed: McpServerConfig =
         serde_json::from_value(config).map_err(|error| format!("invalid MCP config: {error}"))?;
+    state.mcp.disconnect(&server_id).await;
     let tools = state
         .mcp
         .connect_with_retry(&parsed, &version_id, 2)

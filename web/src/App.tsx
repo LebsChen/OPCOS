@@ -60,6 +60,7 @@ import { Icon } from "./components/Icon";
 import { CollectionPage } from "./components/CollectionPage";
 import { IntegrationCard } from "./components/IntegrationCard";
 import { getLocale, setLocale, subscribeLocale, translate } from "./i18n";
+import type { Attachment } from "./types";
 import "./openworker-tailwind.css";
 import "./openworker-styles.css";
 import "./style.css";
@@ -7178,16 +7179,21 @@ function McpManage({
         mcpCatalogUpdateTargets(event.payload, selectedServerId) &&
         event.payload.version_id
       ) {
-        void Promise.all([
-          command<Array<Record<string, unknown>>>("mcp_resources", {
-            serverId: event.payload.server_id,
-            versionId: event.payload.version_id,
-          }),
-          command<Array<Record<string, unknown>>>("mcp_prompts", {
-            serverId: event.payload.server_id,
-            versionId: event.payload.version_id,
-          }),
-        ])
+        void command("retry_mcp_server", {
+          serverId: event.payload.server_id,
+        })
+          .then(() =>
+            Promise.all([
+              command<Array<Record<string, unknown>>>("mcp_resources", {
+                serverId: event.payload.server_id,
+                versionId: event.payload.version_id,
+              }),
+              command<Array<Record<string, unknown>>>("mcp_prompts", {
+                serverId: event.payload.server_id,
+                versionId: event.payload.version_id,
+              }),
+            ]),
+          )
           .then(([nextResources, nextPrompts]) => {
             if (!active) return;
             setResources(nextResources);
@@ -7358,7 +7364,8 @@ function McpManage({
         <section className="panel mt-4">
           <h2>
             {String(selectedServer.name)} resources ({resources.length}) ·
-            prompts ({prompts.length})
+            prompts ({prompts.length}) · tools (
+            {Number(selectedServer.tool_count || 0)})
           </h2>
           <div className="grid gap-2">
             {resources.map((resource) => (
@@ -11187,15 +11194,21 @@ function AppContent() {
       )
       .catch(onError);
   };
-  const submit = (text: string) => {
+  const submit = async (
+    text: string,
+    attachments: Attachment[] = [],
+  ): Promise<void> => {
     if (!selected) return;
     setRunning(true);
-    void command("submit_turn", {
-      request: { session_id: selected.id, text },
-    }).catch((reason) => {
+    try {
+      await command("submit_turn", {
+        request: { session_id: selected.id, text, attachments },
+      });
+    } catch (reason) {
       setRunning(false);
       onError(submitFailureMessage(reason));
-    });
+      throw new Error(submitFailureMessage(reason));
+    }
   };
   const uploadTextAttachmentForSession = async (
     sessionId: string,

@@ -31,6 +31,8 @@ fn configure_no_window(_command: &mut tokio::process::Command) {}
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 pub const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 pub const MAX_DISCOVERY_PAGES: usize = 128;
+const SSE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_SSE_RECONNECT_ATTEMPTS: u32 = 3;
 
 pub fn reconnect_delay(attempt: u32) -> Duration {
     if attempt == 0 {
@@ -1310,6 +1312,15 @@ impl HttpSseClient {
                     if shutdown_rx.try_recv().is_ok() {
                         break;
                     }
+                    if attempt >= MAX_SSE_RECONNECT_ATTEMPTS {
+                        for (_, sender) in pending.lock().await.drain() {
+                            let _ = sender.send(Err(McpClientError::Disconnected));
+                        }
+                        if let Some(sender) = first_endpoint.take() {
+                            let _ = sender.send(Err(McpClientError::Disconnected));
+                        }
+                        break;
+                    }
                     tokio::time::sleep(reconnect_delay(attempt)).await;
                     attempt = attempt.saturating_add(1);
                     continue;
@@ -1322,6 +1333,12 @@ impl HttpSseClient {
                         break;
                     }
                     if shutdown_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    if attempt >= MAX_SSE_RECONNECT_ATTEMPTS {
+                        for (_, sender) in pending.lock().await.drain() {
+                            let _ = sender.send(Err(McpClientError::Disconnected));
+                        }
                         break;
                     }
                     tokio::time::sleep(reconnect_delay(attempt)).await;
@@ -1371,6 +1388,12 @@ impl HttpSseClient {
                 if shutdown_rx.try_recv().is_ok() {
                     break;
                 }
+                if attempt >= MAX_SSE_RECONNECT_ATTEMPTS {
+                    for (_, sender) in pending.lock().await.drain() {
+                        let _ = sender.send(Err(McpClientError::Disconnected));
+                    }
+                    break;
+                }
                 tokio::time::sleep(reconnect_delay(attempt)).await;
                 attempt = attempt.saturating_add(1);
             }
@@ -1399,14 +1422,17 @@ impl HttpSseClient {
         self.next_id += 1;
         let (sender, receiver) = oneshot::channel();
         self.pending.lock().await.insert(id, sender);
-        let response = self
-            .client
-            .post(endpoint)
-            .headers(self.headers.clone())
-            .json(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
-            .send()
-            .await
-            .map_err(|_| McpClientError::Disconnected)?;
+        let response = tokio::time::timeout(
+            SSE_REQUEST_TIMEOUT,
+            self.client
+                .post(endpoint)
+                .headers(self.headers.clone())
+                .json(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
+                .send(),
+        )
+        .await
+        .map_err(|_| McpClientError::Timeout)?
+        .map_err(|_| McpClientError::Disconnected)?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             self.pending.lock().await.remove(&id);
             return Err(McpClientError::AuthRequired);
@@ -1415,7 +1441,7 @@ impl HttpSseClient {
             self.pending.lock().await.remove(&id);
             return Err(McpClientError::Transport);
         }
-        tokio::time::timeout(Duration::from_secs(DEFAULT_EXEC_TIMEOUT_SECONDS), receiver)
+        tokio::time::timeout(SSE_REQUEST_TIMEOUT, receiver)
             .await
             .map_err(|_| McpClientError::Timeout)?
             .map_err(|_| McpClientError::Disconnected)?
@@ -1910,21 +1936,32 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             else {
                 return;
             };
-            let mut values = HashMap::new();
+            let mut values = credentials.get(&server_id).await.unwrap_or_default().unwrap_or_default();
             values.insert("bearer_token".to_owned(), tokens.access_token);
             if let Some(refresh) = tokens.refresh_token {
                 values.insert("refresh_token".to_owned(), refresh);
             }
             values.insert("client_id".to_owned(), client_id);
             let _ = credentials.set(&server_id, values).await;
+            manager.disconnect(&server_id).await;
             if let Some(config) = manager
                 .configs
                 .lock()
                 .await
                 .get(&(server_id.clone(), version_id.clone()))
                 .cloned()
+                && manager
+                    .connect_with_retry(&config, &version_id, 1)
+                    .await
+                    .is_ok()
+                && let Some(sink) = manager.notification_sink.lock().await.clone()
             {
-                let _ = manager.connect_with_retry(&config, &version_id, 1).await;
+                sink(
+                    server_id.clone(),
+                    version_id.clone(),
+                    "oauth/authorized".into(),
+                    None,
+                );
             }
         });
         Ok(authorization.to_string())
@@ -2313,7 +2350,7 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             }
             if !matches!(
                 error,
-                McpClientError::Disconnected | McpClientError::Transport
+                McpClientError::Disconnected | McpClientError::Transport | McpClientError::Timeout
             ) {
                 return Err(error);
             }

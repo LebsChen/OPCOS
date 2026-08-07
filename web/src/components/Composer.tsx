@@ -126,7 +126,7 @@ interface Props {
   modelReady?: boolean;
   onConnectModel?: () => void;
   onConfigureVoiceInput?: () => void;
-  onSend: (text: string, attachments?: Attachment[]) => void;
+  onSend: (text: string, attachments?: Attachment[]) => void | Promise<void>;
   onSteer?: (text: string, attachments?: Attachment[]) => void;
   onInterrupt: () => void;
   assets?: Array<{ kind: string; title: string }>;
@@ -384,7 +384,7 @@ export function Composer(props: Props) {
     }
   };
 
-  const submit = () => {
+  const submit = async () => {
     const t = text.trim();
     if (
       (!t && attachments.length === 0) ||
@@ -411,10 +411,16 @@ export function Composer(props: Props) {
       props.onConnectModel?.();
       return;
     }
-    props.onSend(expandSlashCommand(t), attachments);
-    setSlashQuery(null);
-    setText("");
-    setAttachments([]);
+    try {
+      await props.onSend(expandSlashCommand(t), attachments);
+      setSlashQuery(null);
+      setText("");
+      setAttachments([]);
+    } catch (error) {
+      showAttachNotice(
+        error instanceof Error ? error.message : "Message submission failed.",
+      );
+    }
   };
 
   const onKey = (e: React.KeyboardEvent) => {
