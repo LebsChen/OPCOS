@@ -10190,12 +10190,14 @@ async fn engine_for_with_context(
         && state.store.load_plan(session_id).ok().flatten().is_some()
     {
         system_instructions.push_str(
-            "\n\nAutonomous project routing policy: you are the Lead orchestrator. \
+             "\n\nAutonomous project routing policy: you are the Lead orchestrator. \
              Internal worker routing is automatic and is never a user question. \
              Do not call coordination_dispatch; the desktop dispatches saved plan steps \
              automatically. Do not ask whether to execute in-session or dispatch workers, and do not \
-             present that choice as an option. Sequence, synthesize, and verify; workers \
-             execute their assigned steps. Ask the user only about genuine product \
+             present that choice as an option. Do not open or edit implementation files or \
+             execute implementation work in the Lead workspace. For implementation requests, \
+             create or revise the plan and stop; the desktop dispatches the saved step. \
+             Sequence, synthesize, and verify; workers execute their assigned steps. Ask the user only about genuine product \
              ambiguity or risky external actions requiring approval.",
         );
     }
