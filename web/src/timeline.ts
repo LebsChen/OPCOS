@@ -339,8 +339,11 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
           : plan.length - 1;
     const current = plan[currentIndex];
     if (!current) return;
+    const label = `${completed}/${plan.length} #${currentIndex + 1} ${String(current.content ?? current.title ?? "")}`;
+    const previous = activeWork.rows.at(-1);
+    if (previous?.activityLabel && previous.label === label) return;
     activeWork.rows.push({
-      label: `${completed}/${plan.length} #${currentIndex + 1} ${String(current.content ?? current.title ?? "")}`,
+      label,
       activityLabel: true,
       isMajorAction: true,
     });
