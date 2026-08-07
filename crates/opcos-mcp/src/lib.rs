@@ -1255,6 +1255,12 @@ type SseNotification = (String, Value);
 type PendingSseRequests = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, McpClientError>>>>>;
 type NotificationSink = Arc<dyn Fn(String, String, String, Option<String>) + Send + Sync>;
 
+async fn fail_pending_requests(pending: &PendingSseRequests) {
+    for (_, sender) in pending.lock().await.drain() {
+        let _ = sender.send(Err(McpClientError::Disconnected));
+    }
+}
+
 struct HttpSseClient {
     client: reqwest::Client,
     url: Url,
@@ -1313,9 +1319,7 @@ impl HttpSseClient {
                         break;
                     }
                     if attempt >= MAX_SSE_RECONNECT_ATTEMPTS {
-                        for (_, sender) in pending.lock().await.drain() {
-                            let _ = sender.send(Err(McpClientError::Disconnected));
-                        }
+                        fail_pending_requests(&pending).await;
                         if let Some(sender) = first_endpoint.take() {
                             let _ = sender.send(Err(McpClientError::Disconnected));
                         }
@@ -1336,9 +1340,7 @@ impl HttpSseClient {
                         break;
                     }
                     if attempt >= MAX_SSE_RECONNECT_ATTEMPTS {
-                        for (_, sender) in pending.lock().await.drain() {
-                            let _ = sender.send(Err(McpClientError::Disconnected));
-                        }
+                        fail_pending_requests(&pending).await;
                         break;
                     }
                     tokio::time::sleep(reconnect_delay(attempt)).await;
@@ -1389,17 +1391,13 @@ impl HttpSseClient {
                     break;
                 }
                 if attempt >= MAX_SSE_RECONNECT_ATTEMPTS {
-                    for (_, sender) in pending.lock().await.drain() {
-                        let _ = sender.send(Err(McpClientError::Disconnected));
-                    }
+                    fail_pending_requests(&pending).await;
                     break;
                 }
                 tokio::time::sleep(reconnect_delay(attempt)).await;
                 attempt = attempt.saturating_add(1);
             }
-            for (_, sender) in pending.lock().await.drain() {
-                let _ = sender.send(Err(McpClientError::Disconnected));
-            }
+            fail_pending_requests(&pending).await;
         }));
         tokio::time::timeout(
             Duration::from_secs(DEFAULT_EXEC_TIMEOUT_SECONDS),
@@ -1412,6 +1410,16 @@ impl HttpSseClient {
     }
 
     async fn request(&mut self, method: &str, params: Value) -> Result<Value, McpClientError> {
+        self.request_with_timeout(method, params, SSE_REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn request_with_timeout(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, McpClientError> {
         let endpoint = self
             .endpoint
             .lock()
@@ -1423,7 +1431,7 @@ impl HttpSseClient {
         let (sender, receiver) = oneshot::channel();
         self.pending.lock().await.insert(id, sender);
         let response = tokio::time::timeout(
-            SSE_REQUEST_TIMEOUT,
+            timeout,
             self.client
                 .post(endpoint)
                 .headers(self.headers.clone())
@@ -1441,7 +1449,7 @@ impl HttpSseClient {
             self.pending.lock().await.remove(&id);
             return Err(McpClientError::Transport);
         }
-        tokio::time::timeout(SSE_REQUEST_TIMEOUT, receiver)
+        tokio::time::timeout(timeout, receiver)
             .await
             .map_err(|_| McpClientError::Timeout)?
             .map_err(|_| McpClientError::Disconnected)?
@@ -3431,6 +3439,59 @@ mod tests {
         assert_eq!(notification["method"], "notifications/resources/updated");
         let response: Value = serde_json::from_str(&events[1].data).unwrap();
         assert_eq!(response["id"], 7);
+    }
+
+    #[tokio::test]
+    async fn exhausted_sse_reconnects_fail_pending_requests() {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (sender, receiver) = oneshot::channel();
+        pending.lock().await.insert(1, sender);
+        fail_pending_requests(&pending).await;
+        assert!(matches!(
+            receiver.await.unwrap(),
+            Err(McpClientError::Disconnected)
+        ));
+    }
+
+    #[tokio::test]
+    async fn sse_request_timeout_maps_to_timeout() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let config = McpServerConfig {
+            object_id: "timeout".into(),
+            server_key: "timeout".into(),
+            name: "timeout".into(),
+            transport: McpTransport::HttpSse,
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            url: Some(format!("http://{address}/sse")),
+            headers: HashMap::new(),
+            enabled: true,
+            include_tools: None,
+            exclude_tools: None,
+            requires_approval: true,
+            auth: None,
+            oauth_client_id: None,
+        };
+        let (notifications, _) = mpsc::unbounded_channel();
+        let mut client = HttpSseClient::new(&config, None, notifications).unwrap();
+        *client.endpoint.lock().await =
+            Some(Url::parse(&format!("http://{address}/message")).unwrap());
+        assert!(matches!(
+            client
+                .request_with_timeout("slow", json!({}), Duration::from_millis(10))
+                .await,
+            Err(McpClientError::Timeout)
+        ));
+        server.abort();
     }
 
     #[test]

@@ -7179,21 +7179,16 @@ function McpManage({
         mcpCatalogUpdateTargets(event.payload, selectedServerId) &&
         event.payload.version_id
       ) {
-        void command("retry_mcp_server", {
-          serverId: event.payload.server_id,
-        })
-          .then(() =>
-            Promise.all([
-              command<Array<Record<string, unknown>>>("mcp_resources", {
-                serverId: event.payload.server_id,
-                versionId: event.payload.version_id,
-              }),
-              command<Array<Record<string, unknown>>>("mcp_prompts", {
-                serverId: event.payload.server_id,
-                versionId: event.payload.version_id,
-              }),
-            ]),
-          )
+        void Promise.all([
+          command<Array<Record<string, unknown>>>("mcp_resources", {
+            serverId: event.payload.server_id,
+            versionId: event.payload.version_id,
+          }),
+          command<Array<Record<string, unknown>>>("mcp_prompts", {
+            serverId: event.payload.server_id,
+            versionId: event.payload.version_id,
+          }),
+        ])
           .then(([nextResources, nextPrompts]) => {
             if (!active) return;
             setResources(nextResources);

@@ -12628,7 +12628,6 @@ async fn session_context_attachments(
     state: &DesktopState,
     session_id: &str,
 ) -> Result<Vec<ExternalContextAttachment>, String> {
-    const MAX_CONTEXT_RESOURCE_BYTES: usize = 256 * 1024;
     let resources = {
         let connection = state
             .database
@@ -12668,13 +12667,7 @@ async fn session_context_attachments(
                         .map(|blob| format!("[binary resource: {blob}]"))
                 })
                 .unwrap_or_default();
-            if text.len() > MAX_CONTEXT_RESOURCE_BYTES {
-                return Err(format!(
-                    "MCP resource is too large to attach ({} bytes; limit {} bytes)",
-                    text.len(),
-                    MAX_CONTEXT_RESOURCE_BYTES
-                ));
-            }
+            validate_context_resource_size(&text)?;
             attachments.push(ExternalContextAttachment {
                 source: format!("mcp:{server_id}"),
                 uri: Some(content.uri),
@@ -12684,6 +12677,18 @@ async fn session_context_attachments(
         }
     }
     Ok(attachments)
+}
+
+fn validate_context_resource_size(text: &str) -> Result<(), String> {
+    const MAX_CONTEXT_RESOURCE_BYTES: usize = 256 * 1024;
+    if text.len() > MAX_CONTEXT_RESOURCE_BYTES {
+        return Err(format!(
+            "MCP resource is too large to attach ({} bytes; limit {} bytes)",
+            text.len(),
+            MAX_CONTEXT_RESOURCE_BYTES
+        ));
+    }
+    Ok(())
 }
 
 async fn submit_turn_inner(
@@ -26623,6 +26628,13 @@ agents:
         assert!(constant_time_token_eq("token", "token"));
         assert!(!constant_time_token_eq("token", "Token"));
         assert!(!constant_time_token_eq("token", "token-extra"));
+    }
+
+    #[test]
+    fn oversized_mcp_context_resource_is_rejected_explicitly() {
+        let error = validate_context_resource_size(&"x".repeat(256 * 1024 + 1)).unwrap_err();
+        assert!(error.contains("MCP resource is too large to attach"));
+        assert!(error.contains("limit 262144 bytes"));
     }
 
     #[test]

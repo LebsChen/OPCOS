@@ -877,6 +877,9 @@ where
     }
 
     async fn execute_tool_interruptible(&self, call: &ToolCall) -> Value {
+        if self.interrupted.load(Ordering::SeqCst) {
+            return json!({"error":"tool call interrupted"});
+        }
         tokio::select! {
             result = self.execute_tool_with_hooks(call) => result,
             _ = self.interrupt_notify.notified() => json!({"error":"tool call interrupted"}),
