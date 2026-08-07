@@ -80,6 +80,7 @@ pub struct AcpHarnessConfig {
     pub workspace: String,
     pub command: String,
     pub env: Option<Value>,
+    pub mcp_servers: Vec<Value>,
 }
 
 struct AcpTurn {
@@ -114,6 +115,10 @@ where
     next_id: AtomicU64,
     shutdown: Notify,
     supports_load: Mutex<bool>,
+    protocol_version: Mutex<String>,
+    auth_methods: Mutex<Vec<Value>>,
+    auth_required: Mutex<bool>,
+    mcp_servers: Mutex<Vec<Value>>,
 }
 
 pub struct AcpHarness<S>
@@ -171,6 +176,10 @@ where
             next_id: AtomicU64::new(1),
             shutdown: Notify::new(),
             supports_load: Mutex::new(false),
+            protocol_version: Mutex::new(String::new()),
+            auth_methods: Mutex::new(Vec::new()),
+            auth_required: Mutex::new(false),
+            mcp_servers: Mutex::new(config.mcp_servers.clone()),
         });
         let harness = Arc::new(Self {
             state: state.clone(),
@@ -197,6 +206,29 @@ where
                 }),
             )
             .await?;
+        let protocol_version = init
+            .get("protocolVersion")
+            .and_then(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| value.as_u64().map(|number| number.to_string()))
+            })
+            .ok_or_else(|| {
+                HarnessError::External("ACP initialize response omitted protocolVersion".into())
+            })?;
+        if !matches!(protocol_version.as_str(), "1" | "2" | "v1" | "v2") {
+            return Err(HarnessError::External(format!(
+                "ACP protocol version is incompatible: {protocol_version}"
+            )));
+        }
+        *state.protocol_version.lock().await = protocol_version;
+        let auth_methods = init
+            .get("authMethods")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        *state.auth_methods.lock().await = auth_methods;
         let supports_load = init
             .get("agentCapabilities")
             .and_then(|value| value.get("loadSession"))
@@ -208,10 +240,18 @@ where
                 "session/new",
                 json!({
                     "cwd": config_workspace(&state.workspace),
-                    "mcpServers": []
+                    "mcpServers": config.mcp_servers
                 }),
             )
-            .await?;
+            .await;
+        let session = match session {
+            Ok(session) => session,
+            Err(error) if is_authentication_error(&error) => {
+                *state.auth_required.lock().await = true;
+                return Ok(harness);
+            }
+            Err(error) => return Err(error),
+        };
         let external_session_id = session
             .get("sessionId")
             .and_then(Value::as_str)
@@ -225,6 +265,51 @@ where
             .set_external_session_id(Some(&external_session_id))
             .map_err(|error| HarnessError::External(error.to_string()))?;
         Ok(harness)
+    }
+
+    pub async fn advertised_auth_methods(&self) -> Vec<Value> {
+        self.state.auth_methods.lock().await.clone()
+    }
+
+    pub async fn authenticate(&self, method_id: &str) -> Result<(), HarnessError> {
+        if !self
+            .state
+            .auth_methods
+            .lock()
+            .await
+            .iter()
+            .any(|method| method.get("id").and_then(Value::as_str) == Some(method_id))
+        {
+            return Err(HarnessError::External(
+                "ACP authentication method is not advertised".into(),
+            ));
+        }
+        self.state
+            .request("authenticate", json!({"methodId": method_id}))
+            .await?;
+        let session = self
+            .state
+            .request(
+                "session/new",
+                json!({
+                    "cwd": config_workspace(&self.state.workspace),
+                    "mcpServers": self.state.mcp_servers.lock().await.clone()
+                }),
+            )
+            .await?;
+        let external_session_id = session
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                HarnessError::External("ACP session/new response omitted sessionId".into())
+            })?
+            .to_owned();
+        *self.state.external_session_id.lock().await = external_session_id.clone();
+        *self.state.auth_required.lock().await = false;
+        self.state
+            .recorder
+            .set_external_session_id(Some(&external_session_id))
+            .map_err(|error| HarnessError::External(error.to_string()))
     }
 
     fn new_turn(&self) -> (String, Arc<AcpTurn>, TurnHandle) {
@@ -256,6 +341,12 @@ where
     }
 
     async fn start_turn(&self, input: HarnessTurnInput) -> Result<TurnHandle, HarnessError> {
+        if *self.state.auth_required.lock().await {
+            return Err(HarnessError::AcpAuthenticationRequired(
+                serde_json::to_string(&self.advertised_auth_methods().await)
+                    .unwrap_or_else(|_| "[]".into()),
+            ));
+        }
         let (turn_id, turn, handle) = self.new_turn();
         self.state.turns.lock().await.insert(turn_id.clone(), turn);
         *self.state.active_turn.lock().await = Some(turn_id);
@@ -488,14 +579,26 @@ where
                 *state.active_turn.lock().await = None;
                 if let Some(turn) = turn {
                     match result {
-                        Ok(_) => {
+                        Ok(result) => {
+                            let stop_reason = result
+                                .get("stopReason")
+                                .and_then(Value::as_str)
+                                .unwrap_or("end_turn");
+                            if stop_reason == "cancelled" {
+                                if let Some(sender) = turn.sender.lock().await.take() {
+                                    let _ = sender.send(Err(HarnessError::Engine(
+                                        crate::EngineError::Interrupted,
+                                    )));
+                                }
+                                return Ok(());
+                            }
                             let assistant = opcos_provider::AssistantTurn {
                                 text: Some(turn.text.lock().await.clone())
                                     .filter(|text| !text.is_empty()),
                                 reasoning: Some(turn.reasoning.lock().await.clone())
                                     .filter(|text| !text.is_empty()),
                                 tool_calls: Vec::new(),
-                                finish_reason: Some("stop".into()),
+                                finish_reason: Some(map_stop_reason(stop_reason).into()),
                                 extras: json!({"harness": "acp"}),
                                 usage: None,
                             };
@@ -586,6 +689,16 @@ where
                     .await;
             }
         }
+        "user_message_chunk" => {
+            if let Some(text) = content_text(update.get("content")) {
+                let _ = state
+                    .events
+                    .send(HarnessEvent::AssistantTextDelta {
+                        text: format!("[user] {text}"),
+                    })
+                    .await;
+            }
+        }
         "tool_call" | "tool_call_update" => {
             let _ = state
                 .events
@@ -598,7 +711,26 @@ where
                         .get("title")
                         .and_then(Value::as_str)
                         .map(str::to_owned),
-                    arguments_fragment: update.get("rawInput").map(Value::to_string),
+                    arguments_fragment: Some(
+                        json!({
+                            "rawInput": update.get("rawInput"),
+                            "status": update.get("status"),
+                            "kind": update.get("kind"),
+                            "locations": update.get("locations"),
+                            "content": update.get("content"),
+                        })
+                        .to_string(),
+                    ),
+                })
+                .await;
+        }
+        "plan" | "plan_update" => {
+            let _ = state
+                .events
+                .send(HarnessEvent::ToolCallDelta {
+                    call_id: Some("acp-plan".into()),
+                    tool: Some("plan_update".into()),
+                    arguments_fragment: Some(update.to_string()),
                 })
                 .await;
         }
@@ -622,16 +754,31 @@ where
                 .get("path")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            if params.get("line").is_some() || params.get("limit").is_some() {
-                return state
-                    .error(
-                        id,
-                        "ACP fs/read_text_file line/limit slicing is not supported",
-                    )
-                    .await;
-            }
             match state.host.read(path).await {
-                Ok(file) => state.respond(id, json!({"content": file.content})).await,
+                Ok(file) => {
+                    let line = params
+                        .get("line")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(1);
+                    if line == 0 {
+                        return state.error(id, "ACP line must be 1-based").await;
+                    }
+                    let limit = params.get("limit").and_then(Value::as_u64);
+                    let lines = file.content.lines().collect::<Vec<_>>();
+                    let start = (line - 1) as usize;
+                    if start > lines.len() {
+                        return state.respond(id, json!({"content": ""})).await;
+                    }
+                    let end = limit
+                        .map(|limit| start.saturating_add(limit as usize))
+                        .unwrap_or(lines.len())
+                        .min(lines.len());
+                    let mut content = lines[start..end].join("\n");
+                    if end < lines.len() {
+                        content.push('\n');
+                    }
+                    state.respond(id, json!({"content": content})).await
+                }
                 Err(error) => state.error(id, &error.to_string()).await,
             }
         }
@@ -906,6 +1053,22 @@ fn config_workspace(workspace: &str) -> &str {
     workspace
 }
 
+fn is_authentication_error(error: &HarnessError) -> bool {
+    error.to_string().to_ascii_lowercase().contains("auth")
+}
+
+fn map_stop_reason(reason: &str) -> &'static str {
+    match reason {
+        "max_tokens" => "length",
+        "refusal" => "refusal",
+        "max_turn_requests" => "max_turn_requests",
+        other => match other {
+            "cancelled" => "cancelled",
+            _ => "stop",
+        },
+    }
+}
+
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -1071,7 +1234,7 @@ for line in sys.stdin:
     message = json.loads(line)
     method = message.get("method")
     if method == "initialize":
-        result = {"sessionCapabilities": {"loadSession": True}}
+        result = {"protocolVersion": 1, "sessionCapabilities": {"loadSession": True}}
     elif method == "session/new":
         result = {"sessionId": "external-session"}
     elif method == "session/prompt":
@@ -1130,6 +1293,7 @@ for line in sys.stdin:
                 workspace: root.display().to_string(),
                 command: format!("python3 {}", shell_quote(&script.display().to_string())),
                 env: None,
+                mcp_servers: Vec::new(),
             },
         )
         .await

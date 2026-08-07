@@ -448,6 +448,8 @@ pub enum HarnessError {
     PendingNotFound(String),
     #[error("external harness: {0}")]
     External(String),
+    #[error("ACP authentication required; available methods: {0}")]
+    AcpAuthenticationRequired(String),
 }
 
 #[async_trait]
