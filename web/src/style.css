@@ -758,6 +758,11 @@ h3 {
   color: var(--muted);
   white-space: pre-wrap;
 }
+.transcript-thought-body .artifact-code {
+  margin: 0;
+  padding: 0;
+  color: inherit;
+}
 .transcript-interaction-card {
   flex: none;
   width: 100%;
