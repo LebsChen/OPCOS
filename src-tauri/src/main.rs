@@ -9430,12 +9430,6 @@ async fn engine_for_with_context(
             });
         (provider, base_url)
     };
-    if session_provider.is_none() {
-        state
-            .store
-            .update_session_provider(session_id, Some(&provider_id))
-            .map_err(|error| error.to_string())?;
-    }
     let descriptor = provider_descriptor_for(state, &provider_id)
         .map_err(|_| "provider is not configured; open Provider settings first".to_owned())?;
     let base_url = std::env::var("OPCOS_PROVIDER_BASE_URL")
