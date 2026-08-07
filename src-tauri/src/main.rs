@@ -19779,7 +19779,37 @@ async fn auto_route_project_plan(
                     }
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
-                let _ = coordination_ingest_session_inner(state, worker_session, true).await;
+                let mut result_persisted = false;
+                for _ in 0..30 {
+                    let _ = coordination_ingest_session_inner(state, worker_session, true).await;
+                    result_persisted = {
+                        let connection = state
+                            .database
+                            .lock()
+                            .map_err(|_| "database lock poisoned")?;
+                        connection
+                            .query_row(
+                                "SELECT 1 FROM coord_messages
+                                 WHERE task_id=?1 AND kind='result' AND from_role=?2
+                                 LIMIT 1",
+                                params![task_id, worker.id],
+                                |_| Ok(true),
+                            )
+                            .optional()
+                            .map_err(|error| error.to_string())?
+                            .is_some()
+                    };
+                    if result_persisted {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                if !result_persisted {
+                    return Err(
+                        "Worker result envelope was not persisted after transcript completion"
+                            .to_owned(),
+                    );
+                }
                 coordination_complete_task_inner(state, &task_id, &worker.id, None).await?;
             }
             Err(reason) => {
