@@ -42,7 +42,12 @@ import {
   mergeEvents,
   type TimelineEvent,
 } from "./timeline";
-import { mcpPromptMessagesToDraft, mcpResourceSummary } from "./mcp";
+import {
+  appendMcpPromptDraft,
+  mcpCatalogUpdateTargets,
+  mcpPromptMessagesToDraft,
+  mcpResourceSummary,
+} from "./mcp";
 import { summarizeIterationStats } from "./iterationStats";
 import { Sidebar } from "./components/Sidebar";
 import { sessionStatusLabel } from "./sessionStatus";
@@ -7148,6 +7153,55 @@ function McpManage({
       .then(setContextResources)
       .catch(onError);
   }, [onError, selected?.id]);
+  useEffect(() => {
+    let active = true;
+    if (
+      !(window as Window & { __TAURI_INTERNALS__?: unknown })
+        .__TAURI_INTERNALS__
+    ) {
+      return () => {
+        active = false;
+      };
+    }
+    const subscription = listen<{
+      server_id?: string;
+      version_id?: string;
+      method?: string;
+    }>("mcp-catalog-updated", (event) => {
+      if (!active || !event.payload.server_id) return;
+      void command<Array<Record<string, unknown>>>("list_mcp_servers")
+        .then((nextServers) => {
+          if (active) setServers(nextServers);
+        })
+        .catch(onError);
+      if (
+        mcpCatalogUpdateTargets(event.payload, selectedServerId) &&
+        event.payload.version_id
+      ) {
+        void Promise.all([
+          command<Array<Record<string, unknown>>>("mcp_resources", {
+            serverId: event.payload.server_id,
+            versionId: event.payload.version_id,
+          }),
+          command<Array<Record<string, unknown>>>("mcp_prompts", {
+            serverId: event.payload.server_id,
+            versionId: event.payload.version_id,
+          }),
+        ])
+          .then(([nextResources, nextPrompts]) => {
+            if (!active) return;
+            setResources(nextResources);
+            setPrompts(nextPrompts);
+            setResourcePreview([]);
+          })
+          .catch(onError);
+      }
+    });
+    return () => {
+      active = false;
+      void subscription.then((unsubscribe) => unsubscribe());
+    };
+  }, [onError, selectedServerId]);
   const selectedServer = servers.find(
     (server) => String(server.id) === selectedServerId,
   );
@@ -7211,7 +7265,14 @@ function McpManage({
                           ? "neutral"
                           : "success",
                     }}
-                    description={`${String(server.transport || "remote")} · ${String(server.url || "configured")}`}
+                    description={
+                      <>
+                        {`${String(server.transport || "remote")} · ${String(server.url || "configured")}`}
+                        {server.last_error
+                          ? ` · ${String(server.last_error)}`
+                          : ""}
+                      </>
+                    }
                     actions={
                       <div className="inline-actions">
                         {String(server.status || "").toLowerCase() ===
@@ -11058,6 +11119,13 @@ function AppContent() {
     setSurface("session");
     setHomeInput("");
   };
+  const openPromptDraftHome = (draft: string) => {
+    setSelected(null);
+    setTranscript([]);
+    setRunning(false);
+    setSurface("session");
+    setHomeInput((current) => appendMcpPromptDraft(current, draft));
+  };
   const submitHome = async () => {
     const text = homeInput.trim();
     if (!text || !homeHostId || running) return;
@@ -11477,11 +11545,7 @@ function AppContent() {
               onEditHost={editHost}
               onTestHost={testHost}
               onDeleteHost={deleteHost}
-              onPromptDraft={(draft) =>
-                setHomeInput((current) =>
-                  current ? `${current}\n\n${draft}` : draft,
-                )
-              }
+              onPromptDraft={openPromptDraftHome}
               hostName={hostName}
               setHostName={setHostName}
               hostUrl={hostUrl}

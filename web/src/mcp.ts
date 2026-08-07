@@ -14,6 +14,17 @@ export function mcpPromptMessagesToDraft(messages: unknown[]): string {
     .join("\n\n");
 }
 
+export function appendMcpPromptDraft(current: string, draft: string): string {
+  return current ? `${current}\n\n${draft}` : draft;
+}
+
+export function mcpCatalogUpdateTargets(
+  payload: { server_id?: string },
+  serverId: string,
+): boolean {
+  return Boolean(payload.server_id && payload.server_id === serverId);
+}
+
 export function mcpResourceSummary(resource: Record<string, unknown>): string {
   return `${String(resource.uri || "")} · ${String(resource.mime_type || "unknown")}`;
 }

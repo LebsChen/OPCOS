@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { mcpPromptMessagesToDraft, mcpResourceSummary } from "./mcp";
+import {
+  appendMcpPromptDraft,
+  mcpCatalogUpdateTargets,
+  mcpPromptMessagesToDraft,
+  mcpResourceSummary,
+} from "./mcp";
 
 describe("MCP resources and prompts", () => {
   it("converts prompt messages into an editable draft", () => {
@@ -20,5 +25,22 @@ describe("MCP resources and prompts", () => {
         text: "private content",
       }),
     ).toBe("file:///workspace/readme.md · text/markdown");
+  });
+
+  it("keeps a loaded prompt as non-empty composer draft", () => {
+    expect(appendMcpPromptDraft("", "Draft from MCP")).toBe("Draft from MCP");
+    expect(appendMcpPromptDraft("Existing", "Draft from MCP")).toBe(
+      "Existing\n\nDraft from MCP",
+    );
+  });
+
+  it("targets catalog refreshes to the changed server", () => {
+    expect(mcpCatalogUpdateTargets({ server_id: "server-a" }, "server-a")).toBe(
+      true,
+    );
+    expect(mcpCatalogUpdateTargets({ server_id: "server-a" }, "server-b")).toBe(
+      false,
+    );
+    expect(mcpCatalogUpdateTargets({}, "server-a")).toBe(false);
   });
 });

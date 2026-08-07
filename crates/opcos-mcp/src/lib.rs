@@ -333,6 +333,16 @@ pub enum McpClientError {
     Disconnected,
     #[error("MCP server configuration is invalid")]
     InvalidConfig,
+    #[error("MCP OAuth metadata discovery failed")]
+    OAuthDiscoveryFailed,
+    #[error(
+        "MCP OAuth requires a configured oauth_client_id because dynamic client registration is unavailable"
+    )]
+    OAuthDynamicRegistrationRequired,
+    #[error("MCP OAuth dynamic client registration failed")]
+    OAuthDynamicRegistrationFailed,
+    #[error("MCP OAuth configuration is invalid")]
+    OAuthConfigurationInvalid,
 }
 
 #[async_trait]
@@ -1780,16 +1790,19 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
         version_id: &str,
         resource_url: &str,
     ) -> Result<String, McpClientError> {
-        let resource = Url::parse(resource_url).map_err(|_| McpClientError::InvalidConfig)?;
+        let resource =
+            Url::parse(resource_url).map_err(|_| McpClientError::OAuthConfigurationInvalid)?;
         let loopback = matches!(resource.host_str(), Some("127.0.0.1" | "localhost"));
         if resource.scheme() != "https" && !(resource.scheme() == "http" && loopback) {
-            return Err(McpClientError::InvalidConfig);
+            return Err(McpClientError::OAuthConfigurationInvalid);
         }
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| McpClientError::InvalidConfig)?;
-        let (protected, metadata) = discover_oauth_metadata(&client, &resource, None).await?;
+        let (protected, metadata) = discover_oauth_metadata(&client, &resource, None)
+            .await
+            .map_err(|_| McpClientError::OAuthDiscoveryFailed)?;
         let canonical_resource = protected
             .resource
             .clone()
@@ -1800,11 +1813,11 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
                 .iter()
                 .any(|method| method.eq_ignore_ascii_case("S256"))
         {
-            return Err(McpClientError::InvalidConfig);
+            return Err(McpClientError::OAuthConfigurationInvalid);
         }
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
-            .map_err(|_| McpClientError::Transport)?;
+            .map_err(|_| McpClientError::OAuthConfigurationInvalid)?;
         let port = listener
             .local_addr()
             .map_err(|_| McpClientError::Transport)?
@@ -1837,21 +1850,21 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
                 }))
                 .send()
                 .await
-                .map_err(|_| McpClientError::Disconnected)?;
+                .map_err(|_| McpClientError::OAuthDynamicRegistrationFailed)?;
             if !response.status().is_success() {
-                return Err(McpClientError::Transport);
+                return Err(McpClientError::OAuthDynamicRegistrationFailed);
             }
             let value = response
                 .json::<Value>()
                 .await
-                .map_err(|_| McpClientError::InvalidResponse)?;
+                .map_err(|_| McpClientError::OAuthDynamicRegistrationFailed)?;
             value
                 .get("client_id")
                 .and_then(Value::as_str)
                 .map(str::to_owned)
-                .ok_or(McpClientError::InvalidResponse)?
+                .ok_or(McpClientError::OAuthDynamicRegistrationFailed)?
         } else {
-            return Err(McpClientError::InvalidConfig);
+            return Err(McpClientError::OAuthDynamicRegistrationRequired);
         };
         let mut persisted = existing.unwrap_or_default();
         persisted.insert("client_id".to_owned(), client_id.clone());
@@ -1859,7 +1872,7 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
         let (verifier, challenge) = pkce_verifier_and_challenge();
         let state = oauth_state();
         let mut authorization = Url::parse(&metadata.authorization_endpoint)
-            .map_err(|_| McpClientError::InvalidConfig)?;
+            .map_err(|_| McpClientError::OAuthConfigurationInvalid)?;
         authorization
             .query_pairs_mut()
             .append_pair("response_type", "code")
@@ -1921,6 +1934,12 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
         *self.notification_sink.lock().await = Some(sink);
     }
 
+    pub async fn record_error(&self, object_id: &str, error: &McpClientError) {
+        if let Some(snapshot) = self.statuses.lock().await.get_mut(object_id) {
+            snapshot.last_error = Some(error.to_string());
+        }
+    }
+
     pub async fn connect(
         self: &Arc<Self>,
         config: &McpServerConfig,
@@ -1967,6 +1986,12 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             .get(&config.object_id)
             .is_some_and(|active| active == version_id)
             && self.clients.lock().await.contains_key(&config.object_id)
+            && self
+                .statuses
+                .lock()
+                .await
+                .get(&config.object_id)
+                .is_some_and(|snapshot| snapshot.status == McpServerStatus::Connected)
             && let Some(catalog) = self.cached_catalog(&config.object_id, version_id).await
         {
             return Ok(catalog.tools);
@@ -2251,7 +2276,7 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
     }
 
     pub async fn call(
-        &self,
+        self: &Arc<Self>,
         object_id: &str,
         original_name: &str,
         arguments: Value,
@@ -2263,7 +2288,7 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             .get(object_id)
             .is_some_and(|snapshot| snapshot.status == McpServerStatus::Connected);
         if !connected {
-            return Err(McpClientError::Disconnected);
+            self.reconnect_server(object_id).await?;
         }
         let client = self
             .clients
@@ -2272,20 +2297,62 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             .get(object_id)
             .cloned()
             .ok_or(McpClientError::Disconnected)?;
-        let mut client = client.lock().await;
-        let result = client.call_tool(original_name, arguments).await;
-        drop(client);
-        if result.is_err()
-            && let Some(snapshot) = self.statuses.lock().await.get_mut(object_id)
-        {
-            snapshot.status = McpServerStatus::Disconnected;
-            snapshot.last_error = Some("MCP transport disconnected".into());
+        let mut client_guard = client.lock().await;
+        let result = client_guard
+            .call_tool(original_name, arguments.clone())
+            .await;
+        drop(client_guard);
+        if let Err(error) = result {
+            if let Some(snapshot) = self.statuses.lock().await.get_mut(object_id) {
+                snapshot.status = if matches!(error, McpClientError::AuthRequired) {
+                    McpServerStatus::AuthRequired
+                } else {
+                    McpServerStatus::Disconnected
+                };
+                snapshot.last_error = Some(error.to_string());
+            }
+            if !matches!(
+                error,
+                McpClientError::Disconnected | McpClientError::Transport
+            ) {
+                return Err(error);
+            }
+            self.reconnect_server(object_id).await?;
+            let client = self
+                .clients
+                .lock()
+                .await
+                .get(object_id)
+                .cloned()
+                .ok_or(McpClientError::Disconnected)?;
+            let mut client_guard = client.lock().await;
+            return client_guard.call_tool(original_name, arguments).await;
         }
         result
     }
 
+    async fn reconnect_server(self: &Arc<Self>, object_id: &str) -> Result<(), McpClientError> {
+        let version_id = self
+            .active_versions
+            .lock()
+            .await
+            .get(object_id)
+            .cloned()
+            .ok_or(McpClientError::Disconnected)?;
+        let config = self
+            .configs
+            .lock()
+            .await
+            .get(&(object_id.to_owned(), version_id.clone()))
+            .cloned()
+            .ok_or(McpClientError::Disconnected)?;
+        self.connect_with_retry(&config, &version_id, 1)
+            .await
+            .map(|_| ())
+    }
+
     pub async fn call_qualified(
-        &self,
+        self: &Arc<Self>,
         qualified_name: &str,
         arguments: Value,
     ) -> Result<McpToolResult, McpClientError> {
@@ -3187,6 +3254,29 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn session_tool_reconnect_failure_is_explicit() {
+        let manager = Arc::new(McpManager::new(Arc::new(NoCredentials)));
+        manager.statuses.lock().await.insert(
+            "missing-session".into(),
+            McpServerSnapshot {
+                object_id: "missing-session".into(),
+                name: "Missing".into(),
+                status: McpServerStatus::Disconnected,
+                last_error: None,
+                retry_attempt: 0,
+                tool_count: 0,
+                resource_count: 0,
+                prompt_count: 0,
+                capabilities: McpServerCapabilities::default(),
+            },
+        );
+        assert!(matches!(
+            manager.call("missing-session", "echo", json!({})).await,
+            Err(McpClientError::Disconnected)
+        ));
+    }
+
     #[test]
     fn http_sse_parser_handles_split_frames_and_keepalives() {
         let mut parser = SseParser::default();
@@ -3271,6 +3361,27 @@ mod tests {
         let state = oauth_state();
         assert!(!state.is_empty());
         assert_ne!(state, oauth_state());
+    }
+
+    #[test]
+    fn oauth_authorization_failures_are_actionable_without_credentials() {
+        assert_eq!(
+            McpClientError::OAuthDynamicRegistrationRequired.to_string(),
+            "MCP OAuth requires a configured oauth_client_id because dynamic client registration is unavailable"
+        );
+        assert_eq!(
+            McpClientError::OAuthConfigurationInvalid.to_string(),
+            "MCP OAuth configuration is invalid"
+        );
+        assert_eq!(
+            McpClientError::OAuthDiscoveryFailed.to_string(),
+            "MCP OAuth metadata discovery failed"
+        );
+        assert!(
+            !McpClientError::OAuthDynamicRegistrationFailed
+                .to_string()
+                .contains("token")
+        );
     }
 
     #[test]

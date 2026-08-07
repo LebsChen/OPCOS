@@ -16502,11 +16502,17 @@ async fn mcp_authorize(
     version_id: String,
     resource_url: String,
 ) -> Result<String, String> {
-    let url = state
+    let url = match state
         .mcp
         .begin_oauth(&server_id, &version_id, &resource_url)
         .await
-        .map_err(|error| error.to_string())?;
+    {
+        Ok(url) => url,
+        Err(error) => {
+            state.mcp.record_error(&server_id, &error).await;
+            return Err(error.to_string());
+        }
+    };
     app.opener()
         .open_url(url.clone(), None::<&str>)
         .map_err(|_| "could not open the system browser")?;
