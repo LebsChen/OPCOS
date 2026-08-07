@@ -19738,6 +19738,7 @@ async fn auto_route_project_plan(
                     .submit_text(message)
                     .await
                     .map_err(|error| error.to_string())?;
+                let _ = coordination_ingest_session_inner(state, worker_session, false).await;
             }
             Err(reason) => {
                 return Err(format!(
