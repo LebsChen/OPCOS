@@ -803,6 +803,7 @@ function ProjectDialog({
     repoUrl: string;
     repoRoot: string;
     defaultBranch: string;
+    teamTemplateId: string;
   }) => Promise<void>;
 }) {
   const [name, setName] = useState("");
@@ -812,6 +813,26 @@ function ProjectDialog({
   const [defaultBranch, setDefaultBranch] = useState("main");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [teamTemplates, setTeamTemplates] = useState<LibraryEntry[]>([]);
+  const [teamTemplateId, setTeamTemplateId] = useState("");
+  useEffect(() => {
+    void command<LibraryEntry[]>("list_configured_library", {
+      kind: "team-template",
+    }).then(setTeamTemplates);
+  }, []);
+  const selectedTeam = teamTemplates.find((item) => item.id === teamTemplateId);
+  const selectedTeamContent = selectedTeam
+    ? (() => {
+        try {
+          return JSON.parse(selectedTeam.content) as {
+            agents?: Array<{ name?: string; role?: string }>;
+            workflow?: unknown;
+          };
+        } catch {
+          return null;
+        }
+      })()
+    : null;
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!name.trim() || !hostId) {
@@ -827,6 +848,7 @@ function ProjectDialog({
         repoUrl: repoUrl.trim(),
         repoRoot: repoRoot.trim(),
         defaultBranch: defaultBranch.trim() || "main",
+        teamTemplateId,
       });
     } catch (reason) {
       setError(errorMessage(reason));
@@ -897,6 +919,38 @@ function ProjectDialog({
                 onChange={(event) => setDefaultBranch(event.target.value)}
               />
             </label>
+            <label className="field-label">
+              从 Team 模板创建（可选）
+              <select
+                className="input"
+                value={teamTemplateId}
+                onChange={(event) => setTeamTemplateId(event.target.value)}
+              >
+                <option value="">不使用 Team 模板</option>
+                {teamTemplates.map((template) => (
+                  <option key={template.id} value={template.id}>
+                    {template.name} ·{" "}
+                    {template.status === "builtin" ? "内置" : "自定义"}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {selectedTeamContent && (
+              <div className="rounded-lg border border-line p-3 text-sm">
+                <strong>将创建的成员</strong>
+                <div className="mt-1">
+                  {(selectedTeamContent.agents || [])
+                    .map(
+                      (agent) =>
+                        `${agent.name || "成员"}（${agent.role || "Worker"}）`,
+                    )
+                    .join("、")}
+                </div>
+                <small className="text-muted">
+                  Workflow：{JSON.stringify(selectedTeamContent.workflow)}
+                </small>
+              </div>
+            )}
           </div>
         </div>
         {error && <p className="mt-3 text-sm text-danger">{error}</p>}
@@ -11505,13 +11559,22 @@ function AppContent() {
           hosts={hosts}
           onClose={() => setProjectDialogOpen(false)}
           onSubmit={async (values) => {
-            const project = await command<Project>("create_project", {
-              name: values.name,
-              hostId: values.hostId,
-              repoUrl: values.repoUrl || null,
-              repoRoot: values.repoRoot || null,
-              defaultBranch: values.defaultBranch,
-            });
+            const project = values.teamTemplateId
+              ? await command<Project>("create_project_from_team_template", {
+                  teamTemplateId: values.teamTemplateId,
+                  name: values.name,
+                  hostId: values.hostId,
+                  repoUrl: values.repoUrl || null,
+                  repoRoot: values.repoRoot || null,
+                  defaultBranch: values.defaultBranch,
+                })
+              : await command<Project>("create_project", {
+                  name: values.name,
+                  hostId: values.hostId,
+                  repoUrl: values.repoUrl || null,
+                  repoRoot: values.repoRoot || null,
+                  defaultBranch: values.defaultBranch,
+                });
             await refresh();
             setSelectedProject(project);
             setProjectDialogOpen(false);
