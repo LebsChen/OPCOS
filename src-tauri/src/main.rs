@@ -20017,11 +20017,12 @@ async fn execute_coordination_tool(
         let messages = statement
             .query_map(params![task_id, limit as i64], |row| {
                 let payload: String = row.get(4)?;
+                let kind: String = row.get(3)?;
                 Ok(json!({
                     "msg_id": row.get::<_, String>(0)?,
                     "from": row.get::<_, String>(1)?,
                     "to": row.get::<_, String>(2)?,
-                    "kind": row.get::<_, String>(3)?,
+                    "kind": normalize_coordination_kind(&kind),
                     "payload": serde_json::from_str::<Value>(&payload).unwrap_or(Value::Null),
                     "created_at": row.get::<_, String>(5)?
                 }))
@@ -20127,7 +20128,10 @@ async fn persist_coord_message(
                     envelope.msg_id,
                     envelope.from,
                     envelope.to,
-                    serde_json::to_string(&envelope.kind).map_err(|error| error.to_string())?,
+                    serde_json::to_value(&envelope.kind)
+                        .map_err(|error| error.to_string())?
+                        .as_str()
+                        .ok_or_else(|| "invalid coordination envelope kind".to_owned())?,
                     envelope.reply_to,
                     envelope.payload.to_string(),
                     Utc::now().to_rfc3339(),
@@ -20139,6 +20143,10 @@ async fn persist_coord_message(
         coordination_complete_task_inner(state, task_id, &envelope.from, None).await?;
     }
     Ok(())
+}
+
+fn normalize_coordination_kind(kind: &str) -> &str {
+    kind.trim_matches('"')
 }
 
 fn load_persisted_coord_messages(
@@ -20154,6 +20162,7 @@ fn load_persisted_coord_messages(
     let rows = statement
         .query_map([task_id], |row| {
             let kind: String = row.get(3)?;
+            let kind = normalize_coordination_kind(&kind);
             let payload: String = row.get(6)?;
             let created_at: String = row.get(7)?;
             Ok((
@@ -20367,12 +20376,13 @@ fn load_project_messages(connection: &Connection, project_id: &str) -> Result<Ve
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map([project_id], |row| {
+            let kind: String = row.get(4)?;
             Ok(json!({
                 "task_id": row.get::<_, String>(0)?,
                 "msg_id": row.get::<_, String>(1)?,
                 "from": row.get::<_, String>(2)?,
                 "to": row.get::<_, String>(3)?,
-                "kind": row.get::<_, String>(4)?,
+                "kind": normalize_coordination_kind(&kind),
                 "reply_to": row.get::<_, Option<String>>(5)?,
                 "payload": serde_json::from_str::<Value>(&row.get::<_, String>(6)?).unwrap_or(Value::Null),
                 "created_at": row.get::<_, String>(7)?
@@ -20887,9 +20897,9 @@ async fn verify_task_delivery(
                 .map_err(|_| "database lock poisoned")?;
             connection
                 .query_row(
-                    "SELECT 1 FROM coord_messages
-                     WHERE task_id=?1 AND kind='result' AND from_role=?2
-                     LIMIT 1",
+                    r#"SELECT 1 FROM coord_messages
+                     WHERE task_id=?1 AND kind IN ('result','"result"') AND from_role=?2
+                     LIMIT 1"#,
                     params![task.id.as_str(), worker.id.as_str()],
                     |_| Ok(true),
                 )
