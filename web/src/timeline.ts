@@ -48,6 +48,8 @@ export type TimelineNode =
       startedAt?: number;
       rows: Array<{
         label: string;
+        additions?: number;
+        deletions?: number;
         detail?: string;
         thoughtForCallId?: string;
         activityLabel?: boolean;
@@ -687,8 +689,10 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
             callId: typeof data.call_id === "string" ? data.call_id : undefined,
             label:
               item.action_type === "create"
-                ? `Created ${basename} +${added}`
-                : `Edited ${basename} +${added} −${removed}`,
+                ? `Created ${basename}`
+                : `Edited ${basename}`,
+            additions: added,
+            deletions: removed,
             isMajorAction: true,
             artifactId:
               typeof item.artifact_id === "string"

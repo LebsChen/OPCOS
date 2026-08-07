@@ -479,8 +479,18 @@ describe("single event-log timeline", () => {
     const work = nodes.filter((node) => node.kind === "work");
     const rows = work.flatMap((node) => node.rows.map((row) => row.label));
     expect(rows.some((label) => /^Thought for \d+s$/.test(label))).toBe(true);
-    expect(rows).toContain("Edited alpha.txt +1 −0");
-    expect(rows).toContain("Created notes.md +33");
+    expect(rows).toContain("Edited alpha.txt");
+    expect(rows).toContain("Created notes.md");
+    expect(
+      work
+        .flatMap((node) => node.rows)
+        .find((row) => row.label === "Edited alpha.txt"),
+    ).toMatchObject({ additions: 1, deletions: 0 });
+    expect(
+      work
+        .flatMap((node) => node.rows)
+        .find((row) => row.label === "Created notes.md"),
+    ).toMatchObject({ additions: 33, deletions: 0 });
     expect(rows).toContain("Wrote <temp-workspace>/notes.md");
     expect(rows).toContain("Edited <temp-workspace>/alpha.txt");
     const failedRead = work
@@ -518,8 +528,8 @@ describe("single event-log timeline", () => {
     expect(work?.rows.map((row) => row.label)).toEqual([
       "Thought for 5s",
       "cargo test",
-      "Created notes.md +4",
-      "Edited lib.rs +2 −1",
+      "Created notes.md",
+      "Edited lib.rs",
       "Created 4 Tasks",
       "1/4 #1 Implement the change",
       "Earlier context compacted",
@@ -813,7 +823,9 @@ describe("single event-log timeline", () => {
     expect(rows).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          label: "Edited lib.rs +2 −1",
+          label: "Edited lib.rs",
+          additions: 2,
+          deletions: 1,
           artifactId: "artifact-diff",
           artifactKind: "diff",
         }),

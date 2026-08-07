@@ -37,6 +37,32 @@ function formatDuration(durationMs: number): string {
   return `${Number(seconds.toFixed(seconds < 10 ? 1 : 0))}s`;
 }
 
+function TranscriptRowLabel({
+  label,
+  additions,
+  deletions,
+}: {
+  label: string;
+  additions?: number;
+  deletions?: number;
+}) {
+  return (
+    <>
+      <span>{label}</span>
+      {(additions !== undefined || deletions !== undefined) && (
+        <span className="transcript-diff-badges">
+          {additions !== undefined && (
+            <span className="transcript-additions">+{additions}</span>
+          )}
+          {deletions !== undefined && (
+            <span className="transcript-deletions">−{deletions}</span>
+          )}
+        </span>
+      )}
+    </>
+  );
+}
+
 function BubbleMeta({ text, ts }: { text: string; ts?: number }) {
   const [copied, setCopied] = useState(false);
   const copy = () => {
@@ -366,12 +392,16 @@ function TerminalOutput({
 
 function ArtifactRow({
   label,
+  additions,
+  deletions,
   sessionId,
   artifactId,
   kind,
   mime,
 }: {
   label: string;
+  additions?: number;
+  deletions?: number;
   sessionId: string;
   artifactId: string;
   kind?: string;
@@ -425,6 +455,13 @@ function ArtifactRow({
     <>
       <TranscriptDisclosure
         label={label}
+        summaryContent={
+          <TranscriptRowLabel
+            label={label}
+            additions={additions}
+            deletions={deletions}
+          />
+        }
         className="transcript-artifact"
         onToggle={(open) => {
           if (open) load();
@@ -571,7 +608,13 @@ export function Transcript({
           );
           const terminalSummary = hasTerminalOutput ? (
             <>
-              <span className="transcript-row-label">{row.label}</span>
+              <span className="transcript-row-label">
+                <TranscriptRowLabel
+                  label={row.label}
+                  additions={row.additions}
+                  deletions={row.deletions}
+                />
+              </span>
               {row.shellId && (
                 <span className="transcript-row-meta">{row.shellId}</span>
               )}
@@ -604,7 +647,13 @@ export function Transcript({
               key={rowIndex}
             >
               {!isThoughtRow && !row.artifactId && !hasTerminalOutput && (
-                <span className="transcript-row-label">{row.label}</span>
+                <span className="transcript-row-label">
+                  <TranscriptRowLabel
+                    label={row.label}
+                    additions={row.additions}
+                    deletions={row.deletions}
+                  />
+                </span>
               )}
               {row.shellId && !hasTerminalOutput && (
                 <span className="transcript-row-meta">{row.shellId}</span>
