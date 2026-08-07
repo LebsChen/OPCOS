@@ -695,6 +695,8 @@ export function Transcript({
               {row.artifactId && (
                 <ArtifactRow
                   label={row.label}
+                  additions={row.additions}
+                  deletions={row.deletions}
                   sessionId={sessionId}
                   artifactId={row.artifactId}
                   kind={row.artifactKind}

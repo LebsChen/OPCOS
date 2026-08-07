@@ -485,12 +485,12 @@ describe("single event-log timeline", () => {
       work
         .flatMap((node) => node.rows)
         .find((row) => row.label === "Edited alpha.txt"),
-    ).toMatchObject({ additions: 1, deletions: 0 });
+    ).toMatchObject({ additions: 1, deletions: undefined });
     expect(
       work
         .flatMap((node) => node.rows)
         .find((row) => row.label === "Created notes.md"),
-    ).toMatchObject({ additions: 33, deletions: 0 });
+    ).toMatchObject({ additions: 33, deletions: undefined });
     expect(rows).toContain("Wrote <temp-workspace>/notes.md");
     expect(rows).toContain("Edited <temp-workspace>/alpha.txt");
     const failedRead = work
@@ -608,6 +608,97 @@ describe("single event-log timeline", () => {
         terminalTruncated: undefined,
         terminalTotalBytes: undefined,
       }),
+    );
+  });
+  it("keeps file change counts on file update rows", () => {
+    const rows = buildTimeline([
+      {
+        type: "write_file_started",
+        event_id: "write-started",
+        created_at_ms: 1,
+        working_event: {
+          event_type: "write_file_started",
+          payload: {
+            call_id: "write-call",
+            tool: "write_file",
+            arguments: { path: "src/new.ts" },
+          },
+        },
+      },
+      {
+        type: "multi_edit_result",
+        event_id: "write-update",
+        created_at_ms: 2,
+        working_event: {
+          event_type: "multi_edit_result",
+          payload: {
+            call_id: "write-call",
+            file_updates: [
+              {
+                file_path: "src/new.ts",
+                action_type: "create",
+                lines_added: 4,
+                lines_removed: 0,
+              },
+            ],
+          },
+        },
+      },
+      {
+        type: "edit_file_started",
+        event_id: "edit-started",
+        created_at_ms: 3,
+        working_event: {
+          event_type: "edit_file_started",
+          payload: {
+            call_id: "edit-call",
+            tool: "edit_file",
+            arguments: { path: "src/existing.ts" },
+          },
+        },
+      },
+      {
+        type: "multi_edit_result",
+        event_id: "edit-update",
+        created_at_ms: 4,
+        working_event: {
+          event_type: "multi_edit_result",
+          payload: {
+            call_id: "edit-call",
+            file_updates: [
+              {
+                file_path: "src/existing.ts",
+                action_type: "edit",
+                lines_added: 2,
+                lines_removed: 1,
+              },
+            ],
+          },
+        },
+      },
+    ] as TimelineEvent[])
+      .filter((node) => node.kind === "work")
+      .flatMap((node) => node.rows);
+
+    expect(rows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          label: "Wrote src/new.ts",
+        }),
+        expect.objectContaining({
+          label: "Edited src/existing.ts",
+        }),
+        expect.objectContaining({
+          label: "Created new.ts",
+          additions: 4,
+          deletions: undefined,
+        }),
+        expect.objectContaining({
+          label: "Edited existing.ts",
+          additions: 2,
+          deletions: 1,
+        }),
+      ]),
     );
   });
   it("renders terminal chunks that arrive before a shell row without a sequence field", () => {
