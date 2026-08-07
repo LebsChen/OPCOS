@@ -2171,6 +2171,9 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
                             capabilities: McpServerCapabilities::default(),
                         },
                     );
+                    if matches!(error, McpClientError::AuthRequired) {
+                        return Err(error);
+                    }
                     if attempt >= max_attempts {
                         self.statuses.lock().await.insert(
                             config.object_id.clone(),
@@ -3134,6 +3137,54 @@ mod tests {
         assert!(manager.cached_tools("server-a", "v1").await.is_some());
         assert!(manager.cached_tools("server-a", "v2").await.is_none());
         assert!(manager.cached_tools("server-b", "v1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn auth_required_remains_terminal_after_connect_attempt() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let manager = Arc::new(McpManager::new(Arc::new(NoCredentials)));
+        let config = McpServerConfig {
+            object_id: "auth-required".into(),
+            server_key: "auth-required".into(),
+            name: "Auth required".into(),
+            transport: McpTransport::StreamableHttp,
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            url: Some(format!("http://{address}/mcp")),
+            headers: HashMap::new(),
+            enabled: true,
+            include_tools: None,
+            exclude_tools: None,
+            requires_approval: true,
+            auth: None,
+            oauth_client_id: None,
+        };
+        assert!(matches!(
+            manager.connect_with_retry(&config, "v1", 2).await,
+            Err(McpClientError::AuthRequired)
+        ));
+        let snapshot = manager.statuses.lock().await.get("auth-required").cloned();
+        assert_eq!(
+            snapshot.as_ref().map(|snapshot| &snapshot.status),
+            Some(&McpServerStatus::AuthRequired)
+        );
+        server.await.unwrap();
     }
 
     #[test]
