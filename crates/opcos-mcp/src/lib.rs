@@ -25,7 +25,7 @@ fn configure_no_window(command: &mut tokio::process::Command) {
 #[cfg(not(windows))]
 fn configure_no_window(_command: &mut tokio::process::Command) {}
 
-pub const PROTOCOL_VERSION: &str = "2024-11-05";
+pub const PROTOCOL_VERSION: &str = "2025-06-18";
 pub const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 pub const MAX_DISCOVERY_PAGES: usize = 128;
 
@@ -283,6 +283,8 @@ pub enum McpClientError {
     Timeout,
     #[error("MCP server returned an invalid response")]
     InvalidResponse,
+    #[error("MCP server does not support this method")]
+    MethodNotFound,
     #[error("MCP server process failed to start")]
     ProcessStart,
     #[error("MCP server process exited")]
@@ -429,6 +431,14 @@ fn next_cursor(value: &Value) -> Result<Option<String>, McpClientError> {
     }
 }
 
+fn map_rpc_error(error: &Value) -> McpClientError {
+    if error.get("code") == Some(&Value::from(-32601)) {
+        McpClientError::MethodNotFound
+    } else {
+        McpClientError::Transport
+    }
+}
+
 struct StdioClient {
     child: Child,
     stdin: ChildStdin,
@@ -520,8 +530,8 @@ impl StdioClient {
             if response.get("id") != Some(&expected_id) {
                 continue;
             }
-            if response.get("error").is_some() {
-                return Err(McpClientError::Transport);
+            if let Some(error) = response.get("error") {
+                return Err(map_rpc_error(error));
             }
             return Ok(response.get("result").cloned().unwrap_or(response));
         }
@@ -820,8 +830,8 @@ impl HttpClient {
         } else {
             serde_json::from_slice(&body).map_err(|_| McpClientError::InvalidResponse)?
         };
-        if value.get("error").is_some() {
-            return Err(McpClientError::Transport);
+        if let Some(error) = value.get("error") {
+            return Err(map_rpc_error(error));
         }
         Ok(value.get("result").cloned().unwrap_or(value))
     }
@@ -965,6 +975,7 @@ pub struct McpManager<S> {
     clients: Mutex<HashMap<String, SharedMcpClient>>,
     catalogs: Mutex<HashMap<(String, String), McpServerCatalog>>,
     subscriptions: Mutex<HashMap<(String, String), std::collections::HashSet<String>>>,
+    updated_resources: Mutex<HashMap<(String, String), std::collections::HashSet<String>>>,
     active_versions: Mutex<HashMap<String, String>>,
     statuses: Mutex<HashMap<String, McpServerSnapshot>>,
     watchers: Mutex<HashMap<String, JoinHandle<()>>>,
@@ -977,6 +988,7 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             clients: Mutex::new(HashMap::new()),
             catalogs: Mutex::new(HashMap::new()),
             subscriptions: Mutex::new(HashMap::new()),
+            updated_resources: Mutex::new(HashMap::new()),
             active_versions: Mutex::new(HashMap::new()),
             statuses: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
@@ -1053,9 +1065,13 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             return Err(error);
         }
         let negotiated = client.negotiated_info();
-        let mut tools = if negotiated.capabilities.tools.is_some() {
+        let capabilities_are_empty = negotiated.capabilities.tools.is_none()
+            && negotiated.capabilities.resources.is_none()
+            && negotiated.capabilities.prompts.is_none();
+        let mut tools = if negotiated.capabilities.tools.is_some() || capabilities_are_empty {
             match client.list_tools().await {
                 Ok(tools) => tools,
+                Err(McpClientError::MethodNotFound) => Vec::new(),
                 Err(error) => {
                     client.close().await;
                     return Err(error);
@@ -1073,18 +1089,40 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             config.include_tools.as_deref(),
             config.exclude_tools.as_deref(),
         );
-        let resources = if negotiated.capabilities.resources.is_some() {
-            client.list_resources().await?
+        let resources_capability = negotiated.capabilities.resources.is_some();
+        let resources = if resources_capability {
+            match client.list_resources().await {
+                Ok(resources) => resources,
+                Err(McpClientError::MethodNotFound) => Vec::new(),
+                Err(error) => {
+                    client.close().await;
+                    return Err(error);
+                }
+            }
         } else {
             Vec::new()
         };
-        let resource_templates = if negotiated.capabilities.resources.is_some() {
-            client.list_resource_templates().await?
+        let resource_templates = if resources_capability {
+            match client.list_resource_templates().await {
+                Ok(templates) => templates,
+                Err(McpClientError::MethodNotFound) => Vec::new(),
+                Err(error) => {
+                    client.close().await;
+                    return Err(error);
+                }
+            }
         } else {
             Vec::new()
         };
         let prompts = if negotiated.capabilities.prompts.is_some() {
-            client.list_prompts().await?
+            match client.list_prompts().await {
+                Ok(prompts) => prompts,
+                Err(McpClientError::MethodNotFound) => Vec::new(),
+                Err(error) => {
+                    client.close().await;
+                    return Err(error);
+                }
+            }
         } else {
             Vec::new()
         };
@@ -1346,16 +1384,24 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
         if !recognized {
             return false;
         }
-        self.invalidate_catalog(object_id, version_id).await;
-        if method == "notifications/resources/updated"
-            && let Some(uri) = resource_uri
-        {
-            self.subscriptions
-                .lock()
-                .await
-                .entry((object_id.to_owned(), version_id.to_owned()))
-                .or_default()
-                .insert(uri.to_owned());
+        if method == "notifications/resources/updated" {
+            if let Some(uri) = resource_uri
+                && self
+                    .subscriptions
+                    .lock()
+                    .await
+                    .get(&(object_id.to_owned(), version_id.to_owned()))
+                    .is_some_and(|uris| uris.contains(uri))
+            {
+                self.updated_resources
+                    .lock()
+                    .await
+                    .entry((object_id.to_owned(), version_id.to_owned()))
+                    .or_default()
+                    .insert(uri.to_owned());
+            }
+        } else {
+            self.invalidate_catalog(object_id, version_id).await;
         }
         true
     }
@@ -1405,11 +1451,28 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
         {
             values.remove(uri);
         }
+        if let Some(values) = self
+            .updated_resources
+            .lock()
+            .await
+            .get_mut(&(object_id.to_owned(), version_id.to_owned()))
+        {
+            values.remove(uri);
+        }
         Ok(())
     }
 
     pub async fn subscriptions(&self, object_id: &str, version_id: &str) -> Vec<String> {
         self.subscriptions
+            .lock()
+            .await
+            .get(&(object_id.to_owned(), version_id.to_owned()))
+            .map(|values| values.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub async fn updated_resources(&self, object_id: &str, version_id: &str) -> Vec<String> {
+        self.updated_resources
             .lock()
             .await
             .get(&(object_id.to_owned(), version_id.to_owned()))
@@ -1430,7 +1493,9 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
         {
             return Ok(false);
         }
-        self.connect_inner(config, version_id).await?;
+        if method != "notifications/resources/updated" {
+            self.connect_inner(config, version_id).await?;
+        }
         Ok(true)
     }
 
@@ -1485,6 +1550,10 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             .lock()
             .await
             .retain(|(server_id, _), _| server_id != object_id);
+        self.updated_resources
+            .lock()
+            .await
+            .retain(|(server_id, _), _| server_id != object_id);
     }
 
     pub async fn shutdown(&self) {
@@ -1505,6 +1574,7 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
         }
         self.catalogs.lock().await.clear();
         self.subscriptions.lock().await.clear();
+        self.updated_resources.lock().await.clear();
     }
 
     async fn start_liveness(self: &Arc<Self>, config: McpServerConfig, version_id: String) {
@@ -1779,6 +1849,31 @@ mod tests {
         }))
         .unwrap();
         assert!(prompt.arguments[0].required);
+        let negotiated: McpNegotiatedInfo = serde_json::from_value(json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"resources": {"listChanged": true}},
+            "serverInfo": {"name": "legacy"},
+            "instructions": "server instructions"
+        }))
+        .unwrap();
+        assert_eq!(negotiated.protocol_version, "2024-11-05");
+        assert!(negotiated.capabilities.resources.is_some());
+        assert_eq!(
+            negotiated.instructions.as_deref(),
+            Some("server instructions")
+        );
+    }
+
+    #[test]
+    fn method_not_found_is_distinguished_from_other_rpc_errors() {
+        assert!(matches!(
+            map_rpc_error(&json!({"code": -32601})),
+            McpClientError::MethodNotFound
+        ));
+        assert!(matches!(
+            map_rpc_error(&json!({"code": -32602})),
+            McpClientError::Transport
+        ));
     }
 
     #[test]
@@ -1846,9 +1941,32 @@ mod tests {
                 )
                 .await
         );
-        assert!(manager.cached_catalog("server-a", "v1").await.is_none());
+        assert!(manager.cached_catalog("server-a", "v1").await.is_some());
+        assert!(manager.subscriptions("server-a", "v1").await.is_empty());
+        assert!(manager.updated_resources("server-a", "v1").await.is_empty());
+        manager
+            .seed_cached_catalog("server-a", "v1", McpServerCatalog::default())
+            .await;
+        manager
+            .subscriptions
+            .lock()
+            .await
+            .entry(("server-a".into(), "v1".into()))
+            .or_default()
+            .insert("file:///a".into());
+        assert!(
+            manager
+                .handle_notification(
+                    "server-a",
+                    "v1",
+                    "notifications/resources/updated",
+                    Some("file:///a")
+                )
+                .await
+        );
+        assert!(manager.cached_catalog("server-a", "v1").await.is_some());
         assert_eq!(
-            manager.subscriptions("server-a", "v1").await,
+            manager.updated_resources("server-a", "v1").await,
             vec!["file:///a".to_owned()]
         );
         assert!(
