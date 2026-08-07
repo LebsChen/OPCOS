@@ -12362,6 +12362,14 @@ pub(crate) async fn submit_turn_inner_with_context(
         Some(&request.session_id),
         json!({"role":"user","text":request.text}),
     );
+    if let Err(error) = auto_route_project_plan(&app, state, &request.session_id).await {
+        audit(
+            state,
+            &request.session_id,
+            "coordination_auto_route_error",
+            json!({"error": error}),
+        );
+    }
     match engine.submit_text(request.text).await {
         Ok(_) => {
             let _ = coordination_ingest_session_inner(state, &request.session_id, false).await;
