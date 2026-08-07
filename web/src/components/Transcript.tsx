@@ -37,6 +37,32 @@ function formatDuration(durationMs: number): string {
   return `${Number(seconds.toFixed(seconds < 10 ? 1 : 0))}s`;
 }
 
+function TranscriptRowLabel({
+  label,
+  additions,
+  deletions,
+}: {
+  label: string;
+  additions?: number;
+  deletions?: number;
+}) {
+  return (
+    <>
+      <span>{label}</span>
+      {(additions !== undefined || deletions !== undefined) && (
+        <span className="transcript-diff-badges">
+          {additions !== undefined && (
+            <span className="transcript-additions">+{additions}</span>
+          )}
+          {deletions !== undefined && (
+            <span className="transcript-deletions">−{deletions}</span>
+          )}
+        </span>
+      )}
+    </>
+  );
+}
+
 function BubbleMeta({ text, ts }: { text: string; ts?: number }) {
   const [copied, setCopied] = useState(false);
   const copy = () => {
@@ -72,6 +98,7 @@ function TranscriptDisclosure({
   children,
   className = "",
   summaryClassName = "",
+  summaryContent,
   bare = false,
   onToggle,
 }: {
@@ -79,6 +106,7 @@ function TranscriptDisclosure({
   children: ReactNode;
   className?: string;
   summaryClassName?: string;
+  summaryContent?: ReactNode;
   bare?: boolean;
   onToggle?: (open: boolean) => void;
 }) {
@@ -91,7 +119,7 @@ function TranscriptDisclosure({
         className={`transcript-row-header ${bare ? "transcript-disclosure-bare" : ""} ${summaryClassName}`}
         aria-label={bare ? label : undefined}
       >
-        {!bare && <span>{label}</span>}
+        {!bare && (summaryContent ?? <span>{label}</span>)}
         <TranscriptChevron className="transcript-thought-chevron" />
       </summary>
       <span className="transcript-disclosure-break" aria-hidden="true" />
@@ -328,10 +356,14 @@ function PlanCard({
 }
 
 function TerminalOutput({
+  label,
+  summaryContent,
   output,
   truncated,
   totalBytes,
 }: {
+  label: string;
+  summaryContent?: ReactNode;
   output: string;
   truncated?: boolean;
   totalBytes?: number;
@@ -342,9 +374,9 @@ function TerminalOutput({
       : Math.max(0, totalBytes - new TextEncoder().encode(output).length);
   return (
     <TranscriptDisclosure
-      label="Show output"
+      label={label}
+      summaryContent={summaryContent}
       className="transcript-output"
-      bare
     >
       <pre className="artifact-code max-h-96 overflow-auto whitespace-pre-wrap break-words">
         {output}
@@ -359,11 +391,17 @@ function TerminalOutput({
 }
 
 function ArtifactRow({
+  label,
+  additions,
+  deletions,
   sessionId,
   artifactId,
   kind,
   mime,
 }: {
+  label: string;
+  additions?: number;
+  deletions?: number;
   sessionId: string;
   artifactId: string;
   kind?: string;
@@ -414,11 +452,17 @@ function ArtifactRow({
           ))
       : null;
   return (
-    <div className="artifact-inline">
+    <>
       <TranscriptDisclosure
-        label={kind === "screenshot" ? "View screenshot" : "View diff"}
+        label={label}
+        summaryContent={
+          <TranscriptRowLabel
+            label={label}
+            additions={additions}
+            deletions={deletions}
+          />
+        }
         className="transcript-artifact"
-        bare
         onToggle={(open) => {
           if (open) load();
         }}
@@ -454,7 +498,7 @@ function ArtifactRow({
           />
         </div>
       )}
-    </div>
+    </>
   );
 }
 
@@ -559,14 +603,18 @@ export function Transcript({
         ) => {
           const isThoughtRow =
             Boolean(row.detail) && row.label.startsWith("Thought for ");
-          return (
-            <div
-              className={`transcript-item transcript-row${row.shellId ? " transcript-shell-row" : ""}${row.denied ? " text-muted" : row.resultError || (row.exitCode !== undefined && row.exitCode !== 0) ? " text-danger" : ""}`}
-              key={rowIndex}
-            >
-              {!isThoughtRow && (
-                <span className="transcript-row-label">{row.label}</span>
-              )}
+          const hasTerminalOutput = Boolean(
+            row.terminalOutput || row.terminalTruncated,
+          );
+          const terminalSummary = hasTerminalOutput ? (
+            <>
+              <span className="transcript-row-label">
+                <TranscriptRowLabel
+                  label={row.label}
+                  additions={row.additions}
+                  deletions={row.deletions}
+                />
+              </span>
               {row.shellId && (
                 <span className="transcript-row-meta">{row.shellId}</span>
               )}
@@ -591,8 +639,54 @@ export function Transcript({
                   {row.resultSummary}
                 </span>
               )}
+            </>
+          ) : undefined;
+          return (
+            <div
+              className={`transcript-item transcript-row${row.shellId ? " transcript-shell-row" : ""}${row.denied ? " text-muted" : row.resultError || (row.exitCode !== undefined && row.exitCode !== 0) ? " text-danger" : ""}`}
+              key={rowIndex}
+            >
+              {!isThoughtRow && !row.artifactId && !hasTerminalOutput && (
+                <span className="transcript-row-label">
+                  <TranscriptRowLabel
+                    label={row.label}
+                    additions={row.additions}
+                    deletions={row.deletions}
+                  />
+                </span>
+              )}
+              {row.shellId && !hasTerminalOutput && (
+                <span className="transcript-row-meta">{row.shellId}</span>
+              )}
+              {row.exitCode !== undefined &&
+                row.exitCode !== 0 &&
+                !hasTerminalOutput && (
+                  <span className="transcript-row-meta">
+                    exit {row.exitCode}
+                  </span>
+                )}
+              {row.denied && !hasTerminalOutput && (
+                <span className="ml-2 text-xs text-muted">
+                  not run{row.detail ? ` · ${row.detail}` : ""}
+                </span>
+              )}
+              {row.durationMs !== undefined && !hasTerminalOutput && (
+                <span className="transcript-row-duration">
+                  {formatDuration(row.durationMs)}
+                </span>
+              )}
+              {row.resultSummary && !hasTerminalOutput && (
+                <span
+                  className={`transcript-row-result${row.resultError ? " text-danger" : ""}`}
+                >
+                  {row.resultError && "failed · "}
+                  {row.resultSummary}
+                </span>
+              )}
               {(row.terminalOutput || row.terminalTruncated) && (
                 <TerminalOutput
+                  label={row.label}
+                  summaryContent={terminalSummary}
                   output={row.terminalOutput ?? ""}
                   truncated={row.terminalTruncated}
                   totalBytes={row.terminalTotalBytes}
@@ -600,6 +694,9 @@ export function Transcript({
               )}
               {row.artifactId && (
                 <ArtifactRow
+                  label={row.label}
+                  additions={row.additions}
+                  deletions={row.deletions}
                   sessionId={sessionId}
                   artifactId={row.artifactId}
                   kind={row.artifactKind}

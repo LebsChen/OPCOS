@@ -676,6 +676,10 @@ h3 {
   font-size: 12px;
   font-weight: 500;
 }
+.transcript-row-label > .transcript-diff-badges,
+.transcript-artifact .transcript-diff-badges {
+  margin-left: 8px;
+}
 .transcript-additions {
   color: var(--ok);
 }
@@ -708,7 +712,7 @@ h3 {
   min-width: 0;
   flex-wrap: wrap;
   align-items: flex-start;
-  gap: 0 8px;
+  gap: 8px;
   margin: 0;
   color: var(--muted);
   font-size: 13px;
@@ -725,7 +729,7 @@ h3 {
 }
 .transcript-row-label {
   min-width: 0;
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   overflow-wrap: anywhere;
   line-height: 20px;
 }
@@ -768,6 +772,16 @@ h3 {
   display: block;
   flex: 0 0 100%;
   width: 100%;
+  min-width: 0;
+}
+.transcript-thought > .transcript-row-header {
+  display: inline-flex;
+  width: auto;
+}
+.transcript-output,
+.transcript-artifact {
+  flex: 0 1 auto;
+  width: auto;
 }
 .transcript-thought-chevron {
   flex: 0 0 16px;
@@ -790,6 +804,28 @@ h3 {
   margin: 4px 0 0;
   color: var(--muted);
   white-space: pre-wrap;
+}
+.transcript-thought[open] {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  flex-basis: 100%;
+  width: 100%;
+}
+.transcript-thought[open] > .transcript-row-header {
+  justify-self: start;
+}
+.transcript-thought[open] > .transcript-disclosure-break {
+  display: none;
+}
+.transcript-thought[open] > .transcript-thought-body {
+  grid-column: 1;
+  width: 100%;
+}
+.transcript-output[open],
+.transcript-artifact[open] {
+  flex: 0 0 100%;
+  flex-basis: 100%;
+  width: 100%;
 }
 .transcript-thought-body .artifact-code {
   margin: 0;

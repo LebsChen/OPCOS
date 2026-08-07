@@ -3682,15 +3682,6 @@ impl ToolExecutor for RemoteExecutor {
         if name == "external_ingress_sources" {
             return execute_external_ingress_tool(&self.store, name, &arguments);
         }
-        if self.origin == ToolOrigin::User
-            && automatic_project_routing_active(&self.store, &self.session_id)?
-            && matches!(name, "edit_file" | "write_file")
-        {
-            return Err(
-                "Lead-local implementation is disabled; create a plan and let the desktop dispatch it to a Worker"
-                    .to_owned(),
-            );
-        }
         if matches!(name, "coordination_dispatch" | "coordination_status") {
             if name == "coordination_dispatch"
                 && self.origin == ToolOrigin::User
@@ -4115,15 +4106,6 @@ impl ToolExecutor for DesktopExecutor {
                 }
                 if name == "external_ingress_sources" {
                     return execute_external_ingress_tool(&executor.store, name, &arguments);
-                }
-                if executor.origin == ToolOrigin::User
-                    && automatic_project_routing_active(&executor.store, &executor.session_id)?
-                    && matches!(name, "edit_file" | "write_file")
-                {
-                    return Err(
-                        "Lead-local implementation is disabled; create a plan and let the desktop dispatch it to a Worker"
-                            .to_owned(),
-                    );
                 }
                 if matches!(name, "coordination_dispatch" | "coordination_status") {
                     if name == "coordination_dispatch"
@@ -9942,6 +9924,7 @@ async fn engine_for_with_context(
         permission_mode,
         model.clone(),
     );
+    engine.set_chunk_idle_timeout(std::time::Duration::from_secs(600));
     engine.set_artifact_sink(Arc::new(SessionArtifactSink {
         root: state.artifact_root.clone(),
         store: Arc::clone(&state.store),
@@ -10322,9 +10305,11 @@ async fn engine_for_with_context(
              Internal worker routing is automatic and is never a user question. \
              Do not call coordination_dispatch; the desktop dispatches saved plan steps \
              automatically. Do not ask whether to execute in-session or dispatch workers, and do not \
-             present that choice as an option. Do not open or edit implementation files or \
-             execute implementation work in the Lead workspace. For implementation requests, \
-             create or revise the plan and stop; the desktop dispatches the saved step. \
+             present that choice as an option. \
+             Workers are routed automatically for planned steps; when no worker is available \
+             or Lead-owned implementation and finalization is needed, implement directly in \
+             the Lead workspace. Direct Lead execution is recorded through the existing \
+             coordination_local_execution audit path with execution: lead_local. \
              Sequence, synthesize, and verify; workers execute their assigned steps. Ask the user only about genuine product \
              ambiguity or risky external actions requiring approval.",
         );
@@ -13167,6 +13152,42 @@ async fn steering(
     text: String,
 ) -> Result<(), String> {
     let engine = engine_for(&app, &state, &session_id, ToolOrigin::User).await?;
+    if !engine.has_active_turn() {
+        let handle = app.clone();
+        let session = session_id.clone();
+        let queued_text = text.clone();
+        tauri::async_runtime::spawn(async move {
+            let result = engine.submit_steering(queued_text.clone()).await;
+            let mut completion_state: (String, String) = match &result {
+                Ok(_) => ("idle".into(), "finished".into()),
+                Err(EngineError::TurnAlreadyRunning) => ("running".into(), "none".into()),
+                Err(_) => ("error".into(), "provider_error".into()),
+            };
+            match result {
+                Ok(_) => {}
+                Err(EngineError::TurnAlreadyRunning) => {
+                    let receiver = engine.queue_steering(queued_text).await.ok();
+                    if let Some(receiver) = receiver {
+                        completion_state = receiver.await.unwrap_or_else(|_| {
+                            ("error".into(), "turn_completion_unavailable".into())
+                        });
+                    }
+                }
+                Err(_) => {}
+            };
+            emit(
+                &handle,
+                "turn_done",
+                Some(&session),
+                json!({
+                    "run_state": completion_state.0,
+                    "stop_reason": completion_state.1,
+                }),
+            );
+        });
+        emit(&app, "steering", Some(&session_id), json!({"text":text}));
+        return Ok(());
+    }
     let completion = engine
         .queue_steering(text.clone())
         .await
