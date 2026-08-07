@@ -19499,6 +19499,27 @@ async fn auto_route_project_plan(
                 },
             )?;
         }
+        {
+            let agents = state
+                .store
+                .load_project_agents(project_id)
+                .map_err(|e| e.to_string())?;
+            let roles = agents
+                .into_iter()
+                .filter_map(|agent| {
+                    Some(Role {
+                        project_id: project_id.into(),
+                        id: agent.id,
+                        sort_order: agent.sort_order,
+                        session_id: agent.session_id?,
+                        state: RoleState::Active,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let runtime = CoordinationRuntime::new(roles).map_err(|e| e.to_string())?;
+            let mut runtimes = state.coordination.lock().await;
+            runtimes.entry(task_id.clone()).or_insert(runtime);
+        }
         let message = format!(
             "Execute assigned plan step {}: {}. Work only in your assigned workspace, \
              report concrete results or blockers to the Lead using the coordination protocol.",
