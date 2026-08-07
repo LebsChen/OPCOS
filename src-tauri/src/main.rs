@@ -7251,6 +7251,7 @@ fn git_worktree_add_command(
     worktree_path: &str,
     branch: &str,
     existing_branch: bool,
+    base_ref: Option<&str>,
 ) -> String {
     let quote = |value: &str| quote_for(platform, value);
     if existing_branch {
@@ -7261,11 +7262,15 @@ fn git_worktree_add_command(
             quote(branch)
         )
     } else {
+        let start = base_ref
+            .map(|value| format!(" {}", quote(value)))
+            .unwrap_or_default();
         format!(
-            "git -C {} worktree add {} -b {}",
+            "git -C {} worktree add {} -b {}{}",
             quote(repo_root),
             quote(worktree_path),
-            quote(branch)
+            quote(branch),
+            start
         )
     }
 }
@@ -8449,8 +8454,37 @@ async fn create_project_agent_inner(
     {
         return Err("project worktree path is outside the bound host workspace".to_owned());
     }
+    let platform = host.health().await.ok().and_then(|health| health.platform);
+    let lead_base_ref = if sort_order == 0 {
+        None
+    } else {
+        let lead_workspace = agents
+            .iter()
+            .find(|agent| agent.sort_order == 0)
+            .map(|agent| agent.worktree_path.as_str())
+            .unwrap_or(project.repo_root.as_str());
+        let result = host
+            .exec(ExecRequest {
+                command: format!(
+                    "git -C {} rev-parse --verify HEAD",
+                    quote_for(platform.as_deref(), lead_workspace)
+                ),
+                cwd: None,
+                timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+                session: None,
+                env: None,
+            })
+            .await
+            .map_err(|error| format!("Lead workspace revision check failed: {error}"))?;
+        if result.result.exit_code != 0 {
+            return Err(format!(
+                "Lead workspace revision check failed: {}",
+                result.result.stderr
+            ));
+        }
+        Some(result.result.stdout.trim().to_owned())
+    };
     if sort_order != 0 {
-        let platform = host.health().await.ok().and_then(|health| health.platform);
         let probe = host
             .exec(ExecRequest {
                 command: format!(
@@ -8473,6 +8507,7 @@ async fn create_project_agent_inner(
                     &worktree_path,
                     &branch,
                     probe.result.exit_code == 0,
+                    lead_base_ref.as_deref(),
                 ),
                 cwd: None,
                 timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
@@ -25264,10 +25299,23 @@ agents:
             "/workspace/my repo/worktrees/agent one",
             "agent/code/review-1",
             false,
+            None,
         );
         assert_eq!(
             posix,
             "git -C '/workspace/my repo' worktree add '/workspace/my repo/worktrees/agent one' -b 'agent/code/review-1'"
+        );
+        let posix_with_base = git_worktree_add_command(
+            Some("linux"),
+            "/workspace/repo",
+            "/workspace/repo/worktrees/agent",
+            "agent/code-1",
+            false,
+            Some("lead-head"),
+        );
+        assert_eq!(
+            posix_with_base,
+            "git -C '/workspace/repo' worktree add '/workspace/repo/worktrees/agent' -b 'agent/code-1' 'lead-head'"
         );
         let windows = git_worktree_add_command(
             Some("windows"),
@@ -25275,6 +25323,7 @@ agents:
             r"C:\workspace\my repo\worktrees\agent one",
             "agent/code/review-1",
             true,
+            None,
         );
         assert_eq!(
             windows,
