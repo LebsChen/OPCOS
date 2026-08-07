@@ -882,7 +882,7 @@ h3 {
   margin: 0 0 18px;
 }
 .transcript-shell-row {
-  display: block;
+  display: flex;
 }
 .transcript-terminal-output {
   display: block;
