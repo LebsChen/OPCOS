@@ -7214,6 +7214,20 @@ function McpManage({
                     description={`${String(server.transport || "remote")} · ${String(server.url || "configured")}`}
                     actions={
                       <div className="inline-actions">
+                        {String(server.status || "").toLowerCase() ===
+                          "auth_required" && (
+                          <Button
+                            onClick={() =>
+                              command("mcp_authorize", {
+                                serverId: String(server.id),
+                                versionId: String(server.version_id || ""),
+                                resourceUrl: String(server.url || ""),
+                              }).catch(onError)
+                            }
+                          >
+                            Authorize
+                          </Button>
+                        )}
                         <Button onClick={() => loadServerCatalog(server)}>
                           Resources / prompts
                         </Button>

@@ -465,6 +465,23 @@ impl McpCredentialStore for McpCredentialAdapter {
             })
             .transpose()
     }
+
+    async fn set(
+        &self,
+        server_id: &str,
+        credentials: HashMap<String, String>,
+    ) -> Result<(), opcos_mcp::McpClientError> {
+        let value = serde_json::to_string(&credentials)
+            .map_err(|_| opcos_mcp::McpClientError::Transport)?;
+        let key = self
+            .project_id
+            .as_deref()
+            .map(|id| project_secret_key(id, "mcp-credential", server_id))
+            .unwrap_or_else(|| secret_key("mcp-credential", server_id));
+        self.store
+            .set(&key, &value)
+            .map_err(|_| opcos_mcp::McpClientError::Transport)
+    }
 }
 
 #[async_trait]
@@ -16476,6 +16493,25 @@ async fn mcp_prompts(
 }
 
 #[tauri::command]
+async fn mcp_authorize(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    server_id: String,
+    version_id: String,
+    resource_url: String,
+) -> Result<String, String> {
+    let url = state
+        .mcp
+        .begin_oauth(&server_id, &version_id, &resource_url)
+        .await
+        .map_err(|error| error.to_string())?;
+    app.opener()
+        .open_url(url.clone(), None::<&str>)
+        .map_err(|_| "could not open the system browser")?;
+    Ok(url)
+}
+
+#[tauri::command]
 async fn mcp_get_prompt(
     state: State<'_, DesktopState>,
     server_id: String,
@@ -24367,6 +24403,7 @@ fn main() {
             mcp_context_resources,
             mcp_detach_resource,
             mcp_prompts,
+            mcp_authorize,
             mcp_get_prompt,
             connector_save,
             connector_status,

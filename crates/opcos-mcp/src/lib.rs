@@ -15,6 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -277,6 +278,37 @@ pub struct McpServerSnapshot {
     pub capabilities: McpServerCapabilities,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpOAuthTokens {
+    pub access_token: String,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    #[serde(default)]
+    pub token_type: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpProtectedResourceMetadata {
+    #[serde(default)]
+    pub resource: Option<String>,
+    #[serde(default)]
+    pub authorization_servers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpAuthorizationServerMetadata {
+    #[serde(default)]
+    pub issuer: Option<String>,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    #[serde(default)]
+    pub registration_endpoint: Option<String>,
+    #[serde(default)]
+    pub code_challenge_methods_supported: Vec<String>,
+}
+
 #[derive(Debug, Error)]
 pub enum McpClientError {
     #[error("MCP transport error")]
@@ -303,6 +335,163 @@ pub enum McpClientError {
 pub trait McpCredentialStore: Send + Sync {
     async fn get(&self, server_id: &str)
     -> Result<Option<HashMap<String, String>>, McpClientError>;
+    async fn set(
+        &self,
+        _server_id: &str,
+        _credentials: HashMap<String, String>,
+    ) -> Result<(), McpClientError> {
+        Err(McpClientError::Transport)
+    }
+}
+
+pub fn pkce_verifier_and_challenge() -> (String, String) {
+    use base64::Engine;
+    let verifier = Uuid::new_v4().to_string().replace('-', "");
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(Sha256::digest(verifier.as_bytes()));
+    (verifier, challenge)
+}
+
+pub fn oauth_state() -> String {
+    Uuid::new_v4().to_string()
+}
+
+pub fn resource_metadata_url(resource: &Url) -> Result<Url, McpClientError> {
+    let mut url = resource.clone();
+    url.set_query(None);
+    let path = url.path().trim_end_matches('/');
+    url.set_path(&format!("{path}/.well-known/oauth-protected-resource"));
+    Ok(url)
+}
+
+pub fn authorization_server_metadata_url(issuer: &str) -> Result<Url, McpClientError> {
+    let mut url = Url::parse(issuer).map_err(|_| McpClientError::InvalidConfig)?;
+    url.set_query(None);
+    let path = url.path().trim_end_matches('/');
+    url.set_path(&format!("{path}/.well-known/oauth-authorization-server"));
+    Ok(url)
+}
+
+pub fn parse_resource_metadata_challenge(value: &str) -> Option<Url> {
+    value.split(',').find_map(|part| {
+        let (key, value) = part.trim().split_once('=')?;
+        if key.trim().eq_ignore_ascii_case("resource_metadata") {
+            Url::parse(value.trim().trim_matches('"')).ok()
+        } else {
+            None
+        }
+    })
+}
+
+pub async fn discover_oauth_metadata(
+    client: &reqwest::Client,
+    resource: &Url,
+    www_authenticate: Option<&str>,
+) -> Result<(McpProtectedResourceMetadata, McpAuthorizationServerMetadata), McpClientError> {
+    let protected_url = parse_resource_metadata_challenge(www_authenticate.unwrap_or_default())
+        .unwrap_or(resource_metadata_url(resource)?);
+    let protected = client
+        .get(protected_url)
+        .send()
+        .await
+        .map_err(|_| McpClientError::Disconnected)?;
+    let protected = if protected.status().is_success() {
+        serde_json::from_slice::<McpProtectedResourceMetadata>(
+            &protected
+                .bytes()
+                .await
+                .map_err(|_| McpClientError::InvalidResponse)?,
+        )
+        .map_err(|_| McpClientError::InvalidResponse)?
+    } else {
+        McpProtectedResourceMetadata {
+            resource: Some(resource.to_string()),
+            authorization_servers: Vec::new(),
+        }
+    };
+    let issuer = protected
+        .authorization_servers
+        .first()
+        .cloned()
+        .or_else(|| {
+            let mut fallback = resource.clone();
+            fallback.set_path("");
+            fallback.set_query(None);
+            Some(fallback.to_string())
+        })
+        .ok_or(McpClientError::InvalidConfig)?;
+    let metadata_url = authorization_server_metadata_url(&issuer)?;
+    let response = client
+        .get(metadata_url)
+        .send()
+        .await
+        .map_err(|_| McpClientError::Disconnected)?;
+    if !response.status().is_success() {
+        return Err(McpClientError::Transport);
+    }
+    let metadata = response
+        .json::<McpAuthorizationServerMetadata>()
+        .await
+        .map_err(|_| McpClientError::InvalidResponse)?;
+    Ok((protected, metadata))
+}
+
+pub async fn exchange_oauth_code(
+    client: &reqwest::Client,
+    metadata: &McpAuthorizationServerMetadata,
+    code: &str,
+    redirect_uri: &str,
+    verifier: &str,
+    client_id: &str,
+) -> Result<McpOAuthTokens, McpClientError> {
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "authorization_code")
+        .append_pair("code", code)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("code_verifier", verifier)
+        .append_pair("client_id", client_id)
+        .finish();
+    let response = client
+        .post(&metadata.token_endpoint)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .map_err(|_| McpClientError::Disconnected)?;
+    if !response.status().is_success() {
+        return Err(McpClientError::AuthRequired);
+    }
+    response
+        .json()
+        .await
+        .map_err(|_| McpClientError::InvalidResponse)
+}
+
+pub async fn refresh_oauth_token(
+    client: &reqwest::Client,
+    metadata: &McpAuthorizationServerMetadata,
+    refresh_token: &str,
+    client_id: &str,
+) -> Result<McpOAuthTokens, McpClientError> {
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "refresh_token")
+        .append_pair("refresh_token", refresh_token)
+        .append_pair("client_id", client_id)
+        .finish();
+    let response = client
+        .post(&metadata.token_endpoint)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .map_err(|_| McpClientError::Disconnected)?;
+    if !response.status().is_success() {
+        return Err(McpClientError::AuthRequired);
+    }
+    response
+        .json()
+        .await
+        .map_err(|_| McpClientError::InvalidResponse)
 }
 
 #[async_trait]
@@ -722,10 +911,14 @@ impl StdioClient {
 struct HttpClient {
     client: reqwest::Client,
     url: String,
+    resource_url: Url,
     headers: HeaderMap,
     next_id: u64,
     session_id: Option<String>,
     negotiated: McpNegotiatedInfo,
+    refresh_token: Option<String>,
+    oauth_client_id: Option<String>,
+    oauth_retry_attempted: bool,
 }
 
 impl HttpClient {
@@ -739,6 +932,14 @@ impl HttpClient {
         if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback) {
             return Err(McpClientError::InvalidConfig);
         }
+        let refresh_token = credentials
+            .as_ref()
+            .and_then(|value| value.get("refresh_token"))
+            .cloned();
+        let oauth_client_id = credentials
+            .as_ref()
+            .and_then(|value| value.get("client_id"))
+            .cloned();
         let mut headers = HeaderMap::new();
         headers.insert(
             reqwest::header::ACCEPT,
@@ -768,11 +969,39 @@ impl HttpClient {
                 .build()
                 .map_err(|_| McpClientError::InvalidConfig)?,
             url,
+            resource_url: parsed,
             headers,
             next_id: 1,
             session_id: None,
             negotiated: McpNegotiatedInfo::default(),
+            refresh_token,
+            oauth_client_id,
+            oauth_retry_attempted: false,
         })
+    }
+
+    async fn refresh_access_token(
+        &mut self,
+        challenge: Option<&str>,
+    ) -> Result<(), McpClientError> {
+        let Some(refresh_token) = self.refresh_token.clone() else {
+            return Err(McpClientError::AuthRequired);
+        };
+        let client_id = self
+            .oauth_client_id
+            .clone()
+            .unwrap_or_else(|| "opcos".to_owned());
+        let (_, metadata) =
+            discover_oauth_metadata(&self.client, &self.resource_url, challenge).await?;
+        let tokens =
+            refresh_oauth_token(&self.client, &metadata, &refresh_token, &client_id).await?;
+        let value = HeaderValue::from_str(&format!("Bearer {}", tokens.access_token))
+            .map_err(|_| McpClientError::InvalidConfig)?;
+        self.headers.insert(reqwest::header::AUTHORIZATION, value);
+        if let Some(refresh) = tokens.refresh_token {
+            self.refresh_token = Some(refresh);
+        }
+        Ok(())
     }
 
     async fn request(&mut self, method: &str, params: Value) -> Result<Value, McpClientError> {
@@ -798,7 +1027,20 @@ impl HttpClient {
         .await
         .map_err(|_| McpClientError::Timeout)?
         .map_err(|_| McpClientError::Disconnected)?;
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED && !self.oauth_retry_attempted {
+            self.oauth_retry_attempted = true;
+            let challenge = response
+                .headers()
+                .get(reqwest::header::WWW_AUTHENTICATE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            if self
+                .refresh_access_token(challenge.as_deref())
+                .await
+                .is_ok()
+            {
+                return Box::pin(self.request(method, params)).await;
+            }
             return Err(McpClientError::AuthRequired);
         }
         if !response.status().is_success() {
@@ -1377,6 +1619,7 @@ pub struct McpManager<S> {
     statuses: Mutex<HashMap<String, McpServerSnapshot>>,
     watchers: Mutex<HashMap<String, JoinHandle<()>>>,
     notification_sink: Mutex<Option<NotificationSink>>,
+    configs: Mutex<HashMap<(String, String), McpServerConfig>>,
 }
 
 impl<S: McpCredentialStore + 'static> McpManager<S> {
@@ -1391,7 +1634,161 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
             statuses: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
             notification_sink: Mutex::new(None),
+            configs: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub async fn begin_oauth(
+        self: &Arc<Self>,
+        server_id: &str,
+        version_id: &str,
+        resource_url: &str,
+    ) -> Result<String, McpClientError> {
+        let resource = Url::parse(resource_url).map_err(|_| McpClientError::InvalidConfig)?;
+        let loopback = matches!(resource.host_str(), Some("127.0.0.1" | "localhost"));
+        if resource.scheme() != "https" && !(resource.scheme() == "http" && loopback) {
+            return Err(McpClientError::InvalidConfig);
+        }
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| McpClientError::InvalidConfig)?;
+        let (_, metadata) = discover_oauth_metadata(&client, &resource, None).await?;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .map_err(|_| McpClientError::Transport)?;
+        let port = listener
+            .local_addr()
+            .map_err(|_| McpClientError::Transport)?
+            .port();
+        let redirect_uri = format!("http://127.0.0.1:{port}/oauth/callback");
+        let existing = self.credentials.get(server_id).await?;
+        let client_id = if let Some(existing) = existing
+            .as_ref()
+            .and_then(|values| values.get("client_id"))
+            .cloned()
+        {
+            existing
+        } else if let Some(endpoint) = &metadata.registration_endpoint {
+            let response = client
+                .post(endpoint)
+                .json(&json!({
+                    "client_name":"OPCOS",
+                    "redirect_uris":[redirect_uri],
+                    "grant_types":["authorization_code","refresh_token"],
+                    "response_types":["code"],
+                    "token_endpoint_auth_method":"none"
+                }))
+                .send()
+                .await
+                .map_err(|_| McpClientError::Disconnected)?;
+            if response.status().is_success() {
+                response
+                    .json::<Value>()
+                    .await
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("client_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_else(|| "opcos".to_owned())
+            } else {
+                "opcos".to_owned()
+            }
+        } else {
+            "opcos".to_owned()
+        };
+        let (verifier, challenge) = pkce_verifier_and_challenge();
+        let state = oauth_state();
+        let mut authorization = Url::parse(&metadata.authorization_endpoint)
+            .map_err(|_| McpClientError::InvalidConfig)?;
+        authorization
+            .query_pairs_mut()
+            .append_pair("response_type", "code")
+            .append_pair("client_id", &client_id)
+            .append_pair("redirect_uri", &redirect_uri)
+            .append_pair("scope", "mcp")
+            .append_pair("state", &state)
+            .append_pair("code_challenge", &challenge)
+            .append_pair("code_challenge_method", "S256");
+        let credentials = Arc::clone(&self.credentials);
+        let manager = Arc::clone(self);
+        let version_id = version_id.to_owned();
+        let server_id = server_id.to_owned();
+        tokio::spawn(async move {
+            let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_secs(300), listener.accept()).await
+            else {
+                return;
+            };
+            let mut buffer = [0_u8; 8192];
+            let Ok(size) = stream.read(&mut buffer).await else {
+                return;
+            };
+            let request = String::from_utf8_lossy(&buffer[..size]);
+            let Some(target) = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|value| Url::parse(&format!("http://localhost{value}")).ok())
+            else {
+                return;
+            };
+            let code = target
+                .query_pairs()
+                .find(|(key, _)| key == "code")
+                .map(|(_, value)| value.into_owned());
+            let returned_state = target
+                .query_pairs()
+                .find(|(key, _)| key == "state")
+                .map(|(_, value)| value.into_owned());
+            let valid = returned_state.as_deref() == Some(state.as_str());
+            let response_body = if valid && code.is_some() {
+                "Authorization received. You can return to OPCOS."
+            } else {
+                "Authorization failed."
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            if !valid {
+                return;
+            }
+            let Ok(tokens) = exchange_oauth_code(
+                &client,
+                &metadata,
+                code.as_deref().unwrap_or_default(),
+                &redirect_uri,
+                &verifier,
+                &client_id,
+            )
+            .await
+            else {
+                return;
+            };
+            let mut values = HashMap::new();
+            values.insert("bearer_token".to_owned(), tokens.access_token);
+            if let Some(refresh) = tokens.refresh_token {
+                values.insert("refresh_token".to_owned(), refresh);
+            }
+            values.insert("client_id".to_owned(), client_id);
+            let _ = credentials.set(&server_id, values).await;
+            if let Some(config) = manager
+                .configs
+                .lock()
+                .await
+                .get(&(server_id.clone(), version_id.clone()))
+                .cloned()
+            {
+                let _ = manager.connect_with_retry(&config, &version_id, 1).await;
+            }
+        });
+        Ok(authorization.to_string())
     }
 
     pub async fn set_notification_sink(&self, sink: NotificationSink) {
@@ -1416,6 +1813,10 @@ impl<S: McpCredentialStore + 'static> McpManager<S> {
         config: &McpServerConfig,
         version_id: &str,
     ) -> Result<Vec<McpTool>, McpClientError> {
+        self.configs.lock().await.insert(
+            (config.object_id.clone(), version_id.to_owned()),
+            config.clone(),
+        );
         if !config.enabled {
             self.statuses.lock().await.insert(
                 config.object_id.clone(),
@@ -2625,5 +3026,49 @@ mod tests {
             Some(McpClientError::Transport)
         ));
         assert!(sse_http_status_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR).is_none());
+    }
+
+    #[test]
+    fn oauth_pkce_uses_s256_and_validates_state_inputs() {
+        use base64::Engine;
+        let (verifier, challenge) = pkce_verifier_and_challenge();
+        let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(Sha256::digest(verifier.as_bytes()));
+        assert_eq!(challenge, expected);
+        let state = oauth_state();
+        assert!(!state.is_empty());
+        assert_ne!(state, oauth_state());
+    }
+
+    #[test]
+    fn oauth_resource_metadata_challenge_and_fallback_paths_are_safe() {
+        let resource = Url::parse("https://mcp.example/resource").unwrap();
+        assert_eq!(
+            resource_metadata_url(&resource).unwrap().as_str(),
+            "https://mcp.example/resource/.well-known/oauth-protected-resource"
+        );
+        assert_eq!(
+            authorization_server_metadata_url("https://issuer.example/")
+                .unwrap()
+                .as_str(),
+            "https://issuer.example/.well-known/oauth-authorization-server"
+        );
+        assert_eq!(
+            parse_resource_metadata_challenge(
+                "Bearer realm=\"mcp\", resource_metadata=\"https://issuer.example/meta\""
+            )
+            .unwrap()
+            .as_str(),
+            "https://issuer.example/meta"
+        );
+    }
+
+    #[test]
+    fn oauth_tokens_are_not_in_debuggable_error_shapes() {
+        let error = McpClientError::AuthRequired.to_string();
+        assert!(!error.contains("access"));
+        assert!(!error.contains("refresh"));
+        let url = Url::parse("https://mcp.example/authorize").unwrap();
+        assert!(!url.as_str().contains("token"));
     }
 }

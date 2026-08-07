@@ -4171,6 +4171,7 @@ name = "opcos-mcp"
 version = "0.1.1"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "futures-util",
  "opcos-rvm",
  "reqwest",
@@ -4179,6 +4180,8 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.19",
  "tokio",
+ "url",
+ "uuid",
 ]
 
 [[package]]

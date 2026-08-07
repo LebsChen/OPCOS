@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+base64.workspace = true
 futures-util.workspace = true
 opcos-rvm = { path = "../opcos-rvm" }
 reqwest.workspace = true
@@ -13,3 +14,5 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+url.workspace = true
+uuid.workspace = true
