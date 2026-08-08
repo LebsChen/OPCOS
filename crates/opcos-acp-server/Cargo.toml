@@ -1,0 +1,12 @@
+[package]
+name = "opcos-acp-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agent-client-protocol.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

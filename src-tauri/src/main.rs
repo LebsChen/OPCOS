@@ -116,13 +116,26 @@ impl opcos_assets::RemoteAssetReader for HostAssetReader {
             .map_err(|error| opcos_assets::AssetError::Invalid(error.to_string()))
     }
 }
+use agent_client_protocol::schema::v1::{
+    ContentBlock as AcpContentBlock, ContentChunk as AcpContentChunk,
+    NewSessionRequest as AcpNewSessionRequest, NewSessionResponse as AcpNewSessionResponse,
+    PromptRequest as AcpPromptRequest, RequestPermissionOutcome, SessionNotification,
+    SessionUpdate, StopReason as AcpStopReason, TextContent as AcpTextContent,
+};
 use tauri::{Emitter, Manager, RunEvent, State};
 use tauri_plugin_opener::OpenerExt;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio_tungstenite::accept_async;
+use tokio_tungstenite::{
+    accept_async, accept_hdr_async, connect_async,
+    tungstenite::{
+        Message as WsMessage,
+        client::IntoClientRequest,
+        handshake::server::{Request as WsRequest, Response as WsResponse},
+    },
+};
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -140,6 +153,7 @@ fn configure_no_window(_command: &mut ProcessCommand) {}
 const SECRET_SERVICE: &str = "com.opcos.desktop";
 const ASKPASS_SCRIPT: &str = "if (($args -join ' ') -match 'Username') { $env:OPCOS_GIT_USERNAME } else { $env:OPCOS_GIT_PASSWORD }";
 const MCP_STATE_FILE: &str = "mcp-server.json";
+const ACP_STATE_FILE: &str = "acp-server.json";
 
 #[derive(Debug, Deserialize, Serialize)]
 struct McpBridgeState {
@@ -147,6 +161,8 @@ struct McpBridgeState {
     port: u16,
     token: String,
 }
+
+type AcpBridgeState = McpBridgeState;
 
 fn mcp_state_path() -> Result<PathBuf, String> {
     Ok(dirs::config_dir()
@@ -259,6 +275,150 @@ fn run_mcp_bridge() -> Result<(), String> {
         }
         Ok(())
     })
+}
+
+fn acp_state_path() -> Result<PathBuf, String> {
+    Ok(dirs::config_dir()
+        .ok_or_else(|| "OPCOS configuration directory is unavailable".to_owned())?
+        .join("com.opcos.desktop")
+        .join(ACP_STATE_FILE))
+}
+
+fn write_acp_state(path: &FsPath, port: u16, token: &str) -> Result<(), String> {
+    write_mcp_state(path, port, token)
+}
+
+fn run_acp_bridge() -> Result<(), String> {
+    let path = acp_state_path()?;
+    let state: AcpBridgeState = serde_json::from_str(
+        &std::fs::read_to_string(&path)
+            .map_err(|_| "OPCOS is not running; ACP endpoint state is unavailable".to_owned())?,
+    )
+    .map_err(|error| format!("invalid OPCOS ACP endpoint state: {error}"))?;
+    if state.host != "127.0.0.1" && state.host != "localhost" {
+        return Err("OPCOS ACP endpoint is not loopback-only".into());
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("failed to start ACP bridge runtime: {error}"))?;
+    runtime.block_on(async move {
+        let url = format!("ws://{}:{}/acp", state.host, state.port);
+        let mut request = url
+            .into_client_request()
+            .map_err(|error| format!("invalid OPCOS ACP endpoint: {error}"))?;
+        request.headers_mut().insert(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", state.token)
+                .parse()
+                .map_err(|_| "invalid ACP authorization header".to_owned())?,
+        );
+        let (mut socket, _) = connect_async(request)
+            .await
+            .map_err(|_| "OPCOS is not running; ACP endpoint is unreachable".to_owned())?;
+        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        let mut stdout = tokio::io::stdout();
+        loop {
+            tokio::select! {
+                line = lines.next_line() => {
+                    let Some(line) = line.map_err(|error| error.to_string())? else { break };
+                    if !line.trim().is_empty() {
+                        socket.send(WsMessage::Text(line.into())).await
+                            .map_err(|_| "OPCOS ACP endpoint became unreachable".to_owned())?;
+                    }
+                }
+                message = socket.next() => {
+                    let Some(message) = message else { break };
+                    match message.map_err(|_| "OPCOS ACP endpoint returned an invalid frame".to_owned())? {
+                        WsMessage::Text(text) => {
+                            stdout.write_all(text.as_bytes()).await.map_err(|error| error.to_string())?;
+                            stdout.write_all(b"\n").await.map_err(|error| error.to_string())?;
+                            stdout.flush().await.map_err(|error| error.to_string())?;
+                        }
+                        WsMessage::Binary(bytes) => {
+                            stdout.write_all(&bytes).await.map_err(|error| error.to_string())?;
+                            stdout.write_all(b"\n").await.map_err(|error| error.to_string())?;
+                            stdout.flush().await.map_err(|error| error.to_string())?;
+                        }
+                        WsMessage::Close(_) => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+#[allow(clippy::result_large_err)]
+async fn serve_acp_http<C>(
+    listener: TcpListener,
+    token: String,
+    control_plane: Arc<C>,
+) -> Result<(), String>
+where
+    C: opcos_acp_server::OpcosAcpControlPlane,
+{
+    loop {
+        let (stream, _) = listener.accept().await.map_err(|error| error.to_string())?;
+        let expected = format!("Bearer {token}");
+        let control_plane = Arc::clone(&control_plane);
+        tokio::spawn(async move {
+            let callback = |request: &WsRequest, response: WsResponse| {
+                let authorized = request
+                    .headers()
+                    .get(reqwest::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value == expected);
+                if authorized {
+                    Ok(response)
+                } else {
+                    Err(WsResponse::builder()
+                        .status(401)
+                        .body(Some("unauthorized".into()))
+                        .expect("valid websocket response"))
+                }
+            };
+            let Ok(socket) = accept_hdr_async(stream, callback).await else {
+                return;
+            };
+            let (client, server_io) = tokio::io::duplex(128 * 1024);
+            let server_task = tokio::spawn(async move {
+                let protocol = opcos_acp_server::OpcosAcpServer::new(control_plane);
+                let (reader, writer) = tokio::io::split(server_io);
+                let _ = protocol
+                    .serve_stdio(tokio::io::BufReader::new(reader), writer)
+                    .await;
+            });
+            let (mut ws_writer, mut ws_reader) = socket.split();
+            let (client_reader, mut client_writer) = tokio::io::split(client);
+            let mut output = tokio::io::BufReader::new(client_reader).lines();
+            loop {
+                tokio::select! {
+                    line = output.next_line() => {
+                        let Ok(Some(line)) = line else { break };
+                        if ws_writer.send(WsMessage::Text(line.into())).await.is_err() { break; }
+                    }
+                    message = ws_reader.next() => {
+                        let Some(Ok(message)) = message else { break };
+                        match message {
+                            WsMessage::Text(text) => {
+                                if client_writer.write_all(text.as_bytes()).await.is_err()
+                                    || client_writer.write_all(b"\n").await.is_err() { break; }
+                            }
+                            WsMessage::Binary(bytes) => {
+                                if client_writer.write_all(&bytes).await.is_err()
+                                    || client_writer.write_all(b"\n").await.is_err() { break; }
+                            }
+                            WsMessage::Close(_) => break,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            server_task.abort();
+        });
+    }
 }
 mod ci_repair;
 mod external_ingress;
@@ -481,6 +641,7 @@ struct DesktopState {
     engines: Arc<AsyncMutex<HashMap<String, Arc<GuiEngine>>>>,
     acp_engines: AsyncMutex<HashMap<String, Arc<opcos_engine::AcpHarness<SqliteStore>>>>,
     acp_event_sessions: AsyncMutex<HashSet<String>>,
+    acp_streams: Mutex<HashMap<String, UnboundedSender<(String, Value)>>>,
     trigger_runs: AsyncMutex<HashSet<String>>,
     trigger_http_token: String,
     trigger_http_port: u16,
@@ -4962,6 +5123,103 @@ struct SessionView {
     agent_id: Option<String>,
 }
 
+fn acp_stop_reason(session: &SessionRecord) -> Result<AcpStopReason, String> {
+    match (session.run_state.as_str(), session.stop_reason.as_str()) {
+        ("interrupted", "interrupted_by_user") | (_, "cancelled") => Ok(AcpStopReason::Cancelled),
+        (_, "policy_denied") | (_, "refusal") => Ok(AcpStopReason::Refusal),
+        (_, "max_iterations") | (_, "max_turn_requests") => Ok(AcpStopReason::MaxTurnRequests),
+        (_, "usage_limit") | (_, "max_tokens") => Ok(AcpStopReason::MaxTokens),
+        ("idle", "finished") => Ok(AcpStopReason::EndTurn),
+        (run_state, stop_reason) => Err(format!(
+            "ACP turn ended with unsupported terminal state {run_state}/{stop_reason}"
+        )),
+    }
+}
+
+fn acp_stream_update(kind: &str, payload: &Value) -> Option<SessionUpdate> {
+    match kind {
+        "message" if payload.get("role").and_then(Value::as_str) == Some("assistant") => {
+            Some(SessionUpdate::AgentMessageChunk(AcpContentChunk::new(
+                AcpContentBlock::Text(AcpTextContent::new(
+                    payload
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                )),
+            )))
+        }
+        "thinking" => Some(SessionUpdate::AgentThoughtChunk(AcpContentChunk::new(
+            AcpContentBlock::Text(AcpTextContent::new(
+                payload
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )),
+        ))),
+        "stream" => {
+            match payload.get("type").and_then(Value::as_str) {
+                Some("assistant_delta") => {
+                    payload
+                        .get("text_delta")
+                        .and_then(Value::as_str)
+                        .map(|text| {
+                            SessionUpdate::AgentMessageChunk(AcpContentChunk::new(
+                                AcpContentBlock::Text(AcpTextContent::new(text)),
+                            ))
+                        })
+                }
+                Some("reasoning_delta") => payload
+                    .get("reasoning_delta")
+                    .and_then(Value::as_str)
+                    .map(|text| {
+                        SessionUpdate::AgentThoughtChunk(AcpContentChunk::new(
+                            AcpContentBlock::Text(AcpTextContent::new(text)),
+                        ))
+                    }),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn next_acp_pending<'a>(
+    pending: &'a [opcos_store::PendingRecord],
+    resolved_call_ids: &HashSet<String>,
+) -> Option<&'a opcos_store::PendingRecord> {
+    pending
+        .iter()
+        .find(|record| !resolved_call_ids.contains(&record.call_id))
+}
+
+async fn wait_for_external_approval_resolution(
+    store: Arc<SqliteStore>,
+    session_id: String,
+    call_id: String,
+) -> Result<(), String> {
+    loop {
+        let pending = store
+            .load_pending(&session_id)
+            .map_err(|error| error.to_string())?;
+        let session = store
+            .load_session(&session_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "session not found".to_owned())?;
+        if acp_approval_resolution_ready(&pending, &session, &call_id) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn acp_approval_resolution_ready(
+    pending: &[opcos_store::PendingRecord],
+    session: &SessionRecord,
+    call_id: &str,
+) -> bool {
+    !pending.iter().any(|item| item.call_id == call_id) && session.run_state != "running"
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct ProjectView {
     #[serde(flatten)]
@@ -4987,6 +5245,12 @@ struct OpcosEvent {
 }
 
 fn emit(app: &tauri::AppHandle, kind: &str, session_id: Option<&str>, payload: Value) {
+    if let (Some(session_id), Some(state)) = (session_id, app.try_state::<DesktopState>())
+        && let Ok(streams) = state.acp_streams.lock()
+        && let Some(stream) = streams.get(session_id)
+    {
+        let _ = stream.send((kind.to_owned(), payload.clone()));
+    }
     let _ = app.emit(
         "opcos://event",
         OpcosEvent {
@@ -5334,6 +5598,29 @@ fn emit_approval_decision(
         },
         json!({"call_id": call_id, "approved": approve}),
     );
+}
+
+fn emit_approval_resolution_refresh(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    session_id: &str,
+    call_id: &str,
+    approve: bool,
+    next_call_id: Option<&str>,
+) -> Result<(), String> {
+    emit_approval_decision(app, state, session_id, call_id, approve);
+    if let Some(next_call_id) = next_call_id {
+        emit_pending_approval_for(app, state, session_id, Some(next_call_id))?;
+    } else {
+        let _ = emit_pending_approval(app, state, session_id)?;
+    }
+    emit(
+        app,
+        "turn_done",
+        Some(session_id),
+        session_status_payload(state, session_id),
+    );
+    Ok(())
 }
 
 fn overlay_running_tool_status(
@@ -13705,6 +13992,101 @@ fn mcp_session_view(view: SessionView) -> Value {
     value
 }
 
+fn safe_project_repo_url(value: &str) -> Option<String> {
+    let mut parsed = url::Url::parse(value).ok()?;
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    Some(parsed.to_string())
+}
+
+fn mcp_project_summary(project: &ProjectRecord) -> Value {
+    json!({
+        "project_id": project.id,
+        "name": project.name,
+        "host_id": project.host_id,
+        "repo_url": safe_project_repo_url(&project.repo_url),
+        "repo_root": project.repo_root,
+        "default_branch": project.default_branch,
+        "board_id": project.board_id,
+        "archived": project.archived,
+        "updated_at": project.updated_at.to_rfc3339(),
+    })
+}
+
+fn mcp_project_agent_summary(agent: &ProjectAgentRecord) -> Value {
+    json!({
+        "agent_id": agent.id,
+        "project_id": agent.project_id,
+        "sort_order": agent.sort_order,
+        "name": agent.name,
+        "role": agent.role,
+        "session_id": agent.session_id,
+        "model": agent.model,
+        "harness": agent.harness,
+        "mode": agent.mode,
+        "worktree_path": agent.worktree_path,
+        "branch": agent.branch,
+        "state": agent.state,
+    })
+}
+
+fn mcp_coordination_snapshot(state: &DesktopState, project_id: &str) -> Result<Value, String> {
+    let project = state
+        .store
+        .load_project(project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    let workflow = parse_workflow(&project.workflow_json)?;
+    let agents = state
+        .store
+        .load_project_agents(project_id)
+        .map_err(|error| error.to_string())?
+        .iter()
+        .map(mcp_project_agent_summary)
+        .collect::<Vec<_>>();
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let (stage_index, status): (i64, String) = connection
+        .query_row(
+            "SELECT stage_index,status FROM project_workflow_state WHERE project_id=?1",
+            [project_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .unwrap_or((0, "open".to_owned()));
+    let snapshot = json!({
+        "source": "sqlite",
+        "project": mcp_project_summary(&project),
+        "agents": agents,
+        "workflow": workflow,
+        "stage_index": stage_index,
+        "status": status,
+        "tasks": load_project_tasks(&connection, project_id)?,
+        "messages": load_project_messages(&connection, project_id)?,
+        "runtime": {
+            "available": false,
+            "note": "live in-memory coordination counters are not part of the SQLite snapshot"
+        }
+    });
+    Ok(redact_approval_value(&snapshot))
+}
+
+fn ensure_mcp_coordination_project_access(
+    caller_project_id: &str,
+    requested_project_id: &str,
+) -> Result<(), String> {
+    if caller_project_id == requested_project_id {
+        Ok(())
+    } else {
+        Err("coordination project is outside the caller project".to_owned())
+    }
+}
+
 impl DesktopControlPlane {
     fn state(&self) -> tauri::State<'_, DesktopState> {
         self.app.state::<DesktopState>()
@@ -13717,6 +14099,275 @@ impl DesktopControlPlane {
             .filter(|value| !value.trim().is_empty())
             .map(str::to_owned)
             .ok_or_else(|| format!("missing required argument: {key}"))
+    }
+}
+
+#[async_trait]
+impl opcos_acp_server::OpcosAcpControlPlane for DesktopControlPlane {
+    async fn session_new(
+        &self,
+        request: AcpNewSessionRequest,
+    ) -> Result<AcpNewSessionResponse, String> {
+        let state = self.state();
+        let cwd = request.cwd.to_string_lossy().into_owned();
+        if cwd.trim().is_empty() {
+            return Err("ACP cwd must not be empty".into());
+        }
+        let host_id = {
+            let settings = {
+                let database = state
+                    .database
+                    .lock()
+                    .map_err(|_| "database lock poisoned")?;
+                load_agent_settings(&database, None)?
+            };
+            let platform = settings
+                .get("default_platform")
+                .and_then(Value::as_str)
+                .unwrap_or("Ubuntu")
+                .to_ascii_lowercase();
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            connection
+                .query_row(
+                    "SELECT id FROM hosts WHERE lower(name) LIKE ?1 ORDER BY id LIMIT 1",
+                    [format!("%{platform}%")],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap_or_else(|_| "local".into())
+        };
+        if host_id == "local" {
+            if !FsPath::new(&cwd).is_dir() {
+                return Err(format!(
+                    "ACP cwd is not an available local workspace: {}",
+                    cwd
+                ));
+            }
+        } else {
+            let client = client_for(&self.state(), &host_id)?;
+            client
+                .health()
+                .await
+                .map_err(|error| format!("remote host unavailable: {error}"))?;
+            client
+                .with_workspace(&cwd)
+                .ls(Some(&cwd))
+                .await
+                .map_err(|error| format!("ACP cwd is unavailable on remote host: {error}"))?;
+        }
+        let view = create_session_for_state(
+            &state,
+            "OPCOS ACP session".into(),
+            None,
+            None,
+            None,
+            None,
+            Some("builtin".into()),
+            Some(cwd),
+            None,
+            None,
+            None,
+        )?;
+        emit(
+            &self.app,
+            "session_list_changed",
+            None,
+            json!({"session_id": view.id}),
+        );
+        Ok(AcpNewSessionResponse::new(view.id))
+    }
+
+    async fn session_prompt(
+        &self,
+        request: AcpPromptRequest,
+        sink: Arc<dyn opcos_acp_server::AcpEventSink>,
+    ) -> Result<AcpStopReason, String> {
+        let session_id = request.session_id.to_string();
+        let text = request
+            .prompt
+            .iter()
+            .map(|block| match block {
+                AcpContentBlock::Text(text) => Ok(text.text.as_str()),
+                _ => Err("unsupported ACP prompt content block".to_owned()),
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .join("");
+        sink.update(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::UserMessageChunk(AcpContentChunk::new(AcpContentBlock::Text(
+                AcpTextContent::new(text.clone()),
+            ))),
+        ))
+        .await?;
+        let state = self.state();
+        let (stream_tx, mut stream_rx) = unbounded_channel();
+        state
+            .acp_streams
+            .lock()
+            .map_err(|_| "ACP stream registry lock poisoned".to_owned())?
+            .insert(session_id.clone(), stream_tx);
+        let stream_sink = Arc::clone(&sink);
+        let stream_session = session_id.clone();
+        let stream_forwarder = tokio::spawn(async move {
+            while let Some((kind, payload)) = stream_rx.recv().await {
+                if let Some(update) = acp_stream_update(&kind, &payload)
+                    && stream_sink
+                        .update(SessionNotification::new(stream_session.clone(), update))
+                        .await
+                        .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let outcome = async {
+            let mut resolved_call_ids = HashSet::new();
+            let mut result = submit_turn_inner_with_origin(
+                self.app.clone(),
+                &state,
+                SubmitRequest {
+                    session_id: session_id.clone(),
+                    text,
+                    attachments: Vec::new(),
+                },
+                ToolOrigin::User,
+            )
+            .await;
+            loop {
+                if let Err(error) = result {
+                    let session = session_for(&self.state(), &session_id)?;
+                    if session.run_state == "interrupted"
+                        || session.stop_reason == "interrupted_by_user"
+                    {
+                        return Ok(AcpStopReason::Cancelled);
+                    }
+                    let pending = self
+                        .state()
+                        .store
+                        .load_pending(&session_id)
+                        .map_err(|store_error| store_error.to_string())?;
+                    if let Some(pending) = next_acp_pending(&pending, &resolved_call_ids) {
+                        let pending_call_id = pending.call_id.clone();
+                        let pending_tool = pending.tool.clone();
+                        let permission = sink.request_permission(
+                            serde_json::from_value(json!({
+                                "sessionId": session_id,
+                                "toolCall": {
+                                    "toolCallId": pending_call_id,
+                                    "title": pending_tool,
+                                    "status": "pending"
+                                },
+                                "options": [
+                                    {
+                                        "optionId": "allow_once",
+                                        "name": "Allow once",
+                                        "kind": "allow_once"
+                                    },
+                                    {
+                                        "optionId": "deny",
+                                        "name": "Deny",
+                                        "kind": "reject_once"
+                                    }
+                                ]
+                            }))
+                            .map_err(|error| error.to_string())?,
+                        );
+                        tokio::pin!(permission);
+                        let external_resolution = wait_for_external_approval_resolution(
+                            Arc::clone(&self.state().store),
+                            session_id.clone(),
+                            pending.call_id.clone(),
+                        );
+                        tokio::pin!(external_resolution);
+                        let response = tokio::select! {
+                            response = &mut permission => response?,
+                            resolution = &mut external_resolution => {
+                                resolution?;
+                                result = Err("ACP approval resolved externally".to_owned());
+                                continue;
+                            }
+                        };
+                        let allow = matches!(
+                            response.outcome,
+                            RequestPermissionOutcome::Selected(selected)
+                                if selected.option_id.0.as_ref() == "allow_once"
+                        );
+                        let engine =
+                            engine_for(&self.app, &self.state(), &session_id, ToolOrigin::User)
+                                .await?;
+                        match engine
+                            .resolve_approval(
+                                &pending.call_id,
+                                if allow {
+                                    opcos_engine::ApprovalOutcome::Approve
+                                } else {
+                                    opcos_engine::ApprovalOutcome::Deny
+                                },
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                emit_approval_resolution_refresh(
+                                    &self.app,
+                                    &self.state(),
+                                    &session_id,
+                                    &pending.call_id,
+                                    allow,
+                                    None,
+                                )?;
+                                resolved_call_ids.insert(pending.call_id.clone());
+                                result = Ok(());
+                            }
+                            Err(EngineError::ApprovalAlreadyProcessed(_)) => {
+                                resolved_call_ids.insert(pending.call_id.clone());
+                                result = Ok(());
+                            }
+                            Err(EngineError::ApprovalPending(next_call_id)) => {
+                                emit_approval_resolution_refresh(
+                                    &self.app,
+                                    &self.state(),
+                                    &session_id,
+                                    &pending.call_id,
+                                    allow,
+                                    Some(&next_call_id),
+                                )?;
+                                result = Err(engine_error_message(EngineError::ApprovalPending(
+                                    next_call_id,
+                                )));
+                            }
+                            Err(next) => {
+                                result = Err(engine_error_message(next));
+                            }
+                        }
+                        continue;
+                    }
+                    if let Ok(stop_reason) = acp_stop_reason(&session) {
+                        return Ok(stop_reason);
+                    }
+                    return Err(error);
+                }
+                let session = session_for(&self.state(), &session_id)?;
+                return acp_stop_reason(&session);
+            }
+        }
+        .await;
+        if let Ok(mut streams) = state.acp_streams.lock() {
+            streams.remove(&session_id);
+        }
+        let mut stream_forwarder = stream_forwarder;
+        if tokio::time::timeout(Duration::from_secs(1), &mut stream_forwarder)
+            .await
+            .is_err()
+        {
+            stream_forwarder.abort();
+        }
+        outcome
+    }
+
+    async fn session_cancel(&self, session_id: String) -> Result<(), String> {
+        interrupt_for_state(self.app.clone(), &self.state(), session_id).await
     }
 }
 
@@ -14146,6 +14797,35 @@ impl opcos_mcp_server::OpcosControlPlane for DesktopControlPlane {
             "repositories": list_environment_repositories_for_state(&state, project_id.as_deref())?
         }))
     }
+
+    async fn coordination_projects(&self, arguments: Value) -> Result<Value, String> {
+        let session_id = Self::required_string(&arguments, "session_id")?;
+        let state = self.state();
+        let agent = state
+            .store
+            .load_project_agent_by_session(&session_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "coordination tools require a project agent session".to_owned())?;
+        let project = state
+            .store
+            .load_project(&agent.project_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "project not found".to_owned())?;
+        Ok(json!({"projects": [mcp_project_summary(&project)]}))
+    }
+
+    async fn coordination_snapshot(&self, arguments: Value) -> Result<Value, String> {
+        let session_id = Self::required_string(&arguments, "session_id")?;
+        let project_id = Self::required_string(&arguments, "project_id")?;
+        let state = self.state();
+        let agent = state
+            .store
+            .load_project_agent_by_session(&session_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "coordination tools require a project agent session".to_owned())?;
+        ensure_mcp_coordination_project_access(&agent.project_id, &project_id)?;
+        mcp_coordination_snapshot(&state, &project_id)
+    }
 }
 
 impl DesktopControlPlane {
@@ -14348,12 +15028,7 @@ async fn resolve_approval(
                 if approve { "allow" } else { "deny" },
             )
             .map_err(|error| error.to_string())?;
-        emit(
-            &app,
-            "approval_resolved",
-            Some(&session_id),
-            json!({"call_id":call_id,"approve":approve}),
-        );
+        emit_approval_resolution_refresh(&app, &state, &session_id, &call_id, approve, None)?;
         return Ok(());
     }
     let host_id = session_host_id(&state, &session_id)?;
@@ -14377,10 +15052,8 @@ async fn resolve_approval(
     match result {
         Ok(()) => {
             let _ = coordination_ingest_session_inner(&state, &session_id, false).await;
-            emit_approval_decision(&app, &state, &session_id, &call_id, approve);
             let calls = approval_artifact_calls(&state, &session_id, &call_id, sequence_before)?;
             record_artifacts_best_effort(&app, &state, &session_id, &host_id, calls).await;
-            let _ = emit_pending_approval(&app, &state, &session_id)?;
             if let Some(task_id) = resumed_task {
                 emit(
                     &app,
@@ -14389,12 +15062,7 @@ async fn resolve_approval(
                     json!({"task_id": task_id, "call_id": call_id}),
                 );
             }
-            emit(
-                &app,
-                "turn_done",
-                Some(&session_id),
-                session_status_payload(&state, &session_id),
-            );
+            emit_approval_resolution_refresh(&app, &state, &session_id, &call_id, approve, None)?;
             Ok(())
         }
         Err(opcos_engine::EngineError::ApprovalPending(next_call_id)) => {
@@ -14405,10 +15073,8 @@ async fn resolve_approval(
                 .store
                 .set_pending_visibility(&session_id, &next_call_id, "inbox")
                 .map_err(|error| error.to_string())?;
-            emit_approval_decision(&app, &state, &session_id, &call_id, approve);
             let calls = approval_artifact_calls(&state, &session_id, &call_id, sequence_before)?;
             record_artifacts_best_effort(&app, &state, &session_id, &host_id, calls).await;
-            emit_pending_approval_for(&app, &state, &session_id, Some(&next_call_id))?;
             if let Some(payload) =
                 coordination_approval_payload(&state, &session_id, &next_call_id)?
             {
@@ -24991,6 +25657,13 @@ fn main() {
         }
         return;
     }
+    if std::env::args().nth(1).as_deref() == Some("acp-serve") {
+        if let Err(error) = run_acp_bridge() {
+            eprintln!("ACP bridge unavailable: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
@@ -25071,6 +25744,27 @@ fn main() {
                 let cause: Box<dyn std::error::Error> = Box::new(std::io::Error::other(error));
                 tauri::Error::Setup(cause.into())
             })?;
+            let acp_state_path = acp_state_path().map_err(|error| {
+                let cause: Box<dyn std::error::Error> = Box::new(std::io::Error::other(error));
+                tauri::Error::Setup(cause.into())
+            })?;
+            let acp_token = load_or_create_mcp_token(&acp_state_path).map_err(|error| {
+                let cause: Box<dyn std::error::Error> = Box::new(std::io::Error::other(error));
+                tauri::Error::Setup(cause.into())
+            })?;
+            let acp_listener =
+                std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(tauri::Error::from)?;
+            acp_listener
+                .set_nonblocking(true)
+                .map_err(tauri::Error::from)?;
+            let acp_port = acp_listener
+                .local_addr()
+                .map_err(tauri::Error::from)?
+                .port();
+            write_acp_state(&acp_state_path, acp_port, &acp_token).map_err(|error| {
+                let cause: Box<dyn std::error::Error> = Box::new(std::io::Error::other(error));
+                tauri::Error::Setup(cause.into())
+            })?;
             let mut jobs_path = path.clone();
             jobs_path.set_file_name("background-jobs");
             let mut trigger_token_bytes = [0_u8; 32];
@@ -25127,6 +25821,7 @@ fn main() {
                 engines: Arc::clone(&engines),
                 acp_engines: AsyncMutex::new(HashMap::new()),
                 acp_event_sessions: AsyncMutex::new(HashSet::new()),
+                acp_streams: Mutex::new(HashMap::new()),
                 trigger_runs: AsyncMutex::new(HashSet::new()),
                 surfaces: AsyncMutex::new(HashMap::new()),
                 ide_proxies: AsyncMutex::new(HashMap::new()),
@@ -25187,6 +25882,22 @@ fn main() {
                 let server = Arc::new(opcos_mcp_server::OpcosMcpServer::new(control_plane));
                 if let Err(error) = server.serve_http(listener, mcp_token).await {
                     eprintln!("MCP HTTP server stopped: {error}");
+                }
+            });
+            let acp_service_handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let listener = match TcpListener::from_std(acp_listener) {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        eprintln!("failed to register ACP listener: {error}");
+                        return;
+                    }
+                };
+                let control_plane = Arc::new(DesktopControlPlane {
+                    app: acp_service_handle.clone(),
+                });
+                if let Err(error) = serve_acp_http(listener, acp_token, control_plane).await {
+                    eprintln!("ACP server stopped: {error}");
                 }
             });
             let trigger_handle = handle.clone();
@@ -27843,6 +28554,46 @@ agents:
     }
 
     #[test]
+    fn mcp_coordination_project_access_is_project_scoped() {
+        assert!(ensure_mcp_coordination_project_access("project-a", "project-a").is_ok());
+        let error = ensure_mcp_coordination_project_access("project-a", "project-b").unwrap_err();
+        assert_eq!(error, "coordination project is outside the caller project");
+    }
+
+    #[test]
+    fn mcp_project_repository_urls_strip_credentials_and_query_values() {
+        let safe = safe_project_repo_url(
+            "https://user:secret@example.com/repo.git?access_token=should-not-appear",
+        )
+        .unwrap();
+        assert_eq!(safe, "https://example.com/repo.git");
+        assert!(!safe.contains("secret"));
+        assert!(!safe.contains("access_token"));
+        assert!(safe_project_repo_url("not a url").is_none());
+    }
+
+    #[test]
+    fn mcp_coordination_snapshot_redacts_nested_secret_values() {
+        let snapshot = redact_approval_value(&json!({
+            "messages": [{
+                "payload": {
+                    "api_token": "secret-token",
+                    "text": "Authorization: Bearer secret-token"
+                }
+            }]
+        }));
+        assert_eq!(
+            snapshot["messages"][0]["payload"]["api_token"],
+            "[redacted]"
+        );
+        assert_eq!(
+            snapshot["messages"][0]["payload"]["text"],
+            "Authorization: Bearer [redacted]"
+        );
+        assert!(!snapshot.to_string().contains("secret-token"));
+    }
+
+    #[test]
     fn askpass_script_contains_no_credential_value() {
         let token = "ghp-test-secret";
         assert!(!ASKPASS_SCRIPT.contains(token));
@@ -28484,5 +29235,76 @@ agents:
             .unwrap();
         assert!(columns.contains(&"mode".to_owned()));
         assert!(columns.contains(&"enabled".to_owned()));
+    }
+
+    #[test]
+    fn acp_pending_selection_skips_already_processed_call() {
+        let pending = vec![opcos_store::PendingRecord {
+            session_id: "session".into(),
+            call_id: "call-1".into(),
+            tool: "tool".into(),
+            arguments: Value::Null,
+            state: "pending".into(),
+        }];
+        let resolved = HashSet::from(["call-1".to_owned()]);
+        assert!(next_acp_pending(&pending, &resolved).is_none());
+    }
+
+    #[test]
+    fn acp_stream_updates_translate_engine_deltas() {
+        let message = acp_stream_update(
+            "stream",
+            &json!({"type":"assistant_delta","text_delta":"hello"}),
+        );
+        assert!(matches!(message, Some(SessionUpdate::AgentMessageChunk(_))));
+        let thought = acp_stream_update(
+            "stream",
+            &json!({"type":"reasoning_delta","reasoning_delta":"thinking"}),
+        );
+        assert!(matches!(thought, Some(SessionUpdate::AgentThoughtChunk(_))));
+        assert_eq!(
+            acp_stream_update(
+                "stream",
+                &json!({"type":"tool_call_delta","tool_call_delta":{}})
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn acp_external_approval_resolution_requires_terminal_or_next_state() {
+        let session = SessionRecord {
+            session_id: "session".into(),
+            workspace: "/workspace".into(),
+            model: "auto".into(),
+            mode: "Interactive".into(),
+            harness: "acp".into(),
+            title: "ACP".into(),
+            extra_roots: vec![],
+            grants: json!({}),
+            pinned: false,
+            archived: false,
+            origin: None,
+            origin_label: None,
+            compaction: json!({}),
+            host_id: "local".into(),
+            provider: None,
+            external_session_id: None,
+            run_state: "idle".into(),
+            stop_reason: "waiting_for_approval".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            project_id: None,
+            agent_id: None,
+        };
+        let pending = vec![opcos_store::PendingRecord {
+            session_id: "session".into(),
+            call_id: "call-1".into(),
+            tool: "tool".into(),
+            arguments: Value::Null,
+            state: "pending".into(),
+        }];
+        assert!(!acp_approval_resolution_ready(&pending, &session, "call-1"));
+        assert!(acp_approval_resolution_ready(&[], &session, "call-1"));
     }
 }
