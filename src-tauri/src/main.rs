@@ -374,6 +374,8 @@ struct DesktopState {
     index_root: PathBuf,
     artifact_root: PathBuf,
     mcp: Arc<McpManager<McpCredentialAdapter>>,
+    mcp_projects: AsyncMutex<HashMap<String, Arc<McpManager<McpCredentialAdapter>>>>,
+    mcp_notification_app: tauri::AppHandle,
     jobs: Arc<BackgroundJobManager>,
     local_browser: Arc<dyn BrowserController>,
     ingress_shutdown: tokio::sync::watch::Sender<bool>,
@@ -9867,10 +9869,92 @@ async fn acp_for(
 struct SessionExternalTools {
     tools: Vec<Value>,
     allowed_names: Vec<String>,
+    errors: Vec<String>,
 }
 
 fn mcp_tool_enabled(disabled: &HashSet<String>, name: &str) -> bool {
     !disabled.contains(name)
+}
+
+async fn configure_mcp_notification_sink(
+    mcp: &Arc<McpManager<McpCredentialAdapter>>,
+    app_handle: &tauri::AppHandle,
+    engines: &Arc<AsyncMutex<HashMap<String, Arc<GuiEngine>>>>,
+) {
+    let app_handle = app_handle.clone();
+    let notification_engines = Arc::clone(engines);
+    mcp.set_notification_sink(Arc::new(move |server_id, version_id, method, uri| {
+        if method == "notifications/tools/list_changed" {
+            let app_handle = app_handle.clone();
+            let engines = Arc::clone(&notification_engines);
+            tauri::async_runtime::spawn(async move {
+                let state = app_handle.state::<DesktopState>();
+                let sessions = engines
+                    .lock()
+                    .await
+                    .iter()
+                    .map(|(session_id, engine)| (session_id.clone(), Arc::clone(engine)))
+                    .collect::<Vec<_>>();
+                for (session_id, engine) in sessions {
+                    if let Err(error) =
+                        refresh_session_mcp_tools(&state, &session_id, &engine).await
+                    {
+                        let _ = app_handle.emit(
+                            "mcp-catalog-refresh-error",
+                            serde_json::json!({
+                                "session_id": session_id,
+                                "error": error,
+                            }),
+                        );
+                    }
+                }
+            });
+        }
+        let _ = app_handle.emit(
+            "mcp-catalog-updated",
+            serde_json::json!({
+                "server_id": server_id,
+                "version_id": version_id,
+                "method": method,
+                "uri": uri,
+            }),
+        );
+    }))
+    .await;
+}
+
+async fn mcp_runtime_for_project(
+    state: &DesktopState,
+    project_id: Option<&str>,
+) -> Arc<McpManager<McpCredentialAdapter>> {
+    let Some(project_id) = project_id else {
+        return Arc::clone(&state.mcp);
+    };
+    if let Some(manager) = state.mcp_projects.lock().await.get(project_id).cloned() {
+        return manager;
+    }
+    let manager = Arc::new(McpManager::new(Arc::new(McpCredentialAdapter {
+        store: state.secrets.clone(),
+        project_id: Some(project_id.to_owned()),
+    })));
+    state
+        .mcp_projects
+        .lock()
+        .await
+        .insert(project_id.to_owned(), Arc::clone(&manager));
+    manager
+}
+
+async fn mcp_runtime_for_engine(
+    state: &DesktopState,
+    project_id: Option<&str>,
+) -> Arc<McpManager<McpCredentialAdapter>> {
+    let manager = mcp_runtime_for_project(state, project_id).await;
+    if project_id.is_some() {
+        configure_mcp_notification_sink(&manager, &state.mcp_notification_app, &state.engines)
+            .await;
+    }
+    manager
 }
 
 fn disabled_mcp_tool_names(
@@ -9914,64 +9998,92 @@ async fn session_external_tools(
 ) -> Result<SessionExternalTools, String> {
     let mut tools = Vec::new();
     let mut allowed_names = Vec::new();
+    let mut errors = Vec::new();
     if host_id != "local" {
-        let response = client_for(state, host_id)?
-            .mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
-            .await
-            .map_err(|error| error.to_string())?;
-        let candidates = response
-            .get("result")
-            .and_then(|value| value.get("tools"))
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|tool| Some((tool.get("name")?.as_str()?.to_owned(), tool.clone())));
-        let connection = state
-            .database
-            .lock()
-            .map_err(|_| "database lock poisoned")?;
-        tools.extend(select_mcp_tools(
-            &connection,
-            session_id,
-            "host",
-            candidates,
-        ));
+        let response = match client_for(state, host_id) {
+            Ok(client) => match client
+                .mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
+                .await
+            {
+                Ok(response) => Some(response),
+                Err(error) => {
+                    errors.push(format!("host MCP tools/list failed: {error}"));
+                    None
+                }
+            },
+            Err(error) => {
+                errors.push(format!("host MCP client unavailable: {error}"));
+                None
+            }
+        };
+        if let Some(response) = response {
+            let candidates = response
+                .get("result")
+                .and_then(|value| value.get("tools"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|tool| Some((tool.get("name")?.as_str()?.to_owned(), tool.clone())));
+            match state.database.lock() {
+                Ok(connection) => {
+                    tools.extend(select_mcp_tools(
+                        &connection,
+                        session_id,
+                        "host",
+                        candidates,
+                    ));
+                }
+                Err(_) => {
+                    errors.push("database lock poisoned while filtering host MCP tools".into())
+                }
+            }
+        }
     }
-    let mcp_configs = {
-        let connection = state
-            .database
-            .lock()
-            .map_err(|_| "database lock poisoned")?;
-        effective_config_objects(
+    let mcp_configs = match state.database.lock() {
+        Ok(connection) => match effective_config_objects(
             &connection,
             session_workspace,
             host_id,
             project_id,
             Some(session_id),
-        )?
-        .into_iter()
-        .filter_map(|(object_id, version_id)| {
-            connection
-                .query_row(
-                    "SELECT o.name,COALESCE(o.server_key,''),v.content
-                     FROM config_object o
-                     JOIN config_object_version v ON v.id=?2
-                     WHERE o.id=?1 AND o.kind='mcp'",
-                    params![object_id.clone(), version_id.clone()],
-                    |row| {
-                        Ok((
-                            object_id,
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            version_id,
-                            serde_json::from_str::<Value>(&row.get::<_, String>(2)?)
-                                .unwrap_or_else(|_| json!({})),
-                        ))
-                    },
-                )
-                .ok()
-        })
-        .collect::<Vec<_>>()
+        ) {
+            Ok(objects) => objects
+                .into_iter()
+                .filter_map(|(object_id, version_id)| {
+                    match connection.query_row(
+                        "SELECT o.name,COALESCE(o.server_key,''),v.content
+                         FROM config_object o
+                         JOIN config_object_version v ON v.id=?2
+                         WHERE o.id=?1 AND o.kind='mcp'",
+                        params![object_id.clone(), version_id.clone()],
+                        |row| {
+                            Ok((
+                                object_id,
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                version_id,
+                                serde_json::from_str::<Value>(&row.get::<_, String>(2)?)
+                                    .unwrap_or_else(|_| json!({})),
+                            ))
+                        },
+                    ) {
+                        Ok(config) => Some(config),
+                        Err(error) => {
+                            errors.push(format!("MCP config lookup failed: {error}"));
+                            None
+                        }
+                    }
+                })
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                errors.push(format!("MCP config enumeration failed: {error}"));
+                Vec::new()
+            }
+        },
+        Err(_) => {
+            errors.push("database lock poisoned while enumerating MCP configs".into());
+            Vec::new()
+        }
     };
     for (object_id, name, server_key, version_id, mut content) in mcp_configs {
         content["object_id"] = Value::String(object_id.clone());
@@ -9983,13 +10095,20 @@ async fn session_external_tools(
         });
         let config = match serde_json::from_value::<McpServerConfig>(content) {
             Ok(config) => config,
-            Err(_) => continue,
+            Err(error) => {
+                errors.push(format!("invalid MCP config: {error}"));
+                continue;
+            }
         };
-        let Ok(server_tools) = mcp_runtime
+        let server_tools = match mcp_runtime
             .connect_with_retry(&config, &version_id, 0)
             .await
-        else {
-            continue;
+        {
+            Ok(tools) => tools,
+            Err(error) => {
+                errors.push(format!("MCP server {object_id} unavailable: {error}"));
+                continue;
+            }
         };
         let candidates = server_tools.into_iter().map(|tool| {
             let qualified_name = tool.qualified_name.clone();
@@ -10003,11 +10122,15 @@ async fn session_external_tools(
                 }),
             )
         });
-        let connection = state
-            .database
-            .lock()
-            .map_err(|_| "database lock poisoned")?;
-        let selected = select_mcp_tools(&connection, session_id, &object_id, candidates);
+        let selected = match state.database.lock() {
+            Ok(connection) => select_mcp_tools(&connection, session_id, &object_id, candidates),
+            Err(_) => {
+                errors.push(format!(
+                    "database lock poisoned while filtering MCP server {object_id}"
+                ));
+                Vec::new()
+            }
+        };
         if host_id == "local" {
             allowed_names.extend(
                 selected
@@ -10021,6 +10144,7 @@ async fn session_external_tools(
     Ok(SessionExternalTools {
         tools,
         allowed_names,
+        errors,
     })
 }
 
@@ -10030,16 +10154,7 @@ async fn refresh_session_mcp_tools(
     engine: &GuiEngine,
 ) -> Result<(), String> {
     let session = session_for(state, session_id)?;
-    let mcp_runtime = session
-        .project_id
-        .as_ref()
-        .map(|project_id| {
-            Arc::new(McpManager::new(Arc::new(McpCredentialAdapter {
-                store: state.secrets.clone(),
-                project_id: Some(project_id.clone()),
-            })))
-        })
-        .unwrap_or_else(|| Arc::clone(&state.mcp));
+    let mcp_runtime = mcp_runtime_for_project(state, session.project_id.as_deref()).await;
     let external = session_external_tools(
         state,
         session_id,
@@ -10050,6 +10165,15 @@ async fn refresh_session_mcp_tools(
     )
     .await?;
     engine.set_external_tools(external.tools).await;
+    for error in external.errors {
+        let _ = state.mcp_notification_app.emit(
+            "mcp-catalog-refresh-error",
+            serde_json::json!({
+                "session_id": session_id,
+                "error": error,
+            }),
+        );
+    }
     Ok(())
 }
 
@@ -10218,16 +10342,7 @@ async fn engine_for_with_context(
         .map_err(|error| error.to_string())
     })
     .collect::<Result<HashMap<_, _>, _>>()?;
-    let mcp_runtime = session
-        .project_id
-        .as_ref()
-        .map(|project_id| {
-            Arc::new(McpManager::new(Arc::new(McpCredentialAdapter {
-                store: state.secrets.clone(),
-                project_id: Some(project_id.clone()),
-            })))
-        })
-        .unwrap_or_else(|| Arc::clone(&state.mcp));
+    let mcp_runtime = mcp_runtime_for_engine(state, session.project_id.as_deref()).await;
     let mut remote_platform = None;
     let (workspace, executor, _remote_client, allowed_tools, asset_reader) = if host_id == "local" {
         let workspace = PathBuf::from(resolved_workspace.clone());
@@ -10655,6 +10770,15 @@ async fn engine_for_with_context(
     )
     .await?;
     engine.set_external_tools(session_tools.tools).await;
+    for error in session_tools.errors {
+        let _ = app.emit(
+            "mcp-catalog-refresh-error",
+            serde_json::json!({
+                "session_id": session_id,
+                "error": error,
+            }),
+        );
+    }
     if host_id == "local"
         && let Some(allowed) = allowed_tools.as_mut()
     {
@@ -24425,48 +24549,11 @@ fn main() {
             })));
             let engines = Arc::new(AsyncMutex::new(HashMap::<String, Arc<GuiEngine>>::new()));
             let app_handle = app.handle().clone();
-            let notification_engines = Arc::clone(&engines);
-            tauri::async_runtime::block_on(mcp.set_notification_sink(Arc::new(
-                move |server_id, version_id, method, uri| {
-                    if method == "notifications/tools/list_changed" {
-                        let app_handle = app_handle.clone();
-                        let engines = Arc::clone(&notification_engines);
-                        tauri::async_runtime::spawn(async move {
-                            let state = app_handle.state::<DesktopState>();
-                            let sessions = engines
-                                .lock()
-                                .await
-                                .iter()
-                                .map(|(session_id, engine)| {
-                                    (session_id.clone(), Arc::clone(engine))
-                                })
-                                .collect::<Vec<_>>();
-                            for (session_id, engine) in sessions {
-                                if let Err(error) =
-                                    refresh_session_mcp_tools(&state, &session_id, &engine).await
-                                {
-                                    let _ = app_handle.emit(
-                                        "mcp-catalog-refresh-error",
-                                        serde_json::json!({
-                                            "session_id": session_id,
-                                            "error": error,
-                                        }),
-                                    );
-                                }
-                            }
-                        });
-                    }
-                    let _ = app_handle.emit(
-                        "mcp-catalog-updated",
-                        serde_json::json!({
-                            "server_id": server_id,
-                            "version_id": version_id,
-                            "method": method,
-                            "uri": uri,
-                        }),
-                    );
-                },
-            )));
+            tauri::async_runtime::block_on(configure_mcp_notification_sink(
+                &mcp,
+                &app_handle,
+                &engines,
+            ));
             let mut jobs_path = path.clone();
             jobs_path.set_file_name("background-jobs");
             let mut trigger_token_bytes = [0_u8; 32];
@@ -24545,6 +24632,8 @@ fn main() {
                 trigger_watcher_reload: Mutex::new(None),
                 trigger_watcher_stop: Mutex::new(None),
                 mcp: Arc::clone(&mcp),
+                mcp_projects: AsyncMutex::new(HashMap::new()),
+                mcp_notification_app: app.handle().clone(),
                 jobs,
                 local_browser,
                 ingress_shutdown,

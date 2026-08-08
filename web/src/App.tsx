@@ -7236,6 +7236,33 @@ function McpManage({
       void subscription.then((unsubscribe) => unsubscribe());
     };
   }, [onError, selectedServerId]);
+  useEffect(() => {
+    let active = true;
+    if (
+      !(window as Window & { __TAURI_INTERNALS__?: unknown })
+        .__TAURI_INTERNALS__
+    ) {
+      return () => {
+        active = false;
+      };
+    }
+    const subscription = listen<{ session_id?: string; error?: string }>(
+      "mcp-catalog-refresh-error",
+      (event) => {
+        if (
+          active &&
+          (!event.payload.session_id || event.payload.session_id === selected?.id) &&
+          event.payload.error
+        ) {
+          onError(event.payload.error);
+        }
+      },
+    );
+    return () => {
+      active = false;
+      void subscription.then((unsubscribe) => unsubscribe());
+    };
+  }, [onError, selected?.id]);
   const selectedServer = servers.find(
     (server) => String(server.id) === selectedServerId,
   );
