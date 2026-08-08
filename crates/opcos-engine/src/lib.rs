@@ -1182,6 +1182,21 @@ where
         target.store(enabled, Ordering::SeqCst);
     }
 
+    fn connector_tools_enabled(&self, kind: &str) -> bool {
+        match kind {
+            "linear" => self.linear_tools_enabled.load(Ordering::SeqCst),
+            "github" => self.github_tools_enabled.load(Ordering::SeqCst),
+            "telegram" => self.telegram_tools_enabled.load(Ordering::SeqCst),
+            "discord" => self.discord_tools_enabled.load(Ordering::SeqCst),
+            "slack" => self.slack_tools_enabled.load(Ordering::SeqCst),
+            "notion" => self.notion_tools_enabled.load(Ordering::SeqCst),
+            "gitlab" => self.gitlab_tools_enabled.load(Ordering::SeqCst),
+            "jira" => self.jira_tools_enabled.load(Ordering::SeqCst),
+            "stripe" => self.stripe_tools_enabled.load(Ordering::SeqCst),
+            _ => false,
+        }
+    }
+
     pub fn set_message_usage_limit(&self, limit: u64) {
         self.message_usage_limit.store(limit, Ordering::SeqCst);
     }
@@ -1287,19 +1302,7 @@ where
             });
         }
         for (kind, prefix) in CONNECTOR_TOOL_PREFIXES {
-            let enabled = match *kind {
-                "linear" => self.linear_tools_enabled.load(Ordering::SeqCst),
-                "github" => self.github_tools_enabled.load(Ordering::SeqCst),
-                "telegram" => self.telegram_tools_enabled.load(Ordering::SeqCst),
-                "discord" => self.discord_tools_enabled.load(Ordering::SeqCst),
-                "slack" => self.slack_tools_enabled.load(Ordering::SeqCst),
-                "notion" => self.notion_tools_enabled.load(Ordering::SeqCst),
-                "gitlab" => self.gitlab_tools_enabled.load(Ordering::SeqCst),
-                "jira" => self.jira_tools_enabled.load(Ordering::SeqCst),
-                "stripe" => self.stripe_tools_enabled.load(Ordering::SeqCst),
-                _ => false,
-            };
-            if !enabled {
+            if !self.connector_tools_enabled(kind) {
                 definitions.retain(|definition| {
                     !tool_name(definition).is_some_and(|name| name.starts_with(prefix))
                 });
@@ -1309,6 +1312,9 @@ where
     }
 
     async fn execute_disclosure_tool(&self, call: &ToolCall) -> Option<Value> {
+        if !self.progressive_tool_disclosure() {
+            return None;
+        }
         if call.name == "tool_search" {
             let query = call
                 .arguments
@@ -1356,12 +1362,11 @@ where
             self.described_tools.lock().await.insert(name.to_owned());
             return Some(json!({"tool": definition}));
         }
-        if self.progressive_tool_disclosure()
-            && self
-                .disclosure_definitions()
-                .await
-                .iter()
-                .any(|definition| tool_name(definition) == Some(call.name.as_str()))
+        if self
+            .disclosure_definitions()
+            .await
+            .iter()
+            .any(|definition| tool_name(definition) == Some(call.name.as_str()))
             && is_progressive_catalog_tool(&call.name)
             && !self.described_tools.lock().await.contains(&call.name)
         {
@@ -2324,19 +2329,7 @@ where
                         allowed.as_ref().and_then(|value| value.as_ref()),
                     );
                     for (kind, prefix) in CONNECTOR_TOOL_PREFIXES {
-                        let enabled = match *kind {
-                            "linear" => self.linear_tools_enabled.load(Ordering::SeqCst),
-                            "github" => self.github_tools_enabled.load(Ordering::SeqCst),
-                            "telegram" => self.telegram_tools_enabled.load(Ordering::SeqCst),
-                            "discord" => self.discord_tools_enabled.load(Ordering::SeqCst),
-                            "slack" => self.slack_tools_enabled.load(Ordering::SeqCst),
-                            "notion" => self.notion_tools_enabled.load(Ordering::SeqCst),
-                            "gitlab" => self.gitlab_tools_enabled.load(Ordering::SeqCst),
-                            "jira" => self.jira_tools_enabled.load(Ordering::SeqCst),
-                            "stripe" => self.stripe_tools_enabled.load(Ordering::SeqCst),
-                            _ => false,
-                        };
-                        if !enabled {
+                        if !self.connector_tools_enabled(kind) {
                             tools.retain(|tool| {
                                 !tool
                                     .get("function")
@@ -5230,6 +5223,28 @@ mod tests {
         let entry = catalog_entry(&linear).unwrap();
         assert_eq!(entry["first_useful_call"], "linear_get_issue(identifier=…)");
         assert_eq!(entry["purpose"], "Read a Linear issue by identifier");
+    }
+
+    #[tokio::test]
+    async fn disabled_progressive_disclosure_does_not_execute_tool_search() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(FakeTools),
+            "session",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let result = engine
+            .execute_disclosure_tool(&ToolCall {
+                id: "call".into(),
+                name: "tool_search".into(),
+                arguments: json!({"query": "browser status"}),
+            })
+            .await;
+        assert!(result.is_none());
     }
 
     #[test]
