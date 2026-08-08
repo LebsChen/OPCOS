@@ -4696,6 +4696,7 @@ async fn initialize_mcp(app: &tauri::AppHandle) {
                 .await;
         }
         if let Ok(tools) = state.mcp.connect_with_retry(&config, &version_id, 0).await {
+            let catalog = state.mcp.cached_catalog(&object_id, &version_id).await;
             let Ok(connection) = state.database.lock() else {
                 continue;
             };
@@ -4721,6 +4722,76 @@ async fn initialize_mcp(app: &tauri::AppHandle) {
                         Utc::now().to_rfc3339()
                     ],
                 );
+            }
+            let _ = transaction.execute(
+                "DELETE FROM mcp_resource_cache
+                 WHERE server_object_id=?1 AND config_version_id=?2",
+                params![object_id, version_id],
+            );
+            let _ = transaction.execute(
+                "DELETE FROM mcp_resource_template_cache
+                 WHERE server_object_id=?1 AND config_version_id=?2",
+                params![object_id, version_id],
+            );
+            let _ = transaction.execute(
+                "DELETE FROM mcp_prompt_cache
+                 WHERE server_object_id=?1 AND config_version_id=?2",
+                params![object_id, version_id],
+            );
+            if let Some(catalog) = catalog {
+                for resource in catalog.resources {
+                    let _ = transaction.execute(
+                        "INSERT INTO mcp_resource_cache
+                         (server_object_id,config_version_id,uri,name,title,description,mime_type,annotations_json,discovered_at)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                        params![
+                            object_id,
+                            version_id,
+                            resource.uri,
+                            resource.name,
+                            resource.title,
+                            resource.description,
+                            resource.mime_type,
+                            resource.annotations.map(|v| v.to_string()),
+                            Utc::now().to_rfc3339()
+                        ],
+                    );
+                }
+                for template in catalog.resource_templates {
+                    let _ = transaction.execute(
+                        "INSERT INTO mcp_resource_template_cache
+                         (server_object_id,config_version_id,uri_template,name,title,description,mime_type,annotations_json,discovered_at)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                        params![
+                            object_id,
+                            version_id,
+                            template.uri_template,
+                            template.name,
+                            template.title,
+                            template.description,
+                            template.mime_type,
+                            template.annotations.map(|v| v.to_string()),
+                            Utc::now().to_rfc3339()
+                        ],
+                    );
+                }
+                for prompt in catalog.prompts {
+                    let _ = transaction.execute(
+                        "INSERT INTO mcp_prompt_cache
+                         (server_object_id,config_version_id,prompt_name,title,description,arguments_json,discovered_at)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                        params![
+                            object_id,
+                            version_id,
+                            prompt.name,
+                            prompt.title,
+                            prompt.description,
+                            serde_json::to_string(&prompt.arguments)
+                                .unwrap_or_else(|_| "[]".into()),
+                            Utc::now().to_rfc3339()
+                        ],
+                    );
+                }
             }
             let _ = transaction.commit();
         }
@@ -5173,6 +5244,40 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                discovered_at TEXT NOT NULL,
                PRIMARY KEY(server_object_id,config_version_id,tool_name)
              );
+             CREATE TABLE IF NOT EXISTS mcp_resource_cache (
+               server_object_id TEXT NOT NULL,
+               config_version_id TEXT NOT NULL,
+               uri TEXT NOT NULL,
+               name TEXT NOT NULL,
+               title TEXT,
+               description TEXT,
+               mime_type TEXT,
+               annotations_json TEXT,
+               discovered_at TEXT NOT NULL,
+               PRIMARY KEY(server_object_id,config_version_id,uri)
+             );
+             CREATE TABLE IF NOT EXISTS mcp_resource_template_cache (
+               server_object_id TEXT NOT NULL,
+               config_version_id TEXT NOT NULL,
+               uri_template TEXT NOT NULL,
+               name TEXT NOT NULL,
+               title TEXT,
+               description TEXT,
+               mime_type TEXT,
+               annotations_json TEXT,
+               discovered_at TEXT NOT NULL,
+               PRIMARY KEY(server_object_id,config_version_id,uri_template)
+             );
+             CREATE TABLE IF NOT EXISTS mcp_prompt_cache (
+               server_object_id TEXT NOT NULL,
+               config_version_id TEXT NOT NULL,
+               prompt_name TEXT NOT NULL,
+               title TEXT,
+               description TEXT,
+               arguments_json TEXT NOT NULL,
+               discovered_at TEXT NOT NULL,
+               PRIMARY KEY(server_object_id,config_version_id,prompt_name)
+             );
              CREATE TABLE IF NOT EXISTS asset_session_selection (
                session_id TEXT NOT NULL,
                asset_id TEXT NOT NULL,
@@ -5258,6 +5363,7 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
     migrate_secret_records(&mut connection)?;
     migrate_agent_settings(&connection)?;
     migrate_mcp_session_tools(&connection)?;
+    migrate_mcp_catalog_cache(&connection)?;
     migrate_config_objects(&mut connection)?;
     migrate_config_scope_model(&connection)?;
     migrate_removed_organization_presets(&connection)?;
@@ -6871,6 +6977,66 @@ fn migrate_mcp_session_tools(connection: &Connection) -> Result<(), String> {
              ALTER TABLE mcp_session_tools_v2 RENAME TO mcp_session_tools;",
         )
         .map_err(|error| error.to_string())
+}
+
+fn migrate_mcp_catalog_cache(connection: &Connection) -> Result<(), String> {
+    let already_applied = connection
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM desktop_schema_migrations
+               WHERE version='p1-2-mcp-catalog-cache'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if already_applied {
+        return Ok(());
+    }
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS mcp_resource_cache (
+               server_object_id TEXT NOT NULL,
+               config_version_id TEXT NOT NULL,
+               uri TEXT NOT NULL,
+               name TEXT NOT NULL,
+               title TEXT,
+               description TEXT,
+               mime_type TEXT,
+               annotations_json TEXT,
+               discovered_at TEXT NOT NULL,
+               PRIMARY KEY(server_object_id,config_version_id,uri)
+             );
+             CREATE TABLE IF NOT EXISTS mcp_resource_template_cache (
+               server_object_id TEXT NOT NULL,
+               config_version_id TEXT NOT NULL,
+               uri_template TEXT NOT NULL,
+               name TEXT NOT NULL,
+               title TEXT,
+               description TEXT,
+               mime_type TEXT,
+               annotations_json TEXT,
+               discovered_at TEXT NOT NULL,
+               PRIMARY KEY(server_object_id,config_version_id,uri_template)
+             );
+             CREATE TABLE IF NOT EXISTS mcp_prompt_cache (
+               server_object_id TEXT NOT NULL,
+               config_version_id TEXT NOT NULL,
+               prompt_name TEXT NOT NULL,
+               title TEXT,
+               description TEXT,
+               arguments_json TEXT NOT NULL,
+               discovered_at TEXT NOT NULL,
+               PRIMARY KEY(server_object_id,config_version_id,prompt_name)
+             );
+             INSERT INTO desktop_schema_migrations(version,applied_at)
+             VALUES ('p1-2-mcp-catalog-cache',datetime('now'));",
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 fn content_hash(content: &str) -> String {
@@ -26795,5 +26961,61 @@ agents:
             ),
             None
         );
+    }
+
+    #[test]
+    fn mcp_catalog_cache_migration_creates_metadata_tables_without_content_table() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE desktop_schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                )",
+                [],
+            )
+            .unwrap();
+        migrate_mcp_catalog_cache(&connection).unwrap();
+        for table in [
+            "mcp_resource_cache",
+            "mcp_resource_template_cache",
+            "mcp_prompt_cache",
+        ] {
+            assert!(
+                connection
+                    .query_row(
+                        "SELECT EXISTS(
+                           SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1
+                         )",
+                        [table],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap()
+            );
+        }
+        assert!(
+            !connection
+                .query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM sqlite_master
+                       WHERE type='table' AND name='mcp_resource_content'
+                     )",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+        let applied: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM desktop_schema_migrations
+                   WHERE version='p1-2-mcp-catalog-cache'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(applied);
+        migrate_mcp_catalog_cache(&connection).unwrap();
     }
 }
