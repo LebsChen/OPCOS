@@ -49,6 +49,7 @@ pub struct Outcome {
     pub session_run_state: String,
     pub session_stop_reason: String,
     pub plan_present: bool,
+    pub plan_in_system_message: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -135,13 +136,19 @@ pub enum EvalError {
 #[derive(Clone)]
 struct ScriptedProvider {
     responses: Arc<Mutex<VecDeque<ScriptedResponse>>>,
+    requests: Arc<Mutex<Vec<ProviderRequest>>>,
 }
 
 impl ScriptedProvider {
     fn new(responses: Vec<ScriptedResponse>) -> Self {
         Self {
             responses: Arc::new(Mutex::new(responses.into())),
+            requests: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn requests(&self) -> Vec<ProviderRequest> {
+        self.requests.lock().expect("script lock poisoned").clone()
     }
 }
 
@@ -153,9 +160,13 @@ impl Provider for ScriptedProvider {
 
     async fn stream(
         &self,
-        _request: ProviderRequest,
+        request: ProviderRequest,
         output: tokio::sync::mpsc::Sender<StreamChunk>,
     ) -> Result<AssistantTurn, ProviderError> {
+        self.requests
+            .lock()
+            .map_err(|_| ProviderError::Protocol("script lock poisoned".into()))?
+            .push(request);
         let response = {
             self.responses
                 .lock()
@@ -487,6 +498,7 @@ pub async fn run_builtin_case(case: &EvalCase) -> Result<CaseReport, EvalError> 
         ));
     };
     let provider = ScriptedProvider::new(script.clone());
+    let provider_requests = provider.clone();
     let tool = Arc::new(FixtureTools {
         workspace: temp.path().to_path_buf(),
         fail_writes: case.name == "failed_write_has_no_created_event",
@@ -505,6 +517,15 @@ pub async fn run_builtin_case(case: &EvalCase) -> Result<CaseReport, EvalError> 
         engine.set_chunk_idle_timeout(Duration::from_millis(5));
     }
     let engine = Arc::new(engine);
+    if case.name == "plan_survives_compaction" {
+        engine
+            .set_resolved_capabilities(Caps {
+                context_window: Some(1),
+                context_window_source: Some("trajectory_eval".into()),
+                ..Caps::default()
+            })
+            .await;
+    }
     let _result = match case.name {
         "steering_is_consumed" => {
             let running_engine = engine.clone();
@@ -548,6 +569,12 @@ pub async fn run_builtin_case(case: &EvalCase) -> Result<CaseReport, EvalError> 
         .load_plan(&session_id)
         .map_err(|error| EvalError::Store(error.to_string()))?
         .is_some();
+    let plan_in_system_message = provider_requests.requests().iter().any(|request| {
+        request.messages.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("system")
+                && message.to_string().contains("trajectory plan")
+        })
+    });
     let event_types = events
         .iter()
         .filter_map(|event| {
@@ -571,6 +598,7 @@ pub async fn run_builtin_case(case: &EvalCase) -> Result<CaseReport, EvalError> 
         session_run_state: stored_session.run_state.clone(),
         session_stop_reason: stored_session.stop_reason.clone(),
         plan_present,
+        plan_in_system_message,
     };
     let cost = TrajectoryCost {
         rounds: events
@@ -616,7 +644,7 @@ pub async fn run_builtin_case(case: &EvalCase) -> Result<CaseReport, EvalError> 
                 .parent()
                 .is_some_and(|parent| parent.join("escape.txt").exists()),
             "approval_pending_resumes" => temp.path().join("approved.txt").is_file(),
-            "plan_survives_compaction" => plan_present,
+            "plan_survives_compaction" => plan_present && plan_in_system_message,
             _ => true,
         };
     if !expected_ok {
