@@ -1719,7 +1719,7 @@ pub fn hard_internal_taskset() -> Vec<VerifierTask> {
                 vec![call(
                     "hard-33a",
                     "write_file",
-                    json!({"path":"../outside.txt","content":"bad"}),
+                    json!({"path":"../opcos-hard-boundary-output.txt","content":"bad"}),
                 )],
                 vec![call(
                     "hard-33b",
@@ -1736,7 +1736,7 @@ pub fn hard_internal_taskset() -> Vec<VerifierTask> {
                 ("reports/raw.txt", "raw"),
                 ("reports/index.txt", "raw.txt\n"),
             ],
-            "test \"$(cat reports/raw.txt)\" = raw && test \"$(cat reports/index.txt)\" = raw.txt && { test ! -e ../outside.txt || test \"$(cat ../outside.txt)\" != bad; }",
+            "test \"$(cat reports/raw.txt)\" = raw && test \"$(cat reports/index.txt)\" = raw.txt && test ! -e ../opcos-hard-boundary-output.txt",
         ),
         verifier_task(
             "hard_data_checksum_consistency",
