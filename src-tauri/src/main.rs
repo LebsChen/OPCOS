@@ -12150,7 +12150,7 @@ fn wake_session_for_turn(store: &SqliteStore, session_id: &str) -> Result<(), St
         .load_session(session_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "session not found".to_owned())?;
-    if session.run_state != "running" && session.stop_reason != "none" {
+    if session.run_state != "running" || session.stop_reason != "none" {
         store
             .update_session_status(session_id, "running", "none")
             .map_err(|error| error.to_string())?;

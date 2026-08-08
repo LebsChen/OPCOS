@@ -131,6 +131,10 @@ describe("GUI boundary behavior", () => {
     expect(effectiveRunningState(false, "idle", true)).toBe(false);
   });
 
+  it("keeps a completed session on the send path", () => {
+    expect(effectiveRunningState(false, "idle", false)).toBe(false);
+  });
+
   it("derives every selected surface from the refreshed session list", () => {
     const running = {
       id: "s",
