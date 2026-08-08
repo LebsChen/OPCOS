@@ -1,9 +1,18 @@
 use async_trait::async_trait;
+use axum::{
+    Router,
+    body::{Body, Bytes},
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::Response,
+    routing::post,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -101,7 +110,7 @@ where
                         "model": {"type": "string"},
                         "provider": {"type": "string"},
                         "mode": {"type": "string"},
-                        "harness": {"type": "string", "enum": ["builtin", "opencode", "acp"]}
+                        "harness": {"type": "string", "enum": ["builtin", "acp"]}
                     },
                     "required": ["title"]
                 }),
@@ -160,6 +169,12 @@ where
     }
 
     async fn handle(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
+        if request.id.is_none() {
+            if request.method.starts_with("notifications/") {
+                return None;
+            }
+            return None;
+        }
         if request.jsonrpc != "2.0" {
             return Some(error_response(
                 request.id,
@@ -170,23 +185,27 @@ where
         }
         let id = request.id.clone();
         let result = match request.method.as_str() {
-            "initialize" => Ok(json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {"tools": {"listChanged": true}},
-                "serverInfo": {"name": "opcos", "version": env!("CARGO_PKG_VERSION")}
-            })),
-            "notifications/initialized" | "notifications/tools/list_changed" => {
-                id.as_ref()?;
-                Ok(Value::Null)
+            "initialize" => {
+                let requested = request
+                    .params
+                    .get("protocolVersion")
+                    .and_then(Value::as_str);
+                Ok(json!({
+                    "protocolVersion": requested
+                        .filter(|version| *version == PROTOCOL_VERSION)
+                        .unwrap_or(PROTOCOL_VERSION),
+                    "capabilities": {"tools": {"listChanged": true}},
+                    "serverInfo": {"name": "opcos", "version": env!("CARGO_PKG_VERSION")}
+                }))
             }
             "tools/list" => Ok(json!({"tools": Self::tools()})),
-            "tools/call" => self.call_tool(request.params).await.map(|value| {
-                json!({
-                    "content": [{"type": "text", "text": value.to_string()}],
-                    "structuredContent": value,
-                    "isError": false
-                })
-            }),
+            "tools/call" => match self.call_tool(request.params).await {
+                Ok(value) => Ok(tool_result(value, false)),
+                Err(ServerError::InvalidRequest(message)) => {
+                    Err(ServerError::InvalidRequest(message))
+                }
+                Err(error) => Ok(tool_result(json!({"error": error.to_string()}), true)),
+            },
             method => Err(ServerError::UnsupportedMethod(method.into())),
         };
         Some(match result {
@@ -198,10 +217,10 @@ where
             },
             Err(error) => error_response(
                 id,
-                if matches!(error, ServerError::UnsupportedMethod(_)) {
-                    -32601
-                } else {
-                    -32000
+                match error {
+                    ServerError::UnsupportedMethod(_) => -32601,
+                    ServerError::InvalidRequest(_) => -32602,
+                    _ => -32603,
                 },
                 &error.to_string(),
                 None,
@@ -255,9 +274,101 @@ where
         Ok(())
     }
 
+    pub async fn serve_http(
+        self: Arc<Self>,
+        listener: TcpListener,
+        bearer_token: String,
+    ) -> Result<(), ServerError> {
+        let state = HttpState {
+            server: self,
+            bearer_token: Arc::from(bearer_token),
+        };
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/mcp", post(handle_http))
+                .with_state(state),
+        )
+        .await
+        .map_err(ServerError::Io)
+    }
+
     pub fn tools_list_changed_notification() -> Value {
         json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{}})
     }
+}
+
+struct HttpState<C> {
+    server: Arc<OpcosMcpServer<C>>,
+    bearer_token: Arc<str>,
+}
+
+impl<C> Clone for HttpState<C> {
+    fn clone(&self) -> Self {
+        Self {
+            server: Arc::clone(&self.server),
+            bearer_token: Arc::clone(&self.bearer_token),
+        }
+    }
+}
+
+async fn handle_http<C>(
+    State(state): State<HttpState<C>>,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Response
+where
+    C: OpcosControlPlane + 'static,
+{
+    let authorized = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|value| value == state.bearer_token.as_ref());
+    if !authorized {
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .body(Body::from("unauthorized"))
+            .expect("static response is valid");
+    }
+    let request = match serde_json::from_slice::<JsonRpcRequest>(&bytes) {
+        Ok(request) => request,
+        Err(error) => {
+            let response =
+                error_response(None, -32700, "parse error", Some(json!(error.to_string())));
+            return json_response(StatusCode::OK, &response);
+        }
+    };
+    match state.server.handle(request).await {
+        Some(response) => json_response(StatusCode::OK, &response),
+        None => Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .body(Body::empty())
+            .expect("empty response is valid"),
+    }
+}
+
+fn json_response(status: StatusCode, value: &impl Serialize) -> Response {
+    let body = serde_json::to_vec(value)
+        .unwrap_or_else(|_| b"{\"error\":\"serialization failure\"}".to_vec());
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .expect("JSON response is valid")
+}
+
+fn tool_result(value: Value, is_error: bool) -> Value {
+    let text = value
+        .get("error")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string());
+    json!({
+        "content": [{"type": "text", "text": text}],
+        "structuredContent": value,
+        "isError": is_error
+    })
 }
 
 fn tool(name: &str, description: &str, input_schema: Value) -> ToolDefinition {
@@ -304,6 +415,7 @@ mod tests {
 
     struct FakeControlPlane {
         calls: AtomicUsize,
+        fail_interact: bool,
     }
 
     #[async_trait]
@@ -318,6 +430,9 @@ mod tests {
 
         async fn session_interact(&self, arguments: Value) -> Result<Value, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_interact {
+                return Err("approval is pending".into());
+            }
             Ok(json!({
                 "session_id": arguments["session_id"],
                 "action": arguments["action"]
@@ -337,6 +452,7 @@ mod tests {
     async fn stdio_protocol_dispatches_devin_tools_and_notifications() {
         let fake = Arc::new(FakeControlPlane {
             calls: AtomicUsize::new(0),
+            fail_interact: false,
         });
         let server = OpcosMcpServer::new(fake.clone());
         let input = concat!(
@@ -344,7 +460,9 @@ mod tests {
             "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
             "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n",
             "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"devin_session_interact\",\"arguments\":{\"session_id\":\"session-1\",\"action\":\"get\"}}}\n",
-            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\",\"params\":{}}\n"
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\",\"params\":{}}\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{}}\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"unknown\"}\n"
         );
         let mut output = Vec::new();
         server
@@ -370,6 +488,7 @@ mod tests {
     async fn stdio_protocol_returns_json_rpc_errors_for_unknown_tools() {
         let server = OpcosMcpServer::new(Arc::new(FakeControlPlane {
             calls: AtomicUsize::new(0),
+            fail_interact: false,
         }));
         let mut output = Vec::new();
         server
@@ -383,6 +502,92 @@ mod tests {
             .unwrap();
         let response: Value =
             serde_json::from_slice(output.split(|byte| *byte == b'\n').next().unwrap()).unwrap();
-        assert_eq!(response["error"]["code"], -32601);
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(
+            response["result"]["content"][0]["text"],
+            "unsupported method: missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_failures_are_mcp_errors_and_notifications_are_silent() {
+        let server = OpcosMcpServer::new(Arc::new(FakeControlPlane {
+            calls: AtomicUsize::new(0),
+            fail_interact: true,
+        }));
+        let input = concat!(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"devin_session_interact\",\"arguments\":{\"session_id\":\"session-1\",\"action\":\"message\",\"message\":\"hi\"}}}\n"
+        );
+        let mut output = Vec::new();
+        server
+            .serve_stdio(BufReader::new(input.as_bytes()), &mut output)
+            .await
+            .unwrap();
+        let response: Value =
+            serde_json::from_slice(output.split(|byte| *byte == b'\n').next().unwrap()).unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(
+            response["result"]["content"][0]["text"],
+            "control-plane error: approval is pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_negotiates_supported_protocol_version() {
+        let server = OpcosMcpServer::new(Arc::new(FakeControlPlane {
+            calls: AtomicUsize::new(0),
+            fail_interact: false,
+        }));
+        let input = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{PROTOCOL_VERSION}\"}}}}\n\
+             {{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"older\"}}}}\n"
+        );
+        let mut output = Vec::new();
+        server
+            .serve_stdio(BufReader::new(input.as_bytes()), &mut output)
+            .await
+            .unwrap();
+        let responses = output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(responses[0]["result"]["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(responses[1]["result"]["protocolVersion"], PROTOCOL_VERSION);
+    }
+
+    #[tokio::test]
+    async fn http_transport_requires_bearer_authentication() {
+        let server = Arc::new(OpcosMcpServer::new(Arc::new(FakeControlPlane {
+            calls: AtomicUsize::new(0),
+            fail_interact: false,
+        })));
+        let state = HttpState {
+            server: Arc::clone(&server),
+            bearer_token: Arc::from("secret-token"),
+        };
+        let unauthorized = handle_http(
+            State(state.clone()),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#),
+        )
+        .await;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer secret-token".parse().unwrap());
+        let authorized = handle_http(
+            State(state),
+            headers,
+            Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#),
+        )
+        .await;
+        assert_eq!(authorized.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(authorized.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let response: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response["id"], 1);
+        assert!(response["result"]["tools"].is_array());
     }
 }

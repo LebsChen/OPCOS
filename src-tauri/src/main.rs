@@ -118,7 +118,7 @@ impl opcos_assets::RemoteAssetReader for HostAssetReader {
 }
 use tauri::{Emitter, Manager, RunEvent, State};
 use tauri_plugin_opener::OpenerExt;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -139,6 +139,127 @@ fn configure_no_window(_command: &mut ProcessCommand) {}
 
 const SECRET_SERVICE: &str = "com.opcos.desktop";
 const ASKPASS_SCRIPT: &str = "if (($args -join ' ') -match 'Username') { $env:OPCOS_GIT_USERNAME } else { $env:OPCOS_GIT_PASSWORD }";
+const MCP_STATE_FILE: &str = "mcp-server.json";
+
+#[derive(Debug, Deserialize, Serialize)]
+struct McpBridgeState {
+    host: String,
+    port: u16,
+    token: String,
+}
+
+fn mcp_state_path() -> Result<PathBuf, String> {
+    Ok(dirs::config_dir()
+        .ok_or_else(|| "OPCOS configuration directory is unavailable".to_owned())?
+        .join("com.opcos.desktop")
+        .join(MCP_STATE_FILE))
+}
+
+fn load_or_create_mcp_token(path: &FsPath) -> Result<String, String> {
+    if let Ok(content) = std::fs::read_to_string(path) {
+        let state = serde_json::from_str::<McpBridgeState>(&content)
+            .map_err(|error| format!("invalid MCP state file: {error}"))?;
+        if !state.token.is_empty() {
+            return Ok(state.token);
+        }
+    }
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| format!("failed to generate MCP token: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn write_mcp_state(path: &FsPath, port: u16, token: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "MCP state path has no parent".to_owned())?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temporary = path.with_extension("tmp");
+    let content = serde_json::to_vec(&McpBridgeState {
+        host: "127.0.0.1".into(),
+        port,
+        token: token.into(),
+    })
+    .map_err(|error| error.to_string())?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| error.to_string())?;
+    file.write_all(&content)
+        .map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    std::fs::rename(temporary, path).map_err(|error| error.to_string())
+}
+
+fn run_mcp_bridge() -> Result<(), String> {
+    let path = mcp_state_path()?;
+    let state: McpBridgeState = serde_json::from_str(
+        &std::fs::read_to_string(&path)
+            .map_err(|_| "OPCOS is not running; MCP endpoint state is unavailable".to_owned())?,
+    )
+    .map_err(|error| format!("invalid OPCOS MCP endpoint state: {error}"))?;
+    if state.host != "127.0.0.1" && state.host != "localhost" {
+        return Err("OPCOS MCP endpoint is not loopback-only".into());
+    }
+    if state.port == 0 || state.token.trim().is_empty() {
+        return Err("invalid OPCOS MCP endpoint state".into());
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("failed to start MCP bridge runtime: {error}"))?;
+    runtime.block_on(async move {
+        tokio::net::TcpStream::connect((state.host.as_str(), state.port))
+            .await
+            .map_err(|_| "OPCOS is not running; MCP endpoint is unreachable".to_owned())?;
+        let client = reqwest::Client::new();
+        let authorization = format!("Bearer {}", state.token);
+        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        let mut stdout = tokio::io::stdout();
+        while let Some(line) = lines.next_line().await.map_err(|error| error.to_string())? {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let response = client
+                .post(format!("http://{}:{}/mcp", state.host, state.port))
+                .header(reqwest::header::AUTHORIZATION, &authorization)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(line)
+                .send()
+                .await
+                .map_err(|_| "OPCOS MCP endpoint became unreachable".to_owned())?;
+            if response.status() == reqwest::StatusCode::NO_CONTENT {
+                continue;
+            }
+            if !response.status().is_success() {
+                return Err(format!(
+                    "OPCOS MCP endpoint rejected the request with HTTP {}",
+                    response.status()
+                ));
+            }
+            let body = response
+                .bytes()
+                .await
+                .map_err(|_| "OPCOS MCP endpoint returned an unreadable response".to_owned())?;
+            stdout
+                .write_all(&body)
+                .await
+                .map_err(|error| error.to_string())?;
+            stdout
+                .write_all(b"\n")
+                .await
+                .map_err(|error| error.to_string())?;
+            stdout.flush().await.map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    })
+}
 mod ci_repair;
 mod external_ingress;
 mod repo_index;
@@ -11647,10 +11768,39 @@ async fn start_ide_proxy(
     Ok(port)
 }
 
-#[tauri::command]
+#[tauri::command(rename = "create_session")]
 #[allow(clippy::too_many_arguments)]
-fn create_session(
+fn create_session_command(
     state: State<'_, DesktopState>,
+    title: String,
+    host_id: Option<String>,
+    model: Option<String>,
+    provider: Option<String>,
+    mode: Option<String>,
+    harness: Option<String>,
+    workspace: Option<String>,
+    project_id: Option<String>,
+    agent_id: Option<String>,
+    system_prompt: Option<String>,
+) -> Result<SessionView, String> {
+    create_session_for_state(
+        &state,
+        title,
+        host_id,
+        model,
+        provider,
+        mode,
+        harness,
+        workspace,
+        project_id,
+        agent_id,
+        system_prompt,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_session_for_state(
+    state: &DesktopState,
     title: String,
     host_id: Option<String>,
     model: Option<String>,
@@ -11737,7 +11887,7 @@ fn create_session(
             .or_else(|| {
                 provider
                     .as_deref()
-                    .and_then(|provider| provider_descriptor_for(&state, provider).ok())
+                    .and_then(|provider| provider_descriptor_for(state, provider).ok())
                     .and_then(|descriptor| descriptor.recommended_model)
             })
             .unwrap_or(requested_model)
@@ -11804,7 +11954,7 @@ fn create_session(
     drop(connection);
     let now = Utc::now();
     save_session_via_factory(
-        &state,
+        state,
         SessionRecord {
             session_id: id.clone(),
             workspace: workspace.clone().unwrap_or_default(),
@@ -11875,7 +12025,7 @@ fn create_session(
             .map_err(|error| error.to_string())?;
     }
     audit(
-        &state,
+        state,
         &id,
         "session_created",
         json!({"session_id": id, "host_id": host_id, "model": model}),
@@ -12041,8 +12191,12 @@ async fn harness_options(
     Ok(options)
 }
 
-#[tauri::command]
-fn list_sessions(state: State<'_, DesktopState>) -> Result<Vec<SessionView>, String> {
+#[tauri::command(rename = "list_sessions")]
+fn list_sessions_command(state: State<'_, DesktopState>) -> Result<Vec<SessionView>, String> {
+    list_sessions_for_state(&state)
+}
+
+fn list_sessions_for_state(state: &DesktopState) -> Result<Vec<SessionView>, String> {
     let sessions = state
         .store
         .load_sessions()
@@ -12104,6 +12258,13 @@ async fn read_transcript(
     state: State<'_, DesktopState>,
     session_id: String,
 ) -> Result<Vec<Value>, String> {
+    read_transcript_for_state(&state, session_id).await
+}
+
+async fn read_transcript_for_state(
+    state: &DesktopState,
+    session_id: String,
+) -> Result<Vec<Value>, String> {
     let active_call_ids = {
         let engines = state.engines.lock().await;
         match engines.get(&session_id) {
@@ -12138,9 +12299,16 @@ async fn read_transcript(
         })
 }
 
-#[tauri::command]
-fn read_session_events(
+#[tauri::command(rename = "read_session_events")]
+fn read_session_events_command(
     state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Vec<Value>, String> {
+    read_session_events_for_state(&state, session_id)
+}
+
+fn read_session_events_for_state(
+    state: &DesktopState,
     session_id: String,
 ) -> Result<Vec<Value>, String> {
     state
@@ -13338,10 +13506,18 @@ async fn interrupt(
     state: State<'_, DesktopState>,
     session_id: String,
 ) -> Result<(), String> {
-    let session = session_for(&state, &session_id)?;
+    interrupt_for_state(app, &state, session_id).await
+}
+
+async fn interrupt_for_state(
+    app: tauri::AppHandle,
+    state: &DesktopState,
+    session_id: String,
+) -> Result<(), String> {
+    let session = session_for(state, &session_id)?;
     reject_removed_opencode_session(&session)?;
     if session.harness == "acp" {
-        let harness = acp_for(&state, &session_id).await?;
+        let harness = acp_for(state, &session_id).await?;
         harness.interrupt();
         state
             .store
@@ -13351,18 +13527,18 @@ async fn interrupt(
             &app,
             "turn_done",
             Some(&session_id),
-            session_status_payload(&state, &session_id),
+            session_status_payload(state, &session_id),
         );
         return Ok(());
     }
-    let engine = engine_for(&app, &state, &session_id, ToolOrigin::User).await?;
+    let engine = engine_for(&app, state, &session_id, ToolOrigin::User).await?;
     engine.interrupt();
     state
         .store
         .update_session_status(&session_id, "interrupted", "interrupted_by_user")
         .map_err(|error| error.to_string())?;
     audit(
-        &state,
+        state,
         &session_id,
         "session_interrupted",
         json!({"session_id": session_id}),
@@ -13377,9 +13553,202 @@ async fn interrupt(
         &app,
         "turn_done",
         Some(&session_id),
-        session_status_payload(&state, &session_id),
+        session_status_payload(state, &session_id),
     );
     Ok(())
+}
+
+struct DesktopControlPlane {
+    app: tauri::AppHandle,
+}
+
+impl DesktopControlPlane {
+    fn state(&self) -> tauri::State<'_, DesktopState> {
+        self.app.state::<DesktopState>()
+    }
+
+    fn required_string(arguments: &Value, key: &str) -> Result<String, String> {
+        arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("missing required argument: {key}"))
+    }
+}
+
+#[async_trait]
+impl opcos_mcp_server::OpcosControlPlane for DesktopControlPlane {
+    async fn session_create(&self, arguments: Value) -> Result<Value, String> {
+        let state = self.state();
+        let title = arguments
+            .get("title")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("OPCOS MCP session")
+            .to_owned();
+        let view = create_session_for_state(
+            &state,
+            title,
+            arguments
+                .get("host_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            arguments
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            arguments
+                .get("provider")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            arguments
+                .get("mode")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            arguments
+                .get("harness")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            arguments
+                .get("workspace")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            arguments
+                .get("project_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            arguments
+                .get("agent_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            arguments
+                .get("system_prompt")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        )?;
+        let session_id = view.id.clone();
+        if let Some(prompt) = arguments
+            .get("prompt")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            submit_turn_inner_with_origin(
+                self.app.clone(),
+                &state,
+                SubmitRequest {
+                    session_id: session_id.clone(),
+                    text: prompt.to_owned(),
+                    attachments: vec![],
+                },
+                ToolOrigin::User,
+            )
+            .await?;
+        }
+        Ok(json!({"session_id": session_id, "session": view}))
+    }
+
+    async fn session_search(&self, arguments: Value) -> Result<Value, String> {
+        let state = self.state();
+        let query = arguments
+            .get("query")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase);
+        let status = arguments.get("status").and_then(Value::as_str);
+        let project_id = arguments.get("project_id").and_then(Value::as_str);
+        let limit = arguments
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(100)
+            .clamp(1, 500) as usize;
+        let sessions = list_sessions_for_state(&state)?
+            .into_iter()
+            .filter(|session| {
+                query.as_deref().is_none_or(|query| {
+                    session.id.to_ascii_lowercase().contains(query)
+                        || session.title.to_ascii_lowercase().contains(query)
+                })
+            })
+            .filter(|session| status.is_none_or(|status| session.run_state == status))
+            .filter(|session| project_id.is_none_or(|id| session.project_id.as_deref() == Some(id)))
+            .take(limit)
+            .collect::<Vec<_>>();
+        Ok(json!({"sessions": sessions}))
+    }
+
+    async fn session_interact(&self, arguments: Value) -> Result<Value, String> {
+        let session_id = Self::required_string(&arguments, "session_id")?;
+        let action = Self::required_string(&arguments, "action")?;
+        let state = self.state();
+        match action.as_str() {
+            "get" => list_sessions_for_state(&state)?
+                .into_iter()
+                .find(|session| session.id == session_id)
+                .map(|session| json!({"session": session}))
+                .ok_or_else(|| format!("session not found: {session_id}")),
+            "get_messages" => Ok(json!({
+                "session_id": session_id,
+                "messages": read_transcript_for_state(&state, session_id.clone()).await?
+            })),
+            "message" => {
+                let message = Self::required_string(&arguments, "message")?;
+                submit_turn_inner_with_origin(
+                    self.app.clone(),
+                    &state,
+                    SubmitRequest {
+                        session_id: session_id.clone(),
+                        text: message,
+                        attachments: vec![],
+                    },
+                    ToolOrigin::User,
+                )
+                .await?;
+                let session = list_sessions_for_state(&state)?
+                    .into_iter()
+                    .find(|session| session.id == session_id)
+                    .ok_or_else(|| format!("session not found: {session_id}"))?;
+                Ok(json!({"session": session}))
+            }
+            "terminate" => {
+                interrupt_for_state(self.app.clone(), &state, session_id.clone()).await?;
+                Ok(json!({"session_id": session_id, "terminated": true}))
+            }
+            _ => Err(format!("unsupported session interaction: {action}")),
+        }
+    }
+
+    async fn session_events(&self, arguments: Value) -> Result<Value, String> {
+        let session_id = Self::required_string(&arguments, "session_id")?;
+        let state = self.state();
+        Ok(json!({
+            "session_id": session_id,
+            "events": read_session_events_for_state(&state, session_id)?
+        }))
+    }
+
+    async fn session_gather(&self, arguments: Value) -> Result<Value, String> {
+        let session_id = Self::required_string(&arguments, "session_id")?;
+        let timeout = arguments
+            .get("timeout_seconds")
+            .and_then(Value::as_u64)
+            .unwrap_or(30)
+            .clamp(1, 300);
+        let deadline = Instant::now() + Duration::from_secs(timeout);
+        loop {
+            let state = self.state();
+            let session = list_sessions_for_state(&state)?
+                .into_iter()
+                .find(|session| session.id == session_id)
+                .ok_or_else(|| format!("session not found: {session_id}"))?;
+            if session.run_state != "running" && session.run_state != "waiting" {
+                return Ok(json!({"session": session}));
+            }
+            if Instant::now() >= deadline {
+                return Ok(json!({"session": session, "timed_out": true}));
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
 }
 
 #[tauri::command]
@@ -24015,6 +24384,13 @@ async fn validate_provider_key(
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("mcp-serve") {
+        if let Err(error) = run_mcp_bridge() {
+            eprintln!("MCP bridge unavailable: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
@@ -24074,6 +24450,27 @@ fn main() {
                     );
                 },
             )));
+            let mcp_state_path = mcp_state_path().map_err(|error| {
+                let cause: Box<dyn std::error::Error> = Box::new(std::io::Error::other(error));
+                tauri::Error::Setup(cause.into())
+            })?;
+            let mcp_token = load_or_create_mcp_token(&mcp_state_path).map_err(|error| {
+                let cause: Box<dyn std::error::Error> = Box::new(std::io::Error::other(error));
+                tauri::Error::Setup(cause.into())
+            })?;
+            let mcp_listener =
+                std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(tauri::Error::from)?;
+            mcp_listener
+                .set_nonblocking(true)
+                .map_err(tauri::Error::from)?;
+            let mcp_port = mcp_listener
+                .local_addr()
+                .map_err(tauri::Error::from)?
+                .port();
+            write_mcp_state(&mcp_state_path, mcp_port, &mcp_token).map_err(|error| {
+                let cause: Box<dyn std::error::Error> = Box::new(std::io::Error::other(error));
+                tauri::Error::Setup(cause.into())
+            })?;
             let mut jobs_path = path.clone();
             jobs_path.set_file_name("background-jobs");
             let mut trigger_token_bytes = [0_u8; 32];
@@ -24175,6 +24572,23 @@ fn main() {
                 let _ = recovery_jobs.recover(&local_host).await;
             });
             let handle = app.handle().clone();
+            let mcp_service_handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let listener = match TcpListener::from_std(mcp_listener) {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        eprintln!("failed to register MCP listener: {error}");
+                        return;
+                    }
+                };
+                let control_plane = Arc::new(DesktopControlPlane {
+                    app: mcp_service_handle.clone(),
+                });
+                let server = Arc::new(opcos_mcp_server::OpcosMcpServer::new(control_plane));
+                if let Err(error) = server.serve_http(listener, mcp_token).await {
+                    eprintln!("MCP HTTP server stopped: {error}");
+                }
+            });
             let trigger_handle = handle.clone();
             tauri::async_runtime::spawn(async move {
                 let trigger_listener = match TcpListener::from_std(trigger_listener) {
@@ -24267,7 +24681,7 @@ fn main() {
             run_computer_use,
             test_host,
             delete_host,
-            create_session,
+            create_session_command,
             list_projects,
             create_project,
             create_project_from_team_template,
@@ -24279,8 +24693,8 @@ fn main() {
             delete_project_agent,
             harness_options,
             change_harness,
-            list_sessions,
-            read_session_events,
+            list_sessions_command,
+            read_session_events_command,
             acp_session_capabilities,
             acp_set_mode,
             acp_set_config_option,
