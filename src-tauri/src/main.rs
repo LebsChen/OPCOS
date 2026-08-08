@@ -12186,6 +12186,44 @@ fn read_session_events(
         .map(|events| events.into_iter().map(|record| record.event).collect())
 }
 
+#[tauri::command]
+async fn acp_session_capabilities(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Value, String> {
+    Ok(acp_for(&state, &session_id)
+        .await?
+        .session_capabilities()
+        .await)
+}
+
+#[tauri::command]
+async fn acp_set_mode(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    mode_id: String,
+) -> Result<(), String> {
+    acp_for(&state, &session_id)
+        .await?
+        .set_mode(&mode_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn acp_set_config_option(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    config_id: String,
+    value: Value,
+) -> Result<(), String> {
+    acp_for(&state, &session_id)
+        .await?
+        .set_config_option(&config_id, value)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 fn artifact_kind(path: &str) -> (&'static str, Option<&'static str>) {
     match path
         .rsplit('.')
@@ -13197,6 +13235,27 @@ async fn submit_opencode_turn_inner(
                         "stream",
                         Some(&event_session),
                         json!({"plan_update":{"entries":entries}}),
+                    ),
+                    opcos_engine::HarnessEvent::SessionModeUpdate {
+                        current_mode_id,
+                        available_modes,
+                    } => emit(
+                        &event_app,
+                        "acp_session",
+                        Some(&event_session),
+                        json!({"kind":"mode_update","currentModeId":current_mode_id,"availableModes":available_modes}),
+                    ),
+                    opcos_engine::HarnessEvent::SessionConfigUpdate { config_options } => emit(
+                        &event_app,
+                        "acp_session",
+                        Some(&event_session),
+                        json!({"kind":"config_update","configOptions":config_options}),
+                    ),
+                    opcos_engine::HarnessEvent::AvailableCommandsUpdate { commands } => emit(
+                        &event_app,
+                        "acp_session",
+                        Some(&event_session),
+                        json!({"kind":"commands_update","availableCommands":commands}),
                     ),
                     opcos_engine::HarnessEvent::ApprovalRequested(request) => {
                         let unattended = event_store.is_unattended(&event_session).unwrap_or(false);
@@ -24492,6 +24551,9 @@ fn main() {
             change_harness,
             list_sessions,
             read_session_events,
+            acp_session_capabilities,
+            acp_set_mode,
+            acp_set_config_option,
             read_transcript,
             submit_turn,
             list_artifacts,

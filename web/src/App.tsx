@@ -174,6 +174,25 @@ type SlashCommand = {
   body: string;
   scope: string;
   default_body?: string;
+  description?: string;
+  input?: { hint?: string };
+};
+type AcpCapabilities = {
+  currentModeId?: string | null;
+  availableModes: Array<{ id: string; name: string; description?: string }>;
+  configOptions: Array<{
+    id: string;
+    name: string;
+    description?: string;
+    type: "select" | "boolean";
+    currentValue: string | boolean;
+    options?: Array<{ value: string; name: string; description?: string }>;
+  }>;
+  availableCommands: Array<{
+    name: string;
+    description?: string;
+    input?: { hint?: string };
+  }>;
 };
 type SkillUsageDashboard = {
   skills: Array<{
@@ -10454,6 +10473,8 @@ function AppContent() {
   };
   const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
   const [transcript, setTranscript] = useState<TimelineEvent[]>([]);
+  const [acpCapabilities, setAcpCapabilities] =
+    useState<AcpCapabilities | null>(null);
   const [liveTranscript, setLiveTranscript] = useState<TimelineEvent[]>([]);
   const transcriptScrollRef = useRef<HTMLDivElement>(null);
   const transcriptBottomRef = useRef<HTMLDivElement>(null);
@@ -10586,6 +10607,58 @@ function AppContent() {
   const [selectedHarnessOptions, setSelectedHarnessOptions] = useState<
     Array<{ id: string; label: string; available: boolean; reason?: string }>
   >([]);
+  useEffect(() => {
+    if (!selected || selected.harness !== "acp") {
+      setAcpCapabilities(null);
+      return;
+    }
+    void command<AcpCapabilities>("acp_session_capabilities", {
+      sessionId: selected.id,
+    })
+      .then(setAcpCapabilities)
+      .catch(() => setAcpCapabilities(null));
+  }, [selected?.id, selected?.harness]);
+  useEffect(() => {
+    const subscription = listen<{
+      kind: string;
+      session_id?: string;
+      payload: {
+        kind?: string;
+        currentModeId?: string;
+        availableModes?: AcpCapabilities["availableModes"];
+        configOptions?: AcpCapabilities["configOptions"];
+        availableCommands?: AcpCapabilities["availableCommands"];
+      };
+    }>("opcos://event", (event) => {
+      if (
+        !selected?.id ||
+        event.payload.kind !== "acp_session" ||
+        event.payload.session_id !== selected.id
+      )
+        return;
+      const payload = event.payload.payload;
+      setAcpCapabilities((current) => {
+        if (!current) return current;
+        if (payload.kind === "mode_update")
+          return {
+            ...current,
+            currentModeId: payload.currentModeId,
+            availableModes: payload.availableModes || current.availableModes,
+          };
+        if (payload.kind === "config_update")
+          return { ...current, configOptions: payload.configOptions || [] };
+        if (payload.kind === "commands_update")
+          return {
+            ...current,
+            availableCommands: payload.availableCommands || [],
+          };
+        return current;
+      });
+    });
+    return () => {
+      void subscription.then((unlisten) => unlisten());
+    };
+  }, [selected?.id]);
   const [homeWorkspace, setHomeWorkspace] = useState("");
   const [secretBackend, setSecretBackend] = useState("");
   const generation = useRef(0);
@@ -11527,7 +11600,43 @@ function AppContent() {
                     onInterrupt={interrupt}
                     assets={assets}
                     secrets={secrets}
-                    slashCommands={slashCommands}
+                    slashCommands={
+                      selected.harness === "acp"
+                        ? (acpCapabilities?.availableCommands || []).map(
+                            (item) => ({
+                              name: item.name.startsWith("/")
+                                ? item.name
+                                : `/${item.name}`,
+                              body: "",
+                              kind: "acp",
+                              description: item.description,
+                              input: item.input,
+                            }),
+                          )
+                        : slashCommands
+                    }
+                    acpMode={
+                      acpCapabilities
+                        ? {
+                            currentModeId: acpCapabilities.currentModeId,
+                            availableModes: acpCapabilities.availableModes,
+                          }
+                        : undefined
+                    }
+                    acpConfigOptions={acpCapabilities?.configOptions}
+                    onAcpModeChange={(modeId) =>
+                      void command("acp_set_mode", {
+                        sessionId: selected.id,
+                        modeId,
+                      }).catch(onError)
+                    }
+                    onAcpConfigOptionChange={(configId, value) =>
+                      void command("acp_set_config_option", {
+                        sessionId: selected.id,
+                        configId,
+                        value,
+                      }).catch(onError)
+                    }
                     onUploadFile={uploadTextAttachment}
                     resetKey={selected.id}
                   />
