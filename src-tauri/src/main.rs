@@ -12870,7 +12870,12 @@ fn export_session_trace(
     session_id: String,
     output_dir: String,
 ) -> Result<Value, String> {
-    let manifest = export_trace_session(&state.store, &session_id, output_dir)
+    let known_secrets = state
+        .secret_values
+        .read()
+        .map_err(|_| "secret snapshot lock poisoned".to_owned())?
+        .clone();
+    let manifest = export_trace_session(&state.store, &session_id, output_dir, &known_secrets)
         .map_err(|error| error.to_string())?;
     serde_json::to_value(manifest).map_err(|error| error.to_string())
 }

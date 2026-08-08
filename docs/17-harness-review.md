@@ -252,7 +252,7 @@ OPCOS 现状：`ProviderRequest`/`AssistantTurn`/`TokenUsage` 是 provider-neutr
 
 - `crates/opcos-trace` 将生产会话导出为 raw JSONL、确定性的 per-task analysis 和跨 run overview 三层产物；`src-tauri` 通过导出命令调用它。
 - analysis 机械提取终态、工具序列、重复调用、iteration/token 统计和 P0-1 `error_details.code` 序列；签名的因果地位与 agent 机制维度保留为空位，后续由独立分析步骤填写，不在导出器中启发式猜测。
-- 三层所有字段递归经过 scrubber；原始事件、分析报告和聚合总览都可直接作为模型输入或用户分享物。
+- 三层所有字段递归经过 scrubber；生产导出必须传入当前已知 secret 值做精确替换，启发式规则只作为第二层兜底。原始事件、分析报告和聚合总览都可直接作为模型输入或用户分享物。
 
 ### P1-4 恢复语义与故障分类（对应 §2.11）
 

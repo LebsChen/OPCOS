@@ -2,8 +2,12 @@
 //!
 //! The raw layer preserves ordered session events, the analysis layer contains
 //! deterministic per-session facts, and the overview layer groups runs by the
-//! mechanically available terminal signature. Causal role and agent mechanism
-//! are intentionally left empty for a later analysis pass.
+//! mechanically available terminal signature. The raw layer contains the
+//! persisted session events exposed by `opcos-store`; it intentionally does
+//! not include `assistant_delta`, `reasoning_delta`, or `tool_call_delta`
+//! events, which the store treats as transient. Causal role and agent
+//! mechanism are intentionally left empty for a later analysis pass; they are
+//! explicit placeholders, not omitted implementation.
 
 use opcos_store::{SessionEventRecord, SessionStore, SqliteStore, ToolCallRecord};
 use serde::{Deserialize, Serialize};
@@ -117,14 +121,16 @@ pub fn export_session(
     store: &SqliteStore,
     session_id: &str,
     output_dir: impl AsRef<Path>,
+    known_secrets: &[String],
 ) -> Result<TraceExportManifest, TraceExportError> {
-    export_sessions(store, &[session_id], output_dir)
+    export_sessions(store, &[session_id], output_dir, known_secrets)
 }
 
 pub fn export_sessions(
     store: &SqliteStore,
     session_ids: &[&str],
     output_dir: impl AsRef<Path>,
+    known_secrets: &[String],
 ) -> Result<TraceExportManifest, TraceExportError> {
     let output_dir = output_dir.as_ref();
     let raw_dir = output_dir.join("raw");
@@ -136,14 +142,14 @@ pub fn export_sessions(
     let mut first_raw = None;
     let mut first_analysis = None;
     for session_id in session_ids {
-        let analysis = analyze_session(store, session_id)?;
+        let analysis = analyze_session(store, session_id, known_secrets)?;
         let events = store.load_session_events(session_id)?;
         let raw_path = raw_dir.join(format!("{session_id}.jsonl"));
-        write_raw(&raw_path, &events)?;
+        write_raw(&raw_path, &events, known_secrets)?;
         let analysis_path = analysis_dir.join(format!("{session_id}.json"));
         write_json(
             &analysis_path,
-            &scrub_value(serde_json::to_value(&analysis)?),
+            &scrub_value(serde_json::to_value(&analysis)?, known_secrets),
         )?;
         first_raw.get_or_insert(raw_path);
         first_analysis.get_or_insert(analysis_path);
@@ -154,7 +160,7 @@ pub fn export_sessions(
     let clusters = cluster_analyses(&analyses);
     write_json(
         &overview_path,
-        &scrub_value(serde_json::to_value(&clusters)?),
+        &scrub_value(serde_json::to_value(&clusters)?, known_secrets),
     )?;
     Ok(TraceExportManifest {
         raw_file: first_raw.unwrap_or_else(|| raw_dir.join("")),
@@ -166,13 +172,17 @@ pub fn export_sessions(
 pub fn analyze_session(
     store: &SqliteStore,
     session_id: &str,
+    known_secrets: &[String],
 ) -> Result<TaskAnalysis, TraceExportError> {
     let session = store
         .load_session(session_id)?
         .ok_or_else(|| TraceExportError::SessionNotFound(session_id.to_owned()))?;
     let calls = store.load_tool_calls(session_id)?;
     let events = store.load_session_events(session_id)?;
-    let tool_calls = calls.iter().map(tool_call_summary).collect::<Vec<_>>();
+    let tool_calls = calls
+        .iter()
+        .map(|call| tool_call_summary(call, known_secrets))
+        .collect::<Vec<_>>();
     let mut counts = BTreeMap::new();
     for call in &calls {
         *counts.entry(call.name.clone()).or_insert(0) += 1;
@@ -230,8 +240,8 @@ pub fn analyze_session(
     };
     Ok(TaskAnalysis {
         session_id: session_id.to_owned(),
-        run_state: session.run_state,
-        stop_reason: session.stop_reason,
+        run_state: scrub_text(&session.run_state, known_secrets),
+        stop_reason: scrub_text(&session.stop_reason, known_secrets),
         tool_calls,
         repeated_calls: counts,
         iterations,
@@ -242,12 +252,15 @@ pub fn analyze_session(
     })
 }
 
-fn tool_call_summary(call: &ToolCallRecord) -> ToolCallSummary {
+fn tool_call_summary(call: &ToolCallRecord, known_secrets: &[String]) -> ToolCallSummary {
     ToolCallSummary {
         call_id: call.call_id.clone(),
         name: call.name.clone(),
-        arguments: scrub_value(call.arguments.clone()),
-        result: call.result.clone().map(scrub_value),
+        arguments: scrub_value(call.arguments.clone(), known_secrets),
+        result: call
+            .result
+            .clone()
+            .map(|result| scrub_value(result, known_secrets)),
     }
 }
 
@@ -284,7 +297,11 @@ fn cluster_analyses(analyses: &[TaskAnalysis]) -> Vec<FailureCluster> {
     clusters.into_values().collect()
 }
 
-fn write_raw(path: &Path, events: &[SessionEventRecord]) -> Result<(), TraceExportError> {
+fn write_raw(
+    path: &Path,
+    events: &[SessionEventRecord],
+    known_secrets: &[String],
+) -> Result<(), TraceExportError> {
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
     for event in events {
@@ -292,9 +309,12 @@ fn write_raw(path: &Path, events: &[SessionEventRecord]) -> Result<(), TraceExpo
             event_id: event.event_id.clone(),
             sequence: event.sequence,
             created_at_ms: event.created_at_ms,
-            event: scrub_value(event.event.clone()),
+            event: scrub_value(event.event.clone(), known_secrets),
         };
-        serde_json::to_writer(&mut writer, &scrub_value(serde_json::to_value(&raw)?))?;
+        serde_json::to_writer(
+            &mut writer,
+            &scrub_value(serde_json::to_value(&raw)?, known_secrets),
+        )?;
         writer.write_all(b"\n")?;
     }
     writer.flush()?;
@@ -306,21 +326,32 @@ fn write_json(path: &Path, value: &Value) -> Result<(), TraceExportError> {
     Ok(())
 }
 
-fn scrub_value(value: Value) -> Value {
+fn scrub_value(value: Value, known_secrets: &[String]) -> Value {
     match value {
         Value::Object(object) => {
             let mut scrubbed = Map::new();
             for (key, value) in object {
                 if is_secret_key(&key) {
-                    scrubbed.insert(key, Value::String("[REDACTED]".into()));
+                    scrubbed.insert(
+                        scrub_text(&key, known_secrets),
+                        Value::String("[REDACTED]".into()),
+                    );
                 } else {
-                    scrubbed.insert(key, scrub_value(value));
+                    scrubbed.insert(
+                        scrub_text(&key, known_secrets),
+                        scrub_value(value, known_secrets),
+                    );
                 }
             }
             Value::Object(scrubbed)
         }
-        Value::Array(values) => Value::Array(values.into_iter().map(scrub_value).collect()),
-        Value::String(value) => Value::String(scrub_text(&value)),
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(|value| scrub_value(value, known_secrets))
+                .collect(),
+        ),
+        Value::String(value) => Value::String(scrub_text(&value, known_secrets)),
         value => value,
     }
 }
@@ -336,7 +367,11 @@ fn is_secret_key(key: &str) -> bool {
         || key.contains("apikey")
 }
 
-fn scrub_text(text: &str) -> String {
+fn scrub_text(text: &str, known_secrets: &[String]) -> String {
+    let mut output = text.to_owned();
+    for secret in known_secrets.iter().filter(|secret| !secret.is_empty()) {
+        output = output.replace(secret, "[REDACTED]");
+    }
     let markers = [
         "authorization:",
         "authorization=",
@@ -351,8 +386,9 @@ fn scrub_text(text: &str) -> String {
         "token=",
         "token:",
     ];
-    let lower = text.to_ascii_lowercase();
-    let mut output = String::with_capacity(text.len());
+    let lower = output.to_ascii_lowercase();
+    let original = output;
+    let mut output = String::with_capacity(original.len());
     let mut cursor = 0;
     let mut search_from = 0;
     while search_from < lower.len() {
@@ -368,20 +404,20 @@ fn scrub_text(text: &str) -> String {
             break;
         };
         let value_start = start + marker.len();
-        let end = text[value_start..]
+        let end = original[value_start..]
             .char_indices()
             .find(|(_, character)| character.is_whitespace() || matches!(character, ',' | ';'))
             .map(|(index, _)| value_start + index)
-            .unwrap_or(text.len());
-        output.push_str(&text[cursor..value_start]);
+            .unwrap_or(original.len());
+        output.push_str(&original[cursor..value_start]);
         output.push_str("[REDACTED]");
         cursor = end;
         search_from = end;
     }
     if cursor == 0 {
-        text.to_owned()
+        original
     } else {
-        output.push_str(&text[cursor..]);
+        output.push_str(&original[cursor..]);
         output
     }
 }
@@ -451,9 +487,16 @@ mod tests {
             &store,
             "run-a",
             "call-1",
-            json!({"error":"failed","error_details":{"code":"path_outside_workspace"}}),
+            json!({
+                "error":"failed",
+                "command":"run abc123def",
+                "error_details":{"code":"path_outside_workspace"}
+            }),
         );
         append_call(&store, "run-a", "call-2", json!({"ok":true}));
+        store
+            .update_session_status("run-a", "error", "stop-abc123def")
+            .unwrap();
         store
             .append_session_event(
                 "run-a",
@@ -473,7 +516,8 @@ mod tests {
             )
             .unwrap();
         let dir = test_dir("layers");
-        let manifest = export_session(&store, "run-a", &dir).unwrap();
+        let known_secrets = vec!["abc123def".to_owned()];
+        let manifest = export_session(&store, "run-a", &dir, &known_secrets).unwrap();
         assert!(manifest.raw_file.exists());
         assert!(manifest.analysis_file.exists());
         assert!(manifest.overview_file.exists());
@@ -491,6 +535,7 @@ mod tests {
             let contents = fs::read_to_string(path).unwrap();
             assert!(!contents.contains("fixture-secret"));
             assert!(!contents.contains("event-secret"));
+            assert!(!contents.contains("abc123def"));
         }
         fs::remove_dir_all(dir).unwrap();
     }
@@ -500,7 +545,7 @@ mod tests {
         let store = store_with_session("run-a");
         append_call(&store, "run-a", "call-1", json!({"ok":true}));
         append_call(&store, "run-a", "call-2", json!({"ok":true}));
-        let analysis = analyze_session(&store, "run-a").unwrap();
+        let analysis = analyze_session(&store, "run-a", &[]).unwrap();
         assert_eq!(analysis.repeated_calls["shell"], 2);
         assert!(analysis.signature.causal_role.is_none());
         assert!(analysis.signature.agent_mechanism.is_none());
@@ -514,7 +559,7 @@ mod tests {
         store.save_session(&second).unwrap();
         append_call(&store, "run-b", "call-1", json!({"ok":true}));
         let dir = test_dir("clusters");
-        export_sessions(&store, &["run-a", "run-b"], &dir).unwrap();
+        export_sessions(&store, &["run-a", "run-b"], &dir, &[]).unwrap();
         let overview: Vec<FailureCluster> =
             serde_json::from_slice(&fs::read(dir.join("overview.json")).unwrap()).unwrap();
         assert_eq!(overview.len(), 1);
@@ -524,8 +569,8 @@ mod tests {
         let first = store_with_session("run-a");
         let second = store_with_session("run-b");
         let analyses = vec![
-            analyze_session(&first, "run-a").unwrap(),
-            analyze_session(&second, "run-b").unwrap(),
+            analyze_session(&first, "run-a", &[]).unwrap(),
+            analyze_session(&second, "run-b", &[]).unwrap(),
         ];
         let clusters = cluster_analyses(&analyses);
         assert_eq!(clusters.len(), 1);
@@ -540,7 +585,7 @@ mod tests {
                 "headers": {"authorization": "Bearer nested-secret"}
             }
         });
-        let scrubbed = scrub_value(value);
+        let scrubbed = scrub_value(value, &[]);
         let serialized = serde_json::to_string(&scrubbed).unwrap();
         assert!(!serialized.contains("top-secret"));
         assert!(!serialized.contains("nested-secret"));
