@@ -236,9 +236,10 @@ OPCOS 现状：`ProviderRequest`/`AssistantTurn`/`TokenUsage` 是 provider-neutr
 ### P0-2 渐进式工具披露 + 工具目录检索（对应 §2.3，任务 #26）
 
 - 依据：“Use progressive disclosure for both. Advertise what and why compactly. Load detailed schemas… after selection.”（lopopolo）+ “100+ tools? → Semantic Tool Search → Only inject relevant defs”（WanLanglin 摘要）。
-- 形状：保留高频核心工具全量注入（file/shell/plan/search/ask_user）；把 browser 15 件套、连接器约 20 件套和 MCP 工具改为目录条目（name / purpose / input shape / first useful call），新增 `tool_search(query)` 与 `tool_describe(name)` 取完整 schema；被 describe 过的工具在本 turn 内保持可直接调用。
-- 风险与缓解：这会改变模型可见工具集，必须先有 P0-3 的轨迹回归；因此实现顺序为 P0-1 → P0-3 骨架 → P0-2，且由会话设置控制开关，默认保持现状直到轨迹集显示无退化。
-- 验收：同一任务集下每轮工具定义 token 数下降且完成率不下降（需 P0-3 提供度量）。
+- 形状：保留高频核心工具全量注入（file/shell/plan/search/ask_user）；把 browser、连接器和 MCP 工具按现有工具定义名称规则降为目录条目（name / purpose / input shape / first useful call），新增 `tool_search(query)` 与 `tool_describe(name)` 取完整 schema。
+- 生命周期：渐进式披露由会话设置控制且默认关闭；开启后，被 describe 的工具在整个 session 内保持展开，避免压缩后模型遗忘已经选择的能力。目录工具若未 describe 就被调用，返回 P0-1 结构化错误并指向 `tool_describe(name)`。
+- 风险与缓解：这会改变模型可见工具集，必须先有 P0-3 的轨迹回归；因此实现顺序为 P0-1 → P0-3 骨架 → P0-2，且默认保持现状直到轨迹集显示无退化。
+- 度量：P0-3 trajectory cost 记录首轮实际工具定义体积与全量定义体积的 token 估算（JSON bytes / 4），用于比较开关关闭与开启时的下降幅度；本次不引入 embedding 或外部服务。
 
 ### P0-3 Trajectory eval harness（对应 §2.13，任务 #27）
 

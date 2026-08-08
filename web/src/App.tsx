@@ -10752,6 +10752,8 @@ function AppContent() {
   const [projectDialogOpen, setProjectDialogOpen] = useState(false);
   const [inbox, setInbox] = useState<InboxRecord[]>([]);
   const [unattended, setUnattended] = useState(false);
+  const [progressiveToolDisclosure, setProgressiveToolDisclosure] =
+    useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsSection>("provider");
   const [query, setQuery] = useState("");
   const [error, setError] = useState("");
@@ -11189,10 +11191,16 @@ function AppContent() {
   useEffect(() => {
     if (!selected) {
       setUnattended(false);
+      setProgressiveToolDisclosure(false);
       return;
     }
     void command<boolean>("get_unattended", { sessionId: selected.id })
       .then(setUnattended)
+      .catch((reason) => setError(errorMessage(reason)));
+    void command<boolean>("get_progressive_tool_disclosure", {
+      sessionId: selected.id,
+    })
+      .then(setProgressiveToolDisclosure)
       .catch((reason) => setError(errorMessage(reason)));
   }, [selected?.id]);
   useEffect(() => {
@@ -11843,6 +11851,15 @@ function AppContent() {
                         unattended: on,
                       })
                         .then(() => setUnattended(on))
+                        .catch(onError);
+                    }}
+                    progressiveToolDisclosure={progressiveToolDisclosure}
+                    onProgressiveToolDisclosureChange={(on) => {
+                      void command("set_progressive_tool_disclosure", {
+                        sessionId: selected.id,
+                        enabled: on,
+                      })
+                        .then(() => setProgressiveToolDisclosure(on))
                         .catch(onError);
                     }}
                     onSend={submit}

@@ -11085,6 +11085,12 @@ async fn engine_for_with_context(
             .is_unattended(session_id)
             .map_err(|error| error.to_string())?,
     );
+    engine.set_progressive_tool_disclosure(
+        state
+            .store
+            .progressive_tool_disclosure(session_id)
+            .map_err(|error| error.to_string())?,
+    );
     let mut allowed_tools = allowed_tools;
     if automatic_project_routing_active(&state.store, session_id)?
         && let Some(allowed_tools) = allowed_tools.as_mut()
@@ -15678,6 +15684,40 @@ async fn set_unattended(
         "unattended_changed",
         Some(&session_id),
         json!({"unattended": unattended}),
+    );
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_progressive_tool_disclosure(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<bool, String> {
+    state
+        .store
+        .progressive_tool_disclosure(&session_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn set_progressive_tool_disclosure(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    session_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    state
+        .store
+        .set_progressive_tool_disclosure(&session_id, enabled)
+        .map_err(|error| error.to_string())?;
+    if let Some(engine) = state.engines.lock().await.get(&session_id).cloned() {
+        engine.set_progressive_tool_disclosure(enabled);
+    }
+    emit(
+        &app,
+        "progressive_tool_disclosure_changed",
+        Some(&session_id),
+        json!({"enabled": enabled}),
     );
     Ok(())
 }
@@ -26581,6 +26621,8 @@ fn main() {
             list_pending,
             get_unattended,
             set_unattended,
+            get_progressive_tool_disclosure,
+            set_progressive_tool_disclosure,
             change_mode,
             resolve_inbox,
             change_model,

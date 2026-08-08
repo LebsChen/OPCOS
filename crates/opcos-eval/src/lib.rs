@@ -12,7 +12,10 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
-use opcos_engine::{ApprovalOutcome, EngineError, PreflightDecision, ToolExecutor, TurnEngine};
+use opcos_engine::{
+    ApprovalOutcome, EngineError, PreflightDecision, ToolExecutor, TurnEngine,
+    builtin_tool_definition_tokens,
+};
 use opcos_policy::PermissionMode;
 use opcos_provider::{
     AssistantTurn, Caps, Provider, ProviderError, ProviderRequest, StreamChunk, TokenUsage,
@@ -46,6 +49,8 @@ pub struct TrajectoryCost {
     pub tool_calls: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub tool_definition_tokens: u64,
+    pub full_tool_definition_tokens: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -86,12 +91,14 @@ pub enum FixtureToolBehavior {
     Normal,
     FailWrites,
     RequireApproval,
+    ProgressiveCatalog,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EngineOverrides {
     pub chunk_idle_timeout: Option<Duration>,
     pub context_window: Option<u64>,
+    pub progressive_tool_disclosure: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -103,6 +110,15 @@ pub enum Interaction {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Assertion {
+    RequiredToolCall {
+        tool: String,
+        failure_class: FailureClass,
+    },
+    ToolErrorRepair {
+        code: String,
+        repair_contains: String,
+        failure_class: FailureClass,
+    },
     RequiredEvent {
         event: String,
         failure_class: FailureClass,
@@ -138,7 +154,9 @@ pub enum Assertion {
 impl Assertion {
     fn failure_class(&self) -> &FailureClass {
         match self {
-            Assertion::RequiredEvent { failure_class, .. }
+            Assertion::RequiredToolCall { failure_class, .. }
+            | Assertion::ToolErrorRepair { failure_class, .. }
+            | Assertion::RequiredEvent { failure_class, .. }
             | Assertion::ForbiddenEvent { failure_class, .. }
             | Assertion::SessionState { failure_class, .. }
             | Assertion::FilePresent { failure_class, .. }
@@ -341,6 +359,9 @@ impl ToolExecutor for FixtureTools {
                 Ok(json!({"content":content}))
             }
             "propose_plan" => Ok(json!({"status":"accepted"})),
+            "browser_status" if self.behavior == FixtureToolBehavior::ProgressiveCatalog => {
+                Ok(json!({"status":"available"}))
+            }
             _ => Err(format!("unsupported fixture tool: {name}")),
         }
     }
@@ -442,6 +463,129 @@ fn turn(text: &str, tool_calls: Vec<ToolCall>) -> ScriptedResponse {
 
 pub fn builtin_cases() -> Vec<EvalCase> {
     vec![
+        EvalCase {
+            name: "progressive_search_describe_call",
+            prompt: "find and use the browser status tool",
+            environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture {
+                files: vec![],
+                tool_behavior: FixtureToolBehavior::ProgressiveCatalog,
+            }),
+            provider: ProviderSourceSpec::Scripted(vec![
+                turn(
+                    "searching",
+                    vec![call(
+                        "search-1",
+                        "tool_search",
+                        json!({"query": "browser status"}),
+                    )],
+                ),
+                turn(
+                    "describing",
+                    vec![call(
+                        "describe-1",
+                        "tool_describe",
+                        json!({"name": "browser_status"}),
+                    )],
+                ),
+                turn(
+                    "calling",
+                    vec![call("browser-1", "browser_status", json!({}))],
+                ),
+                turn("done", vec![]),
+            ]),
+            grader: GraderSpec::BuiltIn,
+            engine: EngineOverrides {
+                progressive_tool_disclosure: true,
+                ..EngineOverrides::default()
+            },
+            interactions: vec![],
+            assertions: vec![
+                Assertion::RequiredToolCall {
+                    tool: "tool_search".into(),
+                    failure_class: FailureClass::ToolDesign,
+                },
+                Assertion::RequiredToolCall {
+                    tool: "tool_describe".into(),
+                    failure_class: FailureClass::ToolDesign,
+                },
+                Assertion::RequiredToolCall {
+                    tool: "browser_status".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::FilesEmpty {
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::RequiredEvent {
+                    event: "turn_finished".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::SessionState {
+                    run_state: "idle".into(),
+                    stop_reason: "finished".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+            ],
+        },
+        EvalCase {
+            name: "progressive_undescribed_tool_repair",
+            prompt: "use the browser status tool",
+            environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture {
+                files: vec![],
+                tool_behavior: FixtureToolBehavior::ProgressiveCatalog,
+            }),
+            provider: ProviderSourceSpec::Scripted(vec![
+                turn(
+                    "calling",
+                    vec![call("browser-1", "browser_status", json!({}))],
+                ),
+                turn(
+                    "repairing",
+                    vec![call(
+                        "describe-1",
+                        "tool_describe",
+                        json!({"name": "browser_status"}),
+                    )],
+                ),
+                turn(
+                    "retrying",
+                    vec![call("browser-2", "browser_status", json!({}))],
+                ),
+                turn("done", vec![]),
+            ]),
+            grader: GraderSpec::BuiltIn,
+            engine: EngineOverrides {
+                progressive_tool_disclosure: true,
+                ..EngineOverrides::default()
+            },
+            interactions: vec![],
+            assertions: vec![
+                Assertion::RequiredToolCall {
+                    tool: "tool_describe".into(),
+                    failure_class: FailureClass::ToolDesign,
+                },
+                Assertion::ToolErrorRepair {
+                    code: "tool_not_described".into(),
+                    repair_contains: "tool_describe".into(),
+                    failure_class: FailureClass::ToolDesign,
+                },
+                Assertion::RequiredToolCall {
+                    tool: "browser_status".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::RequiredEvent {
+                    event: "turn_finished".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::FilesEmpty {
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::SessionState {
+                    run_state: "idle".into(),
+                    stop_reason: "finished".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+            ],
+        },
         EvalCase {
             name: "engine_nested_directory_write",
             prompt: "write a nested file",
@@ -569,6 +713,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
             engine: EngineOverrides {
                 chunk_idle_timeout: Some(Duration::from_millis(5)),
                 context_window: None,
+                progressive_tool_disclosure: false,
             },
             interactions: vec![],
             assertions: vec![
@@ -698,6 +843,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
             engine: EngineOverrides {
                 chunk_idle_timeout: None,
                 context_window: Some(1),
+                progressive_tool_disclosure: false,
             },
             interactions: vec![Interaction::CompactNow],
             assertions: vec![
@@ -779,6 +925,7 @@ pub async fn run_builtin_case(case: &EvalCase) -> Result<CaseReport, EvalError> 
             })
             .await;
     }
+    engine.set_progressive_tool_disclosure(case.engine.progressive_tool_disclosure);
     let running_engine = engine.clone();
     let prompt = case.prompt.to_owned();
     let mut submit = Some(tokio::spawn(async move {
@@ -897,12 +1044,12 @@ pub async fn run_builtin_case(case: &EvalCase) -> Result<CaseReport, EvalError> 
         })
         .collect::<HashSet<_>>()
         .len();
+    let tool_calls = store
+        .load_tool_calls(&session_id)
+        .map_err(|error| EvalError::Store(error.to_string()))?;
     let cost = TrajectoryCost {
         iterations,
-        tool_calls: store
-            .load_tool_calls(&session_id)
-            .map_err(|error| EvalError::Store(error.to_string()))?
-            .len(),
+        tool_calls: tool_calls.len(),
         input_tokens: store
             .load_usage(&session_id)
             .map_err(|error| EvalError::Store(error.to_string()))?
@@ -915,12 +1062,39 @@ pub async fn run_builtin_case(case: &EvalCase) -> Result<CaseReport, EvalError> 
             .iter()
             .map(|usage| usage.output_tokens)
             .sum(),
+        tool_definition_tokens: provider_requests
+            .requests()
+            .first()
+            .and_then(|request| serde_json::to_vec(&request.tools).ok())
+            .map(|value| value.len() as u64 / 4)
+            .unwrap_or_default(),
+        full_tool_definition_tokens: builtin_tool_definition_tokens(),
     };
     let failures = case
         .assertions
         .iter()
         .filter_map(|assertion| {
             let passed = match assertion {
+                Assertion::RequiredToolCall { tool, .. } => {
+                    tool_calls.iter().any(|call| call.name == *tool)
+                }
+                Assertion::ToolErrorRepair {
+                    code,
+                    repair_contains,
+                    ..
+                } => tool_calls
+                    .iter()
+                    .filter_map(|call| call.result.as_ref())
+                    .any(|result| {
+                        result
+                            .pointer("/error_details/code")
+                            .and_then(Value::as_str)
+                            == Some(code)
+                            && result
+                                .pointer("/error_details/repair")
+                                .and_then(Value::as_str)
+                                .is_some_and(|repair| repair.contains(repair_contains))
+                    }),
                 Assertion::RequiredEvent { event, .. } => {
                     event_types.iter().any(|item| item == event)
                 }
@@ -1000,6 +1174,17 @@ mod tests {
             assert!(!report.outcome.session_stop_reason.is_empty());
             assert!(!report.proof.required_events.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn progressive_disclosure_reports_smaller_visible_tool_definition_set() {
+        let case = builtin_cases()
+            .into_iter()
+            .find(|case| case.name == "progressive_search_describe_call")
+            .expect("progressive case");
+        let report = run_builtin_case(&case).await.unwrap();
+        assert!(report.passed, "{report:?}");
+        assert!(report.cost.tool_definition_tokens < report.cost.full_tool_definition_tokens);
     }
 
     #[test]
