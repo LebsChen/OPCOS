@@ -12,7 +12,10 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
-use opcos_engine::{ApprovalOutcome, EngineError, PreflightDecision, ToolExecutor, TurnEngine};
+use opcos_engine::{
+    ApprovalOutcome, EngineError, LifecycleHook, LifecycleHookConfig, PreflightDecision,
+    ToolExecutor, TurnEngine,
+};
 use opcos_policy::PermissionMode;
 use opcos_provider::{
     AssistantTurn, Caps, Provider, ProviderError, ProviderRequest, StreamChunk, TokenUsage,
@@ -55,6 +58,9 @@ pub struct Outcome {
     pub session_stop_reason: String,
     pub plan_present: bool,
     pub plan_in_system_message: bool,
+    pub tool_results: Vec<Value>,
+    pub provider_context: Vec<String>,
+    pub executed_tool_calls: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,6 +85,7 @@ pub struct CaseReport {
 pub struct WorkspaceFixture {
     pub files: Vec<(String, String)>,
     pub tool_behavior: FixtureToolBehavior,
+    pub hook_context: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,6 +140,26 @@ pub enum Assertion {
     PlanInSystemMessage {
         failure_class: FailureClass,
     },
+    ToolResultContains {
+        text: String,
+        failure_class: FailureClass,
+    },
+    ToolResultNotContains {
+        text: String,
+        failure_class: FailureClass,
+    },
+    ProviderContextContains {
+        text: String,
+        failure_class: FailureClass,
+    },
+    ToolCallCount {
+        count: usize,
+        failure_class: FailureClass,
+    },
+    ExecutedToolCallCount {
+        count: usize,
+        failure_class: FailureClass,
+    },
 }
 
 impl Assertion {
@@ -145,7 +172,12 @@ impl Assertion {
             | Assertion::FileAbsent { failure_class, .. }
             | Assertion::FilesEmpty { failure_class }
             | Assertion::PlanPresent { failure_class }
-            | Assertion::PlanInSystemMessage { failure_class } => failure_class,
+            | Assertion::PlanInSystemMessage { failure_class }
+            | Assertion::ToolResultContains { failure_class, .. }
+            | Assertion::ToolResultNotContains { failure_class, .. }
+            | Assertion::ProviderContextContains { failure_class, .. }
+            | Assertion::ToolCallCount { failure_class, .. }
+            | Assertion::ExecutedToolCallCount { failure_class, .. } => failure_class,
         }
     }
 }
@@ -172,6 +204,7 @@ pub struct EvalCase {
     pub grader: GraderSpec,
     pub engine: EngineOverrides,
     pub interactions: Vec<Interaction>,
+    pub hooks: Vec<LifecycleHook>,
     pub assertions: Vec<Assertion>,
 }
 
@@ -317,11 +350,19 @@ impl ScriptedProvider {
 struct FixtureTools {
     workspace: PathBuf,
     behavior: FixtureToolBehavior,
+    hook_context: Option<String>,
+    executed_tool_calls: Arc<Mutex<usize>>,
 }
 
 #[async_trait]
 impl ToolExecutor for FixtureTools {
     async fn execute(&self, name: &str, arguments: Value) -> Result<Value, String> {
+        if name != "read_file" {
+            *self
+                .executed_tool_calls
+                .lock()
+                .map_err(|_| "execution count lock poisoned".to_owned())? += 1;
+        }
         match name {
             "write_file" => {
                 let path = checked_path(&self.workspace, arguments["path"].as_str().unwrap_or(""))?;
@@ -353,6 +394,21 @@ impl ToolExecutor for FixtureTools {
         } else {
             Ok(PreflightDecision::Allow)
         }
+    }
+
+    async fn run_hook_command(
+        &self,
+        _command: &str,
+        _input: Value,
+        _timeout: Duration,
+    ) -> Result<Option<Value>, String> {
+        Ok(self.hook_context.as_ref().map(|context| {
+            json!({
+                "hookSpecificOutput": {
+                    "additionalContext": context
+                }
+            })
+        }))
     }
 }
 
@@ -448,6 +504,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
             environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture {
                 files: vec![],
                 tool_behavior: FixtureToolBehavior::Normal,
+                hook_context: None,
             }),
             provider: ProviderSourceSpec::Scripted(vec![
                 turn(
@@ -463,6 +520,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
             grader: GraderSpec::BuiltIn,
             engine: EngineOverrides::default(),
             interactions: vec![],
+            hooks: vec![],
             assertions: vec![
                 Assertion::RequiredEvent {
                     event: "write_file_completed".into(),
@@ -485,6 +543,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
             environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture {
                 files: vec![],
                 tool_behavior: FixtureToolBehavior::FailWrites,
+                hook_context: None,
             }),
             provider: ProviderSourceSpec::Scripted(vec![
                 turn(
@@ -500,6 +559,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
             grader: GraderSpec::BuiltIn,
             engine: EngineOverrides::default(),
             interactions: vec![],
+            hooks: vec![],
             assertions: vec![
                 Assertion::RequiredEvent {
                     event: "write_file_completed".into(),
@@ -526,6 +586,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
             environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture {
                 files: vec![],
                 tool_behavior: FixtureToolBehavior::Normal,
+                hook_context: None,
             }),
             provider: ProviderSourceSpec::Scripted(vec![
                 turn(
@@ -541,6 +602,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
             grader: GraderSpec::BuiltIn,
             engine: EngineOverrides::default(),
             interactions: vec![],
+            hooks: vec![],
             assertions: vec![
                 Assertion::RequiredEvent {
                     event: "write_file_completed".into(),
@@ -563,6 +625,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
             environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture {
                 files: vec![],
                 tool_behavior: FixtureToolBehavior::Normal,
+                hook_context: None,
             }),
             provider: ProviderSourceSpec::Scripted(vec![ScriptedResponse::Hang]),
             grader: GraderSpec::BuiltIn,
@@ -571,6 +634,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
                 context_window: None,
             },
             interactions: vec![],
+            hooks: vec![],
             assertions: vec![
                 Assertion::RequiredEvent {
                     event: "provider_stream_timeout".into(),
@@ -592,6 +656,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
             environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture {
                 files: vec![],
                 tool_behavior: FixtureToolBehavior::Normal,
+                hook_context: None,
             }),
             provider: ProviderSourceSpec::Scripted(vec![
                 ScriptedResponse::Delayed(
@@ -614,6 +679,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
                 after_ms: 1,
                 text: "new direction".into(),
             }],
+            hooks: vec![],
             assertions: vec![
                 Assertion::RequiredEvent {
                     event: "steering_applied".into(),
@@ -635,6 +701,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
             environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture {
                 files: vec![],
                 tool_behavior: FixtureToolBehavior::RequireApproval,
+                hook_context: None,
             }),
             provider: ProviderSourceSpec::Scripted(vec![
                 turn(
@@ -652,6 +719,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
             interactions: vec![Interaction::ResolveApproval {
                 outcome: ApprovalOutcome::Approve,
             }],
+            hooks: vec![],
             assertions: vec![
                 Assertion::RequiredEvent {
                     event: "approval_pending".into(),
@@ -678,6 +746,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
             environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture {
                 files: vec![],
                 tool_behavior: FixtureToolBehavior::Normal,
+                hook_context: None,
             }),
             provider: ProviderSourceSpec::Scripted(vec![
                 turn(
@@ -700,6 +769,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
                 context_window: Some(1),
             },
             interactions: vec![Interaction::CompactNow],
+            hooks: vec![],
             assertions: vec![
                 Assertion::PlanPresent {
                     failure_class: FailureClass::ToolFailure,
@@ -709,6 +779,275 @@ pub fn builtin_cases() -> Vec<EvalCase> {
                 },
                 Assertion::RequiredEvent {
                     event: "turn_finished".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::SessionState {
+                    run_state: "idle".into(),
+                    stop_reason: "finished".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+            ],
+        },
+        EvalCase {
+            name: "repeated_failed_call_is_intercepted",
+            prompt: "retry the failed write",
+            environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture {
+                files: vec![],
+                tool_behavior: FixtureToolBehavior::FailWrites,
+                hook_context: None,
+            }),
+            provider: ProviderSourceSpec::Scripted(vec![
+                turn(
+                    "retry one",
+                    vec![call(
+                        "fail-1",
+                        "write_file",
+                        json!({"path":"same.txt","content":"x"}),
+                    )],
+                ),
+                turn(
+                    "retry two",
+                    vec![call(
+                        "fail-2",
+                        "write_file",
+                        json!({"path":"same.txt","content":"x"}),
+                    )],
+                ),
+                turn(
+                    "retry three",
+                    vec![call(
+                        "fail-3",
+                        "write_file",
+                        json!({"path":"same.txt","content":"x"}),
+                    )],
+                ),
+                turn("done", vec![]),
+            ]),
+            grader: GraderSpec::BuiltIn,
+            engine: EngineOverrides::default(),
+            interactions: vec![],
+            hooks: vec![],
+            assertions: vec![
+                Assertion::RequiredEvent {
+                    event: "turn_finished".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::ToolResultContains {
+                    text: "repeated_failed_call".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::ExecutedToolCallCount {
+                    count: 2,
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::ToolResultContains {
+                    text: "failed 2 times".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::ToolResultContains {
+                    text: "write failed".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::FileAbsent {
+                    path: "same.txt".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::SessionState {
+                    run_state: "idle".into(),
+                    stop_reason: "finished".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+            ],
+        },
+        EvalCase {
+            name: "failed_call_parameter_change_resets_count",
+            prompt: "change the failed write path",
+            environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture {
+                files: vec![],
+                tool_behavior: FixtureToolBehavior::FailWrites,
+                hook_context: None,
+            }),
+            provider: ProviderSourceSpec::Scripted(vec![
+                turn(
+                    "retry one",
+                    vec![call(
+                        "change-1",
+                        "write_file",
+                        json!({"path":"same.txt","content":"x"}),
+                    )],
+                ),
+                turn(
+                    "retry two",
+                    vec![call(
+                        "change-2",
+                        "write_file",
+                        json!({"path":"same.txt","content":"x"}),
+                    )],
+                ),
+                turn(
+                    "change path",
+                    vec![call(
+                        "change-3",
+                        "write_file",
+                        json!({"path":"different.txt","content":"x"}),
+                    )],
+                ),
+                turn("done", vec![]),
+            ]),
+            grader: GraderSpec::BuiltIn,
+            engine: EngineOverrides::default(),
+            interactions: vec![],
+            hooks: vec![],
+            assertions: vec![
+                Assertion::RequiredEvent {
+                    event: "turn_finished".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::ToolCallCount {
+                    count: 3,
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::ExecutedToolCallCount {
+                    count: 3,
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::ToolResultContains {
+                    text: "write failed".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::ToolResultContains {
+                    text: "unclassified".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::ToolResultNotContains {
+                    text: "repeated_failed_call".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::FileAbsent {
+                    path: "different.txt".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::SessionState {
+                    run_state: "idle".into(),
+                    stop_reason: "finished".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+            ],
+        },
+        EvalCase {
+            name: "repeated_successful_call_is_allowed",
+            prompt: "write the same file repeatedly",
+            environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture {
+                files: vec![],
+                tool_behavior: FixtureToolBehavior::Normal,
+                hook_context: None,
+            }),
+            provider: ProviderSourceSpec::Scripted(vec![
+                turn(
+                    "write one",
+                    vec![call(
+                        "success-1",
+                        "write_file",
+                        json!({"path":"same.txt","content":"x"}),
+                    )],
+                ),
+                turn(
+                    "write two",
+                    vec![call(
+                        "success-2",
+                        "write_file",
+                        json!({"path":"same.txt","content":"x"}),
+                    )],
+                ),
+                turn(
+                    "write three",
+                    vec![call(
+                        "success-3",
+                        "write_file",
+                        json!({"path":"same.txt","content":"x"}),
+                    )],
+                ),
+                turn("done", vec![]),
+            ]),
+            grader: GraderSpec::BuiltIn,
+            engine: EngineOverrides::default(),
+            interactions: vec![],
+            hooks: vec![],
+            assertions: vec![
+                Assertion::RequiredEvent {
+                    event: "turn_finished".into(),
+                    failure_class: FailureClass::ToolDesign,
+                },
+                Assertion::ToolCallCount {
+                    count: 3,
+                    failure_class: FailureClass::ToolDesign,
+                },
+                Assertion::ExecutedToolCallCount {
+                    count: 3,
+                    failure_class: FailureClass::ToolDesign,
+                },
+                Assertion::ToolResultContains {
+                    text: "\"status\":\"written\"".into(),
+                    failure_class: FailureClass::ToolDesign,
+                },
+                Assertion::ToolResultNotContains {
+                    text: "repeated_failed_call".into(),
+                    failure_class: FailureClass::ToolDesign,
+                },
+                Assertion::FilePresent {
+                    path: "same.txt".into(),
+                    failure_class: FailureClass::ToolDesign,
+                },
+                Assertion::SessionState {
+                    run_state: "idle".into(),
+                    stop_reason: "finished".into(),
+                    failure_class: FailureClass::ToolDesign,
+                },
+            ],
+        },
+        EvalCase {
+            name: "post_tool_failure_context_reorients_next_turn",
+            prompt: "recover after the failed write",
+            environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture {
+                files: vec![],
+                tool_behavior: FixtureToolBehavior::FailWrites,
+                hook_context: Some("failure guidance: choose a different path".into()),
+            }),
+            provider: ProviderSourceSpec::Scripted(vec![
+                turn(
+                    "write",
+                    vec![call(
+                        "hook-1",
+                        "write_file",
+                        json!({"path":"failed.txt","content":"x"}),
+                    )],
+                ),
+                turn("done", vec![]),
+            ]),
+            grader: GraderSpec::BuiltIn,
+            engine: EngineOverrides::default(),
+            interactions: vec![],
+            hooks: vec![LifecycleHook {
+                event: "PostToolUseFailure".into(),
+                matcher: Some("write_file".into()),
+                hook_type: "command".into(),
+                command: "failure-guidance".into(),
+            }],
+            assertions: vec![
+                Assertion::RequiredEvent {
+                    event: "turn_finished".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::ProviderContextContains {
+                    text: "failure guidance: choose a different path".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::ToolResultContains {
+                    text: "write failed".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::FileAbsent {
+                    path: "failed.txt".into(),
                     failure_class: FailureClass::ToolFailure,
                 },
                 Assertion::SessionState {
@@ -753,9 +1092,15 @@ pub async fn run_builtin_case(case: &EvalCase) -> Result<CaseReport, EvalError> 
             unreachable!("external environment returned above")
         }
     };
+    let executed_tool_calls = Arc::new(Mutex::new(0));
     let tool = Arc::new(FixtureTools {
         workspace: temp.path().to_path_buf(),
         behavior: tool_behavior,
+        hook_context: match &case.environment {
+            ExecutionEnvironmentSpec::LocalFixture(fixture) => fixture.hook_context.clone(),
+            ExecutionEnvironmentSpec::External { .. } => None,
+        },
+        executed_tool_calls: executed_tool_calls.clone(),
     });
     let mut engine = TurnEngine::new(
         provider,
@@ -770,6 +1115,14 @@ pub async fn run_builtin_case(case: &EvalCase) -> Result<CaseReport, EvalError> 
         engine.set_chunk_idle_timeout(timeout);
     }
     let engine = Arc::new(engine);
+    if !case.hooks.is_empty() {
+        engine
+            .set_lifecycle_hooks(Some(LifecycleHookConfig {
+                enabled: true,
+                hooks: case.hooks.clone(),
+            }))
+            .await;
+    }
     if let Some(context_window) = case.engine.context_window {
         engine
             .set_resolved_capabilities(Caps {
@@ -848,6 +1201,20 @@ pub async fn run_builtin_case(case: &EvalCase) -> Result<CaseReport, EvalError> 
                 && message.to_string().contains("trajectory plan")
         })
     });
+    let tool_results = store
+        .load_tool_calls(&session_id)
+        .map_err(|error| EvalError::Store(error.to_string()))?
+        .into_iter()
+        .filter_map(|call| call.result)
+        .collect::<Vec<_>>();
+    let provider_context = provider_requests
+        .requests()
+        .iter()
+        .flat_map(|request| request.messages.iter().map(Value::to_string))
+        .collect::<Vec<_>>();
+    let executed_tool_calls = *executed_tool_calls
+        .lock()
+        .map_err(|_| EvalError::Fixture("execution count lock poisoned".into()))?;
     let event_types = events
         .iter()
         .filter_map(|event| {
@@ -886,6 +1253,9 @@ pub async fn run_builtin_case(case: &EvalCase) -> Result<CaseReport, EvalError> 
         session_stop_reason: stored_session.stop_reason.clone(),
         plan_present,
         plan_in_system_message,
+        tool_results: tool_results.clone(),
+        provider_context: provider_context.clone(),
+        executed_tool_calls,
     };
     let iterations = events
         .iter()
@@ -940,6 +1310,17 @@ pub async fn run_builtin_case(case: &EvalCase) -> Result<CaseReport, EvalError> 
                 Assertion::FilesEmpty { .. } => files_empty,
                 Assertion::PlanPresent { .. } => plan_present,
                 Assertion::PlanInSystemMessage { .. } => plan_in_system_message,
+                Assertion::ToolResultContains { text, .. } => tool_results
+                    .iter()
+                    .any(|result| result.to_string().contains(text)),
+                Assertion::ToolResultNotContains { text, .. } => tool_results
+                    .iter()
+                    .all(|result| !result.to_string().contains(text)),
+                Assertion::ProviderContextContains { text, .. } => provider_context
+                    .iter()
+                    .any(|message| message.contains(text)),
+                Assertion::ToolCallCount { count, .. } => tool_results.len() == *count,
+                Assertion::ExecutedToolCallCount { count, .. } => executed_tool_calls == *count,
             };
             (!passed).then(|| AssertionFailure {
                 assertion: assertion.clone(),
@@ -1017,6 +1398,7 @@ mod tests {
             },
             engine: EngineOverrides::default(),
             interactions: vec![],
+            hooks: vec![],
             assertions: vec![],
         };
         assert!(matches!(

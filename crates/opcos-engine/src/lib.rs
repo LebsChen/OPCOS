@@ -81,6 +81,7 @@ pub enum ToolErrorCode {
     HostIo,
     McpTransport,
     McpAuth,
+    RepeatedFailedCall,
     Unclassified,
 }
 
@@ -394,6 +395,11 @@ fn classify_tool_error(call: &ToolCall, summary: impl Into<String>) -> Value {
     )
 }
 
+fn tool_result_failed(result: &Value) -> bool {
+    result.get("error_details").is_some()
+        || result.get("error").is_some_and(|error| error.is_string())
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ExternalContextAttachment {
     pub source: String,
@@ -506,6 +512,12 @@ pub struct LifecycleHookConfig {
 struct HookEffects {
     blocked: Option<String>,
     additional_context: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct FailedToolCall {
+    count: u32,
+    last_error_code: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -899,6 +911,7 @@ pub struct TurnEngine<P, S, E> {
     hook_permission_rules: Mutex<Option<PermissionRules>>,
     lifecycle_hooks: Mutex<Option<LifecycleHookConfig>>,
     hook_context: Mutex<Vec<String>>,
+    failed_tool_calls: Mutex<HashMap<String, FailedToolCall>>,
     external_tools: Mutex<Vec<Value>>,
     allowed_tools: Mutex<Option<HashSet<String>>>,
     linear_tools_enabled: AtomicBool,
@@ -1068,6 +1081,7 @@ where
             hook_permission_rules: Mutex::new(None),
             lifecycle_hooks: Mutex::new(None),
             hook_context: Mutex::new(Vec::new()),
+            failed_tool_calls: Mutex::new(HashMap::new()),
             external_tools: Mutex::new(Vec::new()),
             allowed_tools: Mutex::new(None),
             linear_tools_enabled: AtomicBool::new(false),
@@ -1250,6 +1264,62 @@ where
         std::mem::take(&mut *self.hook_context.lock().await)
     }
 
+    fn failed_tool_call_key(call: &ToolCall) -> String {
+        format!(
+            "{}\u{0}{}",
+            call.name,
+            serde_json::to_string(&call.arguments).unwrap_or_default()
+        )
+    }
+
+    async fn repeated_failed_call_error(&self, call: &ToolCall) -> Option<Value> {
+        let key = Self::failed_tool_call_key(call);
+        let failed = self.failed_tool_calls.lock().await;
+        let record = failed.get(&key)?;
+        // This intentionally covers every classified failure: retrying a transient
+        // error remains possible only by changing the call or choosing another path.
+        (record.count >= 2).then(|| {
+            structured_tool_error(
+                format!(
+                    "{} has already failed {} times with the same arguments",
+                    call.name, record.count
+                ),
+                ToolErrorEnvelope::new(
+                    ToolErrorCode::RepeatedFailedCall,
+                    "the same tool call and arguments have failed repeatedly",
+                    tool_error_target(call),
+                    format!(
+                        "change the arguments or use a different path/tool; this exact call \
+has failed {} times and the last error code was {}",
+                        record.count, record.last_error_code
+                    ),
+                    ToolErrorRetry::Adjusted,
+                    None,
+                ),
+            )
+        })
+    }
+
+    async fn remember_tool_result(&self, call: &ToolCall, result: &Value) {
+        let key = Self::failed_tool_call_key(call);
+        let mut failed = self.failed_tool_calls.lock().await;
+        if !tool_result_failed(result) {
+            failed.remove(&key);
+            return;
+        }
+        let error_code = result
+            .pointer("/error_details/code")
+            .and_then(Value::as_str)
+            .unwrap_or("unclassified")
+            .to_owned();
+        let record = failed.entry(key).or_insert(FailedToolCall {
+            count: 0,
+            last_error_code: error_code.clone(),
+        });
+        record.count += 1;
+        record.last_error_code = error_code;
+    }
+
     async fn execute_tool_with_hooks(&self, call: &ToolCall) -> Value {
         let pre = self
             .lifecycle_hooks(
@@ -1259,9 +1329,17 @@ where
             )
             .await;
         if let Some(reason) = pre.blocked {
-            return classify_tool_error(call, reason);
+            let result = classify_tool_error(call, reason);
+            self.remember_tool_result(call, &result).await;
+            return result;
         }
-        let result = self.execute_tool_streaming(call).await;
+        let result = if let Some(repeated) = self.repeated_failed_call_error(call).await {
+            repeated
+        } else {
+            let result = self.execute_tool_streaming(call).await;
+            self.remember_tool_result(call, &result).await;
+            result
+        };
         let post = self
             .lifecycle_hooks(
                 "PostToolUse",
@@ -1273,6 +1351,24 @@ where
             .lock()
             .await
             .extend(post.additional_context);
+        if tool_result_failed(&result) {
+            let failure = self
+                .lifecycle_hooks(
+                    "PostToolUseFailure",
+                    Some(&call.name),
+                    json!({
+                        "event":"PostToolUseFailure",
+                        "tool":call.name,
+                        "arguments":call.arguments,
+                        "result":result
+                    }),
+                )
+                .await;
+            self.hook_context
+                .lock()
+                .await
+                .extend(failure.additional_context);
+        }
         result
     }
 
