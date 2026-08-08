@@ -211,6 +211,48 @@ describe("single event-log timeline", () => {
       isMajorAction: true,
     });
   });
+  it("shows the human-readable summary for structured tool errors", () => {
+    const nodes = buildTimeline([
+      {
+        type: "edit_file_started",
+        event_id: "structured-error-start",
+        created_at_ms: 1,
+        working_event: {
+          event_type: "edit_file_started",
+          payload: { call_id: "structured-error-call", tool: "edit_file" },
+        },
+      },
+      {
+        type: "tool_result",
+        event_id: "structured-error-result",
+        created_at_ms: 2,
+        tool_result: {
+          call_id: "structured-error-call",
+          name: "edit_file",
+          result: {
+            error: "edit 0 old_string was not found",
+            error_details: {
+              code: "edit_anchor_not_found",
+              invariant: "each edit anchor must occur exactly once",
+              target: "src/lib.rs",
+              repair:
+                "read the file again and retry with an exact, longer anchor",
+              retry: "adjusted",
+            },
+          },
+        },
+      },
+    ] as TimelineEvent[]);
+    const row = nodes
+      .filter((node) => node.kind === "work")
+      .flatMap((node) => node.rows)
+      .find((candidate) => candidate.callId === "structured-error-call");
+    expect(row).toMatchObject({
+      resultError: true,
+      resultSummary: "edit 0 old_string was not found",
+    });
+    expect(JSON.stringify(row)).not.toContain("edit_anchor_not_found");
+  });
   it("marks resolved approvals and denied calls without process completion", () => {
     const nodes = buildTimeline([
       {

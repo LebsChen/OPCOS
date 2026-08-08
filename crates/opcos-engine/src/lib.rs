@@ -64,6 +64,246 @@ pub enum EngineError {
     ApprovalAlreadyProcessed(String),
 }
 
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolErrorCode {
+    PreflightDenied,
+    PolicyDenied,
+    ApprovalDenied,
+    Interrupted,
+    PathOutsideWorkspace,
+    EditAnchorNotFound,
+    EditAnchorAmbiguous,
+    EditEditsOverlap,
+    EditFileChanged,
+    InvalidArguments,
+    RemoteUnsupported,
+    HostIo,
+    McpTransport,
+    McpAuth,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolErrorRetry {
+    No,
+    Same,
+    Adjusted,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ToolErrorEnvelope {
+    pub code: ToolErrorCode,
+    pub invariant: String,
+    pub target: String,
+    pub repair: String,
+    pub retry: ToolErrorRetry,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval: Option<String>,
+}
+
+impl ToolErrorEnvelope {
+    pub fn new(
+        code: ToolErrorCode,
+        invariant: impl Into<String>,
+        target: impl Into<String>,
+        repair: impl Into<String>,
+        retry: ToolErrorRetry,
+        retrieval: Option<String>,
+    ) -> Self {
+        Self {
+            code,
+            invariant: invariant.into(),
+            target: target.into(),
+            repair: repair.into(),
+            retry,
+            retrieval,
+        }
+    }
+}
+
+pub fn structured_tool_error(summary: impl Into<String>, envelope: ToolErrorEnvelope) -> Value {
+    json!({
+        "error": summary.into(),
+        "error_details": envelope,
+    })
+}
+
+fn tool_error_target(call: &ToolCall) -> String {
+    call.arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .or_else(|| call.arguments.get("url").and_then(Value::as_str))
+        .unwrap_or(&call.name)
+        .to_owned()
+}
+
+fn preflight_tool_error(call: &ToolCall, summary: impl Into<String>) -> Value {
+    structured_tool_error(
+        summary,
+        ToolErrorEnvelope::new(
+            ToolErrorCode::PreflightDenied,
+            "tool preflight requirements must be satisfied before execution",
+            tool_error_target(call),
+            "resolve the preflight requirement and retry with the permitted action",
+            ToolErrorRetry::Adjusted,
+            None,
+        ),
+    )
+}
+
+fn policy_tool_error(call: &ToolCall, summary: impl Into<String>) -> Value {
+    structured_tool_error(
+        summary,
+        ToolErrorEnvelope::new(
+            ToolErrorCode::PolicyDenied,
+            "the active permission policy must allow this tool target",
+            tool_error_target(call),
+            "request approval or adjust the permission policy before retrying",
+            ToolErrorRetry::Adjusted,
+            None,
+        ),
+    )
+}
+
+fn classify_tool_error(call: &ToolCall, summary: impl Into<String>) -> Value {
+    let summary = summary.into();
+    let lower = summary.to_ascii_lowercase();
+    let target = tool_error_target(call);
+    let (code, invariant, repair, retry, retrieval) = if lower.contains("interrupted") {
+        (
+            ToolErrorCode::Interrupted,
+            "the tool call must be allowed to run to completion",
+            "retry the same call when the interruption is no longer active",
+            ToolErrorRetry::Same,
+            None,
+        )
+    } else if (lower.contains("outside")
+        && (lower.contains("workspace") || lower.contains("bound host")))
+        || lower.contains("path rejected")
+    {
+        (
+            ToolErrorCode::PathOutsideWorkspace,
+            "tool paths must remain inside the bound workspace",
+            "use a workspace-relative path and retry",
+            ToolErrorRetry::Adjusted,
+            Some("read_file or list_dir can inspect workspace-relative paths".into()),
+        )
+    } else if lower.contains("old_string was not found") {
+        (
+            ToolErrorCode::EditAnchorNotFound,
+            "each edit anchor must occur exactly once in the current file",
+            "read the file again and retry with an exact, longer anchor",
+            ToolErrorRetry::Adjusted,
+            Some("read_file returns the current file content".into()),
+        )
+    } else if lower.contains("old_string matched") {
+        (
+            ToolErrorCode::EditAnchorAmbiguous,
+            "each edit anchor must match exactly one location",
+            "retry with more surrounding context so the anchor is unique",
+            ToolErrorRetry::Adjusted,
+            Some("read_file returns the current file content".into()),
+        )
+    } else if lower.contains("edits overlap") {
+        (
+            ToolErrorCode::EditEditsOverlap,
+            "edit ranges must not overlap in the original file",
+            "adjust the edit ranges and retry as one atomic edit",
+            ToolErrorRetry::Adjusted,
+            None,
+        )
+    } else if lower.contains("file changed externally") {
+        (
+            ToolErrorCode::EditFileChanged,
+            "the file must remain unchanged between read and atomic write",
+            "read the file again, reconcile the change, and retry",
+            ToolErrorRetry::Adjusted,
+            Some("read_file returns the current file content".into()),
+        )
+    } else if lower.contains("missing string argument")
+        || lower.contains("missing array argument")
+        || lower.contains("missing old_string")
+        || lower.contains("missing new_string")
+        || lower.contains("empty old_string")
+        || lower.contains("edits must contain")
+        || lower.contains("ask_user must be handled")
+    {
+        (
+            ToolErrorCode::InvalidArguments,
+            "tool arguments must satisfy the tool schema",
+            "correct the missing or invalid argument and retry",
+            ToolErrorRetry::Adjusted,
+            None,
+        )
+    } else if lower.contains("denied by policy") || lower.contains("blocked") {
+        (
+            ToolErrorCode::PolicyDenied,
+            "the active permission policy must allow this tool target",
+            "request approval or adjust the permission policy before retrying",
+            ToolErrorRetry::Adjusted,
+            None,
+        )
+    } else if lower.contains("denied by user") || lower.contains("approval denial") {
+        (
+            ToolErrorCode::ApprovalDenied,
+            "the user must approve the requested tool action",
+            "ask for approval again only after explaining the required action",
+            ToolErrorRetry::No,
+            None,
+        )
+    } else if lower.contains("preflight") || lower.contains("approval") {
+        (
+            ToolErrorCode::PreflightDenied,
+            "tool preflight requirements must be satisfied before execution",
+            "resolve the preflight requirement and retry with the permitted action",
+            ToolErrorRetry::Adjusted,
+            None,
+        )
+    } else if lower.contains("unsupported") || lower.contains("unavailable") {
+        (
+            ToolErrorCode::RemoteUnsupported,
+            "the selected host must support the requested capability",
+            "use a supported tool or switch to a host that exposes this capability",
+            ToolErrorRetry::No,
+            None,
+        )
+    } else if lower.contains("mcp") && (lower.contains("auth") || lower.contains("oauth")) {
+        (
+            ToolErrorCode::McpAuth,
+            "the MCP server must accept the configured authentication",
+            "authenticate the MCP server, then retry the tool call",
+            ToolErrorRetry::Adjusted,
+            Some("inspect the MCP server authentication status".into()),
+        )
+    } else if lower.contains("mcp")
+        && (lower.contains("transport")
+            || lower.contains("disconnect")
+            || lower.contains("timed out")
+            || lower.contains("timeout"))
+    {
+        (
+            ToolErrorCode::McpTransport,
+            "the MCP transport must remain connected and responsive",
+            "restore the MCP connection and retry the same call",
+            ToolErrorRetry::Same,
+            Some("inspect the MCP server connection status".into()),
+        )
+    } else {
+        (
+            ToolErrorCode::HostIo,
+            "the host must complete the requested tool operation",
+            "inspect the host error, correct the environment, and retry",
+            ToolErrorRetry::Same,
+            None,
+        )
+    };
+    structured_tool_error(
+        summary,
+        ToolErrorEnvelope::new(code, invariant, target, repair, retry, retrieval),
+    )
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ExternalContextAttachment {
     pub source: String,
@@ -929,7 +1169,7 @@ where
             )
             .await;
         if let Some(reason) = pre.blocked {
-            return json!({"error":reason});
+            return classify_tool_error(call, reason);
         }
         let result = self.execute_tool_streaming(call).await;
         let post = self
@@ -948,16 +1188,16 @@ where
 
     async fn execute_tool_interruptible(&self, call: &ToolCall) -> Value {
         if self.interrupted.load(Ordering::SeqCst) {
-            return json!({"error":"tool call interrupted"});
+            return classify_tool_error(call, "tool call interrupted");
         }
         tokio::select! {
             result = self.execute_tool_with_hooks(call) => result,
-            _ = self.interrupt_notify.notified() => json!({"error":"tool call interrupted"}),
+            _ = self.interrupt_notify.notified() => classify_tool_error(call, "tool call interrupted"),
         }
     }
 
-    fn execute_proposed_plan(&self, arguments: &Value) -> Value {
-        let object = arguments.as_object();
+    fn execute_proposed_plan(&self, call: &ToolCall) -> Value {
+        let object = call.arguments.as_object();
         let title = object
             .and_then(|value| value.get("title"))
             .and_then(Value::as_str)
@@ -986,7 +1226,7 @@ where
                 "plan_id": plan.plan_id,
                 "steps": plan.steps.len(),
             }),
-            Err(error) => json!({"error": error.to_string()}),
+            Err(error) => classify_tool_error(call, error.to_string()),
         }
     }
 
@@ -1500,14 +1740,17 @@ where
             if target.tool == "ask_user" {
                 // Questions remain engine-owned pending input. Never execute one
                 // synchronously through an approval path or fabricate an answer.
-                json!({"error":"ask_user must be handled by the engine pending mechanism"})
+                classify_tool_error(
+                    &target_call,
+                    "ask_user must be handled by the engine pending mechanism",
+                )
             } else if target.tool == "propose_plan" {
-                self.execute_proposed_plan(&target.arguments)
+                self.execute_proposed_plan(&target_call)
             } else {
                 self.execute_tool_streaming(&target_call).await
             }
         } else {
-            json!({"error":"tool call denied by user"})
+            classify_tool_error(&target_call, "tool call denied by user")
         };
         self.append(
             "tool",
@@ -1629,7 +1872,13 @@ where
         }
 
         for pending in remaining {
-            let denied = json!({"error":"tool call canceled after approval denial"});
+            let denied_call = ToolCall {
+                id: pending.call_id.clone(),
+                name: pending.tool.clone(),
+                arguments: pending.arguments.clone(),
+            };
+            let denied =
+                classify_tool_error(&denied_call, "tool call canceled after approval denial");
             self.store
                 .delete_pending(&self.session_id, &pending.call_id)
                 .map_err(|error| EngineError::Store(error.to_string()))?;
@@ -2344,7 +2593,7 @@ where
         let permission_rules = self.permission_rules.lock().await.clone();
         for (index, call) in calls.iter().enumerate() {
             if self.interrupted.load(Ordering::SeqCst) {
-                results[index] = Some(json!({"error":"tool call interrupted"}));
+                results[index] = Some(classify_tool_error(call, "tool call interrupted"));
                 continue;
             }
             let mode = *self.mode.lock().await;
@@ -2519,11 +2768,13 @@ where
                     risk = ToolRisk::Execute;
                 }
             }
-            let preflight = self
-                .executor
-                .preflight(&call.name, &call.arguments)
-                .await
-                .map_err(EngineError::Tool)?;
+            let preflight = match self.executor.preflight(&call.name, &call.arguments).await {
+                Ok(preflight) => preflight,
+                Err(error) => {
+                    results[index] = Some(preflight_tool_error(call, error));
+                    continue;
+                }
+            };
             let mut preflight_reason = None;
             let decision = match preflight {
                 PreflightDecision::Allow if self.executor.grant_allows(target) => {
@@ -2582,10 +2833,9 @@ where
                 let reason = preflight_reason
                     .as_deref()
                     .unwrap_or("tool call denied by preflight");
-                results[index] = Some(json!({
-                    "error": reason,
-                    "_opcos_not_executed": true,
-                }));
+                let mut result = preflight_tool_error(call, reason);
+                result["_opcos_not_executed"] = json!(true);
+                results[index] = Some(result);
                 let _ = self
                     .working_event(
                         "tool_call_denied",
@@ -2620,7 +2870,7 @@ where
                         None
                     };
                     let result = if call.name == "propose_plan" {
-                        self.execute_proposed_plan(&call.arguments)
+                        self.execute_proposed_plan(call)
                     } else {
                         self.execute_tool_interruptible(call).await
                     };
@@ -2633,9 +2883,9 @@ where
                 }
                 Decision::Deny => {
                     self.policy_denied.store(true, Ordering::SeqCst);
-                    results[index] = Some(
-                        json!({"error":"tool call denied by policy","_opcos_not_executed":true}),
-                    );
+                    let mut result = policy_tool_error(call, "tool call denied by policy");
+                    result["_opcos_not_executed"] = json!(true);
+                    results[index] = Some(result);
                     let _ = self
                         .working_event(
                             "tool_call_denied",
@@ -2778,7 +3028,7 @@ where
             .executor
             .execute_streaming(&call.name, call.arguments.clone(), &on_output)
             .await
-            .unwrap_or_else(|error| json!({"error":error}));
+            .unwrap_or_else(|error| classify_tool_error(call, error));
         if truncated.load(Ordering::Relaxed) {
             let _ = self.record_working_event(
                 "terminal_update",
@@ -5159,6 +5409,8 @@ mod tests {
             result.get("error").and_then(Value::as_str),
             Some("destructive command blocked")
         );
+        assert_eq!(result["error_details"]["code"], "policy_denied");
+        assert_eq!(result["error_details"]["retry"], "adjusted");
     }
 
     #[tokio::test]
@@ -6463,6 +6715,136 @@ mod tests {
         assert!(!serialized.contains("known-secret-value"));
     }
 
+    #[test]
+    fn tool_error_failures_have_stable_repair_metadata() {
+        let call = ToolCall {
+            id: "error-call".into(),
+            name: "edit_file".into(),
+            arguments: json!({"path":"src/lib.rs"}),
+        };
+        let cases = [
+            ("shell approval required", "preflight_denied", "adjusted"),
+            ("tool call denied by policy", "policy_denied", "adjusted"),
+            ("tool call interrupted", "interrupted", "same"),
+            (
+                "path is outside local workspace",
+                "path_outside_workspace",
+                "adjusted",
+            ),
+            (
+                "edit 0 old_string was not found",
+                "edit_anchor_not_found",
+                "adjusted",
+            ),
+            (
+                "edit 0 old_string matched 2 times",
+                "edit_anchor_ambiguous",
+                "adjusted",
+            ),
+            (
+                "edits overlap in the original file",
+                "edit_edits_overlap",
+                "adjusted",
+            ),
+            (
+                "file changed externally after it was read",
+                "edit_file_changed",
+                "adjusted",
+            ),
+            (
+                "unsupported host capability: lsp",
+                "remote_unsupported",
+                "no",
+            ),
+            ("local host I/O failed: disk full", "host_io", "same"),
+            ("MCP transport error", "mcp_transport", "same"),
+            ("MCP server authentication required", "mcp_auth", "adjusted"),
+            ("tool call denied by user", "approval_denied", "no"),
+        ];
+        for (summary, code, retry) in cases {
+            let result = classify_tool_error(&call, summary);
+            assert_eq!(result["error"], summary);
+            assert_eq!(result["error_details"]["code"], code);
+            assert_eq!(result["error_details"]["retry"], retry);
+            assert!(
+                result["error_details"]["invariant"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
+            );
+            assert!(
+                result["error_details"]["repair"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_scrubber_redacts_structured_error_fields() {
+        struct Scrubber;
+        impl SecretScrubber for Scrubber {
+            fn scrub(&self, value: &mut Value) {
+                fn visit(value: &mut Value) {
+                    match value {
+                        Value::String(text) => {
+                            *text = text.replace("known-secret-value", "[REDACTED]")
+                        }
+                        Value::Array(items) => items.iter_mut().for_each(visit),
+                        Value::Object(items) => items.values_mut().for_each(visit),
+                        _ => {}
+                    }
+                }
+                visit(value);
+            }
+        }
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let mut engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "structured-error-secret",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine.set_secret_scrubber(Arc::new(Scrubber));
+        let call = ToolCall {
+            id: "secret-error-call".into(),
+            name: "read_file".into(),
+            arguments: json!({"path":"known-secret-value"}),
+        };
+        store
+            .append_tool_call(&opcos_store::ToolCallRecord {
+                session_id: "structured-error-secret".into(),
+                message_sequence: 1,
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+                result: None,
+            })
+            .unwrap();
+        let result = structured_tool_error(
+            "known-secret-value",
+            ToolErrorEnvelope::new(
+                ToolErrorCode::HostIo,
+                "known-secret-value",
+                "known-secret-value",
+                "known-secret-value",
+                ToolErrorRetry::Same,
+                Some("known-secret-value".into()),
+            ),
+        );
+        engine
+            .persist_tool_results(1, &[call], vec![("secret-error-call".into(), result)])
+            .await
+            .unwrap();
+        let serialized =
+            serde_json::to_string(&store.load_messages("structured-error-secret").unwrap())
+                .unwrap();
+        assert!(!serialized.contains("known-secret-value"));
+        assert!(serialized.contains("[REDACTED]"));
+    }
+
     #[tokio::test]
     async fn switching_a_running_engine_to_auto_allows_write_tools() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
@@ -7148,6 +7530,8 @@ mod tests {
             .expect("denied tool call");
         let result = denied_call.result.expect("denied result");
         assert_eq!(result["error"], "tool call denied by policy");
+        assert_eq!(result["error_details"]["code"], "policy_denied");
+        assert_eq!(result["error_details"]["retry"], "adjusted");
         assert!(result.get("_opcos_not_executed").is_none());
         let messages = store.load_messages("unattended-denial").unwrap();
         assert!(
@@ -8235,7 +8619,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result, vec![json!({"error":"write failed"})]);
+        assert_eq!(result[0]["error"], "write failed");
+        assert_eq!(result[0]["error_details"]["code"], "host_io");
+        assert_eq!(result[0]["error_details"]["retry"], "same");
         let updates = store
             .load_audit(Some("failed-write"))
             .unwrap()
@@ -8343,7 +8729,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(results, vec![json!({"error":"tool call interrupted"})]);
+        assert_eq!(results[0]["error"], "tool call interrupted");
+        assert_eq!(results[0]["error_details"]["code"], "interrupted");
+        assert_eq!(results[0]["error_details"]["retry"], "same");
     }
 
     #[tokio::test]
