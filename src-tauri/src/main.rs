@@ -13,7 +13,7 @@ use axum::{
     routing::any,
 };
 use base64::Engine;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures_util::{SinkExt, StreamExt};
 use notify::Watcher;
 use opcos_assets::{
@@ -24,9 +24,8 @@ use opcos_assets::{
 use opcos_engine::SecretScrubber;
 use opcos_engine::{
     AcpHarness, AcpHarnessConfig, AgentEngine, ArtifactReference, ArtifactRequest, ArtifactSink,
-    EngineError, Harness, LifecycleHook, LifecycleHookConfig, OpenCodeHarness,
-    OpenCodeHarnessConfig, PreflightDecision, SessionRecorder, ToolExecutor, ToolOrigin,
-    TurnEngine,
+    EngineError, ExternalContextAttachment, Harness, LifecycleHook, LifecycleHookConfig,
+    PreflightDecision, SessionRecorder, ToolExecutor, ToolOrigin, TurnEngine,
     computer_use::{
         BestEffortScreenshotChangedVerifier, ComputerUseLoopConfig, ComputerUseStep,
         run_computer_use_loop,
@@ -39,7 +38,7 @@ use opcos_engine::{
         restore_login_state as engine_restore_login_state,
     },
     orchestration::{BoardPhase, BoardTask},
-    orchestration::{CoordinationRuntime, Envelope, Role},
+    orchestration::{CoordinationRuntime, Envelope, Role, RoleState},
     planner::{parse_planner_output, planner_dedup_key, planning_prompt},
 };
 use opcos_hosts::{
@@ -119,13 +118,26 @@ impl opcos_assets::RemoteAssetReader for HostAssetReader {
             .map_err(|error| opcos_assets::AssetError::Invalid(error.to_string()))
     }
 }
+use agent_client_protocol::schema::v1::{
+    ContentBlock as AcpContentBlock, ContentChunk as AcpContentChunk,
+    NewSessionRequest as AcpNewSessionRequest, NewSessionResponse as AcpNewSessionResponse,
+    PromptRequest as AcpPromptRequest, RequestPermissionOutcome, SessionNotification,
+    SessionUpdate, StopReason as AcpStopReason, TextContent as AcpTextContent,
+};
 use tauri::{Emitter, Manager, RunEvent, State};
 use tauri_plugin_opener::OpenerExt;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio_tungstenite::accept_async;
+use tokio_tungstenite::{
+    accept_async, accept_hdr_async, connect_async,
+    tungstenite::{
+        Message as WsMessage,
+        client::IntoClientRequest,
+        handshake::server::{Request as WsRequest, Response as WsResponse},
+    },
+};
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -142,6 +154,274 @@ fn configure_no_window(_command: &mut ProcessCommand) {}
 
 const SECRET_SERVICE: &str = "com.opcos.desktop";
 const ASKPASS_SCRIPT: &str = "if (($args -join ' ') -match 'Username') { $env:OPCOS_GIT_USERNAME } else { $env:OPCOS_GIT_PASSWORD }";
+const MCP_STATE_FILE: &str = "mcp-server.json";
+const ACP_STATE_FILE: &str = "acp-server.json";
+
+#[derive(Debug, Deserialize, Serialize)]
+struct McpBridgeState {
+    host: String,
+    port: u16,
+    token: String,
+}
+
+type AcpBridgeState = McpBridgeState;
+
+fn mcp_state_path() -> Result<PathBuf, String> {
+    Ok(dirs::config_dir()
+        .ok_or_else(|| "OPCOS configuration directory is unavailable".to_owned())?
+        .join("com.opcos.desktop")
+        .join(MCP_STATE_FILE))
+}
+
+fn load_or_create_mcp_token(path: &FsPath) -> Result<String, String> {
+    if let Ok(content) = std::fs::read_to_string(path) {
+        let state = serde_json::from_str::<McpBridgeState>(&content)
+            .map_err(|error| format!("invalid MCP state file: {error}"))?;
+        if !state.token.is_empty() {
+            return Ok(state.token);
+        }
+    }
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| format!("failed to generate MCP token: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn write_mcp_state(path: &FsPath, port: u16, token: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "MCP state path has no parent".to_owned())?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temporary = path.with_extension("tmp");
+    let content = serde_json::to_vec(&McpBridgeState {
+        host: "127.0.0.1".into(),
+        port,
+        token: token.into(),
+    })
+    .map_err(|error| error.to_string())?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| error.to_string())?;
+    file.write_all(&content)
+        .map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    std::fs::rename(temporary, path).map_err(|error| error.to_string())
+}
+
+fn run_mcp_bridge() -> Result<(), String> {
+    let path = mcp_state_path()?;
+    let state: McpBridgeState = serde_json::from_str(
+        &std::fs::read_to_string(&path)
+            .map_err(|_| "OPCOS is not running; MCP endpoint state is unavailable".to_owned())?,
+    )
+    .map_err(|error| format!("invalid OPCOS MCP endpoint state: {error}"))?;
+    if state.host != "127.0.0.1" && state.host != "localhost" {
+        return Err("OPCOS MCP endpoint is not loopback-only".into());
+    }
+    if state.port == 0 || state.token.trim().is_empty() {
+        return Err("invalid OPCOS MCP endpoint state".into());
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("failed to start MCP bridge runtime: {error}"))?;
+    runtime.block_on(async move {
+        tokio::net::TcpStream::connect((state.host.as_str(), state.port))
+            .await
+            .map_err(|_| "OPCOS is not running; MCP endpoint is unreachable".to_owned())?;
+        let client = reqwest::Client::new();
+        let authorization = format!("Bearer {}", state.token);
+        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        let mut stdout = tokio::io::stdout();
+        while let Some(line) = lines.next_line().await.map_err(|error| error.to_string())? {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let response = client
+                .post(format!("http://{}:{}/mcp", state.host, state.port))
+                .header(reqwest::header::AUTHORIZATION, &authorization)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(line)
+                .send()
+                .await
+                .map_err(|_| "OPCOS MCP endpoint became unreachable".to_owned())?;
+            if response.status() == reqwest::StatusCode::NO_CONTENT {
+                continue;
+            }
+            if !response.status().is_success() {
+                return Err(format!(
+                    "OPCOS MCP endpoint rejected the request with HTTP {}",
+                    response.status()
+                ));
+            }
+            let body = response
+                .bytes()
+                .await
+                .map_err(|_| "OPCOS MCP endpoint returned an unreadable response".to_owned())?;
+            stdout
+                .write_all(&body)
+                .await
+                .map_err(|error| error.to_string())?;
+            stdout
+                .write_all(b"\n")
+                .await
+                .map_err(|error| error.to_string())?;
+            stdout.flush().await.map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    })
+}
+
+fn acp_state_path() -> Result<PathBuf, String> {
+    Ok(dirs::config_dir()
+        .ok_or_else(|| "OPCOS configuration directory is unavailable".to_owned())?
+        .join("com.opcos.desktop")
+        .join(ACP_STATE_FILE))
+}
+
+fn write_acp_state(path: &FsPath, port: u16, token: &str) -> Result<(), String> {
+    write_mcp_state(path, port, token)
+}
+
+fn run_acp_bridge() -> Result<(), String> {
+    let path = acp_state_path()?;
+    let state: AcpBridgeState = serde_json::from_str(
+        &std::fs::read_to_string(&path)
+            .map_err(|_| "OPCOS is not running; ACP endpoint state is unavailable".to_owned())?,
+    )
+    .map_err(|error| format!("invalid OPCOS ACP endpoint state: {error}"))?;
+    if state.host != "127.0.0.1" && state.host != "localhost" {
+        return Err("OPCOS ACP endpoint is not loopback-only".into());
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("failed to start ACP bridge runtime: {error}"))?;
+    runtime.block_on(async move {
+        let url = format!("ws://{}:{}/acp", state.host, state.port);
+        let mut request = url
+            .into_client_request()
+            .map_err(|error| format!("invalid OPCOS ACP endpoint: {error}"))?;
+        request.headers_mut().insert(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", state.token)
+                .parse()
+                .map_err(|_| "invalid ACP authorization header".to_owned())?,
+        );
+        let (mut socket, _) = connect_async(request)
+            .await
+            .map_err(|_| "OPCOS is not running; ACP endpoint is unreachable".to_owned())?;
+        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        let mut stdout = tokio::io::stdout();
+        loop {
+            tokio::select! {
+                line = lines.next_line() => {
+                    let Some(line) = line.map_err(|error| error.to_string())? else { break };
+                    if !line.trim().is_empty() {
+                        socket.send(WsMessage::Text(line.into())).await
+                            .map_err(|_| "OPCOS ACP endpoint became unreachable".to_owned())?;
+                    }
+                }
+                message = socket.next() => {
+                    let Some(message) = message else { break };
+                    match message.map_err(|_| "OPCOS ACP endpoint returned an invalid frame".to_owned())? {
+                        WsMessage::Text(text) => {
+                            stdout.write_all(text.as_bytes()).await.map_err(|error| error.to_string())?;
+                            stdout.write_all(b"\n").await.map_err(|error| error.to_string())?;
+                            stdout.flush().await.map_err(|error| error.to_string())?;
+                        }
+                        WsMessage::Binary(bytes) => {
+                            stdout.write_all(&bytes).await.map_err(|error| error.to_string())?;
+                            stdout.write_all(b"\n").await.map_err(|error| error.to_string())?;
+                            stdout.flush().await.map_err(|error| error.to_string())?;
+                        }
+                        WsMessage::Close(_) => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+#[allow(clippy::result_large_err)]
+async fn serve_acp_http<C>(
+    listener: TcpListener,
+    token: String,
+    control_plane: Arc<C>,
+) -> Result<(), String>
+where
+    C: opcos_acp_server::OpcosAcpControlPlane,
+{
+    loop {
+        let (stream, _) = listener.accept().await.map_err(|error| error.to_string())?;
+        let expected = format!("Bearer {token}");
+        let control_plane = Arc::clone(&control_plane);
+        tokio::spawn(async move {
+            let callback = |request: &WsRequest, response: WsResponse| {
+                let authorized = request
+                    .headers()
+                    .get(reqwest::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value == expected);
+                if authorized {
+                    Ok(response)
+                } else {
+                    Err(WsResponse::builder()
+                        .status(401)
+                        .body(Some("unauthorized".into()))
+                        .expect("valid websocket response"))
+                }
+            };
+            let Ok(socket) = accept_hdr_async(stream, callback).await else {
+                return;
+            };
+            let (client, server_io) = tokio::io::duplex(128 * 1024);
+            let server_task = tokio::spawn(async move {
+                let protocol = opcos_acp_server::OpcosAcpServer::new(control_plane);
+                let (reader, writer) = tokio::io::split(server_io);
+                let _ = protocol
+                    .serve_stdio(tokio::io::BufReader::new(reader), writer)
+                    .await;
+            });
+            let (mut ws_writer, mut ws_reader) = socket.split();
+            let (client_reader, mut client_writer) = tokio::io::split(client);
+            let mut output = tokio::io::BufReader::new(client_reader).lines();
+            loop {
+                tokio::select! {
+                    line = output.next_line() => {
+                        let Ok(Some(line)) = line else { break };
+                        if ws_writer.send(WsMessage::Text(line.into())).await.is_err() { break; }
+                    }
+                    message = ws_reader.next() => {
+                        let Some(Ok(message)) = message else { break };
+                        match message {
+                            WsMessage::Text(text) => {
+                                if client_writer.write_all(text.as_bytes()).await.is_err()
+                                    || client_writer.write_all(b"\n").await.is_err() { break; }
+                            }
+                            WsMessage::Binary(bytes) => {
+                                if client_writer.write_all(&bytes).await.is_err()
+                                    || client_writer.write_all(b"\n").await.is_err() { break; }
+                            }
+                            WsMessage::Close(_) => break,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            server_task.abort();
+        });
+    }
+}
 mod ci_repair;
 mod external_ingress;
 mod repo_index;
@@ -361,10 +641,9 @@ struct DesktopState {
     secret_values: SecretValues,
     store: Arc<SqliteStore>,
     engines: Arc<AsyncMutex<HashMap<String, Arc<GuiEngine>>>>,
-    opencode_engines: AsyncMutex<HashMap<String, Arc<opcos_engine::OpenCodeHarness<SqliteStore>>>>,
-    opencode_event_sessions: AsyncMutex<HashSet<String>>,
     acp_engines: AsyncMutex<HashMap<String, Arc<opcos_engine::AcpHarness<SqliteStore>>>>,
     acp_event_sessions: AsyncMutex<HashSet<String>>,
+    acp_streams: Mutex<HashMap<String, UnboundedSender<(String, Value)>>>,
     trigger_runs: AsyncMutex<HashSet<String>>,
     trigger_http_token: String,
     trigger_http_port: u16,
@@ -376,6 +655,8 @@ struct DesktopState {
     index_root: PathBuf,
     artifact_root: PathBuf,
     mcp: Arc<McpManager<McpCredentialAdapter>>,
+    mcp_projects: AsyncMutex<HashMap<String, Arc<McpManager<McpCredentialAdapter>>>>,
+    mcp_notification_app: tauri::AppHandle,
     jobs: Arc<BackgroundJobManager>,
     local_browser: Arc<dyn BrowserController>,
     ingress_shutdown: tokio::sync::watch::Sender<bool>,
@@ -466,6 +747,25 @@ impl McpCredentialStore for McpCredentialAdapter {
                 serde_json::from_str(&value).map_err(|_| opcos_mcp::McpClientError::Transport)
             })
             .transpose()
+    }
+
+    async fn set(
+        &self,
+        server_id: &str,
+        credentials: HashMap<String, String>,
+    ) -> Result<(), opcos_mcp::McpClientError> {
+        let mut merged = self.get(server_id).await?.unwrap_or_default();
+        merged.extend(credentials);
+        let value =
+            serde_json::to_string(&merged).map_err(|_| opcos_mcp::McpClientError::Transport)?;
+        let key = self
+            .project_id
+            .as_deref()
+            .map(|id| project_secret_key(id, "mcp-credential", server_id))
+            .unwrap_or_else(|| secret_key("mcp-credential", server_id));
+        self.store
+            .set(&key, &value)
+            .map_err(|_| opcos_mcp::McpClientError::Transport)
     }
 }
 
@@ -1225,7 +1525,7 @@ async fn preflight_git_push(
         .ok_or("git_push requires cwd")?;
     let Some(project_id) = project_id else {
         return Ok(match origin {
-            ToolOrigin::User => PreflightDecision::NeedsUser(
+            ToolOrigin::User | ToolOrigin::System => PreflightDecision::NeedsUser(
                 "push diff inspection unavailable: no bound project".into(),
             ),
             ToolOrigin::RepairLoop => PreflightDecision::Deny(
@@ -1238,7 +1538,7 @@ async fn preflight_git_push(
         .map_err(|error| error.to_string())?
     else {
         return Ok(match origin {
-            ToolOrigin::User => PreflightDecision::NeedsUser(
+            ToolOrigin::User | ToolOrigin::System => PreflightDecision::NeedsUser(
                 "push diff inspection unavailable: bound project could not be loaded".into(),
             ),
             ToolOrigin::RepairLoop => PreflightDecision::Deny(
@@ -1258,7 +1558,7 @@ fn push_diff_preflight(
 ) -> PreflightDecision {
     match inspection {
         Err(error) => match origin {
-            ToolOrigin::User => {
+            ToolOrigin::User | ToolOrigin::System => {
                 PreflightDecision::NeedsUser(format!("push requires approval: {error}"))
             }
             ToolOrigin::RepairLoop => {
@@ -1267,7 +1567,7 @@ fn push_diff_preflight(
         },
         Ok(reasons) if reasons.is_empty() => PreflightDecision::Allow,
         Ok(reasons) => match origin {
-            ToolOrigin::User => PreflightDecision::NeedsUser(format!(
+            ToolOrigin::User | ToolOrigin::System => PreflightDecision::NeedsUser(format!(
                 "push requires approval: diff enters protected repair boundary ({})",
                 reasons.join("; ")
             )),
@@ -3685,6 +3985,15 @@ impl ToolExecutor for RemoteExecutor {
             return execute_external_ingress_tool(&self.store, name, &arguments);
         }
         if matches!(name, "coordination_dispatch" | "coordination_status") {
+            if name == "coordination_dispatch"
+                && self.origin == ToolOrigin::User
+                && automatic_project_routing_active(&self.store, &self.session_id)?
+            {
+                return Err(
+                    "routing is system-managed; planned steps are dispatched automatically"
+                        .to_owned(),
+                );
+            }
             return execute_coordination_tool(
                 &self.store,
                 &self.database,
@@ -3805,6 +4114,17 @@ impl ToolExecutor for RemoteExecutor {
                 for value in values {
                     redact_json_strings(&mut output, &value);
                 }
+                audit_routed_lead_shell(
+                    &self.store,
+                    &self.session_id,
+                    &self.origin,
+                    argument("command")?,
+                    arguments
+                        .get("cwd")
+                        .and_then(Value::as_str)
+                        .or(Some(&self.workspace)),
+                    &output,
+                );
                 Ok(output)
             }
             "git_status" => self
@@ -4090,6 +4410,15 @@ impl ToolExecutor for DesktopExecutor {
                     return execute_external_ingress_tool(&executor.store, name, &arguments);
                 }
                 if matches!(name, "coordination_dispatch" | "coordination_status") {
+                    if name == "coordination_dispatch"
+                        && executor.origin == ToolOrigin::User
+                        && automatic_project_routing_active(&executor.store, &executor.session_id)?
+                    {
+                        return Err(
+                            "routing is system-managed; planned steps are dispatched automatically"
+                                .to_owned(),
+                        );
+                    }
                     return execute_coordination_tool(
                         &executor.store,
                         &executor.database,
@@ -4218,6 +4547,17 @@ impl ToolExecutor for DesktopExecutor {
                         for value in values {
                             redact_json_strings(&mut output, &value);
                         }
+                        audit_routed_lead_shell(
+                            &executor.store,
+                            &executor.session_id,
+                            &executor.origin,
+                            argument("command")?,
+                            arguments
+                                .get("cwd")
+                                .and_then(Value::as_str)
+                                .or(Some(&executor.workspace)),
+                            &output,
+                        );
                         Ok(output)
                     }
                     "git_status" => execute_local_git_read(&executor.host, "status", &arguments).await,
@@ -4388,6 +4728,17 @@ impl ToolExecutor for DesktopExecutor {
         for value in values {
             redact_json_strings(&mut result, &value);
         }
+        audit_routed_lead_shell(
+            &executor.store,
+            &executor.session_id,
+            &executor.origin,
+            command,
+            arguments
+                .get("cwd")
+                .and_then(Value::as_str)
+                .or(Some(&executor.workspace)),
+            &result,
+        );
         Ok(result)
     }
 
@@ -4503,6 +4854,72 @@ fn redact_json_strings(value: &mut Value, secret: &str) {
     }
 }
 
+fn shell_likely_mutating(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    [
+        " >",
+        ">>",
+        "<<",
+        "heredoc",
+        "tee ",
+        "sed -i",
+        "perl -i",
+        "python -c",
+        "python3 -c",
+        "ruby -e",
+        "node -e",
+        "cp ",
+        "mv ",
+        "rm ",
+        "git apply",
+        "git add",
+        "git commit",
+        "git push",
+        "git checkout",
+        "git restore",
+        "git reset",
+        "chmod ",
+        "mkdir ",
+        "touch ",
+        "truncate ",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn audit_routed_lead_shell(
+    store: &SqliteStore,
+    session_id: &str,
+    origin: &ToolOrigin,
+    command: &str,
+    cwd: Option<&str>,
+    result: &Value,
+) {
+    if *origin != ToolOrigin::User
+        || !automatic_project_routing_active(store, session_id).unwrap_or(false)
+    {
+        return;
+    }
+    let exit_code = result
+        .get("exit_code")
+        .or_else(|| {
+            result
+                .get("result")
+                .and_then(|value| value.get("exit_code"))
+        })
+        .and_then(Value::as_i64);
+    let _ = store.append_audit(
+        session_id,
+        "routed_lead_shell",
+        &json!({
+            "workspace": cwd,
+            "command": redact_secret_patterns(command),
+            "likely_mutating": shell_likely_mutating(command),
+            "exit_code": exit_code,
+        }),
+    );
+}
+
 async fn initialize_mcp(app: &tauri::AppHandle) {
     let state = app.state::<DesktopState>();
     let configs = {
@@ -4581,6 +4998,7 @@ async fn initialize_mcp(app: &tauri::AppHandle) {
                 .await;
         }
         if let Ok(tools) = state.mcp.connect_with_retry(&config, &version_id, 0).await {
+            let catalog = state.mcp.cached_catalog(&object_id, &version_id).await;
             let Ok(connection) = state.database.lock() else {
                 continue;
             };
@@ -4606,6 +5024,76 @@ async fn initialize_mcp(app: &tauri::AppHandle) {
                         Utc::now().to_rfc3339()
                     ],
                 );
+            }
+            let _ = transaction.execute(
+                "DELETE FROM mcp_resource_cache
+                 WHERE server_object_id=?1 AND config_version_id=?2",
+                params![object_id, version_id],
+            );
+            let _ = transaction.execute(
+                "DELETE FROM mcp_resource_template_cache
+                 WHERE server_object_id=?1 AND config_version_id=?2",
+                params![object_id, version_id],
+            );
+            let _ = transaction.execute(
+                "DELETE FROM mcp_prompt_cache
+                 WHERE server_object_id=?1 AND config_version_id=?2",
+                params![object_id, version_id],
+            );
+            if let Some(catalog) = catalog {
+                for resource in catalog.resources {
+                    let _ = transaction.execute(
+                        "INSERT INTO mcp_resource_cache
+                         (server_object_id,config_version_id,uri,name,title,description,mime_type,annotations_json,discovered_at)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                        params![
+                            object_id,
+                            version_id,
+                            resource.uri,
+                            resource.name,
+                            resource.title,
+                            resource.description,
+                            resource.mime_type,
+                            resource.annotations.map(|v| v.to_string()),
+                            Utc::now().to_rfc3339()
+                        ],
+                    );
+                }
+                for template in catalog.resource_templates {
+                    let _ = transaction.execute(
+                        "INSERT INTO mcp_resource_template_cache
+                         (server_object_id,config_version_id,uri_template,name,title,description,mime_type,annotations_json,discovered_at)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                        params![
+                            object_id,
+                            version_id,
+                            template.uri_template,
+                            template.name,
+                            template.title,
+                            template.description,
+                            template.mime_type,
+                            template.annotations.map(|v| v.to_string()),
+                            Utc::now().to_rfc3339()
+                        ],
+                    );
+                }
+                for prompt in catalog.prompts {
+                    let _ = transaction.execute(
+                        "INSERT INTO mcp_prompt_cache
+                         (server_object_id,config_version_id,prompt_name,title,description,arguments_json,discovered_at)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                        params![
+                            object_id,
+                            version_id,
+                            prompt.name,
+                            prompt.title,
+                            prompt.description,
+                            serde_json::to_string(&prompt.arguments)
+                                .unwrap_or_else(|_| "[]".into()),
+                            Utc::now().to_rfc3339()
+                        ],
+                    );
+                }
             }
             let _ = transaction.commit();
         }
@@ -4634,8 +5122,106 @@ struct SessionView {
     workspace: String,
     run_state: String,
     stop_reason: String,
+    archived: bool,
     project_id: Option<String>,
     agent_id: Option<String>,
+}
+
+fn acp_stop_reason(session: &SessionRecord) -> Result<AcpStopReason, String> {
+    match (session.run_state.as_str(), session.stop_reason.as_str()) {
+        ("interrupted", "interrupted_by_user") | (_, "cancelled") => Ok(AcpStopReason::Cancelled),
+        (_, "policy_denied") | (_, "refusal") => Ok(AcpStopReason::Refusal),
+        (_, "max_iterations") | (_, "max_turn_requests") => Ok(AcpStopReason::MaxTurnRequests),
+        (_, "usage_limit") | (_, "max_tokens") => Ok(AcpStopReason::MaxTokens),
+        ("idle", "finished") => Ok(AcpStopReason::EndTurn),
+        (run_state, stop_reason) => Err(format!(
+            "ACP turn ended with unsupported terminal state {run_state}/{stop_reason}"
+        )),
+    }
+}
+
+fn acp_stream_update(kind: &str, payload: &Value) -> Option<SessionUpdate> {
+    match kind {
+        "message" if payload.get("role").and_then(Value::as_str) == Some("assistant") => {
+            Some(SessionUpdate::AgentMessageChunk(AcpContentChunk::new(
+                AcpContentBlock::Text(AcpTextContent::new(
+                    payload
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                )),
+            )))
+        }
+        "thinking" => Some(SessionUpdate::AgentThoughtChunk(AcpContentChunk::new(
+            AcpContentBlock::Text(AcpTextContent::new(
+                payload
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )),
+        ))),
+        "stream" => {
+            match payload.get("type").and_then(Value::as_str) {
+                Some("assistant_delta") => {
+                    payload
+                        .get("text_delta")
+                        .and_then(Value::as_str)
+                        .map(|text| {
+                            SessionUpdate::AgentMessageChunk(AcpContentChunk::new(
+                                AcpContentBlock::Text(AcpTextContent::new(text)),
+                            ))
+                        })
+                }
+                Some("reasoning_delta") => payload
+                    .get("reasoning_delta")
+                    .and_then(Value::as_str)
+                    .map(|text| {
+                        SessionUpdate::AgentThoughtChunk(AcpContentChunk::new(
+                            AcpContentBlock::Text(AcpTextContent::new(text)),
+                        ))
+                    }),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn next_acp_pending<'a>(
+    pending: &'a [opcos_store::PendingRecord],
+    resolved_call_ids: &HashSet<String>,
+) -> Option<&'a opcos_store::PendingRecord> {
+    pending
+        .iter()
+        .find(|record| !resolved_call_ids.contains(&record.call_id))
+}
+
+async fn wait_for_external_approval_resolution(
+    store: Arc<SqliteStore>,
+    session_id: String,
+    call_id: String,
+) -> Result<(), String> {
+    loop {
+        let pending = store
+            .load_pending(&session_id)
+            .map_err(|error| error.to_string())?;
+        let session = store
+            .load_session(&session_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "session not found".to_owned())?;
+        if acp_approval_resolution_ready(&pending, &session, &call_id) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn acp_approval_resolution_ready(
+    pending: &[opcos_store::PendingRecord],
+    session: &SessionRecord,
+    call_id: &str,
+) -> bool {
+    !pending.iter().any(|item| item.call_id == call_id) && session.run_state != "running"
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -4651,6 +5237,8 @@ struct ProjectView {
 struct SubmitRequest {
     session_id: String,
     text: String,
+    #[serde(default)]
+    attachments: Vec<ExternalContextAttachment>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -4661,6 +5249,12 @@ struct OpcosEvent {
 }
 
 fn emit(app: &tauri::AppHandle, kind: &str, session_id: Option<&str>, payload: Value) {
+    if let (Some(session_id), Some(state)) = (session_id, app.try_state::<DesktopState>())
+        && let Ok(streams) = state.acp_streams.lock()
+        && let Some(stream) = streams.get(session_id)
+    {
+        let _ = stream.send((kind.to_owned(), payload.clone()));
+    }
     let _ = app.emit(
         "opcos://event",
         OpcosEvent {
@@ -4969,6 +5563,29 @@ fn emit_approval_decision(
     );
 }
 
+fn emit_approval_resolution_refresh(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    session_id: &str,
+    call_id: &str,
+    approve: bool,
+    next_call_id: Option<&str>,
+) -> Result<(), String> {
+    emit_approval_decision(app, state, session_id, call_id, approve);
+    if let Some(next_call_id) = next_call_id {
+        emit_pending_approval_for(app, state, session_id, Some(next_call_id))?;
+    } else {
+        let _ = emit_pending_approval(app, state, session_id)?;
+    }
+    emit(
+        app,
+        "turn_done",
+        Some(session_id),
+        session_status_payload(state, session_id),
+    );
+    Ok(())
+}
+
 fn overlay_running_tool_status(
     kind: &str,
     payload: &mut Value,
@@ -5049,6 +5666,15 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                enabled INTEGER NOT NULL,
                PRIMARY KEY(session_id,name)
              );
+CREATE TABLE IF NOT EXISTS mcp_session_resources (
+               session_id TEXT NOT NULL,
+               server_object_id TEXT NOT NULL,
+               config_version_id TEXT NOT NULL,
+               uri TEXT NOT NULL,
+               mode TEXT NOT NULL CHECK(mode IN ('preview','context','subscribed')),
+               enabled INTEGER NOT NULL DEFAULT 1,
+               PRIMARY KEY(session_id,server_object_id,config_version_id,uri)
+             );
              CREATE TABLE IF NOT EXISTS mcp_tool_cache (
                server_object_id TEXT NOT NULL,
                config_version_id TEXT NOT NULL,
@@ -5057,6 +5683,40 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
                input_schema_json TEXT NOT NULL,
                discovered_at TEXT NOT NULL,
                PRIMARY KEY(server_object_id,config_version_id,tool_name)
+             );
+             CREATE TABLE IF NOT EXISTS mcp_resource_cache (
+               server_object_id TEXT NOT NULL,
+               config_version_id TEXT NOT NULL,
+               uri TEXT NOT NULL,
+               name TEXT NOT NULL,
+               title TEXT,
+               description TEXT,
+               mime_type TEXT,
+               annotations_json TEXT,
+               discovered_at TEXT NOT NULL,
+               PRIMARY KEY(server_object_id,config_version_id,uri)
+             );
+             CREATE TABLE IF NOT EXISTS mcp_resource_template_cache (
+               server_object_id TEXT NOT NULL,
+               config_version_id TEXT NOT NULL,
+               uri_template TEXT NOT NULL,
+               name TEXT NOT NULL,
+               title TEXT,
+               description TEXT,
+               mime_type TEXT,
+               annotations_json TEXT,
+               discovered_at TEXT NOT NULL,
+               PRIMARY KEY(server_object_id,config_version_id,uri_template)
+             );
+             CREATE TABLE IF NOT EXISTS mcp_prompt_cache (
+               server_object_id TEXT NOT NULL,
+               config_version_id TEXT NOT NULL,
+               prompt_name TEXT NOT NULL,
+               title TEXT,
+               description TEXT,
+               arguments_json TEXT NOT NULL,
+               discovered_at TEXT NOT NULL,
+               PRIMARY KEY(server_object_id,config_version_id,prompt_name)
              );
              CREATE TABLE IF NOT EXISTS asset_session_selection (
                session_id TEXT NOT NULL,
@@ -5143,6 +5803,8 @@ fn init_database(path: PathBuf) -> Result<Connection, String> {
     migrate_secret_records(&mut connection)?;
     migrate_agent_settings(&connection)?;
     migrate_mcp_session_tools(&connection)?;
+    migrate_mcp_catalog_cache(&connection)?;
+    migrate_mcp_session_resources(&connection)?;
     migrate_config_objects(&mut connection)?;
     migrate_config_scope_model(&connection)?;
     migrate_removed_organization_presets(&connection)?;
@@ -5953,6 +6615,17 @@ description: 为新行为和缺陷修复设计覆盖正常、失败及边界条�
             "env": {}
         }),
     )?;
+    seed_builtin_template(
+        connection,
+        "template-acp-agent-opencode",
+        "acp-agent",
+        "OpenCode ACP",
+        "通过 ACP 接入本机 OpenCode agent；使用 OpenCode 的标准 ACP 启动命令。",
+        &json!({
+            "command": "opencode acp",
+            "env": {}
+        }),
+    )?;
     Ok(())
 }
 
@@ -6758,6 +7431,101 @@ fn migrate_mcp_session_tools(connection: &Connection) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+fn migrate_mcp_catalog_cache(connection: &Connection) -> Result<(), String> {
+    let already_applied = connection
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM desktop_schema_migrations
+               WHERE version='p1-2-mcp-catalog-cache'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if already_applied {
+        return Ok(());
+    }
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS mcp_resource_cache (
+               server_object_id TEXT NOT NULL,
+               config_version_id TEXT NOT NULL,
+               uri TEXT NOT NULL,
+               name TEXT NOT NULL,
+               title TEXT,
+               description TEXT,
+               mime_type TEXT,
+               annotations_json TEXT,
+               discovered_at TEXT NOT NULL,
+               PRIMARY KEY(server_object_id,config_version_id,uri)
+             );
+             CREATE TABLE IF NOT EXISTS mcp_resource_template_cache (
+               server_object_id TEXT NOT NULL,
+               config_version_id TEXT NOT NULL,
+               uri_template TEXT NOT NULL,
+               name TEXT NOT NULL,
+               title TEXT,
+               description TEXT,
+               mime_type TEXT,
+               annotations_json TEXT,
+               discovered_at TEXT NOT NULL,
+               PRIMARY KEY(server_object_id,config_version_id,uri_template)
+             );
+             CREATE TABLE IF NOT EXISTS mcp_prompt_cache (
+               server_object_id TEXT NOT NULL,
+               config_version_id TEXT NOT NULL,
+               prompt_name TEXT NOT NULL,
+               title TEXT,
+               description TEXT,
+               arguments_json TEXT NOT NULL,
+               discovered_at TEXT NOT NULL,
+               PRIMARY KEY(server_object_id,config_version_id,prompt_name)
+             );
+             INSERT INTO desktop_schema_migrations(version,applied_at)
+             VALUES ('p1-2-mcp-catalog-cache',datetime('now'));",
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn migrate_mcp_session_resources(connection: &Connection) -> Result<(), String> {
+    let already_applied = connection
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM desktop_schema_migrations
+               WHERE version='p2-1-mcp-session-resources'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if already_applied {
+        return Ok(());
+    }
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS mcp_session_resources (
+               session_id TEXT NOT NULL,
+               server_object_id TEXT NOT NULL,
+               config_version_id TEXT NOT NULL,
+               uri TEXT NOT NULL,
+               mode TEXT NOT NULL CHECK(mode IN ('preview','context','subscribed')),
+               enabled INTEGER NOT NULL DEFAULT 1,
+               PRIMARY KEY(session_id,server_object_id,config_version_id,uri)
+             );
+             INSERT INTO desktop_schema_migrations(version,applied_at)
+             VALUES ('p2-1-mcp-session-resources',datetime('now'));",
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
 fn content_hash(content: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(content.as_bytes());
@@ -7125,8 +7893,25 @@ fn session_for(state: &DesktopState, session_id: &str) -> Result<SessionRecord, 
         .ok_or_else(|| "session not found".to_owned())
 }
 
+fn reject_removed_opencode_session(session: &SessionRecord) -> Result<(), String> {
+    if session.harness == "opencode" {
+        return Err(
+            "This OpenCode session is read-only because the bespoke harness was removed; create an ACP session using the `opencode acp` launch recipe."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 async fn project_host(
     state: &State<'_, DesktopState>,
+    project: &ProjectRecord,
+) -> Result<Arc<dyn Host>, String> {
+    project_host_inner(state, project).await
+}
+
+async fn project_host_inner(
+    state: &DesktopState,
     project: &ProjectRecord,
 ) -> Result<Arc<dyn Host>, String> {
     if project.host_id == "local" {
@@ -7246,6 +8031,7 @@ fn git_worktree_add_command(
     worktree_path: &str,
     branch: &str,
     existing_branch: bool,
+    base_ref: Option<&str>,
 ) -> String {
     let quote = |value: &str| quote_for(platform, value);
     if existing_branch {
@@ -7256,11 +8042,15 @@ fn git_worktree_add_command(
             quote(branch)
         )
     } else {
+        let start = base_ref
+            .map(|value| format!(" {}", quote(value)))
+            .unwrap_or_default();
         format!(
-            "git -C {} worktree add {} -b {}",
+            "git -C {} worktree add {} -b {}{}",
             quote(repo_root),
             quote(worktree_path),
-            quote(branch)
+            quote(branch),
+            start
         )
     }
 }
@@ -8377,6 +9167,38 @@ async fn create_project_agent(
     system_prompt: Option<String>,
     branch: Option<String>,
 ) -> Result<ProjectAgentRecord, String> {
+    create_project_agent_inner(
+        &state,
+        project_id,
+        template_id,
+        name,
+        role,
+        sort_order,
+        provider,
+        model,
+        harness,
+        mode,
+        system_prompt,
+        branch,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_project_agent_inner(
+    state: &DesktopState,
+    project_id: String,
+    template_id: Option<String>,
+    name: String,
+    role: String,
+    sort_order: Option<u32>,
+    provider: Option<String>,
+    model: Option<String>,
+    harness: Option<String>,
+    mode: Option<String>,
+    system_prompt: Option<String>,
+    branch: Option<String>,
+) -> Result<ProjectAgentRecord, String> {
     let project = state
         .store
         .load_project(&project_id)
@@ -8406,14 +9228,43 @@ async fn create_project_agent(
             worktree_branch(&role, sort_order, project_suffix)
         })
     };
-    let host = project_host(&state, &project).await?;
+    let host = project_host_inner(state, &project).await?;
     if !project_host_contains(&host, &project.repo_root)
         || !project_host_contains(&host, &worktree_path)
     {
         return Err("project worktree path is outside the bound host workspace".to_owned());
     }
+    let platform = host.health().await.ok().and_then(|health| health.platform);
+    let lead_base_ref = if sort_order == 0 {
+        None
+    } else {
+        let lead_workspace = agents
+            .iter()
+            .find(|agent| agent.sort_order == 0)
+            .map(|agent| agent.worktree_path.as_str())
+            .unwrap_or(project.repo_root.as_str());
+        let result = host
+            .exec(ExecRequest {
+                command: format!(
+                    "git -C {} rev-parse --verify HEAD",
+                    quote_for(platform.as_deref(), lead_workspace)
+                ),
+                cwd: None,
+                timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+                session: None,
+                env: None,
+            })
+            .await
+            .map_err(|error| format!("Lead workspace revision check failed: {error}"))?;
+        if result.result.exit_code != 0 {
+            return Err(format!(
+                "Lead workspace revision check failed: {}",
+                result.result.stderr
+            ));
+        }
+        Some(result.result.stdout.trim().to_owned())
+    };
     if sort_order != 0 {
-        let platform = host.health().await.ok().and_then(|health| health.platform);
         let probe = host
             .exec(ExecRequest {
                 command: format!(
@@ -8436,6 +9287,7 @@ async fn create_project_agent(
                     &worktree_path,
                     &branch,
                     probe.result.exit_code == 0,
+                    lead_base_ref.as_deref(),
                 ),
                 cwd: None,
                 timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
@@ -9124,62 +9976,6 @@ fn record_skill_usage(
     Ok(())
 }
 
-async fn opencode_for(
-    state: &DesktopState,
-    session_id: &str,
-) -> Result<Arc<OpenCodeHarness<SqliteStore>>, String> {
-    {
-        let engines = state.opencode_engines.lock().await;
-        if let Some(engine) = engines.get(session_id) {
-            return Ok(Arc::clone(engine));
-        }
-    }
-    let session = session_for(state, session_id)?;
-    if session.harness != "opencode" {
-        return Err("session is not configured for the OpenCode harness".into());
-    }
-    let workspace = if !session.workspace.is_empty() {
-        session.workspace.clone()
-    } else if session.host_id == "local" {
-        default_local_workspace(state, session_id)?
-    } else {
-        client_for(state, &session.host_id)?
-            .health()
-            .await
-            .map_err(|error| format!("remote host unavailable: {error}"))?
-            .workspace
-            .ok_or_else(|| "remote host did not provide a workspace".to_owned())?
-    };
-    let host: Arc<dyn Host> = if session.host_id == "local" {
-        Arc::new(LocalHost::new(&workspace).map_err(|error| error.to_string())?)
-    } else {
-        let client = client_for(state, &session.host_id)?.with_workspace(workspace.clone());
-        Arc::new(RvmHost::new(
-            session.host_id.clone(),
-            workspace.clone(),
-            client,
-        ))
-    };
-    let harness = OpenCodeHarness::start(
-        host,
-        Arc::new(SessionRecorder::new(Arc::clone(&state.store), session_id)),
-        session_id,
-        OpenCodeHarnessConfig {
-            workspace,
-            model: session.model,
-            password: None,
-        },
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    state
-        .opencode_engines
-        .lock()
-        .await
-        .insert(session_id.into(), Arc::clone(&harness));
-    Ok(harness)
-}
-
 fn select_acp_agent_content<I>(rows: I) -> Option<String>
 where
     I: IntoIterator<Item = (String, String)>,
@@ -9262,7 +10058,89 @@ fn acp_agent_config(
         workspace: String::new(),
         command,
         env: (!env.is_empty()).then_some(Value::Object(env)),
+        mcp_servers: Vec::new(),
     })
+}
+
+fn acp_mcp_servers(state: &DesktopState, session: &SessionRecord) -> Result<Vec<Value>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let configs = effective_config_objects(
+        &connection,
+        &session.workspace,
+        &session.host_id,
+        session.project_id.as_deref(),
+        Some(&session.session_id),
+    )?;
+    let mut servers = Vec::new();
+    for (object_id, version_id) in configs {
+        let row = connection.query_row(
+            "SELECT o.name,COALESCE(o.server_key,''),v.content
+             FROM config_object o
+             JOIN config_object_version v ON v.id=?2
+             WHERE o.id=?1 AND o.kind='mcp'",
+            params![object_id, version_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    serde_json::from_str::<Value>(&row.get::<_, String>(2)?)
+                        .unwrap_or_else(|_| json!({})),
+                ))
+            },
+        );
+        let Ok((name, _server_key, mut content)) = row else {
+            continue;
+        };
+        content["object_id"] = Value::String(object_id.clone());
+        content["name"] = Value::String(name.clone());
+        let Ok(config) = serde_json::from_value::<McpServerConfig>(content) else {
+            continue;
+        };
+        if !config.enabled {
+            continue;
+        }
+        let credentials = scoped_secret_get_from_store(
+            &state.secrets,
+            session.project_id.as_deref(),
+            "mcp-credential",
+            &object_id,
+        )?
+        .and_then(|value| serde_json::from_str::<HashMap<String, String>>(&value).ok())
+        .unwrap_or_default();
+        match config.transport {
+            opcos_mcp::McpTransport::Stdio => {
+                let command = config
+                    .command
+                    .ok_or_else(|| "enabled ACP MCP stdio server has no command".to_owned())?;
+                servers.push(json!({
+                    "type": "stdio",
+                    "name": config.name,
+                    "command": command,
+                    "args": config.args,
+                    "env": config.env.into_iter().map(|(name, value)| json!({"name": name, "value": value})).collect::<Vec<_>>(),
+                }));
+            }
+            _ => {
+                let url = config
+                    .url
+                    .ok_or_else(|| "enabled ACP MCP HTTP server has no URL".to_owned())?;
+                let mut headers = config.headers;
+                if let Some(token) = credentials.get("bearer_token") {
+                    headers.insert("Authorization".into(), format!("Bearer {token}"));
+                }
+                servers.push(json!({
+                    "type": "http",
+                    "name": config.name,
+                    "url": url,
+                    "headers": headers.into_iter().map(|(name, value)| json!({"name": name, "value": value})).collect::<Vec<_>>(),
+                }));
+            }
+        }
+    }
+    Ok(servers)
 }
 
 async fn acp_for(
@@ -9303,6 +10181,7 @@ async fn acp_for(
     };
     let mut config = acp_agent_config(state, session.project_id.as_deref())?;
     config.workspace = workspace;
+    config.mcp_servers = acp_mcp_servers(state, &session)?;
     let harness = AcpHarness::start(
         host,
         Arc::new(SessionRecorder::new(Arc::clone(&state.store), session_id)),
@@ -9317,6 +10196,316 @@ async fn acp_for(
         .await
         .insert(session_id.into(), Arc::clone(&harness));
     Ok(harness)
+}
+
+struct SessionExternalTools {
+    tools: Vec<Value>,
+    allowed_names: Vec<String>,
+    errors: Vec<String>,
+}
+
+fn mcp_tool_enabled(disabled: &HashSet<String>, name: &str) -> bool {
+    !disabled.contains(name)
+}
+
+async fn configure_mcp_notification_sink(
+    mcp: &Arc<McpManager<McpCredentialAdapter>>,
+    app_handle: &tauri::AppHandle,
+) {
+    let app_handle = app_handle.clone();
+    mcp.set_notification_sink(Arc::new(move |server_id, version_id, method, uri| {
+        if method == "notifications/tools/list_changed" {
+            let app_handle = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let state = app_handle.state::<DesktopState>();
+                refresh_cached_mcp_engines(&state).await;
+            });
+        }
+        let _ = app_handle.emit(
+            "mcp-catalog-updated",
+            serde_json::json!({
+                "server_id": server_id,
+                "version_id": version_id,
+                "method": method,
+                "uri": uri,
+            }),
+        );
+    }))
+    .await;
+}
+
+async fn refresh_cached_mcp_engines(state: &DesktopState) {
+    let sessions = state
+        .engines
+        .lock()
+        .await
+        .iter()
+        .map(|(session_id, engine)| (session_id.clone(), Arc::clone(engine)))
+        .collect::<Vec<_>>();
+    for (session_id, engine) in sessions {
+        if let Err(error) = refresh_session_mcp_tools(state, &session_id, &engine).await {
+            let _ = state.mcp_notification_app.emit(
+                "mcp-catalog-refresh-error",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "error": error,
+                }),
+            );
+        }
+    }
+}
+
+async fn mcp_runtime_for_project(
+    state: &DesktopState,
+    project_id: Option<&str>,
+) -> Arc<McpManager<McpCredentialAdapter>> {
+    let Some(project_id) = project_id else {
+        return Arc::clone(&state.mcp);
+    };
+    if let Some(manager) = state.mcp_projects.lock().await.get(project_id).cloned() {
+        return manager;
+    }
+    let manager = Arc::new(McpManager::new(Arc::new(McpCredentialAdapter {
+        store: state.secrets.clone(),
+        project_id: Some(project_id.to_owned()),
+    })));
+    state
+        .mcp_projects
+        .lock()
+        .await
+        .insert(project_id.to_owned(), Arc::clone(&manager));
+    manager
+}
+
+async fn mcp_runtime_for_engine(
+    state: &DesktopState,
+    project_id: Option<&str>,
+) -> Arc<McpManager<McpCredentialAdapter>> {
+    let manager = mcp_runtime_for_project(state, project_id).await;
+    if project_id.is_some() {
+        configure_mcp_notification_sink(&manager, &state.mcp_notification_app).await;
+    }
+    manager
+}
+
+fn disabled_mcp_tool_names(
+    connection: &Connection,
+    session_id: &str,
+    source: &str,
+) -> HashSet<String> {
+    connection
+        .prepare(
+            "SELECT name FROM mcp_session_tools
+             WHERE session_id=?1 AND source=?2 AND enabled=0",
+        )
+        .and_then(|mut statement| {
+            let rows = statement.query_map(params![session_id, source], |row| row.get(0))?;
+            rows.collect::<Result<HashSet<_>, _>>()
+        })
+        .unwrap_or_default()
+}
+
+fn select_mcp_tools(
+    connection: &Connection,
+    session_id: &str,
+    source: &str,
+    candidates: impl IntoIterator<Item = (String, Value)>,
+) -> Vec<Value> {
+    let disabled = disabled_mcp_tool_names(connection, session_id, source);
+    candidates
+        .into_iter()
+        .filter(|(name, _)| mcp_tool_enabled(&disabled, name))
+        .map(|(_, tool)| tool)
+        .collect()
+}
+
+async fn session_external_tools(
+    state: &DesktopState,
+    session_id: &str,
+    session_workspace: &str,
+    host_id: &str,
+    project_id: Option<&str>,
+    mcp_runtime: &Arc<McpManager<McpCredentialAdapter>>,
+) -> Result<SessionExternalTools, String> {
+    let mut tools = Vec::new();
+    let mut allowed_names = Vec::new();
+    let mut errors = Vec::new();
+    if host_id != "local" {
+        let response = match client_for(state, host_id) {
+            Ok(client) => match client
+                .mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
+                .await
+            {
+                Ok(response) => Some(response),
+                Err(error) => {
+                    errors.push(format!("host MCP tools/list failed: {error}"));
+                    None
+                }
+            },
+            Err(error) => {
+                errors.push(format!("host MCP client unavailable: {error}"));
+                None
+            }
+        };
+        if let Some(response) = response {
+            let candidates = response
+                .get("result")
+                .and_then(|value| value.get("tools"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|tool| Some((tool.get("name")?.as_str()?.to_owned(), tool.clone())));
+            match state.database.lock() {
+                Ok(connection) => {
+                    tools.extend(select_mcp_tools(
+                        &connection,
+                        session_id,
+                        "host",
+                        candidates,
+                    ));
+                }
+                Err(_) => {
+                    errors.push("database lock poisoned while filtering host MCP tools".into())
+                }
+            }
+        }
+    }
+    let mcp_configs = match state.database.lock() {
+        Ok(connection) => match effective_config_objects(
+            &connection,
+            session_workspace,
+            host_id,
+            project_id,
+            Some(session_id),
+        ) {
+            Ok(objects) => objects
+                .into_iter()
+                .filter_map(|(object_id, version_id)| {
+                    match connection.query_row(
+                        "SELECT o.name,COALESCE(o.server_key,''),v.content
+                         FROM config_object o
+                         JOIN config_object_version v ON v.id=?2
+                         WHERE o.id=?1 AND o.kind='mcp'",
+                        params![object_id.clone(), version_id.clone()],
+                        |row| {
+                            Ok((
+                                object_id,
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                version_id,
+                                serde_json::from_str::<Value>(&row.get::<_, String>(2)?)
+                                    .unwrap_or_else(|_| json!({})),
+                            ))
+                        },
+                    ) {
+                        Ok(config) => Some(config),
+                        Err(error) => {
+                            errors.push(format!("MCP config lookup failed: {error}"));
+                            None
+                        }
+                    }
+                })
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                errors.push(format!("MCP config enumeration failed: {error}"));
+                Vec::new()
+            }
+        },
+        Err(_) => {
+            errors.push("database lock poisoned while enumerating MCP configs".into());
+            Vec::new()
+        }
+    };
+    for (object_id, name, server_key, version_id, mut content) in mcp_configs {
+        content["object_id"] = Value::String(object_id.clone());
+        content["name"] = Value::String(name);
+        content["server_key"] = Value::String(if server_key.is_empty() {
+            stable_server_key(&object_id)
+        } else {
+            server_key
+        });
+        let config = match serde_json::from_value::<McpServerConfig>(content) {
+            Ok(config) => config,
+            Err(error) => {
+                errors.push(format!("invalid MCP config: {error}"));
+                continue;
+            }
+        };
+        let server_tools = match mcp_runtime
+            .connect_with_retry(&config, &version_id, 0)
+            .await
+        {
+            Ok(tools) => tools,
+            Err(error) => {
+                errors.push(format!("MCP server {object_id} unavailable: {error}"));
+                continue;
+            }
+        };
+        let candidates = server_tools.into_iter().map(|tool| {
+            let qualified_name = tool.qualified_name.clone();
+            (
+                qualified_name,
+                json!({
+                    "name": tool.name,
+                    "qualified_name": tool.qualified_name,
+                    "description": tool.description.unwrap_or_default(),
+                    "inputSchema": tool.input_schema,
+                }),
+            )
+        });
+        let selected = match state.database.lock() {
+            Ok(connection) => select_mcp_tools(&connection, session_id, &object_id, candidates),
+            Err(_) => {
+                errors.push(format!(
+                    "database lock poisoned while filtering MCP server {object_id}"
+                ));
+                Vec::new()
+            }
+        };
+        if host_id == "local" {
+            allowed_names.extend(
+                selected
+                    .iter()
+                    .filter_map(|tool| tool.get("qualified_name")?.as_str())
+                    .map(str::to_owned),
+            );
+        }
+        tools.extend(selected);
+    }
+    Ok(SessionExternalTools {
+        tools,
+        allowed_names,
+        errors,
+    })
+}
+
+async fn refresh_session_mcp_tools(
+    state: &DesktopState,
+    session_id: &str,
+    engine: &GuiEngine,
+) -> Result<(), String> {
+    let session = session_for(state, session_id)?;
+    let mcp_runtime = mcp_runtime_for_project(state, session.project_id.as_deref()).await;
+    let external = session_external_tools(
+        state,
+        session_id,
+        &session.workspace,
+        &session.host_id,
+        session.project_id.as_deref(),
+        &mcp_runtime,
+    )
+    .await?;
+    engine.set_external_tools(external.tools).await;
+    for error in external.errors {
+        let _ = state.mcp_notification_app.emit(
+            "mcp-catalog-refresh-error",
+            serde_json::json!({
+                "session_id": session_id,
+                "error": error,
+            }),
+        );
+    }
+    Ok(())
 }
 
 async fn engine_for(
@@ -9355,13 +10544,13 @@ async fn engine_for_with_context(
     }
     let session = session_for(state, session_id)?;
     if session.harness != "builtin" {
-        return Err("this session uses the OpenCode harness; use its session route".into());
+        return Err("this session uses an unavailable harness and cannot start a new turn".into());
     }
     let host_id = session.host_id;
     let model = session.model;
     let mode = session.mode;
     let session_workspace = session.workspace;
-    let session_provider = session.provider;
+    let session_provider = session.provider.clone();
     let resolved_workspace = if !session_workspace.is_empty() {
         session_workspace.clone()
     } else if host_id == "local" {
@@ -9388,20 +10577,29 @@ async fn engine_for_with_context(
             .map_err(|_| "database lock poisoned")?;
         load_agent_settings(&connection, session.project_id.as_deref())?
     };
+    let agent_provider = session
+        .agent_id
+        .as_deref()
+        .and_then(|agent_id| state.store.load_project_agent(agent_id).ok().flatten())
+        .and_then(|agent| agent.provider);
     let (provider_id, configured_base_url) = {
         let connection = state
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?;
-        let provider = session_provider.unwrap_or_else(|| {
-            connection
-                .query_row(
-                    "SELECT value FROM settings WHERE key='provider.id'",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .unwrap_or_else(|_| "openai".into())
-        });
+        let provider = session_provider
+            .clone()
+            .or(agent_provider)
+            .or_else(|| {
+                connection
+                    .query_row(
+                        "SELECT value FROM settings WHERE key='provider.id'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok()
+            })
+            .ok_or_else(|| "no provider is configured for this session".to_owned())?;
         let base_url = connection
             .query_row(
                 &format!(
@@ -9475,18 +10673,9 @@ async fn engine_for_with_context(
         .map_err(|error| error.to_string())
     })
     .collect::<Result<HashMap<_, _>, _>>()?;
-    let mcp_runtime = session
-        .project_id
-        .as_ref()
-        .map(|project_id| {
-            Arc::new(McpManager::new(Arc::new(McpCredentialAdapter {
-                store: state.secrets.clone(),
-                project_id: Some(project_id.clone()),
-            })))
-        })
-        .unwrap_or_else(|| Arc::clone(&state.mcp));
+    let mcp_runtime = mcp_runtime_for_engine(state, session.project_id.as_deref()).await;
     let mut remote_platform = None;
-    let (workspace, executor, remote_client, allowed_tools, asset_reader) = if host_id == "local" {
+    let (workspace, executor, _remote_client, allowed_tools, asset_reader) = if host_id == "local" {
         let workspace = PathBuf::from(resolved_workspace.clone());
         let host = LocalHost::with_secret_snapshot(&workspace, Arc::clone(&state.secret_values))
             .map_err(|error| error.to_string())?;
@@ -9726,6 +10915,7 @@ async fn engine_for_with_context(
         permission_mode,
         model.clone(),
     );
+    engine.set_chunk_idle_timeout(std::time::Duration::from_secs(600));
     engine.set_artifact_sink(Arc::new(SessionArtifactSink {
         root: state.artifact_root.clone(),
         store: Arc::clone(&state.store),
@@ -9896,153 +11086,37 @@ async fn engine_for_with_context(
             .map_err(|error| error.to_string())?,
     );
     let mut allowed_tools = allowed_tools;
-    if let Some(executor_client) = &remote_client
-        && let Ok(response) = executor_client
-            .mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
-            .await
+    if automatic_project_routing_active(&state.store, session_id)?
+        && let Some(allowed_tools) = allowed_tools.as_mut()
     {
-        let all_tools = response
-            .get("result")
-            .and_then(|value| value.get("tools"))
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let enabled = state
-            .database
-            .lock()
-            .map_err(|_| "database lock poisoned")?
-            .prepare(
-                "SELECT name FROM mcp_session_tools
-                 WHERE session_id=?1 AND source='host' AND enabled=1",
-            )
-            .and_then(|mut statement| {
-                let rows = statement.query_map([session_id], |row| row.get::<_, String>(0))?;
-                rows.collect::<Result<Vec<_>, _>>()
-            })
-            .unwrap_or_default();
-        let selected = all_tools
-            .into_iter()
-            .filter(|tool| {
-                tool.get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| enabled.iter().any(|item| item == name))
-            })
-            .collect();
-        engine.set_external_tools(selected).await;
+        allowed_tools.retain(|tool| tool != "coordination_dispatch");
     }
-    let mcp_configs = {
-        let connection = state
-            .database
-            .lock()
-            .map_err(|_| "database lock poisoned")?;
-        effective_config_objects(
-            &connection,
-            &session_workspace,
-            &host_id,
-            session.project_id.as_deref(),
-            Some(session_id),
-        )?
-        .into_iter()
-        .filter_map(|(object_id, version_id)| {
-            connection
-                .query_row(
-                    "SELECT o.name,COALESCE(o.server_key,''),v.content
-                     FROM config_object o
-                     JOIN config_object_version v ON v.id=?2
-                     WHERE o.id=?1 AND o.kind='mcp'",
-                    params![object_id, version_id],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            serde_json::from_str::<Value>(&row.get::<_, String>(2)?)
-                                .unwrap_or_else(|_| json!({})),
-                        ))
-                    },
-                )
-                .ok()
-                .map(|(name, server_key, content)| {
-                    (object_id, name, server_key, version_id, content)
-                })
-        })
-        .collect::<Vec<_>>()
-    };
-    let mut independent_tools = Vec::new();
-    for (object_id, name, server_key, version_id, mut content) in mcp_configs {
-        content["object_id"] = Value::String(object_id.clone());
-        content["name"] = Value::String(name);
-        content["server_key"] = Value::String(if server_key.is_empty() {
-            stable_server_key(content["object_id"].as_str().unwrap_or_default())
-        } else {
-            server_key
-        });
-        let config = match serde_json::from_value::<McpServerConfig>(content) {
-            Ok(config) => config,
-            Err(_) => continue,
-        };
-        if let Ok(tools) = mcp_runtime
-            .connect_with_retry(&config, &version_id, 0)
-            .await
-        {
-            let qualified_names = tools
-                .iter()
-                .map(|tool| tool.qualified_name.clone())
-                .collect::<Vec<_>>();
-            let selected_names = state
-                .database
-                .lock()
-                .ok()
-                .and_then(|connection| {
-                    connection
-                        .prepare(
-                            "SELECT name FROM mcp_session_tools
-                             WHERE session_id=?1 AND source=?2 AND enabled=1",
-                        )
-                        .ok()
-                        .and_then(|mut statement| {
-                            statement
-                                .query_map(params![session_id, object_id], |row| {
-                                    row.get::<_, String>(0)
-                                })
-                                .ok()
-                                .map(|rows| rows.filter_map(Result::ok).collect::<Vec<_>>())
-                        })
-                })
-                .unwrap_or_default();
-            let has_explicit_selection = !selected_names.is_empty();
-            independent_tools.extend(
-                tools
-                    .into_iter()
-                    .map(|tool| {
-                        json!({
-                            "name": tool.name,
-                            "qualified_name": tool.qualified_name,
-                            "description": tool.description.unwrap_or_default(),
-                            "inputSchema": tool.input_schema,
-                        })
-                    })
-                    .filter(|tool| {
-                        !has_explicit_selection
-                            || selected_names.iter().any(|name| {
-                                name == tool
-                                    .get("qualified_name")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                            })
-                    }),
-            );
-            if host_id == "local"
-                && let Some(allowed) = allowed_tools.as_mut()
-            {
-                allowed.extend(qualified_names);
-            }
-        }
+    let session_tools = session_external_tools(
+        state,
+        session_id,
+        &session_workspace,
+        &host_id,
+        session.project_id.as_deref(),
+        &mcp_runtime,
+    )
+    .await?;
+    engine.set_external_tools(session_tools.tools).await;
+    for error in session_tools.errors {
+        let _ = app.emit(
+            "mcp-catalog-refresh-error",
+            serde_json::json!({
+                "session_id": session_id,
+                "error": error,
+            }),
+        );
+    }
+    if host_id == "local"
+        && let Some(allowed) = allowed_tools.as_mut()
+    {
+        allowed.extend(session_tools.allowed_names);
     }
     if let Some(allowed_tools) = allowed_tools {
         engine.set_allowed_tools(allowed_tools).await;
-    }
-    if !independent_tools.is_empty() {
-        engine.append_external_tools(independent_tools).await;
     }
     let mut bundle = discover_assets(&asset_reader, &workspace)
         .await
@@ -10085,12 +11159,33 @@ async fn engine_for_with_context(
         })
         .or_else(|| initial_task.map(str::to_owned))
         .unwrap_or_default();
+    let mut system_instructions = bundle.system_instructions_for(KnowledgeContext {
+        task: &task_text,
+        repository: Some(&workspace),
+        project: session.project_id.as_deref(),
+    });
+    if session.project_id.is_some()
+        && let Ok(Some(agent)) = state.store.load_project_agent_by_session(session_id)
+        && agent.sort_order == 0
+        && agent.role.eq_ignore_ascii_case("lead")
+        && state.store.load_plan(session_id).ok().flatten().is_some()
+    {
+        system_instructions.push_str(
+             "\n\nAutonomous project routing policy: you are the Lead orchestrator. \
+             Internal worker routing is automatic and is never a user question. \
+             Do not call coordination_dispatch; the desktop dispatches saved plan steps \
+             automatically. Do not ask whether to execute in-session or dispatch workers, and do not \
+             present that choice as an option. \
+             Workers are routed automatically for planned steps; when no worker is available \
+             or Lead-owned implementation and finalization is needed, implement directly in \
+             the Lead workspace. Direct Lead execution is recorded through the existing \
+             coordination_local_execution audit path with execution: lead_local. \
+             Sequence, synthesize, and verify; workers execute their assigned steps. Ask the user only about genuine product \
+             ambiguity or risky external actions requiring approval.",
+        );
+    }
     engine
-        .set_system_instructions(Some(bundle.system_instructions_for(KnowledgeContext {
-            task: &task_text,
-            repository: Some(&workspace),
-            project: session.project_id.as_deref(),
-        })))
+        .set_system_instructions(Some(system_instructions))
         .await;
     if !bundle.knowledge.is_empty() {
         let working_event = json!({
@@ -10204,6 +11299,7 @@ async fn engine_for_with_context(
         .await;
     let mut events = engine.events();
     let handle = app.clone();
+    let event_app = app.clone();
     let session = session_id.to_owned();
     tauri::async_runtime::spawn(async move {
         while let Some(chunk) = events.recv().await {
@@ -10211,8 +11307,13 @@ async fn engine_for_with_context(
                 &handle,
                 "stream",
                 Some(&session),
-                serde_json::to_value(chunk).unwrap_or(Value::Null),
+                serde_json::to_value(&chunk).unwrap_or(Value::Null),
             );
+            if chunk.event_type.as_deref() == Some("turn_finished")
+                && let Some(state) = event_app.try_state::<DesktopState>()
+            {
+                let _ = coordination_ingest_session_inner(&state, &session, false).await;
+            }
         }
     });
     if origin == ToolOrigin::RepairLoop {
@@ -11098,10 +12199,42 @@ async fn start_ide_proxy(
     Ok(port)
 }
 
-#[tauri::command]
+#[tauri::command(rename = "create_session")]
 #[allow(clippy::too_many_arguments)]
-fn create_session(
+fn create_session_command(
+    app: tauri::AppHandle,
     state: State<'_, DesktopState>,
+    title: String,
+    host_id: Option<String>,
+    model: Option<String>,
+    provider: Option<String>,
+    mode: Option<String>,
+    harness: Option<String>,
+    workspace: Option<String>,
+    project_id: Option<String>,
+    agent_id: Option<String>,
+    system_prompt: Option<String>,
+) -> Result<SessionView, String> {
+    let session = create_session_for_state(
+        &state,
+        title,
+        host_id,
+        model,
+        provider,
+        mode,
+        harness,
+        workspace,
+        project_id,
+        agent_id,
+        system_prompt,
+    )?;
+    emit(&app, "session_list_changed", None, json!({}));
+    Ok(session)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_session_for_state(
+    state: &DesktopState,
     title: String,
     host_id: Option<String>,
     model: Option<String>,
@@ -11121,7 +12254,7 @@ fn create_session(
     let mode = mode.unwrap_or_else(|| "Auto".into());
     let mode = permission_mode_name(parse_permission_mode(&mode)?).to_owned();
     let harness = harness.unwrap_or_else(|| "builtin".into());
-    if !matches!(harness.as_str(), "builtin" | "opencode" | "acp") {
+    if !matches!(harness.as_str(), "builtin" | "acp") {
         return Err(format!("unsupported harness: {harness}"));
     }
     if project_id.is_some() != agent_id.is_some() {
@@ -11188,7 +12321,7 @@ fn create_session(
             .or_else(|| {
                 provider
                     .as_deref()
-                    .and_then(|provider| provider_descriptor_for(&state, provider).ok())
+                    .and_then(|provider| provider_descriptor_for(state, provider).ok())
                     .and_then(|descriptor| descriptor.recommended_model)
             })
             .unwrap_or(requested_model)
@@ -11255,7 +12388,7 @@ fn create_session(
     drop(connection);
     let now = Utc::now();
     save_session_via_factory(
-        &state,
+        state,
         SessionRecord {
             session_id: id.clone(),
             workspace: workspace.clone().unwrap_or_default(),
@@ -11326,7 +12459,7 @@ fn create_session(
             .map_err(|error| error.to_string())?;
     }
     audit(
-        &state,
+        state,
         &id,
         "session_created",
         json!({"session_id": id, "host_id": host_id, "model": model}),
@@ -11343,6 +12476,7 @@ fn create_session(
         workspace: workspace.unwrap_or_default(),
         run_state: "idle".into(),
         stop_reason: "none".into(),
+        archived: false,
         project_id: project_id.clone(),
         agent_id: agent_id.clone(),
     })
@@ -11355,7 +12489,7 @@ async fn change_harness(
     session_id: String,
     harness: String,
 ) -> Result<(), String> {
-    if !matches!(harness.as_str(), "builtin" | "opencode" | "acp") {
+    if !matches!(harness.as_str(), "builtin" | "acp") {
         return Err(format!("unsupported harness: {harness}"));
     }
     let session = session_for(&state, &session_id)?;
@@ -11381,7 +12515,7 @@ async fn change_harness(
                 .into(),
         );
     }
-    if matches!(harness.as_str(), "opencode" | "acp") {
+    if harness == "acp" {
         let options = harness_options(
             state.clone(),
             session.host_id.clone(),
@@ -11434,13 +12568,13 @@ async fn harness_options(
     let host: Arc<dyn Host> = if host_id == "local" {
         let workspace = workspace
             .filter(|path| !path.is_empty())
-            .ok_or_else(|| "cannot probe OpenCode: explicit workspace is required".to_owned())?;
+            .ok_or_else(|| "cannot probe ACP: explicit workspace is required".to_owned())?;
         Arc::new(LocalHost::new(&workspace).map_err(|e| e.to_string())?)
     } else {
         let client = client_for(&state, &host_id)?;
         let workspace = workspace
             .filter(|path| !path.is_empty())
-            .ok_or_else(|| "cannot probe OpenCode: explicit workspace is required".to_owned())?;
+            .ok_or_else(|| "cannot probe ACP: explicit workspace is required".to_owned())?;
         Arc::new(RvmHost::new(
             host_id.clone(),
             workspace.clone(),
@@ -11489,50 +12623,135 @@ async fn harness_options(
         }
     };
     options.push(acp_option);
-    let Some(process_stream) = capabilities
-        .items
-        .iter()
-        .find(|item| item.name == "process_stream")
-    else {
-        options.push(HarnessAvailability {
-            id: "opencode".into(),
-            label: "OpenCode".into(),
-            available: false,
-            reason: Some("Host does not provide process_stream".into()),
-        });
-        return Ok(options);
-    };
-    if !process_stream.available {
-        options.push(HarnessAvailability {
-            id: "opencode".into(),
-            label: "OpenCode".into(),
-            available: false,
-            reason: process_stream.reason.clone(),
-        });
-        return Ok(options);
-    }
-    let probe = host
-        .exec(ExecRequest {
-            command: "command -v opencode".into(),
-            cwd: None,
-            timeout_seconds: 10,
-            session: None,
-            env: None,
-        })
-        .await
-        .map_err(|e| format!("cannot probe OpenCode on host: {e}"))?;
-    options.push(HarnessAvailability {
-        id: "opencode".into(),
-        label: "OpenCode".into(),
-        available: probe.result.exit_code == 0,
-        reason: (probe.result.exit_code != 0)
-            .then(|| "opencode is not installed on this host".into()),
-    });
     Ok(options)
 }
 
+#[tauri::command(rename = "list_sessions")]
+fn list_sessions_command(state: State<'_, DesktopState>) -> Result<Vec<SessionView>, String> {
+    list_sessions_for_state(&state)
+}
+
 #[tauri::command]
-fn list_sessions(state: State<'_, DesktopState>) -> Result<Vec<SessionView>, String> {
+fn set_session_archived(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    session_id: String,
+    archived: bool,
+) -> Result<Value, String> {
+    let result = set_session_archived_for_state(&state, &session_id, archived)?;
+    emit(&app, "session_list_changed", None, json!({}));
+    Ok(result)
+}
+
+fn set_session_archived_for_state(
+    state: &DesktopState,
+    session_id: &str,
+    archived: bool,
+) -> Result<Value, String> {
+    let mut session = state
+        .store
+        .load_session(session_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("session not found: {session_id}"))?;
+    session.archived = archived;
+    session.updated_at = Utc::now();
+    state
+        .store
+        .save_session(&session)
+        .map_err(|error| error.to_string())?;
+    Ok(json!({
+        "session_id": session_id,
+        "archived": archived
+    }))
+}
+
+const OPCOS_SETTINGS_CATALOG: &[(&str, &str, &str)] = &[
+    (
+        "appearance",
+        "General",
+        "Set the appearance and language of the OPCOS workbench.",
+    ),
+    (
+        "agent",
+        "Agent defaults",
+        "控制会话默认值、Computer use、用量上限和 Pull request 策略。",
+    ),
+    (
+        "environment",
+        "Environment",
+        "管理 Blueprint、固定环境说明、有序仓库 setup 和长期主机。",
+    ),
+    ("experts", "专家", "管理可供项目启用的专家库。"),
+    ("teams", "团队", "管理可供项目启用的团队库。"),
+    ("command", "Command", "管理可供项目启用的命令库。"),
+    (
+        "provider",
+        "Provider",
+        "Choose a provider and validate its connection key.",
+    ),
+    (
+        "hosts",
+        "Hosts",
+        "Bind and test the remote hosts used by OPCOS sessions.",
+    ),
+    (
+        "agents",
+        "规则",
+        "仓库级运行规则（对应仓库中的 AGENTS.md 文件）。",
+    ),
+    ("instructions", "全局指令", "应用于所有新会话的全局指令。"),
+    (
+        "knowledge",
+        "Knowledge",
+        "Reusable reference material added to context.",
+    ),
+    (
+        "playbook",
+        "Playbook",
+        "Repeatable workflows available to automation.",
+    ),
+    (
+        "skill",
+        "Skill",
+        "Focused capability and instruction bundles.",
+    ),
+    (
+        "mcp",
+        "MCP",
+        "Control the tools exposed by the selected remote host.",
+    ),
+    (
+        "connectors",
+        "Connectors",
+        "Linear is connected locally with a Personal API Key. Other connectors are not integrated.",
+    ),
+    (
+        "ingress",
+        "External events",
+        "Poll GitHub and RSS/Atom sources that can wake OPCOS event rules.",
+    ),
+    (
+        "index",
+        "Repository index",
+        "Build a host-backed path and symbol index before asking the agent to change code.",
+    ),
+    (
+        "secrets",
+        "Secrets",
+        "Inspect secret metadata without exposing secret values.",
+    ),
+    (
+        "blueprint",
+        "Blueprint",
+        "Read and manage the selected host blueprint.",
+    ),
+];
+
+fn opcos_settings_catalog() -> &'static [(&'static str, &'static str, &'static str)] {
+    OPCOS_SETTINGS_CATALOG
+}
+
+fn list_sessions_for_state(state: &DesktopState) -> Result<Vec<SessionView>, String> {
     let sessions = state
         .store
         .load_sessions()
@@ -11571,6 +12790,7 @@ fn session_view_for_host(
         workspace: session.workspace,
         run_state: session.run_state,
         stop_reason: session.stop_reason,
+        archived: session.archived,
         project_id: session.project_id,
         agent_id: session.agent_id,
     }))
@@ -11592,6 +12812,13 @@ fn host_name(connection: &Connection, host_id: &str) -> Result<Option<String>, S
 #[tauri::command]
 async fn read_transcript(
     state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Vec<Value>, String> {
+    read_transcript_for_state(&state, session_id).await
+}
+
+async fn read_transcript_for_state(
+    state: &DesktopState,
     session_id: String,
 ) -> Result<Vec<Value>, String> {
     let active_call_ids = {
@@ -11628,9 +12855,16 @@ async fn read_transcript(
         })
 }
 
-#[tauri::command]
-fn read_session_events(
+#[tauri::command(rename = "read_session_events")]
+fn read_session_events_command(
     state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Vec<Value>, String> {
+    read_session_events_for_state(&state, session_id)
+}
+
+fn read_session_events_for_state(
+    state: &DesktopState,
     session_id: String,
 ) -> Result<Vec<Value>, String> {
     state
@@ -11638,6 +12872,44 @@ fn read_session_events(
         .load_session_events(&session_id)
         .map_err(|error| error.to_string())
         .map(|events| events.into_iter().map(|record| record.event).collect())
+}
+
+#[tauri::command]
+async fn acp_session_capabilities(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Value, String> {
+    Ok(acp_for(&state, &session_id)
+        .await?
+        .session_capabilities()
+        .await)
+}
+
+#[tauri::command]
+async fn acp_set_mode(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    mode_id: String,
+) -> Result<(), String> {
+    acp_for(&state, &session_id)
+        .await?
+        .set_mode(&mode_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn acp_set_config_option(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    config_id: String,
+    value: Value,
+) -> Result<(), String> {
+    acp_for(&state, &session_id)
+        .await?
+        .set_config_option(&config_id, value)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 fn artifact_kind(path: &str) -> (&'static str, Option<&'static str>) {
@@ -11961,10 +13233,17 @@ async fn list_artifacts(
     state: State<'_, DesktopState>,
     session_id: String,
 ) -> Result<Vec<ArtifactRecord>, String> {
-    let (_host, _host_id) = artifact_host(&state, &session_id).await?;
+    list_artifacts_for_state(&state, &session_id).await
+}
+
+async fn list_artifacts_for_state(
+    state: &DesktopState,
+    session_id: &str,
+) -> Result<Vec<ArtifactRecord>, String> {
+    let (_host, _host_id) = artifact_host(state, session_id).await?;
     state
         .store
-        .load_artifacts(&session_id)
+        .load_artifacts(session_id)
         .map_err(|error| error.to_string())
 }
 
@@ -12147,6 +13426,87 @@ async fn submit_turn(
     submit_turn_inner(app, &state, request).await
 }
 
+async fn submit_engine_turn_with_coordination_ingest(
+    engine: &GuiEngine,
+    state: &DesktopState,
+    session_id: &str,
+    text: String,
+    attachments: Vec<ExternalContextAttachment>,
+) -> Result<(), EngineError> {
+    engine
+        .submit_text_with_attachments(text, attachments)
+        .await?;
+    let _ = coordination_ingest_session_inner(state, session_id, false).await;
+    Ok(())
+}
+
+async fn session_context_attachments(
+    state: &DesktopState,
+    session_id: &str,
+) -> Result<Vec<ExternalContextAttachment>, String> {
+    let resources = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let mut statement = connection
+            .prepare(
+                "SELECT server_object_id,config_version_id,uri FROM mcp_session_resources
+                 WHERE session_id=?1 AND mode='context' AND enabled=1",
+            )
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map([session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+    let mut attachments = Vec::new();
+    for (server_id, _version_id, uri) in resources {
+        let contents = state
+            .mcp
+            .read_resource(&server_id, &uri)
+            .await
+            .map_err(|error| error.to_string())?;
+        for content in contents {
+            let text = content
+                .text
+                .or_else(|| {
+                    content
+                        .blob
+                        .map(|blob| format!("[binary resource: {blob}]"))
+                })
+                .unwrap_or_default();
+            validate_context_resource_size(&text)?;
+            attachments.push(ExternalContextAttachment {
+                source: format!("mcp:{server_id}"),
+                uri: Some(content.uri),
+                mime_type: content.mime_type,
+                content: text,
+            });
+        }
+    }
+    Ok(attachments)
+}
+
+fn validate_context_resource_size(text: &str) -> Result<(), String> {
+    const MAX_CONTEXT_RESOURCE_BYTES: usize = 256 * 1024;
+    if text.len() > MAX_CONTEXT_RESOURCE_BYTES {
+        return Err(format!(
+            "MCP resource is too large to attach ({} bytes; limit {} bytes)",
+            text.len(),
+            MAX_CONTEXT_RESOURCE_BYTES
+        ));
+    }
+    Ok(())
+}
+
 fn wake_session_for_turn(store: &SqliteStore, session_id: &str) -> Result<(), String> {
     let session = store
         .load_session(session_id)
@@ -12277,7 +13637,12 @@ pub(crate) async fn submit_turn_inner_with_context(
     repair_loop: Option<RepairLoopContext>,
 ) -> Result<(), String> {
     let session = session_for(state, &request.session_id)?;
-    if execute_control_slash_command(&app, state, &session, &request.text).await? {
+    reject_removed_opencode_session(&session)
+        .map_err(|error| fail_submit_turn(&app, state, &request.session_id, error))?;
+    if execute_control_slash_command(&app, state, &session, &request.text)
+        .await
+        .map_err(|error| fail_submit_turn(&app, state, &request.session_id, error))?
+    {
         emit(
             &app,
             "turn_done",
@@ -12292,32 +13657,34 @@ pub(crate) async fn submit_turn_inner_with_context(
         .and_then(|project_id| state.store.load_project(project_id).ok().flatten())
         .map(|project| format!("repo:{}", project.repo_root));
     request.text = {
-        let connection = state
-            .database
-            .lock()
-            .map_err(|_| "database lock poisoned")?;
+        let connection = state.database.lock().map_err(|_| {
+            fail_submit_turn(
+                &app,
+                state,
+                &request.session_id,
+                "database lock poisoned".into(),
+            )
+        })?;
         expand_slash_command(
             &connection,
             session.project_id.as_deref(),
             repo_scope.as_deref(),
             &request.text,
-        )?
+        )
+        .map_err(|error| fail_submit_turn(&app, state, &request.session_id, error))?
     };
     wake_session_for_turn(&state.store, &request.session_id)
         .map_err(|error| fail_submit_turn(&app, state, &request.session_id, error))?;
-    if session.harness == "opencode" {
-        return submit_opencode_turn_inner(app.clone(), state, request)
-            .await
-            .map_err(|error| fail_submit_turn(&app, state, &session.session_id, error));
-    }
     if session.harness == "acp" {
         return submit_acp_turn_inner(app.clone(), state, request)
             .await
             .map_err(|error| fail_submit_turn(&app, state, &session.session_id, error));
     }
-    let host_id = session_host_id(state, &request.session_id)?;
+    let host_id = session_host_id(state, &request.session_id)
+        .map_err(|error| fail_submit_turn(&app, state, &request.session_id, error))?;
     if host_id != "local" {
-        let client = client_for(state, &host_id)?;
+        let client = client_for(state, &host_id)
+            .map_err(|error| fail_submit_turn(&app, state, &request.session_id, error))?;
         if let Err(error) = client.health().await {
             let _ =
                 state
@@ -12341,7 +13708,7 @@ pub(crate) async fn submit_turn_inner_with_context(
     let sequence_before = state
         .store
         .max_message_notice_sequence(&request.session_id)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| fail_submit_turn(&app, state, &request.session_id, error.to_string()))?;
     let engine = engine_for_with_context(
         &app,
         state,
@@ -12352,19 +13719,62 @@ pub(crate) async fn submit_turn_inner_with_context(
     )
     .await
     .map_err(|error| fail_submit_turn(&app, state, &request.session_id, error))?;
+    let plan_before_turn = state
+        .store
+        .load_plan(&request.session_id)
+        .map_err(|error| fail_submit_turn(&app, state, &request.session_id, error.to_string()))?;
+    if let Err(error) = auto_route_project_plan(&app, state, &request.session_id).await {
+        audit(
+            state,
+            &request.session_id,
+            "coordination_auto_route_error",
+            json!({"error": error}),
+        );
+    }
+    let mut attachments = request.attachments;
+    attachments.extend(
+        session_context_attachments(state, &request.session_id)
+            .await
+            .map_err(|error| fail_submit_turn(&app, state, &request.session_id, error))?,
+    );
     emit(
         &app,
         "message",
         Some(&request.session_id),
         json!({"role":"user","text":request.text}),
     );
-    match engine.submit_text(request.text).await {
+    match submit_engine_turn_with_coordination_ingest(
+        &engine,
+        state,
+        &request.session_id,
+        request.text,
+        attachments,
+    )
+    .await
+    {
         Ok(_) => {
-            let _ = coordination_ingest_session_inner(state, &request.session_id, false).await;
+            if let Err(error) = auto_route_project_plan(&app, state, &request.session_id).await {
+                audit(
+                    state,
+                    &request.session_id,
+                    "coordination_auto_route_error",
+                    json!({"error": error}),
+                );
+            }
+            record_unrouted_completed_plan_steps(
+                &app,
+                state,
+                &request.session_id,
+                plan_before_turn.as_ref(),
+            )
+            .await
+            .map_err(|error| fail_submit_turn(&app, state, &request.session_id, error))?;
             let calls = state
                 .store
                 .load_tool_calls_after(&request.session_id, sequence_before)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| {
+                    fail_submit_turn(&app, state, &request.session_id, error.to_string())
+                })?;
             record_artifacts_best_effort(&app, state, &request.session_id, &host_id, calls).await;
             emit(
                 &app,
@@ -12378,18 +13788,24 @@ pub(crate) async fn submit_turn_inner_with_context(
             let unattended = state
                 .store
                 .is_unattended(&request.session_id)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| {
+                    fail_submit_turn(&app, state, &request.session_id, error.to_string())
+                })?;
             let pending_kind = state
                 .store
                 .get_inbox(&request.session_id, &call_id)
-                .map_err(|error| error.to_string())?
+                .map_err(|error| {
+                    fail_submit_turn(&app, state, &request.session_id, error.to_string())
+                })?
                 .map(|item| item.kind)
                 .unwrap_or_else(|| "approval".into());
             if unattended {
                 state
                     .store
                     .set_pending_visibility(&request.session_id, &call_id, "inbox")
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| {
+                        fail_submit_turn(&app, state, &request.session_id, error.to_string())
+                    })?;
                 audit(
                     state,
                     &request.session_id,
@@ -12400,7 +13816,9 @@ pub(crate) async fn submit_turn_inner_with_context(
             let calls = state
                 .store
                 .load_tool_calls_after(&request.session_id, sequence_before)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| {
+                    fail_submit_turn(&app, state, &request.session_id, error.to_string())
+                })?;
             record_artifacts_best_effort(&app, state, &request.session_id, &host_id, calls).await;
             if unattended {
                 emit(
@@ -12484,7 +13902,9 @@ pub(crate) async fn submit_turn_inner_with_context(
             let calls = state
                 .store
                 .load_tool_calls_after(&request.session_id, sequence_before)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| {
+                    fail_submit_turn(&app, state, &request.session_id, error.to_string())
+                })?;
             record_artifacts_best_effort(&app, state, &request.session_id, &host_id, calls).await;
             let message = engine_error_message(error);
             if message.contains("denied") || message.contains("policy") {
@@ -12510,166 +13930,6 @@ pub(crate) async fn submit_turn_inner_with_context(
             Err(message)
         }
     }
-}
-
-async fn submit_opencode_turn_inner(
-    app: tauri::AppHandle,
-    state: &DesktopState,
-    request: SubmitRequest,
-) -> Result<(), String> {
-    let harness = opencode_for(state, &request.session_id).await?;
-    let mut start_events = false;
-    {
-        let mut sessions = state.opencode_event_sessions.lock().await;
-        if sessions.insert(request.session_id.clone()) {
-            start_events = true;
-        }
-    }
-    if start_events {
-        let mut events = harness.events().map_err(|error| error.to_string())?;
-        let event_app = app.clone();
-        let event_session = request.session_id.clone();
-        let event_store = Arc::clone(&state.store);
-        tauri::async_runtime::spawn(async move {
-            while let Some(event) = events.recv().await {
-                match event {
-                    opcos_engine::HarnessEvent::AssistantTextDelta { text } => emit(
-                        &event_app,
-                        "message",
-                        Some(&event_session),
-                        json!({"role":"assistant","text":text}),
-                    ),
-                    opcos_engine::HarnessEvent::AssistantReasoningDelta { text } => emit(
-                        &event_app,
-                        "thinking",
-                        Some(&event_session),
-                        json!({"text":text}),
-                    ),
-                    opcos_engine::HarnessEvent::ToolCallDelta {
-                        call_id,
-                        tool,
-                        arguments_fragment,
-                    } => emit(
-                        &event_app,
-                        "stream",
-                        Some(&event_session),
-                        json!({"tool_call_delta":{"id":call_id,"name":tool,"arguments_fragment":arguments_fragment}}),
-                    ),
-                    opcos_engine::HarnessEvent::ToolResult {
-                        call_id,
-                        tool,
-                        arguments,
-                        result,
-                    } => emit(
-                        &event_app,
-                        "stream",
-                        Some(&event_session),
-                        json!({"tool_result":{"call_id":call_id,"tool":tool,"arguments":redact_approval_value(&arguments),"result":redact_approval_value(&result)}}),
-                    ),
-                    opcos_engine::HarnessEvent::ApprovalRequested(request) => {
-                        let unattended = event_store.is_unattended(&event_session).unwrap_or(false);
-                        if unattended {
-                            emit(
-                                &event_app,
-                                "notice",
-                                Some(&event_session),
-                                json!({"kind":"approval_pending","text":"Approval request sent to the Inbox"}),
-                            );
-                            emit(
-                                &event_app,
-                                "turn_done",
-                                Some(&event_session),
-                                session_status_payload_from_store(&event_store, &event_session),
-                            );
-                        } else {
-                            emit(
-                                &event_app,
-                                "approval",
-                                Some(&event_session),
-                                json!({"call_id":request.request_id,"tool":request.tool,"arguments":redact_approval_value(&request.arguments)}),
-                            );
-                        }
-                    }
-                    opcos_engine::HarnessEvent::QuestionRequested(request) => {
-                        let unattended = event_store.is_unattended(&event_session).unwrap_or(false);
-                        if unattended {
-                            emit(
-                                &event_app,
-                                "notice",
-                                Some(&event_session),
-                                json!({"kind":"question_pending","text":"Question sent to the Inbox"}),
-                            );
-                            emit(
-                                &event_app,
-                                "turn_done",
-                                Some(&event_session),
-                                session_status_payload_from_store(&event_store, &event_session),
-                            );
-                        } else {
-                            emit(
-                                &event_app,
-                                "question_requested",
-                                Some(&event_session),
-                                json!({"call_id":request.request_id,"tool":request.tool,"arguments":redact_approval_value(&request.arguments)}),
-                            );
-                        }
-                    }
-                    opcos_engine::HarnessEvent::ApprovalEnrichmentFailed {
-                        request_id,
-                        reason,
-                        ..
-                    } => emit(
-                        &event_app,
-                        "notice",
-                        Some(&event_session),
-                        json!({"kind":"error","text":reason,"request_id":request_id}),
-                    ),
-                    opcos_engine::HarnessEvent::Error { message } => {
-                        emit(
-                            &event_app,
-                            "notice",
-                            Some(&event_session),
-                            json!({"kind":"error","text":message}),
-                        );
-                        emit(
-                            &event_app,
-                            "turn_done",
-                            Some(&event_session),
-                            session_status_payload_from_store(&event_store, &event_session),
-                        );
-                    }
-                    opcos_engine::HarnessEvent::TurnFinished { turn } => {
-                        let mut payload =
-                            session_status_payload_from_store(&event_store, &event_session);
-                        if let Some(object) = payload.as_object_mut() {
-                            object.insert("turn".into(), json!(turn));
-                        }
-                        emit(&event_app, "turn_done", Some(&event_session), payload);
-                        if let Some(state) = event_app.try_state::<DesktopState>() {
-                            let _ =
-                                coordination_ingest_session_inner(&state, &event_session, false)
-                                    .await;
-                        }
-                    }
-                }
-            }
-        });
-    }
-    let handle = harness
-        .start_turn(opcos_engine::HarnessTurnInput {
-            text: request.text.clone(),
-            model: String::new(),
-            ..Default::default()
-        })
-        .await
-        .map_err(|error| error.to_string())?;
-    emit(
-        &app,
-        "message",
-        Some(&request.session_id),
-        json!({"role":"user","text":request.text,"turn_id":handle.id()}),
-    );
-    Ok(())
 }
 
 fn acp_session_event(event_type: &str, payload: Value) -> Value {
@@ -12895,16 +14155,10 @@ impl AcpDesktopLifecycle {
         while let Some(event) = events.recv().await {
             match event {
                 opcos_engine::HarnessEvent::AssistantTextDelta { text } => self.emit_stream(
-                    acp_stream_event(
-                        "assistant_delta",
-                        json!({"text_delta": text}),
-                    ),
+                    acp_stream_event("assistant_delta", json!({"text_delta": text})),
                 ),
                 opcos_engine::HarnessEvent::AssistantReasoningDelta { text } => self.emit_stream(
-                    acp_stream_event(
-                        "reasoning_delta",
-                        json!({"reasoning_delta": text}),
-                    ),
+                    acp_stream_event("reasoning_delta", json!({"reasoning_delta": text})),
                 ),
                 opcos_engine::HarnessEvent::ToolCallDelta {
                     call_id,
@@ -12914,6 +14168,36 @@ impl AcpDesktopLifecycle {
                     "tool_call_delta",
                     json!({"tool_call_delta":{"id":call_id,"name":tool,"arguments_fragment":arguments_fragment}}),
                 )),
+                opcos_engine::HarnessEvent::ToolCallUpdate {
+                    call_id,
+                    tool,
+                    status,
+                    content,
+                    locations,
+                } => self.emit_stream(acp_stream_event(
+                    "tool_call_update",
+                    json!({"tool_call_update":{"id":call_id,"name":tool,"status":status,"content":content.map(|value| redact_approval_value(&value)),"locations":locations}}),
+                )),
+                opcos_engine::HarnessEvent::PlanUpdate { entries } => self.emit_stream(
+                    acp_stream_event("plan_update", json!({"plan_update":{"entries":entries}})),
+                ),
+                opcos_engine::HarnessEvent::SessionModeUpdate {
+                    current_mode_id,
+                    available_modes,
+                } => self.sink.emit(
+                    "acp_session",
+                    json!({"kind":"mode_update","currentModeId":current_mode_id,"availableModes":available_modes}),
+                ),
+                opcos_engine::HarnessEvent::SessionConfigUpdate { config_options } => {
+                    self.sink.emit(
+                        "acp_session",
+                        json!({"kind":"config_update","configOptions":config_options}),
+                    )
+                }
+                opcos_engine::HarnessEvent::AvailableCommandsUpdate { commands } => self.sink.emit(
+                    "acp_session",
+                    json!({"kind":"commands_update","availableCommands":commands}),
+                ),
                 opcos_engine::HarnessEvent::ToolResult {
                     call_id,
                     tool,
@@ -12946,6 +14230,37 @@ impl AcpDesktopLifecycle {
                         );
                     }
                 }
+                opcos_engine::HarnessEvent::QuestionRequested(request) => {
+                    let unattended = self.store.is_unattended(&self.session_id).unwrap_or(false);
+                    if unattended {
+                        let _ = self.store.set_pending_visibility(
+                            &self.session_id,
+                            &request.request_id,
+                            "inbox",
+                        );
+                        self.sink.emit(
+                            "notice",
+                            json!({"kind":"question_pending","text":"Question sent to the Inbox"}),
+                        );
+                        self.sink.emit(
+                            "turn_done",
+                            session_status_payload_from_store(&self.store, &self.session_id),
+                        );
+                    } else {
+                        self.sink.emit(
+                            "question_requested",
+                            json!({"call_id":request.request_id,"tool":request.tool,"arguments":redact_approval_value(&request.arguments)}),
+                        );
+                    }
+                }
+                opcos_engine::HarnessEvent::ApprovalEnrichmentFailed {
+                    request_id,
+                    reason,
+                    ..
+                } => self.sink.emit(
+                    "notice",
+                    json!({"kind":"error","text":reason,"request_id":request_id}),
+                ),
                 opcos_engine::HarnessEvent::Error { message } => {
                     self.handle_error(&message).await;
                 }
@@ -12972,7 +14287,6 @@ impl AcpDesktopLifecycle {
                     self.sink.emit("turn_done", payload);
                     self.sink.after_turn_finished().await;
                 }
-                _ => {}
             }
         }
     }
@@ -13112,8 +14426,18 @@ async fn interrupt(
     state: State<'_, DesktopState>,
     session_id: String,
 ) -> Result<(), String> {
-    if session_for(&state, &session_id)?.harness == "opencode" {
-        let harness = opencode_for(&state, &session_id).await?;
+    interrupt_for_state(app, &state, session_id).await
+}
+
+async fn interrupt_for_state(
+    app: tauri::AppHandle,
+    state: &DesktopState,
+    session_id: String,
+) -> Result<(), String> {
+    let session = session_for(state, &session_id)?;
+    reject_removed_opencode_session(&session)?;
+    if session.harness == "acp" {
+        let harness = acp_for(state, &session_id).await?;
         harness.interrupt();
         state
             .store
@@ -13123,33 +14447,18 @@ async fn interrupt(
             &app,
             "turn_done",
             Some(&session_id),
-            session_status_payload(&state, &session_id),
+            session_status_payload(state, &session_id),
         );
         return Ok(());
     }
-    if session_for(&state, &session_id)?.harness == "acp" {
-        let harness = acp_for(&state, &session_id).await?;
-        harness.interrupt();
-        state
-            .store
-            .update_session_status(&session_id, "interrupted", "interrupted_by_user")
-            .map_err(|error| error.to_string())?;
-        emit(
-            &app,
-            "turn_done",
-            Some(&session_id),
-            session_status_payload(&state, &session_id),
-        );
-        return Ok(());
-    }
-    let engine = engine_for(&app, &state, &session_id, ToolOrigin::User).await?;
+    let engine = engine_for(&app, state, &session_id, ToolOrigin::User).await?;
     engine.interrupt();
     state
         .store
         .update_session_status(&session_id, "interrupted", "interrupted_by_user")
         .map_err(|error| error.to_string())?;
     audit(
-        &state,
+        state,
         &session_id,
         "session_interrupted",
         json!({"session_id": session_id}),
@@ -13164,9 +14473,961 @@ async fn interrupt(
         &app,
         "turn_done",
         Some(&session_id),
-        session_status_payload(&state, &session_id),
+        session_status_payload(state, &session_id),
     );
     Ok(())
+}
+
+struct DesktopControlPlane {
+    app: tauri::AppHandle,
+}
+
+fn mcp_session_view(view: SessionView) -> Value {
+    let mut value = serde_json::to_value(view).expect("session view serializes");
+    if let Some(object) = value.as_object_mut()
+        && let Some(id) = object.remove("id")
+    {
+        object.insert("session_id".into(), id);
+    }
+    value
+}
+
+fn safe_project_repo_url(value: &str) -> Option<String> {
+    let mut parsed = url::Url::parse(value).ok()?;
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    Some(parsed.to_string())
+}
+
+fn mcp_project_summary(project: &ProjectRecord) -> Value {
+    json!({
+        "project_id": project.id,
+        "name": project.name,
+        "host_id": project.host_id,
+        "repo_url": safe_project_repo_url(&project.repo_url),
+        "repo_root": project.repo_root,
+        "default_branch": project.default_branch,
+        "board_id": project.board_id,
+        "archived": project.archived,
+        "updated_at": project.updated_at.to_rfc3339(),
+    })
+}
+
+fn mcp_project_agent_summary(agent: &ProjectAgentRecord) -> Value {
+    json!({
+        "agent_id": agent.id,
+        "project_id": agent.project_id,
+        "sort_order": agent.sort_order,
+        "name": agent.name,
+        "role": agent.role,
+        "session_id": agent.session_id,
+        "model": agent.model,
+        "harness": agent.harness,
+        "mode": agent.mode,
+        "worktree_path": agent.worktree_path,
+        "branch": agent.branch,
+        "state": agent.state,
+    })
+}
+
+fn mcp_coordination_snapshot(state: &DesktopState, project_id: &str) -> Result<Value, String> {
+    let project = state
+        .store
+        .load_project(project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    let workflow = parse_workflow(&project.workflow_json)?;
+    let agents = state
+        .store
+        .load_project_agents(project_id)
+        .map_err(|error| error.to_string())?
+        .iter()
+        .map(mcp_project_agent_summary)
+        .collect::<Vec<_>>();
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let (stage_index, status): (i64, String) = connection
+        .query_row(
+            "SELECT stage_index,status FROM project_workflow_state WHERE project_id=?1",
+            [project_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .unwrap_or((0, "open".to_owned()));
+    let snapshot = json!({
+        "source": "sqlite",
+        "project": mcp_project_summary(&project),
+        "agents": agents,
+        "workflow": workflow,
+        "stage_index": stage_index,
+        "status": status,
+        "tasks": load_project_tasks(&connection, project_id)?,
+        "messages": load_project_messages(&connection, project_id)?,
+        "runtime": {
+            "available": false,
+            "note": "live in-memory coordination counters are not part of the SQLite snapshot"
+        }
+    });
+    Ok(redact_approval_value(&snapshot))
+}
+
+fn ensure_mcp_coordination_project_access(
+    caller_project_id: &str,
+    requested_project_id: &str,
+) -> Result<(), String> {
+    if caller_project_id == requested_project_id {
+        Ok(())
+    } else {
+        Err("coordination project is outside the caller project".to_owned())
+    }
+}
+
+impl DesktopControlPlane {
+    fn state(&self) -> tauri::State<'_, DesktopState> {
+        self.app.state::<DesktopState>()
+    }
+
+    fn required_string(arguments: &Value, key: &str) -> Result<String, String> {
+        arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("missing required argument: {key}"))
+    }
+}
+
+#[async_trait]
+impl opcos_acp_server::OpcosAcpControlPlane for DesktopControlPlane {
+    async fn session_new(
+        &self,
+        request: AcpNewSessionRequest,
+    ) -> Result<AcpNewSessionResponse, String> {
+        let state = self.state();
+        let cwd = request.cwd.to_string_lossy().into_owned();
+        if cwd.trim().is_empty() {
+            return Err("ACP cwd must not be empty".into());
+        }
+        let host_id = {
+            let settings = {
+                let database = state
+                    .database
+                    .lock()
+                    .map_err(|_| "database lock poisoned")?;
+                load_agent_settings(&database, None)?
+            };
+            let platform = settings
+                .get("default_platform")
+                .and_then(Value::as_str)
+                .unwrap_or("Ubuntu")
+                .to_ascii_lowercase();
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            connection
+                .query_row(
+                    "SELECT id FROM hosts WHERE lower(name) LIKE ?1 ORDER BY id LIMIT 1",
+                    [format!("%{platform}%")],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap_or_else(|_| "local".into())
+        };
+        if host_id == "local" {
+            if !FsPath::new(&cwd).is_dir() {
+                return Err(format!(
+                    "ACP cwd is not an available local workspace: {}",
+                    cwd
+                ));
+            }
+        } else {
+            let client = client_for(&self.state(), &host_id)?;
+            client
+                .health()
+                .await
+                .map_err(|error| format!("remote host unavailable: {error}"))?;
+            client
+                .with_workspace(&cwd)
+                .ls(Some(&cwd))
+                .await
+                .map_err(|error| format!("ACP cwd is unavailable on remote host: {error}"))?;
+        }
+        let view = create_session_for_state(
+            &state,
+            "OPCOS ACP session".into(),
+            None,
+            None,
+            None,
+            None,
+            Some("builtin".into()),
+            Some(cwd),
+            None,
+            None,
+            None,
+        )?;
+        emit(
+            &self.app,
+            "session_list_changed",
+            None,
+            json!({"session_id": view.id}),
+        );
+        Ok(AcpNewSessionResponse::new(view.id))
+    }
+
+    async fn session_prompt(
+        &self,
+        request: AcpPromptRequest,
+        sink: Arc<dyn opcos_acp_server::AcpEventSink>,
+    ) -> Result<AcpStopReason, String> {
+        let session_id = request.session_id.to_string();
+        let text = request
+            .prompt
+            .iter()
+            .map(|block| match block {
+                AcpContentBlock::Text(text) => Ok(text.text.as_str()),
+                _ => Err("unsupported ACP prompt content block".to_owned()),
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .join("");
+        sink.update(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::UserMessageChunk(AcpContentChunk::new(AcpContentBlock::Text(
+                AcpTextContent::new(text.clone()),
+            ))),
+        ))
+        .await?;
+        let state = self.state();
+        let (stream_tx, mut stream_rx) = unbounded_channel();
+        state
+            .acp_streams
+            .lock()
+            .map_err(|_| "ACP stream registry lock poisoned".to_owned())?
+            .insert(session_id.clone(), stream_tx);
+        let stream_sink = Arc::clone(&sink);
+        let stream_session = session_id.clone();
+        let stream_forwarder = tokio::spawn(async move {
+            while let Some((kind, payload)) = stream_rx.recv().await {
+                if let Some(update) = acp_stream_update(&kind, &payload)
+                    && stream_sink
+                        .update(SessionNotification::new(stream_session.clone(), update))
+                        .await
+                        .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let outcome = async {
+            let mut resolved_call_ids = HashSet::new();
+            let mut result = submit_turn_inner_with_origin(
+                self.app.clone(),
+                &state,
+                SubmitRequest {
+                    session_id: session_id.clone(),
+                    text,
+                    attachments: Vec::new(),
+                },
+                ToolOrigin::User,
+            )
+            .await;
+            loop {
+                if let Err(error) = result {
+                    let session = session_for(&self.state(), &session_id)?;
+                    if session.run_state == "interrupted"
+                        || session.stop_reason == "interrupted_by_user"
+                    {
+                        return Ok(AcpStopReason::Cancelled);
+                    }
+                    let pending = self
+                        .state()
+                        .store
+                        .load_pending(&session_id)
+                        .map_err(|store_error| store_error.to_string())?;
+                    if let Some(pending) = next_acp_pending(&pending, &resolved_call_ids) {
+                        let pending_call_id = pending.call_id.clone();
+                        let pending_tool = pending.tool.clone();
+                        let permission = sink.request_permission(
+                            serde_json::from_value(json!({
+                                "sessionId": session_id,
+                                "toolCall": {
+                                    "toolCallId": pending_call_id,
+                                    "title": pending_tool,
+                                    "status": "pending"
+                                },
+                                "options": [
+                                    {
+                                        "optionId": "allow_once",
+                                        "name": "Allow once",
+                                        "kind": "allow_once"
+                                    },
+                                    {
+                                        "optionId": "deny",
+                                        "name": "Deny",
+                                        "kind": "reject_once"
+                                    }
+                                ]
+                            }))
+                            .map_err(|error| error.to_string())?,
+                        );
+                        tokio::pin!(permission);
+                        let external_resolution = wait_for_external_approval_resolution(
+                            Arc::clone(&self.state().store),
+                            session_id.clone(),
+                            pending.call_id.clone(),
+                        );
+                        tokio::pin!(external_resolution);
+                        let response = tokio::select! {
+                            response = &mut permission => response?,
+                            resolution = &mut external_resolution => {
+                                resolution?;
+                                result = Err("ACP approval resolved externally".to_owned());
+                                continue;
+                            }
+                        };
+                        let allow = matches!(
+                            response.outcome,
+                            RequestPermissionOutcome::Selected(selected)
+                                if selected.option_id.0.as_ref() == "allow_once"
+                        );
+                        let engine =
+                            engine_for(&self.app, &self.state(), &session_id, ToolOrigin::User)
+                                .await?;
+                        match engine
+                            .resolve_approval(
+                                &pending.call_id,
+                                if allow {
+                                    opcos_engine::ApprovalOutcome::Approve
+                                } else {
+                                    opcos_engine::ApprovalOutcome::Deny
+                                },
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                emit_approval_resolution_refresh(
+                                    &self.app,
+                                    &self.state(),
+                                    &session_id,
+                                    &pending.call_id,
+                                    allow,
+                                    None,
+                                )?;
+                                resolved_call_ids.insert(pending.call_id.clone());
+                                result = Ok(());
+                            }
+                            Err(EngineError::ApprovalAlreadyProcessed(_)) => {
+                                resolved_call_ids.insert(pending.call_id.clone());
+                                result = Ok(());
+                            }
+                            Err(EngineError::ApprovalPending(next_call_id)) => {
+                                emit_approval_resolution_refresh(
+                                    &self.app,
+                                    &self.state(),
+                                    &session_id,
+                                    &pending.call_id,
+                                    allow,
+                                    Some(&next_call_id),
+                                )?;
+                                result = Err(engine_error_message(EngineError::ApprovalPending(
+                                    next_call_id,
+                                )));
+                            }
+                            Err(next) => {
+                                result = Err(engine_error_message(next));
+                            }
+                        }
+                        continue;
+                    }
+                    if let Ok(stop_reason) = acp_stop_reason(&session) {
+                        return Ok(stop_reason);
+                    }
+                    return Err(error);
+                }
+                let session = session_for(&self.state(), &session_id)?;
+                return acp_stop_reason(&session);
+            }
+        }
+        .await;
+        if let Ok(mut streams) = state.acp_streams.lock() {
+            streams.remove(&session_id);
+        }
+        let mut stream_forwarder = stream_forwarder;
+        if tokio::time::timeout(Duration::from_secs(1), &mut stream_forwarder)
+            .await
+            .is_err()
+        {
+            stream_forwarder.abort();
+        }
+        outcome
+    }
+
+    async fn session_cancel(&self, session_id: String) -> Result<(), String> {
+        interrupt_for_state(self.app.clone(), &self.state(), session_id).await
+    }
+}
+
+#[async_trait]
+impl opcos_mcp_server::OpcosControlPlane for DesktopControlPlane {
+    async fn session_create(&self, arguments: Value) -> Result<Value, String> {
+        let state = self.state();
+        let title = arguments
+            .get("title")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("OPCOS MCP session")
+            .to_owned();
+        let view = create_session_for_state(
+            &state,
+            title,
+            arguments
+                .get("host_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            arguments
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            arguments
+                .get("provider")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            arguments
+                .get("mode")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            arguments
+                .get("harness")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            arguments
+                .get("workspace")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            arguments
+                .get("project_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            arguments
+                .get("agent_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            arguments
+                .get("system_prompt")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        )?;
+        let session_id = view.id.clone();
+        emit(&self.app, "session_list_changed", None, json!({}));
+        if let Some(prompt) = arguments
+            .get("prompt")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            submit_turn_inner_with_origin(
+                self.app.clone(),
+                &state,
+                SubmitRequest {
+                    session_id: session_id.clone(),
+                    text: prompt.to_owned(),
+                    attachments: vec![],
+                },
+                ToolOrigin::User,
+            )
+            .await?;
+        }
+        Ok(json!({"session_id": session_id, "session": mcp_session_view(view)}))
+    }
+
+    async fn session_search(&self, arguments: Value) -> Result<Value, String> {
+        let state = self.state();
+        let query = arguments
+            .get("query")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase);
+        let status = arguments.get("status").and_then(Value::as_str);
+        let project_id = arguments.get("project_id").and_then(Value::as_str);
+        let limit = arguments
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(100)
+            .clamp(1, 500) as usize;
+        let sessions = list_sessions_for_state(&state)?
+            .into_iter()
+            .filter(|session| {
+                query.as_deref().is_none_or(|query| {
+                    session.id.to_ascii_lowercase().contains(query)
+                        || session.title.to_ascii_lowercase().contains(query)
+                })
+            })
+            .filter(|session| status.is_none_or(|status| session.run_state == status))
+            .filter(|session| project_id.is_none_or(|id| session.project_id.as_deref() == Some(id)))
+            .take(limit)
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "sessions": sessions
+                .into_iter()
+                .map(mcp_session_view)
+                .collect::<Vec<_>>()
+        }))
+    }
+
+    async fn session_interact(&self, arguments: Value) -> Result<Value, String> {
+        let session_id = Self::required_string(&arguments, "session_id")?;
+        let action = Self::required_string(&arguments, "action")?;
+        let state = self.state();
+        match action.as_str() {
+            "get" => list_sessions_for_state(&state)?
+                .into_iter()
+                .find(|session| session.id == session_id)
+                .map(|session| json!({"session": mcp_session_view(session)}))
+                .ok_or_else(|| format!("session not found: {session_id}")),
+            "get_messages" => Ok(json!({
+                "session_id": session_id,
+                "messages": read_transcript_for_state(&state, session_id.clone()).await?
+            })),
+            "message" => {
+                let message = Self::required_string(&arguments, "message")?;
+                submit_turn_inner_with_origin(
+                    self.app.clone(),
+                    &state,
+                    SubmitRequest {
+                        session_id: session_id.clone(),
+                        text: message,
+                        attachments: vec![],
+                    },
+                    ToolOrigin::User,
+                )
+                .await?;
+                let session = list_sessions_for_state(&state)?
+                    .into_iter()
+                    .find(|session| session.id == session_id)
+                    .ok_or_else(|| format!("session not found: {session_id}"))?;
+                Ok(json!({"session": mcp_session_view(session)}))
+            }
+            "terminate" => {
+                interrupt_for_state(self.app.clone(), &state, session_id.clone()).await?;
+                Ok(json!({"session_id": session_id, "terminated": true}))
+            }
+            "archive" => {
+                let result = set_session_archived_for_state(&state, &session_id, true)?;
+                emit(&self.app, "session_list_changed", None, json!({}));
+                Ok(result)
+            }
+            "get_attachments" => Ok(json!({
+                "session_id": session_id,
+                "attachments": list_artifacts_for_state(&state, &session_id).await?
+            })),
+            _ => Err(format!("unsupported session interaction: {action}")),
+        }
+    }
+
+    async fn session_events(&self, arguments: Value) -> Result<Value, String> {
+        let session_id = Self::required_string(&arguments, "session_id")?;
+        let state = self.state();
+        Ok(json!({
+            "session_id": session_id,
+            "events": read_session_events_for_state(&state, session_id)?
+        }))
+    }
+
+    async fn session_gather(&self, arguments: Value) -> Result<Value, String> {
+        let session_ids = arguments
+            .get("session_ids")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|values| !values.is_empty())
+            .or_else(|| {
+                arguments
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| vec![value.to_owned()])
+            })
+            .ok_or_else(|| "missing required argument: session_id or session_ids".to_owned())?;
+        let timeout = arguments
+            .get("timeout_seconds")
+            .and_then(Value::as_u64)
+            .unwrap_or(30)
+            .clamp(1, 300);
+        let results =
+            futures_util::future::try_join_all(session_ids.into_iter().map(|session_id| {
+                let app = self.app.clone();
+                async move {
+                    let deadline = Instant::now() + Duration::from_secs(timeout);
+                    loop {
+                        let state = app.state::<DesktopState>();
+                        let session = list_sessions_for_state(&state)?
+                            .into_iter()
+                            .find(|session| session.id == session_id)
+                            .ok_or_else(|| format!("session not found: {session_id}"))?;
+                        if session.run_state != "running" && session.run_state != "waiting" {
+                            return Ok::<Value, String>(mcp_session_view(session));
+                        }
+                        if Instant::now() >= deadline {
+                            let mut view = mcp_session_view(session);
+                            if let Some(object) = view.as_object_mut() {
+                                object.insert("timed_out".into(), Value::Bool(true));
+                            }
+                            return Ok(view);
+                        }
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                }
+            }))
+            .await?;
+        Ok(json!({"sessions": results}))
+    }
+
+    async fn knowledge_manage(&self, arguments: Value) -> Result<Value, String> {
+        self.manage_assets(arguments, "knowledge")
+    }
+
+    async fn playbook_manage(&self, arguments: Value) -> Result<Value, String> {
+        self.manage_assets(arguments, "playbook")
+    }
+
+    async fn schedule_manage(&self, arguments: Value) -> Result<Value, String> {
+        let action = Self::required_string(&arguments, "action")?;
+        let state = self.state();
+        match action.as_str() {
+            "list" => Ok(json!({"schedules": list_schedules_for_state(&state)?})),
+            "run" => {
+                let id = arguments
+                    .get("id")
+                    .or_else(|| arguments.get("schedule_id"))
+                    .and_then(Value::as_str)
+                    .ok_or("missing required argument: id")?;
+                run_schedule_for(&self.app, &state, id).await?;
+                Ok(json!({"id": id, "started": true}))
+            }
+            "create" | "update" => {
+                let input = arguments
+                    .get("input")
+                    .cloned()
+                    .unwrap_or_else(|| arguments.clone());
+                let schedule: ScheduleInput = serde_json::from_value(input)
+                    .map_err(|error| format!("invalid schedule input: {error}"))?;
+                Ok(json!({"schedule": save_schedule_for_state(&state, schedule)?}))
+            }
+            _ => Err(format!("unsupported schedule action: {action}")),
+        }
+    }
+
+    async fn automation_manage(&self, arguments: Value) -> Result<Value, String> {
+        let action = Self::required_string(&arguments, "action")?;
+        let kind = arguments
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("event_rule");
+        let state = self.state();
+        match (kind, action.as_str()) {
+            ("event_rule", "list") => Ok(json!({"items": event_rules_for_state(&state)?})),
+            ("external_ingress", "list") => Ok(json!({
+                "items": external_ingress_sources_for_state(&state, false)?
+            })),
+            ("event_rule", "create") => {
+                let input = arguments
+                    .get("input")
+                    .cloned()
+                    .unwrap_or_else(|| arguments.clone());
+                let input: EventRuleInput = serde_json::from_value(input)
+                    .map_err(|error| format!("invalid event rule input: {error}"))?;
+                let rule = state
+                    .store
+                    .create_event_rule(
+                        &input.kind_pattern,
+                        &input.effect_kind,
+                        &input.effect,
+                        input.max_triggers,
+                        input.window_seconds,
+                        input.failure_limit,
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(json!({"item": rule}))
+            }
+            ("event_rule", "enable") => {
+                let id = Self::required_string(&arguments, "id")?;
+                let enabled = arguments
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .ok_or("missing required argument: enabled")?;
+                let rule = state
+                    .store
+                    .set_event_rule_enabled(&id, enabled)
+                    .map_err(|error| error.to_string())?;
+                Ok(json!({"item": rule}))
+            }
+            ("external_ingress", "create") | ("external_ingress", "update") => {
+                let source_id = Self::required_string(&arguments, "source_id")?;
+                let provider = Self::required_string(&arguments, "provider")?;
+                let config = arguments
+                    .get("config")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                let source = state
+                    .store
+                    .save_external_ingress_source(&source_id, &provider, &config)
+                    .map_err(|error| error.to_string())?;
+                Ok(json!({"item": source}))
+            }
+            ("external_ingress", "enable") => {
+                let id = Self::required_string(&arguments, "id")?;
+                let enabled = arguments
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .ok_or("missing required argument: enabled")?;
+                state
+                    .store
+                    .set_external_ingress_enabled(&id, enabled)
+                    .map_err(|error| error.to_string())?;
+                Ok(json!({"id": id, "enabled": enabled}))
+            }
+            ("external_ingress", "delete") => {
+                let id = Self::required_string(&arguments, "id")?;
+                state
+                    .store
+                    .delete_external_ingress_source(&id)
+                    .map_err(|error| error.to_string())?;
+                Ok(json!({"id": id, "deleted": true}))
+            }
+            ("external_ingress", "run") => {
+                let id = Self::required_string(&arguments, "id")?;
+                external_ingress::poll_once(&state.store, &state.secrets, &id).await?;
+                Ok(json!({"id": id, "polled": true}))
+            }
+            _ => Err(format!("unsupported automation action: {kind}/{action}")),
+        }
+    }
+
+    async fn list_integrations(&self, arguments: Value) -> Result<Value, String> {
+        let state = self.state();
+        let mcp_servers = list_mcp_servers_for_state(&state).await?;
+        let probe_kinds = arguments
+            .get("probe_kinds")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|value| value.trim().to_ascii_lowercase())
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        let probe = arguments
+            .get("probe")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if probe && probe_kinds.is_empty() {
+            return Err("probe requires a non-empty probe_kinds array".into());
+        }
+        if probe {
+            for kind in &probe_kinds {
+                connector_kind_supported(&state.store, SUPPORTED_CONNECTOR_KINDS, kind)?;
+            }
+        }
+        let mut connectors = Vec::with_capacity(SUPPORTED_CONNECTOR_KINDS.len());
+        for kind in SUPPORTED_CONNECTOR_KINDS {
+            let configured = connector_credentials_configured(&state, kind)?;
+            let mut connector = json!({
+                "kind": kind,
+                "configured": configured
+            });
+            if probe && probe_kinds.contains(*kind) {
+                if !configured {
+                    connector["error"] =
+                        Value::String(format!("{kind} credentials are not configured"));
+                } else {
+                    match connector_identity(&state, kind).await {
+                        Ok(identity) => connector["identity"] = identity,
+                        Err(error) => connector["error"] = Value::String(error),
+                    }
+                }
+            }
+            connectors.push(connector);
+        }
+        Ok(json!({"connectors": connectors, "mcp_servers": mcp_servers}))
+    }
+
+    async fn find_setting(&self, arguments: Value) -> Result<Value, String> {
+        let query = arguments
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let settings = opcos_settings_catalog();
+        let matches = settings
+            .iter()
+            .filter(|(id, title, description)| {
+                query.is_empty()
+                    || id.contains(&query)
+                    || title.to_ascii_lowercase().contains(&query)
+                    || description.to_ascii_lowercase().contains(&query)
+            })
+            .map(|(id, title, description)| {
+                json!({
+                    "id": id,
+                    "title": title,
+                    "description": description,
+                    "location": format!("Settings → {title}")
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({"settings": matches}))
+    }
+
+    async fn list_available_repos(&self, arguments: Value) -> Result<Value, String> {
+        let state = self.state();
+        let project_id = arguments
+            .get("project_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        Ok(json!({
+            "repositories": list_environment_repositories_for_state(&state, project_id.as_deref())?
+        }))
+    }
+
+    async fn coordination_projects(&self, arguments: Value) -> Result<Value, String> {
+        let session_id = Self::required_string(&arguments, "session_id")?;
+        let state = self.state();
+        let agent = state
+            .store
+            .load_project_agent_by_session(&session_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "coordination tools require a project agent session".to_owned())?;
+        let project = state
+            .store
+            .load_project(&agent.project_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "project not found".to_owned())?;
+        Ok(json!({"projects": [mcp_project_summary(&project)]}))
+    }
+
+    async fn coordination_snapshot(&self, arguments: Value) -> Result<Value, String> {
+        let session_id = Self::required_string(&arguments, "session_id")?;
+        let project_id = Self::required_string(&arguments, "project_id")?;
+        let state = self.state();
+        let agent = state
+            .store
+            .load_project_agent_by_session(&session_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "coordination tools require a project agent session".to_owned())?;
+        ensure_mcp_coordination_project_access(&agent.project_id, &project_id)?;
+        mcp_coordination_snapshot(&state, &project_id)
+    }
+}
+
+impl DesktopControlPlane {
+    fn manage_assets(&self, arguments: Value, kind: &str) -> Result<Value, String> {
+        let action = Self::required_string(&arguments, "action")?;
+        let state = self.state();
+        let project_id = arguments
+            .get("project_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        match action.as_str() {
+            "list" => Ok(json!({"items": list_assets_for_state(
+                &state,
+                Some(kind.to_owned()),
+                project_id,
+            )?})),
+            "get" => {
+                let id = arguments
+                    .get("id")
+                    .or_else(|| arguments.get("asset_id"))
+                    .and_then(Value::as_str)
+                    .ok_or("missing required argument: id")?;
+                let item = list_assets_for_state(&state, Some(kind.to_owned()), project_id)?
+                    .into_iter()
+                    .find(|item| item["id"].as_str() == Some(id))
+                    .ok_or_else(|| format!("asset not found: {id}"))?;
+                Ok(json!({"item": item}))
+            }
+            "versions" => {
+                let id = arguments
+                    .get("id")
+                    .or_else(|| arguments.get("asset_id"))
+                    .and_then(Value::as_str)
+                    .ok_or("missing required argument: id")?;
+                Ok(json!({"versions": list_asset_versions_for_state(&state, id)?}))
+            }
+            "delete" => {
+                let id = arguments
+                    .get("id")
+                    .or_else(|| arguments.get("asset_id"))
+                    .and_then(Value::as_str)
+                    .ok_or("missing required argument: id")?;
+                delete_asset_for_state(&state, id)?;
+                Ok(json!({"id": id, "deleted": true}))
+            }
+            "create" | "update" => {
+                let input = arguments
+                    .get("input")
+                    .cloned()
+                    .unwrap_or_else(|| arguments.clone());
+                let id = input
+                    .get("id")
+                    .or_else(|| input.get("asset_id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "asset-{kind}-{}",
+                            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                        )
+                    });
+                let title = input
+                    .get("title")
+                    .or_else(|| input.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(kind)
+                    .to_owned();
+                let body = input
+                    .get("body")
+                    .or_else(|| input.get("content"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                save_asset_for_state(
+                    &state,
+                    id.clone(),
+                    kind.to_owned(),
+                    title,
+                    body,
+                    input
+                        .get("trigger")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    input
+                        .get("scope")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    input
+                        .get("scope_kind")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    input.get("enabled").and_then(Value::as_bool),
+                    input
+                        .get("project_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                )?;
+                Ok(json!({"id": id, "saved": true}))
+            }
+            _ => Err(format!("unsupported asset action: {action}")),
+        }
+    }
 }
 
 #[tauri::command]
@@ -13176,7 +15437,44 @@ async fn steering(
     session_id: String,
     text: String,
 ) -> Result<(), String> {
+    reject_removed_opencode_session(&session_for(&state, &session_id)?)?;
     let engine = engine_for(&app, &state, &session_id, ToolOrigin::User).await?;
+    if !engine.has_active_turn() {
+        let handle = app.clone();
+        let session = session_id.clone();
+        let queued_text = text.clone();
+        tauri::async_runtime::spawn(async move {
+            let result = engine.submit_steering(queued_text.clone()).await;
+            let mut completion_state: (String, String) = match &result {
+                Ok(_) => ("idle".into(), "finished".into()),
+                Err(EngineError::TurnAlreadyRunning) => ("running".into(), "none".into()),
+                Err(_) => ("error".into(), "provider_error".into()),
+            };
+            match result {
+                Ok(_) => {}
+                Err(EngineError::TurnAlreadyRunning) => {
+                    let receiver = engine.queue_steering(queued_text).await.ok();
+                    if let Some(receiver) = receiver {
+                        completion_state = receiver.await.unwrap_or_else(|_| {
+                            ("error".into(), "turn_completion_unavailable".into())
+                        });
+                    }
+                }
+                Err(_) => {}
+            };
+            emit(
+                &handle,
+                "turn_done",
+                Some(&session),
+                json!({
+                    "run_state": completion_state.0,
+                    "stop_reason": completion_state.1,
+                }),
+            );
+        });
+        emit(&app, "steering", Some(&session_id), json!({"text":text}));
+        return Ok(());
+    }
     let completion = engine
         .queue_steering(text.clone())
         .await
@@ -13204,46 +15502,21 @@ async fn resolve_approval(
     session_id: String,
     call_id: String,
     approve: bool,
+    option_id: Option<String>,
 ) -> Result<(), String> {
-    if session_for(&state, &session_id)?.harness == "opencode" {
-        let harness = opencode_for(&state, &session_id).await?;
-        harness
-            .reply_approval(
-                &call_id,
-                if approve {
-                    opcos_engine::ApprovalOutcome::Approve
-                } else {
-                    opcos_engine::ApprovalOutcome::Deny
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        state
-            .store
-            .resolve_inbox(
-                &session_id,
-                &call_id,
-                if approve { "allow" } else { "deny" },
-            )
-            .map_err(|error| error.to_string())?;
-        emit(
-            &app,
-            "approval_resolved",
-            Some(&session_id),
-            json!({"call_id":call_id,"approve":approve}),
-        );
-        return Ok(());
-    }
-    if session_for(&state, &session_id)?.harness == "acp" {
+    let session = session_for(&state, &session_id)?;
+    reject_removed_opencode_session(&session)?;
+    if session.harness == "acp" {
         let harness = acp_for(&state, &session_id).await?;
         harness
-            .reply_approval(
+            .reply_approval_with_option(
                 &call_id,
                 if approve {
                     opcos_engine::ApprovalOutcome::Approve
                 } else {
                     opcos_engine::ApprovalOutcome::Deny
                 },
+                option_id,
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -13255,12 +15528,7 @@ async fn resolve_approval(
                 if approve { "allow" } else { "deny" },
             )
             .map_err(|error| error.to_string())?;
-        emit(
-            &app,
-            "approval_resolved",
-            Some(&session_id),
-            json!({"call_id":call_id,"approve":approve}),
-        );
+        emit_approval_resolution_refresh(&app, &state, &session_id, &call_id, approve, None)?;
         return Ok(());
     }
     let host_id = session_host_id(&state, &session_id)?;
@@ -13269,6 +15537,7 @@ async fn resolve_approval(
         .max_message_notice_sequence(&session_id)
         .map_err(|error| error.to_string())?;
     let engine = engine_for(&app, &state, &session_id, ToolOrigin::User).await?;
+    let resumed_task = resume_coordination_after_approval(&state, &session_id)?;
     let result = engine
         .resolve_approval(
             &call_id,
@@ -13282,23 +15551,41 @@ async fn resolve_approval(
         .map(|_| ());
     match result {
         Ok(()) => {
-            emit_approval_decision(&app, &state, &session_id, &call_id, approve);
+            let _ = coordination_ingest_session_inner(&state, &session_id, false).await;
             let calls = approval_artifact_calls(&state, &session_id, &call_id, sequence_before)?;
             record_artifacts_best_effort(&app, &state, &session_id, &host_id, calls).await;
-            let _ = emit_pending_approval(&app, &state, &session_id)?;
-            emit(
-                &app,
-                "turn_done",
-                Some(&session_id),
-                session_status_payload(&state, &session_id),
-            );
+            if let Some(task_id) = resumed_task {
+                emit(
+                    &app,
+                    "coordination_approval_resumed",
+                    Some(&session_id),
+                    json!({"task_id": task_id, "call_id": call_id}),
+                );
+            }
+            emit_approval_resolution_refresh(&app, &state, &session_id, &call_id, approve, None)?;
             Ok(())
         }
         Err(opcos_engine::EngineError::ApprovalPending(next_call_id)) => {
-            emit_approval_decision(&app, &state, &session_id, &call_id, approve);
+            if let Some(task_id) = resumed_task.as_deref() {
+                await_coordination_after_approval(&state, &session_id, task_id)?;
+            }
+            state
+                .store
+                .set_pending_visibility(&session_id, &next_call_id, "inbox")
+                .map_err(|error| error.to_string())?;
             let calls = approval_artifact_calls(&state, &session_id, &call_id, sequence_before)?;
             record_artifacts_best_effort(&app, &state, &session_id, &host_id, calls).await;
-            emit_pending_approval_for(&app, &state, &session_id, Some(&next_call_id))?;
+            if let Some(payload) =
+                coordination_approval_payload(&state, &session_id, &next_call_id)?
+            {
+                audit(
+                    &state,
+                    &session_id,
+                    "coordination_approval_wait",
+                    payload.clone(),
+                );
+                emit(&app, "coordination_approval_pending", None, payload);
+            }
             emit(
                 &app,
                 "turn_done",
@@ -13308,6 +15595,7 @@ async fn resolve_approval(
             Ok(())
         }
         Err(opcos_engine::EngineError::ApprovalAlreadyProcessed(_)) => {
+            let _ = coordination_ingest_session_inner(&state, &session_id, false).await;
             emit_pending_approval(&app, &state, &session_id)?;
             emit(&app, "turn_done", Some(&session_id), json!({}));
             Ok(())
@@ -13429,15 +15717,19 @@ async fn resolve_inbox(
     call_id: String,
     resolution: String,
 ) -> Result<(), String> {
+    reject_removed_opencode_session(&session_for(&state, &session_id)?)?;
     let item = state
         .store
         .get_inbox(&session_id, &call_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "inbox item not found".to_owned())?;
     if item.state == "resolved" || item.state == "expired" {
+        let _ = resume_coordination_after_approval(&state, &session_id)?;
+        let _ = coordination_ingest_session_inner(&state, &session_id, false).await;
         return Ok(());
     }
     let engine = engine_for(&app, &state, &session_id, ToolOrigin::User).await?;
+    let resumed_task = resume_coordination_after_approval(&state, &session_id)?;
     let result = if matches!(item.kind.as_str(), "approval" | "plan") {
         engine
             .resolve_approval(
@@ -13461,6 +15753,7 @@ async fn resolve_inbox(
             let _ = state
                 .store
                 .resolve_inbox(&session_id, &call_id, &resolution);
+            let _ = coordination_ingest_session_inner(&state, &session_id, false).await;
             audit(
                 &state,
                 &session_id,
@@ -13477,12 +15770,52 @@ async fn resolve_inbox(
                 Some(&session_id),
                 json!({"call_id": call_id, "resolution": resolution}),
             );
+            if let Some(task_id) = resumed_task {
+                emit(
+                    &app,
+                    "coordination_approval_resumed",
+                    Some(&session_id),
+                    json!({"task_id": task_id, "call_id": call_id}),
+                );
+            }
             emit(
                 &app,
                 "turn_done",
                 Some(&session_id),
                 session_status_payload(&state, &session_id),
             );
+            Ok(())
+        }
+        Err(opcos_engine::EngineError::ApprovalPending(next_call_id)) => {
+            if let Some(task_id) = resumed_task.as_deref() {
+                await_coordination_after_approval(&state, &session_id, task_id)?;
+            }
+            state
+                .store
+                .set_pending_visibility(&session_id, &next_call_id, "inbox")
+                .map_err(|error| error.to_string())?;
+            if let Some(payload) =
+                coordination_approval_payload(&state, &session_id, &next_call_id)?
+            {
+                audit(
+                    &state,
+                    &session_id,
+                    "coordination_approval_wait",
+                    payload.clone(),
+                );
+                emit(&app, "coordination_approval_pending", None, payload.clone());
+                emit(
+                    &app,
+                    "notice",
+                    Some(&session_id),
+                    json!({
+                        "kind": "approval_pending",
+                        "text": "Approval required; delivered to the Inbox",
+                        "task_id": payload["task_id"],
+                        "call_id": next_call_id,
+                    }),
+                );
+            }
             Ok(())
         }
         Err(error) => Err(engine_error_message(error)),
@@ -13938,6 +16271,14 @@ async fn validate_session_model(
 #[tauri::command]
 fn list_assets(
     state: State<'_, DesktopState>,
+    kind: Option<String>,
+    project_id: Option<String>,
+) -> Result<Vec<Value>, String> {
+    list_assets_for_state(&state, kind, project_id)
+}
+
+fn list_assets_for_state(
+    state: &DesktopState,
     kind: Option<String>,
     project_id: Option<String>,
 ) -> Result<Vec<Value>, String> {
@@ -15078,6 +17419,24 @@ fn save_asset(
     enabled: Option<bool>,
     project_id: Option<String>,
 ) -> Result<(), String> {
+    save_asset_for_state(
+        &state, id, kind, title, body, trigger, scope, scope_kind, enabled, project_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn save_asset_for_state(
+    state: &DesktopState,
+    id: String,
+    kind: String,
+    title: String,
+    body: String,
+    trigger: Option<String>,
+    scope: Option<String>,
+    scope_kind: Option<String>,
+    enabled: Option<bool>,
+    project_id: Option<String>,
+) -> Result<(), String> {
     if !matches!(
         kind.as_str(),
         "instructions"
@@ -15125,6 +17484,7 @@ fn save_asset(
     let transaction = connection
         .unchecked_transaction()
         .map_err(|error| error.to_string())?;
+    asset_mutation_guard(&transaction, &id, "edited")?;
     let object_kind = match kind.as_str() {
         "agents" => "rules",
         "playbook" => "runbook",
@@ -15238,15 +17598,88 @@ fn save_asset(
 
 #[tauri::command]
 fn delete_asset(state: State<'_, DesktopState>, id: String) -> Result<(), String> {
-    state
+    delete_asset_for_state(&state, &id)
+}
+
+fn delete_asset_for_state(state: &DesktopState, id: &str) -> Result<(), String> {
+    let connection = state
         .database
         .lock()
-        .map_err(|_| "database lock poisoned")?
+        .map_err(|_| "database lock poisoned")?;
+    asset_mutation_guard(&connection, id, "deleted")?;
+    let kind: Option<String> = connection
+        .query_row("SELECT kind FROM config_object WHERE id=?1", [id], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(|error| error.to_string())?;
+    connection
         .execute(
             "UPDATE config_object SET status='deleted' WHERE id=?1",
             [id],
         )
         .map_err(|error| error.to_string())?;
+    drop(connection);
+    if kind.as_deref() == Some("mcp") {
+        delete_mcp_credentials(state, id)?;
+    }
+    Ok(())
+}
+
+fn delete_mcp_credentials(state: &DesktopState, server_id: &str) -> Result<(), String> {
+    let name = format!("mcp-credential:{server_id}");
+    let project_ids = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let mut statement = connection
+            .prepare("SELECT project_id FROM secret_records WHERE name=?1 AND project_id<>''")
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map([name.as_str()], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+    state
+        .secrets
+        .delete(&secret_key("mcp-credential", server_id))
+        .map_err(|error| error.to_string())?;
+    for project_id in project_ids {
+        state
+            .secrets
+            .delete(&project_secret_key(
+                &project_id,
+                "mcp-credential",
+                server_id,
+            ))
+            .map_err(|error| error.to_string())?;
+    }
+    state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .execute("DELETE FROM secret_records WHERE name=?1", [name.as_str()])
+        .map_err(|error| error.to_string())?;
+    refresh_secret_values(state)?;
+    Ok(())
+}
+
+fn asset_mutation_guard(connection: &Connection, id: &str, operation: &str) -> Result<(), String> {
+    let status: Option<String> = connection
+        .query_row(
+            "SELECT status FROM config_object WHERE id=?1",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if status.as_deref() == Some("builtin") {
+        return Err(format!(
+            "builtin assets are read-only and cannot be {operation}"
+        ));
+    }
     Ok(())
 }
 
@@ -15299,6 +17732,13 @@ fn set_asset_enabled(
 fn list_asset_versions(
     state: State<'_, DesktopState>,
     asset_id: String,
+) -> Result<Vec<Value>, String> {
+    list_asset_versions_for_state(&state, &asset_id)
+}
+
+fn list_asset_versions_for_state(
+    state: &DesktopState,
+    asset_id: &str,
 ) -> Result<Vec<Value>, String> {
     let connection = state
         .database
@@ -15929,6 +18369,232 @@ async fn mcp_tools(
         tool["enabled"] = Value::Bool(enabled);
     }
     Ok(tools)
+}
+
+#[tauri::command]
+async fn mcp_resources(
+    state: State<'_, DesktopState>,
+    server_id: String,
+    version_id: String,
+) -> Result<Vec<opcos_mcp::McpResource>, String> {
+    state
+        .mcp
+        .cached_resources(&server_id, &version_id)
+        .await
+        .ok_or_else(|| "MCP server is not connected; retry the connection".to_owned())
+}
+
+#[tauri::command]
+async fn mcp_resource_templates(
+    state: State<'_, DesktopState>,
+    server_id: String,
+    version_id: String,
+) -> Result<Vec<opcos_mcp::McpResourceTemplate>, String> {
+    state
+        .mcp
+        .cached_resource_templates(&server_id, &version_id)
+        .await
+        .ok_or_else(|| "MCP server is not connected; retry the connection".to_owned())
+}
+
+#[tauri::command]
+async fn mcp_read_resource(
+    state: State<'_, DesktopState>,
+    server_id: String,
+    uri: String,
+) -> Result<Vec<opcos_mcp::McpResourceContent>, String> {
+    state
+        .mcp
+        .read_resource(&server_id, &uri)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn mcp_subscribe_resource(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    server_id: String,
+    version_id: String,
+    uri: String,
+) -> Result<(), String> {
+    state
+        .mcp
+        .subscribe_resource(&server_id, &version_id, &uri)
+        .await
+        .map_err(|error| error.to_string())?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    connection
+        .execute(
+            "INSERT INTO mcp_session_resources
+             (session_id,server_object_id,config_version_id,uri,mode,enabled)
+             VALUES (?1,?2,?3,?4,'subscribed',1)
+             ON CONFLICT(session_id,server_object_id,config_version_id,uri)
+             DO UPDATE SET mode='subscribed',enabled=1",
+            params![session_id, server_id, version_id, uri],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn mcp_unsubscribe_resource(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    server_id: String,
+    version_id: String,
+    uri: String,
+) -> Result<(), String> {
+    state
+        .mcp
+        .unsubscribe_resource(&server_id, &version_id, &uri)
+        .await
+        .map_err(|error| error.to_string())?;
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    connection
+        .execute(
+            "DELETE FROM mcp_session_resources
+             WHERE session_id=?1 AND server_object_id=?2 AND config_version_id=?3 AND uri=?4",
+            params![session_id, server_id, version_id, uri],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn mcp_attach_resource(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    server_id: String,
+    version_id: String,
+    uri: String,
+) -> Result<(), String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    connection
+        .execute(
+            "INSERT INTO mcp_session_resources
+             (session_id,server_object_id,config_version_id,uri,mode,enabled)
+             VALUES (?1,?2,?3,?4,'context',1)
+             ON CONFLICT(session_id,server_object_id,config_version_id,uri)
+             DO UPDATE SET mode='context',enabled=1",
+            params![session_id, server_id, version_id, uri],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn mcp_context_resources(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let mut statement = connection
+        .prepare(
+            "SELECT server_object_id,config_version_id,uri,mode
+             FROM mcp_session_resources
+             WHERE session_id=?1 AND mode='context' AND enabled=1",
+        )
+        .map_err(|error| error.to_string())?;
+    statement
+        .query_map([session_id], |row| {
+            Ok(serde_json::json!({
+                "server_id": row.get::<_, String>(0)?,
+                "version_id": row.get::<_, String>(1)?,
+                "uri": row.get::<_, String>(2)?,
+                "mode": row.get::<_, String>(3)?,
+            }))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn mcp_detach_resource(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    server_id: String,
+    version_id: String,
+    uri: String,
+) -> Result<(), String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    connection
+        .execute(
+            "DELETE FROM mcp_session_resources
+             WHERE session_id=?1 AND server_object_id=?2
+               AND config_version_id=?3 AND uri=?4 AND mode='context'",
+            params![session_id, server_id, version_id, uri],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn mcp_prompts(
+    state: State<'_, DesktopState>,
+    server_id: String,
+    version_id: String,
+) -> Result<Vec<opcos_mcp::McpPrompt>, String> {
+    state
+        .mcp
+        .cached_prompts(&server_id, &version_id)
+        .await
+        .ok_or_else(|| "MCP server is not connected; retry the connection".to_owned())
+}
+
+#[tauri::command]
+async fn mcp_authorize(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    server_id: String,
+    version_id: String,
+    resource_url: String,
+) -> Result<String, String> {
+    let url = match state
+        .mcp
+        .begin_oauth(&server_id, &version_id, &resource_url)
+        .await
+    {
+        Ok(url) => url,
+        Err(error) => {
+            state.mcp.record_error(&server_id, &error).await;
+            return Err(error.to_string());
+        }
+    };
+    app.opener()
+        .open_url(url.clone(), None::<&str>)
+        .map_err(|_| "could not open the system browser")?;
+    Ok(url)
+}
+
+#[tauri::command]
+async fn mcp_get_prompt(
+    state: State<'_, DesktopState>,
+    server_id: String,
+    name: String,
+    arguments: HashMap<String, String>,
+) -> Result<opcos_mcp::McpPromptResult, String> {
+    state
+        .mcp
+        .get_prompt(&server_id, &name, arguments)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 async fn linear_graphql(
@@ -17079,6 +19745,60 @@ async fn connector_identity(state: &DesktopState, kind: &str) -> Result<Value, S
 
 /// A connector kind is supported when it is in the catalog, or when it is a
 /// `github@<host>` credential bound to a registered Enterprise instance.
+const SUPPORTED_CONNECTOR_KINDS: &[&str] = &[
+    "github",
+    "telegram",
+    "discord",
+    "slack",
+    "notion",
+    "gitlab",
+    "stripe",
+    "asana",
+    "hubspot",
+    "clickup",
+    "pagerduty",
+    "posthog",
+    "apollo.io",
+    "hunter",
+    "close",
+    "attio",
+    "clay",
+    "figma",
+    "descript",
+    "monday.com",
+    "jira",
+    "confluence",
+    "zendesk",
+    "datadog",
+    "mixpanel",
+    "amplitude",
+    "whatsapp",
+    "email (imap)",
+    "gmail",
+    "google calendar",
+    "google drive",
+    "outlook",
+    "salesforce",
+    "quickbooks",
+    "docusign",
+    "canva",
+    "dropbox",
+    "box",
+];
+
+fn connector_credentials_configured(state: &DesktopState, kind: &str) -> Result<bool, String> {
+    Ok(state
+        .secrets
+        .get(&secret_key("connector-config", kind))
+        .map_err(|error| format!("{kind} credentials unavailable: {error}"))?
+        .is_some()
+        || state
+            .secrets
+            .get(&secret_key("connector-token", kind))
+            .map_err(|error| format!("{kind} token unavailable: {error}"))?
+            .is_some())
+}
+
 fn connector_kind_supported(
     store: &SqliteStore,
     supported: &[&str],
@@ -17285,47 +20005,7 @@ async fn connector_save(
 #[tauri::command]
 async fn connector_status(state: State<'_, DesktopState>, kind: String) -> Result<Value, String> {
     let kind = kind.trim().to_ascii_lowercase();
-    const SUPPORTED: &[&str] = &[
-        "github",
-        "telegram",
-        "discord",
-        "slack",
-        "notion",
-        "gitlab",
-        "stripe",
-        "asana",
-        "hubspot",
-        "clickup",
-        "pagerduty",
-        "posthog",
-        "apollo.io",
-        "hunter",
-        "close",
-        "attio",
-        "clay",
-        "figma",
-        "descript",
-        "monday.com",
-        "jira",
-        "confluence",
-        "zendesk",
-        "datadog",
-        "mixpanel",
-        "amplitude",
-        "whatsapp",
-        "email (imap)",
-        "gmail",
-        "google calendar",
-        "google drive",
-        "outlook",
-        "salesforce",
-        "quickbooks",
-        "docusign",
-        "canva",
-        "dropbox",
-        "box",
-    ];
-    connector_kind_supported(&state.store, SUPPORTED, &kind)?;
+    connector_kind_supported(&state.store, SUPPORTED_CONNECTOR_KINDS, &kind)?;
     connector_identity(&state, &kind).await
 }
 
@@ -17894,6 +20574,10 @@ async fn linear_create_session_from_issue(
 
 #[tauri::command]
 async fn list_mcp_servers(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
+    list_mcp_servers_for_state(&state).await
+}
+
+async fn list_mcp_servers_for_state(state: &DesktopState) -> Result<Vec<Value>, String> {
     let snapshots = state
         .mcp
         .statuses()
@@ -17908,7 +20592,7 @@ async fn list_mcp_servers(state: State<'_, DesktopState>) -> Result<Vec<Value>, 
     let mut statement = connection
         .prepare(
             "SELECT o.id,o.name,o.server_key,o.status,o.current_version_id,
-                    v.content
+                    v.content,o.scope_kind
              FROM config_object o
              JOIN config_object_version v ON v.id=o.current_version_id
              WHERE o.kind='mcp' AND o.status <> 'deleted'
@@ -17925,6 +20609,8 @@ async fn list_mcp_servers(state: State<'_, DesktopState>) -> Result<Vec<Value>, 
                 "id": object_id,
                 "name": row.get::<_, String>(1)?,
                 "server_key": row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                "builtin": row.get::<_, String>(3).unwrap_or_default() == "builtin",
+                "scope_kind": row.get::<_, String>(6).unwrap_or_else(|_| "global".into()),
                 "status": snapshot
                     .map(|value| serde_json::to_value(&value.status).unwrap_or(json!("failed")))
                     .unwrap_or_else(|| {
@@ -17936,10 +20622,20 @@ async fn list_mcp_servers(state: State<'_, DesktopState>) -> Result<Vec<Value>, 
                     }),
                 "last_error": snapshot.and_then(|value| value.last_error.clone()),
                 "tool_count": snapshot.map(|value| value.tool_count).unwrap_or_default(),
+                "resource_count": snapshot.map(|value| value.resource_count).unwrap_or_default(),
+                "prompt_count": snapshot.map(|value| value.prompt_count).unwrap_or_default(),
+                "capabilities": snapshot.map(|value| json!(value.capabilities)).unwrap_or_else(|| json!({})),
                 "version_id": row.get::<_, String>(4)?,
                 "transport": content.get("transport").or_else(|| content.get("type")),
                 "url": content.get("url"),
                 "command": content.get("command"),
+                "args": content.get("args"),
+                "env": content.get("env"),
+                "enabled": content.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+                "requires_approval": content
+                    .get("requires_approval")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
             }))
         })
         .map_err(|error| error.to_string())?
@@ -17997,42 +20693,47 @@ async fn retry_mcp_server(
     config["name"] = Value::String(name.clone());
     let parsed: McpServerConfig =
         serde_json::from_value(config).map_err(|error| format!("invalid MCP config: {error}"))?;
+    state.mcp.disconnect(&server_id).await;
     let tools = state
         .mcp
         .connect_with_retry(&parsed, &version_id, 2)
         .await
         .map_err(|error| format!("MCP server retry failed: {error}"))?;
-    let connection = state
-        .database
-        .lock()
-        .map_err(|_| "database lock poisoned")?;
-    let transaction = connection
-        .unchecked_transaction()
-        .map_err(|error| error.to_string())?;
-    transaction
-        .execute(
-            "DELETE FROM mcp_tool_cache WHERE server_object_id=?1 AND config_version_id=?2",
-            params![server_id, version_id],
-        )
-        .map_err(|error| error.to_string())?;
-    for tool in &tools {
+    {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
         transaction
             .execute(
-                "INSERT INTO mcp_tool_cache
-                 (server_object_id,config_version_id,tool_name,description,input_schema_json,discovered_at)
-                 VALUES (?1,?2,?3,?4,?5,?6)",
-                params![
-                    tool.server_id,
-                    version_id,
-                    tool.name,
-                    tool.description,
-                    serde_json::to_string(&tool.input_schema).map_err(|error| error.to_string())?,
-                    Utc::now().to_rfc3339(),
-                ],
+                "DELETE FROM mcp_tool_cache WHERE server_object_id=?1 AND config_version_id=?2",
+                params![server_id, version_id],
             )
             .map_err(|error| error.to_string())?;
+        for tool in &tools {
+            transaction
+                .execute(
+                    "INSERT INTO mcp_tool_cache
+                     (server_object_id,config_version_id,tool_name,description,input_schema_json,discovered_at)
+                     VALUES (?1,?2,?3,?4,?5,?6)",
+                    params![
+                        tool.server_id,
+                        version_id,
+                        tool.name,
+                        tool.description,
+                        serde_json::to_string(&tool.input_schema)
+                            .map_err(|error| error.to_string())?,
+                        Utc::now().to_rfc3339(),
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
     }
-    transaction.commit().map_err(|error| error.to_string())?;
+    refresh_cached_mcp_engines(&state).await;
     Ok(json!({
         "id": parsed.object_id,
         "name": parsed.name,
@@ -18042,7 +20743,7 @@ async fn retry_mcp_server(
 }
 
 #[tauri::command]
-fn set_mcp_tool_enabled(
+async fn set_mcp_tool_enabled(
     state: State<'_, DesktopState>,
     session_id: String,
     name: String,
@@ -18060,6 +20761,10 @@ fn set_mcp_tool_enabled(
             params![session_id, source, name, enabled],
         )
         .map_err(|error| error.to_string())?;
+    let engine = state.engines.lock().await.get(&session_id).cloned();
+    if let Some(engine) = engine {
+        refresh_session_mcp_tools(&state, &session_id, &engine).await?;
+    }
     Ok(())
 }
 
@@ -18117,11 +20822,18 @@ fn list_environment_repositories(
     state: State<'_, DesktopState>,
     project_id: Option<String>,
 ) -> Result<Vec<Value>, String> {
+    list_environment_repositories_for_state(&state, project_id.as_deref())
+}
+
+fn list_environment_repositories_for_state(
+    state: &DesktopState,
+    project_id: Option<&str>,
+) -> Result<Vec<Value>, String> {
     let connection = state
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?;
-    let repositories = load_environment_repositories(&connection, project_id.as_deref())?;
+    let repositories = load_environment_repositories(&connection, project_id)?;
     Ok(repositories
         .into_iter()
         .enumerate()
@@ -19406,6 +22118,555 @@ async fn coordination_start_project(
     }))
 }
 
+async fn ensure_project_worker_session(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    project: &ProjectRecord,
+    leader: &ProjectAgentRecord,
+    role: &str,
+) -> Result<ProjectAgentRecord, String> {
+    let leader_session = leader
+        .session_id
+        .as_deref()
+        .and_then(|session_id| state.store.load_session(session_id).ok().flatten());
+    let leader_model = leader_session
+        .as_ref()
+        .map(|session| session.model.clone())
+        .filter(|model| model != "auto")
+        .unwrap_or_else(|| leader.model.clone());
+    let leader_provider = leader_session
+        .as_ref()
+        .and_then(|session| session.provider.clone())
+        .or_else(|| leader.provider.clone());
+    let mut agent = state
+        .store
+        .load_project_agents(&project.id)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|candidate| candidate.role.eq_ignore_ascii_case(role));
+    if agent.is_none() {
+        agent = Some(
+            create_project_agent_inner(
+                state,
+                project.id.clone(),
+                None,
+                role.to_owned(),
+                role.to_owned(),
+                None,
+                leader_provider.clone(),
+                Some(leader_model.clone()),
+                Some("builtin".into()),
+                Some("Auto".into()),
+                Some(format!(
+                    "You are the {role} Worker. Execute only the assigned coordination task, \
+                     report concrete results and blockers to the Lead, and do not ask how work \
+                     should be routed."
+                )),
+                None,
+            )
+            .await?,
+        );
+    }
+    let mut agent = agent.expect("worker agent created");
+    if !agent.harness.eq_ignore_ascii_case("builtin") {
+        return Err(format!(
+            "{role} worker uses unsupported {} harness",
+            agent.harness
+        ));
+    }
+    if agent.model == "auto" {
+        agent.model = leader_model;
+    }
+    if agent.provider.is_none() {
+        agent.provider = leader_provider;
+    }
+    agent.updated_at = Utc::now();
+    state
+        .store
+        .save_project_agent(&agent)
+        .map_err(|error| error.to_string())?;
+    let session_id = if let Some(session_id) = agent.session_id.clone() {
+        session_id
+    } else {
+        let session_id = format!(
+            "session-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let now = Utc::now();
+        save_session_via_factory(
+            state,
+            SessionRecord {
+                session_id: session_id.clone(),
+                workspace: agent.worktree_path.clone(),
+                model: if agent.model == "auto" {
+                    leader.model.clone()
+                } else {
+                    agent.model.clone()
+                },
+                mode: permission_mode_name(parse_permission_mode(&agent.mode)?).to_owned(),
+                harness: "builtin".into(),
+                title: format!("{role} Worker"),
+                extra_roots: vec![],
+                grants: json!({}),
+                pinned: false,
+                archived: false,
+                origin: None,
+                origin_label: None,
+                compaction: json!({}),
+                host_id: project.host_id.clone(),
+                provider: agent.provider.clone().or_else(|| leader.provider.clone()),
+                external_session_id: None,
+                run_state: "idle".into(),
+                stop_reason: "none".into(),
+                created_at: now,
+                updated_at: now,
+                project_id: Some(project.id.clone()),
+                agent_id: Some(agent.id.clone()),
+            },
+            false,
+        )?;
+        state
+            .store
+            .update_project_agent_session(&agent.id, Some(&session_id))
+            .map_err(|error| error.to_string())?;
+        agent.session_id = Some(session_id.clone());
+        session_id
+    };
+    if let Some(mut worker_session) = state
+        .store
+        .load_session(&session_id)
+        .map_err(|error| error.to_string())?
+    {
+        worker_session.model = agent.model.clone();
+        worker_session.provider = agent.provider.clone();
+        worker_session.updated_at = Utc::now();
+        state
+            .store
+            .save_session(&worker_session)
+            .map_err(|error| error.to_string())?;
+    }
+    engine_for(app, state, &session_id, ToolOrigin::User).await?;
+    Ok(agent)
+}
+
+async fn ensure_project_coordination(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    project_id: &str,
+    leader_session_id: &str,
+) -> Result<Value, String> {
+    let project = state
+        .store
+        .load_project(project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    let leader = state
+        .store
+        .load_project_agent_by_session(leader_session_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project Lead session is not bound to a project role".to_owned())?;
+    if leader.sort_order != 0 || !leader.role.eq_ignore_ascii_case("lead") {
+        return Err("project session is not the Lead".into());
+    }
+    let mut roles = vec![Role {
+        project_id: project_id.into(),
+        id: leader.id.clone(),
+        sort_order: leader.sort_order,
+        session_id: leader_session_id.into(),
+        state: RoleState::Active,
+    }];
+    let mut unavailable = Vec::new();
+    for (sort_order, role) in ["Code", "Review"].into_iter().enumerate() {
+        match ensure_project_worker_session(app, state, &project, &leader, role).await {
+            Ok(agent) => roles.push(Role {
+                project_id: project_id.into(),
+                id: agent.id,
+                sort_order: (sort_order + 1) as u32,
+                session_id: agent.session_id.unwrap_or_default(),
+                state: RoleState::Active,
+            }),
+            Err(reason) => unavailable.push(json!({"role": role, "reason": reason})),
+        }
+    }
+    let task_id = format!("project-board:{project_id}");
+    let mut runtimes = state.coordination.lock().await;
+    if !runtimes.contains_key(&task_id) {
+        let runtime = CoordinationRuntime::new(roles).map_err(|error| error.to_string())?;
+        let persisted = {
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            load_persisted_coord_messages(&connection, &task_id)?
+        };
+        let mut runtime = runtime;
+        runtime
+            .restore_messages(persisted)
+            .map_err(|error| format!("stored coordination history is invalid: {error}"))?;
+        runtimes.insert(task_id.clone(), runtime);
+    }
+    drop(runtimes);
+    Ok(json!({
+        "project_id": project_id,
+        "task_id": task_id,
+        "unavailable_workers": unavailable,
+        "started": true
+    }))
+}
+
+fn worker_role_for_plan_step(step: &opcos_store::PlanStepRecord) -> &'static str {
+    let description = step.description.to_ascii_lowercase();
+    if description.trim_start().starts_with("review")
+        || description.trim_start().starts_with("audit")
+    {
+        "Review"
+    } else {
+        "Code"
+    }
+}
+
+fn step_has_routing_audit(
+    state: &DesktopState,
+    session_id: &str,
+    step_id: &str,
+) -> Result<bool, String> {
+    let events = state
+        .store
+        .load_audit(Some(session_id))
+        .map_err(|error| error.to_string())?;
+    Ok(events.iter().any(|event| {
+        matches!(
+            event.kind.as_str(),
+            "coordination_auto_dispatch" | "coordination_local_execution"
+        ) && event.payload["step_id"].as_str() == Some(step_id)
+    }))
+}
+
+async fn record_unrouted_completed_plan_steps(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    leader_session_id: &str,
+    plan_before_turn: Option<&opcos_store::PlanRecord>,
+) -> Result<(), String> {
+    let Some(plan_before_turn) = plan_before_turn else {
+        return Ok(());
+    };
+    let before = plan_before_turn
+        .steps
+        .iter()
+        .filter(|step| step.status == "not_started")
+        .map(|step| step.step_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    if before.is_empty() {
+        return Ok(());
+    }
+    let Some(plan_after_turn) = state
+        .store
+        .load_plan(leader_session_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(());
+    };
+    for step in plan_after_turn
+        .steps
+        .into_iter()
+        .filter(|step| before.contains(step.step_id.as_str()) && step.status == "done")
+    {
+        if step_has_routing_audit(state, leader_session_id, &step.step_id)? {
+            continue;
+        }
+        let payload = json!({
+            "step_id": step.step_id,
+            "description": step.description,
+            "reason": "Lead completed the plan step before autonomous dispatch recorded a worker route",
+            "execution": "lead_local",
+        });
+        audit(
+            state,
+            leader_session_id,
+            "coordination_local_execution",
+            payload.clone(),
+        );
+        emit(
+            app,
+            "coordination_local_execution",
+            Some(leader_session_id),
+            payload,
+        );
+    }
+    Ok(())
+}
+
+async fn record_local_plan_execution(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    leader_session_id: &str,
+    step: &opcos_store::PlanStepRecord,
+    reason: &str,
+) -> Result<(), String> {
+    let payload = json!({
+        "step_id": step.step_id,
+        "description": step.description,
+        "reason": reason,
+        "execution": "lead_local",
+    });
+    audit(
+        state,
+        leader_session_id,
+        "coordination_local_execution",
+        payload.clone(),
+    );
+    emit(
+        app,
+        "coordination_local_execution",
+        Some(leader_session_id),
+        payload,
+    );
+    state
+        .store
+        .update_plan_step(
+            leader_session_id,
+            &step.step_id,
+            Some("in_progress"),
+            None,
+            Some(reason),
+        )
+        .map_err(|error| error.to_string())?;
+    let engine = engine_for(app, state, leader_session_id, ToolOrigin::System).await?;
+    let prompt = format!(
+        "Execute this plan step locally as the Lead because worker dispatch was unavailable: \
+         {}. Do not ask the user how to route it; perform the step and verify the result.",
+        step.description
+    );
+    let run_state = state
+        .store
+        .load_session(leader_session_id)
+        .map_err(|error| error.to_string())?
+        .map(|session| session.run_state);
+    if run_state.as_deref() == Some("running") {
+        engine
+            .queue_steering(prompt)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    } else {
+        engine
+            .submit_text(prompt)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+async fn auto_route_project_plan(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    leader_session_id: &str,
+) -> Result<(), String> {
+    let Some(session) = state
+        .store
+        .load_session(leader_session_id)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    let Some(project_id) = session.project_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(plan) = state
+        .store
+        .load_plan(leader_session_id)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    let setup = ensure_project_coordination(app, state, project_id, leader_session_id).await?;
+    let unavailable = setup
+        .get("unavailable_workers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let serial = state
+        .store
+        .load_project(project_id)
+        .ok()
+        .flatten()
+        .and_then(|project| serde_json::from_str::<Value>(&project.workflow_json).ok())
+        .and_then(|workflow| workflow.get("serial").and_then(Value::as_bool))
+        .unwrap_or(true);
+    let steps = plan
+        .steps
+        .into_iter()
+        .filter(|step| step.status == "not_started");
+    for step in if serial {
+        steps.take(1).collect::<Vec<_>>()
+    } else {
+        steps.collect::<Vec<_>>()
+    } {
+        if step_has_routing_audit(state, leader_session_id, &step.step_id)? {
+            continue;
+        }
+        let role_name = worker_role_for_plan_step(&step);
+        let worker = state
+            .store
+            .load_project_agents(project_id)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|agent| agent.role.eq_ignore_ascii_case(role_name));
+        let Some(worker) = worker.filter(|agent| {
+            agent.session_id.is_some() && agent.harness.eq_ignore_ascii_case("builtin")
+        }) else {
+            let reason = unavailable
+                .iter()
+                .find(|item| item["role"].as_str() == Some(role_name))
+                .and_then(|item| item["reason"].as_str())
+                .unwrap_or("worker session is unavailable");
+            record_local_plan_execution(app, state, leader_session_id, &step, reason).await?;
+            continue;
+        };
+        let task_id = format!("plan-step:{}", step.step_id);
+        let existing = {
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            connection
+                .query_row("SELECT 1 FROM coord_tasks WHERE id=?1", [&task_id], |_| {
+                    Ok(true)
+                })
+                .optional()
+                .map_err(|error| error.to_string())?
+                .unwrap_or(false)
+        };
+        if existing {
+            continue;
+        }
+        state
+            .store
+            .update_plan_step(
+                leader_session_id,
+                &step.step_id,
+                Some("in_progress"),
+                None,
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+        {
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            save_coord_task(
+                &connection,
+                &BoardTask {
+                    project_id: project_id.into(),
+                    id: task_id.clone(),
+                    title: step.description.clone(),
+                    phase: BoardPhase::Claimed,
+                    assignee: Some(worker.id.clone()),
+                    lease_generation: 1,
+                    lease_until: Some(Utc::now() + ChronoDuration::hours(24)),
+                    require_acceptance: true,
+                    verified_pr_url: None,
+                    branch: Some(worker.branch.clone()),
+                    pr: None,
+                    dispatch_count: 0,
+                    dispatch_limit: 8,
+                },
+            )?;
+        }
+        {
+            let agents = state
+                .store
+                .load_project_agents(project_id)
+                .map_err(|e| e.to_string())?;
+            let roles = agents
+                .into_iter()
+                .filter_map(|agent| {
+                    Some(Role {
+                        project_id: project_id.into(),
+                        id: agent.id,
+                        sort_order: agent.sort_order,
+                        session_id: agent.session_id?,
+                        state: RoleState::Active,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let runtime = CoordinationRuntime::new(roles).map_err(|e| e.to_string())?;
+            let mut runtimes = state.coordination.lock().await;
+            runtimes.entry(task_id.clone()).or_insert(runtime);
+        }
+        let message = format!(
+            "Execute assigned plan step {} (coordination task {}): {}. Work only in your assigned \
+             workspace. When finished, send the Lead a coordination envelope with taskId exactly \
+             '{}', kind='result', and a concrete report of the work and verification; do not \
+             substitute a prose report for the envelope.",
+            step.step_id, task_id, step.description, task_id
+        );
+        let worker_session = worker
+            .session_id
+            .as_deref()
+            .ok_or_else(|| "coordination target Worker session is not started".to_owned())?;
+        engine_for(app, state, worker_session, ToolOrigin::User).await?;
+        let result = execute_coordination_tool(
+            &state.store,
+            &state.database,
+            &state.engines,
+            &state.coordination,
+            leader_session_id,
+            "coordination_dispatch",
+            &json!({
+                "task_id": task_id,
+                "worker_role_id": worker.id,
+                "message": message,
+            }),
+        )
+        .await;
+        match result {
+            Ok(dispatch) => {
+                audit(
+                    state,
+                    leader_session_id,
+                    "coordination_auto_dispatch",
+                    json!({"step_id": step.step_id, "worker_role": role_name, "dispatch": dispatch}),
+                );
+                let engine = engine_for(app, state, worker_session, ToolOrigin::User).await?;
+                match submit_engine_turn_with_coordination_ingest(
+                    &engine,
+                    state,
+                    worker_session,
+                    message,
+                    Vec::new(),
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(EngineError::ApprovalPending(call_id)) => {
+                        mark_worker_approval_pending(
+                            app,
+                            state,
+                            &task_id,
+                            &worker.id,
+                            worker_session,
+                            leader_session_id,
+                            &call_id,
+                        )
+                        .await?;
+                    }
+                    Err(error) => return Err(engine_error_message(error)),
+                }
+            }
+            Err(reason) => {
+                return Err(format!(
+                    "automatic dispatch failed for plan step {}: {reason}",
+                    step.step_id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn coordination_message(
     state: State<'_, DesktopState>,
@@ -19435,7 +22696,7 @@ async fn coordination_message(
         }
     };
     let project_id = connection_project_for_task(&state, &task_id)?;
-    persist_coord_message(&state, &project_id, &task_id, &envelope)?;
+    persist_coord_message(&state, &project_id, &task_id, &envelope).await?;
     if let Some(worker_session) = worker_session {
         let engine = state
             .engines
@@ -19526,7 +22787,7 @@ async fn execute_coordination_tool(
         }
         if !worker.harness.eq_ignore_ascii_case("builtin") {
             return Err(
-                "coordination dispatch unavailable: only builtin TurnEngine Worker sessions are supported; ACP/OpenCode sessions are not bridged"
+                "coordination dispatch unavailable: only builtin TurnEngine Worker sessions are supported; ACP sessions are not bridged"
                     .to_owned(),
             );
         }
@@ -19652,11 +22913,12 @@ async fn execute_coordination_tool(
         let messages = statement
             .query_map(params![task_id, limit as i64], |row| {
                 let payload: String = row.get(4)?;
+                let kind: String = row.get(3)?;
                 Ok(json!({
                     "msg_id": row.get::<_, String>(0)?,
                     "from": row.get::<_, String>(1)?,
                     "to": row.get::<_, String>(2)?,
-                    "kind": row.get::<_, String>(3)?,
+                    "kind": normalize_coordination_kind(&kind),
                     "payload": serde_json::from_str::<Value>(&payload).unwrap_or(Value::Null),
                     "created_at": row.get::<_, String>(5)?
                 }))
@@ -19709,7 +22971,7 @@ async fn execute_coordination_tool(
             "total_messages": total_messages,
             "omitted_messages": total_messages.saturating_sub(messages.len()),
             "truncated": total_messages > messages.len(),
-            "completion_note": "Worker self-reports never establish completion; branch, push, PR, and GitHub API verification are required"
+            "completion_note": "Worker self-reports never establish completion; forge-backed tasks require branch, push, PR, and GitHub API checks, while local-only tasks require a local branch, clean worktree, and result envelope"
         }));
     }
     Err(format!("unsupported coordination tool: {name}"))
@@ -19728,34 +22990,66 @@ fn connection_project_for_task(state: &DesktopState, task_id: &str) -> Result<St
         .map_err(|error| error.to_string())
 }
 
-fn persist_coord_message(
+async fn persist_coord_message(
     state: &DesktopState,
     project_id: &str,
     task_id: &str,
     envelope: &Envelope,
 ) -> Result<(), String> {
-    state
-        .database
-        .lock()
-        .map_err(|_| "database lock poisoned")?
-        .execute(
-            "INSERT INTO coord_messages
-             (project_id,task_id,msg_id,from_role,to_role,kind,reply_to,payload,created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            params![
-                project_id,
-                task_id,
-                envelope.msg_id,
-                envelope.from,
-                envelope.to,
-                serde_json::to_string(&envelope.kind).map_err(|error| error.to_string())?,
-                envelope.reply_to,
-                envelope.payload.to_string(),
-                Utc::now().to_rfc3339(),
-            ],
-        )
-        .map_err(|error| error.to_string())?;
+    {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        if connection
+            .query_row(
+                "SELECT 1 FROM coord_messages WHERE msg_id=?1 LIMIT 1",
+                params![envelope.msg_id],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Ok(());
+        }
+        connection
+            .execute(
+                "INSERT INTO coord_messages
+                 (project_id,task_id,msg_id,from_role,to_role,kind,reply_to,payload,created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    project_id,
+                    task_id,
+                    envelope.msg_id,
+                    envelope.from,
+                    envelope.to,
+                    serde_json::to_value(&envelope.kind)
+                        .map_err(|error| error.to_string())?
+                        .as_str()
+                        .ok_or_else(|| "invalid coordination envelope kind".to_owned())?,
+                    envelope.reply_to,
+                    envelope.payload.to_string(),
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    if envelope.kind == opcos_engine::orchestration::EnvelopeKind::Result {
+        coordination_complete_task_inner(state, task_id, &envelope.from, None).await?;
+    }
     Ok(())
+}
+
+fn normalize_coordination_kind(kind: &str) -> &str {
+    kind.trim_matches('"')
+}
+
+fn automatic_project_routing_active(store: &SqliteStore, session_id: &str) -> Result<bool, String> {
+    Ok(store
+        .load_project_agent_by_session(session_id)
+        .map_err(|error| error.to_string())?
+        .is_some_and(|agent| agent.sort_order == 0 && agent.role.eq_ignore_ascii_case("lead")))
 }
 
 fn load_persisted_coord_messages(
@@ -19771,6 +23065,7 @@ fn load_persisted_coord_messages(
     let rows = statement
         .query_map([task_id], |row| {
             let kind: String = row.get(3)?;
+            let kind = normalize_coordination_kind(&kind);
             let payload: String = row.get(6)?;
             let created_at: String = row.get(7)?;
             Ok((
@@ -19984,12 +23279,13 @@ fn load_project_messages(connection: &Connection, project_id: &str) -> Result<Ve
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map([project_id], |row| {
+            let kind: String = row.get(4)?;
             Ok(json!({
                 "task_id": row.get::<_, String>(0)?,
                 "msg_id": row.get::<_, String>(1)?,
                 "from": row.get::<_, String>(2)?,
                 "to": row.get::<_, String>(3)?,
-                "kind": row.get::<_, String>(4)?,
+                "kind": normalize_coordination_kind(&kind),
                 "reply_to": row.get::<_, Option<String>>(5)?,
                 "payload": serde_json::from_str::<Value>(&row.get::<_, String>(6)?).unwrap_or(Value::Null),
                 "created_at": row.get::<_, String>(7)?
@@ -20115,7 +23411,8 @@ async fn coordination_ingest_session_inner(
             }));
             continue;
         }
-        if let Err(error) = persist_coord_message(state, &project_id, &envelope.task_id, &envelope)
+        if let Err(error) =
+            persist_coord_message(state, &project_id, &envelope.task_id, &envelope).await
         {
             rejected.push(json!({"msgId": envelope.msg_id, "reason": error}));
         } else {
@@ -20303,6 +23600,189 @@ fn save_coord_task(connection: &Connection, task: &BoardTask) -> Result<(), Stri
     Ok(())
 }
 
+async fn mark_worker_approval_pending(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    task_id: &str,
+    worker_id: &str,
+    worker_session: &str,
+    leader_session: &str,
+    call_id: &str,
+) -> Result<(), String> {
+    {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let mut task = load_coord_task(&connection, task_id)?;
+        task.await_approval(worker_id)
+            .map_err(|error| error.to_string())?;
+        save_coord_task(&connection, &task)?;
+    }
+    state
+        .store
+        .set_pending_visibility(worker_session, call_id, "inbox")
+        .map_err(|error| error.to_string())?;
+    let payload = json!({
+        "task_id": task_id,
+        "worker_id": worker_id,
+        "worker_session_id": worker_session,
+        "call_id": call_id,
+        "phase": "AwaitingApproval",
+    });
+    audit(
+        state,
+        worker_session,
+        "coordination_approval_wait",
+        payload.clone(),
+    );
+    audit(
+        state,
+        leader_session,
+        "coordination_approval_wait",
+        payload.clone(),
+    );
+    emit(
+        app,
+        "coordination_approval_pending",
+        Some(leader_session),
+        payload.clone(),
+    );
+    emit(
+        app,
+        "notice",
+        Some(leader_session),
+        json!({
+            "kind": "coordination_approval_pending",
+            "text": "A dispatched Worker needs approval; open the Inbox to continue.",
+            "task_id": task_id,
+            "worker_session_id": worker_session,
+            "call_id": call_id,
+        }),
+    );
+    emit(
+        app,
+        "notice",
+        Some(worker_session),
+        json!({
+            "kind": "approval_pending",
+            "text": "Approval required; delivered to the Inbox",
+            "task_id": task_id,
+            "call_id": call_id,
+        }),
+    );
+    Ok(())
+}
+
+fn resume_coordination_after_approval(
+    state: &DesktopState,
+    session_id: &str,
+) -> Result<Option<String>, String> {
+    let Some(agent) = state
+        .store
+        .load_project_agent_by_session(session_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let task_id = connection
+        .query_row(
+            "SELECT id FROM coord_tasks
+             WHERE assignee=?1 AND phase='AwaitingApproval'
+             ORDER BY id LIMIT 1",
+            [&agent.id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some(task_id) = task_id else {
+        return Ok(None);
+    };
+    let mut task = load_coord_task(&connection, &task_id)?;
+    task.resume_after_approval(&agent.id, Utc::now())
+        .map_err(|error| error.to_string())?;
+    save_coord_task(&connection, &task)?;
+    drop(connection);
+    audit(
+        state,
+        session_id,
+        "coordination_approval_resumed",
+        json!({"task_id": task_id, "worker_id": agent.id, "phase": "Claimed"}),
+    );
+    Ok(Some(task_id))
+}
+
+fn await_coordination_after_approval(
+    state: &DesktopState,
+    session_id: &str,
+    task_id: &str,
+) -> Result<(), String> {
+    let Some(agent) = state
+        .store
+        .load_project_agent_by_session(session_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(());
+    };
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let mut task = load_coord_task(&connection, task_id)?;
+    task.await_approval(&agent.id)
+        .map_err(|error| error.to_string())?;
+    save_coord_task(&connection, &task)?;
+    drop(connection);
+    audit(
+        state,
+        session_id,
+        "coordination_approval_wait",
+        json!({"task_id": task_id, "worker_id": agent.id, "phase": "AwaitingApproval"}),
+    );
+    Ok(())
+}
+
+fn coordination_approval_payload(
+    state: &DesktopState,
+    session_id: &str,
+    call_id: &str,
+) -> Result<Option<Value>, String> {
+    let Some(agent) = state
+        .store
+        .load_project_agent_by_session(session_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let task_id = connection
+        .query_row(
+            "SELECT id FROM coord_tasks
+             WHERE assignee=?1 AND phase='AwaitingApproval'
+             ORDER BY id LIMIT 1",
+            [&agent.id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    Ok(task_id.map(|task_id| {
+        json!({
+            "task_id": task_id,
+            "worker_id": agent.id,
+            "worker_session_id": session_id,
+            "call_id": call_id,
+            "phase": "AwaitingApproval",
+        })
+    }))
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 fn coordination_create_task(
@@ -20388,12 +23868,28 @@ async fn coordination_complete_task(
     worker: String,
     verified_pr_url: Option<String>,
 ) -> Result<Value, String> {
+    coordination_complete_task_inner(&state, &id, &worker, verified_pr_url.as_deref()).await
+}
+
+async fn coordination_complete_task_inner(
+    state: &DesktopState,
+    id: &str,
+    worker: &str,
+    verified_pr_url: Option<&str>,
+) -> Result<Value, String> {
     let (initial_task, project) = {
         let connection = state
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?;
-        let task = load_coord_task(&connection, &id)?;
+        let task = load_coord_task(&connection, id)?;
+        if matches!(
+            task.phase,
+            opcos_engine::orchestration::BoardPhase::Done
+                | opcos_engine::orchestration::BoardPhase::AwaitingAcceptance
+        ) {
+            return serde_json::to_value(task).map_err(|error| error.to_string());
+        }
         let project = if task.project_id.is_empty() {
             None
         } else {
@@ -20407,30 +23903,135 @@ async fn coordination_complete_task(
         };
         (task, project)
     };
-    if let Some(project) = project.as_ref() {
-        verify_task_delivery(&state, project, &initial_task, verified_pr_url.as_deref()).await?;
-    }
+    let forge_backed = if let Some(project) = project.as_ref() {
+        Some(verify_task_delivery(state, project, &initial_task, verified_pr_url).await?)
+    } else {
+        None
+    };
     let connection = state
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?;
-    let mut task = load_coord_task(&connection, &id)?;
-    task.complete(&worker, Utc::now(), verified_pr_url)
+    let mut task = load_coord_task(&connection, id)?;
+    if forge_backed == Some(false) {
+        task.require_acceptance = false;
+    }
+    task.complete(worker, Utc::now(), verified_pr_url.map(str::to_owned))
         .map_err(|error| error.to_string())?;
     save_coord_task(&connection, &task)?;
     serde_json::to_value(task).map_err(|error| error.to_string())
 }
 
 async fn verify_task_delivery(
-    state: &State<'_, DesktopState>,
+    state: &DesktopState,
     project: &ProjectRecord,
     task: &BoardTask,
     verified_pr_url: Option<&str>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let branch = task
         .branch
         .as_deref()
         .ok_or_else(|| "completion requires a branch".to_owned())?;
+    let host = project_host_inner(state, project).await?;
+    let platform = host.health().await.ok().and_then(|health| health.platform);
+    let remote_result = host
+        .exec(ExecRequest {
+            command: format!(
+                "git -C {} remote",
+                quote_for(platform.as_deref(), &project.repo_root)
+            ),
+            cwd: None,
+            timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+            session: None,
+            env: None,
+        })
+        .await
+        .map_err(|error| format!("completion remote inspection failed: {error}"))?;
+    if remote_result.result.exit_code != 0 {
+        return Err("completion remote inspection failed".to_owned());
+    }
+    let forge_backed =
+        !project.repo_url.trim().is_empty() || !remote_result.result.stdout.trim().is_empty();
+    if !forge_backed {
+        let worker = state
+            .store
+            .load_project_agents(&project.id)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|agent| agent.branch == branch)
+            .ok_or_else(|| {
+                "local completion requires a registered Worker for the task branch".to_owned()
+            })?;
+        {
+            let runtimes = state.coordination.lock().await;
+            let runtime = runtimes.get(&task.id).ok_or_else(|| {
+                "local completion requires a started coordination runtime".to_owned()
+            })?;
+            let role = runtime.role(&worker.id).ok_or_else(|| {
+                "local completion requires the task runtime to include the Worker role".to_owned()
+            })?;
+            if role.session_id != worker.session_id.clone().unwrap_or_default() {
+                return Err(
+                    "local completion requires the task runtime Worker session to match".to_owned(),
+                );
+            }
+        }
+        let result_message = {
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            connection
+                .query_row(
+                    r#"SELECT 1 FROM coord_messages
+                     WHERE task_id=?1 AND kind IN ('result','"result"') AND from_role=?2
+                     LIMIT 1"#,
+                    params![task.id.as_str(), worker.id.as_str()],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .unwrap_or(false)
+        };
+        if !result_message {
+            return Err(
+                "local completion requires a Worker result coordination envelope".to_owned(),
+            );
+        }
+        let worker_workspace = worker.worktree_path;
+        let commands = [
+            format!(
+                "git -C {} rev-parse --verify refs/heads/{}",
+                quote_for(platform.as_deref(), &worker_workspace),
+                quote_for(platform.as_deref(), branch)
+            ),
+            format!(
+                "git -C {} status --porcelain",
+                quote_for(platform.as_deref(), &worker_workspace)
+            ),
+        ];
+        for (index, command) in commands.into_iter().enumerate() {
+            let result = host
+                .exec(ExecRequest {
+                    command,
+                    cwd: None,
+                    timeout_seconds: LIFECYCLE_EXEC_TIMEOUT_SECONDS,
+                    session: None,
+                    env: None,
+                })
+                .await
+                .map_err(|error| format!("local completion verification failed: {error}"))?;
+            if result.result.exit_code != 0
+                || (index == 1 && !result.result.stdout.trim().is_empty())
+            {
+                return Err(
+                    "local completion verification failed: branch is missing or worktree is dirty"
+                        .into(),
+                );
+            }
+        }
+        return Ok(false);
+    }
     let pr_url = verified_pr_url
         .or(task.verified_pr_url.as_deref())
         .or(task.pr.as_deref())
@@ -20442,8 +24043,6 @@ async fn verify_task_delivery(
         return Err("pull request repository does not match the project repository".into());
     }
     let pr_repo = pr_target.repo.clone();
-    let host = project_host(state, project).await?;
-    let platform = host.health().await.ok().and_then(|health| health.platform);
     for command in [
         format!(
             "git -C {} rev-parse --verify refs/heads/{}",
@@ -20521,7 +24120,7 @@ async fn verify_task_delivery(
     {
         return Err("completion verification failed: pull request is closed without merge".into());
     }
-    Ok(())
+    Ok(true)
 }
 
 #[tauri::command]
@@ -20538,6 +24137,10 @@ fn coordination_accept_task(state: State<'_, DesktopState>, id: String) -> Resul
 
 #[tauri::command]
 fn save_schedule(state: State<'_, DesktopState>, schedule: ScheduleInput) -> Result<Value, String> {
+    save_schedule_for_state(&state, schedule)
+}
+
+fn save_schedule_for_state(state: &DesktopState, schedule: ScheduleInput) -> Result<Value, String> {
     let id = schedule.id.unwrap_or_else(|| {
         format!(
             "schedule-{}",
@@ -20642,6 +24245,10 @@ fn save_schedule(state: State<'_, DesktopState>, schedule: ScheduleInput) -> Res
 
 #[tauri::command]
 fn list_schedules(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
+    list_schedules_for_state(&state)
+}
+
+fn list_schedules_for_state(state: &DesktopState) -> Result<Vec<Value>, String> {
     let connection = state
         .database
         .lock()
@@ -21322,9 +24929,16 @@ fn external_ingress_sources(
     state: State<'_, DesktopState>,
     enabled_only: Option<bool>,
 ) -> Result<Vec<Value>, String> {
+    external_ingress_sources_for_state(&state, enabled_only.unwrap_or(false))
+}
+
+fn external_ingress_sources_for_state(
+    state: &DesktopState,
+    enabled_only: bool,
+) -> Result<Vec<Value>, String> {
     state
         .store
-        .load_external_ingress_sources(enabled_only.unwrap_or(false))
+        .load_external_ingress_sources(enabled_only)
         .and_then(|sources| {
             sources
                 .into_iter()
@@ -21622,6 +25236,10 @@ fn set_runner_settings(
 
 #[tauri::command]
 fn event_rules(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
+    event_rules_for_state(&state)
+}
+
+fn event_rules_for_state(state: &DesktopState) -> Result<Vec<Value>, String> {
     state
         .store
         .load_event_rules(false)
@@ -22599,6 +26217,20 @@ async fn validate_provider_key(
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("mcp-serve") {
+        if let Err(error) = run_mcp_bridge() {
+            eprintln!("MCP bridge unavailable: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("acp-serve") {
+        if let Err(error) = run_acp_bridge() {
+            eprintln!("ACP bridge unavailable: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
@@ -22644,6 +26276,51 @@ fn main() {
                 store: secrets.clone(),
                 project_id: None,
             })));
+            let engines = Arc::new(AsyncMutex::new(HashMap::<String, Arc<GuiEngine>>::new()));
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::block_on(configure_mcp_notification_sink(&mcp, &app_handle));
+            let mcp_state_path = mcp_state_path().map_err(|error| {
+                let cause: Box<dyn std::error::Error> = Box::new(std::io::Error::other(error));
+                tauri::Error::Setup(cause.into())
+            })?;
+            let mcp_token = load_or_create_mcp_token(&mcp_state_path).map_err(|error| {
+                let cause: Box<dyn std::error::Error> = Box::new(std::io::Error::other(error));
+                tauri::Error::Setup(cause.into())
+            })?;
+            let mcp_listener =
+                std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(tauri::Error::from)?;
+            mcp_listener
+                .set_nonblocking(true)
+                .map_err(tauri::Error::from)?;
+            let mcp_port = mcp_listener
+                .local_addr()
+                .map_err(tauri::Error::from)?
+                .port();
+            write_mcp_state(&mcp_state_path, mcp_port, &mcp_token).map_err(|error| {
+                let cause: Box<dyn std::error::Error> = Box::new(std::io::Error::other(error));
+                tauri::Error::Setup(cause.into())
+            })?;
+            let acp_state_path = acp_state_path().map_err(|error| {
+                let cause: Box<dyn std::error::Error> = Box::new(std::io::Error::other(error));
+                tauri::Error::Setup(cause.into())
+            })?;
+            let acp_token = load_or_create_mcp_token(&acp_state_path).map_err(|error| {
+                let cause: Box<dyn std::error::Error> = Box::new(std::io::Error::other(error));
+                tauri::Error::Setup(cause.into())
+            })?;
+            let acp_listener =
+                std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(tauri::Error::from)?;
+            acp_listener
+                .set_nonblocking(true)
+                .map_err(tauri::Error::from)?;
+            let acp_port = acp_listener
+                .local_addr()
+                .map_err(tauri::Error::from)?
+                .port();
+            write_acp_state(&acp_state_path, acp_port, &acp_token).map_err(|error| {
+                let cause: Box<dyn std::error::Error> = Box::new(std::io::Error::other(error));
+                tauri::Error::Setup(cause.into())
+            })?;
             let mut jobs_path = path.clone();
             jobs_path.set_file_name("background-jobs");
             let mut trigger_token_bytes = [0_u8; 32];
@@ -22680,7 +26357,6 @@ fn main() {
                 Arc::clone(&secret_values),
             ));
             let local_browser = browser::shared_local_browser(None);
-            let engines = Arc::new(AsyncMutex::new(HashMap::new()));
             let coordination = Arc::new(AsyncMutex::new(HashMap::new()));
             let (ingress_shutdown, ingress_receiver) = tokio::sync::watch::channel(false);
             let ingress_task =
@@ -22698,10 +26374,9 @@ fn main() {
                 secret_values,
                 store,
                 engines: Arc::clone(&engines),
-                opencode_engines: AsyncMutex::new(HashMap::new()),
-                opencode_event_sessions: AsyncMutex::new(HashSet::new()),
                 acp_engines: AsyncMutex::new(HashMap::new()),
                 acp_event_sessions: AsyncMutex::new(HashSet::new()),
+                acp_streams: Mutex::new(HashMap::new()),
                 trigger_runs: AsyncMutex::new(HashSet::new()),
                 surfaces: AsyncMutex::new(HashMap::new()),
                 ide_proxies: AsyncMutex::new(HashMap::new()),
@@ -22723,6 +26398,8 @@ fn main() {
                 trigger_watcher_reload: Mutex::new(None),
                 trigger_watcher_stop: Mutex::new(None),
                 mcp: Arc::clone(&mcp),
+                mcp_projects: AsyncMutex::new(HashMap::new()),
+                mcp_notification_app: app.handle().clone(),
                 jobs,
                 local_browser,
                 ingress_shutdown,
@@ -22747,6 +26424,39 @@ fn main() {
                 let _ = recovery_jobs.recover(&local_host).await;
             });
             let handle = app.handle().clone();
+            let mcp_service_handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let listener = match TcpListener::from_std(mcp_listener) {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        eprintln!("failed to register MCP listener: {error}");
+                        return;
+                    }
+                };
+                let control_plane = Arc::new(DesktopControlPlane {
+                    app: mcp_service_handle.clone(),
+                });
+                let server = Arc::new(opcos_mcp_server::OpcosMcpServer::new(control_plane));
+                if let Err(error) = server.serve_http(listener, mcp_token).await {
+                    eprintln!("MCP HTTP server stopped: {error}");
+                }
+            });
+            let acp_service_handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let listener = match TcpListener::from_std(acp_listener) {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        eprintln!("failed to register ACP listener: {error}");
+                        return;
+                    }
+                };
+                let control_plane = Arc::new(DesktopControlPlane {
+                    app: acp_service_handle.clone(),
+                });
+                if let Err(error) = serve_acp_http(listener, acp_token, control_plane).await {
+                    eprintln!("ACP server stopped: {error}");
+                }
+            });
             let trigger_handle = handle.clone();
             tauri::async_runtime::spawn(async move {
                 let trigger_listener = match TcpListener::from_std(trigger_listener) {
@@ -22839,7 +26549,7 @@ fn main() {
             run_computer_use,
             test_host,
             delete_host,
-            create_session,
+            create_session_command,
             list_projects,
             create_project,
             create_project_from_team_template,
@@ -22851,8 +26561,12 @@ fn main() {
             delete_project_agent,
             harness_options,
             change_harness,
-            list_sessions,
-            read_session_events,
+            list_sessions_command,
+            set_session_archived,
+            read_session_events_command,
+            acp_session_capabilities,
+            acp_set_mode,
+            acp_set_config_option,
             read_transcript,
             submit_turn,
             list_artifacts,
@@ -22896,6 +26610,17 @@ fn main() {
             import_assets,
             discover_remote_assets,
             mcp_tools,
+            mcp_resources,
+            mcp_resource_templates,
+            mcp_read_resource,
+            mcp_subscribe_resource,
+            mcp_unsubscribe_resource,
+            mcp_attach_resource,
+            mcp_context_resources,
+            mcp_detach_resource,
+            mcp_prompts,
+            mcp_authorize,
+            mcp_get_prompt,
             connector_save,
             connector_status,
             connector_validate,
@@ -23104,12 +26829,137 @@ mod m7_tests {
     }
 
     #[test]
+    fn removed_opencode_sessions_are_explicitly_read_only() {
+        let session = SessionRecord {
+            session_id: "legacy-opencode".into(),
+            workspace: String::new(),
+            model: "auto".into(),
+            mode: "Auto".into(),
+            harness: "opencode".into(),
+            title: "Legacy OpenCode".into(),
+            extra_roots: vec![],
+            grants: json!({}),
+            pinned: false,
+            archived: false,
+            origin: None,
+            origin_label: None,
+            compaction: json!({}),
+            host_id: "local".into(),
+            provider: None,
+            external_session_id: None,
+            run_state: "idle".into(),
+            stop_reason: "none".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            project_id: None,
+            agent_id: None,
+        };
+        let error = reject_removed_opencode_session(&session).unwrap_err();
+        assert!(error.contains("read-only"));
+        assert!(error.contains("opencode acp"));
+    }
+
+    #[test]
+    fn builtin_and_acp_harness_kinds_remain_distinct() {
+        assert_ne!(
+            opcos_engine::HarnessKind::Builtin,
+            opcos_engine::HarnessKind::Acp
+        );
+        assert_eq!(
+            opcos_engine::HarnessKind::Builtin,
+            opcos_engine::HarnessKind::Builtin
+        );
+        assert_eq!(
+            opcos_engine::HarnessKind::Acp,
+            opcos_engine::HarnessKind::Acp
+        );
+    }
+
+    #[test]
+    fn builtin_assets_reject_edit_and_delete_mutations() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE config_object (id TEXT PRIMARY KEY, status TEXT NOT NULL)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO config_object (id, status) VALUES ('builtin', 'builtin'), ('custom', 'active')",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            asset_mutation_guard(&connection, "builtin", "edited").unwrap_err(),
+            "builtin assets are read-only and cannot be edited"
+        );
+        assert_eq!(
+            asset_mutation_guard(&connection, "builtin", "deleted").unwrap_err(),
+            "builtin assets are read-only and cannot be deleted"
+        );
+        assert!(asset_mutation_guard(&connection, "custom", "edited").is_ok());
+        assert!(asset_mutation_guard(&connection, "missing", "deleted").is_ok());
+    }
+
+    #[test]
+    fn settings_catalog_matches_frontend_section_keys() {
+        let source = include_str!("../../web/src/components/SettingsView.tsx");
+        let frontend_keys = source
+            .lines()
+            .skip_while(|line| !line.contains("export type SettingsSection"))
+            .take_while(|line| !line.contains("const tabs"))
+            .filter_map(|line| line.trim().strip_prefix("| \""))
+            .filter_map(|line| line.split('"').next())
+            .collect::<HashSet<_>>();
+        let rust_keys = opcos_settings_catalog()
+            .iter()
+            .map(|(key, _, _)| *key)
+            .collect::<HashSet<_>>();
+        assert_eq!(rust_keys, frontend_keys);
+    }
+
+    #[test]
+    fn routed_shell_audit_flags_writes_and_redacts_credentials() {
+        assert!(shell_likely_mutating("cat <<'EOF' > config.txt"));
+        assert!(shell_likely_mutating("git push origin main"));
+        assert!(!shell_likely_mutating("git diff HEAD^..HEAD"));
+        assert_eq!(
+            redact_secret_patterns("curl -H 'Authorization: Bearer secret-value'"),
+            "curl -H 'Authorization: Bearer [redacted]'"
+        );
+    }
+
+    #[test]
     fn generated_project_agent_branches_are_project_unique() {
         assert_ne!(
             worktree_branch("Code", 1, "first"),
             worktree_branch("Code", 1, "second")
         );
         assert_eq!(worktree_branch("Code", 1, "first"), "agent/code-1-first");
+    }
+
+    #[test]
+    fn autonomous_plan_routing_assigns_implementation_and_review_steps() {
+        let implementation = opcos_store::PlanStepRecord {
+            step_id: "step-code".into(),
+            plan_id: "plan".into(),
+            position: 0,
+            description: "Implement the checkout flow".into(),
+            status: "not_started".into(),
+            failure_reason: None,
+            abandoned_reason: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let review = opcos_store::PlanStepRecord {
+            description: "Review and verify the checkout flow".into(),
+            step_id: "step-review".into(),
+            ..implementation.clone()
+        };
+        assert_eq!(worker_role_for_plan_step(&implementation), "Code");
+        assert_eq!(worker_role_for_plan_step(&review), "Review");
     }
 
     #[test]
@@ -23189,6 +27039,75 @@ mod m7_tests {
         for name in ["lsp_definition", "lsp_references", "lsp_diagnostics"] {
             assert!(!remote_allowed.contains(name));
         }
+    }
+
+    #[test]
+    fn mcp_tool_selection_defaults_and_scopes_rows_per_session_and_source() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE mcp_session_tools (
+                    session_id TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    enabled INTEGER NOT NULL
+                )",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO mcp_session_tools VALUES
+                 ('session-a','host','read',0),
+                 ('session-a','independent','server:write',0),
+                 ('session-a','host','enabled-row',1),
+                 ('session-b','host','read',1)",
+                [],
+            )
+            .unwrap();
+
+        let host_tools = select_mcp_tools(
+            &connection,
+            "session-a",
+            "host",
+            [
+                ("read".into(), json!({"name": "read"})),
+                ("enabled-row".into(), json!({"name": "enabled-row"})),
+                ("missing".into(), json!({"name": "missing"})),
+            ],
+        );
+        assert_eq!(
+            host_tools,
+            vec![json!({"name": "enabled-row"}), json!({"name": "missing"}),]
+        );
+        let configured_tools = select_mcp_tools(
+            &connection,
+            "session-a",
+            "independent",
+            [
+                (
+                    "server:write".into(),
+                    json!({"qualified_name": "server:write"}),
+                ),
+                (
+                    "server:read".into(),
+                    json!({"qualified_name": "server:read"}),
+                ),
+            ],
+        );
+        assert_eq!(
+            configured_tools,
+            vec![json!({"qualified_name": "server:read"})]
+        );
+        assert_eq!(
+            select_mcp_tools(
+                &connection,
+                "session-b",
+                "host",
+                [("read".into(), json!({"name": "read"}))],
+            ),
+            vec![json!({"name": "read"})]
+        );
     }
 
     #[test]
@@ -24097,8 +28016,8 @@ mod m7_tests {
                 |row| row.get(0),
             )
             .unwrap();
-        // 156 = 33 baseline assets plus 123 verified, disabled MCP catalog entries.
-        assert_eq!(builtin_count, 156);
+        // 157 = 34 baseline assets plus 123 verified, disabled MCP catalog entries.
+        assert_eq!(builtin_count, 157);
         for id in [
             "template-runbook-playbook-template",
             "template-runbook-pr-review",
@@ -24988,10 +28907,23 @@ agents:
             "/workspace/my repo/worktrees/agent one",
             "agent/code/review-1",
             false,
+            None,
         );
         assert_eq!(
             posix,
             "git -C '/workspace/my repo' worktree add '/workspace/my repo/worktrees/agent one' -b 'agent/code/review-1'"
+        );
+        let posix_with_base = git_worktree_add_command(
+            Some("linux"),
+            "/workspace/repo",
+            "/workspace/repo/worktrees/agent",
+            "agent/code-1",
+            false,
+            Some("lead-head"),
+        );
+        assert_eq!(
+            posix_with_base,
+            "git -C '/workspace/repo' worktree add '/workspace/repo/worktrees/agent' -b 'agent/code-1' 'lead-head'"
         );
         let windows = git_worktree_add_command(
             Some("windows"),
@@ -24999,6 +28931,7 @@ agents:
             r"C:\workspace\my repo\worktrees\agent one",
             "agent/code/review-1",
             true,
+            None,
         );
         assert_eq!(
             windows,
@@ -25108,6 +29041,13 @@ agents:
         assert!(constant_time_token_eq("token", "token"));
         assert!(!constant_time_token_eq("token", "Token"));
         assert!(!constant_time_token_eq("token", "token-extra"));
+    }
+
+    #[test]
+    fn oversized_mcp_context_resource_is_rejected_explicitly() {
+        let error = validate_context_resource_size(&"x".repeat(256 * 1024 + 1)).unwrap_err();
+        assert!(error.contains("MCP resource is too large to attach"));
+        assert!(error.contains("limit 262144 bytes"));
     }
 
     #[test]
@@ -25273,6 +29213,68 @@ agents:
             shell_artifact_paths("generate | tee -a reports/out.log"),
             vec!["reports/out.log"]
         );
+    }
+
+    #[test]
+    fn mcp_session_views_use_session_id_without_frontend_field_churn() {
+        let view = mcp_session_view(SessionView {
+            id: "session-test".into(),
+            title: "Test".into(),
+            host_id: "local".into(),
+            host_name: "本机".into(),
+            model: "auto".into(),
+            provider: None,
+            mode: "Auto".into(),
+            harness: "builtin".into(),
+            workspace: "/tmp".into(),
+            run_state: "idle".into(),
+            stop_reason: "none".into(),
+            archived: false,
+            project_id: None,
+            agent_id: None,
+        });
+        assert_eq!(view["session_id"], "session-test");
+        assert!(view.get("id").is_none());
+    }
+
+    #[test]
+    fn mcp_coordination_project_access_is_project_scoped() {
+        assert!(ensure_mcp_coordination_project_access("project-a", "project-a").is_ok());
+        let error = ensure_mcp_coordination_project_access("project-a", "project-b").unwrap_err();
+        assert_eq!(error, "coordination project is outside the caller project");
+    }
+
+    #[test]
+    fn mcp_project_repository_urls_strip_credentials_and_query_values() {
+        let safe = safe_project_repo_url(
+            "https://user:secret@example.com/repo.git?access_token=should-not-appear",
+        )
+        .unwrap();
+        assert_eq!(safe, "https://example.com/repo.git");
+        assert!(!safe.contains("secret"));
+        assert!(!safe.contains("access_token"));
+        assert!(safe_project_repo_url("not a url").is_none());
+    }
+
+    #[test]
+    fn mcp_coordination_snapshot_redacts_nested_secret_values() {
+        let snapshot = redact_approval_value(&json!({
+            "messages": [{
+                "payload": {
+                    "api_token": "secret-token",
+                    "text": "Authorization: Bearer secret-token"
+                }
+            }]
+        }));
+        assert_eq!(
+            snapshot["messages"][0]["payload"]["api_token"],
+            "[redacted]"
+        );
+        assert_eq!(
+            snapshot["messages"][0]["payload"]["text"],
+            "Authorization: Bearer [redacted]"
+        );
+        assert!(!snapshot.to_string().contains("secret-token"));
     }
 
     #[test]
@@ -25836,6 +29838,158 @@ agents:
             ),
             None
         );
+    }
+
+    #[test]
+    fn mcp_catalog_cache_migration_creates_metadata_tables_without_content_table() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE desktop_schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                )",
+                [],
+            )
+            .unwrap();
+        migrate_mcp_catalog_cache(&connection).unwrap();
+        for table in [
+            "mcp_resource_cache",
+            "mcp_resource_template_cache",
+            "mcp_prompt_cache",
+        ] {
+            assert!(
+                connection
+                    .query_row(
+                        "SELECT EXISTS(
+                           SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1
+                         )",
+                        [table],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap()
+            );
+        }
+        assert!(
+            !connection
+                .query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM sqlite_master
+                       WHERE type='table' AND name='mcp_resource_content'
+                     )",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+        let applied: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM desktop_schema_migrations
+                   WHERE version='p1-2-mcp-catalog-cache'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(applied);
+        migrate_mcp_catalog_cache(&connection).unwrap();
+    }
+
+    #[test]
+    fn mcp_session_resources_migration_is_idempotent() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE desktop_schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                )",
+                [],
+            )
+            .unwrap();
+        migrate_mcp_session_resources(&connection).unwrap();
+        migrate_mcp_session_resources(&connection).unwrap();
+        let columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(mcp_session_resources)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(columns.contains(&"mode".to_owned()));
+        assert!(columns.contains(&"enabled".to_owned()));
+    }
+
+    #[test]
+    fn acp_pending_selection_skips_already_processed_call() {
+        let pending = vec![opcos_store::PendingRecord {
+            session_id: "session".into(),
+            call_id: "call-1".into(),
+            tool: "tool".into(),
+            arguments: Value::Null,
+            state: "pending".into(),
+        }];
+        let resolved = HashSet::from(["call-1".to_owned()]);
+        assert!(next_acp_pending(&pending, &resolved).is_none());
+    }
+
+    #[test]
+    fn acp_stream_updates_translate_engine_deltas() {
+        let message = acp_stream_update(
+            "stream",
+            &json!({"type":"assistant_delta","text_delta":"hello"}),
+        );
+        assert!(matches!(message, Some(SessionUpdate::AgentMessageChunk(_))));
+        let thought = acp_stream_update(
+            "stream",
+            &json!({"type":"reasoning_delta","reasoning_delta":"thinking"}),
+        );
+        assert!(matches!(thought, Some(SessionUpdate::AgentThoughtChunk(_))));
+        assert_eq!(
+            acp_stream_update(
+                "stream",
+                &json!({"type":"tool_call_delta","tool_call_delta":{}})
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn acp_external_approval_resolution_requires_terminal_or_next_state() {
+        let session = SessionRecord {
+            session_id: "session".into(),
+            workspace: "/workspace".into(),
+            model: "auto".into(),
+            mode: "Interactive".into(),
+            harness: "acp".into(),
+            title: "ACP".into(),
+            extra_roots: vec![],
+            grants: json!({}),
+            pinned: false,
+            archived: false,
+            origin: None,
+            origin_label: None,
+            compaction: json!({}),
+            host_id: "local".into(),
+            provider: None,
+            external_session_id: None,
+            run_state: "idle".into(),
+            stop_reason: "waiting_for_approval".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            project_id: None,
+            agent_id: None,
+        };
+        let pending = vec![opcos_store::PendingRecord {
+            session_id: "session".into(),
+            call_id: "call-1".into(),
+            tool: "tool".into(),
+            arguments: Value::Null,
+            state: "pending".into(),
+        }];
+        assert!(!acp_approval_resolution_ready(&pending, &session, "call-1"));
+        assert!(acp_approval_resolution_ready(&[], &session, "call-1"));
     }
 
     struct RecordingAcpSink {

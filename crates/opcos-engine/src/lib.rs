@@ -32,12 +32,10 @@ pub mod event_bus;
 pub mod git;
 pub mod github;
 pub mod login_state;
-mod opencode;
 pub mod orchestration;
 pub mod planner;
 
 pub use acp::{AcpHarness, AcpHarnessConfig};
-pub use opencode::{OpenCodeHarness, OpenCodeHarnessConfig};
 
 const ASSUMED_CONTEXT_WINDOW: u64 = 128_000;
 const ASSUMED_OUTPUT_TOKENS: u64 = 4096;
@@ -46,6 +44,8 @@ const ASSUMED_OUTPUT_TOKENS: u64 = 4096;
 pub enum EngineError {
     #[error("provider: {0}")]
     Provider(#[from] ProviderError),
+    #[error("a turn is already running")]
+    TurnAlreadyRunning,
     #[error("store: {0}")]
     Store(String),
     #[error("tool preflight: {0}")]
@@ -63,6 +63,17 @@ pub enum EngineError {
     #[error("approval already processed: {0}")]
     ApprovalAlreadyProcessed(String),
 }
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ExternalContextAttachment {
+    pub source: String,
+    pub uri: Option<String>,
+    pub mime_type: Option<String>,
+    pub content: String,
+}
+
+// Deadlock safeguard for streams that produce transport bytes but no parsed chunks.
+const DEFAULT_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
@@ -136,6 +147,7 @@ pub trait ArtifactSink: Send + Sync {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolOrigin {
     User,
+    System,
     RepairLoop,
 }
 
@@ -196,7 +208,6 @@ pub trait AgentEngine: Send + Sync {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HarnessKind {
     Builtin,
-    OpenCode,
     Acp,
 }
 
@@ -280,6 +291,26 @@ pub enum HarnessEvent {
         call_id: Option<String>,
         tool: Option<String>,
         arguments_fragment: Option<String>,
+    },
+    ToolCallUpdate {
+        call_id: String,
+        tool: String,
+        status: String,
+        content: Option<Value>,
+        locations: Vec<Value>,
+    },
+    PlanUpdate {
+        entries: Vec<Value>,
+    },
+    SessionModeUpdate {
+        current_mode_id: String,
+        available_modes: Vec<Value>,
+    },
+    SessionConfigUpdate {
+        config_options: Vec<Value>,
+    },
+    AvailableCommandsUpdate {
+        commands: Vec<Value>,
     },
     ToolResult {
         call_id: String,
@@ -477,6 +508,20 @@ pub enum HarnessError {
     PendingNotFound(String),
     #[error("external harness: {0}")]
     External(String),
+    #[error("ACP authentication required")]
+    AcpAuthenticationRequired(Vec<AcpAuthMethod>),
+    #[error("ACP JSON-RPC error {code}: {message}")]
+    AcpRpc {
+        code: i64,
+        message: String,
+        data: Option<Value>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcpAuthMethod {
+    pub id: String,
+    pub description: Option<String>,
 }
 
 #[async_trait]
@@ -510,7 +555,7 @@ pub struct TurnEngine<P, S, E> {
     resolved_caps: Mutex<Option<Caps>>,
     limit_identity: Mutex<Option<(String, String, String)>>,
     interrupted: AtomicBool,
-    steering: Mutex<Vec<String>>,
+    steering: std::sync::Mutex<Vec<String>>,
     last_incoming_event_id: Mutex<Option<String>>,
     steering_waiters: SteeringWaiters,
     events: mpsc::Sender<StreamChunk>,
@@ -537,6 +582,8 @@ pub struct TurnEngine<P, S, E> {
     stripe_tools_enabled: AtomicBool,
     message_usage_limit: AtomicU64,
     max_iterations: AtomicU64,
+    turn_active: AtomicBool,
+    chunk_idle_timeout: Duration,
     active_tool_calls: StdMutex<HashSet<String>>,
     policy_denied: AtomicBool,
     mutating_api_gate_enabled: AtomicBool,
@@ -677,7 +724,7 @@ where
             resolved_caps: Mutex::new(None),
             limit_identity: Mutex::new(None),
             interrupted: AtomicBool::new(false),
-            steering: Mutex::new(Vec::new()),
+            steering: std::sync::Mutex::new(Vec::new()),
             last_incoming_event_id: Mutex::new(None),
             steering_waiters: Arc::new(std::sync::Mutex::new(Vec::new())),
             events,
@@ -704,6 +751,8 @@ where
             stripe_tools_enabled: AtomicBool::new(false),
             message_usage_limit: AtomicU64::new(0),
             max_iterations: AtomicU64::new(256),
+            turn_active: AtomicBool::new(false),
+            chunk_idle_timeout: DEFAULT_CHUNK_IDLE_TIMEOUT,
             active_tool_calls: StdMutex::new(HashSet::new()),
             policy_denied: AtomicBool::new(false),
             mutating_api_gate_enabled: AtomicBool::new(true),
@@ -749,6 +798,10 @@ where
 
     pub async fn set_external_tools(&self, tools: Vec<Value>) {
         *self.external_tools.lock().await = tools;
+    }
+
+    pub async fn external_tools(&self) -> Vec<Value> {
+        self.external_tools.lock().await.clone()
     }
 
     pub async fn append_external_tools(&self, tools: impl IntoIterator<Item = Value>) {
@@ -893,6 +946,16 @@ where
         result
     }
 
+    async fn execute_tool_interruptible(&self, call: &ToolCall) -> Value {
+        if self.interrupted.load(Ordering::SeqCst) {
+            return json!({"error":"tool call interrupted"});
+        }
+        tokio::select! {
+            result = self.execute_tool_with_hooks(call) => result,
+            _ = self.interrupt_notify.notified() => json!({"error":"tool call interrupted"}),
+        }
+    }
+
     fn execute_proposed_plan(&self, arguments: &Value) -> Value {
         let object = arguments.as_object();
         let title = object
@@ -947,11 +1010,41 @@ where
     }
 
     pub async fn submit_text(&self, text: impl Into<String>) -> Result<AssistantTurn, EngineError> {
+        self.submit_text_with_attachments(text, Vec::new()).await
+    }
+
+    pub async fn submit_text_with_attachments(
+        &self,
+        text: impl Into<String>,
+        attachments: Vec<ExternalContextAttachment>,
+    ) -> Result<AssistantTurn, EngineError> {
+        self.begin_turn()?;
+        self.clear_steering_queue();
         self.interrupted.store(false, Ordering::SeqCst);
         self.policy_denied.store(false, Ordering::SeqCst);
         self.set_session_status("running", "none");
         let result = async {
-            self.append_user_message(text.into(), None).await?;
+            self.append_user_message_with_attachments(text.into(), None, &attachments)
+                .await?;
+            self.run_loop(self.provider_messages()?).await
+        }
+        .await;
+        self.finish_turn(&result);
+        result
+    }
+
+    pub async fn submit_steering(
+        &self,
+        text: impl Into<String>,
+    ) -> Result<AssistantTurn, EngineError> {
+        self.begin_turn()?;
+        self.clear_steering_queue();
+        self.interrupted.store(false, Ordering::SeqCst);
+        self.policy_denied.store(false, Ordering::SeqCst);
+        self.set_session_status("running", "none");
+        let result = async {
+            self.append_user_message(text.into(), Some("steering"))
+                .await?;
             self.run_loop(self.provider_messages()?).await
         }
         .await;
@@ -964,10 +1057,37 @@ where
         text: String,
         source: Option<&str>,
     ) -> Result<Value, EngineError> {
+        self.append_user_message_with_attachments(text, source, &[])
+            .await
+    }
+
+    async fn append_user_message_with_attachments(
+        &self,
+        text: String,
+        source: Option<&str>,
+        attachments: &[ExternalContextAttachment],
+    ) -> Result<Value, EngineError> {
         let mut payload =
             serde_json::Map::from_iter([("message".to_owned(), Value::String(text.clone()))]);
         if let Some(source) = source {
             payload.insert("source".to_owned(), Value::String(source.to_owned()));
+        }
+        let summaries = attachments
+            .iter()
+            .map(|attachment| {
+                json!({
+                    "kind": "text",
+                    "name": format!(
+                        "MCP resource: {}",
+                        attachment.uri.as_deref().unwrap_or(&attachment.source)
+                    ),
+                    "mime": attachment.mime_type,
+                    "bytes": attachment.content.len(),
+                })
+            })
+            .collect::<Vec<_>>();
+        if !summaries.is_empty() {
+            payload.insert("attachments".to_owned(), Value::Array(summaries));
         }
         let event = WorkingEvent {
             event_type: "user_message".into(),
@@ -984,12 +1104,16 @@ where
             },
         )?;
         *self.last_incoming_event_id.lock().await = Some(event_id);
-        let value = json!({"role":"user","content":[{"type":"text","text":text}]});
+        let mut content = vec![json!({"type":"text","text":text})];
+        content.extend(attachments.iter().map(external_context_content_block));
+        let value = json!({"role":"user","content":content});
         self.append("user", value.clone()).await?;
         Ok(value)
     }
 
     pub async fn retry(&self) -> Result<AssistantTurn, EngineError> {
+        self.begin_turn()?;
+        self.clear_steering_queue();
         self.interrupted.store(false, Ordering::SeqCst);
         self.policy_denied.store(false, Ordering::SeqCst);
         self.set_session_status("running", "none");
@@ -999,6 +1123,8 @@ where
     }
 
     pub async fn resume_pending_turn(&self) -> Result<Option<AssistantTurn>, EngineError> {
+        self.begin_turn()?;
+        self.clear_steering_queue();
         self.set_session_status("running", "none");
         self.policy_denied.store(false, Ordering::SeqCst);
         let _ = self
@@ -1115,6 +1241,7 @@ where
             Err(EngineError::MaxIterations) => ("error", "max_iterations"),
             Err(EngineError::MessageUsageLimitReached) => ("error", "usage_limit"),
             Err(EngineError::ApprovalAlreadyProcessed(_)) => ("idle", "waiting_for_approval"),
+            Err(EngineError::TurnAlreadyRunning) => ("error", "turn_already_running"),
         };
         if result.is_ok() && self.policy_denied.load(Ordering::SeqCst) {
             return ("idle", "policy_denied");
@@ -1123,6 +1250,8 @@ where
     }
 
     fn finish_turn<T>(&self, result: &Result<T, EngineError>) {
+        self.turn_active.store(false, Ordering::SeqCst);
+        self.clear_steering_queue();
         let (run_state, stop_reason) = self.turn_status(result);
         self.set_session_status(run_state, stop_reason);
         let _ = self.record_working_event(
@@ -1151,13 +1280,40 @@ where
         let text = text.into();
         self.append_user_message(text.clone(), Some("steering"))
             .await?;
+        self.working_event("steering_received", "message", json!({"queued":true}))
+            .await?;
         let (sender, receiver) = oneshot::channel();
         self.steering_waiters
             .lock()
             .expect("steering waiters mutex poisoned")
             .push(sender);
-        self.steering.lock().await.push(text);
+        self.steering
+            .lock()
+            .expect("steering mutex poisoned")
+            .push(text);
         Ok(receiver)
+    }
+
+    fn clear_steering_queue(&self) {
+        self.steering
+            .lock()
+            .expect("steering mutex poisoned")
+            .clear();
+    }
+
+    pub fn has_active_turn(&self) -> bool {
+        self.turn_active.load(Ordering::SeqCst)
+    }
+
+    pub fn set_chunk_idle_timeout(&mut self, timeout: Duration) {
+        self.chunk_idle_timeout = timeout.max(Duration::from_millis(1));
+    }
+
+    fn begin_turn(&self) -> Result<(), EngineError> {
+        self.turn_active
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|_| ())
+            .map_err(|_| EngineError::TurnAlreadyRunning)
     }
 
     pub fn save_grant(
@@ -1609,6 +1765,31 @@ where
         self.receiver.lock().await.take()
     }
 
+    async fn drain_steering(
+        &self,
+        messages: &mut Vec<Value>,
+        next_iteration: u64,
+    ) -> Result<bool, EngineError> {
+        let steering = std::mem::take(&mut *self.steering.lock().expect("steering mutex poisoned"));
+        if steering.is_empty() {
+            return Ok(false);
+        }
+        let count = steering.len();
+        for text in steering {
+            messages.push(json!({
+                "role":"user",
+                "content":[{"type":"text","text":text}]
+            }));
+        }
+        self.working_event(
+            "steering_applied",
+            "message",
+            json!({"iteration":next_iteration,"count":count}),
+        )
+        .await?;
+        Ok(true)
+    }
+
     async fn run_loop(&self, mut messages: Vec<Value>) -> Result<AssistantTurn, EngineError> {
         let mut usage: Option<TokenUsage> = None;
         let mut context_overflow_retries = 0;
@@ -1661,6 +1842,7 @@ where
                     .await?;
                 return Err(EngineError::Interrupted);
             }
+            self.drain_steering(&mut messages, iteration + 1).await?;
             if self.should_compact(&messages, usage.as_ref()) {
                 compaction_count += 1;
                 messages = self
@@ -1724,6 +1906,15 @@ where
             let inference_started = Instant::now();
             let (provider_result, partial) = self.stream_turn(request).await;
             let inference_ms = inference_started.elapsed().as_millis() as u64;
+            if let Err(ProviderError::ChunkIdleTimeout { seconds }) = &provider_result {
+                self.notice(
+                    "provider_stream_timeout",
+                    format!(
+                        "Inference produced no response chunks for {seconds} seconds and was aborted"
+                    ),
+                )
+                .await?;
+            }
             match provider_result {
                 Ok(turn) => {
                     if let Some(reasoning) =
@@ -1844,14 +2035,8 @@ where
                             messages.push(value);
                             continue;
                         }
-                        let steering = std::mem::take(&mut *self.steering.lock().await);
-                        if steering.is_empty() {
+                        if !self.drain_steering(&mut messages, iteration + 2).await? {
                             return Ok(turn);
-                        }
-                        for text in steering {
-                            let value =
-                                json!({"role":"user","content":[{"type":"text","text":text}]});
-                            messages.push(value);
                         }
                     } else {
                         for call in &turn.tool_calls {
@@ -1925,6 +2110,7 @@ where
                             self.append("user", value.clone()).await?;
                             messages.push(value);
                         }
+                        self.drain_steering(&mut messages, iteration + 2).await?;
                     }
                 }
                 Err(error) => {
@@ -1967,6 +2153,7 @@ where
                         context_overflow_retries += 1;
                         pending_retry_count += 1;
                         pending_compaction_count += 1;
+                        self.drain_steering(&mut messages, iteration + 1).await?;
                         messages = self
                             .compact_context(messages)
                             .await
@@ -2068,10 +2255,22 @@ where
         let mut receiver = Some(receiver);
         let provider = self.provider.stream(request, sender);
         tokio::pin!(provider);
+        let idle_timeout = self.chunk_idle_timeout;
+        let idle_deadline = tokio::time::Instant::now() + idle_timeout;
+        let idle_timer = tokio::time::sleep_until(idle_deadline);
+        tokio::pin!(idle_timer);
         let mut partial = PartialOutput::default();
         loop {
             tokio::select! {
                 result = &mut provider => return (result, partial),
+                _ = &mut idle_timer => {
+                    return (
+                        Err(ProviderError::ChunkIdleTimeout {
+                            seconds: idle_timeout.as_secs(),
+                        }),
+                        partial,
+                    );
+                }
                 chunk = async {
                     match receiver.as_mut() {
                         Some(receiver) => receiver.recv().await,
@@ -2082,6 +2281,7 @@ where
                         receiver = None;
                         continue;
                     };
+                    idle_timer.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
                     if self.interrupted.load(Ordering::SeqCst) {
                         return (Err(ProviderError::Protocol("interrupted".into())), partial);
                     }
@@ -2198,7 +2398,7 @@ where
                 })?;
                 let completed_reads = futures_util::future::join_all(readonly.drain(..).map(
                     |(read_index, read_call): (usize, &ToolCall)| async move {
-                        let result = self.execute_tool_with_hooks(read_call).await;
+                        let result = self.execute_tool_interruptible(read_call).await;
                         (read_index, result)
                     },
                 ))
@@ -2422,9 +2622,11 @@ where
                     let result = if call.name == "propose_plan" {
                         self.execute_proposed_plan(&call.arguments)
                     } else {
-                        self.execute_tool_with_hooks(call).await
+                        self.execute_tool_interruptible(call).await
                     };
-                    if matches!(call.name.as_str(), "write_file" | "edit_file") {
+                    if matches!(call.name.as_str(), "write_file" | "edit_file")
+                        && result.get("error").is_none()
+                    {
                         self.emit_file_change(call, previous.as_deref()).await;
                     }
                     results[index] = Some(result);
@@ -2460,7 +2662,7 @@ where
                         .await;
                     let completed_reads = futures_util::future::join_all(readonly.drain(..).map(
                         |(read_index, read_call): (usize, &ToolCall)| async move {
-                            let result = self.execute_tool_with_hooks(read_call).await;
+                            let result = self.execute_tool_interruptible(read_call).await;
                             (read_index, result)
                         },
                     ))
@@ -2505,7 +2707,7 @@ where
         }
         let readonly_results =
             futures_util::future::join_all(readonly.into_iter().map(|(index, call)| async move {
-                let result = self.execute_tool_with_hooks(call).await;
+                let result = self.execute_tool_interruptible(call).await;
                 (index, result)
             }))
             .await;
@@ -3412,6 +3614,16 @@ where
         let _ = self.events.try_send(chunk);
         Ok(())
     }
+}
+
+fn external_context_content_block(attachment: &ExternalContextAttachment) -> Value {
+    let header = format!(
+        "[MCP resource]\nsource: {}\nuri: {}\nmime: {}\n\n",
+        attachment.source,
+        attachment.uri.as_deref().unwrap_or("unknown"),
+        attachment.mime_type.as_deref().unwrap_or("unknown"),
+    );
+    json!({"type": "text", "text": format!("{header}{}", attachment.content)})
 }
 
 fn tool_risk(name: &str) -> ToolRisk {
@@ -4381,6 +4593,25 @@ struct PartialOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_context_content_blocks_use_standard_text_fields() {
+        let block = external_context_content_block(&ExternalContextAttachment {
+            source: "mcp:server".into(),
+            uri: Some("resource://docs".into()),
+            mime_type: Some("text/plain".into()),
+            content: "body".into(),
+        });
+        let keys = block
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec!["type", "text"]);
+        assert_eq!(block["type"], "text");
+        assert!(block["text"].as_str().unwrap().contains("resource://docs"));
+    }
     use async_trait::async_trait;
     use opcos_provider::ToolCallDelta;
     use opcos_store::{SessionRecord, SessionStore, SqliteStore};
@@ -4727,6 +4958,40 @@ mod tests {
     impl ToolExecutor for FakeTools {
         async fn execute(&self, _: &str, _: Value) -> Result<Value, String> {
             Ok(json!("ok"))
+        }
+    }
+
+    struct FailingWriteTools;
+    #[async_trait]
+    impl ToolExecutor for FailingWriteTools {
+        async fn execute(&self, name: &str, _: Value) -> Result<Value, String> {
+            if name == "write_file" {
+                Err("write failed".into())
+            } else {
+                Ok(json!("ok"))
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct StalledProvider;
+
+    #[async_trait]
+    impl Provider for StalledProvider {
+        async fn complete(&self, _: ProviderRequest) -> Result<AssistantTurn, ProviderError> {
+            Ok(AssistantTurn::default())
+        }
+
+        async fn stream(
+            &self,
+            _: ProviderRequest,
+            _: mpsc::Sender<StreamChunk>,
+        ) -> Result<AssistantTurn, ProviderError> {
+            std::future::pending().await
+        }
+
+        fn capabilities(&self, _: &str) -> Caps {
+            Caps::default()
         }
     }
 
@@ -7452,6 +7717,33 @@ mod tests {
         }));
     }
 
+    #[tokio::test]
+    async fn external_tool_selection_changes_on_a_running_engine() {
+        let engine = TurnEngine::new(
+            FakeProvider,
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine
+            .set_external_tools(vec![json!({"name": "mcp:read"})])
+            .await;
+        assert_eq!(
+            engine.external_tools().await,
+            vec![json!({"name": "mcp:read"})]
+        );
+        engine
+            .set_external_tools(vec![json!({"name": "mcp:write"})])
+            .await;
+        assert_eq!(
+            engine.external_tools().await,
+            vec![json!({"name": "mcp:write"})]
+        );
+    }
+
     #[derive(Clone)]
     struct SummaryProvider {
         fail: bool,
@@ -7919,6 +8211,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_file_writes_do_not_emit_file_updates() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FailingWriteTools),
+            "failed-write",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+
+        let result = engine
+            .execute_tools(
+                1,
+                &[ToolCall {
+                    id: "failed-write-call".into(),
+                    name: "write_file".into(),
+                    arguments: json!({"path":"src/routes/categories.js","content":"broken"}),
+                }],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result, vec![json!({"error":"write failed"})]);
+        let updates = store
+            .load_audit(Some("failed-write"))
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "working_event")
+            .filter(|event| event.payload["event_type"] == "multi_edit_result")
+            .collect::<Vec<_>>();
+        assert!(updates.is_empty(), "{updates:?}");
+    }
+
+    #[tokio::test]
     async fn mutating_external_http_shell_calls_require_approval_but_gets_do_not() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let engine = TurnEngine::new(
@@ -8149,6 +8477,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interrupting_a_hanging_tool_finishes_turn_for_next_submission() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let engine = Arc::new(TurnEngine::new(
+            LoopProvider {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                stop_after: Some(1),
+            },
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+            Arc::new(BlockingTools {
+                started: started.clone(),
+                release: Arc::new(tokio::sync::Notify::new()),
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+            "interrupt-tool",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        ));
+        let first = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.submit_text("hang").await })
+        };
+        started.notified().await;
+        engine.interrupt();
+        let first = tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(first, Err(EngineError::Interrupted)));
+        assert!(!engine.has_active_turn());
+        let second = engine.submit_text("next").await.unwrap();
+        assert_eq!(second.text.as_deref(), Some("done"));
+    }
+
+    #[tokio::test]
     async fn default_iteration_limit_allows_long_tool_loop() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let engine = TurnEngine::new(
@@ -8311,6 +8674,69 @@ mod tests {
         }));
     }
 
+    #[tokio::test]
+    async fn chunk_idle_timeout_aborts_stalled_provider_and_finishes_turn() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let mut engine = TurnEngine::new(
+            StalledProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "stalled",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine.set_chunk_idle_timeout(Duration::from_millis(10));
+
+        let result = tokio::time::timeout(Duration::from_secs(1), engine.submit_text("hello"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(EngineError::Provider(
+                ProviderError::ChunkIdleTimeout { .. }
+            ))
+        ));
+        assert!(!engine.has_active_turn());
+        let events = store.load_session_events("stalled").unwrap();
+        assert!(events.iter().any(|event| {
+            event.event["working_event"]["event_type"] == "provider_stream_timeout"
+                && event.event["working_event"]["category"] == "notice"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event["working_event"]["event_type"] == "turn_finished"
+                && event.event["working_event"]["payload"]["run_state"] == "error"
+        }));
+    }
+
+    #[tokio::test]
+    async fn inactive_steering_starts_one_turn_without_duplicate_user_message() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "inactive-steering",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+
+        engine.submit_steering("follow-up direction").await.unwrap();
+
+        let steering_messages = store
+            .load_session_events("inactive-steering")
+            .unwrap()
+            .into_iter()
+            .filter(|event| {
+                event.event["working_event"]["event_type"] == "user_message"
+                    && event.event["working_event"]["payload"]["source"] == "steering"
+            })
+            .count();
+        assert_eq!(steering_messages, 1);
+        assert!(!engine.has_active_turn());
+    }
+
     struct FailingRemoteTools;
     #[async_trait]
     impl ToolExecutor for FailingRemoteTools {
@@ -8408,6 +8834,192 @@ mod tests {
             event.event["type"] == "user_message"
                 && event.event["working_event"]["payload"]["message"] == "follow-up direction"
                 && event.event["working_event"]["payload"]["source"] == "steering"
+        }));
+    }
+
+    #[derive(Clone)]
+    struct CaptureProvider {
+        requests: Arc<std::sync::Mutex<Vec<Vec<Value>>>>,
+    }
+
+    #[async_trait]
+    impl Provider for CaptureProvider {
+        async fn complete(&self, _: ProviderRequest) -> Result<AssistantTurn, ProviderError> {
+            unreachable!()
+        }
+
+        async fn stream(
+            &self,
+            request: ProviderRequest,
+            _: mpsc::Sender<StreamChunk>,
+        ) -> Result<AssistantTurn, ProviderError> {
+            self.requests
+                .lock()
+                .expect("request mutex poisoned")
+                .push(request.messages);
+            Ok(AssistantTurn {
+                text: Some("done".into()),
+                ..Default::default()
+            })
+        }
+
+        fn capabilities(&self, _: &str) -> Caps {
+            Caps::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn inactive_steering_queue_is_not_injected_again_on_next_turn() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = TurnEngine::new(
+            CaptureProvider {
+                requests: requests.clone(),
+            },
+            store,
+            Arc::new(FakeTools),
+            "stale-steering",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+
+        let completion = engine.queue_steering("stale direction").await.unwrap();
+        engine.submit_text("new turn").await.unwrap();
+        assert_eq!(completion.await.unwrap().0, "idle");
+
+        let requests = requests.lock().expect("request mutex poisoned");
+        let stale_count = requests[0]
+            .iter()
+            .filter(|message| message["content"][0]["text"] == "stale direction")
+            .count();
+        assert_eq!(stale_count, 1);
+    }
+
+    #[derive(Clone)]
+    struct SteeringGateProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        requests: Arc<std::sync::Mutex<Vec<Vec<Value>>>>,
+    }
+
+    #[async_trait]
+    impl Provider for SteeringGateProvider {
+        async fn complete(&self, _: ProviderRequest) -> Result<AssistantTurn, ProviderError> {
+            unreachable!()
+        }
+
+        async fn stream(
+            &self,
+            request: ProviderRequest,
+            _: mpsc::Sender<StreamChunk>,
+        ) -> Result<AssistantTurn, ProviderError> {
+            self.requests
+                .lock()
+                .expect("request mutex poisoned")
+                .push(request.messages);
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == 1 {
+                self.started.notify_one();
+                self.release.notified().await;
+                return Ok(AssistantTurn {
+                    tool_calls: vec![ToolCall {
+                        id: "loop".into(),
+                        name: "read_file".into(),
+                        arguments: json!({}),
+                    }],
+                    ..Default::default()
+                });
+            }
+            Ok(AssistantTurn {
+                text: Some("done".into()),
+                ..Default::default()
+            })
+        }
+
+        fn capabilities(&self, _: &str) -> Caps {
+            Caps::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn mid_turn_steering_is_applied_after_tool_results_without_duplicate_event() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let provider = SteeringGateProvider {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            started: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let requests = provider.requests.clone();
+        let started = provider.started.clone();
+        let release = provider.release.clone();
+        let engine = Arc::new(TurnEngine::new(
+            provider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "mid-turn-steering",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        ));
+        let run_engine = engine.clone();
+        let run = tokio::spawn(async move { run_engine.submit_text("keep going").await });
+        started.notified().await;
+        let completion = engine.queue_steering("change direction").await.unwrap();
+        let second_completion = engine.queue_steering("also check tests").await.unwrap();
+        release.notify_one();
+        assert_eq!(run.await.unwrap().unwrap().text.as_deref(), Some("done"));
+        assert_eq!(completion.await.unwrap().0, "idle");
+        assert_eq!(second_completion.await.unwrap().0, "idle");
+
+        let requests = requests.lock().expect("request mutex poisoned");
+        let second_request = &requests[1];
+        let tool_index = second_request
+            .iter()
+            .position(|message| message["role"] == "tool")
+            .unwrap();
+        assert_eq!(
+            second_request[tool_index + 1]["content"][0]["text"],
+            "change direction"
+        );
+        assert_eq!(
+            second_request[tool_index + 2]["content"][0]["text"],
+            "also check tests"
+        );
+        assert_eq!(
+            second_request
+                .iter()
+                .filter(|message| {
+                    message["content"][0]["text"] == "change direction"
+                        || message["content"][0]["text"] == "also check tests"
+                })
+                .count(),
+            2
+        );
+        assert!(second_request[tool_index]["role"] == "tool");
+
+        let messages = store.load_messages("mid-turn-steering").unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| {
+                    message.role == "user"
+                        && message.content["content"][0]["text"] == "change direction"
+                })
+                .count(),
+            1
+        );
+        let events = store.load_session_events("mid-turn-steering").unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| { event.event["working_event"]["event_type"] == "steering_received" })
+        );
+        assert!(events.iter().any(|event| {
+            event.event["working_event"]["event_type"] == "steering_applied"
+                && event.event["working_event"]["payload"]["iteration"] == 2
         }));
     }
 

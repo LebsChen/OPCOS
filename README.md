@@ -16,8 +16,8 @@ RVM 主机。
   等）；模型可按 global/project/session 覆盖。
 - **Harness**：`opcos-engine` 的 `TurnEngine` 是主执行路径——迭代式 agent loop、
   工具目录、审批、压缩、steering、生命周期 hook、iteration stats 和结构化事件
-  流。`Harness` trait 让 OpenCode 和 ACP 作为并列 harness 接入，而不是分叉出
-  第二套 runtime。
+  流。`Harness` trait 让 ACP 作为外部 harness 接入，而不是分叉出第二套
+  runtime；OpenCode 通过 `opencode acp` 使用同一条 ACP 路径。
 - **VM**：`opcos-hosts` 的 Host trait 统一 LocalHost 与 RVM Host——文件、shell、
   持久 shell/PTY、进程、后台 job、repository index、LSP、浏览器/CDP、
   Computer Use、VNC 的可用性都由 Host 声明的 capability 决定，远端不可用时报错
@@ -88,7 +88,6 @@ flowchart TB
 
     D --> H{{"Harness trait<br/>start_turn / events / interrupt /<br/>reply_approval / reply_question / resume"}}
     H --> BI["Builtin TurnEngine<br/>(opcos-engine)"]
-    H --> OC["OpenCode harness<br/>(经 Host 启动)"]
     H --> ACP["ACP harness<br/>(独立路径，不共享工具目录)"]
 
     BI --> PROV["opcos-provider<br/>registry / 模型发现 / 方言适配"]
@@ -116,7 +115,7 @@ flowchart TB
 
 ## 当前边界
 
-- 本地 agent loop 是主要执行路径；OpenCode harness 也可通过 Host 启动。
+- 本地 agent loop 是主要执行路径；OpenCode 通过 `opencode acp` 作为 ACP agent 启动。
 - ACP 是独立 harness 路径，不经过 builtin `TurnEngine` 的工具目录和
   `ToolExecutor`，因此 ACP session 当前不能使用 OPCOS 协同工具。
 - 远端 Host 不可用时返回明确错误，不回退到本机。
@@ -174,7 +173,7 @@ GitHub 只有一个领域模型，多实例差异体现在「实例身份」上�
 
 - builtin TurnEngine 会话、transcript、pending approval、Inbox、暂停/恢复和
   结构化事件；
-- OpenCode harness；ACP harness 独立接入；
+- ACP harness 独立接入；OpenCode ACP 启动 recipe 随 builtin `acp-agent` 模板提供；
 - provider registry 和 API 动态模型发现/缓存；
 - global/project/repo/host/session 配置对象和 builtin preset；
 - `.agents/commands/*.md` 参数化 prompt command：只做纯文本展开，不执行
@@ -231,7 +230,7 @@ Provider 和 connector catalog 覆盖多种 API/OAuth/IMAP 配置；agent tool �
 - CI 工具只查询 GitHub Actions；没有通用 CI provider，也没有“CI 挂了自动修
   到绿”的闭环。CI 工具返回状态和有界失败日志，后续修复仍由 agent loop
   再次编辑/验证。
-- 协同工具只对 builtin TurnEngine 生效；ACP/OpenCode 不自动获得同一工具目录。
+- 协同工具只对 builtin TurnEngine 生效；ACP 不自动获得同一工具目录。
 - coordination Worker result 不会自动推进 Done；真实交付必须经过 branch、
   push、PR repository/head 和 GitHub API 核验，再按 acceptance 规则收口。
 - Commands 不执行动作；MCP repository discovery 不等于 enable/connect。

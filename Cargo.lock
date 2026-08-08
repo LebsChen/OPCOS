@@ -4040,8 +4040,9 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "opcos"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
+ "agent-client-protocol",
  "async-trait",
  "axum",
  "base64 0.22.1",
@@ -4053,11 +4054,13 @@ dependencies = [
  "keyring",
  "native-tls",
  "notify",
+ "opcos-acp-server",
  "opcos-assets",
  "opcos-engine",
  "opcos-hosts",
  "opcos-lsp",
  "opcos-mcp",
+ "opcos-mcp-server",
  "opcos-policy",
  "opcos-provider",
  "opcos-rvm",
@@ -4081,8 +4084,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "opcos-acp-server"
+version = "0.1.1"
+dependencies = [
+ "agent-client-protocol",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
 name = "opcos-assets"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "opcos-rvm",
@@ -4096,7 +4111,7 @@ dependencies = [
 
 [[package]]
 name = "opcos-computer-use"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "png 0.17.16",
@@ -4106,7 +4121,7 @@ dependencies = [
 
 [[package]]
 name = "opcos-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
@@ -4131,7 +4146,7 @@ dependencies = [
 
 [[package]]
 name = "opcos-hosts"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4154,7 +4169,7 @@ dependencies = [
 
 [[package]]
 name = "opcos-lsp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4168,9 +4183,11 @@ dependencies = [
 
 [[package]]
 name = "opcos-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
+ "futures-util",
  "opcos-rvm",
  "reqwest",
  "serde",
@@ -4178,11 +4195,25 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.19",
  "tokio",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "opcos-mcp-server"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "axum",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]
 name = "opcos-policy"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "serde",
@@ -4192,7 +4223,7 @@ dependencies = [
 
 [[package]]
 name = "opcos-provider"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -4213,7 +4244,7 @@ dependencies = [
 
 [[package]]
 name = "opcos-rvm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -4232,7 +4263,7 @@ dependencies = [
 
 [[package]]
 name = "opcos-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "keyring",

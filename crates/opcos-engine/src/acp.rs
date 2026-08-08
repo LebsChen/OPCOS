@@ -1,6 +1,6 @@
 use crate::{
-    ApprovalOutcome, Harness, HarnessApprovalRequest, HarnessError, HarnessEvent, HarnessKind,
-    HarnessResumeInput, HarnessTurnInput, SessionRecorder, TurnHandle,
+    AcpAuthMethod, ApprovalOutcome, Harness, HarnessApprovalRequest, HarnessError, HarnessEvent,
+    HarnessKind, HarnessResumeInput, HarnessTurnInput, SessionRecorder, TurnHandle,
 };
 use async_trait::async_trait;
 use opcos_hosts::{Host, HostProcess, HostStdioProcess, SpawnRequest, StdioEvent};
@@ -12,6 +12,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 
@@ -80,6 +81,7 @@ pub struct AcpHarnessConfig {
     pub workspace: String,
     pub command: String,
     pub env: Option<Value>,
+    pub mcp_servers: Vec<Value>,
 }
 
 struct AcpTurn {
@@ -92,6 +94,7 @@ struct AcpTurn {
 struct PendingPermission {
     turn_id: String,
     options: Vec<String>,
+    switch_mode: bool,
 }
 
 struct AcpState<S>
@@ -105,7 +108,7 @@ where
     external_session_id: Mutex<String>,
     workspace: String,
     events: mpsc::Sender<HarnessEvent>,
-    pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
+    pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, AcpRpcError>>>>,
     prompt_pending: Mutex<HashMap<u64, String>>,
     permissions: Mutex<HashMap<String, PendingPermission>>,
     turns: Mutex<HashMap<String, Arc<AcpTurn>>>,
@@ -114,6 +117,22 @@ where
     next_id: AtomicU64,
     shutdown: Notify,
     supports_load: Mutex<bool>,
+    protocol_version: Mutex<String>,
+    auth_methods: Mutex<Vec<Value>>,
+    auth_required: Mutex<bool>,
+    mcp_servers: Mutex<Vec<Value>>,
+    plan_id: Mutex<Option<String>>,
+    current_mode_id: Mutex<Option<String>>,
+    available_modes: Mutex<Vec<Value>>,
+    config_options: Mutex<Vec<Value>>,
+    available_commands: Mutex<Vec<Value>>,
+}
+
+#[derive(Clone, Debug)]
+struct AcpRpcError {
+    code: i64,
+    message: String,
+    data: Option<Value>,
 }
 
 pub struct AcpHarness<S>
@@ -171,6 +190,15 @@ where
             next_id: AtomicU64::new(1),
             shutdown: Notify::new(),
             supports_load: Mutex::new(false),
+            protocol_version: Mutex::new(String::new()),
+            auth_methods: Mutex::new(Vec::new()),
+            auth_required: Mutex::new(false),
+            mcp_servers: Mutex::new(config.mcp_servers.clone()),
+            plan_id: Mutex::new(None),
+            current_mode_id: Mutex::new(None),
+            available_modes: Mutex::new(Vec::new()),
+            config_options: Mutex::new(Vec::new()),
+            available_commands: Mutex::new(Vec::new()),
         });
         let harness = Arc::new(Self {
             state: state.clone(),
@@ -192,11 +220,38 @@ where
                     },
                     "clientCapabilities": {
                         "fs": {"readTextFile": true, "writeTextFile": true},
-                        "terminal": true
+                        "terminal": true,
+                        "session": {"configOptions": {"boolean": {}}}
                     }
                 }),
             )
             .await?;
+        let protocol_version = init
+            .get("protocolVersion")
+            .cloned()
+            .ok_or_else(|| {
+                HarnessError::External("ACP initialize response omitted protocolVersion".into())
+            })
+            .and_then(|value| {
+                serde_json::from_value::<agent_client_protocol::schema::ProtocolVersion>(value)
+                    .map_err(|error| {
+                        HarnessError::External(format!(
+                            "ACP protocol version is incompatible: {error}"
+                        ))
+                    })
+            })?;
+        if protocol_version != agent_client_protocol::schema::ProtocolVersion::V1 {
+            return Err(HarnessError::External(format!(
+                "ACP protocol version is incompatible: {protocol_version}"
+            )));
+        }
+        *state.protocol_version.lock().await = protocol_version.to_string();
+        let auth_methods = init
+            .get("authMethods")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        *state.auth_methods.lock().await = auth_methods;
         let supports_load = init
             .get("agentCapabilities")
             .and_then(|value| value.get("loadSession"))
@@ -208,7 +263,82 @@ where
                 "session/new",
                 json!({
                     "cwd": config_workspace(&state.workspace),
-                    "mcpServers": []
+                    "mcpServers": config.mcp_servers
+                }),
+            )
+            .await;
+        let session = match session {
+            Ok(session) => session,
+            Err(error) if is_authentication_error(&error) => {
+                *state.auth_required.lock().await = true;
+                return Ok(harness);
+            }
+            Err(error) => return Err(error),
+        };
+        let external_session_id = session
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                HarnessError::External("ACP session/new response omitted sessionId".into())
+            })?
+            .to_owned();
+        *state.external_session_id.lock().await = external_session_id.clone();
+        apply_session_metadata(&state, &session).await;
+        state
+            .recorder
+            .set_external_session_id(Some(&external_session_id))
+            .map_err(|error| HarnessError::External(error.to_string()))?;
+        Ok(harness)
+    }
+
+    pub async fn advertised_auth_methods(&self) -> Vec<Value> {
+        self.state.auth_methods.lock().await.clone()
+    }
+
+    async fn advertised_auth_method_records(&self) -> Vec<AcpAuthMethod> {
+        self.state
+            .auth_methods
+            .lock()
+            .await
+            .iter()
+            .filter_map(|method| {
+                method
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(|id| AcpAuthMethod {
+                        id: id.to_owned(),
+                        description: method
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                    })
+            })
+            .collect()
+    }
+
+    pub async fn authenticate(&self, method_id: &str) -> Result<(), HarnessError> {
+        if !self
+            .state
+            .auth_methods
+            .lock()
+            .await
+            .iter()
+            .any(|method| method.get("id").and_then(Value::as_str) == Some(method_id))
+        {
+            return Err(HarnessError::External(
+                "ACP authentication method is not advertised".into(),
+            ));
+        }
+        self.state
+            .request("authenticate", json!({"methodId": method_id}))
+            .await?;
+        let session = self
+            .state
+            .request(
+                "session/new",
+                json!({
+                    "cwd": config_workspace(&self.state.workspace),
+                    "mcpServers": self.state.mcp_servers.lock().await.clone()
                 }),
             )
             .await?;
@@ -219,12 +349,65 @@ where
                 HarnessError::External("ACP session/new response omitted sessionId".into())
             })?
             .to_owned();
-        *state.external_session_id.lock().await = external_session_id.clone();
-        state
+        *self.state.external_session_id.lock().await = external_session_id.clone();
+        apply_session_metadata(&self.state, &session).await;
+        *self.state.auth_required.lock().await = false;
+        self.state
             .recorder
             .set_external_session_id(Some(&external_session_id))
-            .map_err(|error| HarnessError::External(error.to_string()))?;
-        Ok(harness)
+            .map_err(|error| HarnessError::External(error.to_string()))
+    }
+
+    pub async fn session_capabilities(&self) -> Value {
+        json!({
+            "currentModeId": self.state.current_mode_id.lock().await.clone(),
+            "availableModes": self.state.available_modes.lock().await.clone(),
+            "configOptions": self.state.config_options.lock().await.clone(),
+            "availableCommands": self.state.available_commands.lock().await.clone(),
+        })
+    }
+
+    pub async fn set_mode(&self, mode_id: &str) -> Result<(), HarnessError> {
+        self.state
+            .request(
+                "session/set_mode",
+                json!({"sessionId": self.state.external_session_id.lock().await.clone(), "modeId": mode_id}),
+            )
+            .await?;
+        self.state.set_current_mode(mode_id).await;
+        Ok(())
+    }
+
+    pub async fn set_config_option(
+        &self,
+        config_id: &str,
+        value: Value,
+    ) -> Result<(), HarnessError> {
+        let mut params = json!({
+            "sessionId": self.state.external_session_id.lock().await.clone(),
+            "configId": config_id,
+            "value": value,
+        });
+        if self.state.config_options.lock().await.iter().any(|option| {
+            option.get("id").and_then(Value::as_str) == Some(config_id)
+                && option.get("type").and_then(Value::as_str) == Some("boolean")
+        }) {
+            params["type"] = json!("boolean");
+        }
+        let response = self
+            .state
+            .request("session/set_config_option", params)
+            .await?;
+        self.state
+            .set_config_options(
+                response
+                    .get("configOptions")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+            .await;
+        Ok(())
     }
 
     fn new_turn(&self) -> (String, Arc<AcpTurn>, TurnHandle) {
@@ -256,6 +439,11 @@ where
     }
 
     async fn start_turn(&self, input: HarnessTurnInput) -> Result<TurnHandle, HarnessError> {
+        if *self.state.auth_required.lock().await {
+            return Err(HarnessError::AcpAuthenticationRequired(
+                self.advertised_auth_method_records().await,
+            ));
+        }
         let (turn_id, turn, handle) = self.new_turn();
         self.state.turns.lock().await.insert(turn_id.clone(), turn);
         *self.state.active_turn.lock().await = Some(turn_id);
@@ -306,34 +494,8 @@ where
         request_id: &str,
         outcome: ApprovalOutcome,
     ) -> Result<TurnHandle, HarnessError> {
-        let pending = self
-            .state
-            .permissions
-            .lock()
+        self.reply_approval_with_option(request_id, outcome, None)
             .await
-            .remove(request_id)
-            .ok_or_else(|| HarnessError::PendingNotFound(request_id.into()))?;
-        let result = match outcome {
-            ApprovalOutcome::Approve => pending
-                .options
-                .first()
-                .map(|option_id| json!({"outcome": {"outcome": "selected", "optionId": option_id}}))
-                .unwrap_or_else(|| json!({"outcome": {"outcome": "cancelled"}})),
-            ApprovalOutcome::Deny => json!({"outcome": {"outcome": "cancelled"}}),
-        };
-        self.state.respond(request_id, result).await?;
-        let turn = self
-            .state
-            .turns
-            .lock()
-            .await
-            .get(&pending.turn_id)
-            .cloned()
-            .ok_or(HarnessError::TurnAbandoned)?;
-        Ok(TurnHandle::from_parts(
-            pending.turn_id,
-            turn.receiver.clone(),
-        ))
     }
 
     async fn resume(&self, input: HarnessResumeInput) -> Result<Option<TurnHandle>, HarnessError> {
@@ -348,7 +510,7 @@ where
                 "ACP agent does not advertise session/load".into(),
             ));
         }
-        let _ = self
+        let session = self
             .state
             .request(
                 "session/load",
@@ -358,6 +520,7 @@ where
                 }),
             )
             .await?;
+        apply_session_metadata(&self.state, &session).await;
         Ok(None)
     }
 
@@ -368,6 +531,59 @@ where
     ) -> Result<TurnHandle, HarnessError> {
         Err(HarnessError::External(
             "ACP agents use session/request_permission; question responses are unsupported".into(),
+        ))
+    }
+}
+
+impl<S> AcpHarness<S>
+where
+    S: SessionStore + Send + Sync + 'static,
+{
+    pub async fn reply_approval_with_option(
+        &self,
+        request_id: &str,
+        outcome: ApprovalOutcome,
+        option_id: Option<String>,
+    ) -> Result<TurnHandle, HarnessError> {
+        let pending = self
+            .state
+            .permissions
+            .lock()
+            .await
+            .remove(request_id)
+            .ok_or_else(|| HarnessError::PendingNotFound(request_id.into()))?;
+        let selected_option = option_id
+            .filter(|option| pending.options.iter().any(|candidate| candidate == option))
+            .or_else(|| {
+                (!pending.switch_mode)
+                    .then(|| pending.options.first().cloned())
+                    .flatten()
+            });
+        let result = match outcome {
+            ApprovalOutcome::Approve => selected_option
+                .as_ref()
+                .map(|option_id| json!({"outcome": {"outcome": "selected", "optionId": option_id}}))
+                .unwrap_or_else(|| json!({"outcome": {"outcome": "cancelled"}})),
+            ApprovalOutcome::Deny => json!({"outcome": {"outcome": "cancelled"}}),
+        };
+        self.state.respond(request_id, result).await?;
+        if let ApprovalOutcome::Approve = outcome
+            && pending.switch_mode
+            && let Some(mode_id) = selected_option
+        {
+            self.state.set_current_mode(&mode_id).await;
+        }
+        let turn = self
+            .state
+            .turns
+            .lock()
+            .await
+            .get(&pending.turn_id)
+            .cloned()
+            .ok_or(HarnessError::TurnAbandoned)?;
+        Ok(TurnHandle::from_parts(
+            pending.turn_id,
+            turn.receiver.clone(),
         ))
     }
 }
@@ -385,6 +601,52 @@ impl<S> AcpState<S>
 where
     S: SessionStore + Send + Sync + 'static,
 {
+    async fn set_current_mode(&self, mode_id: &str) {
+        *self.current_mode_id.lock().await = Some(mode_id.to_owned());
+        let _ = self.recorder.store().append_session_event(
+            &self.session_id,
+            &json!({
+                "event_id": format!("event-{}", uuid::Uuid::new_v4()),
+                "type": "acp_mode_update",
+                "modeId": mode_id,
+                "created_at_ms": SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|value| value.as_millis() as i64)
+                    .unwrap_or_default(),
+            }),
+        );
+        let _ = self
+            .events
+            .send(HarnessEvent::SessionModeUpdate {
+                current_mode_id: mode_id.to_owned(),
+                available_modes: self.available_modes.lock().await.clone(),
+            })
+            .await;
+    }
+
+    async fn set_config_options(&self, options: Vec<Value>) {
+        let options = recognized_config_options(options);
+        *self.config_options.lock().await = options.clone();
+        let _ = self.recorder.store().append_session_event(
+            &self.session_id,
+            &json!({
+                "event_id": format!("event-{}", uuid::Uuid::new_v4()),
+                "type": "acp_config_option_update",
+                "configOptions": options,
+                "created_at_ms": SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|value| value.as_millis() as i64)
+                    .unwrap_or_default(),
+            }),
+        );
+        let _ = self
+            .events
+            .send(HarnessEvent::SessionConfigUpdate {
+                config_options: options,
+            })
+            .await;
+    }
+
     async fn request(&self, method: &str, params: Value) -> Result<Value, HarnessError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
@@ -394,7 +656,11 @@ where
         receiver
             .await
             .map_err(|_| HarnessError::External("ACP response channel closed".into()))?
-            .map_err(HarnessError::External)
+            .map_err(|error| HarnessError::AcpRpc {
+                code: error.code,
+                message: error.message,
+                data: error.data,
+            })
     }
 
     async fn notify(&self, method: &str, params: Value) -> Result<(), HarnessError> {
@@ -427,6 +693,38 @@ where
     }
 }
 
+async fn apply_session_metadata<S>(state: &Arc<AcpState<S>>, session: &Value)
+where
+    S: SessionStore + Send + Sync + 'static,
+{
+    if let Some(modes) = session.get("modes") {
+        *state.current_mode_id.lock().await = modes
+            .get("currentModeId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        *state.available_modes.lock().await = modes
+            .get("availableModes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+    }
+    if let Some(options) = session.get("configOptions").and_then(Value::as_array) {
+        *state.config_options.lock().await = recognized_config_options(options.clone());
+    }
+}
+
+fn recognized_config_options(options: Vec<Value>) -> Vec<Value> {
+    options
+        .into_iter()
+        .filter(|option| {
+            matches!(
+                option.get("type").and_then(Value::as_str),
+                Some("select" | "boolean")
+            )
+        })
+        .collect()
+}
+
 async fn read_loop<S>(state: Arc<AcpState<S>>)
 where
     S: SessionStore + Send + Sync + 'static,
@@ -446,7 +744,14 @@ where
                     let line = buffer.drain(..=index).collect::<Vec<_>>();
                     match serde_json::from_slice::<Value>(&line[..line.len() - 1]) {
                         Ok(message) => {
-                            let _ = dispatch_message(&state, message).await;
+                            if let Err(error) = dispatch_message(&state, message).await {
+                                let _ = state
+                                    .events
+                                    .send(HarnessEvent::Error {
+                                        message: error.to_string(),
+                                    })
+                                    .await;
+                            }
                         }
                         Err(error) => {
                             let _ = state
@@ -477,7 +782,11 @@ where
         let pending = std::mem::take(&mut *self.pending.lock().await);
         let had_pending = !pending.is_empty();
         for sender in pending.into_values() {
-            let _ = sender.send(Err(reason.to_owned()));
+            let _ = sender.send(Err(AcpRpcError {
+                code: -1,
+                message: reason.to_owned(),
+                data: None,
+            }));
         }
         let prompt_pending = std::mem::take(&mut *self.prompt_pending.lock().await);
         let had_pending = had_pending || !prompt_pending.is_empty();
@@ -512,24 +821,31 @@ where
     if let Some(id) = message.get("id").and_then(Value::as_u64) {
         if message.get("method").is_none() {
             if let Some(turn_id) = state.prompt_pending.lock().await.remove(&id) {
-                let result = message.get("result").cloned().ok_or_else(|| {
-                    message.get("error").map_or_else(
-                        || "ACP prompt response omitted result".to_owned(),
-                        |error| error.to_string(),
-                    )
-                });
+                let result = rpc_result(&message);
                 let turn = state.turns.lock().await.remove(&turn_id);
                 *state.active_turn.lock().await = None;
                 if let Some(turn) = turn {
                     match result {
-                        Ok(_) => {
+                        Ok(result) => {
+                            let stop_reason = result
+                                .get("stopReason")
+                                .and_then(Value::as_str)
+                                .unwrap_or("end_turn");
+                            if stop_reason == "cancelled" {
+                                if let Some(sender) = turn.sender.lock().await.take() {
+                                    let _ = sender.send(Err(HarnessError::Engine(
+                                        crate::EngineError::Interrupted,
+                                    )));
+                                }
+                                return Ok(());
+                            }
                             let assistant = opcos_provider::AssistantTurn {
                                 text: Some(turn.text.lock().await.clone())
                                     .filter(|text| !text.is_empty()),
                                 reasoning: Some(turn.reasoning.lock().await.clone())
                                     .filter(|text| !text.is_empty()),
                                 tool_calls: Vec::new(),
-                                finish_reason: Some("stop".into()),
+                                finish_reason: Some(map_stop_reason(stop_reason).into()),
                                 extras: json!({"harness": "acp"}),
                                 usage: None,
                             };
@@ -543,19 +859,14 @@ where
                         }
                         Err(error) => {
                             if let Some(sender) = turn.sender.lock().await.take() {
-                                let _ = sender.send(Err(HarnessError::External(error)));
+                                let _ = sender.send(Err(error.into()));
                             }
                         }
                     }
                 }
             }
             if let Some(sender) = state.pending.lock().await.remove(&id) {
-                let result = message.get("result").cloned().ok_or_else(|| {
-                    message.get("error").map_or_else(
-                        || "ACP response omitted result".to_owned(),
-                        |error| error.to_string(),
-                    )
-                });
+                let result = rpc_result(&message);
                 let _ = sender.send(result);
             }
             return Ok(());
@@ -578,6 +889,38 @@ where
             .await;
     }
     Ok(())
+}
+
+fn rpc_result(message: &Value) -> Result<Value, AcpRpcError> {
+    if let Some(result) = message.get("result") {
+        return Ok(result.clone());
+    }
+    let Some(error) = message.get("error") else {
+        return Err(AcpRpcError {
+            code: -32603,
+            message: "ACP response omitted result".into(),
+            data: None,
+        });
+    };
+    Err(AcpRpcError {
+        code: error.get("code").and_then(Value::as_i64).unwrap_or(-32603),
+        message: error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("ACP JSON-RPC request failed")
+            .to_owned(),
+        data: error.get("data").cloned(),
+    })
+}
+
+impl From<AcpRpcError> for HarnessError {
+    fn from(error: AcpRpcError) -> Self {
+        Self::AcpRpc {
+            code: error.code,
+            message: error.message,
+            data: error.data,
+        }
+    }
 }
 
 async fn handle_session_update<S>(
@@ -620,23 +963,202 @@ where
                     .await;
             }
         }
-        "tool_call" | "tool_call_update" => {
+        "user_message_chunk" => {
+            // The ACP user message is already recorded by the desktop submit path.
+        }
+        "tool_call" => {
+            let call_id = update
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let tool = update
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("ACP tool")
+                .to_owned();
             let _ = state
                 .events
                 .send(HarnessEvent::ToolCallDelta {
-                    call_id: update
-                        .get("toolCallId")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    tool: update
-                        .get("title")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
+                    call_id: Some(call_id.clone()),
+                    tool: Some(tool.clone()),
                     arguments_fragment: update.get("rawInput").map(Value::to_string),
                 })
                 .await;
+            let _ = state
+                .events
+                .send(HarnessEvent::ToolCallUpdate {
+                    call_id,
+                    tool,
+                    status: update
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("pending")
+                        .to_owned(),
+                    content: update.get("content").cloned(),
+                    locations: update
+                        .get("locations")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default(),
+                })
+                .await;
+        }
+        "tool_call_update" => {
+            let call_id = update
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let tool = update
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("ACP tool")
+                .to_owned();
+            let status = update
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("in_progress")
+                .to_owned();
+            let content = update.get("content").cloned();
+            let _ = state
+                .events
+                .send(HarnessEvent::ToolCallUpdate {
+                    call_id: call_id.clone(),
+                    tool: tool.clone(),
+                    status: status.clone(),
+                    content: content.clone(),
+                    locations: update
+                        .get("locations")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default(),
+                })
+                .await;
+            if matches!(status.as_str(), "completed" | "failed") {
+                let _ = state
+                    .events
+                    .send(HarnessEvent::ToolResult {
+                        call_id,
+                        tool,
+                        arguments: update.get("rawInput").cloned().unwrap_or_else(|| json!({})),
+                        result: content.unwrap_or_else(|| update.clone()),
+                    })
+                    .await;
+            }
+        }
+        "plan" | "plan_update" => {
+            let entries = update
+                .get("entries")
+                .or_else(|| update.get("plan"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            persist_plan_update(state, &entries).await?;
+            let _ = state
+                .events
+                .send(HarnessEvent::PlanUpdate { entries })
+                .await;
+        }
+        "current_mode_update" => {
+            if let Some(mode_id) = update.get("modeId").and_then(Value::as_str) {
+                state.set_current_mode(mode_id).await;
+            }
+        }
+        "config_option_update" => {
+            state
+                .set_config_options(
+                    update
+                        .get("configOptions")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+                .await;
+        }
+        "available_commands_update" => {
+            let commands = update
+                .get("availableCommands")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            *state.available_commands.lock().await = commands.clone();
+            let _ = state
+                .events
+                .send(HarnessEvent::AvailableCommandsUpdate { commands })
+                .await;
         }
         _ => {}
+    }
+    Ok(())
+}
+
+async fn persist_plan_update<S>(
+    state: &Arc<AcpState<S>>,
+    entries: &[Value],
+) -> Result<(), HarnessError>
+where
+    S: SessionStore + Send + Sync + 'static,
+{
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut plan_id = state.plan_id.lock().await;
+    if plan_id.is_none() {
+        let steps = entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .get("content")
+                    .or_else(|| entry.get("title"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("ACP plan step")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        let plan = state
+            .recorder
+            .store()
+            .create_plan(&state.session_id, None, "ACP plan", "", &steps)
+            .map_err(|error| HarnessError::External(error.to_string()))?;
+        *plan_id = Some(plan.plan_id);
+    }
+    let Some(_plan_id) = plan_id.as_deref() else {
+        return Ok(());
+    };
+    for (index, entry) in entries.iter().enumerate() {
+        let status = match entry.get("status").and_then(Value::as_str) {
+            Some("completed" | "done") => "done",
+            Some("in_progress" | "active") => "in_progress",
+            Some("failed") => "failed",
+            Some("cancelled" | "abandoned") => "abandoned",
+            _ => "not_started",
+        };
+        let reason = if matches!(status, "failed" | "abandoned") {
+            Some(
+                entry
+                    .get("reason")
+                    .or_else(|| entry.get("description"))
+                    .or_else(|| entry.get("content"))
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("ACP agent reported this plan step as failed or abandoned")
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
+        state
+            .recorder
+            .store()
+            .update_plan_step(
+                &state.session_id,
+                &(index + 1).to_string(),
+                Some(status),
+                None,
+                reason.as_deref(),
+            )
+            .map_err(|error| HarnessError::External(error.to_string()))?;
     }
     Ok(())
 }
@@ -656,16 +1178,28 @@ where
                 .get("path")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            if params.get("line").is_some() || params.get("limit").is_some() {
-                return state
-                    .error(
-                        id,
-                        "ACP fs/read_text_file line/limit slicing is not supported",
-                    )
-                    .await;
-            }
             match state.host.read(path).await {
-                Ok(file) => state.respond(id, json!({"content": file.content})).await,
+                Ok(file) => {
+                    let line = params.get("line").and_then(Value::as_u64).unwrap_or(1);
+                    if line == 0 {
+                        return state.error(id, "ACP line must be 1-based").await;
+                    }
+                    let limit = params.get("limit").and_then(Value::as_u64);
+                    let lines = file.content.lines().collect::<Vec<_>>();
+                    let start = (line - 1) as usize;
+                    if start > lines.len() {
+                        return state.respond(id, json!({"content": ""})).await;
+                    }
+                    let end = limit
+                        .map(|limit| start.saturating_add(limit as usize))
+                        .unwrap_or(lines.len())
+                        .min(lines.len());
+                    let mut content = lines[start..end].join("\n");
+                    if end < lines.len() {
+                        content.push('\n');
+                    }
+                    state.respond(id, json!({"content": content})).await
+                }
                 Err(error) => state.error(id, &error.to_string()).await,
             }
         }
@@ -693,6 +1227,11 @@ where
                 PendingPermission {
                     turn_id: turn_id.clone(),
                     options,
+                    switch_mode: params
+                        .get("toolCall")
+                        .and_then(|tool_call| tool_call.get("kind"))
+                        .and_then(Value::as_str)
+                        == Some("switch_mode"),
                 },
             );
             state
@@ -940,6 +1479,21 @@ fn config_workspace(workspace: &str) -> &str {
     workspace
 }
 
+fn is_authentication_error(error: &HarnessError) -> bool {
+    matches!(
+        error,
+        HarnessError::AcpRpc { code, .. } if matches!(*code, -32001 | -32002 | -32003 | 401 | 403)
+    )
+}
+
+fn map_stop_reason(reason: &str) -> &'static str {
+    match reason {
+        "max_tokens" => "length",
+        "cancelled" => "cancelled",
+        _ => "stop",
+    }
+}
+
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -954,12 +1508,61 @@ mod tests {
     use std::sync::Arc;
     use tokio::time::{Duration, timeout};
 
+    fn save_test_session(store: &SqliteStore, root: &std::path::Path) {
+        store
+            .save_session(&SessionRecord {
+                session_id: "session".into(),
+                workspace: root.display().to_string(),
+                model: "test".into(),
+                mode: "interactive".into(),
+                harness: "acp".into(),
+                title: "ACP".into(),
+                extra_roots: vec![],
+                grants: json!({}),
+                pinned: false,
+                archived: false,
+                origin: None,
+                origin_label: None,
+                compaction: json!({}),
+                host_id: "local".into(),
+                provider: None,
+                external_session_id: None,
+                run_state: "idle".into(),
+                stop_reason: "none".into(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                project_id: None,
+                agent_id: None,
+            })
+            .unwrap();
+    }
+
     #[test]
     fn maps_acp_text_content() {
         assert_eq!(
             content_text(Some(&json!({"type": "text", "text": "hello"}))),
             Some("hello".into())
         );
+    }
+
+    #[test]
+    fn preserves_structured_rpc_errors() {
+        let error = rpc_result(&json!({
+            "jsonrpc": "2.0",
+            "error": {"code": -32001, "message": "login required", "data": {"method": "oauth"}}
+        }))
+        .unwrap_err();
+        assert_eq!(error.code, -32001);
+        assert_eq!(error.data, Some(json!({"method": "oauth"})));
+        assert!(is_authentication_error(&HarnessError::from(error)));
+    }
+
+    #[test]
+    fn maps_acp_stop_reasons_to_supported_engine_reasons() {
+        assert_eq!(map_stop_reason("end_turn"), "stop");
+        assert_eq!(map_stop_reason("max_tokens"), "length");
+        assert_eq!(map_stop_reason("cancelled"), "cancelled");
+        assert_eq!(map_stop_reason("refusal"), "stop");
     }
 
     #[test]
@@ -1105,7 +1708,7 @@ for line in sys.stdin:
     message = json.loads(line)
     method = message.get("method")
     if method == "initialize":
-        result = {"sessionCapabilities": {"loadSession": True}}
+        result = {"protocolVersion": 1, "sessionCapabilities": {"loadSession": True}}
     elif method == "session/new":
         result = {"sessionId": "external-session"}
     elif method == "session/prompt":
@@ -1164,6 +1767,7 @@ for line in sys.stdin:
                 workspace: root.display().to_string(),
                 command: format!("python3 {}", shell_quote(&script.display().to_string())),
                 env: None,
+                mcp_servers: Vec::new(),
             },
         )
         .await
@@ -1202,6 +1806,756 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
+    async fn authentication_required_can_authenticate_and_retry_session() {
+        let root = std::env::temp_dir().join(format!("opcos-acp-auth-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let script = root.join("auth-agent.py");
+        fs::write(
+            &script,
+            r#"
+import json, sys
+authenticated = False
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": 1, "authMethods": [{"id": "oauth", "description": "OAuth"}]}
+    elif method == "session/new" and not authenticated:
+        print(json.dumps({"jsonrpc":"2.0","id":message["id"],"error":{"code":-32001,"message":"login required"}}), flush=True)
+        continue
+    elif method == "authenticate":
+        authenticated = message["params"]["methodId"] == "oauth"
+        result = {}
+    elif method == "session/new":
+        result = {"sessionId":"auth-session"}
+    elif method == "session/prompt":
+        print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"authenticated"}}}}), flush=True)
+        result = {"stopReason":"end_turn"}
+    else:
+        continue
+    print(json.dumps({"jsonrpc":"2.0","id":message["id"],"result":result}), flush=True)
+"#,
+        )
+        .unwrap();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        save_test_session(&store, &root);
+        let harness = AcpHarness::start(
+            Arc::new(LocalHost::new(&root).unwrap()),
+            Arc::new(SessionRecorder::new(store, "session")),
+            "session",
+            AcpHarnessConfig {
+                workspace: root.display().to_string(),
+                command: format!("python3 {}", shell_quote(&script.display().to_string())),
+                env: None,
+                mcp_servers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let error = harness
+            .start_turn(HarnessTurnInput::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            HarnessError::AcpAuthenticationRequired(methods)
+                if methods == vec![AcpAuthMethod { id: "oauth".into(), description: Some("OAuth".into()) }]
+        ));
+        assert!(harness.authenticate("unknown").await.is_err());
+        harness.authenticate("oauth").await.unwrap();
+        let turn = harness
+            .start_turn(HarnessTurnInput {
+                text: "hello".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let result = timeout(Duration::from_secs(5), turn.await_finished())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.text.as_deref(), Some("authenticated"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn stop_reasons_are_preserved_in_turn_results() {
+        let root = std::env::temp_dir().join(format!("opcos-acp-stop-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let script = root.join("stop-agent.py");
+        fs::write(
+            &script,
+            r#"
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": 1}
+    elif method == "session/new":
+        result = {"sessionId":"stop-session"}
+    elif method == "session/prompt":
+        prompt = message["params"]["prompt"][0]["text"]
+        result = {"stopReason": prompt}
+    else:
+        continue
+    print(json.dumps({"jsonrpc":"2.0","id":message["id"],"result":result}), flush=True)
+"#,
+        )
+        .unwrap();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        save_test_session(&store, &root);
+        let harness = AcpHarness::start(
+            Arc::new(LocalHost::new(&root).unwrap()),
+            Arc::new(SessionRecorder::new(store, "session")),
+            "session",
+            AcpHarnessConfig {
+                workspace: root.display().to_string(),
+                command: format!("python3 {}", shell_quote(&script.display().to_string())),
+                env: None,
+                mcp_servers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        for (reason, expected) in [
+            ("end_turn", "stop"),
+            ("max_tokens", "length"),
+            ("refusal", "stop"),
+        ] {
+            let turn = harness
+                .start_turn(HarnessTurnInput {
+                    text: reason.into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let result = timeout(Duration::from_secs(5), turn.await_finished())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.finish_reason.as_deref(), Some(expected));
+        }
+        let turn = harness
+            .start_turn(HarnessTurnInput {
+                text: "cancelled".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(5), turn.await_finished())
+                .await
+                .unwrap()
+                .unwrap_err(),
+            HarnessError::Engine(crate::EngineError::Interrupted)
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn incompatible_or_missing_protocol_version_fails_start() {
+        for (name, initialize, needle) in [
+            ("incompatible", r#"{"protocolVersion":99}"#, "99"),
+            ("missing", r#"{}"#, "omitted protocolVersion"),
+        ] {
+            let root =
+                std::env::temp_dir().join(format!("opcos-acp-{name}-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&root).unwrap();
+            let script = root.join("agent.py");
+            fs::write(
+                &script,
+                format!(
+                    r#"
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get("method") == "initialize":
+        print(json.dumps({{"jsonrpc":"2.0","id":message["id"],"result":{initialize}}}), flush=True)
+"#
+                ),
+            )
+            .unwrap();
+            let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+            save_test_session(&store, &root);
+            let result = AcpHarness::start(
+                Arc::new(LocalHost::new(&root).unwrap()),
+                Arc::new(SessionRecorder::new(store, "session")),
+                "session",
+                AcpHarnessConfig {
+                    workspace: root.display().to_string(),
+                    command: format!("python3 {}", shell_quote(&script.display().to_string())),
+                    env: None,
+                    mcp_servers: Vec::new(),
+                },
+            )
+            .await;
+            let error = match result {
+                Ok(_) => panic!("incompatible protocol unexpectedly succeeded"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains(needle), "{error}");
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn fs_read_text_file_supports_line_limits_and_boundaries() {
+        let root = std::env::temp_dir().join(format!("opcos-acp-fs-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("lines.txt");
+        fs::write(&file, "one\ntwo\nthree").unwrap();
+        let script = root.join("fs-agent.py");
+        fs::write(
+            &script,
+            format!(
+                r#"
+import json, sys
+path = {path:?}
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        result = {{"protocolVersion": 1}}
+    elif method == "session/new":
+        result = {{"sessionId":"fs-session"}}
+    elif method == "session/prompt":
+        name = message["params"]["prompt"][0]["text"]
+        params = {{"path": path}}
+        if name == "normal": params.update(line=2, limit=2)
+        if name == "out": params.update(line=9, limit=2)
+        if name == "zero": params.update(line=0, limit=2)
+        if name == "limit": params.update(line=2, limit=9)
+        if name == "notrail": params = {{"path": path, "line": 3}}
+        print(json.dumps({{"jsonrpc":"2.0","id":90,"method":"fs/read_text_file","params":params}}), flush=True)
+        response = json.loads(sys.stdin.readline())
+        text = response.get("result", response.get("error", {{}}))
+        print(json.dumps({{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":json.dumps(text)}}}}}}}}), flush=True)
+        result = {{"stopReason":"end_turn"}}
+    else:
+        continue
+    print(json.dumps({{"jsonrpc":"2.0","id":message["id"],"result":result}}), flush=True)
+"#,
+                path = file.display().to_string()
+            ),
+        )
+        .unwrap();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        save_test_session(&store, &root);
+        let harness = AcpHarness::start(
+            Arc::new(LocalHost::new(&root).unwrap()),
+            Arc::new(SessionRecorder::new(store, "session")),
+            "session",
+            AcpHarnessConfig {
+                workspace: root.display().to_string(),
+                command: format!("python3 {}", shell_quote(&script.display().to_string())),
+                env: None,
+                mcp_servers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        for (name, expected) in [
+            ("normal", "two\nthree"),
+            ("out", ""),
+            ("limit", "two\nthree"),
+            ("notrail", "three"),
+        ] {
+            let turn = harness
+                .start_turn(HarnessTurnInput {
+                    text: name.into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let result = timeout(Duration::from_secs(5), turn.await_finished())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let payload: Value = serde_json::from_str(result.text.as_deref().unwrap()).unwrap();
+            assert_eq!(payload["content"].as_str(), Some(expected));
+        }
+        let turn = harness
+            .start_turn(HarnessTurnInput {
+                text: "zero".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let result = timeout(Duration::from_secs(5), turn.await_finished())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(result.text.unwrap_or_default().contains("1-based"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn tool_and_plan_updates_emit_structured_events_and_persist_plan() {
+        let root = std::env::temp_dir().join(format!("opcos-acp-events-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let script = root.join("events-agent.py");
+        fs::write(
+            &script,
+            r#"
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": 1}
+    elif method == "session/new":
+        result = {"sessionId":"events-session"}
+    elif method == "session/prompt":
+        def update(value):
+            print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{"update":value}}), flush=True)
+        update({"sessionUpdate":"tool_call","toolCallId":"call-1","title":"edit","status":"pending","rawInput":{"path":"a"}})
+        update({"sessionUpdate":"tool_call_update","toolCallId":"call-1","title":"edit","status":"in_progress","locations":[{"path":"a","line":1}]})
+        update({"sessionUpdate":"tool_call_update","toolCallId":"call-1","title":"edit","status":"completed","content":[{"type":"diff","path":"a","oldText":"a","newText":"b"}],"locations":[{"path":"a","line":1}]})
+        update({"sessionUpdate":"tool_call_update","toolCallId":"call-2","title":"read","status":"failed","content":[{"type":"text","text":"failed"}]})
+        update({"sessionUpdate":"plan","entries":[
+            {"content":"one","status":"not_started"},
+            {"content":"two","status":"in_progress"},
+            {"content":"three","status":"completed"},
+            {"content":"four","status":"failed"},
+            {"content":"five","status":"abandoned"}]})
+        update({"sessionUpdate":"plan_update","entries":[
+            {"content":"one","status":"not_started"},
+            {"content":"two","status":"in_progress"},
+            {"content":"three","status":"completed"},
+            {"content":"four","status":"completed"},
+            {"content":"five","status":"abandoned"}]})
+        result = {"stopReason":"end_turn"}
+    else:
+        continue
+    print(json.dumps({"jsonrpc":"2.0","id":message["id"],"result":result}), flush=True)
+"#,
+        )
+        .unwrap();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        save_test_session(&store, &root);
+        let harness = AcpHarness::start(
+            Arc::new(LocalHost::new(&root).unwrap()),
+            Arc::new(SessionRecorder::new(store.clone(), "session")),
+            "session",
+            AcpHarnessConfig {
+                workspace: root.display().to_string(),
+                command: format!("python3 {}", shell_quote(&script.display().to_string())),
+                env: None,
+                mcp_servers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut events = harness.events().unwrap();
+        let turn = harness
+            .start_turn(HarnessTurnInput {
+                text: "events".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let _ = timeout(Duration::from_secs(5), turn.await_finished())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut updates = Vec::new();
+        let mut results = Vec::new();
+        let mut errors = Vec::new();
+        for _ in 0..30 {
+            let Ok(Some(event)) = timeout(Duration::from_millis(100), events.recv()).await else {
+                continue;
+            };
+            match event {
+                HarnessEvent::ToolCallUpdate {
+                    call_id,
+                    status,
+                    content,
+                    locations,
+                    ..
+                } => updates.push((call_id, status, content, locations)),
+                HarnessEvent::ToolResult {
+                    call_id, result, ..
+                } => results.push((call_id, result)),
+                HarnessEvent::PlanUpdate { .. } => {}
+                HarnessEvent::Error { message } => errors.push(message),
+                HarnessEvent::TurnFinished { .. } => {}
+                _ => {}
+            }
+        }
+        assert!(updates.iter().any(|(_, status, _, _)| status == "pending"));
+        assert!(updates.iter().any(|(_, status, content, locations)| {
+            status == "completed"
+                && content
+                    .as_ref()
+                    .is_some_and(|value| value.to_string().contains("\"diff\""))
+                && !locations.is_empty()
+        }));
+        assert!(
+            updates
+                .iter()
+                .any(|(id, status, _, _)| id == "call-2" && status == "failed")
+        );
+        assert!(
+            results
+                .iter()
+                .any(|(id, result)| id == "call-1" && result.to_string().contains("diff"))
+        );
+        let persisted = store.load_plan("session").unwrap().unwrap();
+        assert_eq!(persisted.steps.len(), 5);
+        assert_eq!(persisted.steps[0].status, "not_started");
+        assert_eq!(persisted.steps[1].status, "in_progress");
+        assert_eq!(persisted.steps[2].status, "done");
+        assert_eq!(persisted.steps[3].status, "failed");
+        assert_eq!(persisted.steps[4].status, "abandoned");
+        assert!(
+            errors
+                .iter()
+                .any(|message| message.contains("failed steps cannot silently become done"))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn mcp_server_params_are_forwarded_without_token_in_store_records() {
+        let root = std::env::temp_dir().join(format!("opcos-acp-mcp-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let captured = root.join("session-new.json");
+        let token = "acp-secret-token";
+        let script = root.join("mcp-agent.py");
+        fs::write(
+            &script,
+            format!(
+                r#"
+import json, sys
+capture = {capture:?}
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        result = {{"protocolVersion": 1}}
+    elif method == "session/new":
+        open(capture, "w").write(json.dumps(message["params"]))
+        result = {{"sessionId":"mcp-session"}}
+    else:
+        result = {{}}
+    print(json.dumps({{"jsonrpc":"2.0","id":message["id"],"result":result}}), flush=True)
+"#,
+                capture = captured.display().to_string()
+            ),
+        )
+        .unwrap();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        save_test_session(&store, &root);
+        let harness = AcpHarness::start(
+            Arc::new(LocalHost::new(&root).unwrap()),
+            Arc::new(SessionRecorder::new(store.clone(), "session")),
+            "session",
+            AcpHarnessConfig {
+                workspace: root.display().to_string(),
+                command: format!("python3 {}", shell_quote(&script.display().to_string())),
+                env: None,
+                mcp_servers: vec![
+                    json!({"type":"stdio","name":"local","command":"agent","args":[]}),
+                    json!({"type":"http","name":"remote","url":"https://mcp.example/mcp","headers":[{"name":"Authorization","value":format!("Bearer {token}")}]}),
+                ],
+            },
+        )
+        .await
+        .unwrap();
+        let params = fs::read_to_string(&captured).unwrap();
+        assert!(params.contains("\"type\": \"stdio\""));
+        assert!(params.contains("\"type\": \"http\""));
+        assert!(params.contains("Authorization"));
+        assert!(params.contains(token));
+        assert!(
+            store
+                .load_messages("session")
+                .unwrap()
+                .iter()
+                .all(|message| !message.content.to_string().contains(token))
+        );
+        assert!(
+            store
+                .load_session_events("session")
+                .unwrap()
+                .iter()
+                .all(|event| !event.event.to_string().contains(token))
+        );
+        assert!(
+            store
+                .load_transcript("session")
+                .unwrap()
+                .iter()
+                .all(|entry| !entry.payload.to_string().contains(token))
+        );
+        drop(harness);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn session_modes_config_options_and_commands_round_trip() {
+        let root = std::env::temp_dir().join(format!("opcos-acp-modes-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let script = root.join("modes-agent.py");
+        fs::write(
+            &script,
+            r#"
+import json, sys
+options = [
+  {"id":"model","name":"Model","type":"select","currentValue":"fast","options":[{"value":"fast","name":"Fast"},{"value":"safe","name":"Safe"}]},
+  {"id":"trace","name":"Trace","type":"boolean","currentValue":False},
+  {"id":"ignored","name":"Ignored","type":"future","currentValue":"x"}
+]
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": 1}
+    elif method == "session/new":
+        result = {"sessionId":"modes-session","modes":{"currentModeId":"ask","availableModes":[{"id":"ask","name":"Ask"},{"id":"auto","name":"Auto"}]},"configOptions":options}
+    elif method == "session/set_mode":
+        result = {}
+        print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"current_mode_update","modeId":message["params"]["modeId"]}}}), flush=True)
+    elif method == "session/set_config_option":
+        options = [dict(item, currentValue=(message["params"]["value"] if item["id"] == message["params"]["configId"] else item["currentValue"])) for item in options]
+        result = {"configOptions":options}
+    elif method == "session/prompt":
+        print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"review","description":"Review changes","input":{"hint":"scope"}}]}}}), flush=True)
+        result = {"stopReason":"end_turn"}
+    else:
+        result = {}
+    if "id" in message:
+        print(json.dumps({"jsonrpc":"2.0","id":message["id"],"result":result}), flush=True)
+"#,
+        )
+        .unwrap();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        save_test_session(&store, &root);
+        let harness = AcpHarness::start(
+            Arc::new(LocalHost::new(&root).unwrap()),
+            Arc::new(SessionRecorder::new(store.clone(), "session")),
+            "session",
+            AcpHarnessConfig {
+                workspace: root.display().to_string(),
+                command: format!("python3 {}", shell_quote(&script.display().to_string())),
+                env: None,
+                mcp_servers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let capabilities = harness.session_capabilities().await;
+        assert_eq!(capabilities["currentModeId"], "ask");
+        assert_eq!(capabilities["availableModes"].as_array().unwrap().len(), 2);
+        assert_eq!(capabilities["configOptions"].as_array().unwrap().len(), 2);
+        harness.set_mode("auto").await.unwrap();
+        harness
+            .set_config_option("model", json!("safe"))
+            .await
+            .unwrap();
+        harness
+            .set_config_option("trace", json!(true))
+            .await
+            .unwrap();
+        assert_eq!(
+            harness.session_capabilities().await["configOptions"][1]["currentValue"],
+            true
+        );
+        let mut events = harness.events().unwrap();
+        let turn = harness
+            .start_turn(HarnessTurnInput {
+                text: "/review files".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), turn.await_finished())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut saw_commands = false;
+        for _ in 0..20 {
+            let Ok(Some(event)) = timeout(Duration::from_millis(100), events.recv()).await else {
+                continue;
+            };
+            if matches!(event, HarnessEvent::AvailableCommandsUpdate { .. }) {
+                saw_commands = true;
+                break;
+            }
+        }
+        assert!(saw_commands);
+        assert_eq!(
+            harness.session_capabilities().await["availableCommands"][0]["name"],
+            "review"
+        );
+        drop(harness);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn switch_mode_permission_uses_selected_option_and_updates_state() {
+        let root = std::env::temp_dir().join(format!("opcos-acp-switch-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let selected = root.join("selected.json");
+        let script = root.join("switch-agent.py");
+        fs::write(
+            &script,
+            format!(
+                r#"
+import json, sys
+selected = {selected:?}
+prompt_id = None
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        result = {{"protocolVersion": 1}}
+    elif method == "session/new":
+        result = {{"sessionId":"switch-session","modes":{{"currentModeId":"plan","availableModes":[{{"id":"plan","name":"Plan"}},{{"id":"auto","name":"Auto"}},{{"id":"ask","name":"Ask"}}]}}}}
+    elif method == "session/prompt":
+        prompt_id = message["id"]
+        print(json.dumps({{"jsonrpc":"2.0","method":"session/request_permission","id":77,"params":{{"sessionId":"switch-session","toolCall":{{"kind":"switch_mode"}},"options":[{{"optionId":"plan","name":"Plan"}},{{"optionId":"auto","name":"Auto"}},{{"optionId":"ask","name":"Ask"}}]}}}}), flush=True)
+        continue
+    elif "id" in message and str(message["id"]) == "77":
+        open(selected, "w").write(json.dumps(message))
+        result = {{"stopReason":"end_turn"}}
+    else:
+        result = {{}}
+    if "id" in message and method != "session/prompt":
+        response_id = prompt_id if str(message["id"]) == "77" else message["id"]
+        print(json.dumps({{"jsonrpc":"2.0","id":response_id,"result":result}}), flush=True)
+"#,
+                selected = selected.display().to_string()
+            ),
+        )
+        .unwrap();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        save_test_session(&store, &root);
+        let harness = AcpHarness::start(
+            Arc::new(LocalHost::new(&root).unwrap()),
+            Arc::new(SessionRecorder::new(store, "session")),
+            "session",
+            AcpHarnessConfig {
+                workspace: root.display().to_string(),
+                command: format!("python3 {}", shell_quote(&script.display().to_string())),
+                env: None,
+                mcp_servers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut events = harness.events().unwrap();
+        let _turn = harness
+            .start_turn(HarnessTurnInput {
+                text: "switch".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let request = loop {
+            let event = timeout(Duration::from_secs(5), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let HarnessEvent::ApprovalRequested(request) = event {
+                break request;
+            }
+        };
+        assert_eq!(request.arguments["toolCall"]["kind"], "switch_mode");
+        let _ = harness
+            .reply_approval_with_option(
+                &request.request_id,
+                ApprovalOutcome::Approve,
+                Some("auto".into()),
+            )
+            .await
+            .unwrap();
+        let mode_event = loop {
+            let event = timeout(Duration::from_secs(5), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let HarnessEvent::SessionModeUpdate {
+                current_mode_id, ..
+            } = event
+            {
+                break current_mode_id;
+            }
+        };
+        assert_eq!(mode_event, "auto");
+        timeout(Duration::from_secs(5), async {
+            while !selected.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let response: Value =
+            serde_json::from_str(&fs::read_to_string(&selected).unwrap()).unwrap();
+        assert_eq!(response["result"]["outcome"]["optionId"], "auto");
+        assert_eq!(
+            harness.session_capabilities().await["currentModeId"],
+            "auto"
+        );
+        drop(harness);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn session_without_modes_or_config_options_has_empty_capabilities() {
+        let root = std::env::temp_dir().join(format!("opcos-acp-empty-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let script = root.join("empty-agent.py");
+        fs::write(
+            &script,
+            r#"
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get("method") == "initialize":
+        result = {"protocolVersion": 1}
+    elif message.get("method") == "session/new":
+        result = {"sessionId":"empty-session"}
+    else:
+        result = {}
+    if "id" in message:
+        print(json.dumps({"jsonrpc":"2.0","id":message["id"],"result":result}), flush=True)
+"#,
+        )
+        .unwrap();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        save_test_session(&store, &root);
+        let harness = AcpHarness::start(
+            Arc::new(LocalHost::new(&root).unwrap()),
+            Arc::new(SessionRecorder::new(store, "session")),
+            "session",
+            AcpHarnessConfig {
+                workspace: root.display().to_string(),
+                command: format!("python3 {}", shell_quote(&script.display().to_string())),
+                env: None,
+                mcp_servers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let capabilities = harness.session_capabilities().await;
+        assert!(
+            capabilities["availableModes"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(capabilities["configOptions"].as_array().unwrap().is_empty());
+        drop(harness);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn local_acp_agent_exit_abandons_pending_turn_state() {
         let root = std::env::temp_dir().join(format!("opcos-acp-exit-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
@@ -1215,7 +2569,7 @@ for line in sys.stdin:
     message = json.loads(line)
     method = message.get("method")
     if method == "initialize":
-        result = {"sessionCapabilities": {}}
+        result = {"protocolVersion": 1, "sessionCapabilities": {}}
     elif method == "session/new":
         result = {"sessionId": "external-session"}
     elif method == "session/prompt":
@@ -1263,6 +2617,7 @@ for line in sys.stdin:
                 workspace: root.display().to_string(),
                 command: format!("python3 {}", shell_quote(&script.display().to_string())),
                 env: None,
+                mcp_servers: Vec::new(),
             },
         )
         .await

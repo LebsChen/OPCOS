@@ -42,6 +42,15 @@ import {
   mergeEvents,
   type TimelineEvent,
 } from "./timeline";
+import {
+  appendMcpPromptDraft,
+  isUserMcpServer,
+  mcpCatalogUpdateTargets,
+  mcpServerFormBody,
+  mcpPromptMessagesToDraft,
+  mcpResourceSummary,
+  type McpTransport,
+} from "./mcp";
 import { summarizeIterationStats } from "./iterationStats";
 import { Sidebar } from "./components/Sidebar";
 import { sessionStatusLabel } from "./sessionStatus";
@@ -54,6 +63,7 @@ import { Icon } from "./components/Icon";
 import { CollectionPage } from "./components/CollectionPage";
 import { IntegrationCard } from "./components/IntegrationCard";
 import { getLocale, setLocale, subscribeLocale, translate } from "./i18n";
+import type { Attachment } from "./types";
 import "./openworker-tailwind.css";
 import "./openworker-styles.css";
 import "./style.css";
@@ -167,7 +177,40 @@ type SlashCommand = {
   body: string;
   scope: string;
   default_body?: string;
+  description?: string;
+  input?: { hint?: string };
 };
+type AcpCapabilities = {
+  currentModeId?: string | null;
+  availableModes: Array<{ id: string; name: string; description?: string }>;
+  configOptions: Array<{
+    id: string;
+    name: string;
+    description?: string;
+    type: "select" | "boolean";
+    currentValue: string | boolean;
+    options?: Array<{ value: string; name: string; description?: string }>;
+  }>;
+  availableCommands: Array<{
+    name: string;
+    description?: string;
+    input?: { hint?: string };
+  }>;
+};
+type AcpSessionEventPayload =
+  | {
+      kind: "mode_update";
+      currentModeId: string;
+      availableModes: AcpCapabilities["availableModes"];
+    }
+  | {
+      kind: "config_update";
+      configOptions: AcpCapabilities["configOptions"];
+    }
+  | {
+      kind: "commands_update";
+      availableCommands: AcpCapabilities["availableCommands"];
+    };
 type SkillUsageDashboard = {
   skills: Array<{
     name: string;
@@ -804,7 +847,6 @@ function ProjectDialog({
     repoRoot: string;
     defaultBranch: string;
     teamTemplateId: string;
-    configTemplateIds: string[];
   }) => Promise<void>;
 }) {
   const [name, setName] = useState("");
@@ -815,24 +857,11 @@ function ProjectDialog({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [teamTemplates, setTeamTemplates] = useState<LibraryEntry[]>([]);
-  const [configTemplates, setConfigTemplates] = useState<LibraryEntry[]>([]);
   const [teamTemplateId, setTeamTemplateId] = useState("");
-  const [configTemplateIds, setConfigTemplateIds] = useState<string[]>([]);
   useEffect(() => {
-    void Promise.all([
-      command<LibraryEntry[]>("list_configured_library", {
-        kind: "team-template",
-      }),
-      command<LibraryEntry[]>("list_configured_library"),
-    ]).then(([teams, templates]) => {
-      setTeamTemplates(teams);
-      setConfigTemplates(
-        templates.filter(
-          (template) =>
-            !["agent-template", "team-template"].includes(template.kind),
-        ),
-      );
-    });
+    void command<LibraryEntry[]>("list_configured_library", {
+      kind: "team-template",
+    }).then(setTeamTemplates);
   }, []);
   const selectedTeam = teamTemplates.find((item) => item.id === teamTemplateId);
   const selectedTeamContent = selectedTeam
@@ -863,7 +892,6 @@ function ProjectDialog({
         repoRoot: repoRoot.trim(),
         defaultBranch: defaultBranch.trim() || "main",
         teamTemplateId,
-        configTemplateIds,
       });
     } catch (reason) {
       setError(errorMessage(reason));
@@ -965,32 +993,6 @@ function ProjectDialog({
                   Workflow：{JSON.stringify(selectedTeamContent.workflow)}
                 </small>
               </div>
-            )}
-            {configTemplates.length > 0 && (
-              <fieldset className="rounded-lg border border-line p-3">
-                <legend className="px-1 text-sm font-medium">
-                  配置模板（可勾选）
-                </legend>
-                {configTemplates.map((template) => (
-                  <label
-                    key={template.id}
-                    className="flex items-center gap-2 text-sm"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={configTemplateIds.includes(template.id)}
-                      onChange={(event) =>
-                        setConfigTemplateIds((ids) =>
-                          event.target.checked
-                            ? [...ids, template.id]
-                            : ids.filter((id) => id !== template.id),
-                        )
-                      }
-                    />
-                    {template.name} · {template.kind}
-                  </label>
-                ))}
-              </fieldset>
             )}
           </div>
         </div>
@@ -3422,6 +3424,7 @@ function ManageSections({
   onEditHost,
   onTestHost,
   onDeleteHost,
+  onPromptDraft,
   hostName,
   setHostName,
   hostUrl,
@@ -3444,6 +3447,7 @@ function ManageSections({
   onEditHost: (host: Host) => Promise<void>;
   onTestHost: (hostId: string) => Promise<Host>;
   onDeleteHost: (hostId: string) => Promise<void>;
+  onPromptDraft: (draft: string) => void;
   hostName: string;
   setHostName: (value: string) => void;
   hostUrl: string;
@@ -6325,7 +6329,13 @@ function ManageSections({
             )}
           </div>
         )}
-        {tab === "mcp" && <McpManage selected={selected} onError={onError} />}
+        {tab === "mcp" && (
+          <McpManage
+            selected={selected}
+            onError={onError}
+            onPromptDraft={onPromptDraft}
+          />
+        )}
         {tab === "ingress" && (
           <div className="space-y-5">
             <div className="rounded-xl2 border border-line bg-panel p-5">
@@ -7135,13 +7145,41 @@ function ManageSections({
 function McpManage({
   selected,
   onError,
+  onPromptDraft,
 }: {
   selected: Session | null;
   onError: (error: unknown) => void;
+  onPromptDraft: (draft: string) => void;
 }) {
   const [tools, setTools] = useState<Array<Record<string, unknown>>>([]);
   const [servers, setServers] = useState<Array<Record<string, unknown>>>([]);
+  const [selectedServerId, setSelectedServerId] = useState("");
+  const [resources, setResources] = useState<Array<Record<string, unknown>>>(
+    [],
+  );
+  const [prompts, setPrompts] = useState<Array<Record<string, unknown>>>([]);
+  const [promptArguments, setPromptArguments] = useState<
+    Record<string, Record<string, string>>
+  >({});
+  const [resourcePreview, setResourcePreview] = useState<
+    Array<Record<string, unknown>>
+  >([]);
+  const [contextResources, setContextResources] = useState<
+    Array<Record<string, unknown>>
+  >([]);
   const [search, setSearch] = useState("");
+  const [editingServerId, setEditingServerId] = useState("");
+  const [serverName, setServerName] = useState("");
+  const [serverTransport, setServerTransport] = useState<
+    "stdio" | "streamable-http" | "http-sse"
+  >("streamable-http");
+  const [serverUrl, setServerUrl] = useState("");
+  const [serverCommand, setServerCommand] = useState("");
+  const [serverArgs, setServerArgs] = useState("");
+  const [serverEnv, setServerEnv] = useState("");
+  const [serverToken, setServerToken] = useState("");
+  const [serverEnabled, setServerEnabled] = useState(true);
+  const [serverRequiresApproval, setServerRequiresApproval] = useState(true);
   useEffect(() => {
     void command<Array<Record<string, unknown>>>("list_mcp_servers")
       .then(setServers)
@@ -7153,11 +7191,324 @@ function McpManage({
         .then(setTools)
         .catch(onError);
   }, [selected?.id]);
+  useEffect(() => {
+    if (!selected) {
+      setContextResources([]);
+      return;
+    }
+    void command<Array<Record<string, unknown>>>("mcp_context_resources", {
+      sessionId: selected.id,
+    })
+      .then(setContextResources)
+      .catch(onError);
+  }, [onError, selected?.id]);
+  useEffect(() => {
+    let active = true;
+    if (
+      !(window as Window & { __TAURI_INTERNALS__?: unknown })
+        .__TAURI_INTERNALS__
+    ) {
+      return () => {
+        active = false;
+      };
+    }
+    const subscription = listen<{
+      server_id?: string;
+      version_id?: string;
+      method?: string;
+    }>("mcp-catalog-updated", (event) => {
+      if (!active || !event.payload.server_id) return;
+      void command<Array<Record<string, unknown>>>("list_mcp_servers")
+        .then((nextServers) => {
+          if (active) setServers(nextServers);
+        })
+        .catch(onError);
+      if (
+        mcpCatalogUpdateTargets(event.payload, selectedServerId) &&
+        event.payload.version_id
+      ) {
+        void Promise.all([
+          command<Array<Record<string, unknown>>>("mcp_resources", {
+            serverId: event.payload.server_id,
+            versionId: event.payload.version_id,
+          }),
+          command<Array<Record<string, unknown>>>("mcp_prompts", {
+            serverId: event.payload.server_id,
+            versionId: event.payload.version_id,
+          }),
+        ])
+          .then(([nextResources, nextPrompts]) => {
+            if (!active) return;
+            setResources(nextResources);
+            setPrompts(nextPrompts);
+            setResourcePreview([]);
+          })
+          .catch(onError);
+      }
+    });
+    return () => {
+      active = false;
+      void subscription.then((unsubscribe) => unsubscribe());
+    };
+  }, [onError, selectedServerId]);
+  useEffect(() => {
+    let active = true;
+    if (
+      !(window as Window & { __TAURI_INTERNALS__?: unknown })
+        .__TAURI_INTERNALS__
+    ) {
+      return () => {
+        active = false;
+      };
+    }
+    const subscription = listen<{ session_id?: string; error?: string }>(
+      "mcp-catalog-refresh-error",
+      (event) => {
+        if (
+          active &&
+          (!event.payload.session_id ||
+            event.payload.session_id === selected?.id) &&
+          event.payload.error
+        ) {
+          onError(event.payload.error);
+        }
+      },
+    );
+    return () => {
+      active = false;
+      void subscription.then((unsubscribe) => unsubscribe());
+    };
+  }, [onError, selected?.id]);
+  const selectedServer = servers.find(
+    (server) => String(server.id) === selectedServerId,
+  );
+  const resetServerForm = () => {
+    setEditingServerId("");
+    setServerName("");
+    setServerTransport("streamable-http");
+    setServerUrl("");
+    setServerCommand("");
+    setServerArgs("");
+    setServerEnv("");
+    setServerToken("");
+    setServerEnabled(true);
+    setServerRequiresApproval(true);
+  };
+  const editServer = (server: Record<string, unknown>) => {
+    if (!isUserMcpServer(server)) return;
+    setEditingServerId(String(server.id));
+    setServerName(String(server.name || ""));
+    setServerTransport(
+      String(server.transport || "streamable-http") as McpTransport,
+    );
+    setServerUrl(String(server.url || ""));
+    setServerCommand(String(server.command || ""));
+    setServerArgs(
+      Array.isArray(server.args) ? server.args.map(String).join("\n") : "",
+    );
+    setServerEnv(
+      server.env && typeof server.env === "object"
+        ? Object.entries(server.env as Record<string, unknown>)
+            .map(([key, value]) => `${key}=${String(value)}`)
+            .join("\n")
+        : "",
+    );
+    setServerToken("");
+    setServerEnabled(server.enabled !== false);
+    setServerRequiresApproval(server.requires_approval !== false);
+  };
+  const saveServer = () => {
+    const id = editingServerId || `mcp-${Date.now()}`;
+    const credentialEnvKey = serverEnv
+      .split("\n")
+      .map((line) => line.trim().split("=", 1)[0])
+      .find((key) =>
+        /token|secret|password|authorization|client_secret/i.test(key),
+      );
+    if (credentialEnvKey) {
+      onError(
+        `Environment key "${credentialEnvKey}" looks sensitive. Store credentials in the bearer token field instead.`,
+      );
+      return;
+    }
+    const body = mcpServerFormBody({
+      transport: serverTransport,
+      url: serverUrl,
+      command: serverCommand,
+      args: serverArgs,
+      env: serverEnv,
+      enabled: serverEnabled,
+      requiresApproval: serverRequiresApproval,
+    });
+    void command("save_asset", {
+      id,
+      kind: "mcp",
+      title: serverName.trim(),
+      body: JSON.stringify(body),
+      trigger: null,
+      scope: null,
+      scopeKind: "global",
+      enabled: serverEnabled,
+      projectId: null,
+    })
+      .then(() =>
+        serverToken.trim()
+          ? command("save_mcp_credential", {
+              serverId: id,
+              value: JSON.stringify({ bearer_token: serverToken.trim() }),
+              projectId: null,
+            })
+          : undefined,
+      )
+      .then(() =>
+        serverEnabled
+          ? command("retry_mcp_server", { serverId: id })
+          : undefined,
+      )
+      .then(() => command<Array<Record<string, unknown>>>("list_mcp_servers"))
+      .then((nextServers) => {
+        setServers(nextServers);
+        resetServerForm();
+      })
+      .catch(onError);
+  };
+  const removeServer = (server: Record<string, unknown>) => {
+    if (!isUserMcpServer(server)) return;
+    void command("delete_asset", { id: String(server.id) })
+      .then(() => command<Array<Record<string, unknown>>>("list_mcp_servers"))
+      .then(setServers)
+      .catch(onError);
+  };
+  const loadServerCatalog = (server: Record<string, unknown>) => {
+    const serverId = String(server.id);
+    const versionId = String(server.version_id || "");
+    setSelectedServerId(serverId);
+    void Promise.all([
+      command<Array<Record<string, unknown>>>("mcp_resources", {
+        serverId,
+        versionId,
+      }),
+      command<Array<Record<string, unknown>>>("mcp_prompts", {
+        serverId,
+        versionId,
+      }),
+    ])
+      .then(([nextResources, nextPrompts]) => {
+        setResources(nextResources);
+        setPrompts(nextPrompts);
+        setResourcePreview([]);
+      })
+      .catch(onError);
+  };
+  const previewResource = (resource: Record<string, unknown>) => {
+    if (!selectedServer) return;
+    void command<Array<Record<string, unknown>>>("mcp_read_resource", {
+      serverId: String(selectedServer.id),
+      uri: String(resource.uri),
+    })
+      .then(setResourcePreview)
+      .catch(onError);
+  };
   const filtered = tools.filter((tool) =>
     String(tool.name).toLowerCase().includes(search.toLowerCase()),
   );
   return (
     <>
+      <section className="panel mb-4">
+        <div className="flex items-center justify-between gap-2">
+          <h2>{editingServerId ? "Edit MCP server" : "Add MCP server"}</h2>
+          {editingServerId && <Button onClick={resetServerForm}>Cancel</Button>}
+        </div>
+        <div className="grid gap-2 md:grid-cols-2">
+          <input
+            value={serverName}
+            onChange={(event) => setServerName(event.target.value)}
+            placeholder="Server name"
+          />
+          <select
+            value={serverTransport}
+            onChange={(event) =>
+              setServerTransport(
+                event.target.value as "stdio" | "streamable-http" | "http-sse",
+              )
+            }
+          >
+            <option value="streamable-http">Streamable HTTP</option>
+            <option value="http-sse">HTTP + SSE</option>
+            <option value="stdio">stdio</option>
+          </select>
+          {serverTransport === "stdio" ? (
+            <>
+              <input
+                value={serverCommand}
+                onChange={(event) => setServerCommand(event.target.value)}
+                placeholder="Command"
+              />
+              <textarea
+                value={serverArgs}
+                onChange={(event) => setServerArgs(event.target.value)}
+                placeholder="Arguments, one per line"
+                rows={3}
+              />
+              <textarea
+                value={serverEnv}
+                onChange={(event) => setServerEnv(event.target.value)}
+                placeholder="Environment, KEY=VALUE per line"
+                rows={3}
+              />
+              <p className="text-xs text-slate-500 md:col-span-2">
+                Use environment entries for non-sensitive runtime settings.
+                Store bearer tokens in the secure token field below, not in
+                environment variables.
+              </p>
+            </>
+          ) : (
+            <input
+              className="md:col-span-2"
+              value={serverUrl}
+              onChange={(event) => setServerUrl(event.target.value)}
+              placeholder="https://example.com/mcp"
+            />
+          )}
+          <input
+            type="password"
+            value={serverToken}
+            onChange={(event) => setServerToken(event.target.value)}
+            placeholder="Bearer token (stored securely)"
+          />
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={serverEnabled}
+              onChange={(event) => setServerEnabled(event.target.checked)}
+            />
+            Enabled
+          </label>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={serverRequiresApproval}
+              onChange={(event) =>
+                setServerRequiresApproval(event.target.checked)
+              }
+            />
+            Require approval for tools
+          </label>
+        </div>
+        <div className="mt-3 flex gap-2">
+          <Button
+            disabled={
+              !serverName.trim() ||
+              (serverTransport === "stdio"
+                ? !serverCommand.trim()
+                : !serverUrl.trim())
+            }
+            onClick={saveServer}
+          >
+            {editingServerId ? "Save and verify" : "Create and verify"}
+          </Button>
+        </div>
+      </section>
       <CollectionPage
         search={search}
         onSearch={setSearch}
@@ -7183,24 +7534,60 @@ function McpManage({
                           ? "neutral"
                           : "success",
                     }}
-                    description={`${String(server.transport || "remote")} · ${String(server.url || "configured")}`}
+                    description={
+                      <>
+                        {`${String(server.transport || "remote")} · ${String(server.url || "configured")}`}
+                        {server.last_error
+                          ? ` · ${String(server.last_error)}`
+                          : ""}
+                      </>
+                    }
                     actions={
-                      <Button
-                        onClick={() =>
-                          command("retry_mcp_server", {
-                            serverId: String(server.id),
-                          })
-                            .then(() =>
-                              command<Array<Record<string, unknown>>>(
-                                "list_mcp_servers",
-                              ),
-                            )
-                            .then(setServers)
-                            .catch(onError)
-                        }
-                      >
-                        Retry
-                      </Button>
+                      <div className="inline-actions">
+                        {isUserMcpServer(server) && (
+                          <>
+                            <Button onClick={() => editServer(server)}>
+                              Edit
+                            </Button>
+                            <Button onClick={() => removeServer(server)}>
+                              Delete
+                            </Button>
+                          </>
+                        )}
+                        {String(server.status || "").toLowerCase() ===
+                          "auth_required" && (
+                          <Button
+                            onClick={() =>
+                              command("mcp_authorize", {
+                                serverId: String(server.id),
+                                versionId: String(server.version_id || ""),
+                                resourceUrl: String(server.url || ""),
+                              }).catch(onError)
+                            }
+                          >
+                            Authorize
+                          </Button>
+                        )}
+                        <Button onClick={() => loadServerCatalog(server)}>
+                          Resources / prompts
+                        </Button>
+                        <Button
+                          onClick={() =>
+                            command("retry_mcp_server", {
+                              serverId: String(server.id),
+                            })
+                              .then(() =>
+                                command<Array<Record<string, unknown>>>(
+                                  "list_mcp_servers",
+                                ),
+                              )
+                              .then(setServers)
+                              .catch(onError)
+                          }
+                        >
+                          Retry
+                        </Button>
+                      </div>
                     }
                     key={String(server.id)}
                   />
@@ -7246,6 +7633,136 @@ function McpManage({
             : "Select a session to inspect its host MCP tools."
         }
       />
+      {selectedServer && (
+        <section className="panel mt-4">
+          <h2>
+            {String(selectedServer.name)} resources ({resources.length}) ·
+            prompts ({prompts.length}) · tools (
+            {Number(selectedServer.tool_count || 0)})
+          </h2>
+          <div className="grid gap-2">
+            {resources.map((resource) => (
+              <div className="integration-card" key={String(resource.uri)}>
+                <strong>{String(resource.title || resource.name)}</strong>
+                <small>{mcpResourceSummary(resource)}</small>
+                <div className="inline-actions">
+                  <Button onClick={() => previewResource(resource)}>
+                    Preview
+                  </Button>
+                  <Button
+                    disabled={!selected}
+                    onClick={() =>
+                      selected &&
+                      command("mcp_attach_resource", {
+                        sessionId: selected.id,
+                        serverId: String(selectedServer.id),
+                        versionId: String(selectedServer.version_id || ""),
+                        uri: String(resource.uri),
+                      })
+                        .then(() =>
+                          command<Array<Record<string, unknown>>>(
+                            "mcp_context_resources",
+                            { sessionId: selected.id },
+                          ),
+                        )
+                        .then(setContextResources)
+                        .catch(onError)
+                    }
+                  >
+                    Add to current context
+                  </Button>
+                </div>
+              </div>
+            ))}
+            {prompts.map((prompt) => (
+              <div className="integration-card" key={String(prompt.name)}>
+                <strong>{String(prompt.title || prompt.name)}</strong>
+                <small>{String(prompt.description || "MCP prompt")}</small>
+                {Array.isArray(prompt.arguments) &&
+                  prompt.arguments.map((argument) => {
+                    const argumentName = String(
+                      (argument as Record<string, unknown>).name || "",
+                    );
+                    return (
+                      <input
+                        key={argumentName}
+                        placeholder={argumentName}
+                        value={
+                          promptArguments[String(prompt.name)]?.[
+                            argumentName
+                          ] || ""
+                        }
+                        onChange={(event) =>
+                          setPromptArguments((current) => ({
+                            ...current,
+                            [String(prompt.name)]: {
+                              ...current[String(prompt.name)],
+                              [argumentName]: event.target.value,
+                            },
+                          }))
+                        }
+                      />
+                    );
+                  })}
+                <Button
+                  onClick={() =>
+                    command("mcp_get_prompt", {
+                      serverId: String(selectedServer.id),
+                      name: String(prompt.name),
+                      arguments: promptArguments[String(prompt.name)] || {},
+                    })
+                      .then((result) => {
+                        const messages = (result as { messages?: unknown[] })
+                          .messages;
+                        if (messages?.length) {
+                          onPromptDraft(mcpPromptMessagesToDraft(messages));
+                        }
+                      })
+                      .catch(onError)
+                  }
+                >
+                  Load into composer
+                </Button>
+              </div>
+            ))}
+            {resourcePreview.length > 0 && (
+              <pre className="code-block">
+                {JSON.stringify(resourcePreview, null, 2)}
+              </pre>
+            )}
+            <h4>Current context resources ({contextResources.length})</h4>
+            {contextResources.map((resource) => (
+              <div
+                className="inline-actions"
+                key={`${String(resource.server_id)}:${String(resource.uri)}`}
+              >
+                <span>{String(resource.uri)}</span>
+                <Button
+                  onClick={() =>
+                    selected &&
+                    command("mcp_detach_resource", {
+                      sessionId: selected.id,
+                      serverId: String(resource.server_id),
+                      versionId: String(resource.version_id),
+                      uri: String(resource.uri),
+                    })
+                      .then(() =>
+                        command<Array<Record<string, unknown>>>(
+                          "mcp_context_resources",
+                          { sessionId: selected.id },
+                        ),
+                      )
+                      .then(setContextResources)
+                      .catch(onError)
+                  }
+                >
+                  Remove
+                </Button>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
     </>
   );
 }
@@ -10215,6 +10732,8 @@ function AppContent() {
   };
   const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
   const [transcript, setTranscript] = useState<TimelineEvent[]>([]);
+  const [acpCapabilities, setAcpCapabilities] =
+    useState<AcpCapabilities | null>(null);
   const [liveTranscript, setLiveTranscript] = useState<TimelineEvent[]>([]);
   const transcriptScrollRef = useRef<HTMLDivElement>(null);
   const transcriptBottomRef = useRef<HTMLDivElement>(null);
@@ -10347,6 +10866,52 @@ function AppContent() {
   const [selectedHarnessOptions, setSelectedHarnessOptions] = useState<
     Array<{ id: string; label: string; available: boolean; reason?: string }>
   >([]);
+  useEffect(() => {
+    if (!selected || selected.harness !== "acp") {
+      setAcpCapabilities(null);
+      return;
+    }
+    void command<AcpCapabilities>("acp_session_capabilities", {
+      sessionId: selected.id,
+    })
+      .then(setAcpCapabilities)
+      .catch(() => setAcpCapabilities(null));
+  }, [selected?.id, selected?.harness]);
+  useEffect(() => {
+    const subscription = listen<{
+      kind: "acp_session";
+      session_id?: string;
+      payload: AcpSessionEventPayload;
+    }>("opcos://event", (event) => {
+      if (
+        !selected?.id ||
+        event.payload.kind !== "acp_session" ||
+        event.payload.session_id !== selected.id
+      )
+        return;
+      const payload = event.payload.payload;
+      setAcpCapabilities((current) => {
+        if (!current) return current;
+        if (payload.kind === "mode_update")
+          return {
+            ...current,
+            currentModeId: payload.currentModeId,
+            availableModes: payload.availableModes,
+          };
+        if (payload.kind === "config_update")
+          return { ...current, configOptions: payload.configOptions };
+        if (payload.kind === "commands_update")
+          return {
+            ...current,
+            availableCommands: payload.availableCommands,
+          };
+        return current;
+      });
+    });
+    return () => {
+      void subscription.then((unlisten) => unlisten());
+    };
+  }, [selected?.id]);
   const [homeWorkspace, setHomeWorkspace] = useState("");
   const [secretBackend, setSecretBackend] = useState("");
   const generation = useRef(0);
@@ -10651,6 +11216,10 @@ function AppContent() {
       }
       if (payload.session_id && payload.session_id !== selectedIdRef.current)
         return;
+      if (payload.kind === "session_list_changed") {
+        void refresh().catch(onError);
+        return;
+      }
       if (payload.kind === "stream") {
         const streamPayload = payload.payload;
         const workingEvent =
@@ -10774,6 +11343,9 @@ function AppContent() {
           current?.callId === callId ? null : current,
         );
       }
+      if (payload.kind === "coordination_approval_pending") {
+        void command<InboxRecord[]>("list_inbox").then(setInbox).catch(onError);
+      }
       if (
         payload.kind === "approval_resolved" ||
         (payload.kind === "notice" &&
@@ -10879,6 +11451,13 @@ function AppContent() {
     setSurface("session");
     setHomeInput("");
   };
+  const openPromptDraftHome = (draft: string) => {
+    setSelected(null);
+    setTranscript([]);
+    setRunning(false);
+    setSurface("session");
+    setHomeInput((current) => appendMcpPromptDraft(current, draft));
+  };
   const submitHome = async () => {
     const text = homeInput.trim();
     if (!text || !homeHostId || running) return;
@@ -10940,15 +11519,21 @@ function AppContent() {
       )
       .catch(onError);
   };
-  const submit = (text: string) => {
+  const submit = async (
+    text: string,
+    attachments: Attachment[] = [],
+  ): Promise<void> => {
     if (!selected) return;
     setRunning(true);
-    void command("submit_turn", {
-      request: { session_id: selected.id, text },
-    }).catch((reason) => {
+    try {
+      await command("submit_turn", {
+        request: { session_id: selected.id, text, attachments },
+      });
+    } catch (reason) {
       setRunning(false);
       onError(submitFailureMessage(reason));
-    });
+      throw new Error(submitFailureMessage(reason));
+    }
   };
   const uploadTextAttachmentForSession = async (
     sessionId: string,
@@ -11000,7 +11585,7 @@ function AppContent() {
           updated_at: null,
           messages: 0,
           pinned: false,
-          archived: false,
+          archived: session.archived ?? false,
           attention: 0,
           liveness: selected?.id === session.id && running ? "working" : "idle",
           stop_reason: session.stop_reason,
@@ -11199,11 +11784,12 @@ function AppContent() {
                           reason: "Tool action requires approval",
                         }}
                         hostName={selected.host_name}
-                        onApprove={(decision) => {
+                        onApprove={(decision, optionId) => {
                           void command("resolve_approval", {
                             sessionId: selected.id,
                             callId: pendingApproval.callId,
                             approve: decision === "allow",
+                            optionId,
                           }).catch(onError);
                         }}
                       />
@@ -11272,7 +11858,43 @@ function AppContent() {
                     onInterrupt={interrupt}
                     assets={assets}
                     secrets={secrets}
-                    slashCommands={slashCommands}
+                    slashCommands={
+                      selected.harness === "acp"
+                        ? (acpCapabilities?.availableCommands || []).map(
+                            (item) => ({
+                              name: item.name.startsWith("/")
+                                ? item.name
+                                : `/${item.name}`,
+                              body: "",
+                              kind: "acp",
+                              description: item.description,
+                              input: item.input,
+                            }),
+                          )
+                        : slashCommands
+                    }
+                    acpMode={
+                      acpCapabilities
+                        ? {
+                            currentModeId: acpCapabilities.currentModeId,
+                            availableModes: acpCapabilities.availableModes,
+                          }
+                        : undefined
+                    }
+                    acpConfigOptions={acpCapabilities?.configOptions}
+                    onAcpModeChange={(modeId) =>
+                      void command("acp_set_mode", {
+                        sessionId: selected.id,
+                        modeId,
+                      }).catch(onError)
+                    }
+                    onAcpConfigOptionChange={(configId, value) =>
+                      void command("acp_set_config_option", {
+                        sessionId: selected.id,
+                        configId,
+                        value,
+                      }).catch(onError)
+                    }
                     onUploadFile={uploadTextAttachment}
                     resetKey={selected.id}
                   />
@@ -11298,6 +11920,7 @@ function AppContent() {
               onEditHost={editHost}
               onTestHost={testHost}
               onDeleteHost={deleteHost}
+              onPromptDraft={openPromptDraftHome}
               hostName={hostName}
               setHostName={setHostName}
               hostUrl={hostUrl}
@@ -11605,7 +12228,6 @@ function AppContent() {
                   repoUrl: values.repoUrl || null,
                   repoRoot: values.repoRoot || null,
                   defaultBranch: values.defaultBranch,
-                  configTemplateIds: values.configTemplateIds,
                 })
               : await command<Project>("create_project", {
                   name: values.name,

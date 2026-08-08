@@ -13,6 +13,12 @@ export const TRANSIENT_TIMELINE_EVENT_TYPES = [
   "tool_call_delta",
 ] as const;
 
+export function lastActivityLabel(
+  rows: Array<{ activityLabel?: boolean; label: string }>,
+) {
+  return [...rows].reverse().find((row) => row.activityLabel)?.label;
+}
+
 export type TimelineNode =
   | {
       kind: "user";
@@ -42,6 +48,8 @@ export type TimelineNode =
       startedAt?: number;
       rows: Array<{
         label: string;
+        additions?: number;
+        deletions?: number;
         detail?: string;
         thoughtForCallId?: string;
         activityLabel?: boolean;
@@ -339,8 +347,10 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
           : plan.length - 1;
     const current = plan[currentIndex];
     if (!current) return;
+    const label = `${completed}/${plan.length} #${currentIndex + 1} ${String(current.content ?? current.title ?? "")}`;
+    if (lastActivityLabel(activeWork.rows) === label) return;
     activeWork.rows.push({
-      label: `${completed}/${plan.length} #${currentIndex + 1} ${String(current.content ?? current.title ?? "")}`,
+      label,
       activityLabel: true,
       isMajorAction: true,
     });
@@ -482,6 +492,19 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
       ].includes(type)
     ) {
       continue;
+    } else if (type === "steering_received" || type === "steering_applied") {
+      const activeWork = ensureWork(event.created_at_ms);
+      const iteration =
+        typeof data.iteration === "number" ? data.iteration : undefined;
+      activeWork.rows.push({
+        label:
+          type === "steering_received"
+            ? "Steering received"
+            : "Steering applied",
+        detail:
+          iteration === undefined ? undefined : `Before iteration ${iteration}`,
+        activityLabel: true,
+      });
     } else if (type === "assistant_delta" || type === "reasoning_delta") {
       const activeWork = ensureWork(event.created_at_ms);
       const text = String(
@@ -663,6 +686,8 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
         const updates = Array.isArray(data.file_updates)
           ? data.file_updates
           : [];
+        const callId =
+          typeof data.call_id === "string" ? data.call_id : undefined;
         for (const update of updates) {
           if (!update || typeof update !== "object") continue;
           const item = update as Record<string, unknown>;
@@ -676,11 +701,13 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
               .pop() ?? "";
           appendPlanProgress(activeWork);
           activeWork.rows.push({
-            callId: typeof data.call_id === "string" ? data.call_id : undefined,
+            callId,
             label:
               item.action_type === "create"
-                ? `Created ${basename} +${added}`
-                : `Edited ${basename} +${added} −${removed}`,
+                ? `Created ${basename}`
+                : `Edited ${basename}`,
+            additions: added > 0 ? added : undefined,
+            deletions: removed > 0 ? removed : undefined,
             isMajorAction: true,
             artifactId:
               typeof item.artifact_id === "string"

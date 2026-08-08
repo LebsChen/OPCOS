@@ -165,18 +165,42 @@ function Buttons({
   primaryLabel,
 }: {
   item: ApprovalItem;
-  onApprove: (decision: ApprovalDecision) => void;
+  onApprove: (decision: ApprovalDecision, optionId?: string) => void;
   runTask?: { id: string; title: string } | null;
   primaryLabel: string;
 }) {
+  const switchModeOptions: Array<{ optionId: string; name?: string }> =
+    item.args?.toolCall &&
+    typeof item.args.toolCall === "object" &&
+    (item.args.toolCall as { kind?: unknown }).kind === "switch_mode" &&
+    Array.isArray(item.args.options)
+      ? (item.args.options as unknown[]).filter(
+          (option: unknown): option is { optionId: string; name?: string } =>
+            !!option &&
+            typeof option === "object" &&
+            typeof (option as { optionId?: unknown }).optionId === "string",
+        )
+      : [];
   return (
     <div className="approval-btns">
-      <button
-        className="btn approval-primary"
-        onClick={() => onApprove("allow")}
-      >
-        {primaryLabel}
-      </button>
+      {switchModeOptions.length > 0 ? (
+        switchModeOptions.map((option) => (
+          <button
+            className="btn approval-primary"
+            key={option.optionId}
+            onClick={() => onApprove("allow", option.optionId)}
+          >
+            {option.name || option.optionId}
+          </button>
+        ))
+      ) : (
+        <button
+          className="btn approval-primary"
+          onClick={() => onApprove("allow")}
+        >
+          {primaryLabel}
+        </button>
+      )}
       <span className="spacer" />
       <button className="btn quiet-deny" onClick={() => onApprove("deny")}>
         Deny
@@ -193,7 +217,7 @@ export function ApprovalCard({
   hostName,
 }: {
   item: ApprovalItem;
-  onApprove: (decision: ApprovalDecision) => void;
+  onApprove: (decision: ApprovalDecision, optionId?: string) => void;
   // Present when this approval was raised inside an automation run — unlocks the
   // task-persistent "Allow every time" (in-app only, §25).
   runTask?: { id: string; title: string } | null;

@@ -205,3 +205,73 @@ agent dispatch。需要逐 connector 定义 API schema、风险和审批，不�
 
 仓库有本地 Tauri 构建和门禁命令，但每种 Host/provider/connector/harness
 组合的真机端到端覆盖仍不完整；缺少证据的组合不应标记为已验证。
+
+## Harness 评审优化 backlog（docs/17-harness-review.md）
+
+对照三份外部 harness engineering 资料评审后的结论：14 个维度合计 87/140
+≈ 6.2/10；执行面（编辑、shell、权限、plan、provider 适配）接近成熟，短板
+集中在模型的认知面与工程的验证面。逐维度证据、评分依据、保留的冲突和实验
+清单见 `docs/17-harness-review.md`，此处只列可实施项。
+
+### [ ] P0 结构化工具错误信封
+
+工具失败当前是扁平 `{"error": string}`（`crates/opcos-engine/src/lib.rs:2205-2232`、
+`2462-2530`），模型拿不到 code、违反的不变量与修复路线，也分不清「不该重试」
+与「换参数重试」。改为稳定结构 `{code, invariant, target, repair, retry,
+retrieval}` 并保留人类可读摘要。
+
+### [ ] P0 渐进式工具披露与工具目录检索
+
+`tool_definitions()` 每轮全量注入约 70+ 个定义（`crates/opcos-engine/src/lib.rs:4242-4311`），
+接一个中等规模 MCP 服务端后超过 100 个。核心工具保持全量，browser 15 件套、
+连接器约 20 件套与 MCP 工具改为紧凑目录，新增 `tool_search` / `tool_describe`
+按需取 schema。需要先有轨迹回归才能开启。
+
+### [ ] P0 Trajectory eval harness
+
+当前只有 Rust/前端单测，没有 dataset / grader / trajectory runner，也没有失败
+分类，因此 harness 改动无法回答「完成率变好还是变坏」。按 Run / Trace / Thread
+三层组织，首批用例取自已修过的真实故障（嵌套目录写入、写失败不得产生
+`Created` 行、工作区外写入必须拒绝、卡死 turn 必须收敛、运行中 steering 必须
+被消费、approval 恢复、压缩后 plan 仍在 system message）。
+
+### [ ] P1 恢复语义与故障分类
+
+provider 静默、host 掉线与 harness bug 目前都表现为 timeout 或 provider error。
+需要分类字段进入 `stop_reason`，并支持从事件日志最后一个事件继续当前 turn，
+而不是只标 interrupted 等用户重发。
+
+### [ ] P1 Authority 模型
+
+durable grant 只有 key/target/expiry（`crates/opcos-engine/src/lib.rs:2214-2226`），
+缺 identity 与 environment 维度，无法表达「staging 自动、prod 分阶段」。高后果
+动作需要 assess → prepare → canary → approve → cut over → verify/rollback，并把
+`local_gate_status` 变成进入下一阶段的前置条件而不是模型自述。
+
+### [ ] P1 fan-out / barrier 与独立 evaluator
+
+plan step 是串行 dispatch，没有「等 N 个分支完成后合成」的 barrier；
+`AwaitingAcceptance` 的验收方是实现者所在的 Lead 会话，self-preferential bias
+未被结构性抑制。需要 fan-out group + barrier，以及可配置的独立 evaluator 角色。
+
+### [ ] P1 prompt cache 控制与四个时钟
+
+`cache_read`/`cache_write` 只读不写：没有稳定前缀排序与 `cache_control` 断点，
+命中是运气不是设计。指标侧只记了 worker timing，缺 human attention（approval
+等待时长）与 time to accepted outcome（AwaitingAcceptance → Done）。
+
+### [ ] P2 just-in-time 上下文与 PreCompact
+
+首条 system message 把 plan、runtime context 和全部系统指令一次性前置
+（`crates/opcos-engine/src/lib.rs:2933-2949`）。改为地图 + 路由表，深层规则按路径
+检索；新增 `PreCompact` hook 在压缩前固定「不要做 X」类约束。
+
+### [ ] P2 hook 生命周期补全
+
+现有 `PreToolUse` / `PostToolUse` / `Stop` / `PostCompaction`；缺 `PreCompact`、
+`SessionStart`、`SessionEnd`、`PostToolUseFailure`、`PermissionRequest`。
+`PostToolUseFailure` 的重复计数用于把反复失败升级为环境规则。
+
+### [ ] P2 编辑与验证接口补全
+
+缺 patch/diff 形态的编辑接口，写类工具没有 dry-run 与 postcondition receipt。

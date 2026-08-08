@@ -94,6 +94,7 @@ pub enum CoordinationError {
 pub enum BoardPhase {
     Open,
     Claimed,
+    AwaitingApproval,
     Paused,
     AwaitingAcceptance,
     Done,
@@ -200,6 +201,28 @@ impl BoardTask {
             return Err(CoordinationError::LeaseExpired);
         }
         self.lease_until = Some(now + Duration::minutes(1));
+        Ok(())
+    }
+
+    pub fn await_approval(&mut self, worker: &str) -> Result<(), CoordinationError> {
+        if self.assignee.as_deref() != Some(worker) || self.phase != BoardPhase::Claimed {
+            return Err(CoordinationError::NotClaimable);
+        }
+        self.phase = BoardPhase::AwaitingApproval;
+        self.lease_until = None;
+        Ok(())
+    }
+
+    pub fn resume_after_approval(
+        &mut self,
+        worker: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), CoordinationError> {
+        if self.assignee.as_deref() != Some(worker) || self.phase != BoardPhase::AwaitingApproval {
+            return Err(CoordinationError::NotClaimable);
+        }
+        self.phase = BoardPhase::Claimed;
+        self.lease_until = Some(now + Duration::hours(24));
         Ok(())
     }
 
@@ -672,6 +695,32 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&task).unwrap()).unwrap();
         assert_eq!(restored.dispatch_count, 2);
         assert_eq!(restored.dispatch_limit, 2);
+    }
+
+    #[test]
+    fn approval_wait_releases_lease_and_resumes_without_retrying() {
+        let now = Utc::now();
+        let mut task = BoardTask {
+            project_id: "project".into(),
+            id: "approval".into(),
+            title: "approval".into(),
+            phase: BoardPhase::Claimed,
+            assignee: Some("worker".into()),
+            lease_generation: 1,
+            lease_until: Some(now + Duration::hours(24)),
+            require_acceptance: false,
+            verified_pr_url: None,
+            branch: None,
+            pr: None,
+            dispatch_count: 1,
+            dispatch_limit: 8,
+        };
+        task.await_approval("worker").unwrap();
+        assert_eq!(task.phase, BoardPhase::AwaitingApproval);
+        assert!(task.lease_until.is_none());
+        task.resume_after_approval("worker", now).unwrap();
+        assert_eq!(task.phase, BoardPhase::Claimed);
+        assert!(task.lease_until.is_some_and(|until| until > now));
     }
 
     #[test]

@@ -445,8 +445,13 @@ select:focus {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   overflow-anchor: auto;
   padding: 20px 22px;
+}
+.main-scroll > * {
+  min-width: 0;
+  max-width: 100%;
 }
 .transcript-jump-bottom {
   position: absolute;
@@ -548,11 +553,13 @@ h3 {
   flex: none;
   overflow: visible;
   max-width: none;
+  min-width: 0;
   width: 100%;
   margin: 0;
   padding: 0;
 }
 .transcript-content {
+  min-width: 0;
   width: 100%;
   max-width: none;
   margin: 0;
@@ -669,6 +676,10 @@ h3 {
   font-size: 12px;
   font-weight: 500;
 }
+.transcript-row-label > .transcript-diff-badges,
+.transcript-artifact .transcript-diff-badges {
+  margin-left: 8px;
+}
 .transcript-additions {
   color: var(--ok);
 }
@@ -701,33 +712,44 @@ h3 {
   min-width: 0;
   flex-wrap: wrap;
   align-items: flex-start;
-  gap: 0 8px;
+  gap: 8px;
   margin: 0;
   color: var(--muted);
   font-size: 13px;
   line-height: 20px;
 }
+.transcript-shell-row .transcript-output {
+  flex: 0 0 auto;
+  width: auto;
+  margin-left: 0;
+}
+.transcript-shell-row .transcript-output[open] {
+  flex-basis: 100%;
+  width: 100%;
+}
 .transcript-row-label {
   min-width: 0;
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   overflow-wrap: anywhere;
   line-height: 20px;
 }
 .transcript-row-duration {
   flex: 0 0 auto;
+  margin-left: 8px;
   color: var(--muted);
   font-size: 12px;
   line-height: 18px;
 }
 .transcript-row-meta {
   flex: 0 0 auto;
+  margin-left: 8px;
   color: var(--muted);
   font-size: 12px;
   line-height: 18px;
 }
 .transcript-row-header {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: 4px;
   justify-content: flex-start;
   color: var(--muted);
@@ -747,7 +769,19 @@ h3 {
   padding: 2px;
 }
 .transcript-thought {
-  display: contents;
+  display: block;
+  flex: 0 0 100%;
+  width: 100%;
+  min-width: 0;
+}
+.transcript-thought > .transcript-row-header {
+  display: inline-flex;
+  width: auto;
+}
+.transcript-output,
+.transcript-artifact {
+  flex: 0 1 auto;
+  width: auto;
 }
 .transcript-thought-chevron {
   flex: 0 0 16px;
@@ -770,6 +804,28 @@ h3 {
   margin: 4px 0 0;
   color: var(--muted);
   white-space: pre-wrap;
+}
+.transcript-thought[open] {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  flex-basis: 100%;
+  width: 100%;
+}
+.transcript-thought[open] > .transcript-row-header {
+  justify-self: start;
+}
+.transcript-thought[open] > .transcript-disclosure-break {
+  display: none;
+}
+.transcript-thought[open] > .transcript-thought-body {
+  grid-column: 1;
+  width: 100%;
+}
+.transcript-output[open],
+.transcript-artifact[open] {
+  flex: 0 0 100%;
+  flex-basis: 100%;
+  width: 100%;
 }
 .transcript-thought-body .artifact-code {
   margin: 0;
@@ -866,7 +922,37 @@ h3 {
   margin: 0 0 2px;
 }
 .transcript-item {
+  min-width: 0;
+  max-width: 100%;
   margin: 0 0 18px;
+}
+.transcript-shell-row {
+  display: flex;
+  max-width: 100%;
+}
+.transcript-terminal-output {
+  display: block;
+  margin: 4px 0 0;
+  padding-left: 0;
+}
+.transcript-terminal-output .artifact-code {
+  margin-left: 0;
+}
+.work-segment > summary,
+.thinking > summary,
+.thinking-head {
+  width: max-content;
+  max-width: 100%;
+  align-items: center;
+}
+.work-segment > summary {
+  display: inline-flex;
+}
+.thinking > summary {
+  display: inline-flex;
+}
+.selected-session-row {
+  background: var(--panel);
 }
 .work-segment .transcript-item {
   margin: 0;
@@ -1504,11 +1590,13 @@ h3 {
 .artifact-code {
   margin: 0;
   padding: 18px;
+  max-width: 100%;
   color: var(--color-ink);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
   line-height: 1.55;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .rail-section h3 {
   margin-bottom: 11px;
