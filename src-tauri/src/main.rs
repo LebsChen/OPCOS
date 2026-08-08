@@ -122,7 +122,14 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio_tungstenite::accept_async;
+use tokio_tungstenite::{
+    accept_async, accept_hdr_async, connect_async,
+    tungstenite::{
+        Message as WsMessage,
+        client::IntoClientRequest,
+        handshake::server::{Request as WsRequest, Response as WsResponse},
+    },
+};
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -140,6 +147,7 @@ fn configure_no_window(_command: &mut ProcessCommand) {}
 const SECRET_SERVICE: &str = "com.opcos.desktop";
 const ASKPASS_SCRIPT: &str = "if (($args -join ' ') -match 'Username') { $env:OPCOS_GIT_USERNAME } else { $env:OPCOS_GIT_PASSWORD }";
 const MCP_STATE_FILE: &str = "mcp-server.json";
+const ACP_STATE_FILE: &str = "acp-server.json";
 
 #[derive(Debug, Deserialize, Serialize)]
 struct McpBridgeState {
@@ -147,6 +155,8 @@ struct McpBridgeState {
     port: u16,
     token: String,
 }
+
+type AcpBridgeState = McpBridgeState;
 
 fn mcp_state_path() -> Result<PathBuf, String> {
     Ok(dirs::config_dir()
@@ -259,6 +269,150 @@ fn run_mcp_bridge() -> Result<(), String> {
         }
         Ok(())
     })
+}
+
+fn acp_state_path() -> Result<PathBuf, String> {
+    Ok(dirs::config_dir()
+        .ok_or_else(|| "OPCOS configuration directory is unavailable".to_owned())?
+        .join("com.opcos.desktop")
+        .join(ACP_STATE_FILE))
+}
+
+fn write_acp_state(path: &FsPath, port: u16, token: &str) -> Result<(), String> {
+    write_mcp_state(path, port, token)
+}
+
+fn run_acp_bridge() -> Result<(), String> {
+    let path = acp_state_path()?;
+    let state: AcpBridgeState = serde_json::from_str(
+        &std::fs::read_to_string(&path)
+            .map_err(|_| "OPCOS is not running; ACP endpoint state is unavailable".to_owned())?,
+    )
+    .map_err(|error| format!("invalid OPCOS ACP endpoint state: {error}"))?;
+    if state.host != "127.0.0.1" && state.host != "localhost" {
+        return Err("OPCOS ACP endpoint is not loopback-only".into());
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("failed to start ACP bridge runtime: {error}"))?;
+    runtime.block_on(async move {
+        let url = format!("ws://{}:{}/acp", state.host, state.port);
+        let mut request = url
+            .into_client_request()
+            .map_err(|error| format!("invalid OPCOS ACP endpoint: {error}"))?;
+        request.headers_mut().insert(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", state.token)
+                .parse()
+                .map_err(|_| "invalid ACP authorization header".to_owned())?,
+        );
+        let (mut socket, _) = connect_async(request)
+            .await
+            .map_err(|_| "OPCOS is not running; ACP endpoint is unreachable".to_owned())?;
+        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        let mut stdout = tokio::io::stdout();
+        loop {
+            tokio::select! {
+                line = lines.next_line() => {
+                    let Some(line) = line.map_err(|error| error.to_string())? else { break };
+                    if !line.trim().is_empty() {
+                        socket.send(WsMessage::Text(line.into())).await
+                            .map_err(|_| "OPCOS ACP endpoint became unreachable".to_owned())?;
+                    }
+                }
+                message = socket.next() => {
+                    let Some(message) = message else { break };
+                    match message.map_err(|_| "OPCOS ACP endpoint returned an invalid frame".to_owned())? {
+                        WsMessage::Text(text) => {
+                            stdout.write_all(text.as_bytes()).await.map_err(|error| error.to_string())?;
+                            stdout.write_all(b"\n").await.map_err(|error| error.to_string())?;
+                            stdout.flush().await.map_err(|error| error.to_string())?;
+                        }
+                        WsMessage::Binary(bytes) => {
+                            stdout.write_all(&bytes).await.map_err(|error| error.to_string())?;
+                            stdout.write_all(b"\n").await.map_err(|error| error.to_string())?;
+                            stdout.flush().await.map_err(|error| error.to_string())?;
+                        }
+                        WsMessage::Close(_) => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+#[allow(clippy::result_large_err)]
+async fn serve_acp_http<C>(
+    listener: TcpListener,
+    token: String,
+    control_plane: Arc<C>,
+) -> Result<(), String>
+where
+    C: opcos_acp_server::OpcosAcpControlPlane,
+{
+    loop {
+        let (stream, _) = listener.accept().await.map_err(|error| error.to_string())?;
+        let expected = format!("Bearer {token}");
+        let control_plane = Arc::clone(&control_plane);
+        tokio::spawn(async move {
+            let callback = |request: &WsRequest, response: WsResponse| {
+                let authorized = request
+                    .headers()
+                    .get(reqwest::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value == expected);
+                if authorized {
+                    Ok(response)
+                } else {
+                    Err(WsResponse::builder()
+                        .status(401)
+                        .body(Some("unauthorized".into()))
+                        .expect("valid websocket response"))
+                }
+            };
+            let Ok(socket) = accept_hdr_async(stream, callback).await else {
+                return;
+            };
+            let (client, server_io) = tokio::io::duplex(128 * 1024);
+            let server_task = tokio::spawn(async move {
+                let protocol = opcos_acp_server::OpcosAcpServer::new(control_plane);
+                let (reader, writer) = tokio::io::split(server_io);
+                let _ = protocol
+                    .serve_stdio(tokio::io::BufReader::new(reader), writer)
+                    .await;
+            });
+            let (mut ws_writer, mut ws_reader) = socket.split();
+            let (client_reader, mut client_writer) = tokio::io::split(client);
+            let mut output = tokio::io::BufReader::new(client_reader).lines();
+            loop {
+                tokio::select! {
+                    line = output.next_line() => {
+                        let Ok(Some(line)) = line else { break };
+                        if ws_writer.send(WsMessage::Text(line.into())).await.is_err() { break; }
+                    }
+                    message = ws_reader.next() => {
+                        let Some(Ok(message)) = message else { break };
+                        match message {
+                            WsMessage::Text(text) => {
+                                if client_writer.write_all(text.as_bytes()).await.is_err()
+                                    || client_writer.write_all(b"\n").await.is_err() { break; }
+                            }
+                            WsMessage::Binary(bytes) => {
+                                if client_writer.write_all(&bytes).await.is_err()
+                                    || client_writer.write_all(b"\n").await.is_err() { break; }
+                            }
+                            WsMessage::Close(_) => break,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            server_task.abort();
+        });
+    }
 }
 mod ci_repair;
 mod external_ingress;
@@ -13721,6 +13875,199 @@ impl DesktopControlPlane {
 }
 
 #[async_trait]
+impl opcos_acp_server::OpcosAcpControlPlane for DesktopControlPlane {
+    async fn session_new(&self, arguments: Value) -> Result<Value, String> {
+        let state = self.state();
+        let cwd = arguments
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if let Some(cwd) = cwd.as_deref()
+            && cwd.trim().is_empty()
+        {
+            return Err("ACP cwd must not be empty".into());
+        }
+        let host_id = {
+            let settings = {
+                let database = state
+                    .database
+                    .lock()
+                    .map_err(|_| "database lock poisoned")?;
+                load_agent_settings(&database, None)?
+            };
+            let platform = settings
+                .get("default_platform")
+                .and_then(Value::as_str)
+                .unwrap_or("Ubuntu")
+                .to_ascii_lowercase();
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            connection
+                .query_row(
+                    "SELECT id FROM hosts WHERE lower(name) LIKE ?1 ORDER BY id LIMIT 1",
+                    [format!("%{platform}%")],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap_or_else(|_| "local".into())
+        };
+        if host_id == "local" {
+            if let Some(cwd) = cwd.as_deref()
+                && !FsPath::new(cwd).is_dir()
+            {
+                return Err(format!(
+                    "ACP cwd is not an available local workspace: {cwd}"
+                ));
+            }
+        } else {
+            let client = client_for(&self.state(), &host_id)?;
+            client
+                .health()
+                .await
+                .map_err(|error| format!("remote host unavailable: {error}"))?;
+            if let Some(cwd) = cwd.as_deref() {
+                client
+                    .with_workspace(cwd)
+                    .ls(None)
+                    .await
+                    .map_err(|error| format!("ACP cwd is unavailable on remote host: {error}"))?;
+            }
+        }
+        let view = create_session_for_state(
+            &state,
+            "OPCOS ACP session".into(),
+            None,
+            None,
+            None,
+            None,
+            Some("builtin".into()),
+            cwd,
+            None,
+            None,
+            None,
+        )?;
+        emit(
+            &self.app,
+            "session_list_changed",
+            None,
+            json!({"session_id": view.id}),
+        );
+        Ok(json!({"sessionId": view.id}))
+    }
+
+    async fn session_prompt(
+        &self,
+        session_id: String,
+        prompt: Vec<Value>,
+        sink: Arc<dyn opcos_acp_server::AcpEventSink>,
+    ) -> Result<String, String> {
+        let text = prompt
+            .iter()
+            .map(|block| {
+                if block.get("type").and_then(Value::as_str) != Some("text") {
+                    return Err("unsupported ACP prompt content block".to_owned());
+                }
+                block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "ACP text content is missing text".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .join("");
+        sink.update(
+            &session_id,
+            json!({"sessionUpdate":"user_message_chunk","content":{"type":"text","text":text}}),
+        )
+        .await?;
+        let result = submit_turn_inner_with_origin(
+            self.app.clone(),
+            &self.state(),
+            SubmitRequest {
+                session_id: session_id.clone(),
+                text,
+                attachments: Vec::new(),
+            },
+            ToolOrigin::User,
+        )
+        .await;
+        if let Err(error) = result {
+            let session = session_for(&self.state(), &session_id)?;
+            if session.run_state == "interrupted" || session.stop_reason == "interrupted_by_user" {
+                return Ok("cancelled".into());
+            }
+            let pending = self
+                .state()
+                .store
+                .load_pending(&session_id)
+                .map_err(|store_error| store_error.to_string())?;
+            if let Some(pending) = pending.into_iter().next() {
+                let response = sink
+                    .request_permission(json!({
+                        "sessionId": session_id,
+                        "toolCall": {
+                            "toolCallId": pending.call_id,
+                            "title": pending.tool,
+                            "status": "pending"
+                        },
+                        "options": [
+                            {"optionId":"allow_once","name":"Allow once"},
+                            {"optionId":"deny","name":"Deny"}
+                        ]
+                    }))
+                    .await?;
+                let allow = response
+                    .get("outcome")
+                    .and_then(|outcome| outcome.get("outcome"))
+                    .and_then(Value::as_str)
+                    == Some("selected")
+                    && response
+                        .get("outcome")
+                        .and_then(|outcome| outcome.get("optionId"))
+                        .and_then(Value::as_str)
+                        == Some("allow_once");
+                let engine =
+                    engine_for(&self.app, &self.state(), &session_id, ToolOrigin::User).await?;
+                match engine
+                    .resolve_approval(
+                        &pending.call_id,
+                        if allow {
+                            opcos_engine::ApprovalOutcome::Approve
+                        } else {
+                            opcos_engine::ApprovalOutcome::Deny
+                        },
+                    )
+                    .await
+                {
+                    Ok(_) | Err(EngineError::ApprovalAlreadyProcessed(_)) => {}
+                    Err(next) => return Err(engine_error_message(next)),
+                }
+                return Ok(if allow { "end_turn" } else { "cancelled" }.into());
+            }
+            return Err(error);
+        }
+        let state = self.state();
+        if let Ok(messages) = state.store.load_messages(&session_id)
+            && let Some(message) = messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "assistant")
+        {
+            sink.update(
+                &session_id,
+                json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":message.content}}),
+            )
+            .await?;
+        }
+        Ok("end_turn".into())
+    }
+
+    async fn session_cancel(&self, session_id: String) -> Result<(), String> {
+        interrupt_for_state(self.app.clone(), &self.state(), session_id).await
+    }
+}
+
+#[async_trait]
 impl opcos_mcp_server::OpcosControlPlane for DesktopControlPlane {
     async fn session_create(&self, arguments: Value) -> Result<Value, String> {
         let state = self.state();
@@ -24991,6 +25338,13 @@ fn main() {
         }
         return;
     }
+    if std::env::args().nth(1).as_deref() == Some("acp-serve") {
+        if let Err(error) = run_acp_bridge() {
+            eprintln!("ACP bridge unavailable: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
@@ -25068,6 +25422,27 @@ fn main() {
                 .map_err(tauri::Error::from)?
                 .port();
             write_mcp_state(&mcp_state_path, mcp_port, &mcp_token).map_err(|error| {
+                let cause: Box<dyn std::error::Error> = Box::new(std::io::Error::other(error));
+                tauri::Error::Setup(cause.into())
+            })?;
+            let acp_state_path = acp_state_path().map_err(|error| {
+                let cause: Box<dyn std::error::Error> = Box::new(std::io::Error::other(error));
+                tauri::Error::Setup(cause.into())
+            })?;
+            let acp_token = load_or_create_mcp_token(&acp_state_path).map_err(|error| {
+                let cause: Box<dyn std::error::Error> = Box::new(std::io::Error::other(error));
+                tauri::Error::Setup(cause.into())
+            })?;
+            let acp_listener =
+                std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(tauri::Error::from)?;
+            acp_listener
+                .set_nonblocking(true)
+                .map_err(tauri::Error::from)?;
+            let acp_port = acp_listener
+                .local_addr()
+                .map_err(tauri::Error::from)?
+                .port();
+            write_acp_state(&acp_state_path, acp_port, &acp_token).map_err(|error| {
                 let cause: Box<dyn std::error::Error> = Box::new(std::io::Error::other(error));
                 tauri::Error::Setup(cause.into())
             })?;
@@ -25187,6 +25562,22 @@ fn main() {
                 let server = Arc::new(opcos_mcp_server::OpcosMcpServer::new(control_plane));
                 if let Err(error) = server.serve_http(listener, mcp_token).await {
                     eprintln!("MCP HTTP server stopped: {error}");
+                }
+            });
+            let acp_service_handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let listener = match TcpListener::from_std(acp_listener) {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        eprintln!("failed to register ACP listener: {error}");
+                        return;
+                    }
+                };
+                let control_plane = Arc::new(DesktopControlPlane {
+                    app: acp_service_handle.clone(),
+                });
+                if let Err(error) = serve_acp_http(listener, acp_token, control_plane).await {
+                    eprintln!("ACP server stopped: {error}");
                 }
             });
             let trigger_handle = handle.clone();

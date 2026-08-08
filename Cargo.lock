@@ -4053,6 +4053,7 @@ dependencies = [
  "keyring",
  "native-tls",
  "notify",
+ "opcos-acp-server",
  "opcos-assets",
  "opcos-engine",
  "opcos-hosts",
@@ -4079,6 +4080,18 @@ dependencies = [
  "url",
  "uuid",
  "zip",
+]
+
+[[package]]
+name = "opcos-acp-server"
+version = "0.1.1"
+dependencies = [
+ "agent-client-protocol",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]

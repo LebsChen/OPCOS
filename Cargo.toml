@@ -11,6 +11,7 @@ members = [
   "crates/opcos-store",
   "crates/opcos-mcp",
   "crates/opcos-mcp-server",
+  "crates/opcos-acp-server",
   "crates/opcos-assets",
   "src-tauri",
 ]
@@ -30,6 +31,7 @@ x11rb = "0.13"
 anyhow = "1"
 async-trait = "0.1"
 opcos-mcp-server = { path = "crates/opcos-mcp-server" }
+opcos-acp-server = { path = "crates/opcos-acp-server" }
 agent-client-protocol = "2.0.0"
 opcos-hosts = { path = "crates/opcos-hosts" }
 aws-config = "1"
