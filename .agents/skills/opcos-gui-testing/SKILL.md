@@ -1314,3 +1314,45 @@ string in the body and ask the agent to quote its first line. Also ask the agent
 
 Devin Secrets Needed: `GH_PAT` (GitHub MCP bearer), `Devin_MCP_COG` (mcp.devin.ai bearer),
 `CF_TOKEN`/`CF_ID` for the Cloudflare provider the agent runs on.
+## MCP round-9 findings (commit `7854e25` and later)
+
+Fixture layout that has proven reusable (keep them out of the repo, e.g. `/home/ubuntu/mcp-mock/`):
+- `sse_server.py` — legacy `http-sse` mock. Useful extras: per-method request counters exposed on
+  `GET /stats` (the only oracle for "did the client really re-request?"), paginated `tools/list`
+  (page 1 + `nextCursor`) to prove cursor aggregation, an explicit JSON-RPC `-32601` on
+  `resources/templates/list` to prove `MethodNotFound` degrades to an empty set instead of failing the
+  connection, and separate `/flip` (tools) and `/flip-resource` (resources) routes so a `list_changed`
+  refresh is *visible* in the panel (the card shows resource/prompt counts but no tool count, so a
+  tools-only change is unobservable in the UI).
+- `oauth_server.py` — local AS + protected MCP endpoint on one port: 401 with
+  `WWW-Authenticate: … resource_metadata=…`, RFC 9728 + RFC 8414 metadata with `registration_endpoint`
+  and `code_challenge_methods_supported:["S256"]`, DCR, a token endpoint that verifies the PKCE S256
+  challenge and the loopback `redirect_uri`, short `expires_in`, a `/expire` route to force a refresh,
+  and a `/stats` route returning a redacted event log (`authorize s256=True state=True
+  loopback_callback=True`, `token refresh_token accepted=True`, `mcp authenticated … gen=N`). Write the
+  issued token values to a side file only, so the leak audit can grep for them without ever printing
+  them. This is the only practical way to prove the OAuth chain — real ASes (github.com) advertise no
+  `registration_endpoint`.
+
+Behaviours to expect / watch for when testing MCP:
+- `pkill -f 'sse_server.py'` kills your own shell (the pattern matches the shell's command line). Use
+  `pkill -9 -f 'sse_serv[e]r.py'` and start mocks with `(setsid python3 … &)`.
+- Agent-facing MCP tools only appear in sessions whose `project_id` matches the project that owns the
+  MCP config (`effective_config_objects`). A scratch session with `project_id = NULL` will report "no
+  such tool" — always use the project's session (e.g. its Lead member session).
+- After the OAuth token exchange the card can stay `auth_required`; `Retry` may issue no request at all.
+  Restarting the app makes the stored token take effect. Check `mcp-credential:<object_id>` in
+  `secrets.enc` (keys only!) to tell "token stored but not applied" from "token exchange failed".
+- A legacy-SSE server that is *fully down* (not just restarted) can make a tool call hang for many
+  minutes with no explicit error, and afterwards the session may refuse to start any new turn
+  (`session_events` gets no rows) until the app is restarted. Budget for an app restart in that scenario
+  and prefer restart-the-mock (self-healing works) over kill-the-mock when you only need reconnect
+  coverage.
+- Submitting a message while an attached resource's MCP server is unreachable can silently drop the
+  submission (composer clears, no turn, no error) — detach context resources before down-server tests.
+- GitHub MCP resources are 0.8–1.1 MB HTML apps. Attaching one kills the turn with
+  `Provider request failed`; there is no truncation on the attachment path. Use a small mock resource
+  with a unique marker to prove the model really consumes attached context.
+- `mcp_resource_templates` / `mcp_subscribe_resource` / `mcp_unsubscribe_resource` have no frontend
+  caller (`grep web/src`), so templates and subscribe/unsubscribe cannot be tested through the UI —
+  report them untested-by-design rather than hunting for a button.
