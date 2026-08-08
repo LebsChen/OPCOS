@@ -9,14 +9,29 @@
 //! evaluates engine-side orchestration (events, state transitions, approvals,
 //! steering, and compaction), not the production tool implementation in
 //! `src-tauri`.
+//!
+//! `internal_taskset` contains deterministic offline verifier tasks. Each task
+//! declares its initial workspace, prompt, scripted provider, expected
+//! artifacts, verifier script, and permanent held-in/held-out split. A task
+//! passes only when the generated verifier script exits successfully; expected
+//! artifact checks are rendered into that script. Live model providers and
+//! external execution environments remain adapter seams and are not required
+//! by this taskset.
+//!
+//! The opt-in live entry point is the `internal_taskset_live` binary. It reads
+//! `xinlicloud_KEY` only for the Authorization bearer header, with
+//! `OPCOS_TASKSET_MODEL`, `OPCOS_TASKSET_CONCURRENCY`, and
+//! `OPCOS_TASKSET_REPEATS` controlling the rollout. `OPCOS_TASKSET_LIVE=1` is
+//! required; live execution is never part of the normal test gates.
 
 use async_trait::async_trait;
 use chrono::Utc;
 use opcos_engine::{ApprovalOutcome, EngineError, PreflightDecision, ToolExecutor, TurnEngine};
 use opcos_policy::PermissionMode;
+use opcos_provider::openai::OpenAiProvider;
 use opcos_provider::{
-    AssistantTurn, Caps, Provider, ProviderError, ProviderRequest, StreamChunk, TokenUsage,
-    ToolCall,
+    AssistantTurn, Caps, Provider, ProviderConfig, ProviderError, ProviderRequest, StreamChunk,
+    TokenUsage, ToolCall,
 };
 use opcos_store::{SessionRecord, SessionStore, SqliteStore};
 use serde::{Deserialize, Serialize};
@@ -25,6 +40,7 @@ use std::{
     collections::{HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
+    process::Command,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -178,6 +194,7 @@ pub struct EvalCase {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProviderSourceSpec {
     Scripted(Vec<ScriptedResponse>),
+    OpenAiCompatible { base_url: String, model: String },
     External,
 }
 
@@ -195,6 +212,197 @@ pub enum GraderSpec {
         fail_to_pass: Vec<String>,
         pass_to_pass: Vec<String>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TaskSplit {
+    HeldIn,
+    HeldOut,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExpectedArtifact {
+    pub path: String,
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerificationScript {
+    pub filename: String,
+    pub body: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VerifierTask {
+    pub name: String,
+    pub description: String,
+    pub split: TaskSplit,
+    pub initial_workspace: Vec<(String, String)>,
+    pub prompt: String,
+    pub provider: ProviderSourceSpec,
+    pub expected_artifacts: Vec<ExpectedArtifact>,
+    pub verifier: VerificationScript,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveRolloutConfig {
+    pub base_url: String,
+    pub model: String,
+    pub concurrency: usize,
+    pub repeats: usize,
+}
+
+impl LiveRolloutConfig {
+    pub fn from_env() -> Result<Self, EvalError> {
+        if std::env::var("OPCOS_TASKSET_LIVE").ok().as_deref() != Some("1") {
+            return Err(EvalError::Fixture(
+                "live rollout is disabled; set OPCOS_TASKSET_LIVE=1 explicitly".into(),
+            ));
+        }
+        let api_key = std::env::var("xinlicloud_KEY").map_err(|_| {
+            EvalError::Fixture("xinlicloud_KEY is required for live rollout".into())
+        })?;
+        if api_key.is_empty() {
+            return Err(EvalError::Fixture(
+                "xinlicloud_KEY must not be empty".into(),
+            ));
+        }
+        Ok(Self {
+            base_url: std::env::var("OPCOS_TASKSET_BASE_URL")
+                .unwrap_or_else(|_| "https://llm.xinlicloud.top/v1".into()),
+            model: std::env::var("OPCOS_TASKSET_MODEL").unwrap_or_else(|_| "glm-5.2".into()),
+            concurrency: parse_positive_env("OPCOS_TASKSET_CONCURRENCY", 1)?,
+            repeats: parse_positive_env("OPCOS_TASKSET_REPEATS", 1)?,
+        })
+    }
+}
+
+fn parse_positive_env(name: &str, default: usize) -> Result<usize, EvalError> {
+    let value = std::env::var(name).unwrap_or_else(|_| default.to_string());
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| EvalError::Fixture(format!("{name} must be a positive integer")))?;
+    (parsed > 0)
+        .then_some(parsed)
+        .ok_or_else(|| EvalError::Fixture(format!("{name} must be a positive integer")))
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerifierTaskReport {
+    pub task: String,
+    pub split: TaskSplit,
+    pub passed: bool,
+    pub verifier_exit_code: Option<i32>,
+    pub expected_artifacts: Vec<ExpectedArtifact>,
+    pub engine_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SplitPassCount {
+    pub total: usize,
+    pub passed: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TasksetRun {
+    pub reports: Vec<VerifierTaskReport>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AggregatedTaskset {
+    pub runs: usize,
+    pub task_passes: std::collections::BTreeMap<String, SplitPassCount>,
+    pub held_in: SplitPassCount,
+    pub held_out: SplitPassCount,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ComparisonResult {
+    pub accepted: bool,
+    pub reason: String,
+    pub baseline: AggregatedTaskset,
+    pub candidate: AggregatedTaskset,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CandidateEvaluationRecord {
+    pub candidate: String,
+    pub comparison: ComparisonResult,
+}
+
+pub fn aggregate_taskset_runs(runs: &[TasksetRun]) -> AggregatedTaskset {
+    let mut task_passes = std::collections::BTreeMap::<String, SplitPassCount>::new();
+    let mut held_in = SplitPassCount {
+        total: 0,
+        passed: 0,
+    };
+    let mut held_out = SplitPassCount {
+        total: 0,
+        passed: 0,
+    };
+    for run in runs {
+        for report in &run.reports {
+            let task = task_passes
+                .entry(report.task.clone())
+                .or_insert(SplitPassCount {
+                    total: 0,
+                    passed: 0,
+                });
+            task.total += 1;
+            task.passed += usize::from(report.passed);
+            let split = match report.split {
+                TaskSplit::HeldIn => &mut held_in,
+                TaskSplit::HeldOut => &mut held_out,
+            };
+            split.total += 1;
+            split.passed += usize::from(report.passed);
+        }
+    }
+    AggregatedTaskset {
+        runs: runs.len(),
+        task_passes,
+        held_in,
+        held_out,
+    }
+}
+
+pub fn compare_taskset_runs(
+    baseline: &AggregatedTaskset,
+    candidate: &AggregatedTaskset,
+) -> ComparisonResult {
+    let held_in_ok = pass_rate_not_lower(&baseline.held_in, &candidate.held_in);
+    let held_out_ok = pass_rate_not_lower(&baseline.held_out, &candidate.held_out);
+    let accepted = held_in_ok && held_out_ok;
+    let reason = match (held_in_ok, held_out_ok) {
+        (true, true) => "candidate does not regress held-in or held-out".into(),
+        (false, true) => "candidate regresses held-in".into(),
+        (true, false) => "candidate regresses held-out".into(),
+        (false, false) => "candidate regresses held-in and held-out".into(),
+    };
+    ComparisonResult {
+        accepted,
+        reason,
+        baseline: baseline.clone(),
+        candidate: candidate.clone(),
+    }
+}
+
+pub fn record_taskset_candidate(
+    candidate: impl Into<String>,
+    baseline: &AggregatedTaskset,
+    candidate_result: &AggregatedTaskset,
+) -> CandidateEvaluationRecord {
+    CandidateEvaluationRecord {
+        candidate: candidate.into(),
+        comparison: compare_taskset_runs(baseline, candidate_result),
+    }
+}
+
+fn pass_rate_not_lower(baseline: &SplitPassCount, candidate: &SplitPassCount) -> bool {
+    if baseline.total == 0 {
+        return true;
+    }
+    candidate.passed * baseline.total >= baseline.passed * candidate.total
 }
 
 /// A provider source can be a replay or a live model adapter supplied by a
@@ -339,6 +547,46 @@ impl ToolExecutor for FixtureTools {
                 let path = checked_path(&self.workspace, arguments["path"].as_str().unwrap_or(""))?;
                 let content = fs::read_to_string(path).map_err(|error| error.to_string())?;
                 Ok(json!({"content":content}))
+            }
+            "edit_file" => {
+                let path = checked_path(&self.workspace, arguments["path"].as_str().unwrap_or(""))?;
+                let old = arguments["old_string"].as_str().unwrap_or_default();
+                let new = arguments["new_string"].as_str().unwrap_or_default();
+                let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+                if content.matches(old).count() != 1 {
+                    return Err("edit anchor must match exactly once".into());
+                }
+                fs::write(path, content.replacen(old, new, 1))
+                    .map_err(|error| error.to_string())?;
+                Ok(json!({"status":"edited"}))
+            }
+            "append_file" => {
+                let path = checked_path(&self.workspace, arguments["path"].as_str().unwrap_or(""))?;
+                let content = arguments["content"].as_str().unwrap_or_default();
+                use std::io::Write;
+                let mut file = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .map_err(|error| error.to_string())?;
+                file.write_all(content.as_bytes())
+                    .map_err(|error| error.to_string())?;
+                Ok(json!({"status":"appended"}))
+            }
+            "run_shell" => {
+                let command = arguments["command"].as_str().unwrap_or_default();
+                let output = Command::new("sh")
+                    .args(["-c", command])
+                    .current_dir(&self.workspace)
+                    .output()
+                    .map_err(|error| error.to_string())?;
+                if !output.status.success() {
+                    return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+                }
+                Ok(json!({
+                    "status":"completed",
+                    "stdout":String::from_utf8_lossy(&output.stdout).to_string()
+                }))
             }
             "propose_plan" => Ok(json!({"status":"accepted"})),
             _ => Err(format!("unsupported fixture tool: {name}")),
@@ -721,6 +969,599 @@ pub fn builtin_cases() -> Vec<EvalCase> {
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
+fn verifier_task(
+    name: &str,
+    description: &str,
+    split: TaskSplit,
+    initial_workspace: Vec<(&str, &str)>,
+    prompt: &str,
+    turns: Vec<Vec<ToolCall>>,
+    expected_artifacts: Vec<(&str, &str)>,
+    verifier: &str,
+) -> VerifierTask {
+    VerifierTask {
+        name: name.into(),
+        description: description.into(),
+        split,
+        initial_workspace: initial_workspace
+            .into_iter()
+            .map(|(path, content)| (path.into(), content.into()))
+            .collect(),
+        prompt: prompt.into(),
+        provider: ProviderSourceSpec::Scripted(
+            turns
+                .into_iter()
+                .enumerate()
+                .map(|(index, calls)| turn(&format!("step {index}"), calls))
+                .chain(std::iter::once(turn("done", vec![])))
+                .collect(),
+        ),
+        expected_artifacts: expected_artifacts
+            .into_iter()
+            .map(|(path, content)| ExpectedArtifact {
+                path: path.into(),
+                content: content.into(),
+            })
+            .collect(),
+        verifier: VerificationScript {
+            filename: "verify.sh".into(),
+            body: verifier.into(),
+        },
+    }
+}
+
+pub fn internal_taskset() -> Vec<VerifierTask> {
+    use TaskSplit::{HeldIn, HeldOut};
+    vec![
+        verifier_task(
+            "nested_write",
+            "Write the requested content into a nested directory.",
+            HeldIn,
+            vec![],
+            "Create nested/result.txt containing alpha.",
+            vec![vec![call(
+                "task-1",
+                "write_file",
+                json!({"path":"nested/result.txt","content":"alpha"}),
+            )]],
+            vec![("nested/result.txt", "alpha")],
+            "test \"$(cat nested/result.txt)\" = alpha",
+        ),
+        verifier_task(
+            "exact_edit",
+            "Replace one exact anchor without changing surrounding content.",
+            HeldIn,
+            vec![("config.txt", "mode=old\nkeep=yes\n")],
+            "Change mode from old to new and preserve keep.",
+            vec![vec![call(
+                "task-2",
+                "edit_file",
+                json!({"path":"config.txt","old_string":"mode=old","new_string":"mode=new"}),
+            )]],
+            vec![("config.txt", "mode=new\nkeep=yes\n")],
+            "grep -Fx 'mode=new' config.txt && grep -Fx 'keep=yes' config.txt",
+        ),
+        verifier_task(
+            "append_log",
+            "Append a record to an existing file.",
+            HeldIn,
+            vec![("log.txt", "start\n")],
+            "Append done to log.txt.",
+            vec![vec![call(
+                "task-3",
+                "append_file",
+                json!({"path":"log.txt","content":"done\n"}),
+            )]],
+            vec![("log.txt", "start\ndone\n")],
+            "test \"$(tail -n 1 log.txt)\" = done",
+        ),
+        verifier_task(
+            "read_then_write",
+            "Use an existing file's value to produce a derived artifact.",
+            HeldIn,
+            vec![("source.txt", "source-value")],
+            "Read source.txt and write its value to copied.txt.",
+            vec![
+                vec![call("task-4a", "read_file", json!({"path":"source.txt"}))],
+                vec![call(
+                    "task-4b",
+                    "write_file",
+                    json!({"path":"copied.txt","content":"source-value"}),
+                )],
+            ],
+            vec![("copied.txt", "source-value")],
+            "test \"$(cat copied.txt)\" = source-value",
+        ),
+        verifier_task(
+            "parent_boundary_recovery",
+            "Recover from a parent traversal rejection by using a safe path.",
+            HeldIn,
+            vec![],
+            "Do not write outside the workspace; write safe.txt instead.",
+            vec![
+                vec![call(
+                    "task-5a",
+                    "write_file",
+                    json!({"path":"../unsafe.txt","content":"no"}),
+                )],
+                vec![call(
+                    "task-5b",
+                    "write_file",
+                    json!({"path":"safe.txt","content":"safe"}),
+                )],
+            ],
+            vec![("safe.txt", "safe")],
+            "test \"$(cat safe.txt)\" = safe && test ! -e ../unsafe.txt",
+        ),
+        verifier_task(
+            "absolute_boundary_recovery",
+            "Recover from an absolute path rejection without creating the target.",
+            HeldIn,
+            vec![],
+            "Write the result to local.txt, never to an absolute path.",
+            vec![
+                vec![call(
+                    "task-6a",
+                    "write_file",
+                    json!({"path":"/tmp/not-allowed.txt","content":"no"}),
+                )],
+                vec![call(
+                    "task-6b",
+                    "write_file",
+                    json!({"path":"local.txt","content":"local"}),
+                )],
+            ],
+            vec![("local.txt", "local")],
+            "test \"$(cat local.txt)\" = local",
+        ),
+        verifier_task(
+            "shell_create_file",
+            "Use an offline shell command to create the requested artifact.",
+            HeldIn,
+            vec![],
+            "Create shell.txt with the word shell.",
+            vec![vec![call(
+                "task-7",
+                "run_shell",
+                json!({"command":"printf shell > shell.txt"}),
+            )]],
+            vec![("shell.txt", "shell")],
+            "test \"$(cat shell.txt)\" = shell",
+        ),
+        verifier_task(
+            "shell_failure_recovery",
+            "Recover after a deterministic shell failure.",
+            HeldIn,
+            vec![],
+            "If the first command fails, correct it and create recovered.txt.",
+            vec![
+                vec![call("task-8a", "run_shell", json!({"command":"false"}))],
+                vec![call(
+                    "task-8b",
+                    "run_shell",
+                    json!({"command":"printf recovered > recovered.txt"}),
+                )],
+            ],
+            vec![("recovered.txt", "recovered")],
+            "test \"$(cat recovered.txt)\" = recovered",
+        ),
+        verifier_task(
+            "multi_step_directory",
+            "Complete a dependent directory and file creation sequence.",
+            HeldIn,
+            vec![],
+            "Create reports/summary.txt containing ready.",
+            vec![
+                vec![call(
+                    "task-9a",
+                    "run_shell",
+                    json!({"command":"mkdir -p reports"}),
+                )],
+                vec![call(
+                    "task-9b",
+                    "write_file",
+                    json!({"path":"reports/summary.txt","content":"ready"}),
+                )],
+            ],
+            vec![("reports/summary.txt", "ready")],
+            "test -d reports && test \"$(cat reports/summary.txt)\" = ready",
+        ),
+        verifier_task(
+            "preserve_unrelated",
+            "Edit one field while preserving unrelated file content.",
+            HeldIn,
+            vec![("settings.ini", "a=1\nb=2\nc=3\n")],
+            "Change b to 9 and preserve a and c.",
+            vec![vec![call(
+                "task-10",
+                "edit_file",
+                json!({"path":"settings.ini","old_string":"b=2","new_string":"b=9"}),
+            )]],
+            vec![("settings.ini", "a=1\nb=9\nc=3\n")],
+            "grep -Fx 'a=1' settings.ini && grep -Fx 'b=9' settings.ini && grep -Fx 'c=3' settings.ini",
+        ),
+        verifier_task(
+            "exact_newline",
+            "Persist exact multiline output including its final newline.",
+            HeldIn,
+            vec![],
+            "Write the exact two-line output to exact.txt.",
+            vec![vec![call(
+                "task-11",
+                "write_file",
+                json!({"path":"exact.txt","content":"one\ntwo\n"}),
+            )]],
+            vec![("exact.txt", "one\ntwo\n")],
+            "test \"$(wc -l < exact.txt)\" -eq 2 && test \"$(tail -n 1 exact.txt)\" = two",
+        ),
+        verifier_task(
+            "multiple_artifacts",
+            "Produce two independent artifacts with exact contents.",
+            HeldIn,
+            vec![],
+            "Write left.txt and right.txt.",
+            vec![vec![
+                call(
+                    "task-12a",
+                    "write_file",
+                    json!({"path":"left.txt","content":"left"}),
+                ),
+                call(
+                    "task-12b",
+                    "write_file",
+                    json!({"path":"right.txt","content":"right"}),
+                ),
+            ]],
+            vec![("left.txt", "left"), ("right.txt", "right")],
+            "test \"$(cat left.txt)\" = left && test \"$(cat right.txt)\" = right",
+        ),
+        verifier_task(
+            "heldout_nested_edit",
+            "Edit a file in a nested directory.",
+            HeldOut,
+            vec![("src/app.txt", "status=todo\n")],
+            "Change the nested status to done.",
+            vec![vec![call(
+                "task-13",
+                "edit_file",
+                json!({"path":"src/app.txt","old_string":"status=todo","new_string":"status=done"}),
+            )]],
+            vec![("src/app.txt", "status=done\n")],
+            "grep -Fx 'status=done' src/app.txt",
+        ),
+        verifier_task(
+            "heldout_sibling_boundary",
+            "Avoid a sibling path while producing the requested local artifact.",
+            HeldOut,
+            vec![],
+            "Recover from ../sibling.txt rejection and write child.txt.",
+            vec![
+                vec![call(
+                    "task-14a",
+                    "write_file",
+                    json!({"path":"../sibling.txt","content":"bad"}),
+                )],
+                vec![call(
+                    "task-14b",
+                    "write_file",
+                    json!({"path":"child.txt","content":"child"}),
+                )],
+            ],
+            vec![("child.txt", "child")],
+            "test \"$(cat child.txt)\" = child && test ! -e ../sibling.txt",
+        ),
+        verifier_task(
+            "heldout_shell_pipeline",
+            "Use an offline shell pipeline to transform a file.",
+            HeldOut,
+            vec![("input.txt", "beta\nalpha\n")],
+            "Sort input.txt into sorted.txt.",
+            vec![vec![call(
+                "task-15",
+                "run_shell",
+                json!({"command":"sort input.txt > sorted.txt"}),
+            )]],
+            vec![("sorted.txt", "alpha\nbeta\n")],
+            "test \"$(head -n 1 sorted.txt)\" = alpha && test \"$(tail -n 1 sorted.txt)\" = beta",
+        ),
+        verifier_task(
+            "heldout_shell_stderr_recovery",
+            "Recover from a shell command with deterministic stderr.",
+            HeldOut,
+            vec![],
+            "After the failing command, create fixed.txt.",
+            vec![
+                vec![call(
+                    "task-16a",
+                    "run_shell",
+                    json!({"command":"echo expected-error >&2; exit 7"}),
+                )],
+                vec![call(
+                    "task-16b",
+                    "write_file",
+                    json!({"path":"fixed.txt","content":"fixed"}),
+                )],
+            ],
+            vec![("fixed.txt", "fixed")],
+            "test \"$(cat fixed.txt)\" = fixed",
+        ),
+        verifier_task(
+            "heldout_missing_parent",
+            "Create an artifact whose parent directory does not exist yet.",
+            HeldOut,
+            vec![],
+            "Write nested/deep/output.txt.",
+            vec![vec![call(
+                "task-17",
+                "write_file",
+                json!({"path":"nested/deep/output.txt","content":"deep"}),
+            )]],
+            vec![("nested/deep/output.txt", "deep")],
+            "test \"$(cat nested/deep/output.txt)\" = deep",
+        ),
+        verifier_task(
+            "heldout_overwrite",
+            "Replace an existing artifact with the requested exact content.",
+            HeldOut,
+            vec![("replace.txt", "old")],
+            "Replace replace.txt with new.",
+            vec![vec![call(
+                "task-18",
+                "write_file",
+                json!({"path":"replace.txt","content":"new"}),
+            )]],
+            vec![("replace.txt", "new")],
+            "test \"$(cat replace.txt)\" = new",
+        ),
+        verifier_task(
+            "heldout_config_dependency",
+            "Read a config value and use it in a dependent output.",
+            HeldOut,
+            vec![("config.txt", "enabled")],
+            "Read config.txt and write its value to state.txt.",
+            vec![
+                vec![call("task-19a", "read_file", json!({"path":"config.txt"}))],
+                vec![call(
+                    "task-19b",
+                    "write_file",
+                    json!({"path":"state.txt","content":"enabled"}),
+                )],
+            ],
+            vec![("state.txt", "enabled")],
+            "test \"$(cat state.txt)\" = enabled",
+        ),
+        verifier_task(
+            "heldout_exact_json",
+            "Write a valid exact JSON artifact.",
+            HeldOut,
+            vec![],
+            "Write payload.json with the requested JSON.",
+            vec![vec![call(
+                "task-20",
+                "write_file",
+                json!({"path":"payload.json","content":"{\"ok\":true,\"count\":2}"}),
+            )]],
+            vec![("payload.json", "{\"ok\":true,\"count\":2}")],
+            "grep -Fx '{\"ok\":true,\"count\":2}' payload.json",
+        ),
+        verifier_task(
+            "heldout_whitespace",
+            "Preserve meaningful whitespace in an output artifact.",
+            HeldOut,
+            vec![],
+            "Write padded.txt exactly with two leading spaces.",
+            vec![vec![call(
+                "task-21",
+                "write_file",
+                json!({"path":"padded.txt","content":"  padded"}),
+            )]],
+            vec![("padded.txt", "  padded")],
+            "test \"$(cat padded.txt)\" = '  padded'",
+        ),
+        verifier_task(
+            "heldout_two_appends",
+            "Apply two ordered append operations.",
+            HeldOut,
+            vec![("events.txt", "one\n")],
+            "Append two ordered events.",
+            vec![
+                vec![call(
+                    "task-22a",
+                    "append_file",
+                    json!({"path":"events.txt","content":"two\n"}),
+                )],
+                vec![call(
+                    "task-22b",
+                    "append_file",
+                    json!({"path":"events.txt","content":"three\n"}),
+                )],
+            ],
+            vec![("events.txt", "one\ntwo\nthree\n")],
+            "test \"$(tail -n 1 events.txt)\" = three",
+        ),
+        verifier_task(
+            "heldout_failure_alternate_path",
+            "Recover from a failed write by selecting an alternate output path.",
+            HeldOut,
+            vec![],
+            "Do not repeat the rejected path; write alternate.txt.",
+            vec![
+                vec![call(
+                    "task-23a",
+                    "write_file",
+                    json!({"path":"../rejected.txt","content":"bad"}),
+                )],
+                vec![call(
+                    "task-23b",
+                    "write_file",
+                    json!({"path":"alternate.txt","content":"alternate"}),
+                )],
+            ],
+            vec![("alternate.txt", "alternate")],
+            "test \"$(cat alternate.txt)\" = alternate",
+        ),
+        verifier_task(
+            "heldout_independent_outputs",
+            "Create independent summary and checksum artifacts.",
+            HeldOut,
+            vec![],
+            "Write summary.txt and checksum.txt.",
+            vec![vec![
+                call(
+                    "task-24a",
+                    "write_file",
+                    json!({"path":"summary.txt","content":"summary"}),
+                ),
+                call(
+                    "task-24b",
+                    "write_file",
+                    json!({"path":"checksum.txt","content":"checksum"}),
+                ),
+            ]],
+            vec![("summary.txt", "summary"), ("checksum.txt", "checksum")],
+            "test -s summary.txt && test -s checksum.txt",
+        ),
+    ]
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn render_verifier(task: &VerifierTask) -> String {
+    let mut script = String::from("set -eu\n");
+    for (index, artifact) in task.expected_artifacts.iter().enumerate() {
+        script.push_str(&format!(
+            "test -f {} || exit 1\n",
+            shell_quote(&artifact.path)
+        ));
+        script.push_str(&format!(
+            "cmp -s {} {} || exit 1\n",
+            shell_quote(&artifact.path),
+            shell_quote(&format!(".opcos-expected-{index}"))
+        ));
+    }
+    script.push_str(&task.verifier.body);
+    script.push('\n');
+    script
+}
+
+pub async fn run_verifier_task(task: &VerifierTask) -> Result<VerifierTaskReport, EvalError> {
+    let ProviderSourceSpec::Scripted(script) = &task.provider else {
+        return Err(EvalError::Fixture(
+            "run_verifier_task requires a scripted provider".into(),
+        ));
+    };
+    run_verifier_task_with_provider(task, ScriptedProvider::new(script.clone()), "taskset").await
+}
+
+async fn run_verifier_task_with_provider<P>(
+    task: &VerifierTask,
+    provider: P,
+    model: &str,
+) -> Result<VerifierTaskReport, EvalError>
+where
+    P: Provider + Send + Sync + 'static,
+{
+    let temp = TempDir::new().map_err(|error| EvalError::Fixture(error.to_string()))?;
+    for (path, content) in &task.initial_workspace {
+        let target = checked_path(temp.path(), path).map_err(EvalError::Fixture)?;
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|error| EvalError::Fixture(error.to_string()))?;
+        }
+        fs::write(target, content).map_err(|error| EvalError::Fixture(error.to_string()))?;
+    }
+    let store = Arc::new(
+        SqliteStore::open_in_memory().map_err(|error| EvalError::Store(error.to_string()))?,
+    );
+    let session_id = format!("taskset-{}", task.name);
+    session(&store, &session_id, temp.path())?;
+    let engine = TurnEngine::new(
+        provider,
+        store,
+        Arc::new(FixtureTools {
+            workspace: temp.path().to_path_buf(),
+            behavior: FixtureToolBehavior::Normal,
+        }),
+        &session_id,
+        temp.path().display().to_string(),
+        PermissionMode::Auto,
+        model,
+    );
+    let engine = Arc::new(engine);
+    let engine_result = engine.submit_text(task.prompt.clone()).await;
+
+    let script_path = temp.path().join(&task.verifier.filename);
+    for (index, artifact) in task.expected_artifacts.iter().enumerate() {
+        fs::write(
+            temp.path().join(format!(".opcos-expected-{index}")),
+            &artifact.content,
+        )
+        .map_err(|error| EvalError::Fixture(error.to_string()))?;
+    }
+    fs::write(&script_path, render_verifier(task))
+        .map_err(|error| EvalError::Fixture(error.to_string()))?;
+    let verifier = Command::new("sh")
+        .arg(&script_path)
+        .current_dir(temp.path())
+        .status()
+        .map_err(|error| EvalError::Fixture(error.to_string()))?;
+    Ok(VerifierTaskReport {
+        task: task.name.clone(),
+        split: task.split,
+        passed: verifier.success(),
+        verifier_exit_code: verifier.code(),
+        expected_artifacts: task.expected_artifacts.clone(),
+        engine_error: engine_result.err().map(|error| error.to_string()),
+    })
+}
+
+pub async fn run_internal_taskset() -> Result<TasksetRun, EvalError> {
+    let mut reports = Vec::new();
+    for task in internal_taskset() {
+        reports.push(run_verifier_task(&task).await?);
+    }
+    Ok(TasksetRun { reports })
+}
+
+pub async fn run_live_internal_taskset(
+    config: &LiveRolloutConfig,
+) -> Result<Vec<TasksetRun>, EvalError> {
+    let api_key = std::env::var("xinlicloud_KEY")
+        .map_err(|_| EvalError::Fixture("xinlicloud_KEY is required for live rollout".into()))?;
+    if api_key.is_empty() {
+        return Err(EvalError::Fixture(
+            "xinlicloud_KEY must not be empty".into(),
+        ));
+    }
+    let mut runs = Vec::with_capacity(config.repeats);
+    for _ in 0..config.repeats {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(config.concurrency));
+        let mut tasks = tokio::task::JoinSet::new();
+        for task in internal_taskset() {
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|error| EvalError::Fixture(error.to_string()))?;
+            let provider = OpenAiProvider::new(ProviderConfig::new(&config.base_url, &api_key));
+            let model = config.model.clone();
+            tasks.spawn(async move {
+                let _permit = permit;
+                run_verifier_task_with_provider(&task, provider, &model).await
+            });
+        }
+        let mut reports = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            reports.push(result.map_err(|error| EvalError::Fixture(error.to_string()))??);
+        }
+        reports.sort_by(|left, right| left.task.cmp(&right.task));
+        runs.push(TasksetRun { reports });
+    }
+    Ok(runs)
+}
+
 pub async fn run_builtin_case(case: &EvalCase) -> Result<CaseReport, EvalError> {
     let temp = TempDir::new().map_err(|error| EvalError::Fixture(error.to_string()))?;
     let ExecutionEnvironmentSpec::LocalFixture(fixture) = &case.environment else {
@@ -1025,6 +1866,11 @@ mod tests {
         ));
         assert!(matches!(case.provider, ProviderSourceSpec::External));
         assert!(matches!(case.grader, GraderSpec::ExternalTests { .. }));
+        let live = ProviderSourceSpec::OpenAiCompatible {
+            base_url: "https://llm.xinlicloud.top/v1".into(),
+            model: "glm-5.2".into(),
+        };
+        assert!(matches!(live, ProviderSourceSpec::OpenAiCompatible { .. }));
     }
 
     #[test]
@@ -1052,5 +1898,161 @@ mod tests {
                 )
             }));
         }
+    }
+
+    #[test]
+    fn internal_taskset_has_stable_nonrandom_splits() {
+        let tasks = internal_taskset();
+        assert_eq!(tasks.len(), 24);
+        assert_eq!(
+            tasks
+                .iter()
+                .filter(|task| task.split == TaskSplit::HeldIn)
+                .count(),
+            12
+        );
+        assert_eq!(
+            tasks
+                .iter()
+                .filter(|task| task.split == TaskSplit::HeldOut)
+                .count(),
+            12
+        );
+        let names = tasks
+            .iter()
+            .map(|task| task.name.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(names.len(), tasks.len());
+        assert!(tasks.iter().all(|task| {
+            !task.description.is_empty()
+                && !task.prompt.is_empty()
+                && !task.verifier.body.is_empty()
+                && !task.expected_artifacts.is_empty()
+        }));
+    }
+
+    #[tokio::test]
+    async fn verifier_exit_code_and_artifact_expectations_drive_results() {
+        let task = internal_taskset()
+            .into_iter()
+            .find(|task| task.name == "nested_write")
+            .unwrap();
+        let passed = run_verifier_task(&task).await.unwrap();
+        assert!(passed.passed);
+        assert_eq!(passed.verifier_exit_code, Some(0));
+
+        let mut failed_script = task.clone();
+        failed_script.verifier.body = "exit 1".into();
+        let failed = run_verifier_task(&failed_script).await.unwrap();
+        assert!(!failed.passed);
+        assert_eq!(failed.verifier_exit_code, Some(1));
+
+        let mut missing_artifact = task;
+        missing_artifact.expected_artifacts = vec![ExpectedArtifact {
+            path: "does-not-exist.txt".into(),
+            content: "claimed".into(),
+        }];
+        let missing = run_verifier_task(&missing_artifact).await.unwrap();
+        assert!(!missing.passed);
+        assert_eq!(missing.verifier_exit_code, Some(1));
+    }
+
+    #[tokio::test]
+    async fn every_internal_task_passes_its_offline_verifier() {
+        let run = run_internal_taskset().await.unwrap();
+        assert_eq!(run.reports.len(), 24);
+        for report in &run.reports {
+            assert!(
+                report.passed,
+                "{} failed with {:?}: {:?}",
+                report.task, report.verifier_exit_code, report.engine_error
+            );
+            assert_eq!(report.verifier_exit_code, Some(0));
+        }
+    }
+
+    #[test]
+    fn repeated_runs_aggregate_by_task_and_split() {
+        let tasks = internal_taskset();
+        let reports = tasks
+            .iter()
+            .map(|task| VerifierTaskReport {
+                task: task.name.clone(),
+                split: task.split,
+                passed: true,
+                verifier_exit_code: Some(0),
+                expected_artifacts: task.expected_artifacts.clone(),
+                engine_error: None,
+            })
+            .collect::<Vec<_>>();
+        let mut second = reports.clone();
+        second[0].passed = false;
+        let aggregate = aggregate_taskset_runs(&[
+            TasksetRun {
+                reports: reports.clone(),
+            },
+            TasksetRun { reports: second },
+        ]);
+        assert_eq!(aggregate.runs, 2);
+        assert_eq!(
+            aggregate.held_in,
+            SplitPassCount {
+                total: 24,
+                passed: 23,
+            }
+        );
+        assert_eq!(
+            aggregate.task_passes["nested_write"],
+            SplitPassCount {
+                total: 2,
+                passed: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn comparator_rejects_one_split_regression_and_accepts_no_regression() {
+        let baseline = AggregatedTaskset {
+            runs: 1,
+            task_passes: std::collections::BTreeMap::new(),
+            held_in: SplitPassCount {
+                total: 10,
+                passed: 8,
+            },
+            held_out: SplitPassCount {
+                total: 10,
+                passed: 8,
+            },
+        };
+        let regressed = AggregatedTaskset {
+            held_in: SplitPassCount {
+                total: 10,
+                passed: 9,
+            },
+            held_out: SplitPassCount {
+                total: 10,
+                passed: 7,
+            },
+            ..baseline.clone()
+        };
+        let rejected = compare_taskset_runs(&baseline, &regressed);
+        assert!(!rejected.accepted);
+        assert_eq!(rejected.reason, "candidate regresses held-out");
+
+        let improved = AggregatedTaskset {
+            held_in: SplitPassCount {
+                total: 10,
+                passed: 9,
+            },
+            held_out: SplitPassCount {
+                total: 10,
+                passed: 8,
+            },
+            ..baseline.clone()
+        };
+        assert!(compare_taskset_runs(&baseline, &improved).accepted);
+        let record = record_taskset_candidate("progressive-disclosure", &baseline, &regressed);
+        assert_eq!(record.candidate, "progressive-disclosure");
+        assert!(!record.comparison.accepted);
     }
 }
