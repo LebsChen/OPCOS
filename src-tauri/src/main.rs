@@ -116,6 +116,12 @@ impl opcos_assets::RemoteAssetReader for HostAssetReader {
             .map_err(|error| opcos_assets::AssetError::Invalid(error.to_string()))
     }
 }
+use agent_client_protocol::schema::v1::{
+    ContentBlock as AcpContentBlock, ContentChunk as AcpContentChunk,
+    NewSessionRequest as AcpNewSessionRequest, NewSessionResponse as AcpNewSessionResponse,
+    PromptRequest as AcpPromptRequest, RequestPermissionOutcome, SessionNotification,
+    SessionUpdate, StopReason as AcpStopReason, TextContent as AcpTextContent,
+};
 use tauri::{Emitter, Manager, RunEvent, State};
 use tauri_plugin_opener::OpenerExt;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -635,6 +641,7 @@ struct DesktopState {
     engines: Arc<AsyncMutex<HashMap<String, Arc<GuiEngine>>>>,
     acp_engines: AsyncMutex<HashMap<String, Arc<opcos_engine::AcpHarness<SqliteStore>>>>,
     acp_event_sessions: AsyncMutex<HashSet<String>>,
+    acp_streams: AsyncMutex<HashMap<String, UnboundedSender<(String, Value)>>>,
     trigger_runs: AsyncMutex<HashSet<String>>,
     trigger_http_token: String,
     trigger_http_port: u16,
@@ -5116,6 +5123,43 @@ struct SessionView {
     agent_id: Option<String>,
 }
 
+fn acp_stop_reason(session: &SessionRecord) -> Result<AcpStopReason, String> {
+    match (session.run_state.as_str(), session.stop_reason.as_str()) {
+        ("interrupted", "interrupted_by_user") | (_, "cancelled") => Ok(AcpStopReason::Cancelled),
+        (_, "policy_denied") | (_, "refusal") => Ok(AcpStopReason::Refusal),
+        (_, "max_iterations") | (_, "max_turn_requests") => Ok(AcpStopReason::MaxTurnRequests),
+        (_, "usage_limit") | (_, "max_tokens") => Ok(AcpStopReason::MaxTokens),
+        ("idle", "finished") => Ok(AcpStopReason::EndTurn),
+        (run_state, stop_reason) => Err(format!(
+            "ACP turn ended with unsupported terminal state {run_state}/{stop_reason}"
+        )),
+    }
+}
+
+fn acp_stream_update(kind: &str, payload: &Value) -> Option<SessionUpdate> {
+    match kind {
+        "message" if payload.get("role").and_then(Value::as_str) == Some("assistant") => {
+            Some(SessionUpdate::AgentMessageChunk(AcpContentChunk::new(
+                AcpContentBlock::Text(AcpTextContent::new(
+                    payload
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                )),
+            )))
+        }
+        "thinking" => Some(SessionUpdate::AgentThoughtChunk(AcpContentChunk::new(
+            AcpContentBlock::Text(AcpTextContent::new(
+                payload
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )),
+        ))),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct ProjectView {
     #[serde(flatten)]
@@ -5141,6 +5185,12 @@ struct OpcosEvent {
 }
 
 fn emit(app: &tauri::AppHandle, kind: &str, session_id: Option<&str>, payload: Value) {
+    if let (Some(session_id), Some(state)) = (session_id, app.try_state::<DesktopState>())
+        && let Ok(streams) = state.acp_streams.try_lock()
+        && let Some(stream) = streams.get(session_id)
+    {
+        let _ = stream.send((kind.to_owned(), payload.clone()));
+    }
     let _ = app.emit(
         "opcos://event",
         OpcosEvent {
@@ -13876,15 +13926,13 @@ impl DesktopControlPlane {
 
 #[async_trait]
 impl opcos_acp_server::OpcosAcpControlPlane for DesktopControlPlane {
-    async fn session_new(&self, arguments: Value) -> Result<Value, String> {
+    async fn session_new(
+        &self,
+        request: AcpNewSessionRequest,
+    ) -> Result<AcpNewSessionResponse, String> {
         let state = self.state();
-        let cwd = arguments
-            .get("cwd")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        if let Some(cwd) = cwd.as_deref()
-            && cwd.trim().is_empty()
-        {
+        let cwd = request.cwd.to_string_lossy().into_owned();
+        if cwd.trim().is_empty() {
             return Err("ACP cwd must not be empty".into());
         }
         let host_id = {
@@ -13913,11 +13961,10 @@ impl opcos_acp_server::OpcosAcpControlPlane for DesktopControlPlane {
                 .unwrap_or_else(|_| "local".into())
         };
         if host_id == "local" {
-            if let Some(cwd) = cwd.as_deref()
-                && !FsPath::new(cwd).is_dir()
-            {
+            if !FsPath::new(&cwd).is_dir() {
                 return Err(format!(
-                    "ACP cwd is not an available local workspace: {cwd}"
+                    "ACP cwd is not an available local workspace: {}",
+                    cwd
                 ));
             }
         } else {
@@ -13926,13 +13973,11 @@ impl opcos_acp_server::OpcosAcpControlPlane for DesktopControlPlane {
                 .health()
                 .await
                 .map_err(|error| format!("remote host unavailable: {error}"))?;
-            if let Some(cwd) = cwd.as_deref() {
-                client
-                    .with_workspace(cwd)
-                    .ls(None)
-                    .await
-                    .map_err(|error| format!("ACP cwd is unavailable on remote host: {error}"))?;
-            }
+            client
+                .with_workspace(&cwd)
+                .ls(None)
+                .await
+                .map_err(|error| format!("ACP cwd is unavailable on remote host: {error}"))?;
         }
         let view = create_session_for_state(
             &state,
@@ -13942,7 +13987,7 @@ impl opcos_acp_server::OpcosAcpControlPlane for DesktopControlPlane {
             None,
             None,
             Some("builtin".into()),
-            cwd,
+            Some(cwd),
             None,
             None,
             None,
@@ -13953,113 +13998,147 @@ impl opcos_acp_server::OpcosAcpControlPlane for DesktopControlPlane {
             None,
             json!({"session_id": view.id}),
         );
-        Ok(json!({"sessionId": view.id}))
+        Ok(AcpNewSessionResponse::new(view.id))
     }
 
     async fn session_prompt(
         &self,
-        session_id: String,
-        prompt: Vec<Value>,
+        request: AcpPromptRequest,
         sink: Arc<dyn opcos_acp_server::AcpEventSink>,
-    ) -> Result<String, String> {
-        let text = prompt
+    ) -> Result<AcpStopReason, String> {
+        let session_id = request.session_id.to_string();
+        let text = request
+            .prompt
             .iter()
-            .map(|block| {
-                if block.get("type").and_then(Value::as_str) != Some("text") {
-                    return Err("unsupported ACP prompt content block".to_owned());
-                }
-                block
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| "ACP text content is missing text".to_owned())
+            .map(|block| match block {
+                AcpContentBlock::Text(text) => Ok(text.text.as_str()),
+                _ => Err("unsupported ACP prompt content block".to_owned()),
             })
             .collect::<Result<Vec<_>, _>>()?
             .join("");
-        sink.update(
-            &session_id,
-            json!({"sessionUpdate":"user_message_chunk","content":{"type":"text","text":text}}),
-        )
+        sink.update(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::UserMessageChunk(AcpContentChunk::new(AcpContentBlock::Text(
+                AcpTextContent::new(text.clone()),
+            ))),
+        ))
         .await?;
-        let result = submit_turn_inner_with_origin(
-            self.app.clone(),
-            &self.state(),
-            SubmitRequest {
-                session_id: session_id.clone(),
-                text,
-                attachments: Vec::new(),
-            },
-            ToolOrigin::User,
-        )
-        .await;
-        if let Err(error) = result {
-            let session = session_for(&self.state(), &session_id)?;
-            if session.run_state == "interrupted" || session.stop_reason == "interrupted_by_user" {
-                return Ok("cancelled".into());
-            }
-            let pending = self
-                .state()
-                .store
-                .load_pending(&session_id)
-                .map_err(|store_error| store_error.to_string())?;
-            if let Some(pending) = pending.into_iter().next() {
-                let response = sink
-                    .request_permission(json!({
-                        "sessionId": session_id,
-                        "toolCall": {
-                            "toolCallId": pending.call_id,
-                            "title": pending.tool,
-                            "status": "pending"
-                        },
-                        "options": [
-                            {"optionId":"allow_once","name":"Allow once"},
-                            {"optionId":"deny","name":"Deny"}
-                        ]
-                    }))
-                    .await?;
-                let allow = response
-                    .get("outcome")
-                    .and_then(|outcome| outcome.get("outcome"))
-                    .and_then(Value::as_str)
-                    == Some("selected")
-                    && response
-                        .get("outcome")
-                        .and_then(|outcome| outcome.get("optionId"))
-                        .and_then(Value::as_str)
-                        == Some("allow_once");
-                let engine =
-                    engine_for(&self.app, &self.state(), &session_id, ToolOrigin::User).await?;
-                match engine
-                    .resolve_approval(
-                        &pending.call_id,
-                        if allow {
-                            opcos_engine::ApprovalOutcome::Approve
-                        } else {
-                            opcos_engine::ApprovalOutcome::Deny
-                        },
-                    )
-                    .await
-                {
-                    Ok(_) | Err(EngineError::ApprovalAlreadyProcessed(_)) => {}
-                    Err(next) => return Err(engine_error_message(next)),
-                }
-                return Ok(if allow { "end_turn" } else { "cancelled" }.into());
-            }
-            return Err(error);
-        }
         let state = self.state();
-        if let Ok(messages) = state.store.load_messages(&session_id)
-            && let Some(message) = messages
-                .iter()
-                .rev()
-                .find(|message| message.role == "assistant")
-        {
-            sink.update(
-                &session_id,
-                json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":message.content}}),
+        let (stream_tx, mut stream_rx) = unbounded_channel();
+        state
+            .acp_streams
+            .lock()
+            .await
+            .insert(session_id.clone(), stream_tx);
+        let stream_sink = Arc::clone(&sink);
+        let stream_session = session_id.clone();
+        let stream_forwarder = tokio::spawn(async move {
+            while let Some((kind, payload)) = stream_rx.recv().await {
+                if let Some(update) = acp_stream_update(&kind, &payload)
+                    && stream_sink
+                        .update(SessionNotification::new(stream_session.clone(), update))
+                        .await
+                        .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let outcome = async {
+            let mut result = submit_turn_inner_with_origin(
+                self.app.clone(),
+                &state,
+                SubmitRequest {
+                    session_id: session_id.clone(),
+                    text,
+                    attachments: Vec::new(),
+                },
+                ToolOrigin::User,
             )
-            .await?;
+            .await;
+            loop {
+                if let Err(error) = result {
+                    let session = session_for(&self.state(), &session_id)?;
+                    if session.run_state == "interrupted"
+                        || session.stop_reason == "interrupted_by_user"
+                    {
+                        return Ok(AcpStopReason::Cancelled);
+                    }
+                    let pending = self
+                        .state()
+                        .store
+                        .load_pending(&session_id)
+                        .map_err(|store_error| store_error.to_string())?;
+                    if let Some(pending) = pending.into_iter().next() {
+                        let response = sink
+                            .request_permission(
+                                serde_json::from_value(json!({
+                                    "sessionId": session_id,
+                                    "toolCall": {
+                                        "toolCallId": pending.call_id,
+                                        "title": pending.tool,
+                                        "status": "pending"
+                                    },
+                                    "options": [
+                                        {
+                                            "optionId": "allow_once",
+                                            "name": "Allow once",
+                                            "kind": "allow_once"
+                                        },
+                                        {
+                                            "optionId": "deny",
+                                            "name": "Deny",
+                                            "kind": "reject_once"
+                                        }
+                                    ]
+                                }))
+                                .map_err(|error| error.to_string())?,
+                            )
+                            .await?;
+                        let allow = matches!(
+                            response.outcome,
+                            RequestPermissionOutcome::Selected(selected)
+                                if selected.option_id.0.as_ref() == "allow_once"
+                        );
+                        let engine =
+                            engine_for(&self.app, &self.state(), &session_id, ToolOrigin::User)
+                                .await?;
+                        match engine
+                            .resolve_approval(
+                                &pending.call_id,
+                                if allow {
+                                    opcos_engine::ApprovalOutcome::Approve
+                                } else {
+                                    opcos_engine::ApprovalOutcome::Deny
+                                },
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                result = Ok(());
+                            }
+                            Err(EngineError::ApprovalAlreadyProcessed(_)) => {
+                                result = Err(error);
+                            }
+                            Err(next) => {
+                                result = Err(engine_error_message(next));
+                            }
+                        }
+                        continue;
+                    }
+                    if let Ok(stop_reason) = acp_stop_reason(&session) {
+                        return Ok(stop_reason);
+                    }
+                    return Err(error);
+                }
+                let session = session_for(&self.state(), &session_id)?;
+                return acp_stop_reason(&session);
+            }
         }
-        Ok("end_turn".into())
+        .await;
+        state.acp_streams.lock().await.remove(&session_id);
+        stream_forwarder.abort();
+        outcome
     }
 
     async fn session_cancel(&self, session_id: String) -> Result<(), String> {
@@ -25502,6 +25581,7 @@ fn main() {
                 engines: Arc::clone(&engines),
                 acp_engines: AsyncMutex::new(HashMap::new()),
                 acp_event_sessions: AsyncMutex::new(HashSet::new()),
+                acp_streams: AsyncMutex::new(HashMap::new()),
                 trigger_runs: AsyncMutex::new(HashSet::new()),
                 surfaces: AsyncMutex::new(HashMap::new()),
                 ide_proxies: AsyncMutex::new(HashMap::new()),

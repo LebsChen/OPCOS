@@ -1,4 +1,11 @@
-use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::schema::{
+    ProtocolVersion,
+    v1::{
+        AgentCapabilities, InitializeRequest, InitializeResponse, NewSessionRequest,
+        NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
+        RequestPermissionRequest, RequestPermissionResponse, SessionNotification, StopReason,
+    },
+};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -54,19 +61,21 @@ enum Outgoing {
 
 #[async_trait]
 pub trait AcpEventSink: Send + Sync {
-    async fn update(&self, session_id: &str, update: Value) -> Result<(), String>;
-    async fn request_permission(&self, params: Value) -> Result<Value, String>;
+    async fn update(&self, notification: SessionNotification) -> Result<(), String>;
+    async fn request_permission(
+        &self,
+        request: RequestPermissionRequest,
+    ) -> Result<RequestPermissionResponse, String>;
 }
 
 #[async_trait]
 pub trait OpcosAcpControlPlane: Send + Sync + 'static {
-    async fn session_new(&self, params: Value) -> Result<Value, String>;
+    async fn session_new(&self, request: NewSessionRequest) -> Result<NewSessionResponse, String>;
     async fn session_prompt(
         &self,
-        session_id: String,
-        prompt: Vec<Value>,
+        request: PromptRequest,
         sink: Arc<dyn AcpEventSink>,
-    ) -> Result<String, String>;
+    ) -> Result<StopReason, String>;
     async fn session_cancel(&self, session_id: String) -> Result<(), String>;
 }
 
@@ -181,53 +190,55 @@ where
         };
         match method {
             "initialize" => {
-                let requested = request
-                    .params
-                    .get("protocolVersion")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(PROTOCOL_VERSION as u64);
-                let version = if requested == ProtocolVersion::V1.as_u16() as u64 {
-                    ProtocolVersion::V1.as_u16()
-                } else {
-                    PROTOCOL_VERSION
-                };
+                let _: InitializeRequest = serde_json::from_value(request.params)?;
+                let version = ProtocolVersion::V1;
+                let capabilities =
+                    AgentCapabilities::default().prompt_capabilities(PromptCapabilities::new());
                 send_response(
                     &outgoing,
                     id,
-                    Ok(json!({
-                        "protocolVersion": version,
-                        "agentCapabilities": {},
-                        "authMethods": [],
-                        "agentInfo": {"name":"opcos","version":env!("CARGO_PKG_VERSION")}
-                    })),
+                    serde_json::to_value(
+                        InitializeResponse::new(version).agent_capabilities(capabilities),
+                    )
+                    .map_err(ServerError::Json),
                 )?;
             }
             "session/new" => {
+                let new_session: NewSessionRequest = serde_json::from_value(request.params)?;
                 let result = self
                     .control_plane
-                    .session_new(request.params)
+                    .session_new(new_session)
                     .await
-                    .map_err(ServerError::ControlPlane);
+                    .map_err(ServerError::ControlPlane)
+                    .and_then(|response| serde_json::to_value(response).map_err(ServerError::Json));
                 send_response(&outgoing, id, result)?;
             }
             "session/prompt" => {
-                let session_id = required_string(&request.params, "sessionId")?;
-                let prompt = request
-                    .params
-                    .get("prompt")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .ok_or_else(|| ServerError::InvalidRequest("prompt is required".into()))?;
+                let prompt: PromptRequest = serde_json::from_value(request.params)?;
                 let control_plane = Arc::clone(&self.control_plane);
                 let sink = Arc::clone(&sink);
                 prompts.spawn(async move {
                     let result = control_plane
-                        .session_prompt(session_id, prompt, sink)
+                        .session_prompt(prompt, sink)
                         .await
-                        .map(|stop_reason| json!({"stopReason": stop_reason}))
+                        .map(|stop_reason| {
+                            serde_json::to_value(PromptResponse::new(stop_reason))
+                                .map_err(|error| error.to_string())
+                        })
+                        .and_then(|result| result)
                         .map_err(ServerError::ControlPlane);
                     let _ = outgoing.send(Outgoing::PromptResponse { id, result });
                 });
+            }
+            "session/cancel" => {
+                let session_id = required_string(&request.params, "sessionId")?;
+                let result = self
+                    .control_plane
+                    .session_cancel(session_id)
+                    .await
+                    .map(|_| json!({}))
+                    .map_err(ServerError::ControlPlane);
+                send_response(&outgoing, id, result)?;
             }
             other => {
                 send_response(
@@ -268,28 +279,29 @@ impl ConnectionSink {
 
 #[async_trait]
 impl AcpEventSink for ConnectionSink {
-    async fn update(&self, session_id: &str, update: Value) -> Result<(), String> {
+    async fn update(&self, notification: SessionNotification) -> Result<(), String> {
         self.outgoing
             .send(Outgoing::Message(json!({
                 "jsonrpc": "2.0",
                 "method": "session/update",
-                "params": {"sessionId": session_id, "update": update}
+                "params": notification
             })))
             .map_err(|_| "ACP connection closed".into())
     }
 
-    async fn request_permission(&self, mut params: Value) -> Result<Value, String> {
+    async fn request_permission(
+        &self,
+        request: RequestPermissionRequest,
+    ) -> Result<RequestPermissionResponse, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
         if let Some(result) = self.responses.lock().await.remove(&id) {
-            return result;
+            return result.and_then(|value| {
+                serde_json::from_value(value).map_err(|error| error.to_string())
+            });
         }
         let (sender, receiver) = oneshot::channel();
         self.permissions.lock().await.insert(id.clone(), sender);
-        if let Some(object) = params.as_object_mut() {
-            object
-                .entry("sessionId")
-                .or_insert_with(|| Value::String(String::new()));
-        }
+        let params = serde_json::to_value(request).map_err(|error| error.to_string())?;
         self.outgoing
             .send(Outgoing::Message(json!({
                 "jsonrpc": "2.0",
@@ -298,9 +310,10 @@ impl AcpEventSink for ConnectionSink {
                 "params": params
             })))
             .map_err(|_| "ACP connection closed".to_owned())?;
-        receiver
+        let result = receiver
             .await
-            .map_err(|_| "ACP connection closed".to_owned())?
+            .map_err(|_| "ACP connection closed".to_owned())??;
+        serde_json::from_value(result).map_err(|error| error.to_string())
     }
 }
 
@@ -358,6 +371,7 @@ fn id_key(id: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, SessionUpdate};
     use std::sync::atomic::AtomicBool;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -367,25 +381,26 @@ mod tests {
 
     #[async_trait]
     impl OpcosAcpControlPlane for FakeControlPlane {
-        async fn session_new(&self, _params: Value) -> Result<Value, String> {
-            Ok(json!({"sessionId":"session-fake"}))
+        async fn session_new(
+            &self,
+            _request: NewSessionRequest,
+        ) -> Result<NewSessionResponse, String> {
+            Ok(NewSessionResponse::new("session-fake"))
         }
 
         async fn session_prompt(
             &self,
-            session_id: String,
-            _prompt: Vec<Value>,
+            request: PromptRequest,
             sink: Arc<dyn AcpEventSink>,
-        ) -> Result<String, String> {
-            sink.update(
-                &session_id,
-                json!({
-                    "sessionUpdate":"agent_message_chunk",
-                    "content":{"type":"text","text":"hello"}
-                }),
-            )
+        ) -> Result<StopReason, String> {
+            sink.update(SessionNotification::new(
+                request.session_id,
+                SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                    serde_json::from_value(json!({"text":"hello"})).unwrap(),
+                ))),
+            ))
             .await?;
-            Ok("end_turn".into())
+            Ok(StopReason::EndTurn)
         }
 
         async fn session_cancel(&self, _session_id: String) -> Result<(), String> {
@@ -434,6 +449,15 @@ mod tests {
                 .iter()
                 .any(|value| value["result"]["stopReason"] == "end_turn")
         );
+        let update_index = values
+            .iter()
+            .position(|value| value["method"] == "session/update")
+            .unwrap();
+        let response_index = values
+            .iter()
+            .position(|value| value["id"] == 3 && value["result"]["stopReason"].is_string())
+            .unwrap();
+        assert!(update_index < response_index);
     }
 
     #[tokio::test]
@@ -456,32 +480,70 @@ mod tests {
         assert!(output.is_empty());
     }
 
-    struct PermissionControlPlane;
+    #[tokio::test]
+    async fn cancellation_request_is_answered() {
+        let fake = Arc::new(FakeControlPlane {
+            cancelled: AtomicBool::new(false),
+        });
+        let server = OpcosAcpServer::new(Arc::clone(&fake));
+        let mut output = Vec::new();
+        server
+            .serve_stdio(
+                BufReader::new(
+                    br#"{"jsonrpc":"2.0","id":7,"method":"session/cancel","params":{"sessionId":"session-fake"}}"#.as_slice(),
+                ),
+                &mut output,
+            )
+            .await
+            .unwrap();
+        let response: Value = serde_json::from_slice(output.trim_ascii()).unwrap();
+        assert_eq!(response["id"], 7);
+        assert_eq!(response["result"], json!({}));
+        assert!(fake.cancelled.load(Ordering::SeqCst));
+    }
+
+    struct PermissionControlPlane {
+        approvals: usize,
+    }
 
     #[async_trait]
     impl OpcosAcpControlPlane for PermissionControlPlane {
-        async fn session_new(&self, _params: Value) -> Result<Value, String> {
-            Ok(json!({"sessionId":"session-permission"}))
+        async fn session_new(
+            &self,
+            _request: NewSessionRequest,
+        ) -> Result<NewSessionResponse, String> {
+            Ok(NewSessionResponse::new("session-permission"))
         }
 
         async fn session_prompt(
             &self,
-            session_id: String,
-            _prompt: Vec<Value>,
+            request: PromptRequest,
             sink: Arc<dyn AcpEventSink>,
-        ) -> Result<String, String> {
-            let response = sink
-                .request_permission(json!({
-                    "sessionId": session_id,
-                    "toolCall": {"toolCallId":"call-1","title":"test"},
-                    "options": [{"optionId":"allow_once","name":"Allow once"}]
-                }))
-                .await?;
-            if response["outcome"]["optionId"] == "allow_once" {
-                Ok("end_turn".into())
-            } else {
-                Ok("cancelled".into())
+        ) -> Result<StopReason, String> {
+            for index in 0..self.approvals {
+                let response = sink
+                    .request_permission(
+                        serde_json::from_value(json!({
+                            "sessionId": request.session_id,
+                            "toolCall": {"toolCallId":format!("call-{index}"),"title":"test"},
+                            "options": [{
+                                "optionId":"allow_once",
+                                "name":"Allow once",
+                                "kind":"allow_once"
+                            }]
+                        }))
+                        .unwrap(),
+                    )
+                    .await?;
+                if !matches!(
+                    response.outcome,
+                    agent_client_protocol::schema::v1::RequestPermissionOutcome::Selected(selected)
+                        if selected.option_id.0.as_ref() == "allow_once"
+                ) {
+                    return Ok(StopReason::Cancelled);
+                }
             }
+            Ok(StopReason::EndTurn)
         }
 
         async fn session_cancel(&self, _session_id: String) -> Result<(), String> {
@@ -491,7 +553,7 @@ mod tests {
 
     #[tokio::test]
     async fn permission_round_trip_and_client_cancellation_are_forwarded() {
-        let server = OpcosAcpServer::new(Arc::new(PermissionControlPlane));
+        let server = OpcosAcpServer::new(Arc::new(PermissionControlPlane { approvals: 1 }));
         let (mut client, server_io) = tokio::io::duplex(16 * 1024);
         let (server_reader, server_writer) = tokio::io::split(server_io);
         let server_task = tokio::spawn(async move {
@@ -529,7 +591,7 @@ mod tests {
         drop(response_reader);
         server_task.await.unwrap();
 
-        let server = OpcosAcpServer::new(Arc::new(PermissionControlPlane));
+        let server = OpcosAcpServer::new(Arc::new(PermissionControlPlane { approvals: 1 }));
         let input = concat!(
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/prompt\",\"params\":{\"sessionId\":\"session-permission\",\"prompt\":[]}}\n",
             "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"error\":{\"code\":-32800,\"message\":\"cancelled\"}}\n"
@@ -545,5 +607,49 @@ mod tests {
             .map(|line| serde_json::from_slice::<Value>(line).unwrap())
             .collect::<Vec<_>>();
         assert!(values.iter().any(|value| value["error"]["code"] == -32000));
+    }
+
+    #[tokio::test]
+    async fn multiple_permission_round_trips_complete_one_prompt() {
+        let server = OpcosAcpServer::new(Arc::new(PermissionControlPlane { approvals: 2 }));
+        let (mut client, server_io) = tokio::io::duplex(16 * 1024);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let server_task = tokio::spawn(async move {
+            server
+                .serve_stdio(BufReader::new(server_reader), server_writer)
+                .await
+                .unwrap();
+        });
+        client
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/prompt\",\"params\":{\"sessionId\":\"session-permission\",\"prompt\":[]}}\n",
+            )
+            .await
+            .unwrap();
+        let mut reader = BufReader::new(client);
+        for id in ["1", "2"] {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "session/request_permission");
+            assert_eq!(request["id"], id);
+            let mut client = reader.into_inner();
+            client
+                .write_all(
+                    format!(
+                        "{{\"jsonrpc\":\"2.0\",\"id\":\"{id}\",\"result\":{{\"outcome\":{{\"outcome\":\"selected\",\"optionId\":\"allow_once\"}}}}}}\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            reader = BufReader::new(client);
+        }
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let response: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["result"]["stopReason"], "end_turn");
+        drop(reader);
+        server_task.await.unwrap();
     }
 }
