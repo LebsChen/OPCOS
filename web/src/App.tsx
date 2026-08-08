@@ -42,6 +42,7 @@ import {
   mergeEvents,
   type TimelineEvent,
 } from "./timeline";
+import { mcpPromptMessagesToDraft, mcpResourceSummary } from "./mcp";
 import { summarizeIterationStats } from "./iterationStats";
 import { Sidebar } from "./components/Sidebar";
 import { sessionStatusLabel } from "./sessionStatus";
@@ -3381,6 +3382,7 @@ function ManageSections({
   onEditHost,
   onTestHost,
   onDeleteHost,
+  onPromptDraft,
   hostName,
   setHostName,
   hostUrl,
@@ -3403,6 +3405,7 @@ function ManageSections({
   onEditHost: (host: Host) => Promise<void>;
   onTestHost: (hostId: string) => Promise<Host>;
   onDeleteHost: (hostId: string) => Promise<void>;
+  onPromptDraft: (draft: string) => void;
   hostName: string;
   setHostName: (value: string) => void;
   hostUrl: string;
@@ -6284,7 +6287,13 @@ function ManageSections({
             )}
           </div>
         )}
-        {tab === "mcp" && <McpManage selected={selected} onError={onError} />}
+        {tab === "mcp" && (
+          <McpManage
+            selected={selected}
+            onError={onError}
+            onPromptDraft={onPromptDraft}
+          />
+        )}
         {tab === "ingress" && (
           <div className="space-y-5">
             <div className="rounded-xl2 border border-line bg-panel p-5">
@@ -7094,12 +7103,28 @@ function ManageSections({
 function McpManage({
   selected,
   onError,
+  onPromptDraft,
 }: {
   selected: Session | null;
   onError: (error: unknown) => void;
+  onPromptDraft: (draft: string) => void;
 }) {
   const [tools, setTools] = useState<Array<Record<string, unknown>>>([]);
   const [servers, setServers] = useState<Array<Record<string, unknown>>>([]);
+  const [selectedServerId, setSelectedServerId] = useState("");
+  const [resources, setResources] = useState<Array<Record<string, unknown>>>(
+    [],
+  );
+  const [prompts, setPrompts] = useState<Array<Record<string, unknown>>>([]);
+  const [promptArguments, setPromptArguments] = useState<
+    Record<string, Record<string, string>>
+  >({});
+  const [resourcePreview, setResourcePreview] = useState<
+    Array<Record<string, unknown>>
+  >([]);
+  const [contextResources, setContextResources] = useState<
+    Array<Record<string, unknown>>
+  >([]);
   const [search, setSearch] = useState("");
   useEffect(() => {
     void command<Array<Record<string, unknown>>>("list_mcp_servers")
@@ -7112,6 +7137,50 @@ function McpManage({
         .then(setTools)
         .catch(onError);
   }, [selected?.id]);
+  useEffect(() => {
+    if (!selected) {
+      setContextResources([]);
+      return;
+    }
+    void command<Array<Record<string, unknown>>>("mcp_context_resources", {
+      sessionId: selected.id,
+    })
+      .then(setContextResources)
+      .catch(onError);
+  }, [onError, selected?.id]);
+  const selectedServer = servers.find(
+    (server) => String(server.id) === selectedServerId,
+  );
+  const loadServerCatalog = (server: Record<string, unknown>) => {
+    const serverId = String(server.id);
+    const versionId = String(server.version_id || "");
+    setSelectedServerId(serverId);
+    void Promise.all([
+      command<Array<Record<string, unknown>>>("mcp_resources", {
+        serverId,
+        versionId,
+      }),
+      command<Array<Record<string, unknown>>>("mcp_prompts", {
+        serverId,
+        versionId,
+      }),
+    ])
+      .then(([nextResources, nextPrompts]) => {
+        setResources(nextResources);
+        setPrompts(nextPrompts);
+        setResourcePreview([]);
+      })
+      .catch(onError);
+  };
+  const previewResource = (resource: Record<string, unknown>) => {
+    if (!selectedServer) return;
+    void command<Array<Record<string, unknown>>>("mcp_read_resource", {
+      serverId: String(selectedServer.id),
+      uri: String(resource.uri),
+    })
+      .then(setResourcePreview)
+      .catch(onError);
+  };
   const filtered = tools.filter((tool) =>
     String(tool.name).toLowerCase().includes(search.toLowerCase()),
   );
@@ -7144,22 +7213,27 @@ function McpManage({
                     }}
                     description={`${String(server.transport || "remote")} · ${String(server.url || "configured")}`}
                     actions={
-                      <Button
-                        onClick={() =>
-                          command("retry_mcp_server", {
-                            serverId: String(server.id),
-                          })
-                            .then(() =>
-                              command<Array<Record<string, unknown>>>(
-                                "list_mcp_servers",
-                              ),
-                            )
-                            .then(setServers)
-                            .catch(onError)
-                        }
-                      >
-                        Retry
-                      </Button>
+                      <div className="inline-actions">
+                        <Button onClick={() => loadServerCatalog(server)}>
+                          Resources / prompts
+                        </Button>
+                        <Button
+                          onClick={() =>
+                            command("retry_mcp_server", {
+                              serverId: String(server.id),
+                            })
+                              .then(() =>
+                                command<Array<Record<string, unknown>>>(
+                                  "list_mcp_servers",
+                                ),
+                              )
+                              .then(setServers)
+                              .catch(onError)
+                          }
+                        >
+                          Retry
+                        </Button>
+                      </div>
                     }
                     key={String(server.id)}
                   />
@@ -7205,6 +7279,135 @@ function McpManage({
             : "Select a session to inspect its host MCP tools."
         }
       />
+      {selectedServer && (
+        <section className="panel mt-4">
+          <h2>
+            {String(selectedServer.name)} resources ({resources.length}) ·
+            prompts ({prompts.length})
+          </h2>
+          <div className="grid gap-2">
+            {resources.map((resource) => (
+              <div className="integration-card" key={String(resource.uri)}>
+                <strong>{String(resource.title || resource.name)}</strong>
+                <small>{mcpResourceSummary(resource)}</small>
+                <div className="inline-actions">
+                  <Button onClick={() => previewResource(resource)}>
+                    Preview
+                  </Button>
+                  <Button
+                    disabled={!selected}
+                    onClick={() =>
+                      selected &&
+                      command("mcp_attach_resource", {
+                        sessionId: selected.id,
+                        serverId: String(selectedServer.id),
+                        versionId: String(selectedServer.version_id || ""),
+                        uri: String(resource.uri),
+                      })
+                        .then(() =>
+                          command<Array<Record<string, unknown>>>(
+                            "mcp_context_resources",
+                            { sessionId: selected.id },
+                          ),
+                        )
+                        .then(setContextResources)
+                        .catch(onError)
+                    }
+                  >
+                    Add to current context
+                  </Button>
+                </div>
+              </div>
+            ))}
+            {prompts.map((prompt) => (
+              <div className="integration-card" key={String(prompt.name)}>
+                <strong>{String(prompt.title || prompt.name)}</strong>
+                <small>{String(prompt.description || "MCP prompt")}</small>
+                {Array.isArray(prompt.arguments) &&
+                  prompt.arguments.map((argument) => {
+                    const argumentName = String(
+                      (argument as Record<string, unknown>).name || "",
+                    );
+                    return (
+                      <input
+                        key={argumentName}
+                        placeholder={argumentName}
+                        value={
+                          promptArguments[String(prompt.name)]?.[
+                            argumentName
+                          ] || ""
+                        }
+                        onChange={(event) =>
+                          setPromptArguments((current) => ({
+                            ...current,
+                            [String(prompt.name)]: {
+                              ...current[String(prompt.name)],
+                              [argumentName]: event.target.value,
+                            },
+                          }))
+                        }
+                      />
+                    );
+                  })}
+                <Button
+                  onClick={() =>
+                    command("mcp_get_prompt", {
+                      serverId: String(selectedServer.id),
+                      name: String(prompt.name),
+                      arguments: promptArguments[String(prompt.name)] || {},
+                    })
+                      .then((result) => {
+                        const messages = (result as { messages?: unknown[] })
+                          .messages;
+                        if (messages?.length) {
+                          onPromptDraft(mcpPromptMessagesToDraft(messages));
+                        }
+                      })
+                      .catch(onError)
+                  }
+                >
+                  Load into composer
+                </Button>
+              </div>
+            ))}
+            {resourcePreview.length > 0 && (
+              <pre className="code-block">
+                {JSON.stringify(resourcePreview, null, 2)}
+              </pre>
+            )}
+            <h4>Current context resources ({contextResources.length})</h4>
+            {contextResources.map((resource) => (
+              <div
+                className="inline-actions"
+                key={`${String(resource.server_id)}:${String(resource.uri)}`}
+              >
+                <span>{String(resource.uri)}</span>
+                <Button
+                  onClick={() =>
+                    selected &&
+                    command("mcp_detach_resource", {
+                      sessionId: selected.id,
+                      serverId: String(resource.server_id),
+                      versionId: String(resource.version_id),
+                      uri: String(resource.uri),
+                    })
+                      .then(() =>
+                        command<Array<Record<string, unknown>>>(
+                          "mcp_context_resources",
+                          { sessionId: selected.id },
+                        ),
+                      )
+                      .then(setContextResources)
+                      .catch(onError)
+                  }
+                >
+                  Remove
+                </Button>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
     </>
   );
 }
@@ -11260,6 +11463,11 @@ function AppContent() {
               onEditHost={editHost}
               onTestHost={testHost}
               onDeleteHost={deleteHost}
+              onPromptDraft={(draft) =>
+                setHomeInput((current) =>
+                  current ? `${current}\n\n${draft}` : draft,
+                )
+              }
               hostName={hostName}
               setHostName={setHostName}
               hostUrl={hostUrl}
