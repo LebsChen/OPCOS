@@ -1205,7 +1205,6 @@ returned `next_call_id`, never by taking the first database row. A card that say
 engine evidence: verify the corresponding persisted resolution event and that the next tool or
 approval actually starts. When several gated writes are needed, use fresh marker filenames and
 verify the remote file state after each Allow/Deny decision.
-
 ## Testing transcript CSS/layout fixes (chevrons, row wrapping)
 
 Style-only fixes in `web/src/style.css` are picked up by **Vite HMR** in the running Tauri window, so no
@@ -1262,3 +1261,56 @@ The presence/absence of a **separate** `Created <path> +N` row (a `multi_edit_re
 signal for `emit_file_change` regressions. Cross-check in sqlite after a clean shutdown: search
 `session_events.event_json` for `"multi_edit_result"` and confirm none mentions the failed path (the
 column is `event_json`, and `session_events` has no `kind` column — `audit_events` does).
+
+## Testing the MCP client (panel, catalogs, credentials, transports)
+
+Route reality check before planning:
+
+- The **only** UI that creates an MCP server config is project board → 项目配置 → **MCP** tab (名称 + 内容
+  JSON → 新增配置). Content is validated and credential-ish keys are rejected, so credentials must go
+  through 项目运行凭据 → `MCP credential` (`MCP server ID` = the config object id, `Credential JSON` =
+  `{"bearer_token": "…"}`; the field is `type=password` and shows dots).
+- Settings → **MCP** panel (`McpManage`) lists *server cards* (status, `Authorize` when
+  status == `auth_required`, `Resources / prompts`, `Retry`). The per-tool rows/toggles in the same panel
+  come from `mcp_tools`, which **errors for local-host sessions** (`本机 host 不提供远程 MCP tools`) — you
+  need a bound remote RVM host to test tool toggles/approval at all.
+- Two different credential scopes exist: the panel's manager reads the **global** key
+  `mcp-credential:<object_id>`, while project sessions build their own manager reading
+  `project:<pid>/mcp-credential:<object_id>`. A UI-entered credential therefore fixes agent/session calls
+  but may not fix the Settings panel; if you must, inject the global key into
+  `~/.config/com.opcos.desktop/secrets.enc` (header `OCS1` + 12-byte nonce + AES-GCM, key =
+  `sha256("opcos-secret-store\0" + /etc/machine-id)`) — never print the value.
+- Credentials are only read **at connect time**. Deleting/adding a credential does not affect an already
+  connected client; restart the app (or `Retry` for the panel's manager) to force a fresh connect.
+
+Useful oracles (setup, not UI evidence): the UI prints no tool count, so read
+`mcp_tool_cache` / `mcp_resource_cache` / `mcp_prompt_cache` / `mcp_session_resources` from
+`~/.config/com.opcos.desktop/opcos.db`, and probe the endpoint with curl beforehand
+(`initialize` → `mcp-session-id` header → `tools/list`) to know the expected counts. Remote catalogs drift
+(mcp.devin.ai returned 18 tools where a doc said 17) — treat exact counts as soft expectations.
+
+Real endpoints that work anonymously: `https://mcp.context7.com/mcp` (2 tools, 0 resources/prompts),
+`https://mcp.devin.ai/mcp` (`/sse` is gone — do not use it). `https://api.githubcopilot.com/mcp/` returns
+401 + `WWW-Authenticate` with resource metadata, which is the way to exercise `auth_required`.
+
+Legacy `http-sse` needs a local mock; a minimal one is enough (`GET /sse` → `event: endpoint` +
+`data: /message?s=<id>`, `POST /message` → 202 with the reply pushed on the stream, plus a `/flip` route
+that pushes `notifications/tools/list_changed` and adds a tool). Gotchas:
+- Restarting the mock leaves the session runtime with a dead client: every tool call returns
+  `MCP server is disconnected` until the whole app restarts (`resources/read` still works because it goes
+  through the global manager). Start the mock **before** the app and leave it alone.
+- `notifications/*/list_changed` only *drops* the cached catalog. There is no frontend listener for
+  `mcp-catalog-updated`, so the panel shows `MCP server is not connected; retry the connection` until you
+  click `Retry`. Expect an error toast in the middle of that flow, not an auto-refresh.
+
+`Load into composer` (prompt → draft) may look like a no-op: the draft lands in `homeInput`, but the only
+navigation to the Home composer (`openNewSessionHome`) clears it. If a draft never appears, check that path
+before blaming `prompts/get` (verify the request really happened via the mock log or a direct curl probe).
+
+Attached resources: the transcript intentionally shows only a chip `MCP resource: <uri>` (mime + bytes);
+the body goes to the model. To prove the model really received it, attach a resource with a unique marker
+string in the body and ask the agent to quote its first line. Also ask the agent to list its `mcp__*` tools
+— that is the cheapest UI-level proof that resources/prompts are **not** registered as tools.
+
+Devin Secrets Needed: `GH_PAT` (GitHub MCP bearer), `Devin_MCP_COG` (mcp.devin.ai bearer),
+`CF_TOKEN`/`CF_ID` for the Cloudflare provider the agent runs on.
