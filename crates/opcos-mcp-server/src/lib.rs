@@ -73,6 +73,13 @@ pub trait OpcosControlPlane: Send + Sync {
     async fn session_interact(&self, arguments: Value) -> Result<Value, String>;
     async fn session_events(&self, arguments: Value) -> Result<Value, String>;
     async fn session_gather(&self, arguments: Value) -> Result<Value, String>;
+    async fn knowledge_manage(&self, arguments: Value) -> Result<Value, String>;
+    async fn playbook_manage(&self, arguments: Value) -> Result<Value, String>;
+    async fn schedule_manage(&self, arguments: Value) -> Result<Value, String>;
+    async fn automation_manage(&self, arguments: Value) -> Result<Value, String>;
+    async fn list_integrations(&self, arguments: Value) -> Result<Value, String>;
+    async fn find_setting(&self, arguments: Value) -> Result<Value, String>;
+    async fn list_available_repos(&self, arguments: Value) -> Result<Value, String>;
 }
 
 pub struct OpcosMcpServer<C> {
@@ -137,7 +144,7 @@ where
                         "session_id": {"type": "string"},
                         "action": {
                             "type": "string",
-                            "enum": ["get", "message", "get_messages", "terminate"]
+                            "enum": ["get", "message", "get_messages", "terminate", "archive", "get_attachments"]
                         },
                         "message": {"type": "string"}
                     },
@@ -165,16 +172,55 @@ where
                     "required": ["session_id"]
                 }),
             ),
+            tool(
+                "devin_knowledge_manage",
+                "Manage OPCOS knowledge assets.",
+                manage_schema(),
+            ),
+            tool(
+                "devin_playbook_manage",
+                "Manage OPCOS playbook assets.",
+                manage_schema(),
+            ),
+            tool(
+                "devin_schedule_manage",
+                "Manage OPCOS schedules.",
+                manage_schema(),
+            ),
+            tool(
+                "devin_automation_manage",
+                "Manage OPCOS event rules and external ingress automations.",
+                manage_schema(),
+            ),
+            tool(
+                "list_integrations",
+                "List configured OPCOS integrations and MCP servers.",
+                json!({
+                    "type": "object",
+                    "properties": {"kind": {"type": "string"}}
+                }),
+            ),
+            tool(
+                "find_setting",
+                "Find an OPCOS setting route.",
+                json!({
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                }),
+            ),
+            tool(
+                "list_available_repos",
+                "List repositories configured for an OPCOS environment.",
+                json!({
+                    "type": "object",
+                    "properties": {"project_id": {"type": "string"}}
+                }),
+            ),
         ]
     }
 
     async fn handle(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
-        if request.id.is_none() {
-            if request.method.starts_with("notifications/") {
-                return None;
-            }
-            return None;
-        }
+        request.id.as_ref()?;
         if request.jsonrpc != "2.0" {
             return Some(error_response(
                 request.id,
@@ -243,6 +289,13 @@ where
             "devin_session_interact" => self.control_plane.session_interact(arguments).await,
             "devin_session_events" => self.control_plane.session_events(arguments).await,
             "devin_session_gather" => self.control_plane.session_gather(arguments).await,
+            "devin_knowledge_manage" => self.control_plane.knowledge_manage(arguments).await,
+            "devin_playbook_manage" => self.control_plane.playbook_manage(arguments).await,
+            "devin_schedule_manage" => self.control_plane.schedule_manage(arguments).await,
+            "devin_automation_manage" => self.control_plane.automation_manage(arguments).await,
+            "list_integrations" => self.control_plane.list_integrations(arguments).await,
+            "find_setting" => self.control_plane.find_setting(arguments).await,
+            "list_available_repos" => self.control_plane.list_available_repos(arguments).await,
             other => return Err(ServerError::UnsupportedMethod(other.into())),
         };
         result.map_err(ServerError::ControlPlane)
@@ -379,6 +432,27 @@ fn tool(name: &str, description: &str, input_schema: Value) -> ToolDefinition {
     }
 }
 
+fn manage_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["list", "get", "create", "update", "delete", "versions", "run", "enable"]
+            },
+            "id": {"type": "string"},
+            "asset_id": {"type": "string"},
+            "title": {"type": "string"},
+            "body": {"type": "string"},
+            "kind": {"type": "string"},
+            "enabled": {"type": "boolean"},
+            "project_id": {"type": "string"},
+            "input": {"type": "object"}
+        },
+        "required": ["action"]
+    })
+}
+
 fn error_response(
     id: Option<Value>,
     code: i32,
@@ -416,6 +490,7 @@ mod tests {
     struct FakeControlPlane {
         calls: AtomicUsize,
         fail_interact: bool,
+        fail_knowledge: bool,
     }
 
     #[async_trait]
@@ -446,6 +521,37 @@ mod tests {
         async fn session_gather(&self, arguments: Value) -> Result<Value, String> {
             Ok(json!({"status":"idle","arguments":arguments}))
         }
+
+        async fn knowledge_manage(&self, arguments: Value) -> Result<Value, String> {
+            if self.fail_knowledge {
+                return Err("builtin assets are read-only and cannot be deleted".into());
+            }
+            Ok(json!({"kind":"knowledge","arguments":arguments}))
+        }
+
+        async fn playbook_manage(&self, arguments: Value) -> Result<Value, String> {
+            Ok(json!({"kind":"playbook","arguments":arguments}))
+        }
+
+        async fn schedule_manage(&self, arguments: Value) -> Result<Value, String> {
+            Ok(json!({"kind":"schedule","arguments":arguments}))
+        }
+
+        async fn automation_manage(&self, arguments: Value) -> Result<Value, String> {
+            Ok(json!({"kind":"automation","arguments":arguments}))
+        }
+
+        async fn list_integrations(&self, arguments: Value) -> Result<Value, String> {
+            Ok(json!({"kind":"integrations","arguments":arguments}))
+        }
+
+        async fn find_setting(&self, arguments: Value) -> Result<Value, String> {
+            Ok(json!({"kind":"setting","arguments":arguments}))
+        }
+
+        async fn list_available_repos(&self, arguments: Value) -> Result<Value, String> {
+            Ok(json!({"kind":"repositories","arguments":arguments}))
+        }
     }
 
     #[tokio::test]
@@ -453,6 +559,7 @@ mod tests {
         let fake = Arc::new(FakeControlPlane {
             calls: AtomicUsize::new(0),
             fail_interact: false,
+            fail_knowledge: false,
         });
         let server = OpcosMcpServer::new(fake.clone());
         let input = concat!(
@@ -476,7 +583,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(responses.len(), 3);
         assert_eq!(responses[0]["result"]["protocolVersion"], PROTOCOL_VERSION);
-        assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 5);
+        assert_eq!(
+            responses[1]["result"]["tools"].as_array().unwrap().len(),
+            12
+        );
         assert_eq!(
             responses[2]["result"]["structuredContent"]["session_id"],
             "session-1"
@@ -489,6 +599,7 @@ mod tests {
         let server = OpcosMcpServer::new(Arc::new(FakeControlPlane {
             calls: AtomicUsize::new(0),
             fail_interact: false,
+            fail_knowledge: false,
         }));
         let mut output = Vec::new();
         server
@@ -514,6 +625,7 @@ mod tests {
         let server = OpcosMcpServer::new(Arc::new(FakeControlPlane {
             calls: AtomicUsize::new(0),
             fail_interact: true,
+            fail_knowledge: false,
         }));
         let input = concat!(
             "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{}}\n",
@@ -534,10 +646,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stage_two_asset_guard_is_a_readable_tool_error() {
+        let server = OpcosMcpServer::new(Arc::new(FakeControlPlane {
+            calls: AtomicUsize::new(0),
+            fail_interact: false,
+            fail_knowledge: true,
+        }));
+        let mut output = Vec::new();
+        server
+            .serve_stdio(
+                BufReader::new(
+                    br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"devin_knowledge_manage","arguments":{"action":"delete","id":"builtin-knowledge"}}}"#.as_slice(),
+                ),
+                &mut output,
+            )
+            .await
+            .unwrap();
+        let response: Value =
+            serde_json::from_slice(output.split(|byte| *byte == b'\n').next().unwrap()).unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(
+            response["result"]["content"][0]["text"],
+            "control-plane error: builtin assets are read-only and cannot be deleted"
+        );
+    }
+
+    #[tokio::test]
     async fn initialize_negotiates_supported_protocol_version() {
         let server = OpcosMcpServer::new(Arc::new(FakeControlPlane {
             calls: AtomicUsize::new(0),
             fail_interact: false,
+            fail_knowledge: false,
         }));
         let input = format!(
             "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{PROTOCOL_VERSION}\"}}}}\n\
@@ -562,6 +701,7 @@ mod tests {
         let server = Arc::new(OpcosMcpServer::new(Arc::new(FakeControlPlane {
             calls: AtomicUsize::new(0),
             fail_interact: false,
+            fail_knowledge: false,
         })));
         let state = HttpState {
             server: Arc::clone(&server),

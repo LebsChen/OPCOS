@@ -4957,6 +4957,7 @@ struct SessionView {
     workspace: String,
     run_state: String,
     stop_reason: String,
+    archived: bool,
     project_id: Option<String>,
     agent_id: Option<String>,
 }
@@ -12042,6 +12043,7 @@ fn create_session_for_state(
         workspace: workspace.unwrap_or_default(),
         run_state: "idle".into(),
         stop_reason: "none".into(),
+        archived: false,
         project_id: project_id.clone(),
         agent_id: agent_id.clone(),
     })
@@ -12196,6 +12198,37 @@ fn list_sessions_command(state: State<'_, DesktopState>) -> Result<Vec<SessionVi
     list_sessions_for_state(&state)
 }
 
+#[tauri::command]
+fn set_session_archived(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    archived: bool,
+) -> Result<Value, String> {
+    set_session_archived_for_state(&state, &session_id, archived)
+}
+
+fn set_session_archived_for_state(
+    state: &DesktopState,
+    session_id: &str,
+    archived: bool,
+) -> Result<Value, String> {
+    let mut session = state
+        .store
+        .load_session(session_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("session not found: {session_id}"))?;
+    session.archived = archived;
+    session.updated_at = Utc::now();
+    state
+        .store
+        .save_session(&session)
+        .map_err(|error| error.to_string())?;
+    Ok(json!({
+        "session_id": session_id,
+        "archived": archived
+    }))
+}
+
 fn list_sessions_for_state(state: &DesktopState) -> Result<Vec<SessionView>, String> {
     let sessions = state
         .store
@@ -12235,6 +12268,7 @@ fn session_view_for_host(
         workspace: session.workspace,
         run_state: session.run_state,
         stop_reason: session.stop_reason,
+        archived: session.archived,
         project_id: session.project_id,
         agent_id: session.agent_id,
     }))
@@ -12677,10 +12711,17 @@ async fn list_artifacts(
     state: State<'_, DesktopState>,
     session_id: String,
 ) -> Result<Vec<ArtifactRecord>, String> {
-    let (_host, _host_id) = artifact_host(&state, &session_id).await?;
+    list_artifacts_for_state(&state, &session_id).await
+}
+
+async fn list_artifacts_for_state(
+    state: &DesktopState,
+    session_id: &str,
+) -> Result<Vec<ArtifactRecord>, String> {
+    let (_host, _host_id) = artifact_host(state, session_id).await?;
     state
         .store
-        .load_artifacts(&session_id)
+        .load_artifacts(session_id)
         .map_err(|error| error.to_string())
 }
 
@@ -13713,6 +13754,11 @@ impl opcos_mcp_server::OpcosControlPlane for DesktopControlPlane {
                 interrupt_for_state(self.app.clone(), &state, session_id.clone()).await?;
                 Ok(json!({"session_id": session_id, "terminated": true}))
             }
+            "archive" => set_session_archived_for_state(&state, &session_id, true),
+            "get_attachments" => Ok(json!({
+                "session_id": session_id,
+                "attachments": list_artifacts_for_state(&state, &session_id).await?
+            })),
             _ => Err(format!("unsupported session interaction: {action}")),
         }
     }
@@ -13747,6 +13793,318 @@ impl opcos_mcp_server::OpcosControlPlane for DesktopControlPlane {
                 return Ok(json!({"session": session, "timed_out": true}));
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    async fn knowledge_manage(&self, arguments: Value) -> Result<Value, String> {
+        self.manage_assets(arguments, "knowledge")
+    }
+
+    async fn playbook_manage(&self, arguments: Value) -> Result<Value, String> {
+        self.manage_assets(arguments, "playbook")
+    }
+
+    async fn schedule_manage(&self, arguments: Value) -> Result<Value, String> {
+        let action = Self::required_string(&arguments, "action")?;
+        let state = self.state();
+        match action.as_str() {
+            "list" => Ok(json!({"schedules": list_schedules_for_state(&state)?})),
+            "run" => {
+                let id = arguments
+                    .get("id")
+                    .or_else(|| arguments.get("schedule_id"))
+                    .and_then(Value::as_str)
+                    .ok_or("missing required argument: id")?;
+                run_schedule_for(&self.app, &state, id).await?;
+                Ok(json!({"id": id, "started": true}))
+            }
+            "create" | "update" => {
+                let input = arguments
+                    .get("input")
+                    .cloned()
+                    .unwrap_or_else(|| arguments.clone());
+                let schedule: ScheduleInput = serde_json::from_value(input)
+                    .map_err(|error| format!("invalid schedule input: {error}"))?;
+                Ok(json!({"schedule": save_schedule_for_state(&state, schedule)?}))
+            }
+            _ => Err(format!("unsupported schedule action: {action}")),
+        }
+    }
+
+    async fn automation_manage(&self, arguments: Value) -> Result<Value, String> {
+        let action = Self::required_string(&arguments, "action")?;
+        let kind = arguments
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("event_rule");
+        let state = self.state();
+        match (kind, action.as_str()) {
+            ("event_rule", "list") => Ok(json!({"items": event_rules_for_state(&state)?})),
+            ("external_ingress", "list") => Ok(json!({
+                "items": external_ingress_sources_for_state(&state, false)?
+            })),
+            ("event_rule", "create") => {
+                let input = arguments
+                    .get("input")
+                    .cloned()
+                    .unwrap_or_else(|| arguments.clone());
+                let input: EventRuleInput = serde_json::from_value(input)
+                    .map_err(|error| format!("invalid event rule input: {error}"))?;
+                let rule = state
+                    .store
+                    .create_event_rule(
+                        &input.kind_pattern,
+                        &input.effect_kind,
+                        &input.effect,
+                        input.max_triggers,
+                        input.window_seconds,
+                        input.failure_limit,
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(json!({"item": rule}))
+            }
+            ("event_rule", "enable") => {
+                let id = Self::required_string(&arguments, "id")?;
+                let enabled = arguments
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .ok_or("missing required argument: enabled")?;
+                let rule = state
+                    .store
+                    .set_event_rule_enabled(&id, enabled)
+                    .map_err(|error| error.to_string())?;
+                Ok(json!({"item": rule}))
+            }
+            ("external_ingress", "create") | ("external_ingress", "update") => {
+                let source_id = Self::required_string(&arguments, "source_id")?;
+                let provider = Self::required_string(&arguments, "provider")?;
+                let config = arguments
+                    .get("config")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                let source = state
+                    .store
+                    .save_external_ingress_source(&source_id, &provider, &config)
+                    .map_err(|error| error.to_string())?;
+                Ok(json!({"item": source}))
+            }
+            ("external_ingress", "enable") => {
+                let id = Self::required_string(&arguments, "id")?;
+                let enabled = arguments
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .ok_or("missing required argument: enabled")?;
+                state
+                    .store
+                    .set_external_ingress_enabled(&id, enabled)
+                    .map_err(|error| error.to_string())?;
+                Ok(json!({"id": id, "enabled": enabled}))
+            }
+            ("external_ingress", "delete") => {
+                let id = Self::required_string(&arguments, "id")?;
+                state
+                    .store
+                    .delete_external_ingress_source(&id)
+                    .map_err(|error| error.to_string())?;
+                Ok(json!({"id": id, "deleted": true}))
+            }
+            ("external_ingress", "run") => {
+                let id = Self::required_string(&arguments, "id")?;
+                external_ingress::poll_once(&state.store, &state.secrets, &id).await?;
+                Ok(json!({"id": id, "polled": true}))
+            }
+            _ => Err(format!("unsupported automation action: {kind}/{action}")),
+        }
+    }
+
+    async fn list_integrations(&self, _arguments: Value) -> Result<Value, String> {
+        let state = self.state();
+        let mcp_servers = list_mcp_servers_for_state(&state).await?;
+        let kinds = [
+            "github",
+            "telegram",
+            "discord",
+            "slack",
+            "notion",
+            "gitlab",
+            "stripe",
+            "asana",
+            "hubspot",
+            "clickup",
+            "pagerduty",
+            "posthog",
+            "apollo.io",
+            "hunter",
+            "close",
+            "attio",
+            "clay",
+            "figma",
+            "descript",
+            "monday.com",
+            "jira",
+            "confluence",
+            "zendesk",
+            "datadog",
+            "mixpanel",
+            "amplitude",
+            "whatsapp",
+            "email (imap)",
+            "gmail",
+            "google calendar",
+            "google drive",
+            "outlook",
+            "salesforce",
+            "quickbooks",
+            "docusign",
+            "canva",
+            "dropbox",
+            "box",
+        ];
+        let mut connectors = Vec::new();
+        for kind in kinds {
+            if let Ok(value) = connector_identity(&state, kind).await {
+                connectors.push(value);
+            }
+        }
+        Ok(json!({"connectors": connectors, "mcp_servers": mcp_servers}))
+    }
+
+    async fn find_setting(&self, arguments: Value) -> Result<Value, String> {
+        let query = arguments
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let settings = [
+            ("provider", "Provider settings", "settings#provider"),
+            ("agent", "Agent settings", "settings#agent"),
+            ("runner", "Runner settings", "settings#runner"),
+            ("integrations", "Integrations", "integrations"),
+            ("automations", "Automations", "automations"),
+        ];
+        let matches = settings
+            .into_iter()
+            .filter(|(id, title, route)| {
+                query.is_empty()
+                    || id.contains(&query)
+                    || title.to_ascii_lowercase().contains(&query)
+                    || route.contains(&query)
+            })
+            .map(|(id, title, route)| json!({"id":id,"title":title,"route":route}))
+            .collect::<Vec<_>>();
+        Ok(json!({"settings": matches}))
+    }
+
+    async fn list_available_repos(&self, arguments: Value) -> Result<Value, String> {
+        let state = self.state();
+        let project_id = arguments
+            .get("project_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        Ok(json!({
+            "repositories": list_environment_repositories_for_state(&state, project_id.as_deref())?
+        }))
+    }
+}
+
+impl DesktopControlPlane {
+    fn manage_assets(&self, arguments: Value, kind: &str) -> Result<Value, String> {
+        let action = Self::required_string(&arguments, "action")?;
+        let state = self.state();
+        let project_id = arguments
+            .get("project_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        match action.as_str() {
+            "list" => Ok(json!({"items": list_assets_for_state(
+                &state,
+                Some(kind.to_owned()),
+                project_id,
+            )?})),
+            "get" => {
+                let id = arguments
+                    .get("id")
+                    .or_else(|| arguments.get("asset_id"))
+                    .and_then(Value::as_str)
+                    .ok_or("missing required argument: id")?;
+                let item = list_assets_for_state(&state, Some(kind.to_owned()), project_id)?
+                    .into_iter()
+                    .find(|item| item["id"].as_str() == Some(id))
+                    .ok_or_else(|| format!("asset not found: {id}"))?;
+                Ok(json!({"item": item}))
+            }
+            "versions" => {
+                let id = arguments
+                    .get("id")
+                    .or_else(|| arguments.get("asset_id"))
+                    .and_then(Value::as_str)
+                    .ok_or("missing required argument: id")?;
+                Ok(json!({"versions": list_asset_versions_for_state(&state, id)?}))
+            }
+            "delete" => {
+                let id = arguments
+                    .get("id")
+                    .or_else(|| arguments.get("asset_id"))
+                    .and_then(Value::as_str)
+                    .ok_or("missing required argument: id")?;
+                delete_asset_for_state(&state, id)?;
+                Ok(json!({"id": id, "deleted": true}))
+            }
+            "create" | "update" => {
+                let input = arguments
+                    .get("input")
+                    .cloned()
+                    .unwrap_or_else(|| arguments.clone());
+                let id = input
+                    .get("id")
+                    .or_else(|| input.get("asset_id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "asset-{kind}-{}",
+                            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                        )
+                    });
+                let title = input
+                    .get("title")
+                    .or_else(|| input.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(kind)
+                    .to_owned();
+                let body = input
+                    .get("body")
+                    .or_else(|| input.get("content"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                save_asset_for_state(
+                    &state,
+                    id.clone(),
+                    kind.to_owned(),
+                    title,
+                    body,
+                    input
+                        .get("trigger")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    input
+                        .get("scope")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    input
+                        .get("scope_kind")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    input.get("enabled").and_then(Value::as_bool),
+                    input
+                        .get("project_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                )?;
+                Ok(json!({"id": id, "saved": true}))
+            }
+            _ => Err(format!("unsupported asset action: {action}")),
         }
     }
 }
@@ -14606,6 +14964,14 @@ async fn validate_session_model(
 #[tauri::command]
 fn list_assets(
     state: State<'_, DesktopState>,
+    kind: Option<String>,
+    project_id: Option<String>,
+) -> Result<Vec<Value>, String> {
+    list_assets_for_state(&state, kind, project_id)
+}
+
+fn list_assets_for_state(
+    state: &DesktopState,
     kind: Option<String>,
     project_id: Option<String>,
 ) -> Result<Vec<Value>, String> {
@@ -15746,6 +16112,24 @@ fn save_asset(
     enabled: Option<bool>,
     project_id: Option<String>,
 ) -> Result<(), String> {
+    save_asset_for_state(
+        &state, id, kind, title, body, trigger, scope, scope_kind, enabled, project_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn save_asset_for_state(
+    state: &DesktopState,
+    id: String,
+    kind: String,
+    title: String,
+    body: String,
+    trigger: Option<String>,
+    scope: Option<String>,
+    scope_kind: Option<String>,
+    enabled: Option<bool>,
+    project_id: Option<String>,
+) -> Result<(), String> {
     if !matches!(
         kind.as_str(),
         "instructions"
@@ -15793,6 +16177,7 @@ fn save_asset(
     let transaction = connection
         .unchecked_transaction()
         .map_err(|error| error.to_string())?;
+    asset_mutation_guard(&transaction, &id, "edited")?;
     let object_kind = match kind.as_str() {
         "agents" => "rules",
         "playbook" => "runbook",
@@ -15906,15 +16291,38 @@ fn save_asset(
 
 #[tauri::command]
 fn delete_asset(state: State<'_, DesktopState>, id: String) -> Result<(), String> {
-    state
+    delete_asset_for_state(&state, &id)
+}
+
+fn delete_asset_for_state(state: &DesktopState, id: &str) -> Result<(), String> {
+    let connection = state
         .database
         .lock()
-        .map_err(|_| "database lock poisoned")?
+        .map_err(|_| "database lock poisoned")?;
+    asset_mutation_guard(&connection, id, "deleted")?;
+    connection
         .execute(
             "UPDATE config_object SET status='deleted' WHERE id=?1",
             [id],
         )
         .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn asset_mutation_guard(connection: &Connection, id: &str, operation: &str) -> Result<(), String> {
+    let status: Option<String> = connection
+        .query_row(
+            "SELECT status FROM config_object WHERE id=?1",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if status.as_deref() == Some("builtin") {
+        return Err(format!(
+            "builtin assets are read-only and cannot be {operation}"
+        ));
+    }
     Ok(())
 }
 
@@ -15967,6 +16375,13 @@ fn set_asset_enabled(
 fn list_asset_versions(
     state: State<'_, DesktopState>,
     asset_id: String,
+) -> Result<Vec<Value>, String> {
+    list_asset_versions_for_state(&state, &asset_id)
+}
+
+fn list_asset_versions_for_state(
+    state: &DesktopState,
+    asset_id: &str,
 ) -> Result<Vec<Value>, String> {
     let connection = state
         .database
@@ -18788,6 +19203,10 @@ async fn linear_create_session_from_issue(
 
 #[tauri::command]
 async fn list_mcp_servers(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
+    list_mcp_servers_for_state(&state).await
+}
+
+async fn list_mcp_servers_for_state(state: &DesktopState) -> Result<Vec<Value>, String> {
     let snapshots = state
         .mcp
         .statuses()
@@ -19015,11 +19434,18 @@ fn list_environment_repositories(
     state: State<'_, DesktopState>,
     project_id: Option<String>,
 ) -> Result<Vec<Value>, String> {
+    list_environment_repositories_for_state(&state, project_id.as_deref())
+}
+
+fn list_environment_repositories_for_state(
+    state: &DesktopState,
+    project_id: Option<&str>,
+) -> Result<Vec<Value>, String> {
     let connection = state
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?;
-    let repositories = load_environment_repositories(&connection, project_id.as_deref())?;
+    let repositories = load_environment_repositories(&connection, project_id)?;
     Ok(repositories
         .into_iter()
         .enumerate()
@@ -22323,6 +22749,10 @@ fn coordination_accept_task(state: State<'_, DesktopState>, id: String) -> Resul
 
 #[tauri::command]
 fn save_schedule(state: State<'_, DesktopState>, schedule: ScheduleInput) -> Result<Value, String> {
+    save_schedule_for_state(&state, schedule)
+}
+
+fn save_schedule_for_state(state: &DesktopState, schedule: ScheduleInput) -> Result<Value, String> {
     let id = schedule.id.unwrap_or_else(|| {
         format!(
             "schedule-{}",
@@ -22427,6 +22857,10 @@ fn save_schedule(state: State<'_, DesktopState>, schedule: ScheduleInput) -> Res
 
 #[tauri::command]
 fn list_schedules(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
+    list_schedules_for_state(&state)
+}
+
+fn list_schedules_for_state(state: &DesktopState) -> Result<Vec<Value>, String> {
     let connection = state
         .database
         .lock()
@@ -23107,9 +23541,16 @@ fn external_ingress_sources(
     state: State<'_, DesktopState>,
     enabled_only: Option<bool>,
 ) -> Result<Vec<Value>, String> {
+    external_ingress_sources_for_state(&state, enabled_only.unwrap_or(false))
+}
+
+fn external_ingress_sources_for_state(
+    state: &DesktopState,
+    enabled_only: bool,
+) -> Result<Vec<Value>, String> {
     state
         .store
-        .load_external_ingress_sources(enabled_only.unwrap_or(false))
+        .load_external_ingress_sources(enabled_only)
         .and_then(|sources| {
             sources
                 .into_iter()
@@ -23407,6 +23848,10 @@ fn set_runner_settings(
 
 #[tauri::command]
 fn event_rules(state: State<'_, DesktopState>) -> Result<Vec<Value>, String> {
+    event_rules_for_state(&state)
+}
+
+fn event_rules_for_state(state: &DesktopState) -> Result<Vec<Value>, String> {
     state
         .store
         .load_event_rules(false)
@@ -24694,6 +25139,7 @@ fn main() {
             harness_options,
             change_harness,
             list_sessions_command,
+            set_session_archived,
             read_session_events_command,
             acp_session_capabilities,
             acp_set_mode,
@@ -24946,6 +25392,34 @@ mod m7_tests {
             opcos_engine::HarnessKind::Acp,
             opcos_engine::HarnessKind::Acp
         );
+    }
+
+    #[test]
+    fn builtin_assets_reject_edit_and_delete_mutations() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE config_object (id TEXT PRIMARY KEY, status TEXT NOT NULL)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO config_object (id, status) VALUES ('builtin', 'builtin'), ('custom', 'active')",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            asset_mutation_guard(&connection, "builtin", "edited").unwrap_err(),
+            "builtin assets are read-only and cannot be edited"
+        );
+        assert_eq!(
+            asset_mutation_guard(&connection, "builtin", "deleted").unwrap_err(),
+            "builtin assets are read-only and cannot be deleted"
+        );
+        assert!(asset_mutation_guard(&connection, "custom", "edited").is_ok());
+        assert!(asset_mutation_guard(&connection, "missing", "deleted").is_ok());
     }
 
     #[test]

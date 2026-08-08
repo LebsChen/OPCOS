@@ -11336,7 +11336,7 @@ function AppContent() {
           updated_at: null,
           messages: 0,
           pinned: false,
-          archived: false,
+          archived: session.archived ?? false,
           attention: 0,
           liveness: selected?.id === session.id && running ? "working" : "idle",
           stop_reason: session.stop_reason,
