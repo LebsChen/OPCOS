@@ -1205,3 +1205,150 @@ returned `next_call_id`, never by taking the first database row. A card that say
 engine evidence: verify the corresponding persisted resolution event and that the next tool or
 approval actually starts. When several gated writes are needed, use fresh marker filenames and
 verify the remote file state after each Allow/Deny decision.
+
+## Testing the OPCOS MCP server and `mcp-serve` bridge
+
+The MCP service runs inside the already-running desktop app on loopback at an ephemeral
+`POST /mcp` endpoint. The app writes its discovery state to
+`<config_dir>/com.opcos.desktop/mcp-server.json` with mode `0600`; it contains the loopback host,
+port, and a generated bearer token. `opcos mcp-serve` is a thin stdio-to-HTTP bridge and must not
+boot Tauri, open another window, or create another SQLite runtime. Verify this with `wmctrl -l`
+and by checking `/proc/<pid>/fd` for database links: only the GUI process should hold the database.
+
+Drive the bridge from an external MCP client. Hermes can provide a fast real-client discovery
+check:
+
+```bash
+hermes mcp add opcos --command /path/to/target/debug/opcos --args mcp-serve
+hermes mcp test opcos
+```
+
+Hermes currently needs the MCP SDK 1.x API (`mcp==1.28.1`); MCP 2.x changes
+`CallToolResult.isError` and can crash the CLI. If an agent model turn hangs against the local
+gateway, do not invent an agent-driven result. Use the official MCP SDK's stdio client from the
+same environment, disclose that fallback, and test the bridge protocol directly. Codex and pi
+may require `/v1/responses`, which a chat-completions-only local gateway does not provide.
+
+The MCP bridge safety matrix should be repeatable and should always produce exit status 1, empty
+stdout, and no extra window/process:
+
+- app stopped with a stale state file → endpoint unreachable;
+- discovery state removed → endpoint state unavailable;
+- host changed to `0.0.0.0` → rejected as not loopback-only;
+- malformed JSON → invalid endpoint-state error;
+- port `0` → invalid endpoint-state error.
+
+Never print the MCP bearer token. Inspect only mode, host, port, and token length. Perform
+counting-only leakage checks over application logs, the database and its `-wal`/`-shm` files,
+bridge traces, and screenshots. The MCP server itself needs no user-provided secret; remote-host
+tests use the normal bearer-header-only RVM procedure described above.
+
+When checking Devin-shaped MCP contracts, verify session objects use the expected identifier
+shape, gather accepts the supported multi-session form, and tool failures are returned as MCP
+errors with readable control-plane messages rather than internal prefixes. Compare settings
+discovery with the actual Settings sidebar order, and use explicit probe kinds when testing
+integration probing. Builtin assets must remain read-only: select an item reported as builtin and
+verify update/delete returns a readable error.
+
+## Testing the OPCOS ACP server and `acp-serve` bridge
+
+The ACP service also runs inside the existing desktop app. `opcos acp-serve` is a thin
+stdio-to-authenticated-loopback-WebSocket bridge dispatched before Tauri startup, so it must not
+start a second app. It discovers `<config_dir>/com.opcos.desktop/acp-server.json` (mode `0600`,
+keys `host`, `port`, and `token`) and connects to the loopback `/acp` endpoint with a bearer
+header. The token is reused while the state file exists; the port may rotate on app restart.
+Read only mode, host, port, and token length; never print the token.
+
+There is usually no real ACP client installed. ACP *agent* CLIs such as `codex-acp`,
+`claude-agent-acp`, `pi-acp`, `hermes acp`, and `opencode acp` are the wrong side of the
+protocol: they are agents that connect to an ACP server, not clients that drive this server.
+Use a scripted client that spawns `opcos acp-serve` and speaks newline-delimited JSON-RPC when no
+real client is available. Keep monotonic timestamps in every trace; they are the evidence that
+`session/update` notifications arrived before the `session/prompt` response. The reusable driver
+is `/home/ubuntu/mcp-mock/acp_client_drive.py` and supports:
+
+```text
+init
+roundtrip <cwd>
+cancel notify|request <cwd> [seconds]
+perm approve|deny|ignore-ui|drop <session_id> <marker>
+turn <cwd> <text>
+cwd <cwd>
+```
+
+Avoid `input()` in scripted scenarios because they normally run non-interactively and receive
+EOF. Test initialization/version negotiation, session creation, streaming, both cancellation
+forms, permission round trips, client cancellation, connection drops, and stdout purity.
+
+### Deterministic ACP turns
+
+Model turns through the local LiteLLM gateway may not complete deterministically. Point the test
+session at the local fixture provider (`http://127.0.0.1:8899/v1`) and use its `RUNSHELL:<command>`
+trigger to force a real `run_shell` call. Give each scenario a fresh placeholder marker path and
+verify file existence out of band; transcript text alone does not prove execution.
+
+The fixture's ordinary response may contain only one content delta. To prove live streaming,
+configure the fixture to emit several delayed SSE content chunks (the fixture's stream helper
+supports extra deltas), then require multiple ACP `agent_message_chunk` updates with timestamps
+strictly before the prompt result. After changing the fixture, ensure the old process is gone,
+verify `/v1/models` responds, and relaunch it from a persistent tty; stale fixture processes can
+continue serving the old code after an apparent restart.
+
+ACP-created sessions default to Auto, so approval scenarios must switch the mounted session to
+Interactive / “Ask for approval” first. In Interactive mode, `run_shell` and writes raise an
+approval card and persist a pending record. Auto will silently allow the same calls and is not a
+valid approval test.
+
+### Remote `cwd` matrix
+
+`session/new` selects a host by matching the agent setting `default_platform` against registered
+host names. Set it to the intended remote host, save, and verify the created session's persisted
+`host_id`; do not infer host selection from the setting alone because it may be cached.
+
+For a DevBox-style Windows host, test both missing and known-good remote paths. `/api/ls` returns
+an HTTP 404 `ENOENT ... scandir` for a missing directory, while Linux-looking paths may be mapped
+under the Windows root and therefore make useful negative cases. Keep a known-good path such as
+`C:\Users\Admin` in the matrix so a validation fix cannot reject every path. Cross-check existence
+out of band with authenticated remote `/api/ls` or `/api/exec-sync`; never use local filesystem
+semantics to decide whether a remote path exists.
+
+To simulate an unreachable host without changing its data, edit the host URL in Settings → Hosts
+to a dead loopback port such as `http://127.0.0.1:9`, leaving the stored token untouched. Expect
+an explicit `/api/health` connection error and no local fallback. Restore the original URL,
+re-run a known-good remote path, and leave the `default_platform` setting at the requested value.
+
+### ACP bridge safety and approval cleanup
+
+Repeat these checks for ACP:
+
+- state file mode is `0600`;
+- the WebSocket binds loopback only;
+- missing or wrong bearer credentials receive 401, a valid credential receives 101, and a LAN
+  address cannot connect;
+- absent, stale, malformed, non-loopback, and invalid-port state files make the bridge exit 1,
+  print only an `ACP bridge unavailable: ...` diagnostic on stderr, leave stdout empty, and
+  spawn no window/process;
+- two bridges still show one OPCOS window and zero database links from bridge processes;
+- token counts remain zero in logs, database files, client traces, and screenshots.
+
+Before every approval scenario, verify there are no leftover rows in `pending` with
+`state='pending'`. Clean leftovers through the UI/Inbox before starting the next scenario.
+Overlapping permission runs can make an “exactly one request” assertion meaningless.
+
+For UI-side resolution, bound the wait and record request count, prompt latency, marker existence,
+and persisted pending state. For ACP-side approval or denial, verify the mounted view itself:
+the card must disappear and status must leave Running without navigating away. If the database says
+the session is idle/finished and the pending row is resolved but the card clears only after
+navigating away and back, the backend turn is not stuck; this is a live frontend refresh gap.
+Conversely, if remounting does not clear it, inspect engine state, persisted events, and fixture
+request counts before attributing it to rendering.
+
+## External-agent bridge checklist
+
+For any bridge test, prove the external process connects to the already-running app rather than
+starting another Tauri/SQLite/background runtime. Capture protocol traces, process/window counts,
+state-file permissions, loopback binding, and token-count-only leak results. Keep fixture files and
+marker paths outside the repository's test material when possible so the agent cannot discover
+expected answers by searching parent directories. Restore temporary host URLs and provider
+fixtures before finishing, and record any intentionally changed agent setting without silently
+“fixing” it.
