@@ -4890,6 +4890,47 @@ fn attended_pending_event_kind(pending_kind: &str) -> &'static str {
     }
 }
 
+fn emit_acp_session_update(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    event: opcos_engine::HarnessEvent,
+) {
+    match event {
+        opcos_engine::HarnessEvent::SessionModeUpdate {
+            current_mode_id,
+            available_modes,
+        } => emit(
+            app,
+            "acp_session",
+            Some(session_id),
+            json!({
+                "kind": "mode_update",
+                "currentModeId": current_mode_id,
+                "availableModes": available_modes,
+            }),
+        ),
+        opcos_engine::HarnessEvent::SessionConfigUpdate { config_options } => emit(
+            app,
+            "acp_session",
+            Some(session_id),
+            json!({
+                "kind": "config_update",
+                "configOptions": config_options,
+            }),
+        ),
+        opcos_engine::HarnessEvent::AvailableCommandsUpdate { commands } => emit(
+            app,
+            "acp_session",
+            Some(session_id),
+            json!({
+                "kind": "commands_update",
+                "availableCommands": commands,
+            }),
+        ),
+        _ => {}
+    }
+}
+
 fn emit_pending_approval(
     app: &tauri::AppHandle,
     state: &DesktopState,
@@ -13236,27 +13277,11 @@ async fn submit_opencode_turn_inner(
                         Some(&event_session),
                         json!({"plan_update":{"entries":entries}}),
                     ),
-                    opcos_engine::HarnessEvent::SessionModeUpdate {
-                        current_mode_id,
-                        available_modes,
-                    } => emit(
-                        &event_app,
-                        "acp_session",
-                        Some(&event_session),
-                        json!({"kind":"mode_update","currentModeId":current_mode_id,"availableModes":available_modes}),
-                    ),
-                    opcos_engine::HarnessEvent::SessionConfigUpdate { config_options } => emit(
-                        &event_app,
-                        "acp_session",
-                        Some(&event_session),
-                        json!({"kind":"config_update","configOptions":config_options}),
-                    ),
-                    opcos_engine::HarnessEvent::AvailableCommandsUpdate { commands } => emit(
-                        &event_app,
-                        "acp_session",
-                        Some(&event_session),
-                        json!({"kind":"commands_update","availableCommands":commands}),
-                    ),
+                    event @ opcos_engine::HarnessEvent::SessionModeUpdate { .. }
+                    | event @ opcos_engine::HarnessEvent::SessionConfigUpdate { .. }
+                    | event @ opcos_engine::HarnessEvent::AvailableCommandsUpdate { .. } => {
+                        emit_acp_session_update(&event_app, &event_session, event)
+                    }
                     opcos_engine::HarnessEvent::ApprovalRequested(request) => {
                         let unattended = event_store.is_unattended(&event_session).unwrap_or(false);
                         if unattended {
@@ -13432,46 +13457,11 @@ async fn submit_acp_turn_inner(
                         Some(&event_session),
                         json!({"plan_update":{"entries":entries}}),
                     ),
-                    opcos_engine::HarnessEvent::SessionModeUpdate {
-                        current_mode_id,
-                        available_modes,
-                    } => emit(
-                        &event_app,
-                        "acp_session",
-                        Some(&event_session),
-                        json!({
-                            "kind": "acp_session",
-                            "payload": {
-                                "kind": "mode_update",
-                                "currentModeId": current_mode_id,
-                                "availableModes": available_modes,
-                            }
-                        }),
-                    ),
-                    opcos_engine::HarnessEvent::SessionConfigUpdate { config_options } => emit(
-                        &event_app,
-                        "acp_session",
-                        Some(&event_session),
-                        json!({
-                            "kind": "acp_session",
-                            "payload": {
-                                "kind": "config_update",
-                                "configOptions": config_options,
-                            }
-                        }),
-                    ),
-                    opcos_engine::HarnessEvent::AvailableCommandsUpdate { commands } => emit(
-                        &event_app,
-                        "acp_session",
-                        Some(&event_session),
-                        json!({
-                            "kind": "acp_session",
-                            "payload": {
-                                "kind": "commands_update",
-                                "availableCommands": commands,
-                            }
-                        }),
-                    ),
+                    event @ opcos_engine::HarnessEvent::SessionModeUpdate { .. }
+                    | event @ opcos_engine::HarnessEvent::SessionConfigUpdate { .. }
+                    | event @ opcos_engine::HarnessEvent::AvailableCommandsUpdate { .. } => {
+                        emit_acp_session_update(&event_app, &event_session, event)
+                    }
                     opcos_engine::HarnessEvent::ApprovalRequested(request) => {
                         let unattended = event_store.is_unattended(&event_session).unwrap_or(false);
                         if unattended {

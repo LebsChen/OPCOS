@@ -194,6 +194,20 @@ type AcpCapabilities = {
     input?: { hint?: string };
   }>;
 };
+type AcpSessionEventPayload =
+  | {
+      kind: "mode_update";
+      currentModeId: string;
+      availableModes: AcpCapabilities["availableModes"];
+    }
+  | {
+      kind: "config_update";
+      configOptions: AcpCapabilities["configOptions"];
+    }
+  | {
+      kind: "commands_update";
+      availableCommands: AcpCapabilities["availableCommands"];
+    };
 type SkillUsageDashboard = {
   skills: Array<{
     name: string;
@@ -10620,15 +10634,9 @@ function AppContent() {
   }, [selected?.id, selected?.harness]);
   useEffect(() => {
     const subscription = listen<{
-      kind: string;
+      kind: "acp_session";
       session_id?: string;
-      payload: {
-        kind?: string;
-        currentModeId?: string;
-        availableModes?: AcpCapabilities["availableModes"];
-        configOptions?: AcpCapabilities["configOptions"];
-        availableCommands?: AcpCapabilities["availableCommands"];
-      };
+      payload: AcpSessionEventPayload;
     }>("opcos://event", (event) => {
       if (
         !selected?.id ||
@@ -10643,14 +10651,14 @@ function AppContent() {
           return {
             ...current,
             currentModeId: payload.currentModeId,
-            availableModes: payload.availableModes || current.availableModes,
+            availableModes: payload.availableModes,
           };
         if (payload.kind === "config_update")
-          return { ...current, configOptions: payload.configOptions || [] };
+          return { ...current, configOptions: payload.configOptions };
         if (payload.kind === "commands_update")
           return {
             ...current,
-            availableCommands: payload.availableCommands || [],
+            availableCommands: payload.availableCommands,
           };
         return current;
       });
