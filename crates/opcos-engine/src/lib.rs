@@ -768,6 +768,10 @@ where
         *self.external_tools.lock().await = tools;
     }
 
+    pub async fn external_tools(&self) -> Vec<Value> {
+        self.external_tools.lock().await.clone()
+    }
+
     pub async fn append_external_tools(&self, tools: impl IntoIterator<Item = Value>) {
         self.external_tools.lock().await.extend(tools);
     }
@@ -7679,6 +7683,33 @@ mod tests {
                 .and_then(Value::as_str)
                 .is_none_or(|text| !text.trim().is_empty())
         }));
+    }
+
+    #[tokio::test]
+    async fn external_tool_selection_changes_on_a_running_engine() {
+        let engine = TurnEngine::new(
+            FakeProvider,
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine
+            .set_external_tools(vec![json!({"name": "mcp:read"})])
+            .await;
+        assert_eq!(
+            engine.external_tools().await,
+            vec![json!({"name": "mcp:read"})]
+        );
+        engine
+            .set_external_tools(vec![json!({"name": "mcp:write"})])
+            .await;
+        assert_eq!(
+            engine.external_tools().await,
+            vec![json!({"name": "mcp:write"})]
+        );
     }
 
     #[derive(Clone)]

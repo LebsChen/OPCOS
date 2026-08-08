@@ -4725,7 +4725,7 @@ async fn initialize_mcp(app: &tauri::AppHandle) {
             let _ = transaction.execute(
                 "DELETE FROM mcp_tool_cache
                  WHERE server_object_id=?1 AND config_version_id=?2",
-                params![object_id, version_id],
+                params![object_id.clone(), version_id.clone()],
             );
             for tool in tools {
                 let _ = transaction.execute(
@@ -9864,6 +9864,144 @@ async fn acp_for(
     Ok(harness)
 }
 
+fn mcp_tool_enabled(disabled: &HashSet<String>, name: &str) -> bool {
+    !disabled.contains(name)
+}
+
+async fn refresh_session_mcp_tools(
+    state: &DesktopState,
+    session_id: &str,
+    engine: &GuiEngine,
+) -> Result<(), String> {
+    let session = session_for(state, session_id)?;
+    let host_id = session_host_id(state, session_id)?;
+    let mut external_tools = Vec::new();
+    if host_id != "local" {
+        let response = client_for(state, &host_id)?
+            .mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
+            .await
+            .map_err(|error| error.to_string())?;
+        let disabled = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?
+            .prepare(
+                "SELECT name FROM mcp_session_tools
+                 WHERE session_id=?1 AND source='host' AND enabled=0",
+            )
+            .and_then(|mut statement| {
+                let rows = statement.query_map([session_id], |row| row.get::<_, String>(0))?;
+                rows.collect::<Result<std::collections::HashSet<_>, _>>()
+            })
+            .unwrap_or_default();
+        external_tools.extend(
+            response
+                .get("result")
+                .and_then(|value| value.get("tools"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|tool| {
+                    tool.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| mcp_tool_enabled(&disabled, name))
+                })
+                .cloned(),
+        );
+    }
+    let mcp_configs = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        effective_config_objects(
+            &connection,
+            &session.workspace,
+            &host_id,
+            session.project_id.as_deref(),
+            Some(session_id),
+        )?
+        .into_iter()
+        .filter_map(|(object_id, version_id)| {
+            connection
+                .query_row(
+                    "SELECT o.name,COALESCE(o.server_key,''),v.content
+                     FROM config_object o
+                     JOIN config_object_version v ON v.id=?2
+                     WHERE o.id=?1 AND o.kind='mcp'",
+                    params![object_id.clone(), version_id.clone()],
+                    |row| {
+                        Ok((
+                            object_id,
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            version_id,
+                            serde_json::from_str::<Value>(&row.get::<_, String>(2)?)
+                                .unwrap_or_else(|_| json!({})),
+                        ))
+                    },
+                )
+                .ok()
+        })
+        .collect::<Vec<_>>()
+    };
+    for (object_id, name, server_key, version_id, mut content) in mcp_configs {
+        content["object_id"] = Value::String(object_id.clone());
+        content["name"] = Value::String(name);
+        content["server_key"] = Value::String(if server_key.is_empty() {
+            stable_server_key(&object_id)
+        } else {
+            server_key
+        });
+        let config = match serde_json::from_value::<McpServerConfig>(content) {
+            Ok(config) => config,
+            Err(_) => continue,
+        };
+        let Ok(tools) = state.mcp.connect_with_retry(&config, &version_id, 0).await else {
+            continue;
+        };
+        let disabled = state
+            .database
+            .lock()
+            .ok()
+            .and_then(|connection| {
+                connection
+                    .prepare(
+                        "SELECT name FROM mcp_session_tools
+                         WHERE session_id=?1 AND source=?2 AND enabled=0",
+                    )
+                    .ok()
+                    .and_then(|mut statement| {
+                        statement
+                            .query_map(params![session_id, object_id], |row| {
+                                row.get::<_, String>(0)
+                            })
+                            .ok()
+                            .map(|rows| {
+                                rows.filter_map(Result::ok)
+                                    .collect::<std::collections::HashSet<_>>()
+                            })
+                    })
+            })
+            .unwrap_or_default();
+        external_tools.extend(
+            tools
+                .into_iter()
+                .filter(|tool| mcp_tool_enabled(&disabled, &tool.qualified_name))
+                .map(|tool| {
+                    json!({
+                        "name": tool.name,
+                        "qualified_name": tool.qualified_name,
+                        "description": tool.description.unwrap_or_default(),
+                        "inputSchema": tool.input_schema,
+                    })
+                }),
+        );
+    }
+    engine.set_external_tools(external_tools).await;
+    Ok(())
+}
+
 async fn engine_for(
     app: &tauri::AppHandle,
     state: &DesktopState,
@@ -10467,17 +10605,17 @@ async fn engine_for_with_context(
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let enabled = state
+        let disabled = state
             .database
             .lock()
             .map_err(|_| "database lock poisoned")?
             .prepare(
                 "SELECT name FROM mcp_session_tools
-                 WHERE session_id=?1 AND source='host' AND enabled=1",
+                 WHERE session_id=?1 AND source='host' AND enabled=0",
             )
             .and_then(|mut statement| {
                 let rows = statement.query_map([session_id], |row| row.get::<_, String>(0))?;
-                rows.collect::<Result<Vec<_>, _>>()
+                rows.collect::<Result<std::collections::HashSet<_>, _>>()
             })
             .unwrap_or_default();
         let selected = all_tools
@@ -10485,7 +10623,7 @@ async fn engine_for_with_context(
             .filter(|tool| {
                 tool.get("name")
                     .and_then(Value::as_str)
-                    .is_some_and(|name| enabled.iter().any(|item| item == name))
+                    .is_some_and(|name| !disabled.contains(name))
             })
             .collect();
         engine.set_external_tools(selected).await;
@@ -13023,6 +13161,7 @@ pub(crate) async fn submit_turn_inner_with_context(
     }
     let mut attachments = request.attachments;
     attachments.extend(session_context_attachments(state, &request.session_id).await?);
+    refresh_session_mcp_tools(state, &request.session_id, &engine).await?;
     emit(
         &app,
         "message",
@@ -18871,7 +19010,7 @@ async fn retry_mcp_server(
 }
 
 #[tauri::command]
-fn set_mcp_tool_enabled(
+async fn set_mcp_tool_enabled(
     state: State<'_, DesktopState>,
     session_id: String,
     name: String,
@@ -18889,6 +19028,10 @@ fn set_mcp_tool_enabled(
             params![session_id, source, name, enabled],
         )
         .map_err(|error| error.to_string())?;
+    let engine = state.engines.lock().await.get(&session_id).cloned();
+    if let Some(engine) = engine {
+        refresh_session_mcp_tools(&state, &session_id, &engine).await?;
+    }
     Ok(())
 }
 
@@ -24908,6 +25051,20 @@ mod m7_tests {
         for name in ["lsp_definition", "lsp_references", "lsp_diagnostics"] {
             assert!(!remote_allowed.contains(name));
         }
+    }
+
+    #[test]
+    fn mcp_tools_are_enabled_when_their_session_rows_are_absent() {
+        let disabled = HashSet::new();
+        assert!(mcp_tool_enabled(&disabled, "host:read"));
+        assert!(mcp_tool_enabled(&disabled, "server:write"));
+    }
+
+    #[test]
+    fn mcp_tools_with_explicit_disabled_rows_are_filtered() {
+        let disabled = HashSet::from(["host:read".to_owned()]);
+        assert!(!mcp_tool_enabled(&disabled, "host:read"));
+        assert!(mcp_tool_enabled(&disabled, "host:write"));
     }
 
     #[test]
