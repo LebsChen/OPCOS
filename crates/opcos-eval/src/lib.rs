@@ -1068,7 +1068,7 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             "Append a record to an existing file.",
             HeldIn,
             vec![("log.txt", "start\n")],
-            "Append exactly the line done followed by a newline to log.txt, preserving its existing start line.",
+            "Append exactly the line done followed by a newline to log.txt, preserving its existing start line. The final bytes of log.txt must be exactly `start\\ndone\\n`.",
             vec![vec![call(
                 "task-3",
                 "run_shell",
@@ -1099,7 +1099,7 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             "Recover from a parent traversal rejection by using a safe path.",
             HeldIn,
             vec![],
-            "Do not write outside the workspace; write safe.txt instead.",
+            "Do not write outside the workspace; write safe.txt containing exactly safe with no trailing newline instead.",
             vec![
                 vec![call(
                     "task-5a",
@@ -1207,7 +1207,7 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             "Persist exact multiline output including its final newline.",
             HeldIn,
             vec![],
-            "Write exact.txt with exactly these two lines and a final newline: first line one, second line two.",
+            "Write exact.txt with the exact byte sequence `one\\ntwo\\n`: first line one, second line two, and one final newline byte after two.",
             vec![vec![call(
                 "task-11",
                 "write_file",
@@ -1242,7 +1242,7 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             "Edit a file in a nested directory.",
             HeldOut,
             vec![("src/app.txt", "status=todo\n")],
-            "Change the nested status to done.",
+            "The existing src/app.txt contains exactly `status=todo\\n`. Replace that line so the complete file is exactly `status=done\\n`.",
             vec![vec![call(
                 "task-13",
                 "edit_file",
