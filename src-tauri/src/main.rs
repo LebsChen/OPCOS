@@ -15903,6 +15903,15 @@ fn save_asset(
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?;
+    let existing_status: Option<String> = connection
+        .query_row(
+            "SELECT status FROM config_object WHERE id=?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    reject_builtin_asset_mutation(existing_status.as_deref(), "edited")?;
     let transaction = connection
         .unchecked_transaction()
         .map_err(|error| error.to_string())?;
@@ -16017,22 +16026,33 @@ fn save_asset(
     transaction.commit().map_err(|error| error.to_string())
 }
 
+fn reject_builtin_asset_mutation(status: Option<&str>, operation: &str) -> Result<(), String> {
+    if status == Some("builtin") {
+        return Err(format!(
+            "builtin assets are read-only and cannot be {operation}"
+        ));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn delete_asset(state: State<'_, DesktopState>, id: String) -> Result<(), String> {
-    let is_mcp = state
+    let asset = state
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?
         .query_row(
-            "SELECT kind FROM config_object WHERE id=?1",
+            "SELECT kind,status FROM config_object WHERE id=?1",
             [id.as_str()],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()
-        .map_err(|error| error.to_string())?
-        .as_deref()
-        == Some("mcp");
-    if is_mcp {
+        .map_err(|error| error.to_string())?;
+    let Some((kind, status)) = asset else {
+        return Ok(());
+    };
+    reject_builtin_asset_mutation(Some(&status), "deleted")?;
+    if kind == "mcp" {
         delete_mcp_credentials(&state, &id)?;
     }
     state
@@ -25033,6 +25053,18 @@ fn main() {
 #[cfg(test)]
 mod m7_tests {
     use super::*;
+
+    #[test]
+    fn builtin_assets_reject_edit_and_delete_mutations() {
+        let edit_error = reject_builtin_asset_mutation(Some("builtin"), "edited").unwrap_err();
+        assert!(edit_error.contains("read-only"));
+        assert!(edit_error.contains("edited"));
+        let delete_error = reject_builtin_asset_mutation(Some("builtin"), "deleted").unwrap_err();
+        assert!(delete_error.contains("read-only"));
+        assert!(delete_error.contains("deleted"));
+        assert!(reject_builtin_asset_mutation(Some("active"), "edited").is_ok());
+        assert!(reject_builtin_asset_mutation(None, "deleted").is_ok());
+    }
 
     #[test]
     fn routed_shell_audit_flags_writes_and_redacts_credentials() {
