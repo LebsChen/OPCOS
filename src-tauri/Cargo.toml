@@ -38,6 +38,7 @@ opcos-policy = { path = "../crates/opcos-policy" }
 opcos-provider = { path = "../crates/opcos-provider" }
 opcos-rvm = { path = "../crates/opcos-rvm" }
 opcos-mcp = { path = "../crates/opcos-mcp" }
+opcos-trace = { path = "../crates/opcos-trace" }
 opcos-mcp-server.workspace = true
 opcos-acp-server.workspace = true
 agent-client-protocol.workspace = true

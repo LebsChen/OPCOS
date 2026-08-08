@@ -65,6 +65,7 @@ use opcos_store::{
     LoginStateBackupRecord, ProjectAgentRecord, ProjectRecord, SecretStore, SessionRecord,
     SessionStore, SqliteStore, ToolCallRecord,
 };
+use opcos_trace::export_session as export_trace_session;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -12861,6 +12862,17 @@ fn read_session_events_command(
     session_id: String,
 ) -> Result<Vec<Value>, String> {
     read_session_events_for_state(&state, session_id)
+}
+
+#[tauri::command]
+fn export_session_trace(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    output_dir: String,
+) -> Result<Value, String> {
+    let manifest = export_trace_session(&state.store, &session_id, output_dir)
+        .map_err(|error| error.to_string())?;
+    serde_json::to_value(manifest).map_err(|error| error.to_string())
 }
 
 fn read_session_events_for_state(
@@ -26564,6 +26576,7 @@ fn main() {
             list_sessions_command,
             set_session_archived,
             read_session_events_command,
+            export_session_trace,
             acp_session_capabilities,
             acp_set_mode,
             acp_set_config_option,

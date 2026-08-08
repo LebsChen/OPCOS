@@ -1,0 +1,9 @@
+[package]
+name = "opcos-trace"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+opcos-store = { path = "../opcos-store" }
+serde.workspace = true
+serde_json.workspace = true
