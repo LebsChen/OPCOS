@@ -9879,35 +9879,14 @@ fn mcp_tool_enabled(disabled: &HashSet<String>, name: &str) -> bool {
 async fn configure_mcp_notification_sink(
     mcp: &Arc<McpManager<McpCredentialAdapter>>,
     app_handle: &tauri::AppHandle,
-    engines: &Arc<AsyncMutex<HashMap<String, Arc<GuiEngine>>>>,
 ) {
     let app_handle = app_handle.clone();
-    let notification_engines = Arc::clone(engines);
     mcp.set_notification_sink(Arc::new(move |server_id, version_id, method, uri| {
         if method == "notifications/tools/list_changed" {
             let app_handle = app_handle.clone();
-            let engines = Arc::clone(&notification_engines);
             tauri::async_runtime::spawn(async move {
                 let state = app_handle.state::<DesktopState>();
-                let sessions = engines
-                    .lock()
-                    .await
-                    .iter()
-                    .map(|(session_id, engine)| (session_id.clone(), Arc::clone(engine)))
-                    .collect::<Vec<_>>();
-                for (session_id, engine) in sessions {
-                    if let Err(error) =
-                        refresh_session_mcp_tools(&state, &session_id, &engine).await
-                    {
-                        let _ = app_handle.emit(
-                            "mcp-catalog-refresh-error",
-                            serde_json::json!({
-                                "session_id": session_id,
-                                "error": error,
-                            }),
-                        );
-                    }
-                }
+                refresh_cached_mcp_engines(&state).await;
             });
         }
         let _ = app_handle.emit(
@@ -9921,6 +9900,27 @@ async fn configure_mcp_notification_sink(
         );
     }))
     .await;
+}
+
+async fn refresh_cached_mcp_engines(state: &DesktopState) {
+    let sessions = state
+        .engines
+        .lock()
+        .await
+        .iter()
+        .map(|(session_id, engine)| (session_id.clone(), Arc::clone(engine)))
+        .collect::<Vec<_>>();
+    for (session_id, engine) in sessions {
+        if let Err(error) = refresh_session_mcp_tools(state, &session_id, &engine).await {
+            let _ = state.mcp_notification_app.emit(
+                "mcp-catalog-refresh-error",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "error": error,
+                }),
+            );
+        }
+    }
 }
 
 async fn mcp_runtime_for_project(
@@ -9951,8 +9951,7 @@ async fn mcp_runtime_for_engine(
 ) -> Arc<McpManager<McpCredentialAdapter>> {
     let manager = mcp_runtime_for_project(state, project_id).await;
     if project_id.is_some() {
-        configure_mcp_notification_sink(&manager, &state.mcp_notification_app, &state.engines)
-            .await;
+        configure_mcp_notification_sink(&manager, &state.mcp_notification_app).await;
     }
     manager
 }
@@ -15904,6 +15903,15 @@ fn save_asset(
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?;
+    let existing_status: Option<String> = connection
+        .query_row(
+            "SELECT status FROM config_object WHERE id=?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    reject_builtin_asset_mutation(existing_status.as_deref(), "edited")?;
     let transaction = connection
         .unchecked_transaction()
         .map_err(|error| error.to_string())?;
@@ -16018,8 +16026,35 @@ fn save_asset(
     transaction.commit().map_err(|error| error.to_string())
 }
 
+fn reject_builtin_asset_mutation(status: Option<&str>, operation: &str) -> Result<(), String> {
+    if status == Some("builtin") {
+        return Err(format!(
+            "builtin assets are read-only and cannot be {operation}"
+        ));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn delete_asset(state: State<'_, DesktopState>, id: String) -> Result<(), String> {
+    let asset = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .query_row(
+            "SELECT kind,status FROM config_object WHERE id=?1",
+            [id.as_str()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((kind, status)) = asset else {
+        return Ok(());
+    };
+    reject_builtin_asset_mutation(Some(&status), "deleted")?;
+    if kind == "mcp" {
+        delete_mcp_credentials(&state, &id)?;
+    }
     state
         .database
         .lock()
@@ -16029,6 +16064,46 @@ fn delete_asset(state: State<'_, DesktopState>, id: String) -> Result<(), String
             [id],
         )
         .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn delete_mcp_credentials(state: &DesktopState, server_id: &str) -> Result<(), String> {
+    let name = format!("mcp-credential:{server_id}");
+    let project_ids = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let mut statement = connection
+            .prepare("SELECT project_id FROM secret_records WHERE name=?1 AND project_id<>''")
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map([name.as_str()], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+    state
+        .secrets
+        .delete(&secret_key("mcp-credential", server_id))
+        .map_err(|error| error.to_string())?;
+    for project_id in project_ids {
+        state
+            .secrets
+            .delete(&project_secret_key(
+                &project_id,
+                "mcp-credential",
+                server_id,
+            ))
+            .map_err(|error| error.to_string())?;
+    }
+    state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .execute("DELETE FROM secret_records WHERE name=?1", [name.as_str()])
+        .map_err(|error| error.to_string())?;
+    refresh_secret_values(state)?;
     Ok(())
 }
 
@@ -18916,7 +18991,7 @@ async fn list_mcp_servers(state: State<'_, DesktopState>) -> Result<Vec<Value>, 
     let mut statement = connection
         .prepare(
             "SELECT o.id,o.name,o.server_key,o.status,o.current_version_id,
-                    v.content
+                    v.content,o.scope_kind
              FROM config_object o
              JOIN config_object_version v ON v.id=o.current_version_id
              WHERE o.kind='mcp' AND o.status <> 'deleted'
@@ -18933,6 +19008,8 @@ async fn list_mcp_servers(state: State<'_, DesktopState>) -> Result<Vec<Value>, 
                 "id": object_id,
                 "name": row.get::<_, String>(1)?,
                 "server_key": row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                "builtin": row.get::<_, String>(3).unwrap_or_default() == "builtin",
+                "scope_kind": row.get::<_, String>(6).unwrap_or_else(|_| "global".into()),
                 "status": snapshot
                     .map(|value| serde_json::to_value(&value.status).unwrap_or(json!("failed")))
                     .unwrap_or_else(|| {
@@ -18951,6 +19028,13 @@ async fn list_mcp_servers(state: State<'_, DesktopState>) -> Result<Vec<Value>, 
                 "transport": content.get("transport").or_else(|| content.get("type")),
                 "url": content.get("url"),
                 "command": content.get("command"),
+                "args": content.get("args"),
+                "env": content.get("env"),
+                "enabled": content.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+                "requires_approval": content
+                    .get("requires_approval")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
             }))
         })
         .map_err(|error| error.to_string())?
@@ -19014,37 +19098,41 @@ async fn retry_mcp_server(
         .connect_with_retry(&parsed, &version_id, 2)
         .await
         .map_err(|error| format!("MCP server retry failed: {error}"))?;
-    let connection = state
-        .database
-        .lock()
-        .map_err(|_| "database lock poisoned")?;
-    let transaction = connection
-        .unchecked_transaction()
-        .map_err(|error| error.to_string())?;
-    transaction
-        .execute(
-            "DELETE FROM mcp_tool_cache WHERE server_object_id=?1 AND config_version_id=?2",
-            params![server_id, version_id],
-        )
-        .map_err(|error| error.to_string())?;
-    for tool in &tools {
+    {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
         transaction
             .execute(
-                "INSERT INTO mcp_tool_cache
-                 (server_object_id,config_version_id,tool_name,description,input_schema_json,discovered_at)
-                 VALUES (?1,?2,?3,?4,?5,?6)",
-                params![
-                    tool.server_id,
-                    version_id,
-                    tool.name,
-                    tool.description,
-                    serde_json::to_string(&tool.input_schema).map_err(|error| error.to_string())?,
-                    Utc::now().to_rfc3339(),
-                ],
+                "DELETE FROM mcp_tool_cache WHERE server_object_id=?1 AND config_version_id=?2",
+                params![server_id, version_id],
             )
             .map_err(|error| error.to_string())?;
+        for tool in &tools {
+            transaction
+                .execute(
+                    "INSERT INTO mcp_tool_cache
+                     (server_object_id,config_version_id,tool_name,description,input_schema_json,discovered_at)
+                     VALUES (?1,?2,?3,?4,?5,?6)",
+                    params![
+                        tool.server_id,
+                        version_id,
+                        tool.name,
+                        tool.description,
+                        serde_json::to_string(&tool.input_schema)
+                            .map_err(|error| error.to_string())?,
+                        Utc::now().to_rfc3339(),
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
     }
-    transaction.commit().map_err(|error| error.to_string())?;
+    refresh_cached_mcp_engines(&state).await;
     Ok(json!({
         "id": parsed.object_id,
         "name": parsed.name,
@@ -24549,11 +24637,7 @@ fn main() {
             })));
             let engines = Arc::new(AsyncMutex::new(HashMap::<String, Arc<GuiEngine>>::new()));
             let app_handle = app.handle().clone();
-            tauri::async_runtime::block_on(configure_mcp_notification_sink(
-                &mcp,
-                &app_handle,
-                &engines,
-            ));
+            tauri::async_runtime::block_on(configure_mcp_notification_sink(&mcp, &app_handle));
             let mut jobs_path = path.clone();
             jobs_path.set_file_name("background-jobs");
             let mut trigger_token_bytes = [0_u8; 32];
@@ -24969,6 +25053,18 @@ fn main() {
 #[cfg(test)]
 mod m7_tests {
     use super::*;
+
+    #[test]
+    fn builtin_assets_reject_edit_and_delete_mutations() {
+        let edit_error = reject_builtin_asset_mutation(Some("builtin"), "edited").unwrap_err();
+        assert!(edit_error.contains("read-only"));
+        assert!(edit_error.contains("edited"));
+        let delete_error = reject_builtin_asset_mutation(Some("builtin"), "deleted").unwrap_err();
+        assert!(delete_error.contains("read-only"));
+        assert!(delete_error.contains("deleted"));
+        assert!(reject_builtin_asset_mutation(Some("active"), "edited").is_ok());
+        assert!(reject_builtin_asset_mutation(None, "deleted").is_ok());
+    }
 
     #[test]
     fn routed_shell_audit_flags_writes_and_redacts_credentials() {

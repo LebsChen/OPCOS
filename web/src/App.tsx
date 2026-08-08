@@ -44,9 +44,12 @@ import {
 } from "./timeline";
 import {
   appendMcpPromptDraft,
+  isUserMcpServer,
   mcpCatalogUpdateTargets,
+  mcpServerFormBody,
   mcpPromptMessagesToDraft,
   mcpResourceSummary,
+  type McpTransport,
 } from "./mcp";
 import { summarizeIterationStats } from "./iterationStats";
 import { Sidebar } from "./components/Sidebar";
@@ -7165,6 +7168,18 @@ function McpManage({
     Array<Record<string, unknown>>
   >([]);
   const [search, setSearch] = useState("");
+  const [editingServerId, setEditingServerId] = useState("");
+  const [serverName, setServerName] = useState("");
+  const [serverTransport, setServerTransport] = useState<
+    "stdio" | "streamable-http" | "http-sse"
+  >("streamable-http");
+  const [serverUrl, setServerUrl] = useState("");
+  const [serverCommand, setServerCommand] = useState("");
+  const [serverArgs, setServerArgs] = useState("");
+  const [serverEnv, setServerEnv] = useState("");
+  const [serverToken, setServerToken] = useState("");
+  const [serverEnabled, setServerEnabled] = useState(true);
+  const [serverRequiresApproval, setServerRequiresApproval] = useState(true);
   useEffect(() => {
     void command<Array<Record<string, unknown>>>("list_mcp_servers")
       .then(setServers)
@@ -7267,6 +7282,103 @@ function McpManage({
   const selectedServer = servers.find(
     (server) => String(server.id) === selectedServerId,
   );
+  const resetServerForm = () => {
+    setEditingServerId("");
+    setServerName("");
+    setServerTransport("streamable-http");
+    setServerUrl("");
+    setServerCommand("");
+    setServerArgs("");
+    setServerEnv("");
+    setServerToken("");
+    setServerEnabled(true);
+    setServerRequiresApproval(true);
+  };
+  const editServer = (server: Record<string, unknown>) => {
+    if (!isUserMcpServer(server)) return;
+    setEditingServerId(String(server.id));
+    setServerName(String(server.name || ""));
+    setServerTransport(
+      String(server.transport || "streamable-http") as McpTransport,
+    );
+    setServerUrl(String(server.url || ""));
+    setServerCommand(String(server.command || ""));
+    setServerArgs(
+      Array.isArray(server.args) ? server.args.map(String).join("\n") : "",
+    );
+    setServerEnv(
+      server.env && typeof server.env === "object"
+        ? Object.entries(server.env as Record<string, unknown>)
+            .map(([key, value]) => `${key}=${String(value)}`)
+            .join("\n")
+        : "",
+    );
+    setServerToken("");
+    setServerEnabled(server.enabled !== false);
+    setServerRequiresApproval(server.requires_approval !== false);
+  };
+  const saveServer = () => {
+    const id = editingServerId || `mcp-${Date.now()}`;
+    const credentialEnvKey = serverEnv
+      .split("\n")
+      .map((line) => line.trim().split("=", 1)[0])
+      .find((key) =>
+        /token|secret|password|authorization|client_secret/i.test(key),
+      );
+    if (credentialEnvKey) {
+      onError(
+        `Environment key "${credentialEnvKey}" looks sensitive. Store credentials in the bearer token field instead.`,
+      );
+      return;
+    }
+    const body = mcpServerFormBody({
+      transport: serverTransport,
+      url: serverUrl,
+      command: serverCommand,
+      args: serverArgs,
+      env: serverEnv,
+      enabled: serverEnabled,
+      requiresApproval: serverRequiresApproval,
+    });
+    void command("save_asset", {
+      id,
+      kind: "mcp",
+      title: serverName.trim(),
+      body: JSON.stringify(body),
+      trigger: null,
+      scope: null,
+      scopeKind: "global",
+      enabled: serverEnabled,
+      projectId: null,
+    })
+      .then(() =>
+        serverToken.trim()
+          ? command("save_mcp_credential", {
+              serverId: id,
+              value: JSON.stringify({ bearer_token: serverToken.trim() }),
+              projectId: null,
+            })
+          : undefined,
+      )
+      .then(() =>
+        serverEnabled
+          ? command("retry_mcp_server", { serverId: id })
+          : undefined,
+      )
+      .then(() => command<Array<Record<string, unknown>>>("list_mcp_servers"))
+      .then((nextServers) => {
+        setServers(nextServers);
+        resetServerForm();
+      })
+      .catch(onError);
+  };
+  const removeServer = (server: Record<string, unknown>) => {
+    if (!isUserMcpServer(server)) return;
+    void command("delete_asset", { id: String(server.id) })
+      .then(() => command<Array<Record<string, unknown>>>("list_mcp_servers"))
+      .then(setServers)
+      .catch(onError);
+  };
   const loadServerCatalog = (server: Record<string, unknown>) => {
     const serverId = String(server.id);
     const versionId = String(server.version_id || "");
@@ -7302,6 +7414,101 @@ function McpManage({
   );
   return (
     <>
+      <section className="panel mb-4">
+        <div className="flex items-center justify-between gap-2">
+          <h2>{editingServerId ? "Edit MCP server" : "Add MCP server"}</h2>
+          {editingServerId && <Button onClick={resetServerForm}>Cancel</Button>}
+        </div>
+        <div className="grid gap-2 md:grid-cols-2">
+          <input
+            value={serverName}
+            onChange={(event) => setServerName(event.target.value)}
+            placeholder="Server name"
+          />
+          <select
+            value={serverTransport}
+            onChange={(event) =>
+              setServerTransport(
+                event.target.value as "stdio" | "streamable-http" | "http-sse",
+              )
+            }
+          >
+            <option value="streamable-http">Streamable HTTP</option>
+            <option value="http-sse">HTTP + SSE</option>
+            <option value="stdio">stdio</option>
+          </select>
+          {serverTransport === "stdio" ? (
+            <>
+              <input
+                value={serverCommand}
+                onChange={(event) => setServerCommand(event.target.value)}
+                placeholder="Command"
+              />
+              <textarea
+                value={serverArgs}
+                onChange={(event) => setServerArgs(event.target.value)}
+                placeholder="Arguments, one per line"
+                rows={3}
+              />
+              <textarea
+                value={serverEnv}
+                onChange={(event) => setServerEnv(event.target.value)}
+                placeholder="Environment, KEY=VALUE per line"
+                rows={3}
+              />
+              <p className="text-xs text-slate-500 md:col-span-2">
+                Use environment entries for non-sensitive runtime settings.
+                Store bearer tokens in the secure token field below, not in
+                environment variables.
+              </p>
+            </>
+          ) : (
+            <input
+              className="md:col-span-2"
+              value={serverUrl}
+              onChange={(event) => setServerUrl(event.target.value)}
+              placeholder="https://example.com/mcp"
+            />
+          )}
+          <input
+            type="password"
+            value={serverToken}
+            onChange={(event) => setServerToken(event.target.value)}
+            placeholder="Bearer token (stored securely)"
+          />
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={serverEnabled}
+              onChange={(event) => setServerEnabled(event.target.checked)}
+            />
+            Enabled
+          </label>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={serverRequiresApproval}
+              onChange={(event) =>
+                setServerRequiresApproval(event.target.checked)
+              }
+            />
+            Require approval for tools
+          </label>
+        </div>
+        <div className="mt-3 flex gap-2">
+          <Button
+            disabled={
+              !serverName.trim() ||
+              (serverTransport === "stdio"
+                ? !serverCommand.trim()
+                : !serverUrl.trim())
+            }
+            onClick={saveServer}
+          >
+            {editingServerId ? "Save and verify" : "Create and verify"}
+          </Button>
+        </div>
+      </section>
       <CollectionPage
         search={search}
         onSearch={setSearch}
@@ -7337,6 +7544,16 @@ function McpManage({
                     }
                     actions={
                       <div className="inline-actions">
+                        {isUserMcpServer(server) && (
+                          <>
+                            <Button onClick={() => editServer(server)}>
+                              Edit
+                            </Button>
+                            <Button onClick={() => removeServer(server)}>
+                              Delete
+                            </Button>
+                          </>
+                        )}
                         {String(server.status || "").toLowerCase() ===
                           "auth_required" && (
                           <Button
