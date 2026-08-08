@@ -10971,6 +10971,10 @@ function AppContent() {
       }
       if (payload.session_id && payload.session_id !== selectedIdRef.current)
         return;
+      if (payload.kind === "session_list_changed") {
+        void refresh().catch(onError);
+        return;
+      }
       if (payload.kind === "stream") {
         const streamPayload = payload.payload;
         const workingEvent =
@@ -11336,7 +11340,7 @@ function AppContent() {
           updated_at: null,
           messages: 0,
           pinned: false,
-          archived: false,
+          archived: session.archived ?? false,
           attention: 0,
           liveness: selected?.id === session.id && running ? "working" : "idle",
           stop_reason: session.stop_reason,
