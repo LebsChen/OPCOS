@@ -24092,6 +24092,20 @@ fn main() {
                 store: secrets.clone(),
                 project_id: None,
             })));
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::block_on(mcp.set_notification_sink(Arc::new(
+                move |server_id, version_id, method, uri| {
+                    let _ = app_handle.emit(
+                        "mcp-catalog-updated",
+                        serde_json::json!({
+                            "server_id": server_id,
+                            "version_id": version_id,
+                            "method": method,
+                            "uri": uri,
+                        }),
+                    );
+                },
+            )));
             let mut jobs_path = path.clone();
             jobs_path.set_file_name("background-jobs");
             let mut trigger_token_bytes = [0_u8; 32];

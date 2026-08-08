@@ -4171,6 +4171,7 @@ name = "opcos-mcp"
 version = "0.1.1"
 dependencies = [
  "async-trait",
+ "futures-util",
  "opcos-rvm",
  "reqwest",
  "serde",

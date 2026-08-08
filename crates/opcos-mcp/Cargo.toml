@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+futures-util.workspace = true
 opcos-rvm = { path = "../opcos-rvm" }
 reqwest.workspace = true
 serde.workspace = true

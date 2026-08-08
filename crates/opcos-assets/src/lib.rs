@@ -273,13 +273,8 @@ pub fn builtin_mcp_catalog() -> Result<Vec<McpCatalogEntry>, AssetError> {
             )));
         }
         match entry.transport.as_str() {
-            "streamable-http" => {
-                if entry.command.is_some()
-                    || !entry
-                        .url
-                        .as_deref()
-                        .is_some_and(|url| url.starts_with("https://"))
-                {
+            "streamable-http" | "http-sse" => {
+                if !valid_http_connection_fields(entry) {
                     return Err(AssetError::Invalid(format!(
                         "HTTP MCP catalog entry has invalid connection fields: {}",
                         entry.slug
@@ -314,6 +309,14 @@ pub fn builtin_mcp_catalog() -> Result<Vec<McpCatalogEntry>, AssetError> {
         }
     }
     Ok(entries)
+}
+
+fn valid_http_connection_fields(entry: &McpCatalogEntry) -> bool {
+    entry.command.is_none()
+        && entry
+            .url
+            .as_deref()
+            .is_some_and(|url| url.starts_with("https://"))
 }
 
 fn default_argument_type() -> String {
@@ -1748,5 +1751,48 @@ mod tests {
         assert!(bundle.hooks.is_none());
         assert_eq!(bundle.hook_errors.len(), 1);
         assert_eq!(bundle.agents[0].path, "/repo/.agents/rules/x.md");
+    }
+
+    #[test]
+    fn http_sse_catalog_entries_use_http_connection_rules() {
+        let entry = McpCatalogEntry {
+            slug: "sse".into(),
+            name: "SSE".into(),
+            description: "SSE server".into(),
+            links: BTreeMap::new(),
+            enabled: false,
+            requires_approval: true,
+            transport: "http-sse".into(),
+            url: Some("https://example.test/mcp".into()),
+            command: None,
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            auth: "none".into(),
+            required_inputs: Vec::new(),
+            credential_inputs: Vec::new(),
+        };
+        assert!(valid_http_connection_fields(&entry));
+        assert!(builtin_mcp_catalog().is_ok());
+    }
+
+    #[test]
+    fn http_sse_catalog_entries_reject_stdio_fields() {
+        let entry = McpCatalogEntry {
+            slug: "sse".into(),
+            name: "SSE".into(),
+            description: "SSE server".into(),
+            links: BTreeMap::new(),
+            enabled: false,
+            requires_approval: true,
+            transport: "http-sse".into(),
+            url: Some("https://example.test/mcp".into()),
+            command: Some("server".into()),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            auth: "none".into(),
+            required_inputs: Vec::new(),
+            credential_inputs: Vec::new(),
+        };
+        assert!(!valid_http_connection_fields(&entry));
     }
 }
