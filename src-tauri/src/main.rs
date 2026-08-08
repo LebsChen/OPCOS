@@ -13432,6 +13432,46 @@ async fn submit_acp_turn_inner(
                         Some(&event_session),
                         json!({"plan_update":{"entries":entries}}),
                     ),
+                    opcos_engine::HarnessEvent::SessionModeUpdate {
+                        current_mode_id,
+                        available_modes,
+                    } => emit(
+                        &event_app,
+                        "acp_session",
+                        Some(&event_session),
+                        json!({
+                            "kind": "acp_session",
+                            "payload": {
+                                "kind": "mode_update",
+                                "currentModeId": current_mode_id,
+                                "availableModes": available_modes,
+                            }
+                        }),
+                    ),
+                    opcos_engine::HarnessEvent::SessionConfigUpdate { config_options } => emit(
+                        &event_app,
+                        "acp_session",
+                        Some(&event_session),
+                        json!({
+                            "kind": "acp_session",
+                            "payload": {
+                                "kind": "config_update",
+                                "configOptions": config_options,
+                            }
+                        }),
+                    ),
+                    opcos_engine::HarnessEvent::AvailableCommandsUpdate { commands } => emit(
+                        &event_app,
+                        "acp_session",
+                        Some(&event_session),
+                        json!({
+                            "kind": "acp_session",
+                            "payload": {
+                                "kind": "commands_update",
+                                "availableCommands": commands,
+                            }
+                        }),
+                    ),
                     opcos_engine::HarnessEvent::ApprovalRequested(request) => {
                         let unattended = event_store.is_unattended(&event_session).unwrap_or(false);
                         if unattended {
@@ -13698,6 +13738,7 @@ async fn resolve_approval(
     session_id: String,
     call_id: String,
     approve: bool,
+    option_id: Option<String>,
 ) -> Result<(), String> {
     if session_for(&state, &session_id)?.harness == "opencode" {
         let harness = opencode_for(&state, &session_id).await?;
@@ -13731,13 +13772,14 @@ async fn resolve_approval(
     if session_for(&state, &session_id)?.harness == "acp" {
         let harness = acp_for(&state, &session_id).await?;
         harness
-            .reply_approval(
+            .reply_approval_with_option(
                 &call_id,
                 if approve {
                     opcos_engine::ApprovalOutcome::Approve
                 } else {
                     opcos_engine::ApprovalOutcome::Deny
                 },
+                option_id,
             )
             .await
             .map_err(|error| error.to_string())?;

@@ -702,7 +702,7 @@ export function Composer(props: Props) {
             )}
           {props.harness === "acp" &&
             !props.acpConfigOptions?.length &&
-            props.acpMode?.availableModes.length &&
+            !!props.acpMode?.availableModes.length &&
             props.onAcpModeChange && (
               <select
                 className="chip"

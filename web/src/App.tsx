@@ -11527,11 +11527,12 @@ function AppContent() {
                           reason: "Tool action requires approval",
                         }}
                         hostName={selected.host_name}
-                        onApprove={(decision) => {
+                        onApprove={(decision, optionId) => {
                           void command("resolve_approval", {
                             sessionId: selected.id,
                             callId: pendingApproval.callId,
                             approve: decision === "allow",
+                            optionId,
                           }).catch(onError);
                         }}
                       />
