@@ -4058,6 +4058,7 @@ dependencies = [
  "opcos-hosts",
  "opcos-lsp",
  "opcos-mcp",
+ "opcos-mcp-server",
  "opcos-policy",
  "opcos-provider",
  "opcos-rvm",
@@ -4182,6 +4183,17 @@ dependencies = [
  "tokio",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "opcos-mcp-server"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]
