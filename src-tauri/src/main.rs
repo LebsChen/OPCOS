@@ -4890,6 +4890,47 @@ fn attended_pending_event_kind(pending_kind: &str) -> &'static str {
     }
 }
 
+fn emit_acp_session_update(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    event: opcos_engine::HarnessEvent,
+) {
+    match event {
+        opcos_engine::HarnessEvent::SessionModeUpdate {
+            current_mode_id,
+            available_modes,
+        } => emit(
+            app,
+            "acp_session",
+            Some(session_id),
+            json!({
+                "kind": "mode_update",
+                "currentModeId": current_mode_id,
+                "availableModes": available_modes,
+            }),
+        ),
+        opcos_engine::HarnessEvent::SessionConfigUpdate { config_options } => emit(
+            app,
+            "acp_session",
+            Some(session_id),
+            json!({
+                "kind": "config_update",
+                "configOptions": config_options,
+            }),
+        ),
+        opcos_engine::HarnessEvent::AvailableCommandsUpdate { commands } => emit(
+            app,
+            "acp_session",
+            Some(session_id),
+            json!({
+                "kind": "commands_update",
+                "availableCommands": commands,
+            }),
+        ),
+        _ => {}
+    }
+}
+
 fn emit_pending_approval(
     app: &tauri::AppHandle,
     state: &DesktopState,
@@ -12186,6 +12227,44 @@ fn read_session_events(
         .map(|events| events.into_iter().map(|record| record.event).collect())
 }
 
+#[tauri::command]
+async fn acp_session_capabilities(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Value, String> {
+    Ok(acp_for(&state, &session_id)
+        .await?
+        .session_capabilities()
+        .await)
+}
+
+#[tauri::command]
+async fn acp_set_mode(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    mode_id: String,
+) -> Result<(), String> {
+    acp_for(&state, &session_id)
+        .await?
+        .set_mode(&mode_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn acp_set_config_option(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    config_id: String,
+    value: Value,
+) -> Result<(), String> {
+    acp_for(&state, &session_id)
+        .await?
+        .set_config_option(&config_id, value)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 fn artifact_kind(path: &str) -> (&'static str, Option<&'static str>) {
     match path
         .rsplit('.')
@@ -13198,6 +13277,11 @@ async fn submit_opencode_turn_inner(
                         Some(&event_session),
                         json!({"plan_update":{"entries":entries}}),
                     ),
+                    event @ opcos_engine::HarnessEvent::SessionModeUpdate { .. }
+                    | event @ opcos_engine::HarnessEvent::SessionConfigUpdate { .. }
+                    | event @ opcos_engine::HarnessEvent::AvailableCommandsUpdate { .. } => {
+                        emit_acp_session_update(&event_app, &event_session, event)
+                    }
                     opcos_engine::HarnessEvent::ApprovalRequested(request) => {
                         let unattended = event_store.is_unattended(&event_session).unwrap_or(false);
                         if unattended {
@@ -13373,6 +13457,11 @@ async fn submit_acp_turn_inner(
                         Some(&event_session),
                         json!({"plan_update":{"entries":entries}}),
                     ),
+                    event @ opcos_engine::HarnessEvent::SessionModeUpdate { .. }
+                    | event @ opcos_engine::HarnessEvent::SessionConfigUpdate { .. }
+                    | event @ opcos_engine::HarnessEvent::AvailableCommandsUpdate { .. } => {
+                        emit_acp_session_update(&event_app, &event_session, event)
+                    }
                     opcos_engine::HarnessEvent::ApprovalRequested(request) => {
                         let unattended = event_store.is_unattended(&event_session).unwrap_or(false);
                         if unattended {
@@ -13639,6 +13728,7 @@ async fn resolve_approval(
     session_id: String,
     call_id: String,
     approve: bool,
+    option_id: Option<String>,
 ) -> Result<(), String> {
     if session_for(&state, &session_id)?.harness == "opencode" {
         let harness = opencode_for(&state, &session_id).await?;
@@ -13672,13 +13762,14 @@ async fn resolve_approval(
     if session_for(&state, &session_id)?.harness == "acp" {
         let harness = acp_for(&state, &session_id).await?;
         harness
-            .reply_approval(
+            .reply_approval_with_option(
                 &call_id,
                 if approve {
                     opcos_engine::ApprovalOutcome::Approve
                 } else {
                     opcos_engine::ApprovalOutcome::Deny
                 },
+                option_id,
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -24492,6 +24583,9 @@ fn main() {
             change_harness,
             list_sessions,
             read_session_events,
+            acp_session_capabilities,
+            acp_set_mode,
+            acp_set_config_option,
             read_transcript,
             submit_turn,
             list_artifacts,

@@ -133,10 +133,26 @@ interface Props {
   secrets?: Array<{ name: string }>;
   slashCommands?: Array<{
     name: string;
-    body: string;
-    kind: string;
+    body?: string;
+    description?: string;
+    input?: { hint?: string };
+    kind?: string;
     execution?: string;
   }>;
+  acpMode?: {
+    currentModeId?: string | null;
+    availableModes: Array<{ id: string; name: string; description?: string }>;
+  };
+  acpConfigOptions?: Array<{
+    id: string;
+    name: string;
+    description?: string;
+    type: "select" | "boolean";
+    currentValue: string | boolean;
+    options?: Array<{ value: string; name: string; description?: string }>;
+  }>;
+  onAcpModeChange?: (modeId: string) => void;
+  onAcpConfigOptionChange?: (configId: string, value: string | boolean) => void;
   onUploadFile?: (file: File) => Promise<string>;
   onModeChange?: (mode: string) => void;
   onHarnessChange?: (harness: string) => void;
@@ -354,7 +370,14 @@ export function Composer(props: Props) {
   };
 
   const expandSlashCommand = (value: string) => {
-    return expandSlashCommandValue(value, props.slashCommands ?? []);
+    return expandSlashCommandValue(
+      value,
+      (props.slashCommands ?? []).map((command) => ({
+        ...command,
+        body: command.body || "",
+        kind: command.kind || "custom",
+      })),
+    );
   };
 
   const uploadFile = async (file: File) => {
@@ -640,6 +663,62 @@ export function Composer(props: Props) {
               onUnattendedChange={props.onUnattendedChange}
             />
           ) : null}
+          {props.harness === "acp" &&
+            props.acpConfigOptions?.map((option) =>
+              option.type === "boolean" ? (
+                <label className="chip flex items-center gap-1" key={option.id}>
+                  <input
+                    type="checkbox"
+                    checked={option.currentValue === true}
+                    onChange={(event) =>
+                      props.onAcpConfigOptionChange?.(
+                        option.id,
+                        event.target.checked,
+                      )
+                    }
+                  />
+                  {option.name}
+                </label>
+              ) : (
+                <select
+                  className="chip"
+                  key={option.id}
+                  title={option.description || option.name}
+                  value={String(option.currentValue)}
+                  onChange={(event) =>
+                    props.onAcpConfigOptionChange?.(
+                      option.id,
+                      event.target.value,
+                    )
+                  }
+                >
+                  {option.options?.map((item) => (
+                    <option key={item.value} value={item.value}>
+                      {item.name}
+                    </option>
+                  ))}
+                </select>
+              ),
+            )}
+          {props.harness === "acp" &&
+            !props.acpConfigOptions?.length &&
+            !!props.acpMode?.availableModes.length &&
+            props.onAcpModeChange && (
+              <select
+                className="chip"
+                title="ACP mode"
+                value={props.acpMode.currentModeId || ""}
+                onChange={(event) =>
+                  props.onAcpModeChange?.(event.target.value)
+                }
+              >
+                {props.acpMode.availableModes.map((mode) => (
+                  <option key={mode.id} value={mode.id}>
+                    {mode.name}
+                  </option>
+                ))}
+              </select>
+            )}
           {!dictation?.recording &&
             props.harness &&
             props.onHarnessChange &&

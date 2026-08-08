@@ -305,6 +305,16 @@ pub enum HarnessEvent {
     PlanUpdate {
         entries: Vec<Value>,
     },
+    SessionModeUpdate {
+        current_mode_id: String,
+        available_modes: Vec<Value>,
+    },
+    SessionConfigUpdate {
+        config_options: Vec<Value>,
+    },
+    AvailableCommandsUpdate {
+        commands: Vec<Value>,
+    },
     ToolResult {
         call_id: String,
         tool: String,
