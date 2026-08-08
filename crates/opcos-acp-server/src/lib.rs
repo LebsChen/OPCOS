@@ -394,9 +394,16 @@ mod tests {
             sink: Arc<dyn AcpEventSink>,
         ) -> Result<StopReason, String> {
             sink.update(SessionNotification::new(
-                request.session_id,
+                request.session_id.clone(),
                 SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
                     serde_json::from_value(json!({"text":"hello"})).unwrap(),
+                ))),
+            ))
+            .await?;
+            sink.update(SessionNotification::new(
+                request.session_id,
+                SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                    serde_json::from_value(json!({"text":" world"})).unwrap(),
                 ))),
             ))
             .await?;
@@ -449,15 +456,17 @@ mod tests {
                 .iter()
                 .any(|value| value["result"]["stopReason"] == "end_turn")
         );
-        let update_index = values
-            .iter()
-            .position(|value| value["method"] == "session/update")
-            .unwrap();
         let response_index = values
             .iter()
             .position(|value| value["id"] == 3 && value["result"]["stopReason"].is_string())
             .unwrap();
-        assert!(update_index < response_index);
+        let update_indices = values
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| (value["method"] == "session/update").then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(update_indices.len(), 2);
+        assert!(update_indices.iter().all(|index| *index < response_index));
     }
 
     #[tokio::test]

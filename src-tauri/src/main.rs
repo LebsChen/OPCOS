@@ -641,7 +641,7 @@ struct DesktopState {
     engines: Arc<AsyncMutex<HashMap<String, Arc<GuiEngine>>>>,
     acp_engines: AsyncMutex<HashMap<String, Arc<opcos_engine::AcpHarness<SqliteStore>>>>,
     acp_event_sessions: AsyncMutex<HashSet<String>>,
-    acp_streams: AsyncMutex<HashMap<String, UnboundedSender<(String, Value)>>>,
+    acp_streams: Mutex<HashMap<String, UnboundedSender<(String, Value)>>>,
     trigger_runs: AsyncMutex<HashSet<String>>,
     trigger_http_token: String,
     trigger_http_port: u16,
@@ -5160,6 +5160,15 @@ fn acp_stream_update(kind: &str, payload: &Value) -> Option<SessionUpdate> {
     }
 }
 
+fn next_acp_pending<'a>(
+    pending: &'a [opcos_store::PendingRecord],
+    resolved_call_ids: &HashSet<String>,
+) -> Option<&'a opcos_store::PendingRecord> {
+    pending
+        .iter()
+        .find(|record| !resolved_call_ids.contains(&record.call_id))
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct ProjectView {
     #[serde(flatten)]
@@ -5186,7 +5195,7 @@ struct OpcosEvent {
 
 fn emit(app: &tauri::AppHandle, kind: &str, session_id: Option<&str>, payload: Value) {
     if let (Some(session_id), Some(state)) = (session_id, app.try_state::<DesktopState>())
-        && let Ok(streams) = state.acp_streams.try_lock()
+        && let Ok(streams) = state.acp_streams.lock()
         && let Some(stream) = streams.get(session_id)
     {
         let _ = stream.send((kind.to_owned(), payload.clone()));
@@ -14028,7 +14037,7 @@ impl opcos_acp_server::OpcosAcpControlPlane for DesktopControlPlane {
         state
             .acp_streams
             .lock()
-            .await
+            .map_err(|_| "ACP stream registry lock poisoned".to_owned())?
             .insert(session_id.clone(), stream_tx);
         let stream_sink = Arc::clone(&sink);
         let stream_session = session_id.clone();
@@ -14045,6 +14054,7 @@ impl opcos_acp_server::OpcosAcpControlPlane for DesktopControlPlane {
             }
         });
         let outcome = async {
+            let mut resolved_call_ids = HashSet::new();
             let mut result = submit_turn_inner_with_origin(
                 self.app.clone(),
                 &state,
@@ -14069,7 +14079,7 @@ impl opcos_acp_server::OpcosAcpControlPlane for DesktopControlPlane {
                         .store
                         .load_pending(&session_id)
                         .map_err(|store_error| store_error.to_string())?;
-                    if let Some(pending) = pending.into_iter().next() {
+                    if let Some(pending) = next_acp_pending(&pending, &resolved_call_ids) {
                         let response = sink
                             .request_permission(
                                 serde_json::from_value(json!({
@@ -14115,10 +14125,12 @@ impl opcos_acp_server::OpcosAcpControlPlane for DesktopControlPlane {
                             .await
                         {
                             Ok(_) => {
+                                resolved_call_ids.insert(pending.call_id.clone());
                                 result = Ok(());
                             }
                             Err(EngineError::ApprovalAlreadyProcessed(_)) => {
-                                result = Err(error);
+                                resolved_call_ids.insert(pending.call_id.clone());
+                                result = Ok(());
                             }
                             Err(next) => {
                                 result = Err(engine_error_message(next));
@@ -14136,8 +14148,16 @@ impl opcos_acp_server::OpcosAcpControlPlane for DesktopControlPlane {
             }
         }
         .await;
-        state.acp_streams.lock().await.remove(&session_id);
-        stream_forwarder.abort();
+        if let Ok(mut streams) = state.acp_streams.lock() {
+            streams.remove(&session_id);
+        }
+        let mut stream_forwarder = stream_forwarder;
+        if tokio::time::timeout(Duration::from_secs(1), &mut stream_forwarder)
+            .await
+            .is_err()
+        {
+            stream_forwarder.abort();
+        }
         outcome
     }
 
@@ -25581,7 +25601,7 @@ fn main() {
                 engines: Arc::clone(&engines),
                 acp_engines: AsyncMutex::new(HashMap::new()),
                 acp_event_sessions: AsyncMutex::new(HashSet::new()),
-                acp_streams: AsyncMutex::new(HashMap::new()),
+                acp_streams: Mutex::new(HashMap::new()),
                 trigger_runs: AsyncMutex::new(HashSet::new()),
                 surfaces: AsyncMutex::new(HashMap::new()),
                 ide_proxies: AsyncMutex::new(HashMap::new()),
@@ -28955,5 +28975,18 @@ agents:
             .unwrap();
         assert!(columns.contains(&"mode".to_owned()));
         assert!(columns.contains(&"enabled".to_owned()));
+    }
+
+    #[test]
+    fn acp_pending_selection_skips_already_processed_call() {
+        let pending = vec![opcos_store::PendingRecord {
+            session_id: "session".into(),
+            call_id: "call-1".into(),
+            tool: "tool".into(),
+            arguments: Value::Null,
+            state: "pending".into(),
+        }];
+        let resolved = HashSet::from(["call-1".to_owned()]);
+        assert!(next_acp_pending(&pending, &resolved).is_none());
     }
 }
