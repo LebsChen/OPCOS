@@ -17290,11 +17290,9 @@ fn delete_asset_for_state(state: &DesktopState, id: &str) -> Result<(), String> 
         .map_err(|_| "database lock poisoned")?;
     asset_mutation_guard(&connection, id, "deleted")?;
     let kind: Option<String> = connection
-        .query_row(
-            "SELECT kind FROM config_object WHERE id=?1",
-            [id],
-            |row| row.get(0),
-        )
+        .query_row("SELECT kind FROM config_object WHERE id=?1", [id], |row| {
+            row.get(0)
+        })
         .optional()
         .map_err(|error| error.to_string())?;
     connection
