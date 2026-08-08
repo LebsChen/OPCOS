@@ -25,8 +25,7 @@ use opcos_engine::SecretScrubber;
 use opcos_engine::{
     AcpHarness, AcpHarnessConfig, AgentEngine, ArtifactReference, ArtifactRequest, ArtifactSink,
     EngineError, ExternalContextAttachment, Harness, LifecycleHook, LifecycleHookConfig,
-    OpenCodeHarness, OpenCodeHarnessConfig, PreflightDecision, SessionRecorder, ToolExecutor,
-    ToolOrigin, TurnEngine,
+    PreflightDecision, SessionRecorder, ToolExecutor, ToolOrigin, TurnEngine,
     computer_use::{
         BestEffortScreenshotChangedVerifier, ComputerUseLoopConfig, ComputerUseStep,
         run_computer_use_loop,
@@ -359,8 +358,6 @@ struct DesktopState {
     secret_values: SecretValues,
     store: Arc<SqliteStore>,
     engines: Arc<AsyncMutex<HashMap<String, Arc<GuiEngine>>>>,
-    opencode_engines: AsyncMutex<HashMap<String, Arc<opcos_engine::OpenCodeHarness<SqliteStore>>>>,
-    opencode_event_sessions: AsyncMutex<HashSet<String>>,
     acp_engines: AsyncMutex<HashMap<String, Arc<opcos_engine::AcpHarness<SqliteStore>>>>,
     acp_event_sessions: AsyncMutex<HashSet<String>>,
     trigger_runs: AsyncMutex<HashSet<String>>,
@@ -6246,6 +6243,17 @@ description: 为新行为和缺陷修复设计覆盖正常、失败及边界条�
             "env": {}
         }),
     )?;
+    seed_builtin_template(
+        connection,
+        "template-acp-agent-opencode",
+        "acp-agent",
+        "OpenCode ACP",
+        "通过 ACP 接入本机 OpenCode agent；使用 OpenCode 的标准 ACP 启动命令。",
+        &json!({
+            "command": "opencode acp",
+            "env": {}
+        }),
+    )?;
     Ok(())
 }
 
@@ -7511,6 +7519,16 @@ fn session_for(state: &DesktopState, session_id: &str) -> Result<SessionRecord, 
         .load_session(session_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "session not found".to_owned())
+}
+
+fn reject_removed_opencode_session(session: &SessionRecord) -> Result<(), String> {
+    if session.harness == "opencode" {
+        return Err(
+            "This OpenCode session is read-only because the bespoke harness was removed; create an ACP session using the `opencode acp` launch recipe."
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 async fn project_host(
@@ -9586,62 +9604,6 @@ fn record_skill_usage(
     Ok(())
 }
 
-async fn opencode_for(
-    state: &DesktopState,
-    session_id: &str,
-) -> Result<Arc<OpenCodeHarness<SqliteStore>>, String> {
-    {
-        let engines = state.opencode_engines.lock().await;
-        if let Some(engine) = engines.get(session_id) {
-            return Ok(Arc::clone(engine));
-        }
-    }
-    let session = session_for(state, session_id)?;
-    if session.harness != "opencode" {
-        return Err("session is not configured for the OpenCode harness".into());
-    }
-    let workspace = if !session.workspace.is_empty() {
-        session.workspace.clone()
-    } else if session.host_id == "local" {
-        default_local_workspace(state, session_id)?
-    } else {
-        client_for(state, &session.host_id)?
-            .health()
-            .await
-            .map_err(|error| format!("remote host unavailable: {error}"))?
-            .workspace
-            .ok_or_else(|| "remote host did not provide a workspace".to_owned())?
-    };
-    let host: Arc<dyn Host> = if session.host_id == "local" {
-        Arc::new(LocalHost::new(&workspace).map_err(|error| error.to_string())?)
-    } else {
-        let client = client_for(state, &session.host_id)?.with_workspace(workspace.clone());
-        Arc::new(RvmHost::new(
-            session.host_id.clone(),
-            workspace.clone(),
-            client,
-        ))
-    };
-    let harness = OpenCodeHarness::start(
-        host,
-        Arc::new(SessionRecorder::new(Arc::clone(&state.store), session_id)),
-        session_id,
-        OpenCodeHarnessConfig {
-            workspace,
-            model: session.model,
-            password: None,
-        },
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    state
-        .opencode_engines
-        .lock()
-        .await
-        .insert(session_id.into(), Arc::clone(&harness));
-    Ok(harness)
-}
-
 fn select_acp_agent_content<I>(rows: I) -> Option<String>
 where
     I: IntoIterator<Item = (String, String)>,
@@ -9900,7 +9862,7 @@ async fn engine_for_with_context(
     }
     let session = session_for(state, session_id)?;
     if session.harness != "builtin" {
-        return Err("this session uses the OpenCode harness; use its session route".into());
+        return Err("this session uses an unavailable harness and cannot start a new turn".into());
     }
     let host_id = session.host_id;
     let model = session.model;
@@ -11708,7 +11670,7 @@ fn create_session(
     let mode = mode.unwrap_or_else(|| "Auto".into());
     let mode = permission_mode_name(parse_permission_mode(&mode)?).to_owned();
     let harness = harness.unwrap_or_else(|| "builtin".into());
-    if !matches!(harness.as_str(), "builtin" | "opencode" | "acp") {
+    if !matches!(harness.as_str(), "builtin" | "acp") {
         return Err(format!("unsupported harness: {harness}"));
     }
     if project_id.is_some() != agent_id.is_some() {
@@ -11942,7 +11904,7 @@ async fn change_harness(
     session_id: String,
     harness: String,
 ) -> Result<(), String> {
-    if !matches!(harness.as_str(), "builtin" | "opencode" | "acp") {
+    if !matches!(harness.as_str(), "builtin" | "acp") {
         return Err(format!("unsupported harness: {harness}"));
     }
     let session = session_for(&state, &session_id)?;
@@ -11968,7 +11930,7 @@ async fn change_harness(
                 .into(),
         );
     }
-    if matches!(harness.as_str(), "opencode" | "acp") {
+    if harness == "acp" {
         let options = harness_options(
             state.clone(),
             session.host_id.clone(),
@@ -12021,13 +11983,13 @@ async fn harness_options(
     let host: Arc<dyn Host> = if host_id == "local" {
         let workspace = workspace
             .filter(|path| !path.is_empty())
-            .ok_or_else(|| "cannot probe OpenCode: explicit workspace is required".to_owned())?;
+            .ok_or_else(|| "cannot probe ACP: explicit workspace is required".to_owned())?;
         Arc::new(LocalHost::new(&workspace).map_err(|e| e.to_string())?)
     } else {
         let client = client_for(&state, &host_id)?;
         let workspace = workspace
             .filter(|path| !path.is_empty())
-            .ok_or_else(|| "cannot probe OpenCode: explicit workspace is required".to_owned())?;
+            .ok_or_else(|| "cannot probe ACP: explicit workspace is required".to_owned())?;
         Arc::new(RvmHost::new(
             host_id.clone(),
             workspace.clone(),
@@ -12076,45 +12038,6 @@ async fn harness_options(
         }
     };
     options.push(acp_option);
-    let Some(process_stream) = capabilities
-        .items
-        .iter()
-        .find(|item| item.name == "process_stream")
-    else {
-        options.push(HarnessAvailability {
-            id: "opencode".into(),
-            label: "OpenCode".into(),
-            available: false,
-            reason: Some("Host does not provide process_stream".into()),
-        });
-        return Ok(options);
-    };
-    if !process_stream.available {
-        options.push(HarnessAvailability {
-            id: "opencode".into(),
-            label: "OpenCode".into(),
-            available: false,
-            reason: process_stream.reason.clone(),
-        });
-        return Ok(options);
-    }
-    let probe = host
-        .exec(ExecRequest {
-            command: "command -v opencode".into(),
-            cwd: None,
-            timeout_seconds: 10,
-            session: None,
-            env: None,
-        })
-        .await
-        .map_err(|e| format!("cannot probe OpenCode on host: {e}"))?;
-    options.push(HarnessAvailability {
-        id: "opencode".into(),
-        label: "OpenCode".into(),
-        available: probe.result.exit_code == 0,
-        reason: (probe.result.exit_code != 0)
-            .then(|| "opencode is not installed on this host".into()),
-    });
     Ok(options)
 }
 
@@ -12941,6 +12864,7 @@ pub(crate) async fn submit_turn_inner_with_context(
     repair_loop: Option<RepairLoopContext>,
 ) -> Result<(), String> {
     let session = session_for(state, &request.session_id)?;
+    reject_removed_opencode_session(&session)?;
     if execute_control_slash_command(&app, state, &session, &request.text).await? {
         emit(
             &app,
@@ -12967,9 +12891,6 @@ pub(crate) async fn submit_turn_inner_with_context(
             &request.text,
         )?
     };
-    if session.harness == "opencode" {
-        return submit_opencode_turn_inner(app, state, request).await;
-    }
     if session.harness == "acp" {
         return submit_acp_turn_inner(app, state, request).await;
     }
@@ -13205,189 +13126,6 @@ pub(crate) async fn submit_turn_inner_with_context(
     }
 }
 
-async fn submit_opencode_turn_inner(
-    app: tauri::AppHandle,
-    state: &DesktopState,
-    request: SubmitRequest,
-) -> Result<(), String> {
-    let harness = opencode_for(state, &request.session_id).await?;
-    let mut start_events = false;
-    {
-        let mut sessions = state.opencode_event_sessions.lock().await;
-        if sessions.insert(request.session_id.clone()) {
-            start_events = true;
-        }
-    }
-    if start_events {
-        let mut events = harness.events().map_err(|error| error.to_string())?;
-        let event_app = app.clone();
-        let event_session = request.session_id.clone();
-        let event_store = Arc::clone(&state.store);
-        tauri::async_runtime::spawn(async move {
-            while let Some(event) = events.recv().await {
-                match event {
-                    opcos_engine::HarnessEvent::AssistantTextDelta { text } => emit(
-                        &event_app,
-                        "message",
-                        Some(&event_session),
-                        json!({"role":"assistant","text":text}),
-                    ),
-                    opcos_engine::HarnessEvent::AssistantReasoningDelta { text } => emit(
-                        &event_app,
-                        "thinking",
-                        Some(&event_session),
-                        json!({"text":text}),
-                    ),
-                    opcos_engine::HarnessEvent::ToolCallDelta {
-                        call_id,
-                        tool,
-                        arguments_fragment,
-                    } => emit(
-                        &event_app,
-                        "stream",
-                        Some(&event_session),
-                        json!({"tool_call_delta":{"id":call_id,"name":tool,"arguments_fragment":arguments_fragment}}),
-                    ),
-                    opcos_engine::HarnessEvent::ToolResult {
-                        call_id,
-                        tool,
-                        arguments,
-                        result,
-                    } => emit(
-                        &event_app,
-                        "stream",
-                        Some(&event_session),
-                        json!({"tool_result":{"call_id":call_id,"tool":tool,"arguments":redact_approval_value(&arguments),"result":redact_approval_value(&result)}}),
-                    ),
-                    opcos_engine::HarnessEvent::ToolCallUpdate {
-                        call_id,
-                        tool,
-                        status,
-                        content,
-                        locations,
-                    } => emit(
-                        &event_app,
-                        "stream",
-                        Some(&event_session),
-                        json!({"tool_call_update":{"id":call_id,"name":tool,"status":status,"content":content.map(|value| redact_approval_value(&value)),"locations":locations}}),
-                    ),
-                    opcos_engine::HarnessEvent::PlanUpdate { entries } => emit(
-                        &event_app,
-                        "stream",
-                        Some(&event_session),
-                        json!({"plan_update":{"entries":entries}}),
-                    ),
-                    event @ opcos_engine::HarnessEvent::SessionModeUpdate { .. }
-                    | event @ opcos_engine::HarnessEvent::SessionConfigUpdate { .. }
-                    | event @ opcos_engine::HarnessEvent::AvailableCommandsUpdate { .. } => {
-                        emit_acp_session_update(&event_app, &event_session, event)
-                    }
-                    opcos_engine::HarnessEvent::ApprovalRequested(request) => {
-                        let unattended = event_store.is_unattended(&event_session).unwrap_or(false);
-                        if unattended {
-                            emit(
-                                &event_app,
-                                "notice",
-                                Some(&event_session),
-                                json!({"kind":"approval_pending","text":"Approval request sent to the Inbox"}),
-                            );
-                            emit(
-                                &event_app,
-                                "turn_done",
-                                Some(&event_session),
-                                session_status_payload_from_store(&event_store, &event_session),
-                            );
-                        } else {
-                            emit(
-                                &event_app,
-                                "approval",
-                                Some(&event_session),
-                                json!({"call_id":request.request_id,"tool":request.tool,"arguments":redact_approval_value(&request.arguments)}),
-                            );
-                        }
-                    }
-                    opcos_engine::HarnessEvent::QuestionRequested(request) => {
-                        let unattended = event_store.is_unattended(&event_session).unwrap_or(false);
-                        if unattended {
-                            emit(
-                                &event_app,
-                                "notice",
-                                Some(&event_session),
-                                json!({"kind":"question_pending","text":"Question sent to the Inbox"}),
-                            );
-                            emit(
-                                &event_app,
-                                "turn_done",
-                                Some(&event_session),
-                                session_status_payload_from_store(&event_store, &event_session),
-                            );
-                        } else {
-                            emit(
-                                &event_app,
-                                "question_requested",
-                                Some(&event_session),
-                                json!({"call_id":request.request_id,"tool":request.tool,"arguments":redact_approval_value(&request.arguments)}),
-                            );
-                        }
-                    }
-                    opcos_engine::HarnessEvent::ApprovalEnrichmentFailed {
-                        request_id,
-                        reason,
-                        ..
-                    } => emit(
-                        &event_app,
-                        "notice",
-                        Some(&event_session),
-                        json!({"kind":"error","text":reason,"request_id":request_id}),
-                    ),
-                    opcos_engine::HarnessEvent::Error { message } => {
-                        emit(
-                            &event_app,
-                            "notice",
-                            Some(&event_session),
-                            json!({"kind":"error","text":message}),
-                        );
-                        emit(
-                            &event_app,
-                            "turn_done",
-                            Some(&event_session),
-                            session_status_payload_from_store(&event_store, &event_session),
-                        );
-                    }
-                    opcos_engine::HarnessEvent::TurnFinished { turn } => {
-                        let mut payload =
-                            session_status_payload_from_store(&event_store, &event_session);
-                        if let Some(object) = payload.as_object_mut() {
-                            object.insert("turn".into(), json!(turn));
-                        }
-                        emit(&event_app, "turn_done", Some(&event_session), payload);
-                        if let Some(state) = event_app.try_state::<DesktopState>() {
-                            let _ =
-                                coordination_ingest_session_inner(&state, &event_session, false)
-                                    .await;
-                        }
-                    }
-                }
-            }
-        });
-    }
-    let handle = harness
-        .start_turn(opcos_engine::HarnessTurnInput {
-            text: request.text.clone(),
-            model: String::new(),
-            ..Default::default()
-        })
-        .await
-        .map_err(|error| error.to_string())?;
-    emit(
-        &app,
-        "message",
-        Some(&request.session_id),
-        json!({"role":"user","text":request.text,"turn_id":handle.id()}),
-    );
-    Ok(())
-}
-
 async fn submit_acp_turn_inner(
     app: tauri::AppHandle,
     state: &DesktopState,
@@ -13600,22 +13338,9 @@ async fn interrupt(
     state: State<'_, DesktopState>,
     session_id: String,
 ) -> Result<(), String> {
-    if session_for(&state, &session_id)?.harness == "opencode" {
-        let harness = opencode_for(&state, &session_id).await?;
-        harness.interrupt();
-        state
-            .store
-            .update_session_status(&session_id, "interrupted", "interrupted_by_user")
-            .map_err(|error| error.to_string())?;
-        emit(
-            &app,
-            "turn_done",
-            Some(&session_id),
-            session_status_payload(&state, &session_id),
-        );
-        return Ok(());
-    }
-    if session_for(&state, &session_id)?.harness == "acp" {
+    let session = session_for(&state, &session_id)?;
+    reject_removed_opencode_session(&session)?;
+    if session.harness == "acp" {
         let harness = acp_for(&state, &session_id).await?;
         harness.interrupt();
         state
@@ -13664,6 +13389,7 @@ async fn steering(
     session_id: String,
     text: String,
 ) -> Result<(), String> {
+    reject_removed_opencode_session(&session_for(&state, &session_id)?)?;
     let engine = engine_for(&app, &state, &session_id, ToolOrigin::User).await?;
     if !engine.has_active_turn() {
         let handle = app.clone();
@@ -13730,36 +13456,9 @@ async fn resolve_approval(
     approve: bool,
     option_id: Option<String>,
 ) -> Result<(), String> {
-    if session_for(&state, &session_id)?.harness == "opencode" {
-        let harness = opencode_for(&state, &session_id).await?;
-        harness
-            .reply_approval(
-                &call_id,
-                if approve {
-                    opcos_engine::ApprovalOutcome::Approve
-                } else {
-                    opcos_engine::ApprovalOutcome::Deny
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        state
-            .store
-            .resolve_inbox(
-                &session_id,
-                &call_id,
-                if approve { "allow" } else { "deny" },
-            )
-            .map_err(|error| error.to_string())?;
-        emit(
-            &app,
-            "approval_resolved",
-            Some(&session_id),
-            json!({"call_id":call_id,"approve":approve}),
-        );
-        return Ok(());
-    }
-    if session_for(&state, &session_id)?.harness == "acp" {
+    let session = session_for(&state, &session_id)?;
+    reject_removed_opencode_session(&session)?;
+    if session.harness == "acp" {
         let harness = acp_for(&state, &session_id).await?;
         harness
             .reply_approval_with_option(
@@ -13984,6 +13683,7 @@ async fn resolve_inbox(
     call_id: String,
     resolution: String,
 ) -> Result<(), String> {
+    reject_removed_opencode_session(&session_for(&state, &session_id)?)?;
     let item = state
         .store
         .get_inbox(&session_id, &call_id)
@@ -20904,7 +20604,7 @@ async fn execute_coordination_tool(
         }
         if !worker.harness.eq_ignore_ascii_case("builtin") {
             return Err(
-                "coordination dispatch unavailable: only builtin TurnEngine Worker sessions are supported; ACP/OpenCode sessions are not bridged"
+                "coordination dispatch unavailable: only builtin TurnEngine Worker sessions are supported; ACP sessions are not bridged"
                     .to_owned(),
             );
         }
@@ -24428,8 +24128,6 @@ fn main() {
                 secret_values,
                 store,
                 engines: Arc::clone(&engines),
-                opencode_engines: AsyncMutex::new(HashMap::new()),
-                opencode_event_sessions: AsyncMutex::new(HashSet::new()),
                 acp_engines: AsyncMutex::new(HashMap::new()),
                 acp_event_sessions: AsyncMutex::new(HashSet::new()),
                 trigger_runs: AsyncMutex::new(HashSet::new()),
@@ -24788,6 +24486,53 @@ fn main() {
 #[cfg(test)]
 mod m7_tests {
     use super::*;
+
+    #[test]
+    fn removed_opencode_sessions_are_explicitly_read_only() {
+        let session = SessionRecord {
+            session_id: "legacy-opencode".into(),
+            workspace: String::new(),
+            model: "auto".into(),
+            mode: "Auto".into(),
+            harness: "opencode".into(),
+            title: "Legacy OpenCode".into(),
+            extra_roots: vec![],
+            grants: json!({}),
+            pinned: false,
+            archived: false,
+            origin: None,
+            origin_label: None,
+            compaction: json!({}),
+            host_id: "local".into(),
+            provider: None,
+            external_session_id: None,
+            run_state: "idle".into(),
+            stop_reason: "none".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            project_id: None,
+            agent_id: None,
+        };
+        let error = reject_removed_opencode_session(&session).unwrap_err();
+        assert!(error.contains("read-only"));
+        assert!(error.contains("opencode acp"));
+    }
+
+    #[test]
+    fn builtin_and_acp_harness_kinds_remain_distinct() {
+        assert_ne!(
+            opcos_engine::HarnessKind::Builtin,
+            opcos_engine::HarnessKind::Acp
+        );
+        assert_eq!(
+            opcos_engine::HarnessKind::Builtin,
+            opcos_engine::HarnessKind::Builtin
+        );
+        assert_eq!(
+            opcos_engine::HarnessKind::Acp,
+            opcos_engine::HarnessKind::Acp
+        );
+    }
 
     #[test]
     fn routed_shell_audit_flags_writes_and_redacts_credentials() {
@@ -25816,8 +25561,8 @@ mod m7_tests {
                 |row| row.get(0),
             )
             .unwrap();
-        // 156 = 33 baseline assets plus 123 verified, disabled MCP catalog entries.
-        assert_eq!(builtin_count, 156);
+        // 157 = 34 baseline assets plus 123 verified, disabled MCP catalog entries.
+        assert_eq!(builtin_count, 157);
         for id in [
             "template-runbook-playbook-template",
             "template-runbook-pr-review",

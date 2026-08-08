@@ -32,12 +32,10 @@ pub mod event_bus;
 pub mod git;
 pub mod github;
 pub mod login_state;
-mod opencode;
 pub mod orchestration;
 pub mod planner;
 
 pub use acp::{AcpHarness, AcpHarnessConfig};
-pub use opencode::{OpenCodeHarness, OpenCodeHarnessConfig};
 
 const ASSUMED_CONTEXT_WINDOW: u64 = 128_000;
 const ASSUMED_OUTPUT_TOKENS: u64 = 4096;
@@ -210,7 +208,6 @@ pub trait AgentEngine: Send + Sync {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HarnessKind {
     Builtin,
-    OpenCode,
     Acp,
 }
 
