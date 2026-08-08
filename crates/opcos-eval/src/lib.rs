@@ -1001,14 +1001,40 @@ fn verifier_task(
     expected_artifacts: Vec<(&str, &str)>,
     verifier: &str,
 ) -> VerifierTask {
+    verifier_task_owned(
+        name,
+        description,
+        split,
+        initial_workspace
+            .into_iter()
+            .map(|(path, content)| (path.into(), content.into()))
+            .collect(),
+        prompt,
+        turns,
+        expected_artifacts
+            .into_iter()
+            .map(|(path, content)| (path.into(), content.into()))
+            .collect(),
+        verifier,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verifier_task_owned(
+    name: &str,
+    description: &str,
+    split: TaskSplit,
+    initial_workspace: Vec<(String, String)>,
+    prompt: &str,
+    turns: Vec<Vec<ToolCall>>,
+    expected_artifacts: Vec<(String, String)>,
+    verifier: &str,
+) -> VerifierTask {
     VerifierTask {
         name: name.into(),
         description: description.into(),
         split,
-        initial_workspace: initial_workspace
-            .into_iter()
-            .map(|(path, content)| (path.into(), content.into()))
-            .collect(),
+        initial_workspace,
         prompt: prompt.into(),
         provider: ProviderSourceSpec::Scripted(
             turns
@@ -1020,10 +1046,7 @@ fn verifier_task(
         ),
         expected_artifacts: expected_artifacts
             .into_iter()
-            .map(|(path, content)| ExpectedArtifact {
-                path: path.into(),
-                content: content.into(),
-            })
+            .map(|(path, content)| ExpectedArtifact { path, content })
             .collect(),
         verifier: VerificationScript {
             filename: "verify.sh".into(),
@@ -1032,7 +1055,7 @@ fn verifier_task(
     }
 }
 
-pub fn internal_taskset() -> Vec<VerifierTask> {
+pub fn baseline_internal_taskset() -> Vec<VerifierTask> {
     use TaskSplit::{HeldIn, HeldOut};
     vec![
         verifier_task(
@@ -1444,6 +1467,380 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             "test -s summary.txt && test -s checksum.txt",
         ),
     ]
+}
+
+pub fn hard_internal_taskset() -> Vec<VerifierTask> {
+    use TaskSplit::{HeldIn, HeldOut};
+    vec![
+        verifier_task_owned(
+            "hard_large_targeted_edit",
+            "Edit one exact line in a large file while preserving all unrelated lines.",
+            HeldIn,
+            vec![(
+                "large.txt".into(),
+                (1..=80)
+                    .map(|index| format!("line-{index:02}=value-{index:02}\n"))
+                    .collect::<String>(),
+            )],
+            "Read large.txt first. An attempted edit using the nonexistent line-99=value-99 must fail; recover by replacing only the exact line line-47=value-47 with line-47=value-47-updated. Preserve every other line and the final newline.",
+            vec![
+                vec![call("hard-25a", "read_file", json!({"path":"large.txt"}))],
+                vec![call(
+                    "hard-25b",
+                    "edit_file",
+                    json!({"path":"large.txt","edits":[{"old_string":"line-99=value-99","new_string":"bad"}]}),
+                )],
+                vec![call(
+                    "hard-25c",
+                    "edit_file",
+                    json!({"path":"large.txt","edits":[{"old_string":"line-47=value-47","new_string":"line-47=value-47-updated"}]}),
+                )],
+            ],
+            vec![(
+                "large.txt".into(),
+                (1..=80)
+                    .map(|index| {
+                        if index == 47 {
+                            "line-47=value-47-updated\n".to_owned()
+                        } else {
+                            format!("line-{index:02}=value-{index:02}\n")
+                        }
+                    })
+                    .collect::<String>(),
+            )],
+            "test \"$(grep -c '^line-' large.txt)\" -eq 80 && grep -Fx 'line-47=value-47-updated' large.txt && test \"$(tail -n 1 large.txt)\" = 'line-80=value-80'",
+        ),
+        verifier_task(
+            "hard_ambiguous_anchor_recovery",
+            "Recover from a non-unique edit anchor by using a more specific anchor.",
+            HeldIn,
+            vec![("records.txt", "id=1\nstatus=todo\nid=2\nstatus=todo\n")],
+            "Change only record id=2 from status=todo to status=done. First inspect records.txt. A generic status=todo anchor is ambiguous; recover by using the unique adjacent id=2 and status=todo text. The final file must be exactly id=1\\nstatus=todo\\nid=2\\nstatus=done\\n.",
+            vec![
+                vec![call(
+                    "hard-26a",
+                    "edit_file",
+                    json!({"path":"records.txt","edits":[{"old_string":"status=todo","new_string":"status=done"}]}),
+                )],
+                vec![call(
+                    "hard-26b",
+                    "edit_file",
+                    json!({"path":"records.txt","edits":[{"old_string":"id=2\nstatus=todo","new_string":"id=2\nstatus=done"}]}),
+                )],
+            ],
+            vec![("records.txt", "id=1\nstatus=todo\nid=2\nstatus=done\n")],
+            "grep -Fx 'status=todo' records.txt && grep -Fx 'status=done' records.txt && test \"$(grep -c '^id=' records.txt)\" -eq 2",
+        ),
+        verifier_task(
+            "hard_probe_then_branch",
+            "Inspect workspace state before choosing a dependent output.",
+            HeldIn,
+            vec![("mode.txt", "beta")],
+            "Probe missing.txt first; that read will fail and must not stop the task. Then read mode.txt before acting. Because its exact value is beta, write branch.txt with exactly beta-path and no trailing newline. Do not overwrite mode.txt.",
+            vec![
+                vec![call("hard-27a", "read_file", json!({"path":"missing.txt"}))],
+                vec![call("hard-27b", "read_file", json!({"path":"mode.txt"}))],
+                vec![call(
+                    "hard-27c",
+                    "write_file",
+                    json!({"path":"branch.txt","content":"beta-path"}),
+                )],
+            ],
+            vec![("branch.txt", "beta-path"), ("mode.txt", "beta")],
+            "test \"$(cat branch.txt)\" = beta-path && test \"$(cat mode.txt)\" = beta",
+        ),
+        verifier_task(
+            "hard_failure_then_dependency",
+            "Recover from an intermediate tool failure before producing dependent artifacts.",
+            HeldIn,
+            vec![],
+            "A first attempt to read missing.txt will fail, and a first write to ../outside.txt will be rejected. Recover from both errors, then create intermediate.txt with exactly ready and dependent.txt with exactly ready-dependent.",
+            vec![
+                vec![call("hard-28a", "read_file", json!({"path":"missing.txt"}))],
+                vec![call(
+                    "hard-28b",
+                    "write_file",
+                    json!({"path":"../outside.txt","content":"bad"}),
+                )],
+                vec![call(
+                    "hard-28c",
+                    "write_file",
+                    json!({"path":"intermediate.txt","content":"ready"}),
+                )],
+                vec![call(
+                    "hard-28d",
+                    "read_file",
+                    json!({"path":"intermediate.txt"}),
+                )],
+                vec![call(
+                    "hard-28e",
+                    "write_file",
+                    json!({"path":"dependent.txt","content":"ready-dependent"}),
+                )],
+            ],
+            vec![
+                ("intermediate.txt", "ready"),
+                ("dependent.txt", "ready-dependent"),
+            ],
+            "test \"$(cat intermediate.txt)\" = ready && test \"$(cat dependent.txt)\" = ready-dependent",
+        ),
+        verifier_task(
+            "hard_consistent_index",
+            "Create artifacts and an index whose entries match the actual generated files.",
+            HeldIn,
+            vec![],
+            "A first write to ../outside.txt will be rejected. Recover, then create exactly these files with no trailing newlines: docs/a.txt containing alpha, docs/b.txt containing beta, and docs/index.txt containing exactly `a.txt\\nb.txt\\n`. The index must list the two generated data files in alphabetical order and must not list itself.",
+            vec![
+                vec![call(
+                    "hard-29a",
+                    "write_file",
+                    json!({"path":"../outside.txt","content":"bad"}),
+                )],
+                vec![call(
+                    "hard-29b",
+                    "write_file",
+                    json!({"path":"docs/a.txt","content":"alpha"}),
+                )],
+                vec![call(
+                    "hard-29c",
+                    "write_file",
+                    json!({"path":"docs/b.txt","content":"beta"}),
+                )],
+                vec![call(
+                    "hard-29d",
+                    "write_file",
+                    json!({"path":"docs/index.txt","content":"a.txt\nb.txt\n"}),
+                )],
+            ],
+            vec![
+                ("docs/a.txt", "alpha"),
+                ("docs/b.txt", "beta"),
+                ("docs/index.txt", "a.txt\nb.txt\n"),
+            ],
+            "grep -Fx 'a.txt' docs/index.txt && grep -Fx 'b.txt' docs/index.txt && test \"$(wc -l < docs/index.txt)\" -eq 2 && test \"$(find docs -maxdepth 1 -type f | wc -l)\" -eq 3",
+        ),
+        verifier_task_owned(
+            "hard_large_multiline_edit",
+            "Apply a precise multiline replacement in a large document while preserving unrelated sections.",
+            HeldIn,
+            vec![(
+                "document.txt".into(),
+                (0..30)
+                    .map(|index| format!("section-{index}\nkeep-{index}\n"))
+                    .collect::<String>(),
+            )],
+            "Read document.txt first. An attempted replacement of the nonexistent block `section-99\\nkeep-99\\n` must fail; recover by replacing exactly the two-line block `section-17\\nkeep-17\\n` with `section-17\\nupdated-17\\n`. Preserve all other 29 sections and the final newline.",
+            vec![
+                vec![call(
+                    "hard-30a",
+                    "read_file",
+                    json!({"path":"document.txt"}),
+                )],
+                vec![call(
+                    "hard-30b",
+                    "edit_file",
+                    json!({"path":"document.txt","edits":[{"old_string":"section-99\nkeep-99\n","new_string":"bad"}]}),
+                )],
+                vec![call(
+                    "hard-30c",
+                    "edit_file",
+                    json!({"path":"document.txt","edits":[{"old_string":"section-17\nkeep-17\n","new_string":"section-17\nupdated-17\n"}]}),
+                )],
+            ],
+            vec![(
+                "document.txt".into(),
+                (0..30)
+                    .map(|index| {
+                        if index == 17 {
+                            "section-17\nupdated-17\n".to_owned()
+                        } else {
+                            format!("section-{index}\nkeep-{index}\n")
+                        }
+                    })
+                    .collect::<String>(),
+            )],
+            "grep -Fx 'updated-17' document.txt && test \"$(grep -c '^section-' document.txt)\" -eq 30",
+        ),
+        verifier_task(
+            "hard_stale_anchor_recovery",
+            "Recover after a stale edit anchor by inspecting the current file.",
+            HeldOut,
+            vec![("version.txt", "version=2\n")],
+            "Read version.txt first. An attempt using the stale anchor version=1 will fail; recover by replacing the actual line version=2 with version=3. The final file must be exactly version=3 followed by one newline.",
+            vec![
+                vec![call(
+                    "hard-31a",
+                    "edit_file",
+                    json!({"path":"version.txt","edits":[{"old_string":"version=1","new_string":"version=3"}]}),
+                )],
+                vec![call("hard-31b", "read_file", json!({"path":"version.txt"}))],
+                vec![call(
+                    "hard-31c",
+                    "edit_file",
+                    json!({"path":"version.txt","edits":[{"old_string":"version=2","new_string":"version=3"}]}),
+                )],
+            ],
+            vec![("version.txt", "version=3\n")],
+            "grep -Fx 'version=3' version.txt && test \"$(wc -l < version.txt)\" -eq 1",
+        ),
+        verifier_task(
+            "hard_probe_existing_outputs",
+            "Inspect existing outputs and reconcile a manifest without stale entries.",
+            HeldOut,
+            vec![("a.txt", "a"), ("b.txt", "b")],
+            "Probe missing.txt first; that read will fail. Then inspect the workspace. The only existing data files are a.txt and b.txt. Write manifest.txt with exactly `a.txt\\nb.txt\\n`, in alphabetical order, and do not modify a.txt or b.txt.",
+            vec![
+                vec![call("hard-32a", "read_file", json!({"path":"missing.txt"}))],
+                vec![call(
+                    "hard-32b",
+                    "run_shell",
+                    json!({"command":"find . -maxdepth 1 -type f -printf '%f\\n' | sort"}),
+                )],
+                vec![call(
+                    "hard-32c",
+                    "write_file",
+                    json!({"path":"manifest.txt","content":"a.txt\nb.txt\n"}),
+                )],
+            ],
+            vec![
+                ("manifest.txt", "a.txt\nb.txt\n"),
+                ("a.txt", "a"),
+                ("b.txt", "b"),
+            ],
+            "grep -Fx 'a.txt' manifest.txt && grep -Fx 'b.txt' manifest.txt && test \"$(grep -c '^' manifest.txt)\" -eq 2",
+        ),
+        verifier_task(
+            "hard_boundary_then_nested_dependency",
+            "Recover from a rejected path before completing a nested dependent output.",
+            HeldOut,
+            vec![],
+            "First avoid writing outside the workspace after the rejected path error. Then create reports/raw.txt with exactly raw and reports/index.txt with exactly `raw.txt\\n`, both without extra content.",
+            vec![
+                vec![call(
+                    "hard-33a",
+                    "write_file",
+                    json!({"path":"../outside.txt","content":"bad"}),
+                )],
+                vec![call(
+                    "hard-33b",
+                    "write_file",
+                    json!({"path":"reports/raw.txt","content":"raw"}),
+                )],
+                vec![call(
+                    "hard-33c",
+                    "write_file",
+                    json!({"path":"reports/index.txt","content":"raw.txt\n"}),
+                )],
+            ],
+            vec![
+                ("reports/raw.txt", "raw"),
+                ("reports/index.txt", "raw.txt\n"),
+            ],
+            "test \"$(cat reports/raw.txt)\" = raw && test \"$(cat reports/index.txt)\" = raw.txt && { test ! -e ../outside.txt || test \"$(cat ../outside.txt)\" != bad; }",
+        ),
+        verifier_task(
+            "hard_data_checksum_consistency",
+            "Create data and a checksum that are mutually consistent.",
+            HeldOut,
+            vec![],
+            "A first checksum attempt for missing.txt will fail. Recover by writing data.txt with exactly checksum-input and no trailing newline. Then create checksum.txt containing the lowercase SHA-256 hexadecimal digest of data.txt, followed by one newline. The digest must be computed from the actual data.txt bytes.",
+            vec![
+                vec![call(
+                    "hard-34a",
+                    "run_shell",
+                    json!({"command":"sha256sum missing.txt | cut -d' ' -f1 > checksum.txt"}),
+                )],
+                vec![call(
+                    "hard-34b",
+                    "write_file",
+                    json!({"path":"data.txt","content":"checksum-input"}),
+                )],
+                vec![call(
+                    "hard-34c",
+                    "run_shell",
+                    json!({"command":"sha256sum data.txt | cut -d' ' -f1 > checksum.txt"}),
+                )],
+            ],
+            vec![("data.txt", "checksum-input")],
+            "test \"$(sha256sum data.txt | cut -d' ' -f1)\" = \"$(cat checksum.txt)\"",
+        ),
+        verifier_task_owned(
+            "hard_large_two_point_edit",
+            "Edit two exact points in a large file while preserving all other lines.",
+            HeldOut,
+            vec![(
+                "settings.txt".into(),
+                (1..=60)
+                    .map(|index| format!("setting-{index:02}=old\n"))
+                    .collect::<String>(),
+            )],
+            "Read settings.txt first. An attempted edit containing the nonexistent setting-99=old anchor must fail without changing the file. Recover by changing only setting-12=old to setting-12=new and setting-48=old to setting-48=new. Preserve all other 58 settings and the final newline.",
+            vec![
+                vec![call(
+                    "hard-35a",
+                    "read_file",
+                    json!({"path":"settings.txt"}),
+                )],
+                vec![call(
+                    "hard-35b",
+                    "edit_file",
+                    json!({"path":"settings.txt","edits":[{"old_string":"setting-12=old","new_string":"setting-12=new"},{"old_string":"setting-99=old","new_string":"bad"}]}),
+                )],
+                vec![call(
+                    "hard-35c",
+                    "edit_file",
+                    json!({"path":"settings.txt","edits":[{"old_string":"setting-12=old","new_string":"setting-12=new"},{"old_string":"setting-48=old","new_string":"setting-48=new"}]}),
+                )],
+            ],
+            vec![(
+                "settings.txt".into(),
+                (1..=60)
+                    .map(|index| {
+                        if index == 12 || index == 48 {
+                            format!("setting-{index:02}=new\n")
+                        } else {
+                            format!("setting-{index:02}=old\n")
+                        }
+                    })
+                    .collect::<String>(),
+            )],
+            "grep -Fx 'setting-12=new' settings.txt && grep -Fx 'setting-48=new' settings.txt && test \"$(grep -c '^setting-' settings.txt)\" -eq 60",
+        ),
+        verifier_task(
+            "hard_index_no_stale_entries",
+            "Probe a workspace and produce an index that exactly matches its data files.",
+            HeldOut,
+            vec![
+                ("input/a.txt", "a"),
+                ("input/b.txt", "b"),
+                ("input/c.txt", "c"),
+            ],
+            "A first write to ../outside.txt will be rejected. Then inspect input/. Write input/index.txt containing exactly `a.txt\\nb.txt\\nc.txt\\n`. It must list all three existing data files alphabetically, contain no stale entry, and leave their contents unchanged.",
+            vec![
+                vec![call(
+                    "hard-36a",
+                    "write_file",
+                    json!({"path":"../outside.txt","content":"bad"}),
+                )],
+                vec![call("hard-36b", "read_file", json!({"path":"input/a.txt"}))],
+                vec![call("hard-36c", "read_file", json!({"path":"input/b.txt"}))],
+                vec![call("hard-36d", "read_file", json!({"path":"input/c.txt"}))],
+                vec![call(
+                    "hard-36e",
+                    "write_file",
+                    json!({"path":"input/index.txt","content":"a.txt\nb.txt\nc.txt\n"}),
+                )],
+            ],
+            vec![("input/index.txt", "a.txt\nb.txt\nc.txt\n")],
+            "grep -Fx 'a.txt' input/index.txt && grep -Fx 'b.txt' input/index.txt && grep -Fx 'c.txt' input/index.txt && test \"$(wc -l < input/index.txt)\" -eq 3 && test \"$(find input -maxdepth 1 -type f | wc -l)\" -eq 4",
+        ),
+    ]
+}
+
+pub fn internal_taskset() -> Vec<VerifierTask> {
+    let mut tasks = baseline_internal_taskset();
+    tasks.extend(hard_internal_taskset());
+    tasks
 }
 
 fn shell_quote(value: &str) -> String {
@@ -1925,21 +2322,37 @@ mod tests {
 
     #[test]
     fn internal_taskset_has_stable_nonrandom_splits() {
-        let tasks = internal_taskset();
-        assert_eq!(tasks.len(), 24);
+        let baseline = baseline_internal_taskset();
+        assert_eq!(baseline.len(), 24);
         assert_eq!(
-            tasks
+            baseline
                 .iter()
                 .filter(|task| task.split == TaskSplit::HeldIn)
                 .count(),
             12
         );
         assert_eq!(
-            tasks
+            baseline
                 .iter()
                 .filter(|task| task.split == TaskSplit::HeldOut)
                 .count(),
             12
+        );
+        let tasks = internal_taskset();
+        assert_eq!(tasks.len(), 36);
+        assert_eq!(
+            tasks
+                .iter()
+                .filter(|task| task.split == TaskSplit::HeldIn)
+                .count(),
+            18
+        );
+        assert_eq!(
+            tasks
+                .iter()
+                .filter(|task| task.split == TaskSplit::HeldOut)
+                .count(),
+            18
         );
         let names = tasks
             .iter()
@@ -1983,7 +2396,7 @@ mod tests {
     #[tokio::test]
     async fn every_internal_task_passes_its_offline_verifier() {
         let run = run_internal_taskset().await.unwrap();
-        assert_eq!(run.reports.len(), 24);
+        assert_eq!(run.reports.len(), 36);
         for report in &run.reports {
             assert!(
                 report.passed,
@@ -2020,8 +2433,8 @@ mod tests {
         assert_eq!(
             aggregate.held_in,
             SplitPassCount {
-                total: 24,
-                passed: 23,
+                total: 36,
+                passed: 35,
             }
         );
         assert_eq!(
