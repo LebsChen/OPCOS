@@ -400,6 +400,22 @@ fn tool_result_failed(result: &Value) -> bool {
         || result.get("error").is_some_and(|error| error.is_string())
 }
 
+fn canonical_json(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            Value::Object(
+                keys.into_iter()
+                    .map(|key| (key.clone(), canonical_json(&object[key])))
+                    .collect(),
+            )
+        }
+        Value::Array(array) => Value::Array(array.iter().map(canonical_json).collect()),
+        value => value.clone(),
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ExternalContextAttachment {
     pub source: String,
@@ -1268,7 +1284,7 @@ where
         format!(
             "{}\u{0}{}",
             call.name,
-            serde_json::to_string(&call.arguments).unwrap_or_default()
+            serde_json::to_string(&canonical_json(&call.arguments)).unwrap_or_default()
         )
     }
 
