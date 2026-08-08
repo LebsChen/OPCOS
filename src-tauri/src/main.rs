@@ -13992,6 +13992,101 @@ fn mcp_session_view(view: SessionView) -> Value {
     value
 }
 
+fn safe_project_repo_url(value: &str) -> Option<String> {
+    let mut parsed = url::Url::parse(value).ok()?;
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    Some(parsed.to_string())
+}
+
+fn mcp_project_summary(project: &ProjectRecord) -> Value {
+    json!({
+        "project_id": project.id,
+        "name": project.name,
+        "host_id": project.host_id,
+        "repo_url": safe_project_repo_url(&project.repo_url),
+        "repo_root": project.repo_root,
+        "default_branch": project.default_branch,
+        "board_id": project.board_id,
+        "archived": project.archived,
+        "updated_at": project.updated_at.to_rfc3339(),
+    })
+}
+
+fn mcp_project_agent_summary(agent: &ProjectAgentRecord) -> Value {
+    json!({
+        "agent_id": agent.id,
+        "project_id": agent.project_id,
+        "sort_order": agent.sort_order,
+        "name": agent.name,
+        "role": agent.role,
+        "session_id": agent.session_id,
+        "model": agent.model,
+        "harness": agent.harness,
+        "mode": agent.mode,
+        "worktree_path": agent.worktree_path,
+        "branch": agent.branch,
+        "state": agent.state,
+    })
+}
+
+fn mcp_coordination_snapshot(state: &DesktopState, project_id: &str) -> Result<Value, String> {
+    let project = state
+        .store
+        .load_project(project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_owned())?;
+    let workflow = parse_workflow(&project.workflow_json)?;
+    let agents = state
+        .store
+        .load_project_agents(project_id)
+        .map_err(|error| error.to_string())?
+        .iter()
+        .map(mcp_project_agent_summary)
+        .collect::<Vec<_>>();
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let (stage_index, status): (i64, String) = connection
+        .query_row(
+            "SELECT stage_index,status FROM project_workflow_state WHERE project_id=?1",
+            [project_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .unwrap_or((0, "open".to_owned()));
+    let snapshot = json!({
+        "source": "sqlite",
+        "project": mcp_project_summary(&project),
+        "agents": agents,
+        "workflow": workflow,
+        "stage_index": stage_index,
+        "status": status,
+        "tasks": load_project_tasks(&connection, project_id)?,
+        "messages": load_project_messages(&connection, project_id)?,
+        "runtime": {
+            "available": false,
+            "note": "live in-memory coordination counters are not part of the SQLite snapshot"
+        }
+    });
+    Ok(redact_approval_value(&snapshot))
+}
+
+fn ensure_mcp_coordination_project_access(
+    caller_project_id: &str,
+    requested_project_id: &str,
+) -> Result<(), String> {
+    if caller_project_id == requested_project_id {
+        Ok(())
+    } else {
+        Err("coordination project is outside the caller project".to_owned())
+    }
+}
+
 impl DesktopControlPlane {
     fn state(&self) -> tauri::State<'_, DesktopState> {
         self.app.state::<DesktopState>()
@@ -14701,6 +14796,35 @@ impl opcos_mcp_server::OpcosControlPlane for DesktopControlPlane {
         Ok(json!({
             "repositories": list_environment_repositories_for_state(&state, project_id.as_deref())?
         }))
+    }
+
+    async fn coordination_projects(&self, arguments: Value) -> Result<Value, String> {
+        let session_id = Self::required_string(&arguments, "session_id")?;
+        let state = self.state();
+        let agent = state
+            .store
+            .load_project_agent_by_session(&session_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "coordination tools require a project agent session".to_owned())?;
+        let project = state
+            .store
+            .load_project(&agent.project_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "project not found".to_owned())?;
+        Ok(json!({"projects": [mcp_project_summary(&project)]}))
+    }
+
+    async fn coordination_snapshot(&self, arguments: Value) -> Result<Value, String> {
+        let session_id = Self::required_string(&arguments, "session_id")?;
+        let project_id = Self::required_string(&arguments, "project_id")?;
+        let state = self.state();
+        let agent = state
+            .store
+            .load_project_agent_by_session(&session_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "coordination tools require a project agent session".to_owned())?;
+        ensure_mcp_coordination_project_access(&agent.project_id, &project_id)?;
+        mcp_coordination_snapshot(&state, &project_id)
     }
 }
 
@@ -28427,6 +28551,46 @@ agents:
         });
         assert_eq!(view["session_id"], "session-test");
         assert!(view.get("id").is_none());
+    }
+
+    #[test]
+    fn mcp_coordination_project_access_is_project_scoped() {
+        assert!(ensure_mcp_coordination_project_access("project-a", "project-a").is_ok());
+        let error = ensure_mcp_coordination_project_access("project-a", "project-b").unwrap_err();
+        assert_eq!(error, "coordination project is outside the caller project");
+    }
+
+    #[test]
+    fn mcp_project_repository_urls_strip_credentials_and_query_values() {
+        let safe = safe_project_repo_url(
+            "https://user:secret@example.com/repo.git?access_token=should-not-appear",
+        )
+        .unwrap();
+        assert_eq!(safe, "https://example.com/repo.git");
+        assert!(!safe.contains("secret"));
+        assert!(!safe.contains("access_token"));
+        assert!(safe_project_repo_url("not a url").is_none());
+    }
+
+    #[test]
+    fn mcp_coordination_snapshot_redacts_nested_secret_values() {
+        let snapshot = redact_approval_value(&json!({
+            "messages": [{
+                "payload": {
+                    "api_token": "secret-token",
+                    "text": "Authorization: Bearer secret-token"
+                }
+            }]
+        }));
+        assert_eq!(
+            snapshot["messages"][0]["payload"]["api_token"],
+            "[redacted]"
+        );
+        assert_eq!(
+            snapshot["messages"][0]["payload"]["text"],
+            "Authorization: Bearer [redacted]"
+        );
+        assert!(!snapshot.to_string().contains("secret-token"));
     }
 
     #[test]

@@ -80,6 +80,8 @@ pub trait OpcosControlPlane: Send + Sync {
     async fn list_integrations(&self, arguments: Value) -> Result<Value, String>;
     async fn find_setting(&self, arguments: Value) -> Result<Value, String>;
     async fn list_available_repos(&self, arguments: Value) -> Result<Value, String>;
+    async fn coordination_projects(&self, arguments: Value) -> Result<Value, String>;
+    async fn coordination_snapshot(&self, arguments: Value) -> Result<Value, String>;
 }
 
 pub struct OpcosMcpServer<C> {
@@ -229,6 +231,29 @@ where
                     "properties": {"project_id": {"type": "string"}}
                 }),
             ),
+            tool(
+                "coordination_projects",
+                "List the project coordination scope visible to a bound OPCOS session.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"}
+                    },
+                    "required": ["session_id"]
+                }),
+            ),
+            tool(
+                "coordination_snapshot",
+                "Read the SQLite-backed coordination snapshot for the caller's project.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "project_id": {"type": "string"}
+                    },
+                    "required": ["session_id", "project_id"]
+                }),
+            ),
         ]
     }
 
@@ -309,6 +334,8 @@ where
             "list_integrations" => self.control_plane.list_integrations(arguments).await,
             "find_setting" => self.control_plane.find_setting(arguments).await,
             "list_available_repos" => self.control_plane.list_available_repos(arguments).await,
+            "coordination_projects" => self.control_plane.coordination_projects(arguments).await,
+            "coordination_snapshot" => self.control_plane.coordination_snapshot(arguments).await,
             other => return Err(ServerError::UnsupportedMethod(other.into())),
         };
         result.map_err(ServerError::ControlPlane)
@@ -578,6 +605,14 @@ mod tests {
         async fn list_available_repos(&self, arguments: Value) -> Result<Value, String> {
             Ok(json!({"kind":"repositories","arguments":arguments}))
         }
+
+        async fn coordination_projects(&self, arguments: Value) -> Result<Value, String> {
+            Ok(json!({"projects":[],"arguments":arguments}))
+        }
+
+        async fn coordination_snapshot(&self, arguments: Value) -> Result<Value, String> {
+            Ok(json!({"snapshot":{},"arguments":arguments}))
+        }
     }
 
     #[tokio::test]
@@ -611,7 +646,7 @@ mod tests {
         assert_eq!(responses[0]["result"]["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(
             responses[1]["result"]["tools"].as_array().unwrap().len(),
-            12
+            14
         );
         assert_eq!(
             responses[2]["result"]["structuredContent"]["session_id"],
@@ -712,6 +747,38 @@ mod tests {
         assert_eq!(
             responses[2]["result"]["structuredContent"]["arguments"]["session_ids"][0],
             "session-one"
+        );
+    }
+
+    #[tokio::test]
+    async fn coordination_tools_are_readable_mcp_results() {
+        let server = OpcosMcpServer::new(Arc::new(FakeControlPlane {
+            calls: AtomicUsize::new(0),
+            fail_interact: false,
+            fail_knowledge: false,
+        }));
+        let input = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"coordination_projects\",\"arguments\":{\"session_id\":\"session-one\"}}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"coordination_snapshot\",\"arguments\":{\"session_id\":\"session-one\",\"project_id\":\"project-one\"}}}\n"
+        );
+        let mut output = Vec::new();
+        server
+            .serve_stdio(BufReader::new(input.as_bytes()), &mut output)
+            .await
+            .unwrap();
+        let responses = output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(responses[0]["result"]["isError"], false);
+        assert_eq!(
+            responses[0]["result"]["structuredContent"]["arguments"]["session_id"],
+            "session-one"
+        );
+        assert_eq!(
+            responses[1]["result"]["structuredContent"]["arguments"]["project_id"],
+            "project-one"
         );
     }
 
