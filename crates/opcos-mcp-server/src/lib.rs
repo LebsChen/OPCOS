@@ -22,7 +22,7 @@ pub enum ServerError {
     InvalidRequest(String),
     #[error("unsupported method: {0}")]
     UnsupportedMethod(String),
-    #[error("control-plane error: {0}")]
+    #[error("{0}")]
     ControlPlane(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -167,9 +167,16 @@ where
                     "type": "object",
                     "properties": {
                         "session_id": {"type": "string"},
+                        "session_ids": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        },
                         "timeout_seconds": {"type": "integer", "minimum": 1}
                     },
-                    "required": ["session_id"]
+                    "anyOf": [
+                        {"required": ["session_id"]},
+                        {"required": ["session_ids"]}
+                    ]
                 }),
             ),
             tool(
@@ -502,11 +509,18 @@ mod tests {
     #[async_trait]
     impl OpcosControlPlane for FakeControlPlane {
         async fn session_create(&self, arguments: Value) -> Result<Value, String> {
-            Ok(json!({"session_id":"session-fake","arguments":arguments}))
+            Ok(json!({
+                "session_id":"session-fake",
+                "session":{"session_id":"session-fake"},
+                "arguments":arguments
+            }))
         }
 
         async fn session_search(&self, arguments: Value) -> Result<Value, String> {
-            Ok(json!({"sessions":[],"arguments":arguments}))
+            Ok(json!({
+                "sessions":[{"session_id":"session-fake"}],
+                "arguments":arguments
+            }))
         }
 
         async fn session_interact(&self, arguments: Value) -> Result<Value, String> {
@@ -525,7 +539,13 @@ mod tests {
         }
 
         async fn session_gather(&self, arguments: Value) -> Result<Value, String> {
-            Ok(json!({"status":"idle","arguments":arguments}))
+            Ok(json!({
+                "sessions":[
+                    {"session_id":"session-one"},
+                    {"session_id":"session-two"}
+                ],
+                "arguments":arguments
+            }))
         }
 
         async fn knowledge_manage(&self, arguments: Value) -> Result<Value, String> {
@@ -647,7 +667,51 @@ mod tests {
         assert_eq!(response["result"]["isError"], true);
         assert_eq!(
             response["result"]["content"][0]["text"],
-            "control-plane error: approval is pending"
+            "approval is pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn devin_session_contracts_use_session_id_and_support_multi_gather() {
+        let server = OpcosMcpServer::new(Arc::new(FakeControlPlane {
+            calls: AtomicUsize::new(0),
+            fail_interact: false,
+            fail_knowledge: false,
+        }));
+        let input = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"devin_session_create\",\"arguments\":{\"title\":\"test\"}}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"devin_session_search\",\"arguments\":{}}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"devin_session_gather\",\"arguments\":{\"session_ids\":[\"session-one\",\"session-two\"]}}}\n"
+        );
+        let mut output = Vec::new();
+        server
+            .serve_stdio(BufReader::new(input.as_bytes()), &mut output)
+            .await
+            .unwrap();
+        let responses = output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            responses[0]["result"]["structuredContent"]["session"]["session_id"],
+            "session-fake"
+        );
+        assert!(responses[0]["result"]["structuredContent"]["session"]["id"].is_null());
+        assert_eq!(
+            responses[1]["result"]["structuredContent"]["sessions"][0]["session_id"],
+            "session-fake"
+        );
+        assert_eq!(
+            responses[2]["result"]["structuredContent"]["sessions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            responses[2]["result"]["structuredContent"]["arguments"]["session_ids"][0],
+            "session-one"
         );
     }
 
@@ -673,7 +737,7 @@ mod tests {
         assert_eq!(response["result"]["isError"], true);
         assert_eq!(
             response["result"]["content"][0]["text"],
-            "control-plane error: builtin assets are read-only and cannot be deleted"
+            "builtin assets are read-only and cannot be deleted"
         );
     }
 

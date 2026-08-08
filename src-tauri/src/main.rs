@@ -11772,6 +11772,7 @@ async fn start_ide_proxy(
 #[tauri::command(rename = "create_session")]
 #[allow(clippy::too_many_arguments)]
 fn create_session_command(
+    app: tauri::AppHandle,
     state: State<'_, DesktopState>,
     title: String,
     host_id: Option<String>,
@@ -11784,7 +11785,7 @@ fn create_session_command(
     agent_id: Option<String>,
     system_prompt: Option<String>,
 ) -> Result<SessionView, String> {
-    create_session_for_state(
+    let session = create_session_for_state(
         &state,
         title,
         host_id,
@@ -11796,7 +11797,9 @@ fn create_session_command(
         project_id,
         agent_id,
         system_prompt,
-    )
+    )?;
+    emit(&app, "session_list_changed", None, json!({}));
+    Ok(session)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12200,11 +12203,14 @@ fn list_sessions_command(state: State<'_, DesktopState>) -> Result<Vec<SessionVi
 
 #[tauri::command]
 fn set_session_archived(
+    app: tauri::AppHandle,
     state: State<'_, DesktopState>,
     session_id: String,
     archived: bool,
 ) -> Result<Value, String> {
-    set_session_archived_for_state(&state, &session_id, archived)
+    let result = set_session_archived_for_state(&state, &session_id, archived)?;
+    emit(&app, "session_list_changed", None, json!({}));
+    Ok(result)
 }
 
 fn set_session_archived_for_state(
@@ -13689,6 +13695,16 @@ struct DesktopControlPlane {
     app: tauri::AppHandle,
 }
 
+fn mcp_session_view(view: SessionView) -> Value {
+    let mut value = serde_json::to_value(view).expect("session view serializes");
+    if let Some(object) = value.as_object_mut()
+        && let Some(id) = object.remove("id")
+    {
+        object.insert("session_id".into(), id);
+    }
+    value
+}
+
 impl DesktopControlPlane {
     fn state(&self) -> tauri::State<'_, DesktopState> {
         self.app.state::<DesktopState>()
@@ -13755,6 +13771,7 @@ impl opcos_mcp_server::OpcosControlPlane for DesktopControlPlane {
                 .map(str::to_owned),
         )?;
         let session_id = view.id.clone();
+        emit(&self.app, "session_list_changed", None, json!({}));
         if let Some(prompt) = arguments
             .get("prompt")
             .and_then(Value::as_str)
@@ -13772,7 +13789,7 @@ impl opcos_mcp_server::OpcosControlPlane for DesktopControlPlane {
             )
             .await?;
         }
-        Ok(json!({"session_id": session_id, "session": view}))
+        Ok(json!({"session_id": session_id, "session": mcp_session_view(view)}))
     }
 
     async fn session_search(&self, arguments: Value) -> Result<Value, String> {
@@ -13800,7 +13817,12 @@ impl opcos_mcp_server::OpcosControlPlane for DesktopControlPlane {
             .filter(|session| project_id.is_none_or(|id| session.project_id.as_deref() == Some(id)))
             .take(limit)
             .collect::<Vec<_>>();
-        Ok(json!({"sessions": sessions}))
+        Ok(json!({
+            "sessions": sessions
+                .into_iter()
+                .map(mcp_session_view)
+                .collect::<Vec<_>>()
+        }))
     }
 
     async fn session_interact(&self, arguments: Value) -> Result<Value, String> {
@@ -13811,7 +13833,7 @@ impl opcos_mcp_server::OpcosControlPlane for DesktopControlPlane {
             "get" => list_sessions_for_state(&state)?
                 .into_iter()
                 .find(|session| session.id == session_id)
-                .map(|session| json!({"session": session}))
+                .map(|session| json!({"session": mcp_session_view(session)}))
                 .ok_or_else(|| format!("session not found: {session_id}")),
             "get_messages" => Ok(json!({
                 "session_id": session_id,
@@ -13834,13 +13856,17 @@ impl opcos_mcp_server::OpcosControlPlane for DesktopControlPlane {
                     .into_iter()
                     .find(|session| session.id == session_id)
                     .ok_or_else(|| format!("session not found: {session_id}"))?;
-                Ok(json!({"session": session}))
+                Ok(json!({"session": mcp_session_view(session)}))
             }
             "terminate" => {
                 interrupt_for_state(self.app.clone(), &state, session_id.clone()).await?;
                 Ok(json!({"session_id": session_id, "terminated": true}))
             }
-            "archive" => set_session_archived_for_state(&state, &session_id, true),
+            "archive" => {
+                let result = set_session_archived_for_state(&state, &session_id, true)?;
+                emit(&self.app, "session_list_changed", None, json!({}));
+                Ok(result)
+            }
             "get_attachments" => Ok(json!({
                 "session_id": session_id,
                 "attachments": list_artifacts_for_state(&state, &session_id).await?
@@ -13859,27 +13885,58 @@ impl opcos_mcp_server::OpcosControlPlane for DesktopControlPlane {
     }
 
     async fn session_gather(&self, arguments: Value) -> Result<Value, String> {
-        let session_id = Self::required_string(&arguments, "session_id")?;
+        let session_ids = arguments
+            .get("session_ids")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|values| !values.is_empty())
+            .or_else(|| {
+                arguments
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| vec![value.to_owned()])
+            })
+            .ok_or_else(|| "missing required argument: session_id or session_ids".to_owned())?;
         let timeout = arguments
             .get("timeout_seconds")
             .and_then(Value::as_u64)
             .unwrap_or(30)
             .clamp(1, 300);
-        let deadline = Instant::now() + Duration::from_secs(timeout);
-        loop {
-            let state = self.state();
-            let session = list_sessions_for_state(&state)?
-                .into_iter()
-                .find(|session| session.id == session_id)
-                .ok_or_else(|| format!("session not found: {session_id}"))?;
-            if session.run_state != "running" && session.run_state != "waiting" {
-                return Ok(json!({"session": session}));
-            }
-            if Instant::now() >= deadline {
-                return Ok(json!({"session": session, "timed_out": true}));
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
+        let results =
+            futures_util::future::try_join_all(session_ids.into_iter().map(|session_id| {
+                let app = self.app.clone();
+                async move {
+                    let deadline = Instant::now() + Duration::from_secs(timeout);
+                    loop {
+                        let state = app.state::<DesktopState>();
+                        let session = list_sessions_for_state(&state)?
+                            .into_iter()
+                            .find(|session| session.id == session_id)
+                            .ok_or_else(|| format!("session not found: {session_id}"))?;
+                        if session.run_state != "running" && session.run_state != "waiting" {
+                            return Ok::<Value, String>(mcp_session_view(session));
+                        }
+                        if Instant::now() >= deadline {
+                            let mut view = mcp_session_view(session);
+                            if let Some(object) = view.as_object_mut() {
+                                object.insert("timed_out".into(), Value::Bool(true));
+                            }
+                            return Ok(view);
+                        }
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                }
+            }))
+            .await?;
+        Ok(json!({"sessions": results}))
     }
 
     async fn knowledge_manage(&self, arguments: Value) -> Result<Value, String> {
@@ -27761,6 +27818,28 @@ agents:
             shell_artifact_paths("generate | tee -a reports/out.log"),
             vec!["reports/out.log"]
         );
+    }
+
+    #[test]
+    fn mcp_session_views_use_session_id_without_frontend_field_churn() {
+        let view = mcp_session_view(SessionView {
+            id: "session-test".into(),
+            title: "Test".into(),
+            host_id: "local".into(),
+            host_name: "本机".into(),
+            model: "auto".into(),
+            provider: None,
+            mode: "Auto".into(),
+            harness: "builtin".into(),
+            workspace: "/tmp".into(),
+            run_state: "idle".into(),
+            stop_reason: "none".into(),
+            archived: false,
+            project_id: None,
+            agent_id: None,
+        });
+        assert_eq!(view["session_id"], "session-test");
+        assert!(view.get("id").is_none());
     }
 
     #[test]
