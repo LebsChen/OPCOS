@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use opcos_engine::{
     ApprovalOutcome, EngineError, PreflightDecision, ToolExecutor, TurnEngine,
-    builtin_tool_definition_tokens,
+    builtin_full_tool_catalog_tokens, builtin_tool_catalog_tokens, builtin_tool_definition_tokens,
 };
 use opcos_policy::PermissionMode;
 use opcos_provider::{
@@ -51,6 +51,8 @@ pub struct TrajectoryCost {
     pub output_tokens: u64,
     pub tool_definition_tokens: u64,
     pub full_tool_definition_tokens: u64,
+    pub tool_catalog_tokens: u64,
+    pub full_tool_catalog_tokens: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1069,6 +1071,8 @@ pub async fn run_builtin_case(case: &EvalCase) -> Result<CaseReport, EvalError> 
             .map(|value| value.len() as u64 / 4)
             .unwrap_or_default(),
         full_tool_definition_tokens: builtin_tool_definition_tokens(),
+        tool_catalog_tokens: builtin_tool_catalog_tokens(),
+        full_tool_catalog_tokens: builtin_full_tool_catalog_tokens(),
     };
     let failures = case
         .assertions
@@ -1185,6 +1189,7 @@ mod tests {
         let report = run_builtin_case(&case).await.unwrap();
         assert!(report.passed, "{report:?}");
         assert!(report.cost.tool_definition_tokens < report.cost.full_tool_definition_tokens);
+        assert!(report.cost.tool_catalog_tokens < report.cost.full_tool_catalog_tokens);
     }
 
     #[test]

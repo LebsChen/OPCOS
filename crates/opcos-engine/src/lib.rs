@@ -1157,11 +1157,18 @@ where
     }
 
     pub fn set_linear_tools_enabled(&self, enabled: bool) {
-        self.linear_tools_enabled.store(enabled, Ordering::SeqCst);
+        self.set_connector_tools_enabled("linear", enabled);
     }
 
     pub fn set_connector_tools_enabled(&self, kind: &str, enabled: bool) {
+        if !CONNECTOR_TOOL_PREFIXES
+            .iter()
+            .any(|(connector, _)| *connector == kind)
+        {
+            return;
+        }
         let target = match kind {
+            "linear" => &self.linear_tools_enabled,
             "github" => &self.github_tools_enabled,
             "telegram" => &self.telegram_tools_enabled,
             "discord" => &self.discord_tools_enabled,
@@ -1279,23 +1286,19 @@ where
                 tool_name(definition).is_some_and(|name| allowed.contains(name))
             });
         }
-        for (prefix, enabled) in [
-            ("linear_", self.linear_tools_enabled.load(Ordering::SeqCst)),
-            ("github_", self.github_tools_enabled.load(Ordering::SeqCst)),
-            (
-                "telegram_",
-                self.telegram_tools_enabled.load(Ordering::SeqCst),
-            ),
-            (
-                "discord_",
-                self.discord_tools_enabled.load(Ordering::SeqCst),
-            ),
-            ("slack_", self.slack_tools_enabled.load(Ordering::SeqCst)),
-            ("notion_", self.notion_tools_enabled.load(Ordering::SeqCst)),
-            ("gitlab_", self.gitlab_tools_enabled.load(Ordering::SeqCst)),
-            ("jira_", self.jira_tools_enabled.load(Ordering::SeqCst)),
-            ("stripe_", self.stripe_tools_enabled.load(Ordering::SeqCst)),
-        ] {
+        for (kind, prefix) in CONNECTOR_TOOL_PREFIXES {
+            let enabled = match *kind {
+                "linear" => self.linear_tools_enabled.load(Ordering::SeqCst),
+                "github" => self.github_tools_enabled.load(Ordering::SeqCst),
+                "telegram" => self.telegram_tools_enabled.load(Ordering::SeqCst),
+                "discord" => self.discord_tools_enabled.load(Ordering::SeqCst),
+                "slack" => self.slack_tools_enabled.load(Ordering::SeqCst),
+                "notion" => self.notion_tools_enabled.load(Ordering::SeqCst),
+                "gitlab" => self.gitlab_tools_enabled.load(Ordering::SeqCst),
+                "jira" => self.jira_tools_enabled.load(Ordering::SeqCst),
+                "stripe" => self.stripe_tools_enabled.load(Ordering::SeqCst),
+                _ => false,
+            };
             if !enabled {
                 definitions.retain(|definition| {
                     !tool_name(definition).is_some_and(|name| name.starts_with(prefix))
@@ -2320,31 +2323,19 @@ where
                         tools,
                         allowed.as_ref().and_then(|value| value.as_ref()),
                     );
-                    if !self.linear_tools_enabled.load(Ordering::SeqCst) {
-                        tools.retain(|tool| {
-                            !tool
-                                .get("function")
-                                .and_then(|function| function.get("name"))
-                                .and_then(Value::as_str)
-                                .is_some_and(|name| name.starts_with("linear_"))
-                        });
-                    }
-                    for (prefix, enabled) in [
-                        ("github_", self.github_tools_enabled.load(Ordering::SeqCst)),
-                        (
-                            "telegram_",
-                            self.telegram_tools_enabled.load(Ordering::SeqCst),
-                        ),
-                        (
-                            "discord_",
-                            self.discord_tools_enabled.load(Ordering::SeqCst),
-                        ),
-                        ("slack_", self.slack_tools_enabled.load(Ordering::SeqCst)),
-                        ("notion_", self.notion_tools_enabled.load(Ordering::SeqCst)),
-                        ("gitlab_", self.gitlab_tools_enabled.load(Ordering::SeqCst)),
-                        ("jira_", self.jira_tools_enabled.load(Ordering::SeqCst)),
-                        ("stripe_", self.stripe_tools_enabled.load(Ordering::SeqCst)),
-                    ] {
+                    for (kind, prefix) in CONNECTOR_TOOL_PREFIXES {
+                        let enabled = match *kind {
+                            "linear" => self.linear_tools_enabled.load(Ordering::SeqCst),
+                            "github" => self.github_tools_enabled.load(Ordering::SeqCst),
+                            "telegram" => self.telegram_tools_enabled.load(Ordering::SeqCst),
+                            "discord" => self.discord_tools_enabled.load(Ordering::SeqCst),
+                            "slack" => self.slack_tools_enabled.load(Ordering::SeqCst),
+                            "notion" => self.notion_tools_enabled.load(Ordering::SeqCst),
+                            "gitlab" => self.gitlab_tools_enabled.load(Ordering::SeqCst),
+                            "jira" => self.jira_tools_enabled.load(Ordering::SeqCst),
+                            "stripe" => self.stripe_tools_enabled.load(Ordering::SeqCst),
+                            _ => false,
+                        };
                         if !enabled {
                             tools.retain(|tool| {
                                 !tool
@@ -4914,23 +4905,25 @@ fn tool_name(definition: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+const CONNECTOR_TOOL_PREFIXES: &[(&str, &str)] = &[
+    ("linear", "linear_"),
+    ("github", "github_"),
+    ("telegram", "telegram_"),
+    ("discord", "discord_"),
+    ("slack", "slack_"),
+    ("notion", "notion_"),
+    ("gitlab", "gitlab_"),
+    ("jira", "jira_"),
+    ("stripe", "stripe_"),
+];
+
 fn is_progressive_catalog_tool(name: &str) -> bool {
     name.starts_with("browser_")
         || name.starts_with("mcp:")
         || name.contains("__")
-        || [
-            "linear_",
-            "github_",
-            "telegram_",
-            "discord_",
-            "slack_",
-            "notion_",
-            "gitlab_",
-            "jira_",
-            "stripe_",
-        ]
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
+        || CONNECTOR_TOOL_PREFIXES
+            .iter()
+            .any(|(_, prefix)| name.starts_with(prefix))
 }
 
 fn tool_input_shape(definition: &Value) -> String {
@@ -4949,8 +4942,37 @@ fn tool_input_shape(definition: &Value) -> String {
     }
 }
 
-fn first_useful_call(name: &str) -> String {
-    format!("call {name} with the required arguments")
+fn first_useful_call(definition: &Value) -> String {
+    let name = tool_name(definition).unwrap_or("tool");
+    let required = definition
+        .pointer("/function/parameters/required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|field| format!("{field}=…"))
+        .collect::<Vec<_>>();
+    format!("{name}({})", required.join(", "))
+}
+
+fn compact_purpose(definition: &Value) -> String {
+    const MAX_PURPOSE_CHARS: usize = 160;
+    let purpose = definition
+        .pointer("/function/description")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .split_once('.')
+        .map_or_else(
+            || {
+                definition
+                    .pointer("/function/description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            },
+            |(first_sentence, _)| first_sentence,
+        )
+        .trim();
+    purpose.chars().take(MAX_PURPOSE_CHARS).collect()
 }
 
 fn catalog_entry(definition: &Value) -> Option<Value> {
@@ -4958,9 +4980,9 @@ fn catalog_entry(definition: &Value) -> Option<Value> {
     let name = function.get("name")?.as_str()?;
     Some(json!({
         "name": name,
-        "purpose": function.get("description").and_then(Value::as_str).unwrap_or(""),
+        "purpose": compact_purpose(definition),
         "input_shape": tool_input_shape(definition),
-        "first_useful_call": first_useful_call(name),
+        "first_useful_call": first_useful_call(definition),
     }))
 }
 
@@ -4995,6 +5017,37 @@ pub fn builtin_tool_names() -> HashSet<String> {
 
 pub fn builtin_tool_definition_tokens() -> u64 {
     serde_json::to_vec(&tool_definitions())
+        .map(|value| value.len() as u64 / 4)
+        .unwrap_or_default()
+}
+
+pub fn builtin_tool_catalog_tokens() -> u64 {
+    let entries = tool_definitions()
+        .iter()
+        .filter(|definition| tool_name(definition).is_some_and(is_progressive_catalog_tool))
+        .filter_map(catalog_entry)
+        .collect::<Vec<_>>();
+    serde_json::to_vec(&entries)
+        .map(|value| value.len() as u64 / 4)
+        .unwrap_or_default()
+}
+
+pub fn builtin_full_tool_catalog_tokens() -> u64 {
+    let entries = tool_definitions()
+        .iter()
+        .filter(|definition| tool_name(definition).is_some_and(is_progressive_catalog_tool))
+        .filter_map(|definition| {
+            let function = definition.get("function")?;
+            let name = function.get("name")?.as_str()?;
+            Some(json!({
+                "name": name,
+                "purpose": function.get("description").and_then(Value::as_str).unwrap_or(""),
+                "input_shape": tool_input_shape(definition),
+                "first_useful_call": first_useful_call(definition),
+            }))
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_vec(&entries)
         .map(|value| value.len() as u64 / 4)
         .unwrap_or_default()
 }
@@ -5152,6 +5205,32 @@ struct PartialOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connector_tools_are_all_catalogued() {
+        let connector_tools = tool_definitions()
+            .into_iter()
+            .filter_map(|definition| tool_name(&definition).map(str::to_owned))
+            .filter(|name| {
+                CONNECTOR_TOOL_PREFIXES
+                    .iter()
+                    .any(|(_, prefix)| name.starts_with(prefix))
+            })
+            .collect::<Vec<_>>();
+        assert!(!connector_tools.is_empty());
+        assert!(
+            connector_tools
+                .iter()
+                .all(|name| is_progressive_catalog_tool(name))
+        );
+        let linear = tool_definitions()
+            .into_iter()
+            .find(|definition| tool_name(definition) == Some("linear_get_issue"))
+            .unwrap();
+        let entry = catalog_entry(&linear).unwrap();
+        assert_eq!(entry["first_useful_call"], "linear_get_issue(identifier=…)");
+        assert_eq!(entry["purpose"], "Read a Linear issue by identifier");
+    }
 
     #[test]
     fn external_context_content_blocks_use_standard_text_fields() {
