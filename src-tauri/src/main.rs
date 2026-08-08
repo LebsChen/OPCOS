@@ -5156,6 +5156,29 @@ fn acp_stream_update(kind: &str, payload: &Value) -> Option<SessionUpdate> {
                     .unwrap_or_default(),
             )),
         ))),
+        "stream" => {
+            match payload.get("type").and_then(Value::as_str) {
+                Some("assistant_delta") => {
+                    payload
+                        .get("text_delta")
+                        .and_then(Value::as_str)
+                        .map(|text| {
+                            SessionUpdate::AgentMessageChunk(AcpContentChunk::new(
+                                AcpContentBlock::Text(AcpTextContent::new(text)),
+                            ))
+                        })
+                }
+                Some("reasoning_delta") => payload
+                    .get("reasoning_delta")
+                    .and_then(Value::as_str)
+                    .map(|text| {
+                        SessionUpdate::AgentThoughtChunk(AcpContentChunk::new(
+                            AcpContentBlock::Text(AcpTextContent::new(text)),
+                        ))
+                    }),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -5167,6 +5190,34 @@ fn next_acp_pending<'a>(
     pending
         .iter()
         .find(|record| !resolved_call_ids.contains(&record.call_id))
+}
+
+async fn wait_for_external_approval_resolution(
+    store: Arc<SqliteStore>,
+    session_id: String,
+    call_id: String,
+) -> Result<(), String> {
+    loop {
+        let pending = store
+            .load_pending(&session_id)
+            .map_err(|error| error.to_string())?;
+        let session = store
+            .load_session(&session_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "session not found".to_owned())?;
+        if acp_approval_resolution_ready(&pending, &session, &call_id) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn acp_approval_resolution_ready(
+    pending: &[opcos_store::PendingRecord],
+    session: &SessionRecord,
+    call_id: &str,
+) -> bool {
+    !pending.iter().any(|item| item.call_id == call_id) && session.run_state != "running"
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -13984,7 +14035,7 @@ impl opcos_acp_server::OpcosAcpControlPlane for DesktopControlPlane {
                 .map_err(|error| format!("remote host unavailable: {error}"))?;
             client
                 .with_workspace(&cwd)
-                .ls(None)
+                .ls(Some(&cwd))
                 .await
                 .map_err(|error| format!("ACP cwd is unavailable on remote host: {error}"))?;
         }
@@ -14080,31 +14131,46 @@ impl opcos_acp_server::OpcosAcpControlPlane for DesktopControlPlane {
                         .load_pending(&session_id)
                         .map_err(|store_error| store_error.to_string())?;
                     if let Some(pending) = next_acp_pending(&pending, &resolved_call_ids) {
-                        let response = sink
-                            .request_permission(
-                                serde_json::from_value(json!({
-                                    "sessionId": session_id,
-                                    "toolCall": {
-                                        "toolCallId": pending.call_id,
-                                        "title": pending.tool,
-                                        "status": "pending"
+                        let pending_call_id = pending.call_id.clone();
+                        let pending_tool = pending.tool.clone();
+                        let permission = sink.request_permission(
+                            serde_json::from_value(json!({
+                                "sessionId": session_id,
+                                "toolCall": {
+                                    "toolCallId": pending_call_id,
+                                    "title": pending_tool,
+                                    "status": "pending"
+                                },
+                                "options": [
+                                    {
+                                        "optionId": "allow_once",
+                                        "name": "Allow once",
+                                        "kind": "allow_once"
                                     },
-                                    "options": [
-                                        {
-                                            "optionId": "allow_once",
-                                            "name": "Allow once",
-                                            "kind": "allow_once"
-                                        },
-                                        {
-                                            "optionId": "deny",
-                                            "name": "Deny",
-                                            "kind": "reject_once"
-                                        }
-                                    ]
-                                }))
-                                .map_err(|error| error.to_string())?,
-                            )
-                            .await?;
+                                    {
+                                        "optionId": "deny",
+                                        "name": "Deny",
+                                        "kind": "reject_once"
+                                    }
+                                ]
+                            }))
+                            .map_err(|error| error.to_string())?,
+                        );
+                        tokio::pin!(permission);
+                        let external_resolution = wait_for_external_approval_resolution(
+                            Arc::clone(&self.state().store),
+                            session_id.clone(),
+                            pending.call_id.clone(),
+                        );
+                        tokio::pin!(external_resolution);
+                        let response = tokio::select! {
+                            response = &mut permission => response?,
+                            resolution = &mut external_resolution => {
+                                resolution?;
+                                result = Err("ACP approval resolved externally".to_owned());
+                                continue;
+                            }
+                        };
                         let allow = matches!(
                             response.outcome,
                             RequestPermissionOutcome::Selected(selected)
@@ -14794,11 +14860,13 @@ async fn resolve_approval(
                 if approve { "allow" } else { "deny" },
             )
             .map_err(|error| error.to_string())?;
+        emit_approval_decision(&app, &state, &session_id, &call_id, approve);
+        let _ = emit_pending_approval(&app, &state, &session_id)?;
         emit(
             &app,
-            "approval_resolved",
+            "turn_done",
             Some(&session_id),
-            json!({"call_id":call_id,"approve":approve}),
+            session_status_payload(&state, &session_id),
         );
         return Ok(());
     }
@@ -28988,5 +29056,63 @@ agents:
         }];
         let resolved = HashSet::from(["call-1".to_owned()]);
         assert!(next_acp_pending(&pending, &resolved).is_none());
+    }
+
+    #[test]
+    fn acp_stream_updates_translate_engine_deltas() {
+        let message = acp_stream_update(
+            "stream",
+            &json!({"type":"assistant_delta","text_delta":"hello"}),
+        );
+        assert!(matches!(message, Some(SessionUpdate::AgentMessageChunk(_))));
+        let thought = acp_stream_update(
+            "stream",
+            &json!({"type":"reasoning_delta","reasoning_delta":"thinking"}),
+        );
+        assert!(matches!(thought, Some(SessionUpdate::AgentThoughtChunk(_))));
+        assert_eq!(
+            acp_stream_update(
+                "stream",
+                &json!({"type":"tool_call_delta","tool_call_delta":{}})
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn acp_external_approval_resolution_requires_terminal_or_next_state() {
+        let session = SessionRecord {
+            session_id: "session".into(),
+            workspace: "/workspace".into(),
+            model: "auto".into(),
+            mode: "Interactive".into(),
+            harness: "acp".into(),
+            title: "ACP".into(),
+            extra_roots: vec![],
+            grants: json!({}),
+            pinned: false,
+            archived: false,
+            origin: None,
+            origin_label: None,
+            compaction: json!({}),
+            host_id: "local".into(),
+            provider: None,
+            external_session_id: None,
+            run_state: "idle".into(),
+            stop_reason: "waiting_for_approval".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            project_id: None,
+            agent_id: None,
+        };
+        let pending = vec![opcos_store::PendingRecord {
+            session_id: "session".into(),
+            call_id: "call-1".into(),
+            tool: "tool".into(),
+            arguments: Value::Null,
+            state: "pending".into(),
+        }];
+        assert!(!acp_approval_resolution_ready(&pending, &session, "call-1"));
+        assert!(acp_approval_resolution_ready(&[], &session, "call-1"));
     }
 }
