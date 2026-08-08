@@ -4,6 +4,11 @@
 //! `Provider`, `ExecutionEnvironmentSpec`, and `GraderSpec` seams intentionally
 //! also accept external model providers, container/remote environments, and
 //! test-command graders without adding a dataset or container dependency here.
+//!
+//! The built-in tool executor is a fixture substitute. This harness currently
+//! evaluates engine-side orchestration (events, state transitions, approvals,
+//! steering, and compaction), not the production tool implementation in
+//! `src-tauri`.
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -17,7 +22,7 @@ use opcos_store::{SessionRecord, SessionStore, SqliteStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -37,7 +42,7 @@ pub enum FailureClass {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TrajectoryCost {
-    pub rounds: usize,
+    pub iterations: usize,
     pub tool_calls: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -64,8 +69,7 @@ pub struct Proof {
 pub struct CaseReport {
     pub case: String,
     pub passed: bool,
-    pub failure_class: Option<FailureClass>,
-    pub failure: Option<String>,
+    pub failures: Vec<AssertionFailure>,
     pub outcome: Outcome,
     pub proof: Proof,
     pub cost: TrajectoryCost,
@@ -74,6 +78,83 @@ pub struct CaseReport {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceFixture {
     pub files: Vec<(String, String)>,
+    pub tool_behavior: FixtureToolBehavior,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FixtureToolBehavior {
+    Normal,
+    FailWrites,
+    RequireApproval,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EngineOverrides {
+    pub chunk_idle_timeout: Option<Duration>,
+    pub context_window: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Interaction {
+    QueueSteering { after_ms: u64, text: String },
+    ResolveApproval { outcome: ApprovalOutcome },
+    CompactNow,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Assertion {
+    RequiredEvent {
+        event: String,
+        failure_class: FailureClass,
+    },
+    ForbiddenEvent {
+        event: String,
+        failure_class: FailureClass,
+    },
+    SessionState {
+        run_state: String,
+        stop_reason: String,
+        failure_class: FailureClass,
+    },
+    FilePresent {
+        path: String,
+        failure_class: FailureClass,
+    },
+    FileAbsent {
+        path: String,
+        failure_class: FailureClass,
+    },
+    FilesEmpty {
+        failure_class: FailureClass,
+    },
+    PlanPresent {
+        failure_class: FailureClass,
+    },
+    PlanInSystemMessage {
+        failure_class: FailureClass,
+    },
+}
+
+impl Assertion {
+    fn failure_class(&self) -> &FailureClass {
+        match self {
+            Assertion::RequiredEvent { failure_class, .. }
+            | Assertion::ForbiddenEvent { failure_class, .. }
+            | Assertion::SessionState { failure_class, .. }
+            | Assertion::FilePresent { failure_class, .. }
+            | Assertion::FileAbsent { failure_class, .. }
+            | Assertion::FilesEmpty { failure_class }
+            | Assertion::PlanPresent { failure_class }
+            | Assertion::PlanInSystemMessage { failure_class } => failure_class,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AssertionFailure {
+    pub assertion: Assertion,
+    pub failure_class: FailureClass,
+    pub message: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,6 +170,9 @@ pub struct EvalCase {
     pub environment: ExecutionEnvironmentSpec,
     pub provider: ProviderSourceSpec,
     pub grader: GraderSpec,
+    pub engine: EngineOverrides,
+    pub interactions: Vec<Interaction>,
+    pub assertions: Vec<Assertion>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -232,8 +316,7 @@ impl ScriptedProvider {
 
 struct FixtureTools {
     workspace: PathBuf,
-    fail_writes: bool,
-    approval_required: bool,
+    behavior: FixtureToolBehavior,
 }
 
 #[async_trait]
@@ -242,7 +325,7 @@ impl ToolExecutor for FixtureTools {
         match name {
             "write_file" => {
                 let path = checked_path(&self.workspace, arguments["path"].as_str().unwrap_or(""))?;
-                if self.fail_writes {
+                if self.behavior == FixtureToolBehavior::FailWrites {
                     return Err("write failed".into());
                 }
                 if let Some(parent) = path.parent() {
@@ -263,7 +346,7 @@ impl ToolExecutor for FixtureTools {
     }
 
     async fn preflight(&self, name: &str, _arguments: &Value) -> Result<PreflightDecision, String> {
-        if self.approval_required && name == "write_file" {
+        if self.behavior == FixtureToolBehavior::RequireApproval && name == "write_file" {
             Ok(PreflightDecision::NeedsUser(
                 "write approval required".into(),
             ))
@@ -298,6 +381,12 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     result
+}
+
+fn fixture_file_exists(workspace: &Path, requested: &str) -> bool {
+    let path = checked_path(workspace, requested)
+        .unwrap_or_else(|_| normalize_path(&workspace.join(requested)));
+    path.is_file()
 }
 
 fn session(store: &SqliteStore, id: &str, workspace: &Path) -> Result<(), EvalError> {
@@ -354,9 +443,12 @@ fn turn(text: &str, tool_calls: Vec<ToolCall>) -> ScriptedResponse {
 pub fn builtin_cases() -> Vec<EvalCase> {
     vec![
         EvalCase {
-            name: "nested_directory_write",
+            name: "engine_nested_directory_write",
             prompt: "write a nested file",
-            environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture { files: vec![] }),
+            environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture {
+                files: vec![],
+                tool_behavior: FixtureToolBehavior::Normal,
+            }),
             provider: ProviderSourceSpec::Scripted(vec![
                 turn(
                     "writing",
@@ -369,11 +461,31 @@ pub fn builtin_cases() -> Vec<EvalCase> {
                 turn("done", vec![]),
             ]),
             grader: GraderSpec::BuiltIn,
+            engine: EngineOverrides::default(),
+            interactions: vec![],
+            assertions: vec![
+                Assertion::RequiredEvent {
+                    event: "write_file_completed".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::FilePresent {
+                    path: "nested/dir/result.txt".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::SessionState {
+                    run_state: "idle".into(),
+                    stop_reason: "finished".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+            ],
         },
         EvalCase {
-            name: "failed_write_has_no_created_event",
+            name: "engine_failed_write_has_no_created_event",
             prompt: "write but preserve the failed mutation",
-            environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture { files: vec![] }),
+            environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture {
+                files: vec![],
+                tool_behavior: FixtureToolBehavior::FailWrites,
+            }),
             provider: ProviderSourceSpec::Scripted(vec![
                 turn(
                     "writing",
@@ -386,11 +498,35 @@ pub fn builtin_cases() -> Vec<EvalCase> {
                 turn("done", vec![]),
             ]),
             grader: GraderSpec::BuiltIn,
+            engine: EngineOverrides::default(),
+            interactions: vec![],
+            assertions: vec![
+                Assertion::RequiredEvent {
+                    event: "write_file_completed".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::ForbiddenEvent {
+                    event: "file_created".into(),
+                    failure_class: FailureClass::ToolDesign,
+                },
+                Assertion::FileAbsent {
+                    path: "result.txt".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::SessionState {
+                    run_state: "idle".into(),
+                    stop_reason: "finished".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+            ],
         },
         EvalCase {
-            name: "outside_workspace_rejected",
+            name: "engine_workspace_rejection",
             prompt: "write outside the workspace",
-            environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture { files: vec![] }),
+            environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture {
+                files: vec![],
+                tool_behavior: FixtureToolBehavior::Normal,
+            }),
             provider: ProviderSourceSpec::Scripted(vec![
                 turn(
                     "writing",
@@ -403,18 +539,60 @@ pub fn builtin_cases() -> Vec<EvalCase> {
                 turn("done", vec![]),
             ]),
             grader: GraderSpec::BuiltIn,
+            engine: EngineOverrides::default(),
+            interactions: vec![],
+            assertions: vec![
+                Assertion::RequiredEvent {
+                    event: "write_file_completed".into(),
+                    failure_class: FailureClass::ToolDesign,
+                },
+                Assertion::FileAbsent {
+                    path: "../escape.txt".into(),
+                    failure_class: FailureClass::ToolDesign,
+                },
+                Assertion::SessionState {
+                    run_state: "idle".into(),
+                    stop_reason: "finished".into(),
+                    failure_class: FailureClass::ToolDesign,
+                },
+            ],
         },
         EvalCase {
             name: "hanging_turn_converges",
             prompt: "wait for the model",
-            environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture { files: vec![] }),
+            environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture {
+                files: vec![],
+                tool_behavior: FixtureToolBehavior::Normal,
+            }),
             provider: ProviderSourceSpec::Scripted(vec![ScriptedResponse::Hang]),
             grader: GraderSpec::BuiltIn,
+            engine: EngineOverrides {
+                chunk_idle_timeout: Some(Duration::from_millis(5)),
+                context_window: None,
+            },
+            interactions: vec![],
+            assertions: vec![
+                Assertion::RequiredEvent {
+                    event: "provider_stream_timeout".into(),
+                    failure_class: FailureClass::ModelLimitation,
+                },
+                Assertion::FilesEmpty {
+                    failure_class: FailureClass::ModelLimitation,
+                },
+                Assertion::SessionState {
+                    run_state: "error".into(),
+                    stop_reason: "provider_error".into(),
+                    failure_class: FailureClass::ModelLimitation,
+                },
+            ],
         },
         EvalCase {
             name: "steering_is_consumed",
             prompt: "follow the new direction",
-            environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture { files: vec![] }),
+            environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture {
+                files: vec![],
+                tool_behavior: FixtureToolBehavior::Normal,
+            }),
             provider: ProviderSourceSpec::Scripted(vec![
                 ScriptedResponse::Delayed(
                     Duration::from_millis(10),
@@ -431,11 +609,33 @@ pub fn builtin_cases() -> Vec<EvalCase> {
                 turn("second", vec![]),
             ]),
             grader: GraderSpec::BuiltIn,
+            engine: EngineOverrides::default(),
+            interactions: vec![Interaction::QueueSteering {
+                after_ms: 1,
+                text: "new direction".into(),
+            }],
+            assertions: vec![
+                Assertion::RequiredEvent {
+                    event: "steering_applied".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::FilesEmpty {
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::SessionState {
+                    run_state: "idle".into(),
+                    stop_reason: "finished".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+            ],
         },
         EvalCase {
             name: "approval_pending_resumes",
             prompt: "write after approval",
-            environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture { files: vec![] }),
+            environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture {
+                files: vec![],
+                tool_behavior: FixtureToolBehavior::RequireApproval,
+            }),
             provider: ProviderSourceSpec::Scripted(vec![
                 turn(
                     "requesting approval",
@@ -448,11 +648,37 @@ pub fn builtin_cases() -> Vec<EvalCase> {
                 turn("done", vec![]),
             ]),
             grader: GraderSpec::BuiltIn,
+            engine: EngineOverrides::default(),
+            interactions: vec![Interaction::ResolveApproval {
+                outcome: ApprovalOutcome::Approve,
+            }],
+            assertions: vec![
+                Assertion::RequiredEvent {
+                    event: "approval_pending".into(),
+                    failure_class: FailureClass::ToolDesign,
+                },
+                Assertion::RequiredEvent {
+                    event: "approval_resolved".into(),
+                    failure_class: FailureClass::ToolDesign,
+                },
+                Assertion::FilePresent {
+                    path: "approved.txt".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::SessionState {
+                    run_state: "idle".into(),
+                    stop_reason: "finished".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+            ],
         },
         EvalCase {
             name: "plan_survives_compaction",
             prompt: "make a plan and compact",
-            environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture { files: vec![] }),
+            environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture {
+                files: vec![],
+                tool_behavior: FixtureToolBehavior::Normal,
+            }),
             provider: ProviderSourceSpec::Scripted(vec![
                 turn(
                     "plan",
@@ -469,6 +695,28 @@ pub fn builtin_cases() -> Vec<EvalCase> {
                 turn("done", vec![]),
             ]),
             grader: GraderSpec::BuiltIn,
+            engine: EngineOverrides {
+                chunk_idle_timeout: None,
+                context_window: Some(1),
+            },
+            interactions: vec![Interaction::CompactNow],
+            assertions: vec![
+                Assertion::PlanPresent {
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::PlanInSystemMessage {
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::RequiredEvent {
+                    event: "turn_finished".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+                Assertion::SessionState {
+                    run_state: "idle".into(),
+                    stop_reason: "finished".into(),
+                    failure_class: FailureClass::ToolFailure,
+                },
+            ],
         },
     ]
 }
@@ -499,10 +747,15 @@ pub async fn run_builtin_case(case: &EvalCase) -> Result<CaseReport, EvalError> 
     };
     let provider = ScriptedProvider::new(script.clone());
     let provider_requests = provider.clone();
+    let tool_behavior = match &case.environment {
+        ExecutionEnvironmentSpec::LocalFixture(fixture) => fixture.tool_behavior.clone(),
+        ExecutionEnvironmentSpec::External { .. } => {
+            unreachable!("external environment returned above")
+        }
+    };
     let tool = Arc::new(FixtureTools {
         workspace: temp.path().to_path_buf(),
-        fail_writes: case.name == "failed_write_has_no_created_event",
-        approval_required: case.name == "approval_pending_resumes",
+        behavior: tool_behavior,
     });
     let mut engine = TurnEngine::new(
         provider,
@@ -513,50 +766,69 @@ pub async fn run_builtin_case(case: &EvalCase) -> Result<CaseReport, EvalError> 
         PermissionMode::Auto,
         "scripted",
     );
-    if case.name == "hanging_turn_converges" {
-        engine.set_chunk_idle_timeout(Duration::from_millis(5));
+    if let Some(timeout) = case.engine.chunk_idle_timeout {
+        engine.set_chunk_idle_timeout(timeout);
     }
     let engine = Arc::new(engine);
-    if case.name == "plan_survives_compaction" {
+    if let Some(context_window) = case.engine.context_window {
         engine
             .set_resolved_capabilities(Caps {
-                context_window: Some(1),
+                context_window: Some(context_window),
                 context_window_source: Some("trajectory_eval".into()),
                 ..Caps::default()
             })
             .await;
     }
-    let _result = match case.name {
-        "steering_is_consumed" => {
-            let running_engine = engine.clone();
-            let prompt = case.prompt.to_owned();
-            let submit = tokio::spawn(async move { running_engine.submit_text(prompt).await });
-            tokio::time::sleep(Duration::from_millis(1)).await;
-            let steering = engine.queue_steering("new direction").await?;
-            let result = submit
-                .await
-                .map_err(|error| EvalError::Fixture(error.to_string()))?;
-            let _ = steering.await;
-            result
-        }
-        "approval_pending_resumes" => {
-            let pending = engine.submit_text(case.prompt).await;
-            if let Err(EngineError::ApprovalPending(call_id)) = pending {
-                engine
-                    .resolve_approval(&call_id, ApprovalOutcome::Approve)
-                    .await
-            } else {
-                pending
+    let running_engine = engine.clone();
+    let prompt = case.prompt.to_owned();
+    let mut submit = Some(tokio::spawn(async move {
+        running_engine.submit_text(prompt).await
+    }));
+    let mut submit_result = None;
+    for interaction in &case.interactions {
+        match interaction {
+            Interaction::QueueSteering { after_ms, text } => {
+                tokio::time::sleep(Duration::from_millis(*after_ms)).await;
+                let steering = engine.queue_steering(text.clone()).await?;
+                let _ = steering.await;
             }
-        }
-        _ => {
-            let result = engine.submit_text(case.prompt).await;
-            if case.name == "plan_survives_compaction" {
+            Interaction::ResolveApproval { outcome } => {
+                let pending = submit
+                    .take()
+                    .expect("approval interaction has one submit")
+                    .await
+                    .map_err(|error| EvalError::Fixture(error.to_string()))?;
+                let result = if let Err(EngineError::ApprovalPending(call_id)) = pending {
+                    engine.resolve_approval(&call_id, *outcome).await
+                } else {
+                    pending
+                };
+                submit_result = Some(result);
+            }
+            Interaction::CompactNow => {
+                if submit_result.is_none() {
+                    submit_result = Some(
+                        submit
+                            .take()
+                            .expect("compaction interaction has one submit")
+                            .await
+                            .map_err(|error| EvalError::Fixture(error.to_string()))?,
+                    );
+                }
                 engine.compact_now().await?;
             }
-            result
         }
-    };
+    }
+    if submit_result.is_none() {
+        submit_result = Some(
+            submit
+                .take()
+                .expect("submit result has one task")
+                .await
+                .map_err(|error| EvalError::Fixture(error.to_string()))?,
+        );
+    }
+    let _result = submit_result.expect("submit result recorded");
     let events = store
         .load_session_events(&session_id)
         .map_err(|error| EvalError::Store(error.to_string()))?;
@@ -565,6 +837,7 @@ pub async fn run_builtin_case(case: &EvalCase) -> Result<CaseReport, EvalError> 
         .map_err(|error| EvalError::Store(error.to_string()))?
         .ok_or_else(|| EvalError::Store("session disappeared".into()))?;
     let files = walk_files(temp.path())?;
+    let files_empty = files.is_empty();
     let plan_present = store
         .load_plan(&session_id)
         .map_err(|error| EvalError::Store(error.to_string()))?
@@ -585,8 +858,22 @@ pub async fn run_builtin_case(case: &EvalCase) -> Result<CaseReport, EvalError> 
         })
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let (required_events, forbidden_events, expected_stop, expected_state) =
-        expectations(case.name);
+    let required_events = case
+        .assertions
+        .iter()
+        .filter_map(|assertion| match assertion {
+            Assertion::RequiredEvent { event, .. } => Some(event.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let forbidden_events = case
+        .assertions
+        .iter()
+        .filter_map(|assertion| match assertion {
+            Assertion::ForbiddenEvent { event, .. } => Some(event.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     let proof = Proof {
         required_events: required_events.clone(),
         forbidden_events: forbidden_events.clone(),
@@ -600,14 +887,18 @@ pub async fn run_builtin_case(case: &EvalCase) -> Result<CaseReport, EvalError> 
         plan_present,
         plan_in_system_message,
     };
+    let iterations = events
+        .iter()
+        .filter_map(|event| {
+            (event.event["type"] == "iteration_stats")
+                .then(|| event.event.pointer("/working_event/payload/iteration"))
+                .flatten()
+                .and_then(Value::as_u64)
+        })
+        .collect::<HashSet<_>>()
+        .len();
     let cost = TrajectoryCost {
-        rounds: events
-            .iter()
-            .filter(|event| {
-                event.event.pointer("/working_event/event_type")
-                    == Some(&Value::String("status_update".into()))
-            })
-            .count(),
+        iterations,
         tool_calls: store
             .load_tool_calls(&session_id)
             .map_err(|error| EvalError::Store(error.to_string()))?
@@ -625,67 +916,46 @@ pub async fn run_builtin_case(case: &EvalCase) -> Result<CaseReport, EvalError> 
             .map(|usage| usage.output_tokens)
             .sum(),
     };
-    let mut failures = Vec::new();
-    let expected_ok = expected_stop == stored_session.stop_reason
-        && expected_state == stored_session.run_state
-        && required_events
-            .iter()
-            .all(|event| event_types.iter().any(|item| item == event))
-        && forbidden_events
-            .iter()
-            .all(|event| !event_types.iter().any(|item| item == event))
-        && match case.name {
-            "nested_directory_write" => temp.path().join("nested/dir/result.txt").is_file(),
-            "failed_write_has_no_created_event" => {
-                !event_types.iter().any(|event| event == "file_created")
-            }
-            "outside_workspace_rejected" => !temp
-                .path()
-                .parent()
-                .is_some_and(|parent| parent.join("escape.txt").exists()),
-            "approval_pending_resumes" => temp.path().join("approved.txt").is_file(),
-            "plan_survives_compaction" => plan_present && plan_in_system_message,
-            _ => true,
-        };
-    if !expected_ok {
-        failures.push(format!(
-            "outcome or proof assertion failed (events: {event_types:?})"
-        ));
-    }
+    let failures = case
+        .assertions
+        .iter()
+        .filter_map(|assertion| {
+            let passed = match assertion {
+                Assertion::RequiredEvent { event, .. } => {
+                    event_types.iter().any(|item| item == event)
+                }
+                Assertion::ForbiddenEvent { event, .. } => {
+                    !event_types.iter().any(|item| item == event)
+                }
+                Assertion::SessionState {
+                    run_state,
+                    stop_reason,
+                    ..
+                } => {
+                    stored_session.run_state == *run_state
+                        && stored_session.stop_reason == *stop_reason
+                }
+                Assertion::FilePresent { path, .. } => fixture_file_exists(temp.path(), path),
+                Assertion::FileAbsent { path, .. } => !fixture_file_exists(temp.path(), path),
+                Assertion::FilesEmpty { .. } => files_empty,
+                Assertion::PlanPresent { .. } => plan_present,
+                Assertion::PlanInSystemMessage { .. } => plan_in_system_message,
+            };
+            (!passed).then(|| AssertionFailure {
+                assertion: assertion.clone(),
+                failure_class: assertion.failure_class().clone(),
+                message: format!("assertion failed; events: {event_types:?}"),
+            })
+        })
+        .collect::<Vec<_>>();
     Ok(CaseReport {
         case: case.name.into(),
         passed: failures.is_empty(),
-        failure_class: (!failures.is_empty()).then_some(FailureClass::ToolFailure),
-        failure: (!failures.is_empty()).then(|| failures.join("; ")),
+        failures,
         outcome,
         proof,
         cost,
     })
-}
-
-fn expectations(name: &str) -> (Vec<String>, Vec<String>, &str, &str) {
-    match name {
-        "hanging_turn_converges" => (
-            vec!["provider_stream_timeout".into()],
-            vec![],
-            "provider_error",
-            "error",
-        ),
-        "steering_is_consumed" => (vec!["steering_applied".into()], vec![], "finished", "idle"),
-        "approval_pending_resumes" => (
-            vec!["approval_pending".into(), "approval_resolved".into()],
-            vec![],
-            "finished",
-            "idle",
-        ),
-        "outside_workspace_rejected" | "failed_write_has_no_created_event" => (
-            vec!["write_file_completed".into()],
-            vec!["file_created".into()],
-            "finished",
-            "idle",
-        ),
-        _ => (vec!["turn_finished".into()], vec![], "finished", "idle"),
-    }
 }
 
 fn walk_files(root: &Path) -> Result<Vec<String>, EvalError> {
@@ -721,15 +991,14 @@ mod tests {
         for case in builtin_cases() {
             let report = run_builtin_case(&case).await.unwrap();
             assert!(
-                report.failure.is_none(),
+                report.failures.is_empty(),
                 "{}: {:?}\n{:?}",
                 case.name,
-                report.failure,
+                report.failures,
                 report
             );
             assert!(!report.outcome.session_stop_reason.is_empty());
             assert!(!report.proof.required_events.is_empty());
-            assert!(report.cost.rounds > 0 || case.name == "hanging_turn_converges");
         }
     }
 
@@ -746,6 +1015,9 @@ mod tests {
                 fail_to_pass: vec!["python -m pytest tests/test_regression.py".into()],
                 pass_to_pass: vec!["python -m pytest tests/test_existing.py".into()],
             },
+            engine: EngineOverrides::default(),
+            interactions: vec![],
+            assertions: vec![],
         };
         assert!(matches!(
             case.environment,
@@ -753,5 +1025,32 @@ mod tests {
         ));
         assert!(matches!(case.provider, ProviderSourceSpec::External));
         assert!(matches!(case.grader, GraderSpec::ExternalTests { .. }));
+    }
+
+    #[test]
+    fn builtin_cases_are_unique_and_have_outcome_and_proof_assertions() {
+        let cases = builtin_cases();
+        let names = cases.iter().map(|case| case.name).collect::<HashSet<_>>();
+        assert_eq!(names.len(), cases.len());
+        for case in cases {
+            assert!(case.assertions.iter().any(|assertion| {
+                matches!(
+                    assertion,
+                    Assertion::FilePresent { .. }
+                        | Assertion::FileAbsent { .. }
+                        | Assertion::FilesEmpty { .. }
+                        | Assertion::PlanPresent { .. }
+                        | Assertion::PlanInSystemMessage { .. }
+                )
+            }));
+            assert!(case.assertions.iter().any(|assertion| {
+                matches!(
+                    assertion,
+                    Assertion::RequiredEvent { .. }
+                        | Assertion::ForbiddenEvent { .. }
+                        | Assertion::SessionState { .. }
+                )
+            }));
+        }
     }
 }

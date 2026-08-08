@@ -244,6 +244,7 @@ OPCOS 现状：`ProviderRequest`/`AssistantTurn`/`TokenUsage` 是 provider-neutr
 - 依据：Run / Trace / Thread 三层；正例 + 反例；失败分类；“A pull request, line count, plan, token total… None establishes value on its own.”
 - 形状：`crates/opcos-eval`（或 `crates/opcos-engine/tests/trajectories`）提供 case 定义（初始 workspace fixture、prompt、脚本化 provider 响应或录制回放）、runner、grader（终态断言 + 事件断言 + 成本记录）与失败分类枚举（prompt / tool design / model limitation / tool failure / data gap）。
 - 首批用例直接来自已修过的真实故障：嵌套目录写入、写失败不得产生 `Created` 行、工作区外写入必须拒绝、卡死 turn 必须收敛、运行中 steering 必须被消费、approval pending 后恢复、压缩后 plan 仍在 system message。
+- 当前骨架验证的是 engine 侧编排不变量；工具行为由 fixture executor 替身提供，不等同于 `src-tauri` 的生产工具实现。要覆盖真实工具语义，后续需将 `src-tauri` 工具实现抽成独立 crate，本次不做。
 - 验收：`cargo test -p opcos-eval` 在 CI 跑；每个 case 输出 outcome / proof / trajectory cost 三段结果。
 
 ### P1-4 恢复语义与故障分类（对应 §2.11）
