@@ -7251,7 +7251,8 @@ function McpManage({
       (event) => {
         if (
           active &&
-          (!event.payload.session_id || event.payload.session_id === selected?.id) &&
+          (!event.payload.session_id ||
+            event.payload.session_id === selected?.id) &&
           event.payload.error
         ) {
           onError(event.payload.error);
