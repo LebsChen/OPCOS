@@ -231,6 +231,7 @@ OPCOS 现状：`ProviderRequest`/`AssistantTurn`/`TokenUsage` 是 provider-neutr
 - 形状：所有工具失败返回稳定结构 `{"error": {"code", "invariant", "target", "repair", "retry": "no|same|adjusted", "retrieval"}}`，同时保留 `error` 的人类可读摘要以兼容现有 timeline 与测试。
 - 覆盖：preflight denial、policy denial、interrupt、path rejection、`edit_file` 各类校验失败、远端 unsupported、host I/O、MCP transport/auth 失败。
 - 验收：engine 单测断言每个失败分支的 code/repair 非空；`_opcos_*` 内部字段仍被 strip；scrubber 仍生效；timeline 显示摘要而非整包 JSON。
+- 当前分类是跨 `ToolExecutor` 字符串边界的启发式规则；长期应让 `ToolExecutor` 错误类型直接携带 code（后续项，本次不做）。
 
 ### P0-2 渐进式工具披露 + 工具目录检索（对应 §2.3，任务 #26）
 

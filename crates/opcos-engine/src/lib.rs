@@ -81,6 +81,7 @@ pub enum ToolErrorCode {
     HostIo,
     McpTransport,
     McpAuth,
+    Unclassified,
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -166,141 +167,230 @@ fn policy_tool_error(call: &ToolCall, summary: impl Into<String>) -> Value {
     )
 }
 
+struct ToolErrorRule {
+    pattern: &'static str,
+    matches: fn(&str) -> bool,
+    code: ToolErrorCode,
+    invariant: &'static str,
+    repair: &'static str,
+    retry: ToolErrorRetry,
+    retrieval: Option<&'static str>,
+}
+
+fn contains(text: &str, pattern: &str) -> bool {
+    text.contains(pattern)
+}
+
+fn path_rejected(text: &str) -> bool {
+    (contains(text, "outside") && (contains(text, "workspace") || contains(text, "bound host")))
+        || contains(text, "path rejected")
+}
+
+fn invalid_arguments(text: &str) -> bool {
+    [
+        "missing string argument",
+        "missing array argument",
+        "missing old_string",
+        "missing new_string",
+        "empty old_string",
+        "edits must contain",
+        "ask_user must be handled",
+    ]
+    .iter()
+    .any(|pattern| contains(text, pattern))
+}
+
+fn policy_denied(text: &str) -> bool {
+    contains(text, "denied by policy") || contains(text, "blocked by policy")
+}
+
+fn preflight_denied(text: &str) -> bool {
+    contains(text, "preflight") || contains(text, "approval")
+}
+
+fn mcp_auth(text: &str) -> bool {
+    contains(text, "mcp") && (contains(text, "auth") || contains(text, "oauth"))
+}
+
+fn mcp_transport(text: &str) -> bool {
+    contains(text, "mcp")
+        && [
+            "transport",
+            "disconnect",
+            "timed out",
+            "timeout",
+            "unavailable",
+        ]
+        .iter()
+        .any(|pattern| contains(text, pattern))
+}
+
+fn remote_unsupported(text: &str) -> bool {
+    contains(text, "unsupported") || contains(text, "unavailable")
+}
+
+fn host_io(text: &str) -> bool {
+    contains(text, "host i/o failed")
+        || contains(text, "could not verify edit version")
+        || contains(text, "failed to apply atomic edit")
+}
+
+// These rules classify summaries across ToolExecutor's String boundary.
+// If a producer changes its wording, the rule intentionally degrades to unclassified.
+const TOOL_ERROR_RULES: &[ToolErrorRule] = &[
+    ToolErrorRule {
+        pattern: "interrupted",
+        matches: |text| contains(text, "interrupted"),
+        code: ToolErrorCode::Interrupted,
+        invariant: "the tool call must be allowed to run to completion",
+        repair: "retry the same call when the interruption is no longer active",
+        retry: ToolErrorRetry::Same,
+        retrieval: None,
+    },
+    ToolErrorRule {
+        pattern: "path outside workspace or rejected",
+        matches: path_rejected,
+        code: ToolErrorCode::PathOutsideWorkspace,
+        invariant: "tool paths must remain inside the bound workspace",
+        repair: "use a workspace-relative path and retry",
+        retry: ToolErrorRetry::Adjusted,
+        retrieval: Some("read_file or list_dir can inspect workspace-relative paths"),
+    },
+    ToolErrorRule {
+        pattern: "old_string was not found",
+        matches: |text| contains(text, "old_string was not found"),
+        code: ToolErrorCode::EditAnchorNotFound,
+        invariant: "each edit anchor must occur exactly once in the current file",
+        repair: "read the file again and retry with an exact, longer anchor",
+        retry: ToolErrorRetry::Adjusted,
+        retrieval: Some("read_file returns the current file content"),
+    },
+    ToolErrorRule {
+        pattern: "old_string matched",
+        matches: |text| contains(text, "old_string matched"),
+        code: ToolErrorCode::EditAnchorAmbiguous,
+        invariant: "each edit anchor must match exactly one location",
+        repair: "retry with more surrounding context so the anchor is unique",
+        retry: ToolErrorRetry::Adjusted,
+        retrieval: Some("read_file returns the current file content"),
+    },
+    ToolErrorRule {
+        pattern: "edits overlap",
+        matches: |text| contains(text, "edits overlap"),
+        code: ToolErrorCode::EditEditsOverlap,
+        invariant: "edit ranges must not overlap in the original file",
+        repair: "adjust the edit ranges and retry as one atomic edit",
+        retry: ToolErrorRetry::Adjusted,
+        retrieval: None,
+    },
+    ToolErrorRule {
+        pattern: "file changed externally",
+        matches: |text| contains(text, "file changed externally"),
+        code: ToolErrorCode::EditFileChanged,
+        invariant: "the file must remain unchanged between read and atomic write",
+        repair: "read the file again, reconcile the change, and retry",
+        retry: ToolErrorRetry::Adjusted,
+        retrieval: Some("read_file returns the current file content"),
+    },
+    ToolErrorRule {
+        pattern: "edit_file or ask_user argument validation",
+        matches: invalid_arguments,
+        code: ToolErrorCode::InvalidArguments,
+        invariant: "tool arguments must satisfy the tool schema",
+        repair: "correct the missing or invalid argument and retry",
+        retry: ToolErrorRetry::Adjusted,
+        retrieval: None,
+    },
+    ToolErrorRule {
+        pattern: "denied by policy or blocked by policy",
+        matches: policy_denied,
+        code: ToolErrorCode::PolicyDenied,
+        invariant: "the active permission policy must allow this tool target",
+        repair: "request approval or adjust the permission policy before retrying",
+        retry: ToolErrorRetry::Adjusted,
+        retrieval: None,
+    },
+    ToolErrorRule {
+        pattern: "denied by user or approval denial",
+        matches: |text| contains(text, "denied by user") || contains(text, "approval denial"),
+        code: ToolErrorCode::ApprovalDenied,
+        invariant: "the user must approve the requested tool action",
+        repair: "ask for approval again only after explaining the required action",
+        retry: ToolErrorRetry::No,
+        retrieval: None,
+    },
+    ToolErrorRule {
+        pattern: "preflight or approval",
+        matches: preflight_denied,
+        code: ToolErrorCode::PreflightDenied,
+        invariant: "tool preflight requirements must be satisfied before execution",
+        repair: "resolve the preflight requirement and retry with the permitted action",
+        retry: ToolErrorRetry::Adjusted,
+        retrieval: None,
+    },
+    ToolErrorRule {
+        pattern: "mcp authentication",
+        matches: mcp_auth,
+        code: ToolErrorCode::McpAuth,
+        invariant: "the MCP server must accept the configured authentication",
+        repair: "authenticate the MCP server, then retry the tool call",
+        retry: ToolErrorRetry::Adjusted,
+        retrieval: Some("inspect the MCP server authentication status"),
+    },
+    ToolErrorRule {
+        pattern: "mcp transport, disconnect, timeout, or unavailable",
+        matches: mcp_transport,
+        code: ToolErrorCode::McpTransport,
+        invariant: "the MCP transport must remain connected and responsive",
+        repair: "restore the MCP connection and retry the same call",
+        retry: ToolErrorRetry::Same,
+        retrieval: Some("inspect the MCP server connection status"),
+    },
+    ToolErrorRule {
+        pattern: "unsupported or unavailable non-MCP capability",
+        matches: remote_unsupported,
+        code: ToolErrorCode::RemoteUnsupported,
+        invariant: "the selected host must support the requested capability",
+        repair: "use a supported tool or switch to a host that exposes this capability",
+        retry: ToolErrorRetry::No,
+        retrieval: None,
+    },
+    ToolErrorRule {
+        pattern: "host I/O or edit application failure",
+        matches: host_io,
+        code: ToolErrorCode::HostIo,
+        invariant: "the host must complete the requested tool operation",
+        repair: "inspect the host error, correct the environment, and retry",
+        retry: ToolErrorRetry::Same,
+        retrieval: None,
+    },
+];
+
 fn classify_tool_error(call: &ToolCall, summary: impl Into<String>) -> Value {
     let summary = summary.into();
     let lower = summary.to_ascii_lowercase();
-    let target = tool_error_target(call);
-    let (code, invariant, repair, retry, retrieval) = if lower.contains("interrupted") {
-        (
-            ToolErrorCode::Interrupted,
-            "the tool call must be allowed to run to completion",
-            "retry the same call when the interruption is no longer active",
-            ToolErrorRetry::Same,
-            None,
-        )
-    } else if (lower.contains("outside")
-        && (lower.contains("workspace") || lower.contains("bound host")))
-        || lower.contains("path rejected")
-    {
-        (
-            ToolErrorCode::PathOutsideWorkspace,
-            "tool paths must remain inside the bound workspace",
-            "use a workspace-relative path and retry",
-            ToolErrorRetry::Adjusted,
-            Some("read_file or list_dir can inspect workspace-relative paths".into()),
-        )
-    } else if lower.contains("old_string was not found") {
-        (
-            ToolErrorCode::EditAnchorNotFound,
-            "each edit anchor must occur exactly once in the current file",
-            "read the file again and retry with an exact, longer anchor",
-            ToolErrorRetry::Adjusted,
-            Some("read_file returns the current file content".into()),
-        )
-    } else if lower.contains("old_string matched") {
-        (
-            ToolErrorCode::EditAnchorAmbiguous,
-            "each edit anchor must match exactly one location",
-            "retry with more surrounding context so the anchor is unique",
-            ToolErrorRetry::Adjusted,
-            Some("read_file returns the current file content".into()),
-        )
-    } else if lower.contains("edits overlap") {
-        (
-            ToolErrorCode::EditEditsOverlap,
-            "edit ranges must not overlap in the original file",
-            "adjust the edit ranges and retry as one atomic edit",
-            ToolErrorRetry::Adjusted,
-            None,
-        )
-    } else if lower.contains("file changed externally") {
-        (
-            ToolErrorCode::EditFileChanged,
-            "the file must remain unchanged between read and atomic write",
-            "read the file again, reconcile the change, and retry",
-            ToolErrorRetry::Adjusted,
-            Some("read_file returns the current file content".into()),
-        )
-    } else if lower.contains("missing string argument")
-        || lower.contains("missing array argument")
-        || lower.contains("missing old_string")
-        || lower.contains("missing new_string")
-        || lower.contains("empty old_string")
-        || lower.contains("edits must contain")
-        || lower.contains("ask_user must be handled")
-    {
-        (
-            ToolErrorCode::InvalidArguments,
-            "tool arguments must satisfy the tool schema",
-            "correct the missing or invalid argument and retry",
-            ToolErrorRetry::Adjusted,
-            None,
-        )
-    } else if lower.contains("denied by policy") || lower.contains("blocked") {
-        (
-            ToolErrorCode::PolicyDenied,
-            "the active permission policy must allow this tool target",
-            "request approval or adjust the permission policy before retrying",
-            ToolErrorRetry::Adjusted,
-            None,
-        )
-    } else if lower.contains("denied by user") || lower.contains("approval denial") {
-        (
-            ToolErrorCode::ApprovalDenied,
-            "the user must approve the requested tool action",
-            "ask for approval again only after explaining the required action",
-            ToolErrorRetry::No,
-            None,
-        )
-    } else if lower.contains("preflight") || lower.contains("approval") {
-        (
-            ToolErrorCode::PreflightDenied,
-            "tool preflight requirements must be satisfied before execution",
-            "resolve the preflight requirement and retry with the permitted action",
-            ToolErrorRetry::Adjusted,
-            None,
-        )
-    } else if lower.contains("unsupported") || lower.contains("unavailable") {
-        (
-            ToolErrorCode::RemoteUnsupported,
-            "the selected host must support the requested capability",
-            "use a supported tool or switch to a host that exposes this capability",
-            ToolErrorRetry::No,
-            None,
-        )
-    } else if lower.contains("mcp") && (lower.contains("auth") || lower.contains("oauth")) {
-        (
-            ToolErrorCode::McpAuth,
-            "the MCP server must accept the configured authentication",
-            "authenticate the MCP server, then retry the tool call",
-            ToolErrorRetry::Adjusted,
-            Some("inspect the MCP server authentication status".into()),
-        )
-    } else if lower.contains("mcp")
-        && (lower.contains("transport")
-            || lower.contains("disconnect")
-            || lower.contains("timed out")
-            || lower.contains("timeout"))
-    {
-        (
-            ToolErrorCode::McpTransport,
-            "the MCP transport must remain connected and responsive",
-            "restore the MCP connection and retry the same call",
-            ToolErrorRetry::Same,
-            Some("inspect the MCP server connection status".into()),
-        )
-    } else {
-        (
-            ToolErrorCode::HostIo,
-            "the host must complete the requested tool operation",
-            "inspect the host error, correct the environment, and retry",
-            ToolErrorRetry::Same,
-            None,
-        )
+    let rule = TOOL_ERROR_RULES.iter().find(|rule| (rule.matches)(&lower));
+    let fallback = ToolErrorRule {
+        pattern: "unmatched",
+        matches: |_| true,
+        code: ToolErrorCode::Unclassified,
+        invariant: "the failure reason is not classified by the current tool error rules",
+        repair: "read the error summary, then adjust the parameters or use another approach",
+        retry: ToolErrorRetry::Same,
+        retrieval: None,
     };
+    let rule = rule.unwrap_or(&fallback);
+    let _ = rule.pattern;
     structured_tool_error(
         summary,
-        ToolErrorEnvelope::new(code, invariant, target, repair, retry, retrieval),
+        ToolErrorEnvelope::new(
+            rule.code,
+            rule.invariant,
+            tool_error_target(call),
+            rule.repair,
+            rule.retry,
+            rule.retrieval.map(str::to_owned),
+        ),
     )
 }
 
@@ -5409,8 +5499,8 @@ mod tests {
             result.get("error").and_then(Value::as_str),
             Some("destructive command blocked")
         );
-        assert_eq!(result["error_details"]["code"], "policy_denied");
-        assert_eq!(result["error_details"]["retry"], "adjusted");
+        assert_eq!(result["error_details"]["code"], "unclassified");
+        assert_eq!(result["error_details"]["retry"], "same");
     }
 
     #[tokio::test]
@@ -6722,32 +6812,39 @@ mod tests {
             name: "edit_file".into(),
             arguments: json!({"path":"src/lib.rs"}),
         };
+        for rule in TOOL_ERROR_RULES {
+            assert!(!rule.pattern.is_empty());
+            assert!(!rule.invariant.is_empty());
+            assert!(!rule.repair.is_empty());
+        }
         let cases = [
             ("shell approval required", "preflight_denied", "adjusted"),
             ("tool call denied by policy", "policy_denied", "adjusted"),
+            ("blocked by policy", "policy_denied", "adjusted"),
+            ("port blocked", "unclassified", "same"),
             ("tool call interrupted", "interrupted", "same"),
             (
-                "path is outside local workspace",
+                "path is outside the configured remote workspace",
                 "path_outside_workspace",
                 "adjusted",
             ),
             (
-                "edit 0 old_string was not found",
+                "edit 0 old_string was not found; no close candidate found; include more surrounding context",
                 "edit_anchor_not_found",
                 "adjusted",
             ),
             (
-                "edit 0 old_string matched 2 times",
+                "edit 0 old_string matched 2 times at lines [3, 8]; provide more context",
                 "edit_anchor_ambiguous",
                 "adjusted",
             ),
             (
-                "edits overlap in the original file",
+                "edits overlap in the original file; no changes were applied",
                 "edit_edits_overlap",
                 "adjusted",
             ),
             (
-                "file changed externally after it was read",
+                "file changed externally after it was read; no changes were applied",
                 "edit_file_changed",
                 "adjusted",
             ),
@@ -6757,9 +6854,25 @@ mod tests {
                 "no",
             ),
             ("local host I/O failed: disk full", "host_io", "same"),
+            (
+                "could not verify edit version: stale read",
+                "host_io",
+                "same",
+            ),
+            (
+                "MCP server unavailable: connection refused",
+                "mcp_transport",
+                "same",
+            ),
+            ("MCP transport unavailable", "mcp_transport", "same"),
             ("MCP transport error", "mcp_transport", "same"),
             ("MCP server authentication required", "mcp_auth", "adjusted"),
             ("tool call denied by user", "approval_denied", "no"),
+            (
+                "provider returned an unexpected response",
+                "unclassified",
+                "same",
+            ),
         ];
         for (summary, code, retry) in cases {
             let result = classify_tool_error(&call, summary);
@@ -6834,6 +6947,8 @@ mod tests {
                 Some("known-secret-value".into()),
             ),
         );
+        let mut result = result;
+        result["_opcos_not_executed"] = json!(true);
         engine
             .persist_tool_results(1, &[call], vec![("secret-error-call".into(), result)])
             .await
@@ -6843,6 +6958,7 @@ mod tests {
                 .unwrap();
         assert!(!serialized.contains("known-secret-value"));
         assert!(serialized.contains("[REDACTED]"));
+        assert!(!serialized.contains("_opcos_not_executed"));
     }
 
     #[tokio::test]
@@ -8620,7 +8736,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result[0]["error"], "write failed");
-        assert_eq!(result[0]["error_details"]["code"], "host_io");
+        assert_eq!(result[0]["error_details"]["code"], "unclassified");
         assert_eq!(result[0]["error_details"]["retry"], "same");
         let updates = store
             .load_audit(Some("failed-write"))
