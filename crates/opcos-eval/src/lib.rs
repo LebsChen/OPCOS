@@ -40,7 +40,7 @@ use std::{
     collections::{HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -550,14 +550,35 @@ impl ToolExecutor for FixtureTools {
             }
             "edit_file" => {
                 let path = checked_path(&self.workspace, arguments["path"].as_str().unwrap_or(""))?;
-                let old = arguments["old_string"].as_str().unwrap_or_default();
-                let new = arguments["new_string"].as_str().unwrap_or_default();
                 let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-                if content.matches(old).count() != 1 {
-                    return Err("edit anchor must match exactly once".into());
+                let edits = arguments
+                    .get("edits")
+                    .and_then(Value::as_array)
+                    .map(|edits| {
+                        edits
+                            .iter()
+                            .map(|edit| {
+                                (
+                                    edit["old_string"].as_str().unwrap_or_default(),
+                                    edit["new_string"].as_str().unwrap_or_default(),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_else(|| {
+                        vec![(
+                            arguments["old_string"].as_str().unwrap_or_default(),
+                            arguments["new_string"].as_str().unwrap_or_default(),
+                        )]
+                    });
+                let mut edited = content.clone();
+                for (old, new) in edits {
+                    if content.matches(old).count() != 1 {
+                        return Err("edit anchor must match exactly once".into());
+                    }
+                    edited = edited.replacen(old, new, 1);
                 }
-                fs::write(path, content.replacen(old, new, 1))
-                    .map_err(|error| error.to_string())?;
+                fs::write(path, edited).map_err(|error| error.to_string())?;
                 Ok(json!({"status":"edited"}))
             }
             "append_file" => {
@@ -1019,7 +1040,7 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             "Write the requested content into a nested directory.",
             HeldIn,
             vec![],
-            "Create nested/result.txt containing alpha.",
+            "Create nested/result.txt containing exactly the single line alpha with no trailing newline.",
             vec![vec![call(
                 "task-1",
                 "write_file",
@@ -1037,7 +1058,7 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             vec![vec![call(
                 "task-2",
                 "edit_file",
-                json!({"path":"config.txt","old_string":"mode=old","new_string":"mode=new"}),
+                json!({"path":"config.txt","edits":[{"old_string":"mode=old","new_string":"mode=new"}]}),
             )]],
             vec![("config.txt", "mode=new\nkeep=yes\n")],
             "grep -Fx 'mode=new' config.txt && grep -Fx 'keep=yes' config.txt",
@@ -1047,11 +1068,11 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             "Append a record to an existing file.",
             HeldIn,
             vec![("log.txt", "start\n")],
-            "Append done to log.txt.",
+            "Append exactly the line done followed by a newline to log.txt, preserving its existing start line.",
             vec![vec![call(
                 "task-3",
-                "append_file",
-                json!({"path":"log.txt","content":"done\n"}),
+                "run_shell",
+                json!({"command":"printf 'done\\n' >> log.txt"}),
             )]],
             vec![("log.txt", "start\ndone\n")],
             "test \"$(tail -n 1 log.txt)\" = done",
@@ -1061,7 +1082,7 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             "Use an existing file's value to produce a derived artifact.",
             HeldIn,
             vec![("source.txt", "source-value")],
-            "Read source.txt and write its value to copied.txt.",
+            "Read source.txt and write its exact contents, source-value with no trailing newline, to copied.txt.",
             vec![
                 vec![call("task-4a", "read_file", json!({"path":"source.txt"}))],
                 vec![call(
@@ -1099,7 +1120,7 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             "Recover from an absolute path rejection without creating the target.",
             HeldIn,
             vec![],
-            "Write the result to local.txt, never to an absolute path.",
+            "Write exactly local with no trailing newline to local.txt, never to an absolute path.",
             vec![
                 vec![call(
                     "task-6a",
@@ -1120,7 +1141,7 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             "Use an offline shell command to create the requested artifact.",
             HeldIn,
             vec![],
-            "Create shell.txt with the word shell.",
+            "Create shell.txt with exactly shell and no trailing newline using an offline shell command.",
             vec![vec![call(
                 "task-7",
                 "run_shell",
@@ -1134,7 +1155,7 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             "Recover after a deterministic shell failure.",
             HeldIn,
             vec![],
-            "If the first command fails, correct it and create recovered.txt.",
+            "If the first command fails, correct it and create recovered.txt containing exactly recovered with no trailing newline.",
             vec![
                 vec![call("task-8a", "run_shell", json!({"command":"false"}))],
                 vec![call(
@@ -1151,7 +1172,7 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             "Complete a dependent directory and file creation sequence.",
             HeldIn,
             vec![],
-            "Create reports/summary.txt containing ready.",
+            "Create reports/summary.txt containing exactly ready with no trailing newline.",
             vec![
                 vec![call(
                     "task-9a",
@@ -1172,11 +1193,11 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             "Edit one field while preserving unrelated file content.",
             HeldIn,
             vec![("settings.ini", "a=1\nb=2\nc=3\n")],
-            "Change b to 9 and preserve a and c.",
+            "Change the line b=2 to exactly b=9 while preserving the exact lines a=1 and c=3 and their newlines.",
             vec![vec![call(
                 "task-10",
                 "edit_file",
-                json!({"path":"settings.ini","old_string":"b=2","new_string":"b=9"}),
+                json!({"path":"settings.ini","edits":[{"old_string":"b=2","new_string":"b=9"}]}),
             )]],
             vec![("settings.ini", "a=1\nb=9\nc=3\n")],
             "grep -Fx 'a=1' settings.ini && grep -Fx 'b=9' settings.ini && grep -Fx 'c=3' settings.ini",
@@ -1186,7 +1207,7 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             "Persist exact multiline output including its final newline.",
             HeldIn,
             vec![],
-            "Write the exact two-line output to exact.txt.",
+            "Write exact.txt with exactly these two lines and a final newline: first line one, second line two.",
             vec![vec![call(
                 "task-11",
                 "write_file",
@@ -1200,7 +1221,7 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             "Produce two independent artifacts with exact contents.",
             HeldIn,
             vec![],
-            "Write left.txt and right.txt.",
+            "Write left.txt with exactly left and no trailing newline, and right.txt with exactly right and no trailing newline.",
             vec![vec![
                 call(
                     "task-12a",
@@ -1225,7 +1246,7 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             vec![vec![call(
                 "task-13",
                 "edit_file",
-                json!({"path":"src/app.txt","old_string":"status=todo","new_string":"status=done"}),
+                json!({"path":"src/app.txt","edits":[{"old_string":"status=todo","new_string":"status=done"}]}),
             )]],
             vec![("src/app.txt", "status=done\n")],
             "grep -Fx 'status=done' src/app.txt",
@@ -1235,7 +1256,7 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             "Avoid a sibling path while producing the requested local artifact.",
             HeldOut,
             vec![],
-            "Recover from ../sibling.txt rejection and write child.txt.",
+            "Recover from ../sibling.txt rejection and write child.txt containing exactly child with no trailing newline.",
             vec![
                 vec![call(
                     "task-14a",
@@ -1256,7 +1277,7 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             "Use an offline shell pipeline to transform a file.",
             HeldOut,
             vec![("input.txt", "beta\nalpha\n")],
-            "Sort input.txt into sorted.txt.",
+            "Sort input.txt line-by-line in ascending order into sorted.txt; its exact contents must be alpha followed by a newline and then beta followed by a newline.",
             vec![vec![call(
                 "task-15",
                 "run_shell",
@@ -1270,7 +1291,7 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             "Recover from a shell command with deterministic stderr.",
             HeldOut,
             vec![],
-            "After the failing command, create fixed.txt.",
+            "After the failing command, create fixed.txt containing exactly fixed with no trailing newline.",
             vec![
                 vec![call(
                     "task-16a",
@@ -1291,7 +1312,7 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             "Create an artifact whose parent directory does not exist yet.",
             HeldOut,
             vec![],
-            "Write nested/deep/output.txt.",
+            "Write nested/deep/output.txt containing exactly deep with no trailing newline.",
             vec![vec![call(
                 "task-17",
                 "write_file",
@@ -1305,7 +1326,7 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             "Replace an existing artifact with the requested exact content.",
             HeldOut,
             vec![("replace.txt", "old")],
-            "Replace replace.txt with new.",
+            "Replace replace.txt so its exact contents are new with no trailing newline.",
             vec![vec![call(
                 "task-18",
                 "write_file",
@@ -1319,7 +1340,7 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             "Read a config value and use it in a dependent output.",
             HeldOut,
             vec![("config.txt", "enabled")],
-            "Read config.txt and write its value to state.txt.",
+            "Read config.txt and write its exact value, enabled with no trailing newline, to state.txt.",
             vec![
                 vec![call("task-19a", "read_file", json!({"path":"config.txt"}))],
                 vec![call(
@@ -1336,7 +1357,7 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             "Write a valid exact JSON artifact.",
             HeldOut,
             vec![],
-            "Write payload.json with the requested JSON.",
+            "Write payload.json with exactly this one-line JSON and no trailing newline: {\"ok\":true,\"count\":2}",
             vec![vec![call(
                 "task-20",
                 "write_file",
@@ -1350,7 +1371,7 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             "Preserve meaningful whitespace in an output artifact.",
             HeldOut,
             vec![],
-            "Write padded.txt exactly with two leading spaces.",
+            "Write padded.txt with exactly two leading spaces followed by the six letters padded, and no trailing newline: `  padded`.",
             vec![vec![call(
                 "task-21",
                 "write_file",
@@ -1364,17 +1385,17 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             "Apply two ordered append operations.",
             HeldOut,
             vec![("events.txt", "one\n")],
-            "Append two ordered events.",
+            "Append exactly the line two followed by a newline, then exactly the line three followed by a newline, to events.txt.",
             vec![
                 vec![call(
                     "task-22a",
-                    "append_file",
-                    json!({"path":"events.txt","content":"two\n"}),
+                    "run_shell",
+                    json!({"command":"printf 'two\\n' >> events.txt"}),
                 )],
                 vec![call(
                     "task-22b",
-                    "append_file",
-                    json!({"path":"events.txt","content":"three\n"}),
+                    "run_shell",
+                    json!({"command":"printf 'three\\n' >> events.txt"}),
                 )],
             ],
             vec![("events.txt", "one\ntwo\nthree\n")],
@@ -1385,7 +1406,7 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             "Recover from a failed write by selecting an alternate output path.",
             HeldOut,
             vec![],
-            "Do not repeat the rejected path; write alternate.txt.",
+            "Do not repeat the rejected path; write alternate.txt containing exactly alternate with no trailing newline.",
             vec![
                 vec![call(
                     "task-23a",
@@ -1406,7 +1427,7 @@ pub fn internal_taskset() -> Vec<VerifierTask> {
             "Create independent summary and checksum artifacts.",
             HeldOut,
             vec![],
-            "Write summary.txt and checksum.txt.",
+            "Write summary.txt with exactly summary and no trailing newline, and checksum.txt with exactly checksum and no trailing newline.",
             vec![vec![
                 call(
                     "task-24a",
@@ -1505,6 +1526,8 @@ where
     let verifier = Command::new("sh")
         .arg(&script_path)
         .current_dir(temp.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map_err(|error| EvalError::Fixture(error.to_string()))?;
     Ok(VerifierTaskReport {
