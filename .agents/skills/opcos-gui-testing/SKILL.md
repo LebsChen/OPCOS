@@ -1314,7 +1314,6 @@ string in the body and ask the agent to quote its first line. Also ask the agent
 
 Devin Secrets Needed: `GH_PAT` (GitHub MCP bearer), `Devin_MCP_COG` (mcp.devin.ai bearer),
 `CF_TOKEN`/`CF_ID` for the Cloudflare provider the agent runs on.
-
 ## MCP round-9 findings (commit `7854e25` and later)
 
 Fixture layout that has proven reusable (keep them out of the repo, e.g. `/home/ubuntu/mcp-mock/`):
