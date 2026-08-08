@@ -1205,154 +1205,150 @@ returned `next_call_id`, never by taking the first database row. A card that say
 engine evidence: verify the corresponding persisted resolution event and that the next tool or
 approval actually starts. When several gated writes are needed, use fresh marker filenames and
 verify the remote file state after each Allow/Deny decision.
-## Testing transcript CSS/layout fixes (chevrons, row wrapping)
 
-Style-only fixes in `web/src/style.css` are picked up by **Vite HMR** in the running Tauri window, so no
-rebuild/restart is needed — but the app must have been started against a Vite instance serving the branch
-checkout. A screenshot of the fixed state alone proves nothing; use a **broken control**:
+## Testing the OPCOS MCP server and `mcp-serve` bridge
 
-1. Screenshot the fixed rows (full-resolution `zoom` on the row strip, window maximized).
-2. Temporarily edit `style.css` back to the pre-fix values, wait ~3 s for HMR, screenshot again.
-3. `git checkout -- web/src/style.css` and screenshot once more to show the fix returning.
+The MCP service runs inside the already-running desktop app on loopback at an ephemeral
+`POST /mcp` endpoint. The app writes its discovery state to
+`<config_dir>/com.opcos.desktop/mcp-server.json` with mode `0600`; it contains the loopback host,
+port, and a generated bearer token. `opcos mcp-serve` is a thin stdio-to-HTTP bridge and must not
+boot Tauri, open another window, or create another SQLite runtime. Verify this with `wmctrl -l`
+and by checking `/proc/<pid>/fd` for database links: only the GUI process should hold the database.
 
-Report the measured pixel geometry (gap label→chevron, chevron→row right edge) rather than "looks right".
-All collapsible transcript rows come from one component, `TranscriptDisclosure`
-(`web/src/components/Transcript.tsx`), rendering `<details class="transcript-thought">`: `Thought for Ns`
-(labelled), and the *bare* variants `Show output` (shell rows) and `View diff` / `View screenshot`
-(artifact rows). One prompt covers three of the four families:
+Drive the bridge from an external MCP client. Hermes can provide a fast real-client discovery
+check:
 
-> 1) run: `echo <150 identical-ish chars>` ; 2) use write_file to create
-> `src/routes/deep/nested/categories.js` with some content ; 3) run: `ls -R src`
+```bash
+hermes mcp add opcos --command /path/to/target/debug/opcos --args mcp-serve
+hermes mcp test opcos
+```
 
-The long `echo` gives the wrapping-label case, the write gives the `View diff` chevron and doubles as the
-nested-directory local-write test. `View screenshot` needs a browser/screenshot artifact — if none is
-produced, report it as untested instead of assuming parity with `View diff`.
+Hermes currently needs the MCP SDK 1.x API (`mcp==1.28.1`); MCP 2.x changes
+`CallToolResult.isError` and can crash the CLI. If an agent model turn hangs against the local
+gateway, do not invent an agent-driven result. Use the official MCP SDK's stdio client from the
+same environment, disclose that fallback, and test the bridge protocol directly. Codex and pi
+may require `/v1/responses`, which a chat-completions-only local gateway does not provide.
 
-## Faking a "stuck running" session (steering / recovery fixes)
+The MCP bridge safety matrix should be repeatable and should always produce exit status 1, empty
+stdout, and no extra window/process:
 
-`sessions.run_state` is read straight from sqlite by `list_sessions`, but:
+- app stopped with a stale state file → endpoint unreachable;
+- discovery state removed → endpoint state unavailable;
+- host changed to `0.0.0.0` → rejected as not loopback-only;
+- malformed JSON → invalid endpoint-state error;
+- port `0` → invalid endpoint-state error.
 
-- A `running` value **does not survive a restart**: startup recovery rewrites it to
-  `interrupted` / `interrupted_by_crash` (frontend label `已中断（应用退出）`).
-- Editing the DB while the app runs works (WAL, cross-process), but the frontend keeps its cached session
-  list; navigating between views does *not* refetch. What does refetch is a full `refresh()` — the cheapest
-  UI trigger is **creating another session from the home composer** (`submitHome` awaits `refresh()`), or
-  any `turn_done` with `runState !== "running"`.
+Never print the MCP bearer token. Inspect only mode, host, port, and token length. Perform
+counting-only leakage checks over application logs, the database and its `-wal`/`-shm` files,
+bridge traces, and screenshots. The MCP server itself needs no user-provided secret; remote-host
+tests use the normal bearer-header-only RVM procedure described above.
 
-Recipe: stop the app → set `run_state='running', stop_reason='none'` → relaunch → set it again while live →
-create a throwaway session → reopen the target session; it now shows `STATUS Running` / `Working for Ns`
-with no engine turn active. Typing and sending there routes through the `steering` command
-(`gui.ts::submissionRoute` + `App.tsx` `steer`), which is the path to exercise.
+When checking Devin-shaped MCP contracts, verify session objects use the expected identifier
+shape, gather accepts the supported multi-session form, and tool failures are returned as MCP
+errors with readable control-plane messages rather than internal prefixes. Compare settings
+discovery with the actual Settings sidebar order, and use explicit probe kinds when testing
+integration probing. Builtin assets must remain read-only: select an item reported as builtin and
+verify update/delete returns a readable error.
 
-## Cheap Lead-local / project-routing fixture
+## Testing the OPCOS ACP server and `acp-serve` bridge
 
-`automatic_project_routing_active` is true only for the project member with `sort_order == 0` **and** role
-`Lead`. Fastest fixture (no remote host): `git init -b main ~/opcos-test/<repo>` with one commit → sidebar
-项目 `+` → name + 仓库路径 → 添加成员 with 名称 + 角色 `Lead` + Provider/Model set explicitly → 保存 →
-card `启动会话` (click it twice: the first click creates the session, the button then becomes `打开会话`).
-The member dialog's Provider/Model default to 默认/Auto, which fails on a box with only Cloudflare
-configured — always set them in the dialog.
+The ACP service also runs inside the existing desktop app. `opcos acp-serve` is a thin
+stdio-to-authenticated-loopback-WebSocket bridge dispatched before Tauri startup, so it must not
+start a second app. It discovers `<config_dir>/com.opcos.desktop/acp-server.json` (mode `0600`,
+keys `host`, `port`, and `token`) and connects to the loopback `/acp` endpoint with a bearer
+header. The token is reused while the state file exists; the port may rotate on app restart.
+Read only mode, host, port, and token length; never print the token.
 
-## Judging "a write failed" from the transcript
+There is usually no real ACP client installed. ACP *agent* CLIs such as `codex-acp`,
+`claude-agent-acp`, `pi-acp`, `hermes acp`, and `opencode acp` are the wrong side of the
+protocol: they are agents that connect to an ACP server, not clients that drive this server.
+Use a scripted client that spawns `opcos acp-serve` and speaks newline-delimited JSON-RPC when no
+real client is available. Keep monotonic timestamps in every trace; they are the evidence that
+`session/update` notifications arrived before the `session/prompt` response. The reusable driver
+is `/home/ubuntu/mcp-mock/acp_client_drive.py` and supports:
 
-A failed local write renders as a single tool row
-`Wrote <path>  Nms  failed · local host path rejected: path is outside local workspace`.
-The presence/absence of a **separate** `Created <path> +N` row (a `multi_edit_result` event) is the real
-signal for `emit_file_change` regressions. Cross-check in sqlite after a clean shutdown: search
-`session_events.event_json` for `"multi_edit_result"` and confirm none mentions the failed path (the
-column is `event_json`, and `session_events` has no `kind` column — `audit_events` does).
+```text
+init
+roundtrip <cwd>
+cancel notify|request <cwd> [seconds]
+perm approve|deny|ignore-ui|drop <session_id> <marker>
+turn <cwd> <text>
+cwd <cwd>
+```
 
-## Testing the MCP client (panel, catalogs, credentials, transports)
+Avoid `input()` in scripted scenarios because they normally run non-interactively and receive
+EOF. Test initialization/version negotiation, session creation, streaming, both cancellation
+forms, permission round trips, client cancellation, connection drops, and stdout purity.
 
-Route reality check before planning:
+### Deterministic ACP turns
 
-- The **only** UI that creates an MCP server config is project board → 项目配置 → **MCP** tab (名称 + 内容
-  JSON → 新增配置). Content is validated and credential-ish keys are rejected, so credentials must go
-  through 项目运行凭据 → `MCP credential` (`MCP server ID` = the config object id, `Credential JSON` =
-  `{"bearer_token": "…"}`; the field is `type=password` and shows dots).
-- Settings → **MCP** panel (`McpManage`) lists *server cards* (status, `Authorize` when
-  status == `auth_required`, `Resources / prompts`, `Retry`). The per-tool rows/toggles in the same panel
-  come from `mcp_tools`, which **errors for local-host sessions** (`本机 host 不提供远程 MCP tools`) — you
-  need a bound remote RVM host to test tool toggles/approval at all.
-- Two different credential scopes exist: the panel's manager reads the **global** key
-  `mcp-credential:<object_id>`, while project sessions build their own manager reading
-  `project:<pid>/mcp-credential:<object_id>`. A UI-entered credential therefore fixes agent/session calls
-  but may not fix the Settings panel; if you must, inject the global key into
-  `~/.config/com.opcos.desktop/secrets.enc` (header `OCS1` + 12-byte nonce + AES-GCM, key =
-  `sha256("opcos-secret-store\0" + /etc/machine-id)`) — never print the value.
-- Credentials are only read **at connect time**. Deleting/adding a credential does not affect an already
-  connected client; restart the app (or `Retry` for the panel's manager) to force a fresh connect.
+Model turns through the local LiteLLM gateway may not complete deterministically. Point the test
+session at the local fixture provider (`http://127.0.0.1:8899/v1`) and use its `RUNSHELL:<command>`
+trigger to force a real `run_shell` call. Give each scenario a fresh placeholder marker path and
+verify file existence out of band; transcript text alone does not prove execution.
 
-Useful oracles (setup, not UI evidence): the UI prints no tool count, so read
-`mcp_tool_cache` / `mcp_resource_cache` / `mcp_prompt_cache` / `mcp_session_resources` from
-`~/.config/com.opcos.desktop/opcos.db`, and probe the endpoint with curl beforehand
-(`initialize` → `mcp-session-id` header → `tools/list`) to know the expected counts. Remote catalogs drift
-(mcp.devin.ai returned 18 tools where a doc said 17) — treat exact counts as soft expectations.
+The fixture's ordinary response may contain only one content delta. To prove live streaming,
+configure the fixture to emit several delayed SSE content chunks (the fixture's stream helper
+supports extra deltas), then require multiple ACP `agent_message_chunk` updates with timestamps
+strictly before the prompt result. After changing the fixture, ensure the old process is gone,
+verify `/v1/models` responds, and relaunch it from a persistent tty; stale fixture processes can
+continue serving the old code after an apparent restart.
 
-Real endpoints that work anonymously: `https://mcp.context7.com/mcp` (2 tools, 0 resources/prompts),
-`https://mcp.devin.ai/mcp` (`/sse` is gone — do not use it). `https://api.githubcopilot.com/mcp/` returns
-401 + `WWW-Authenticate` with resource metadata, which is the way to exercise `auth_required`.
+ACP-created sessions default to Auto, so approval scenarios must switch the mounted session to
+Interactive / “Ask for approval” first. In Interactive mode, `run_shell` and writes raise an
+approval card and persist a pending record. Auto will silently allow the same calls and is not a
+valid approval test.
 
-Legacy `http-sse` needs a local mock; a minimal one is enough (`GET /sse` → `event: endpoint` +
-`data: /message?s=<id>`, `POST /message` → 202 with the reply pushed on the stream, plus a `/flip` route
-that pushes `notifications/tools/list_changed` and adds a tool). Gotchas:
-- Restarting the mock leaves the session runtime with a dead client: every tool call returns
-  `MCP server is disconnected` until the whole app restarts (`resources/read` still works because it goes
-  through the global manager). Start the mock **before** the app and leave it alone.
-- `notifications/*/list_changed` only *drops* the cached catalog. There is no frontend listener for
-  `mcp-catalog-updated`, so the panel shows `MCP server is not connected; retry the connection` until you
-  click `Retry`. Expect an error toast in the middle of that flow, not an auto-refresh.
+### Remote `cwd` matrix
 
-`Load into composer` (prompt → draft) may look like a no-op: the draft lands in `homeInput`, but the only
-navigation to the Home composer (`openNewSessionHome`) clears it. If a draft never appears, check that path
-before blaming `prompts/get` (verify the request really happened via the mock log or a direct curl probe).
+`session/new` selects a host by matching the agent setting `default_platform` against registered
+host names. Set it to the intended remote host, save, and verify the created session's persisted
+`host_id`; do not infer host selection from the setting alone because it may be cached.
 
-Attached resources: the transcript intentionally shows only a chip `MCP resource: <uri>` (mime + bytes);
-the body goes to the model. To prove the model really received it, attach a resource with a unique marker
-string in the body and ask the agent to quote its first line. Also ask the agent to list its `mcp__*` tools
-— that is the cheapest UI-level proof that resources/prompts are **not** registered as tools.
+For a DevBox-style Windows host, test both missing and known-good remote paths. `/api/ls` returns
+an HTTP 404 `ENOENT ... scandir` for a missing directory, while Linux-looking paths may be mapped
+under the Windows root and therefore make useful negative cases. Keep a known-good path such as
+`C:\Users\Admin` in the matrix so a validation fix cannot reject every path. Cross-check existence
+out of band with authenticated remote `/api/ls` or `/api/exec-sync`; never use local filesystem
+semantics to decide whether a remote path exists.
 
-Devin Secrets Needed: `GH_PAT` (GitHub MCP bearer), `Devin_MCP_COG` (mcp.devin.ai bearer),
-`CF_TOKEN`/`CF_ID` for the Cloudflare provider the agent runs on.
-## MCP round-9 findings (commit `7854e25` and later)
+To simulate an unreachable host without changing its data, edit the host URL in Settings → Hosts
+to a dead loopback port such as `http://127.0.0.1:9`, leaving the stored token untouched. Expect
+an explicit `/api/health` connection error and no local fallback. Restore the original URL,
+re-run a known-good remote path, and leave the `default_platform` setting at the requested value.
 
-Fixture layout that has proven reusable (keep them out of the repo, e.g. `/home/ubuntu/mcp-mock/`):
-- `sse_server.py` — legacy `http-sse` mock. Useful extras: per-method request counters exposed on
-  `GET /stats` (the only oracle for "did the client really re-request?"), paginated `tools/list`
-  (page 1 + `nextCursor`) to prove cursor aggregation, an explicit JSON-RPC `-32601` on
-  `resources/templates/list` to prove `MethodNotFound` degrades to an empty set instead of failing the
-  connection, and separate `/flip` (tools) and `/flip-resource` (resources) routes so a `list_changed`
-  refresh is *visible* in the panel (the card shows resource/prompt counts but no tool count, so a
-  tools-only change is unobservable in the UI).
-- `oauth_server.py` — local AS + protected MCP endpoint on one port: 401 with
-  `WWW-Authenticate: … resource_metadata=…`, RFC 9728 + RFC 8414 metadata with `registration_endpoint`
-  and `code_challenge_methods_supported:["S256"]`, DCR, a token endpoint that verifies the PKCE S256
-  challenge and the loopback `redirect_uri`, short `expires_in`, a `/expire` route to force a refresh,
-  and a `/stats` route returning a redacted event log (`authorize s256=True state=True
-  loopback_callback=True`, `token refresh_token accepted=True`, `mcp authenticated … gen=N`). Write the
-  issued token values to a side file only, so the leak audit can grep for them without ever printing
-  them. This is the only practical way to prove the OAuth chain — real ASes (github.com) advertise no
-  `registration_endpoint`.
+### ACP bridge safety and approval cleanup
 
-Behaviours to expect / watch for when testing MCP:
-- `pkill -f 'sse_server.py'` kills your own shell (the pattern matches the shell's command line). Use
-  `pkill -9 -f 'sse_serv[e]r.py'` and start mocks with `(setsid python3 … &)`.
-- Agent-facing MCP tools only appear in sessions whose `project_id` matches the project that owns the
-  MCP config (`effective_config_objects`). A scratch session with `project_id = NULL` will report "no
-  such tool" — always use the project's session (e.g. its Lead member session).
-- After the OAuth token exchange the card can stay `auth_required`; `Retry` may issue no request at all.
-  Restarting the app makes the stored token take effect. Check `mcp-credential:<object_id>` in
-  `secrets.enc` (keys only!) to tell "token stored but not applied" from "token exchange failed".
-- A legacy-SSE server that is *fully down* (not just restarted) can make a tool call hang for many
-  minutes with no explicit error, and afterwards the session may refuse to start any new turn
-  (`session_events` gets no rows) until the app is restarted. Budget for an app restart in that scenario
-  and prefer restart-the-mock (self-healing works) over kill-the-mock when you only need reconnect
-  coverage.
-- Submitting a message while an attached resource's MCP server is unreachable can silently drop the
-  submission (composer clears, no turn, no error) — detach context resources before down-server tests.
-- GitHub MCP resources are 0.8–1.1 MB HTML apps. Attaching one kills the turn with
-  `Provider request failed`; there is no truncation on the attachment path. Use a small mock resource
-  with a unique marker to prove the model really consumes attached context.
-- `mcp_resource_templates` / `mcp_subscribe_resource` / `mcp_unsubscribe_resource` have no frontend
-  caller (`grep web/src`), so templates and subscribe/unsubscribe cannot be tested through the UI —
-  report them untested-by-design rather than hunting for a button.
+Repeat these checks for ACP:
+
+- state file mode is `0600`;
+- the WebSocket binds loopback only;
+- missing or wrong bearer credentials receive 401, a valid credential receives 101, and a LAN
+  address cannot connect;
+- absent, stale, malformed, non-loopback, and invalid-port state files make the bridge exit 1,
+  print only an `ACP bridge unavailable: ...` diagnostic on stderr, leave stdout empty, and
+  spawn no window/process;
+- two bridges still show one OPCOS window and zero database links from bridge processes;
+- token counts remain zero in logs, database files, client traces, and screenshots.
+
+Before every approval scenario, verify there are no leftover rows in `pending` with
+`state='pending'`. Clean leftovers through the UI/Inbox before starting the next scenario.
+Overlapping permission runs can make an “exactly one request” assertion meaningless.
+
+For UI-side resolution, bound the wait and record request count, prompt latency, marker existence,
+and persisted pending state. For ACP-side approval or denial, verify the mounted view itself:
+the card must disappear and status must leave Running without navigating away. If the database says
+the session is idle/finished and the pending row is resolved but the card clears only after
+navigating away and back, the backend turn is not stuck; this is a live frontend refresh gap.
+Conversely, if remounting does not clear it, inspect engine state, persisted events, and fixture
+request counts before attributing it to rendering.
+
+## External-agent bridge checklist
+
+For any bridge test, prove the external process connects to the already-running app rather than
+starting another Tauri/SQLite/background runtime. Capture protocol traces, process/window counts,
+state-file permissions, loopback binding, and token-count-only leak results. Keep fixture files and
+marker paths outside the repository's test material when possible so the agent cannot discover
+expected answers by searching parent directories. Restore temporary host URLs and provider
+fixtures before finishing, and record any intentionally changed agent setting without silently
+“fixing” it.
