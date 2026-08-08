@@ -567,12 +567,11 @@ where
             ApprovalOutcome::Deny => json!({"outcome": {"outcome": "cancelled"}}),
         };
         self.state.respond(request_id, result).await?;
-        if let ApprovalOutcome::Approve = outcome {
-            if pending.switch_mode {
-                if let Some(mode_id) = selected_option {
-                    self.state.set_current_mode(&mode_id).await;
-                }
-            }
+        if let ApprovalOutcome::Approve = outcome
+            && pending.switch_mode
+            && let Some(mode_id) = selected_option
+        {
+            self.state.set_current_mode(&mode_id).await;
         }
         let turn = self
             .state
