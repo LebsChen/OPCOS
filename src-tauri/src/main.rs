@@ -5600,6 +5600,29 @@ fn emit_approval_decision(
     );
 }
 
+fn emit_approval_resolution_refresh(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    session_id: &str,
+    call_id: &str,
+    approve: bool,
+    next_call_id: Option<&str>,
+) -> Result<(), String> {
+    emit_approval_decision(app, state, session_id, call_id, approve);
+    if let Some(next_call_id) = next_call_id {
+        emit_pending_approval_for(app, state, session_id, Some(next_call_id))?;
+    } else {
+        let _ = emit_pending_approval(app, state, session_id)?;
+    }
+    emit(
+        app,
+        "turn_done",
+        Some(session_id),
+        session_status_payload(state, session_id),
+    );
+    Ok(())
+}
+
 fn overlay_running_tool_status(
     kind: &str,
     payload: &mut Value,
@@ -14191,12 +14214,33 @@ impl opcos_acp_server::OpcosAcpControlPlane for DesktopControlPlane {
                             .await
                         {
                             Ok(_) => {
+                                emit_approval_resolution_refresh(
+                                    &self.app,
+                                    &self.state(),
+                                    &session_id,
+                                    &pending.call_id,
+                                    allow,
+                                    None,
+                                )?;
                                 resolved_call_ids.insert(pending.call_id.clone());
                                 result = Ok(());
                             }
                             Err(EngineError::ApprovalAlreadyProcessed(_)) => {
                                 resolved_call_ids.insert(pending.call_id.clone());
                                 result = Ok(());
+                            }
+                            Err(EngineError::ApprovalPending(next_call_id)) => {
+                                emit_approval_resolution_refresh(
+                                    &self.app,
+                                    &self.state(),
+                                    &session_id,
+                                    &pending.call_id,
+                                    allow,
+                                    Some(&next_call_id),
+                                )?;
+                                result = Err(engine_error_message(EngineError::ApprovalPending(
+                                    next_call_id,
+                                )));
                             }
                             Err(next) => {
                                 result = Err(engine_error_message(next));
@@ -14860,14 +14904,7 @@ async fn resolve_approval(
                 if approve { "allow" } else { "deny" },
             )
             .map_err(|error| error.to_string())?;
-        emit_approval_decision(&app, &state, &session_id, &call_id, approve);
-        let _ = emit_pending_approval(&app, &state, &session_id)?;
-        emit(
-            &app,
-            "turn_done",
-            Some(&session_id),
-            session_status_payload(&state, &session_id),
-        );
+        emit_approval_resolution_refresh(&app, &state, &session_id, &call_id, approve, None)?;
         return Ok(());
     }
     let host_id = session_host_id(&state, &session_id)?;
@@ -14891,10 +14928,8 @@ async fn resolve_approval(
     match result {
         Ok(()) => {
             let _ = coordination_ingest_session_inner(&state, &session_id, false).await;
-            emit_approval_decision(&app, &state, &session_id, &call_id, approve);
             let calls = approval_artifact_calls(&state, &session_id, &call_id, sequence_before)?;
             record_artifacts_best_effort(&app, &state, &session_id, &host_id, calls).await;
-            let _ = emit_pending_approval(&app, &state, &session_id)?;
             if let Some(task_id) = resumed_task {
                 emit(
                     &app,
@@ -14903,12 +14938,7 @@ async fn resolve_approval(
                     json!({"task_id": task_id, "call_id": call_id}),
                 );
             }
-            emit(
-                &app,
-                "turn_done",
-                Some(&session_id),
-                session_status_payload(&state, &session_id),
-            );
+            emit_approval_resolution_refresh(&app, &state, &session_id, &call_id, approve, None)?;
             Ok(())
         }
         Err(opcos_engine::EngineError::ApprovalPending(next_call_id)) => {
@@ -14919,10 +14949,8 @@ async fn resolve_approval(
                 .store
                 .set_pending_visibility(&session_id, &next_call_id, "inbox")
                 .map_err(|error| error.to_string())?;
-            emit_approval_decision(&app, &state, &session_id, &call_id, approve);
             let calls = approval_artifact_calls(&state, &session_id, &call_id, sequence_before)?;
             record_artifacts_best_effort(&app, &state, &session_id, &host_id, calls).await;
-            emit_pending_approval_for(&app, &state, &session_id, Some(&next_call_id))?;
             if let Some(payload) =
                 coordination_approval_payload(&state, &session_id, &next_call_id)?
             {
