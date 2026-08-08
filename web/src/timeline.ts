@@ -492,6 +492,19 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
       ].includes(type)
     ) {
       continue;
+    } else if (type === "steering_received" || type === "steering_applied") {
+      const activeWork = ensureWork(event.created_at_ms);
+      const iteration =
+        typeof data.iteration === "number" ? data.iteration : undefined;
+      activeWork.rows.push({
+        label:
+          type === "steering_received"
+            ? "Steering received"
+            : "Steering applied",
+        detail:
+          iteration === undefined ? undefined : `Before iteration ${iteration}`,
+        activityLabel: true,
+      });
     } else if (type === "assistant_delta" || type === "reasoning_delta") {
       const activeWork = ensureWork(event.created_at_ms);
       const text = String(
