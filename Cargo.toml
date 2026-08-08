@@ -13,6 +13,7 @@ members = [
   "crates/opcos-mcp-server",
   "crates/opcos-acp-server",
   "crates/opcos-assets",
+  "crates/opcos-eval",
   "src-tauri",
 ]
 
