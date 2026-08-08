@@ -12147,6 +12147,48 @@ async fn submit_turn(
     submit_turn_inner(app, &state, request).await
 }
 
+fn wake_session_for_turn(store: &SqliteStore, session_id: &str) -> Result<(), String> {
+    let session = store
+        .load_session(session_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "session not found".to_owned())?;
+    if session.run_state != "running" || session.stop_reason != "none" {
+        store
+            .update_session_status(session_id, "running", "none")
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn record_submit_failure(store: &SqliteStore, session_id: &str) -> Result<(), String> {
+    store
+        .update_session_status(session_id, "error", "internal_error")
+        .map_err(|store_error| store_error.to_string())?;
+    Ok(())
+}
+
+fn fail_submit_turn(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    session_id: &str,
+    error: String,
+) -> String {
+    let _ = record_submit_failure(&state.store, session_id);
+    emit(
+        app,
+        "notice",
+        Some(session_id),
+        json!({"kind":"error","text":error}),
+    );
+    emit(
+        app,
+        "turn_done",
+        Some(session_id),
+        session_status_payload(state, session_id),
+    );
+    error
+}
+
 async fn submit_turn_inner(
     app: tauri::AppHandle,
     state: &DesktopState,
@@ -12261,11 +12303,17 @@ pub(crate) async fn submit_turn_inner_with_context(
             &request.text,
         )?
     };
+    wake_session_for_turn(&state.store, &request.session_id)
+        .map_err(|error| fail_submit_turn(&app, state, &request.session_id, error))?;
     if session.harness == "opencode" {
-        return submit_opencode_turn_inner(app, state, request).await;
+        return submit_opencode_turn_inner(app.clone(), state, request)
+            .await
+            .map_err(|error| fail_submit_turn(&app, state, &session.session_id, error));
     }
     if session.harness == "acp" {
-        return submit_acp_turn_inner(app, state, request).await;
+        return submit_acp_turn_inner(app.clone(), state, request)
+            .await
+            .map_err(|error| fail_submit_turn(&app, state, &session.session_id, error));
     }
     let host_id = session_host_id(state, &request.session_id)?;
     if host_id != "local" {
@@ -12302,7 +12350,8 @@ pub(crate) async fn submit_turn_inner_with_context(
         repair_loop,
         Some(&request.text),
     )
-    .await?;
+    .await
+    .map_err(|error| fail_submit_turn(&app, state, &request.session_id, error))?;
     emit(
         &app,
         "message",
@@ -22995,6 +23044,64 @@ fn main() {
 #[cfg(test)]
 mod m7_tests {
     use super::*;
+
+    fn wake_test_session(store: &SqliteStore, session_id: &str, harness: &str) {
+        let now = Utc::now();
+        store
+            .save_session(&SessionRecord {
+                session_id: session_id.into(),
+                workspace: "/workspace".into(),
+                model: "test".into(),
+                mode: "interactive".into(),
+                harness: harness.into(),
+                title: "Wake test".into(),
+                extra_roots: vec![],
+                grants: json!({}),
+                pinned: false,
+                archived: false,
+                origin: None,
+                origin_label: None,
+                compaction: json!({}),
+                host_id: "local".into(),
+                provider: None,
+                external_session_id: None,
+                run_state: "idle".into(),
+                stop_reason: "finished".into(),
+                created_at: now,
+                updated_at: now,
+                project_id: None,
+                agent_id: None,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn terminal_builtin_and_acp_sessions_wake_for_the_next_turn() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        wake_test_session(&store, "builtin-wake", "builtin");
+        wake_test_session(&store, "acp-wake", "acp");
+
+        wake_session_for_turn(&store, "builtin-wake").unwrap();
+        wake_session_for_turn(&store, "acp-wake").unwrap();
+
+        for session_id in ["builtin-wake", "acp-wake"] {
+            let session = store.load_session(session_id).unwrap().unwrap();
+            assert_eq!(session.run_state, "running");
+            assert_eq!(session.stop_reason, "none");
+        }
+    }
+
+    #[test]
+    fn failed_wake_records_terminal_error_state_for_visible_failure() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        wake_test_session(&store, "failed-wake", "builtin");
+
+        record_submit_failure(&store, "failed-wake").unwrap();
+
+        let session = store.load_session("failed-wake").unwrap().unwrap();
+        assert_eq!(session.run_state, "error");
+        assert_eq!(session.stop_reason, "internal_error");
+    }
 
     #[test]
     fn generated_project_agent_branches_are_project_unique() {
