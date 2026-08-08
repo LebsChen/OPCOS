@@ -18916,7 +18916,7 @@ async fn list_mcp_servers(state: State<'_, DesktopState>) -> Result<Vec<Value>, 
     let mut statement = connection
         .prepare(
             "SELECT o.id,o.name,o.server_key,o.status,o.current_version_id,
-                    v.content
+                    v.content,o.scope_kind
              FROM config_object o
              JOIN config_object_version v ON v.id=o.current_version_id
              WHERE o.kind='mcp' AND o.status <> 'deleted'
@@ -18933,6 +18933,8 @@ async fn list_mcp_servers(state: State<'_, DesktopState>) -> Result<Vec<Value>, 
                 "id": object_id,
                 "name": row.get::<_, String>(1)?,
                 "server_key": row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                "builtin": row.get::<_, String>(3).unwrap_or_default() == "builtin",
+                "scope_kind": row.get::<_, String>(6).unwrap_or_else(|_| "global".into()),
                 "status": snapshot
                     .map(|value| serde_json::to_value(&value.status).unwrap_or(json!("failed")))
                     .unwrap_or_else(|| {
@@ -18951,6 +18953,13 @@ async fn list_mcp_servers(state: State<'_, DesktopState>) -> Result<Vec<Value>, 
                 "transport": content.get("transport").or_else(|| content.get("type")),
                 "url": content.get("url"),
                 "command": content.get("command"),
+                "args": content.get("args"),
+                "env": content.get("env"),
+                "enabled": content.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+                "requires_approval": content
+                    .get("requires_approval")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
             }))
         })
         .map_err(|error| error.to_string())?
@@ -19014,37 +19023,41 @@ async fn retry_mcp_server(
         .connect_with_retry(&parsed, &version_id, 2)
         .await
         .map_err(|error| format!("MCP server retry failed: {error}"))?;
-    let connection = state
-        .database
-        .lock()
-        .map_err(|_| "database lock poisoned")?;
-    let transaction = connection
-        .unchecked_transaction()
-        .map_err(|error| error.to_string())?;
-    transaction
-        .execute(
-            "DELETE FROM mcp_tool_cache WHERE server_object_id=?1 AND config_version_id=?2",
-            params![server_id, version_id],
-        )
-        .map_err(|error| error.to_string())?;
-    for tool in &tools {
+    {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
         transaction
             .execute(
-                "INSERT INTO mcp_tool_cache
-                 (server_object_id,config_version_id,tool_name,description,input_schema_json,discovered_at)
-                 VALUES (?1,?2,?3,?4,?5,?6)",
-                params![
-                    tool.server_id,
-                    version_id,
-                    tool.name,
-                    tool.description,
-                    serde_json::to_string(&tool.input_schema).map_err(|error| error.to_string())?,
-                    Utc::now().to_rfc3339(),
-                ],
+                "DELETE FROM mcp_tool_cache WHERE server_object_id=?1 AND config_version_id=?2",
+                params![server_id, version_id],
             )
             .map_err(|error| error.to_string())?;
+        for tool in &tools {
+            transaction
+                .execute(
+                    "INSERT INTO mcp_tool_cache
+                     (server_object_id,config_version_id,tool_name,description,input_schema_json,discovered_at)
+                     VALUES (?1,?2,?3,?4,?5,?6)",
+                    params![
+                        tool.server_id,
+                        version_id,
+                        tool.name,
+                        tool.description,
+                        serde_json::to_string(&tool.input_schema)
+                            .map_err(|error| error.to_string())?,
+                        Utc::now().to_rfc3339(),
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
     }
-    transaction.commit().map_err(|error| error.to_string())?;
+    state.engines.lock().await.clear();
     Ok(json!({
         "id": parsed.object_id,
         "name": parsed.name,
