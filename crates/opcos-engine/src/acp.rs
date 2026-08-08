@@ -432,9 +432,11 @@ where
     S: SessionStore + Send + Sync + 'static,
 {
     let mut buffer = Vec::new();
+    let reason;
     loop {
         let event = state.process.next_event().await;
         let Ok(Some(event)) = event else {
+            reason = "ACP agent stdio closed".to_owned();
             break;
         };
         match event {
@@ -459,14 +461,46 @@ where
             }
             StdioEvent::Stderr(_) => {}
             StdioEvent::Exited(code) => {
-                let _ = state
-                    .events
-                    .send(HarnessEvent::Error {
-                        message: format!("ACP agent exited: {code:?}"),
-                    })
-                    .await;
+                reason = format!("ACP agent exited: {code:?}");
                 break;
             }
+        }
+    }
+    state.abandon_pending(&reason).await;
+}
+
+impl<S> AcpState<S>
+where
+    S: SessionStore + Send + Sync + 'static,
+{
+    async fn abandon_pending(&self, reason: &str) {
+        let pending = std::mem::take(&mut *self.pending.lock().await);
+        let had_pending = !pending.is_empty();
+        for sender in pending.into_values() {
+            let _ = sender.send(Err(reason.to_owned()));
+        }
+        let prompt_pending = std::mem::take(&mut *self.prompt_pending.lock().await);
+        let had_pending = had_pending || !prompt_pending.is_empty();
+        let mut turns = self.turns.lock().await;
+        let had_pending =
+            had_pending || !turns.is_empty() || self.active_turn.lock().await.is_some();
+        for turn_id in prompt_pending.into_values() {
+            if let Some(turn) = turns.remove(&turn_id)
+                && let Some(sender) = turn.sender.lock().await.take()
+            {
+                let _ = sender.send(Err(HarnessError::External(reason.to_owned())));
+            }
+        }
+        turns.clear();
+        *self.active_turn.lock().await = None;
+        self.permissions.lock().await.clear();
+        if had_pending {
+            let _ = self
+                .events
+                .send(HarnessEvent::Error {
+                    message: reason.to_owned(),
+                })
+                .await;
         }
     }
 }
@@ -1164,6 +1198,90 @@ for line in sys.stdin:
         }
         assert!(saw_text);
         assert!(saw_finished);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn local_acp_agent_exit_abandons_pending_turn_state() {
+        let root = std::env::temp_dir().join(format!("opcos-acp-exit-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let script = root.join("agent.py");
+        fs::write(
+            &script,
+            r#"
+import json
+import sys
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        result = {"sessionCapabilities": {}}
+    elif method == "session/new":
+        result = {"sessionId": "external-session"}
+    elif method == "session/prompt":
+        sys.exit(0)
+    else:
+        continue
+    print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+"#,
+        )
+        .unwrap();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .save_session(&SessionRecord {
+                session_id: "session".into(),
+                workspace: root.display().to_string(),
+                model: "test".into(),
+                mode: "interactive".into(),
+                harness: "acp".into(),
+                title: "ACP".into(),
+                extra_roots: vec![],
+                grants: json!({}),
+                pinned: false,
+                archived: false,
+                origin: None,
+                origin_label: None,
+                compaction: json!({}),
+                host_id: "local".into(),
+                provider: None,
+                external_session_id: None,
+                run_state: "idle".into(),
+                stop_reason: "none".into(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                project_id: None,
+                agent_id: None,
+            })
+            .unwrap();
+        let host = Arc::new(LocalHost::new(&root).unwrap());
+        let recorder = Arc::new(SessionRecorder::new(store, "session"));
+        let harness = AcpHarness::start(
+            host,
+            recorder,
+            "session",
+            AcpHarnessConfig {
+                workspace: root.display().to_string(),
+                command: format!("python3 {}", shell_quote(&script.display().to_string())),
+                env: None,
+            },
+        )
+        .await
+        .unwrap();
+        let turn = harness
+            .start_turn(HarnessTurnInput {
+                text: "hi".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let result = timeout(Duration::from_secs(5), turn.await_finished())
+            .await
+            .unwrap();
+        assert!(result.is_err());
+        assert!(harness.state.active_turn.lock().await.is_none());
+        assert!(harness.state.prompt_pending.lock().await.is_empty());
+        assert!(harness.state.pending.lock().await.is_empty());
+        assert!(harness.state.turns.lock().await.is_empty());
         let _ = fs::remove_dir_all(root);
     }
 }

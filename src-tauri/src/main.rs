@@ -12621,6 +12621,96 @@ async fn submit_opencode_turn_inner(
     Ok(())
 }
 
+fn acp_session_event(event_type: &str, payload: Value) -> Value {
+    json!({
+        "type": event_type,
+        "event_id": format!("event-{}", Uuid::new_v4()),
+        "created_at_ms": Utc::now().timestamp_millis(),
+        "timestamp": Utc::now().to_rfc3339(),
+        "working_event": payload,
+    })
+}
+
+fn acp_working_event(event_type: &str, category: &str, direction: &str, payload: Value) -> Value {
+    json!({
+        "event_type": event_type,
+        "category": category,
+        "direction": direction,
+        "timestamp": Utc::now().to_rfc3339(),
+        "payload": payload,
+    })
+}
+
+fn persist_acp_user_turn(
+    recorder: &SessionRecorder<SqliteStore>,
+    text: &str,
+) -> Result<(), String> {
+    recorder
+        .append_session_event(&acp_session_event(
+            "user_message",
+            acp_working_event(
+                "user_message",
+                "message",
+                "incoming",
+                json!({"message": text}),
+            ),
+        ))
+        .map_err(|error| error.to_string())?;
+    recorder
+        .append_message(
+            "user",
+            json!({"role":"user","content":[{"type":"text","text":text}]}),
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn persist_acp_assistant_turn(
+    recorder: &SessionRecorder<SqliteStore>,
+    turn: &opcos_provider::AssistantTurn,
+) -> Result<(), String> {
+    let content = json!({
+        "role": "assistant",
+        "content": turn.text.clone().unwrap_or_default(),
+        "tool_calls": turn.tool_calls,
+        "reasoning": turn.reasoning,
+    });
+    recorder
+        .append_message("assistant", content)
+        .map_err(|error| error.to_string())?;
+    recorder
+        .append_session_event(&json!({
+            "type": "turn",
+            "event_id": format!("event-{}", Uuid::new_v4()),
+            "created_at_ms": Utc::now().timestamp_millis(),
+            "timestamp": Utc::now().to_rfc3339(),
+            "turn": turn,
+        }))
+        .map_err(|error| error.to_string())
+}
+
+fn persist_acp_turn_finished(
+    recorder: &SessionRecorder<SqliteStore>,
+    run_state: &str,
+    stop_reason: &str,
+) -> Result<(), String> {
+    recorder
+        .append_session_event(&acp_session_event(
+            "turn_finished",
+            acp_working_event(
+                "turn_finished",
+                "status",
+                "outgoing",
+                json!({"run_state":run_state,"stop_reason":stop_reason}),
+            ),
+        ))
+        .map_err(|error| error.to_string())
+}
+
+async fn evict_acp_harness(state: &DesktopState, session_id: &str) {
+    state.acp_event_sessions.lock().await.remove(session_id);
+    state.acp_engines.lock().await.remove(session_id);
+}
+
 async fn submit_acp_turn_inner(
     app: tauri::AppHandle,
     state: &DesktopState,
@@ -12638,6 +12728,28 @@ async fn submit_acp_turn_inner(
             return Err(error);
         }
     };
+    let recorder = Arc::new(SessionRecorder::new(
+        Arc::clone(&state.store),
+        request.session_id.clone(),
+    ));
+    recorder
+        .update_status("running", "none")
+        .map_err(|error| error.to_string())?;
+    persist_acp_user_turn(&recorder, &request.text)?;
+    emit(
+        &app,
+        "stream",
+        Some(&request.session_id),
+        acp_session_event(
+            "user_message",
+            acp_working_event(
+                "user_message",
+                "message",
+                "incoming",
+                json!({"message": request.text}),
+            ),
+        ),
+    );
     let start_events = {
         let mut sessions = state.acp_event_sessions.lock().await;
         sessions.insert(request.session_id.clone())
@@ -12647,20 +12759,33 @@ async fn submit_acp_turn_inner(
         let event_app = app.clone();
         let event_session = request.session_id.clone();
         let event_store = Arc::clone(&state.store);
+        let event_recorder = Arc::clone(&recorder);
         tauri::async_runtime::spawn(async move {
             while let Some(event) = events.recv().await {
                 match event {
                     opcos_engine::HarnessEvent::AssistantTextDelta { text } => emit(
                         &event_app,
-                        "message",
+                        "stream",
                         Some(&event_session),
-                        json!({"role":"assistant","text":text}),
+                        json!({
+                            "type": "assistant_delta",
+                            "event_id": format!("event-{}", Uuid::new_v4()),
+                            "created_at_ms": Utc::now().timestamp_millis(),
+                            "timestamp": Utc::now().to_rfc3339(),
+                            "text_delta": text,
+                        }),
                     ),
                     opcos_engine::HarnessEvent::AssistantReasoningDelta { text } => emit(
                         &event_app,
-                        "thinking",
+                        "stream",
                         Some(&event_session),
-                        json!({"text":text}),
+                        json!({
+                            "type": "reasoning_delta",
+                            "event_id": format!("event-{}", Uuid::new_v4()),
+                            "created_at_ms": Utc::now().timestamp_millis(),
+                            "timestamp": Utc::now().to_rfc3339(),
+                            "reasoning_delta": text,
+                        }),
                     ),
                     opcos_engine::HarnessEvent::ToolCallDelta {
                         call_id,
@@ -12701,39 +12826,71 @@ async fn submit_acp_turn_inner(
                             );
                         }
                     }
-                    opcos_engine::HarnessEvent::Error { message } => emit(
-                        &event_app,
-                        "notice",
-                        Some(&event_session),
-                        json!({"kind":"error","text":message}),
-                    ),
+                    opcos_engine::HarnessEvent::Error { message } => {
+                        let _ = event_recorder.append_notice("error", &message);
+                        let _ = event_recorder.update_status("error", "harness_error");
+                        emit(
+                            &event_app,
+                            "notice",
+                            Some(&event_session),
+                            json!({"kind":"error","text":message}),
+                        );
+                        emit(
+                            &event_app,
+                            "turn_done",
+                            Some(&event_session),
+                            session_status_payload_from_store(&event_store, &event_session),
+                        );
+                        if let Some(state) = event_app.try_state::<DesktopState>() {
+                            evict_acp_harness(&state, &event_session).await;
+                        }
+                    }
                     opcos_engine::HarnessEvent::TurnFinished { turn } => {
+                        let _ = persist_acp_assistant_turn(&event_recorder, &turn);
+                        let _ = event_recorder.update_status("idle", "finished");
+                        let _ = persist_acp_turn_finished(&event_recorder, "idle", "finished");
                         let mut payload =
                             session_status_payload_from_store(&event_store, &event_session);
                         if let Some(object) = payload.as_object_mut() {
                             object.insert("turn".into(), json!(turn));
                         }
                         emit(&event_app, "turn_done", Some(&event_session), payload);
+                        if let Some(state) = event_app.try_state::<DesktopState>() {
+                            let _ =
+                                coordination_ingest_session_inner(&state, &event_session, false)
+                                    .await;
+                        }
                     }
                     _ => {}
                 }
             }
         });
     }
-    let handle = harness
+    harness
         .start_turn(opcos_engine::HarnessTurnInput {
             text: request.text.clone(),
             model: String::new(),
             ..Default::default()
         })
         .await
-        .map_err(|error| error.to_string())?;
-    emit(
-        &app,
-        "message",
-        Some(&request.session_id),
-        json!({"role":"user","text":request.text,"turn_id":handle.id()}),
-    );
+        .map_err(|error| {
+            let message = error.to_string();
+            let _ = recorder.append_notice("error", &message);
+            let _ = recorder.update_status("error", "harness_error");
+            emit(
+                &app,
+                "notice",
+                Some(&request.session_id),
+                json!({"kind":"error","text":message}),
+            );
+            emit(
+                &app,
+                "turn_done",
+                Some(&request.session_id),
+                session_status_payload_from_store(&state.store, &request.session_id),
+            );
+            message
+        })?;
     Ok(())
 }
 
@@ -25476,5 +25633,75 @@ agents:
             ),
             None
         );
+    }
+
+    #[test]
+    fn acp_desktop_lifecycle_persists_terminal_turn_contract() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let now = Utc::now();
+        store
+            .save_session(&SessionRecord {
+                session_id: "acp-lifecycle".into(),
+                workspace: "/workspace".into(),
+                model: "test".into(),
+                mode: "interactive".into(),
+                harness: "acp".into(),
+                title: "ACP".into(),
+                extra_roots: vec![],
+                grants: json!({}),
+                pinned: false,
+                archived: false,
+                origin: None,
+                origin_label: None,
+                compaction: json!({}),
+                host_id: "local".into(),
+                provider: None,
+                external_session_id: None,
+                run_state: "idle".into(),
+                stop_reason: "none".into(),
+                created_at: now,
+                updated_at: now,
+                project_id: None,
+                agent_id: None,
+            })
+            .unwrap();
+        let recorder = SessionRecorder::new(store.clone(), "acp-lifecycle");
+
+        recorder.update_status("running", "none").unwrap();
+        persist_acp_user_turn(&recorder, "hello").unwrap();
+        assert_eq!(
+            store
+                .load_session("acp-lifecycle")
+                .unwrap()
+                .unwrap()
+                .run_state,
+            "running"
+        );
+        assert_eq!(store.load_messages("acp-lifecycle").unwrap().len(), 1);
+
+        persist_acp_assistant_turn(
+            &recorder,
+            &opcos_provider::AssistantTurn {
+                text: Some("world".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        recorder.update_status("idle", "finished").unwrap();
+        persist_acp_turn_finished(&recorder, "idle", "finished").unwrap();
+
+        let session = store.load_session("acp-lifecycle").unwrap().unwrap();
+        assert_eq!(session.run_state, "idle");
+        assert_eq!(session.stop_reason, "finished");
+        assert_eq!(store.load_messages("acp-lifecycle").unwrap().len(), 2);
+        let events = store.load_session_events("acp-lifecycle").unwrap();
+        assert!(events.iter().any(|event| {
+            event.event["type"] == "user_message"
+                && event.event["working_event"]["event_type"] == "user_message"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event["type"] == "turn_finished"
+                && event.event["working_event"]["payload"]["stop_reason"] == "finished"
+        }));
     }
 }

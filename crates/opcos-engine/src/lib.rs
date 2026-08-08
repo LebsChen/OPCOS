@@ -405,6 +405,41 @@ where
             + 1)
     }
 
+    pub fn append_message(&self, role: &str, content: Value) -> Result<(), EngineError> {
+        let sequence = self.next_message_sequence()?;
+        self.store
+            .append_message(&StoredMessage {
+                session_id: self.session_id.clone(),
+                sequence,
+                role: role.into(),
+                content,
+                display_only: false,
+            })
+            .map_err(|error| EngineError::Store(error.to_string()))
+    }
+
+    pub fn append_session_event(&self, event: &Value) -> Result<(), EngineError> {
+        self.store
+            .append_session_event(&self.session_id, event)
+            .map_err(|error| EngineError::Store(error.to_string()))
+    }
+
+    pub fn append_notice(&self, kind: &str, content: &str) -> Result<(), EngineError> {
+        let sequence = self
+            .store
+            .max_message_notice_sequence(&self.session_id)
+            .map_err(|error| EngineError::Store(error.to_string()))?
+            + 1;
+        self.store
+            .append_notice(&opcos_store::NoticeRecord {
+                session_id: self.session_id.clone(),
+                sequence,
+                kind: kind.into(),
+                content: content.into(),
+            })
+            .map_err(|error| EngineError::Store(error.to_string()))
+    }
+
     pub fn complete_tool_call(
         &self,
         message_sequence: i64,
