@@ -12229,6 +12229,92 @@ fn set_session_archived_for_state(
     }))
 }
 
+const OPCOS_SETTINGS_CATALOG: &[(&str, &str, &str)] = &[
+    (
+        "appearance",
+        "General",
+        "Set the appearance and language of the OPCOS workbench.",
+    ),
+    (
+        "agent",
+        "Agent defaults",
+        "控制会话默认值、Computer use、用量上限和 Pull request 策略。",
+    ),
+    (
+        "environment",
+        "Environment",
+        "管理 Blueprint、固定环境说明、有序仓库 setup 和长期主机。",
+    ),
+    ("experts", "专家", "管理可供项目启用的专家库。"),
+    ("teams", "团队", "管理可供项目启用的团队库。"),
+    ("command", "Command", "管理可供项目启用的命令库。"),
+    (
+        "provider",
+        "Provider",
+        "Choose a provider and validate its connection key.",
+    ),
+    (
+        "hosts",
+        "Hosts",
+        "Bind and test the remote hosts used by OPCOS sessions.",
+    ),
+    (
+        "agents",
+        "规则",
+        "仓库级运行规则（对应仓库中的 AGENTS.md 文件）。",
+    ),
+    ("instructions", "全局指令", "应用于所有新会话的全局指令。"),
+    (
+        "knowledge",
+        "Knowledge",
+        "Reusable reference material added to context.",
+    ),
+    (
+        "playbook",
+        "Playbook",
+        "Repeatable workflows available to automation.",
+    ),
+    (
+        "skill",
+        "Skill",
+        "Focused capability and instruction bundles.",
+    ),
+    (
+        "mcp",
+        "MCP",
+        "Control the tools exposed by the selected remote host.",
+    ),
+    (
+        "connectors",
+        "Connectors",
+        "Linear is connected locally with a Personal API Key. Other connectors are not integrated.",
+    ),
+    (
+        "ingress",
+        "External events",
+        "Poll GitHub and RSS/Atom sources that can wake OPCOS event rules.",
+    ),
+    (
+        "index",
+        "Repository index",
+        "Build a host-backed path and symbol index before asking the agent to change code.",
+    ),
+    (
+        "secrets",
+        "Secrets",
+        "Inspect secret metadata without exposing secret values.",
+    ),
+    (
+        "blueprint",
+        "Blueprint",
+        "Read and manage the selected host blueprint.",
+    ),
+];
+
+fn opcos_settings_catalog() -> &'static [(&'static str, &'static str, &'static str)] {
+    OPCOS_SETTINGS_CATALOG
+}
+
 fn list_sessions_for_state(state: &DesktopState) -> Result<Vec<SessionView>, String> {
     let sessions = state
         .store
@@ -13917,54 +14003,51 @@ impl opcos_mcp_server::OpcosControlPlane for DesktopControlPlane {
         }
     }
 
-    async fn list_integrations(&self, _arguments: Value) -> Result<Value, String> {
+    async fn list_integrations(&self, arguments: Value) -> Result<Value, String> {
         let state = self.state();
         let mcp_servers = list_mcp_servers_for_state(&state).await?;
-        let kinds = [
-            "github",
-            "telegram",
-            "discord",
-            "slack",
-            "notion",
-            "gitlab",
-            "stripe",
-            "asana",
-            "hubspot",
-            "clickup",
-            "pagerduty",
-            "posthog",
-            "apollo.io",
-            "hunter",
-            "close",
-            "attio",
-            "clay",
-            "figma",
-            "descript",
-            "monday.com",
-            "jira",
-            "confluence",
-            "zendesk",
-            "datadog",
-            "mixpanel",
-            "amplitude",
-            "whatsapp",
-            "email (imap)",
-            "gmail",
-            "google calendar",
-            "google drive",
-            "outlook",
-            "salesforce",
-            "quickbooks",
-            "docusign",
-            "canva",
-            "dropbox",
-            "box",
-        ];
-        let mut connectors = Vec::new();
-        for kind in kinds {
-            if let Ok(value) = connector_identity(&state, kind).await {
-                connectors.push(value);
+        let probe_kinds = arguments
+            .get("probe_kinds")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|value| value.trim().to_ascii_lowercase())
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        let probe = arguments
+            .get("probe")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if probe && probe_kinds.is_empty() {
+            return Err("probe requires a non-empty probe_kinds array".into());
+        }
+        if probe {
+            for kind in &probe_kinds {
+                connector_kind_supported(&state.store, SUPPORTED_CONNECTOR_KINDS, kind)?;
             }
+        }
+        let mut connectors = Vec::with_capacity(SUPPORTED_CONNECTOR_KINDS.len());
+        for kind in SUPPORTED_CONNECTOR_KINDS {
+            let configured = connector_credentials_configured(&state, kind)?;
+            let mut connector = json!({
+                "kind": kind,
+                "configured": configured
+            });
+            if probe && probe_kinds.contains(*kind) {
+                if !configured {
+                    connector["error"] =
+                        Value::String(format!("{kind} credentials are not configured"));
+                } else {
+                    match connector_identity(&state, kind).await {
+                        Ok(identity) => connector["identity"] = identity,
+                        Err(error) => connector["error"] = Value::String(error),
+                    }
+                }
+            }
+            connectors.push(connector);
         }
         Ok(json!({"connectors": connectors, "mcp_servers": mcp_servers}))
     }
@@ -13975,22 +14058,23 @@ impl opcos_mcp_server::OpcosControlPlane for DesktopControlPlane {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_ascii_lowercase();
-        let settings = [
-            ("provider", "Provider settings", "settings#provider"),
-            ("agent", "Agent settings", "settings#agent"),
-            ("runner", "Runner settings", "settings#runner"),
-            ("integrations", "Integrations", "integrations"),
-            ("automations", "Automations", "automations"),
-        ];
+        let settings = opcos_settings_catalog();
         let matches = settings
-            .into_iter()
-            .filter(|(id, title, route)| {
+            .iter()
+            .filter(|(id, title, description)| {
                 query.is_empty()
                     || id.contains(&query)
                     || title.to_ascii_lowercase().contains(&query)
-                    || route.contains(&query)
+                    || description.to_ascii_lowercase().contains(&query)
             })
-            .map(|(id, title, route)| json!({"id":id,"title":title,"route":route}))
+            .map(|(id, title, description)| {
+                json!({
+                    "id": id,
+                    "title": title,
+                    "description": description,
+                    "location": format!("Settings → {title}")
+                })
+            })
             .collect::<Vec<_>>();
         Ok(json!({"settings": matches}))
     }
@@ -18388,6 +18472,60 @@ async fn connector_identity(state: &DesktopState, kind: &str) -> Result<Value, S
 
 /// A connector kind is supported when it is in the catalog, or when it is a
 /// `github@<host>` credential bound to a registered Enterprise instance.
+const SUPPORTED_CONNECTOR_KINDS: &[&str] = &[
+    "github",
+    "telegram",
+    "discord",
+    "slack",
+    "notion",
+    "gitlab",
+    "stripe",
+    "asana",
+    "hubspot",
+    "clickup",
+    "pagerduty",
+    "posthog",
+    "apollo.io",
+    "hunter",
+    "close",
+    "attio",
+    "clay",
+    "figma",
+    "descript",
+    "monday.com",
+    "jira",
+    "confluence",
+    "zendesk",
+    "datadog",
+    "mixpanel",
+    "amplitude",
+    "whatsapp",
+    "email (imap)",
+    "gmail",
+    "google calendar",
+    "google drive",
+    "outlook",
+    "salesforce",
+    "quickbooks",
+    "docusign",
+    "canva",
+    "dropbox",
+    "box",
+];
+
+fn connector_credentials_configured(state: &DesktopState, kind: &str) -> Result<bool, String> {
+    Ok(state
+        .secrets
+        .get(&secret_key("connector-config", kind))
+        .map_err(|error| format!("{kind} credentials unavailable: {error}"))?
+        .is_some()
+        || state
+            .secrets
+            .get(&secret_key("connector-token", kind))
+            .map_err(|error| format!("{kind} token unavailable: {error}"))?
+            .is_some())
+}
+
 fn connector_kind_supported(
     store: &SqliteStore,
     supported: &[&str],
@@ -18594,47 +18732,7 @@ async fn connector_save(
 #[tauri::command]
 async fn connector_status(state: State<'_, DesktopState>, kind: String) -> Result<Value, String> {
     let kind = kind.trim().to_ascii_lowercase();
-    const SUPPORTED: &[&str] = &[
-        "github",
-        "telegram",
-        "discord",
-        "slack",
-        "notion",
-        "gitlab",
-        "stripe",
-        "asana",
-        "hubspot",
-        "clickup",
-        "pagerduty",
-        "posthog",
-        "apollo.io",
-        "hunter",
-        "close",
-        "attio",
-        "clay",
-        "figma",
-        "descript",
-        "monday.com",
-        "jira",
-        "confluence",
-        "zendesk",
-        "datadog",
-        "mixpanel",
-        "amplitude",
-        "whatsapp",
-        "email (imap)",
-        "gmail",
-        "google calendar",
-        "google drive",
-        "outlook",
-        "salesforce",
-        "quickbooks",
-        "docusign",
-        "canva",
-        "dropbox",
-        "box",
-    ];
-    connector_kind_supported(&state.store, SUPPORTED, &kind)?;
+    connector_kind_supported(&state.store, SUPPORTED_CONNECTOR_KINDS, &kind)?;
     connector_identity(&state, &kind).await
 }
 
@@ -25420,6 +25518,23 @@ mod m7_tests {
         );
         assert!(asset_mutation_guard(&connection, "custom", "edited").is_ok());
         assert!(asset_mutation_guard(&connection, "missing", "deleted").is_ok());
+    }
+
+    #[test]
+    fn settings_catalog_matches_frontend_section_keys() {
+        let source = include_str!("../../web/src/components/SettingsView.tsx");
+        let frontend_keys = source
+            .lines()
+            .skip_while(|line| !line.contains("export type SettingsSection"))
+            .take_while(|line| !line.contains("const tabs"))
+            .filter_map(|line| line.trim().strip_prefix("| \""))
+            .filter_map(|line| line.split('"').next())
+            .collect::<HashSet<_>>();
+        let rust_keys = opcos_settings_catalog()
+            .iter()
+            .map(|(key, _, _)| *key)
+            .collect::<HashSet<_>>();
+        assert_eq!(rust_keys, frontend_keys);
     }
 
     #[test]

@@ -197,7 +197,13 @@ where
                 "List configured OPCOS integrations and MCP servers.",
                 json!({
                     "type": "object",
-                    "properties": {"kind": {"type": "string"}}
+                    "properties": {
+                        "probe": {"type": "boolean"},
+                        "probe_kinds": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        }
+                    }
                 }),
             ),
             tool(
