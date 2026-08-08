@@ -181,6 +181,7 @@ interface Props {
 }
 
 export function Composer(props: Props) {
+  const legacyOpenCode = props.harness === "opencode";
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [plusOpen, setPlusOpen] = useState(false);
@@ -555,6 +556,12 @@ export function Composer(props: Props) {
       )}
 
       <div className="composer-card">
+        {legacyOpenCode && (
+          <div className="px-3.5 pt-3.5 text-[12px] text-muted">
+            This historical OpenCode session is read-only. Create an ACP session
+            using the <code>opencode acp</code> launch recipe to continue.
+          </div>
+        )}
         <textarea
           ref={textareaRef}
           className="w-full block px-3.5 pt-3.5 pb-1.5 text-[14.5px]"
@@ -568,6 +575,7 @@ export function Composer(props: Props) {
           }}
           onKeyDown={onKey}
           rows={1}
+          disabled={legacyOpenCode}
         />
         {slashQuery !== null && props.slashCommands && (
           <div className="px-3 pb-2 flex flex-wrap gap-1.5">
@@ -731,7 +739,18 @@ export function Composer(props: Props) {
                   props.onHarnessChange?.(event.target.value)
                 }
               >
-                {props.harnessOptions.map((option) => (
+                {(legacyOpenCode &&
+                !props.harnessOptions.some((option) => option.id === "opencode")
+                  ? [
+                      ...props.harnessOptions,
+                      {
+                        id: "opencode",
+                        label: "OpenCode (read-only)",
+                        available: false,
+                      },
+                    ]
+                  : props.harnessOptions
+                ).map((option) => (
                   <option
                     key={option.id}
                     value={option.id}
@@ -849,6 +868,7 @@ export function Composer(props: Props) {
             running={props.running}
             disabled={
               !props.connected ||
+              legacyOpenCode ||
               !!dictation?.recording ||
               !!dictationBusy ||
               (!hasContent && !props.running)
