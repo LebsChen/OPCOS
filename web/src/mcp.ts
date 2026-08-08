@@ -32,7 +32,7 @@ export function mcpResourceSummary(resource: Record<string, unknown>): string {
 export type McpTransport = "stdio" | "streamable-http" | "http-sse";
 
 export function isUserMcpServer(server: Record<string, unknown>): boolean {
-  return server.status !== "builtin";
+  return server.builtin === false;
 }
 
 export function mcpServerFormBody(fields: {

@@ -61,10 +61,11 @@ describe("MCP resources and prompts", () => {
     expect(attachments).toEqual([{ uri: "resource://one", name: "one.md" }]);
   });
 
-  it("protects catalog entries by status rather than incidental fields", () => {
-    expect(isUserMcpServer({ status: "builtin", builtin: false })).toBe(false);
-    expect(isUserMcpServer({ status: "active", builtin: true })).toBe(true);
-    expect(isUserMcpServer({ status: "active" })).toBe(true);
+  it("protects builtin catalog entries using the backend flag", () => {
+    expect(isUserMcpServer({ status: "connected", builtin: true })).toBe(false);
+    expect(isUserMcpServer({ status: "active", builtin: false })).toBe(true);
+    expect(isUserMcpServer({ status: "active" })).toBe(false);
+    expect(isUserMcpServer({ status: "active", builtin: "false" })).toBe(false);
   });
 
   it.each([
