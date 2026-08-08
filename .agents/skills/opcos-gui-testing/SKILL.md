@@ -1205,8 +1205,6 @@ returned `next_call_id`, never by taking the first database row. A card that say
 engine evidence: verify the corresponding persisted resolution event and that the next tool or
 approval actually starts. When several gated writes are needed, use fresh marker filenames and
 verify the remote file state after each Allow/Deny decision.
-<<<<<<< HEAD
-
 ## Testing transcript CSS/layout fixes (chevrons, row wrapping)
 
 Style-only fixes in `web/src/style.css` are picked up by **Vite HMR** in the running Tauri window, so no
