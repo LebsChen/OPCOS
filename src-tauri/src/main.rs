@@ -12633,6 +12633,24 @@ fn acp_session_event(event_type: &str, payload: Value) -> Value {
     })
 }
 
+fn acp_stream_event(event_type: &str, payload: Value) -> Value {
+    let mut event = match payload {
+        Value::Object(payload) => payload,
+        _ => serde_json::Map::new(),
+    };
+    event.insert("type".into(), Value::String(event_type.into()));
+    event.insert(
+        "event_id".into(),
+        Value::String(format!("event-{}", Uuid::new_v4())),
+    );
+    event.insert(
+        "created_at_ms".into(),
+        Value::Number(Utc::now().timestamp_millis().into()),
+    );
+    event.insert("timestamp".into(), Value::String(Utc::now().to_rfc3339()));
+    Value::Object(event)
+}
+
 fn acp_working_event(event_type: &str, category: &str, direction: &str, payload: Value) -> Value {
     json!({
         "event_type": event_type,
@@ -12679,6 +12697,19 @@ fn persist_acp_assistant_turn(
     recorder
         .append_message("assistant", content)
         .map_err(|error| error.to_string())?;
+    if let Some(text) = turn.text.as_deref().filter(|text| !text.trim().is_empty()) {
+        recorder
+            .append_session_event(&acp_session_event(
+                "devin_message",
+                acp_working_event(
+                    "devin_message",
+                    "message",
+                    "outgoing",
+                    json!({"message": text, "tool_calls": turn.tool_calls.len()}),
+                ),
+            ))
+            .map_err(|error| error.to_string())?;
+    }
     recorder
         .append_session_event(&json!({
             "type": "turn",
@@ -12756,6 +12787,11 @@ struct AcpDesktopLifecycle {
 }
 
 impl AcpDesktopLifecycle {
+    fn emit_stream(&self, event: Value) {
+        let _ = self.recorder.append_session_event(&event);
+        self.sink.emit("stream", event);
+    }
+
     fn start(&self, text: &str) -> Result<(), String> {
         self.recorder
             .update_status("running", "none")
@@ -12779,6 +12815,15 @@ impl AcpDesktopLifecycle {
     async fn handle_error(&self, message: &str) {
         let _ = self.recorder.append_notice("error", message);
         let _ = self.recorder.update_status("error", "harness_error");
+        let _ = self.recorder.append_session_event(&acp_session_event(
+            "error",
+            acp_working_event(
+                "error",
+                "notice",
+                "outgoing",
+                json!({"message": message, "text": message}),
+            ),
+        ));
         self.sink
             .emit("notice", json!({"kind":"error","text":message}));
         self.sink.emit(
@@ -12794,34 +12839,35 @@ impl AcpDesktopLifecycle {
     ) {
         while let Some(event) = events.recv().await {
             match event {
-                opcos_engine::HarnessEvent::AssistantTextDelta { text } => self.sink.emit(
-                    "stream",
-                    json!({
-                        "type": "assistant_delta",
-                        "event_id": format!("event-{}", Uuid::new_v4()),
-                        "created_at_ms": Utc::now().timestamp_millis(),
-                        "timestamp": Utc::now().to_rfc3339(),
-                        "text_delta": text,
-                    }),
+                opcos_engine::HarnessEvent::AssistantTextDelta { text } => self.emit_stream(
+                    acp_stream_event(
+                        "assistant_delta",
+                        json!({"text_delta": text}),
+                    ),
                 ),
-                opcos_engine::HarnessEvent::AssistantReasoningDelta { text } => self.sink.emit(
-                    "stream",
-                    json!({
-                        "type": "reasoning_delta",
-                        "event_id": format!("event-{}", Uuid::new_v4()),
-                        "created_at_ms": Utc::now().timestamp_millis(),
-                        "timestamp": Utc::now().to_rfc3339(),
-                        "reasoning_delta": text,
-                    }),
+                opcos_engine::HarnessEvent::AssistantReasoningDelta { text } => self.emit_stream(
+                    acp_stream_event(
+                        "reasoning_delta",
+                        json!({"reasoning_delta": text}),
+                    ),
                 ),
                 opcos_engine::HarnessEvent::ToolCallDelta {
                     call_id,
                     tool,
                     arguments_fragment,
-                } => self.sink.emit(
-                    "stream",
+                } => self.emit_stream(acp_stream_event(
+                    "tool_call_delta",
                     json!({"tool_call_delta":{"id":call_id,"name":tool,"arguments_fragment":arguments_fragment}}),
-                ),
+                )),
+                opcos_engine::HarnessEvent::ToolResult {
+                    call_id,
+                    tool,
+                    arguments,
+                    result,
+                } => self.emit_stream(acp_stream_event(
+                    "tool_result",
+                    json!({"tool_result":{"call_id":call_id,"tool":tool,"arguments":redact_approval_value(&arguments),"result":redact_approval_value(&result)}}),
+                )),
                 opcos_engine::HarnessEvent::ApprovalRequested(request) => {
                     let unattended = self.store.is_unattended(&self.session_id).unwrap_or(false);
                     if unattended {
@@ -12850,8 +12896,19 @@ impl AcpDesktopLifecycle {
                 }
                 opcos_engine::HarnessEvent::TurnFinished { turn } => {
                     let _ = persist_acp_assistant_turn(&self.recorder, &turn);
-                    let _ = self.recorder.update_status("idle", "finished");
-                    let _ = persist_acp_turn_finished(&self.recorder, "idle", "finished");
+                    let (run_state, stop_reason) = self
+                        .store
+                        .load_session(&self.session_id)
+                        .ok()
+                        .flatten()
+                        .filter(|session| {
+                            session.run_state == "interrupted"
+                                && session.stop_reason == "interrupted_by_user"
+                        })
+                        .map(|session| (session.run_state, session.stop_reason))
+                        .unwrap_or_else(|| ("idle".into(), "finished".into()));
+                    let _ = self.recorder.update_status(&run_state, &stop_reason);
+                    let _ = persist_acp_turn_finished(&self.recorder, &run_state, &stop_reason);
                     let mut payload =
                         session_status_payload_from_store(&self.store, &self.session_id);
                     if let Some(object) = payload.as_object_mut() {
@@ -25786,6 +25843,10 @@ agents:
             event.event["type"] == "turn_finished"
                 && event.event["working_event"]["payload"]["stop_reason"] == "finished"
         }));
+        assert!(events.iter().any(|event| {
+            event.event["type"] == "devin_message"
+                && event.event["working_event"]["payload"]["message"] == "world"
+        }));
         let emitted = sink.emitted.lock().unwrap();
         assert!(emitted.iter().any(|(kind, payload)| {
             kind == "stream"
@@ -25802,6 +25863,43 @@ agents:
             sink.terminal_status_at_emit.lock().unwrap().as_ref(),
             Some(&("idle".into(), "finished".into()))
         );
+    }
+
+    #[tokio::test]
+    async fn acp_desktop_lifecycle_preserves_user_interrupt_on_turn_finished() {
+        let store = acp_test_store();
+        let sink = Arc::new(RecordingAcpSink {
+            store: store.clone(),
+            emitted: Mutex::new(Vec::new()),
+            terminal_status_at_emit: Mutex::new(None),
+            evicted: std::sync::atomic::AtomicBool::new(false),
+        });
+        let lifecycle = Arc::new(AcpDesktopLifecycle {
+            recorder: Arc::new(SessionRecorder::new(store.clone(), "acp-lifecycle")),
+            store: store.clone(),
+            session_id: "acp-lifecycle".into(),
+            sink,
+        });
+        lifecycle.start("hello").unwrap();
+        store
+            .update_session_status("acp-lifecycle", "interrupted", "interrupted_by_user")
+            .unwrap();
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(lifecycle.consume(receiver));
+        sender
+            .send(opcos_engine::HarnessEvent::TurnFinished {
+                turn: opcos_provider::AssistantTurn {
+                    text: Some("partial".into()),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        drop(sender);
+        task.await.unwrap();
+        let session = store.load_session("acp-lifecycle").unwrap().unwrap();
+        assert_eq!(session.run_state, "interrupted");
+        assert_eq!(session.stop_reason, "interrupted_by_user");
     }
 
     #[tokio::test]
@@ -25846,6 +25944,14 @@ agents:
             emitted
                 .iter()
                 .any(|(kind, payload)| kind == "notice" && payload["kind"] == "error")
+        );
+        assert!(
+            store
+                .load_session_events("acp-lifecycle")
+                .unwrap()
+                .iter()
+                .any(|event| event.event["type"] == "error"
+                    && event.event["working_event"]["payload"]["message"] == "agent exited")
         );
         assert_eq!(
             emitted
