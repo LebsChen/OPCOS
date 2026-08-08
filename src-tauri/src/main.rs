@@ -465,6 +465,25 @@ impl McpCredentialStore for McpCredentialAdapter {
             })
             .transpose()
     }
+
+    async fn set(
+        &self,
+        server_id: &str,
+        credentials: HashMap<String, String>,
+    ) -> Result<(), opcos_mcp::McpClientError> {
+        let mut merged = self.get(server_id).await?.unwrap_or_default();
+        merged.extend(credentials);
+        let value =
+            serde_json::to_string(&merged).map_err(|_| opcos_mcp::McpClientError::Transport)?;
+        let key = self
+            .project_id
+            .as_deref()
+            .map(|id| project_secret_key(id, "mcp-credential", server_id))
+            .unwrap_or_else(|| secret_key("mcp-credential", server_id));
+        self.store
+            .set(&key, &value)
+            .map_err(|_| opcos_mcp::McpClientError::Transport)
+    }
 }
 
 #[async_trait]
@@ -12648,6 +12667,7 @@ async fn session_context_attachments(
                         .map(|blob| format!("[binary resource: {blob}]"))
                 })
                 .unwrap_or_default();
+            validate_context_resource_size(&text)?;
             attachments.push(ExternalContextAttachment {
                 source: format!("mcp:{server_id}"),
                 uri: Some(content.uri),
@@ -12657,6 +12677,18 @@ async fn session_context_attachments(
         }
     }
     Ok(attachments)
+}
+
+fn validate_context_resource_size(text: &str) -> Result<(), String> {
+    const MAX_CONTEXT_RESOURCE_BYTES: usize = 256 * 1024;
+    if text.len() > MAX_CONTEXT_RESOURCE_BYTES {
+        return Err(format!(
+            "MCP resource is too large to attach ({} bytes; limit {} bytes)",
+            text.len(),
+            MAX_CONTEXT_RESOURCE_BYTES
+        ));
+    }
+    Ok(())
 }
 
 async fn submit_turn_inner(
@@ -12819,12 +12851,6 @@ pub(crate) async fn submit_turn_inner_with_context(
         .store
         .load_plan(&request.session_id)
         .map_err(|error| error.to_string())?;
-    emit(
-        &app,
-        "message",
-        Some(&request.session_id),
-        json!({"role":"user","text":request.text}),
-    );
     if let Err(error) = auto_route_project_plan(&app, state, &request.session_id).await {
         audit(
             state,
@@ -12835,6 +12861,12 @@ pub(crate) async fn submit_turn_inner_with_context(
     }
     let mut attachments = request.attachments;
     attachments.extend(session_context_attachments(state, &request.session_id).await?);
+    emit(
+        &app,
+        "message",
+        Some(&request.session_id),
+        json!({"role":"user","text":request.text}),
+    );
     match submit_engine_turn_with_coordination_ingest(
         &engine,
         state,
@@ -16476,6 +16508,31 @@ async fn mcp_prompts(
 }
 
 #[tauri::command]
+async fn mcp_authorize(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    server_id: String,
+    version_id: String,
+    resource_url: String,
+) -> Result<String, String> {
+    let url = match state
+        .mcp
+        .begin_oauth(&server_id, &version_id, &resource_url)
+        .await
+    {
+        Ok(url) => url,
+        Err(error) => {
+            state.mcp.record_error(&server_id, &error).await;
+            return Err(error.to_string());
+        }
+    };
+    app.opener()
+        .open_url(url.clone(), None::<&str>)
+        .map_err(|_| "could not open the system browser")?;
+    Ok(url)
+}
+
+#[tauri::command]
 async fn mcp_get_prompt(
     state: State<'_, DesktopState>,
     server_id: String,
@@ -18558,6 +18615,7 @@ async fn retry_mcp_server(
     config["name"] = Value::String(name.clone());
     let parsed: McpServerConfig =
         serde_json::from_value(config).map_err(|error| format!("invalid MCP config: {error}"))?;
+    state.mcp.disconnect(&server_id).await;
     let tools = state
         .mcp
         .connect_with_retry(&parsed, &version_id, 2)
@@ -24367,6 +24425,7 @@ fn main() {
             mcp_context_resources,
             mcp_detach_resource,
             mcp_prompts,
+            mcp_authorize,
             mcp_get_prompt,
             connector_save,
             connector_status,
@@ -26569,6 +26628,13 @@ agents:
         assert!(constant_time_token_eq("token", "token"));
         assert!(!constant_time_token_eq("token", "Token"));
         assert!(!constant_time_token_eq("token", "token-extra"));
+    }
+
+    #[test]
+    fn oversized_mcp_context_resource_is_rejected_explicitly() {
+        let error = validate_context_resource_size(&"x".repeat(256 * 1024 + 1)).unwrap_err();
+        assert!(error.contains("MCP resource is too large to attach"));
+        assert!(error.contains("limit 262144 bytes"));
     }
 
     #[test]

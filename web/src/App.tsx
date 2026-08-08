@@ -42,7 +42,12 @@ import {
   mergeEvents,
   type TimelineEvent,
 } from "./timeline";
-import { mcpPromptMessagesToDraft, mcpResourceSummary } from "./mcp";
+import {
+  appendMcpPromptDraft,
+  mcpCatalogUpdateTargets,
+  mcpPromptMessagesToDraft,
+  mcpResourceSummary,
+} from "./mcp";
 import { summarizeIterationStats } from "./iterationStats";
 import { Sidebar } from "./components/Sidebar";
 import { sessionStatusLabel } from "./sessionStatus";
@@ -55,6 +60,7 @@ import { Icon } from "./components/Icon";
 import { CollectionPage } from "./components/CollectionPage";
 import { IntegrationCard } from "./components/IntegrationCard";
 import { getLocale, setLocale, subscribeLocale, translate } from "./i18n";
+import type { Attachment } from "./types";
 import "./openworker-tailwind.css";
 import "./openworker-styles.css";
 import "./style.css";
@@ -7148,6 +7154,55 @@ function McpManage({
       .then(setContextResources)
       .catch(onError);
   }, [onError, selected?.id]);
+  useEffect(() => {
+    let active = true;
+    if (
+      !(window as Window & { __TAURI_INTERNALS__?: unknown })
+        .__TAURI_INTERNALS__
+    ) {
+      return () => {
+        active = false;
+      };
+    }
+    const subscription = listen<{
+      server_id?: string;
+      version_id?: string;
+      method?: string;
+    }>("mcp-catalog-updated", (event) => {
+      if (!active || !event.payload.server_id) return;
+      void command<Array<Record<string, unknown>>>("list_mcp_servers")
+        .then((nextServers) => {
+          if (active) setServers(nextServers);
+        })
+        .catch(onError);
+      if (
+        mcpCatalogUpdateTargets(event.payload, selectedServerId) &&
+        event.payload.version_id
+      ) {
+        void Promise.all([
+          command<Array<Record<string, unknown>>>("mcp_resources", {
+            serverId: event.payload.server_id,
+            versionId: event.payload.version_id,
+          }),
+          command<Array<Record<string, unknown>>>("mcp_prompts", {
+            serverId: event.payload.server_id,
+            versionId: event.payload.version_id,
+          }),
+        ])
+          .then(([nextResources, nextPrompts]) => {
+            if (!active) return;
+            setResources(nextResources);
+            setPrompts(nextPrompts);
+            setResourcePreview([]);
+          })
+          .catch(onError);
+      }
+    });
+    return () => {
+      active = false;
+      void subscription.then((unsubscribe) => unsubscribe());
+    };
+  }, [onError, selectedServerId]);
   const selectedServer = servers.find(
     (server) => String(server.id) === selectedServerId,
   );
@@ -7211,9 +7266,30 @@ function McpManage({
                           ? "neutral"
                           : "success",
                     }}
-                    description={`${String(server.transport || "remote")} · ${String(server.url || "configured")}`}
+                    description={
+                      <>
+                        {`${String(server.transport || "remote")} · ${String(server.url || "configured")}`}
+                        {server.last_error
+                          ? ` · ${String(server.last_error)}`
+                          : ""}
+                      </>
+                    }
                     actions={
                       <div className="inline-actions">
+                        {String(server.status || "").toLowerCase() ===
+                          "auth_required" && (
+                          <Button
+                            onClick={() =>
+                              command("mcp_authorize", {
+                                serverId: String(server.id),
+                                versionId: String(server.version_id || ""),
+                                resourceUrl: String(server.url || ""),
+                              }).catch(onError)
+                            }
+                          >
+                            Authorize
+                          </Button>
+                        )}
                         <Button onClick={() => loadServerCatalog(server)}>
                           Resources / prompts
                         </Button>
@@ -7283,7 +7359,8 @@ function McpManage({
         <section className="panel mt-4">
           <h2>
             {String(selectedServer.name)} resources ({resources.length}) ·
-            prompts ({prompts.length})
+            prompts ({prompts.length}) · tools (
+            {Number(selectedServer.tool_count || 0)})
           </h2>
           <div className="grid gap-2">
             {resources.map((resource) => (
@@ -11044,6 +11121,13 @@ function AppContent() {
     setSurface("session");
     setHomeInput("");
   };
+  const openPromptDraftHome = (draft: string) => {
+    setSelected(null);
+    setTranscript([]);
+    setRunning(false);
+    setSurface("session");
+    setHomeInput((current) => appendMcpPromptDraft(current, draft));
+  };
   const submitHome = async () => {
     const text = homeInput.trim();
     if (!text || !homeHostId || running) return;
@@ -11105,15 +11189,21 @@ function AppContent() {
       )
       .catch(onError);
   };
-  const submit = (text: string) => {
+  const submit = async (
+    text: string,
+    attachments: Attachment[] = [],
+  ): Promise<void> => {
     if (!selected) return;
     setRunning(true);
-    void command("submit_turn", {
-      request: { session_id: selected.id, text },
-    }).catch((reason) => {
+    try {
+      await command("submit_turn", {
+        request: { session_id: selected.id, text, attachments },
+      });
+    } catch (reason) {
       setRunning(false);
       onError(submitFailureMessage(reason));
-    });
+      throw new Error(submitFailureMessage(reason));
+    }
   };
   const uploadTextAttachmentForSession = async (
     sessionId: string,
@@ -11463,11 +11553,7 @@ function AppContent() {
               onEditHost={editHost}
               onTestHost={testHost}
               onDeleteHost={deleteHost}
-              onPromptDraft={(draft) =>
-                setHomeInput((current) =>
-                  current ? `${current}\n\n${draft}` : draft,
-                )
-              }
+              onPromptDraft={openPromptDraftHome}
               hostName={hostName}
               setHostName={setHostName}
               hostUrl={hostUrl}
