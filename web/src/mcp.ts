@@ -28,3 +28,47 @@ export function mcpCatalogUpdateTargets(
 export function mcpResourceSummary(resource: Record<string, unknown>): string {
   return `${String(resource.uri || "")} · ${String(resource.mime_type || "unknown")}`;
 }
+
+export type McpTransport = "stdio" | "streamable-http" | "http-sse";
+
+export function isUserMcpServer(server: Record<string, unknown>): boolean {
+  return server.status !== "builtin";
+}
+
+export function mcpServerFormBody(fields: {
+  transport: McpTransport;
+  url: string;
+  command: string;
+  args: string;
+  env: string;
+  enabled: boolean;
+  requiresApproval: boolean;
+}): Record<string, unknown> {
+  const env = Object.fromEntries(
+    fields.env
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => {
+        const separator = line.indexOf("=");
+        return separator < 1
+          ? [line, ""]
+          : [line.slice(0, separator).trim(), line.slice(separator + 1)];
+      }),
+  );
+  return {
+    transport: fields.transport,
+    ...(fields.transport === "stdio"
+      ? {
+          command: fields.command,
+          args: fields.args
+            .split("\n")
+            .map((value) => value.trim())
+            .filter(Boolean),
+          env,
+        }
+      : { url: fields.url.trim() }),
+    enabled: fields.enabled,
+    requires_approval: fields.requiresApproval,
+  };
+}

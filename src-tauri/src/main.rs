@@ -9879,35 +9879,14 @@ fn mcp_tool_enabled(disabled: &HashSet<String>, name: &str) -> bool {
 async fn configure_mcp_notification_sink(
     mcp: &Arc<McpManager<McpCredentialAdapter>>,
     app_handle: &tauri::AppHandle,
-    engines: &Arc<AsyncMutex<HashMap<String, Arc<GuiEngine>>>>,
 ) {
     let app_handle = app_handle.clone();
-    let notification_engines = Arc::clone(engines);
     mcp.set_notification_sink(Arc::new(move |server_id, version_id, method, uri| {
         if method == "notifications/tools/list_changed" {
             let app_handle = app_handle.clone();
-            let engines = Arc::clone(&notification_engines);
             tauri::async_runtime::spawn(async move {
                 let state = app_handle.state::<DesktopState>();
-                let sessions = engines
-                    .lock()
-                    .await
-                    .iter()
-                    .map(|(session_id, engine)| (session_id.clone(), Arc::clone(engine)))
-                    .collect::<Vec<_>>();
-                for (session_id, engine) in sessions {
-                    if let Err(error) =
-                        refresh_session_mcp_tools(&state, &session_id, &engine).await
-                    {
-                        let _ = app_handle.emit(
-                            "mcp-catalog-refresh-error",
-                            serde_json::json!({
-                                "session_id": session_id,
-                                "error": error,
-                            }),
-                        );
-                    }
-                }
+                refresh_cached_mcp_engines(&state).await;
             });
         }
         let _ = app_handle.emit(
@@ -9921,6 +9900,27 @@ async fn configure_mcp_notification_sink(
         );
     }))
     .await;
+}
+
+async fn refresh_cached_mcp_engines(state: &DesktopState) {
+    let sessions = state
+        .engines
+        .lock()
+        .await
+        .iter()
+        .map(|(session_id, engine)| (session_id.clone(), Arc::clone(engine)))
+        .collect::<Vec<_>>();
+    for (session_id, engine) in sessions {
+        if let Err(error) = refresh_session_mcp_tools(state, &session_id, &engine).await {
+            let _ = state.mcp_notification_app.emit(
+                "mcp-catalog-refresh-error",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "error": error,
+                }),
+            );
+        }
+    }
 }
 
 async fn mcp_runtime_for_project(
@@ -9951,8 +9951,7 @@ async fn mcp_runtime_for_engine(
 ) -> Arc<McpManager<McpCredentialAdapter>> {
     let manager = mcp_runtime_for_project(state, project_id).await;
     if project_id.is_some() {
-        configure_mcp_notification_sink(&manager, &state.mcp_notification_app, &state.engines)
-            .await;
+        configure_mcp_notification_sink(&manager, &state.mcp_notification_app).await;
     }
     manager
 }
@@ -16020,6 +16019,22 @@ fn save_asset(
 
 #[tauri::command]
 fn delete_asset(state: State<'_, DesktopState>, id: String) -> Result<(), String> {
+    let is_mcp = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .query_row(
+            "SELECT kind FROM config_object WHERE id=?1",
+            [id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .as_deref()
+        == Some("mcp");
+    if is_mcp {
+        delete_mcp_credentials(&state, &id)?;
+    }
     state
         .database
         .lock()
@@ -16029,6 +16044,46 @@ fn delete_asset(state: State<'_, DesktopState>, id: String) -> Result<(), String
             [id],
         )
         .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn delete_mcp_credentials(state: &DesktopState, server_id: &str) -> Result<(), String> {
+    let name = format!("mcp-credential:{server_id}");
+    let project_ids = {
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        let mut statement = connection
+            .prepare("SELECT project_id FROM secret_records WHERE name=?1 AND project_id<>''")
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map([name.as_str()], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+    state
+        .secrets
+        .delete(&secret_key("mcp-credential", server_id))
+        .map_err(|error| error.to_string())?;
+    for project_id in project_ids {
+        state
+            .secrets
+            .delete(&project_secret_key(
+                &project_id,
+                "mcp-credential",
+                server_id,
+            ))
+            .map_err(|error| error.to_string())?;
+    }
+    state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .execute("DELETE FROM secret_records WHERE name=?1", [name.as_str()])
+        .map_err(|error| error.to_string())?;
+    refresh_secret_values(state)?;
     Ok(())
 }
 
@@ -19057,7 +19112,7 @@ async fn retry_mcp_server(
         }
         transaction.commit().map_err(|error| error.to_string())?;
     }
-    state.engines.lock().await.clear();
+    refresh_cached_mcp_engines(&state).await;
     Ok(json!({
         "id": parsed.object_id,
         "name": parsed.name,
@@ -24562,11 +24617,7 @@ fn main() {
             })));
             let engines = Arc::new(AsyncMutex::new(HashMap::<String, Arc<GuiEngine>>::new()));
             let app_handle = app.handle().clone();
-            tauri::async_runtime::block_on(configure_mcp_notification_sink(
-                &mcp,
-                &app_handle,
-                &engines,
-            ));
+            tauri::async_runtime::block_on(configure_mcp_notification_sink(&mcp, &app_handle));
             let mut jobs_path = path.clone();
             jobs_path.set_file_name("background-jobs");
             let mut trigger_token_bytes = [0_u8; 32];

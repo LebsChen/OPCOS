@@ -44,9 +44,12 @@ import {
 } from "./timeline";
 import {
   appendMcpPromptDraft,
+  isUserMcpServer,
   mcpCatalogUpdateTargets,
+  mcpServerFormBody,
   mcpPromptMessagesToDraft,
   mcpResourceSummary,
+  type McpTransport,
 } from "./mcp";
 import { summarizeIterationStats } from "./iterationStats";
 import { Sidebar } from "./components/Sidebar";
@@ -7292,12 +7295,11 @@ function McpManage({
     setServerRequiresApproval(true);
   };
   const editServer = (server: Record<string, unknown>) => {
-    if (server.builtin === true) return;
+    if (!isUserMcpServer(server)) return;
     setEditingServerId(String(server.id));
     setServerName(String(server.name || ""));
     setServerTransport(
-      String(server.transport || "streamable-http") as
-        "stdio" | "streamable-http" | "http-sse",
+      String(server.transport || "streamable-http") as McpTransport,
     );
     setServerUrl(String(server.url || ""));
     setServerCommand(String(server.command || ""));
@@ -7317,33 +7319,27 @@ function McpManage({
   };
   const saveServer = () => {
     const id = editingServerId || `mcp-${Date.now()}`;
-    const env = Object.fromEntries(
-      serverEnv
-        .split("\n")
-        .map((line) => line.trim())
-        .filter(Boolean)
-        .map((line) => {
-          const separator = line.indexOf("=");
-          return separator < 1
-            ? [line, ""]
-            : [line.slice(0, separator).trim(), line.slice(separator + 1)];
-        }),
-    );
-    const body = {
+    const credentialEnvKey = serverEnv
+      .split("\n")
+      .map((line) => line.trim().split("=", 1)[0])
+      .find((key) =>
+        /token|secret|password|authorization|client_secret/i.test(key),
+      );
+    if (credentialEnvKey) {
+      onError(
+        `Environment key "${credentialEnvKey}" looks sensitive. Store credentials in the bearer token field instead.`,
+      );
+      return;
+    }
+    const body = mcpServerFormBody({
       transport: serverTransport,
-      ...(serverTransport === "stdio"
-        ? {
-            command: serverCommand,
-            args: serverArgs
-              .split("\n")
-              .map((value) => value.trim())
-              .filter(Boolean),
-            env,
-          }
-        : { url: serverUrl.trim() }),
+      url: serverUrl,
+      command: serverCommand,
+      args: serverArgs,
+      env: serverEnv,
       enabled: serverEnabled,
-      requires_approval: serverRequiresApproval,
-    };
+      requiresApproval: serverRequiresApproval,
+    });
     void command("save_asset", {
       id,
       kind: "mcp",
@@ -7377,7 +7373,7 @@ function McpManage({
       .catch(onError);
   };
   const removeServer = (server: Record<string, unknown>) => {
-    if (server.builtin === true) return;
+    if (!isUserMcpServer(server)) return;
     void command("delete_asset", { id: String(server.id) })
       .then(() => command<Array<Record<string, unknown>>>("list_mcp_servers"))
       .then(setServers)
@@ -7460,6 +7456,11 @@ function McpManage({
                 placeholder="Environment, KEY=VALUE per line"
                 rows={3}
               />
+              <p className="text-xs text-slate-500 md:col-span-2">
+                Use environment entries for non-sensitive runtime settings.
+                Store bearer tokens in the secure token field below, not in
+                environment variables.
+              </p>
             </>
           ) : (
             <input
@@ -7543,7 +7544,7 @@ function McpManage({
                     }
                     actions={
                       <div className="inline-actions">
-                        {server.builtin !== true && (
+                        {isUserMcpServer(server) && (
                           <>
                             <Button onClick={() => editServer(server)}>
                               Edit

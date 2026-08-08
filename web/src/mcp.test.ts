@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   appendMcpPromptDraft,
+  isUserMcpServer,
   mcpCatalogUpdateTargets,
+  mcpServerFormBody,
   mcpPromptMessagesToDraft,
   mcpResourceSummary,
 } from "./mcp";
@@ -58,4 +60,67 @@ describe("MCP resources and prompts", () => {
     expect(draft).toBe("Keep this draft");
     expect(attachments).toEqual([{ uri: "resource://one", name: "one.md" }]);
   });
+
+  it("protects catalog entries by status rather than incidental fields", () => {
+    expect(isUserMcpServer({ status: "builtin", builtin: false })).toBe(false);
+    expect(isUserMcpServer({ status: "active", builtin: true })).toBe(true);
+    expect(isUserMcpServer({ status: "active" })).toBe(true);
+  });
+
+  it.each([
+    {
+      transport: "stdio" as const,
+      fields: {
+        command: "npx",
+        args: "--yes\nserver",
+        env: "PORT=8080",
+        url: "",
+      },
+      expected: {
+        command: "npx",
+        args: ["--yes", "server"],
+        env: { PORT: "8080" },
+      },
+    },
+    {
+      transport: "streamable-http" as const,
+      fields: {
+        command: "",
+        args: "",
+        env: "",
+        url: " https://example.test/mcp ",
+      },
+      expected: { url: "https://example.test/mcp" },
+    },
+    {
+      transport: "http-sse" as const,
+      fields: {
+        command: "",
+        args: "",
+        env: "",
+        url: "https://example.test/sse",
+      },
+      expected: { url: "https://example.test/sse" },
+    },
+  ])(
+    "produces a save_asset body that round-trips for $transport",
+    ({ transport, fields, expected }) => {
+      const body = mcpServerFormBody({
+        ...fields,
+        transport,
+        enabled: true,
+        requiresApproval: false,
+      });
+      const listed = JSON.parse(JSON.stringify(body)) as Record<
+        string,
+        unknown
+      >;
+      expect(listed).toMatchObject({
+        transport,
+        enabled: true,
+        requires_approval: false,
+        ...expected,
+      });
+    },
+  );
 });
