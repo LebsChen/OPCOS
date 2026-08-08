@@ -12788,7 +12788,13 @@ struct AcpDesktopLifecycle {
 
 impl AcpDesktopLifecycle {
     fn emit_stream(&self, event: Value) {
-        let _ = self.recorder.append_session_event(&event);
+        let persist = !matches!(
+            event.get("type").and_then(Value::as_str),
+            Some("assistant_delta" | "reasoning_delta" | "tool_call_delta")
+        );
+        if persist {
+            let _ = self.recorder.append_session_event(&event);
+        }
         self.sink.emit("stream", event);
     }
 
@@ -25819,6 +25825,15 @@ agents:
             .await
             .unwrap();
         sender
+            .send(opcos_engine::HarnessEvent::ToolResult {
+                call_id: "call-1".into(),
+                tool: "read_file".into(),
+                arguments: json!({"path":"notes.md"}),
+                result: json!("contents"),
+            })
+            .await
+            .unwrap();
+        sender
             .send(opcos_engine::HarnessEvent::TurnFinished {
                 turn: opcos_provider::AssistantTurn {
                     text: Some("world".into()),
@@ -25846,6 +25861,15 @@ agents:
         assert!(events.iter().any(|event| {
             event.event["type"] == "devin_message"
                 && event.event["working_event"]["payload"]["message"] == "world"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event["type"] == "tool_result"
+                && event.event["tool_result"]["call_id"] == "call-1"
+        }));
+        assert!(!events.iter().any(|event| {
+            event.event["type"] == "assistant_delta"
+                || event.event["type"] == "reasoning_delta"
+                || event.event["type"] == "tool_call_delta"
         }));
         let emitted = sink.emitted.lock().unwrap();
         assert!(emitted.iter().any(|(kind, payload)| {
