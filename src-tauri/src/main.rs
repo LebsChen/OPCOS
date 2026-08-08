@@ -9683,7 +9683,89 @@ fn acp_agent_config(
         workspace: String::new(),
         command,
         env: (!env.is_empty()).then_some(Value::Object(env)),
+        mcp_servers: Vec::new(),
     })
+}
+
+fn acp_mcp_servers(state: &DesktopState, session: &SessionRecord) -> Result<Vec<Value>, String> {
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let configs = effective_config_objects(
+        &connection,
+        &session.workspace,
+        &session.host_id,
+        session.project_id.as_deref(),
+        Some(&session.session_id),
+    )?;
+    let mut servers = Vec::new();
+    for (object_id, version_id) in configs {
+        let row = connection.query_row(
+            "SELECT o.name,COALESCE(o.server_key,''),v.content
+             FROM config_object o
+             JOIN config_object_version v ON v.id=?2
+             WHERE o.id=?1 AND o.kind='mcp'",
+            params![object_id, version_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    serde_json::from_str::<Value>(&row.get::<_, String>(2)?)
+                        .unwrap_or_else(|_| json!({})),
+                ))
+            },
+        );
+        let Ok((name, _server_key, mut content)) = row else {
+            continue;
+        };
+        content["object_id"] = Value::String(object_id.clone());
+        content["name"] = Value::String(name.clone());
+        let Ok(config) = serde_json::from_value::<McpServerConfig>(content) else {
+            continue;
+        };
+        if !config.enabled {
+            continue;
+        }
+        let credentials = scoped_secret_get_from_store(
+            &state.secrets,
+            session.project_id.as_deref(),
+            "mcp-credential",
+            &object_id,
+        )?
+        .and_then(|value| serde_json::from_str::<HashMap<String, String>>(&value).ok())
+        .unwrap_or_default();
+        match config.transport {
+            opcos_mcp::McpTransport::Stdio => {
+                let command = config
+                    .command
+                    .ok_or_else(|| "enabled ACP MCP stdio server has no command".to_owned())?;
+                servers.push(json!({
+                    "type": "stdio",
+                    "name": config.name,
+                    "command": command,
+                    "args": config.args,
+                    "env": config.env.into_iter().map(|(name, value)| json!({"name": name, "value": value})).collect::<Vec<_>>(),
+                }));
+            }
+            _ => {
+                let url = config
+                    .url
+                    .ok_or_else(|| "enabled ACP MCP HTTP server has no URL".to_owned())?;
+                let mut headers = config.headers;
+                if let Some(token) = credentials.get("bearer_token") {
+                    headers.insert("Authorization".into(), format!("Bearer {token}"));
+                }
+                servers.push(json!({
+                    "type": "http",
+                    "name": config.name,
+                    "url": url,
+                    "headers": headers.into_iter().map(|(name, value)| json!({"name": name, "value": value})).collect::<Vec<_>>(),
+                }));
+            }
+        }
+    }
+    Ok(servers)
 }
 
 async fn acp_for(
@@ -9724,6 +9806,7 @@ async fn acp_for(
     };
     let mut config = acp_agent_config(state, session.project_id.as_deref())?;
     config.workspace = workspace;
+    config.mcp_servers = acp_mcp_servers(state, &session)?;
     let harness = AcpHarness::start(
         host,
         Arc::new(SessionRecorder::new(Arc::clone(&state.store), session_id)),
@@ -13097,6 +13180,24 @@ async fn submit_opencode_turn_inner(
                         Some(&event_session),
                         json!({"tool_result":{"call_id":call_id,"tool":tool,"arguments":redact_approval_value(&arguments),"result":redact_approval_value(&result)}}),
                     ),
+                    opcos_engine::HarnessEvent::ToolCallUpdate {
+                        call_id,
+                        tool,
+                        status,
+                        content,
+                        locations,
+                    } => emit(
+                        &event_app,
+                        "stream",
+                        Some(&event_session),
+                        json!({"tool_call_update":{"id":call_id,"name":tool,"status":status,"content":content.map(|value| redact_approval_value(&value)),"locations":locations}}),
+                    ),
+                    opcos_engine::HarnessEvent::PlanUpdate { entries } => emit(
+                        &event_app,
+                        "stream",
+                        Some(&event_session),
+                        json!({"plan_update":{"entries":entries}}),
+                    ),
                     opcos_engine::HarnessEvent::ApprovalRequested(request) => {
                         let unattended = event_store.is_unattended(&event_session).unwrap_or(false);
                         if unattended {
@@ -13253,6 +13354,24 @@ async fn submit_acp_turn_inner(
                         "stream",
                         Some(&event_session),
                         json!({"tool_call_delta":{"id":call_id,"name":tool,"arguments_fragment":arguments_fragment}}),
+                    ),
+                    opcos_engine::HarnessEvent::ToolCallUpdate {
+                        call_id,
+                        tool,
+                        status,
+                        content,
+                        locations,
+                    } => emit(
+                        &event_app,
+                        "stream",
+                        Some(&event_session),
+                        json!({"tool_call_update":{"id":call_id,"name":tool,"status":status,"content":content.map(|value| redact_approval_value(&value)),"locations":locations}}),
+                    ),
+                    opcos_engine::HarnessEvent::PlanUpdate { entries } => emit(
+                        &event_app,
+                        "stream",
+                        Some(&event_session),
+                        json!({"plan_update":{"entries":entries}}),
                     ),
                     opcos_engine::HarnessEvent::ApprovalRequested(request) => {
                         let unattended = event_store.is_unattended(&event_session).unwrap_or(false);

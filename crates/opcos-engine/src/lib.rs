@@ -295,6 +295,16 @@ pub enum HarnessEvent {
         tool: Option<String>,
         arguments_fragment: Option<String>,
     },
+    ToolCallUpdate {
+        call_id: String,
+        tool: String,
+        status: String,
+        content: Option<Value>,
+        locations: Vec<Value>,
+    },
+    PlanUpdate {
+        entries: Vec<Value>,
+    },
     ToolResult {
         call_id: String,
         tool: String,
@@ -456,6 +466,20 @@ pub enum HarnessError {
     PendingNotFound(String),
     #[error("external harness: {0}")]
     External(String),
+    #[error("ACP authentication required")]
+    AcpAuthenticationRequired(Vec<AcpAuthMethod>),
+    #[error("ACP JSON-RPC error {code}: {message}")]
+    AcpRpc {
+        code: i64,
+        message: String,
+        data: Option<Value>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcpAuthMethod {
+    pub id: String,
+    pub description: Option<String>,
 }
 
 #[async_trait]
