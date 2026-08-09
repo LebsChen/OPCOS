@@ -584,7 +584,13 @@ export function Transcript({
         if (node.kind === "notice")
           return (
             <div
-              className={`notice ${node.annotationResult === "failed" ? "error" : node.annotationType ? "info" : "warn"}`}
+              className={`notice ${
+                node.annotationResult === "failed"
+                  ? "error"
+                  : node.tone === "info" || node.annotationType
+                    ? "info"
+                    : "warn"
+              }`}
               key={index}
             >
               <span>{node.text}</span>

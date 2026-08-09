@@ -1320,7 +1320,11 @@ where
         if let Some(reason) = pre.blocked {
             return classify_tool_error(call, reason);
         }
-        let result = self.execute_tool_streaming(call).await;
+        let result = if matches!(call.name.as_str(), "send_user_message" | "report_blocker") {
+            self.execute_user_communication(call).await
+        } else {
+            self.execute_tool_streaming(call).await
+        };
         let post = self
             .lifecycle_hooks(
                 "PostToolUse",
@@ -3179,6 +3183,10 @@ where
                 }
                 return Err(EngineError::ApprovalPending(call.id.clone()));
             }
+            if matches!(call.name.as_str(), "send_user_message" | "report_blocker") {
+                results[index] = Some(self.execute_tool_interruptible(call).await);
+                continue;
+            }
             let mut risk = if call.name == "propose_plan" {
                 ToolRisk::Read
             } else {
@@ -3546,6 +3554,93 @@ where
             );
         }
         result
+    }
+
+    async fn execute_user_communication(&self, call: &ToolCall) -> Value {
+        let message = call
+            .arguments
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| call.arguments.get("summary").and_then(Value::as_str))
+            .unwrap_or_default()
+            .trim();
+        if message.is_empty() {
+            return json!({"error": "missing string argument: message"});
+        }
+
+        if call.name == "send_user_message" {
+            let kind = call
+                .arguments
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("progress");
+            if !matches!(kind, "progress" | "risk" | "finding") {
+                return json!({"error": "kind must be progress, risk, or finding"});
+            }
+            let event_id = match self.record_working_event(
+                "agent_message",
+                "message",
+                json!({
+                    "call_id": call.id,
+                    "message": message,
+                    "kind": kind,
+                }),
+            ) {
+                Ok(event_id) => event_id,
+                Err(_) => return json!({"error": "failed to persist user message"}),
+            };
+            return json!({"status": "delivered", "event_id": event_id});
+        }
+
+        let severity = call
+            .arguments
+            .get("severity")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !matches!(severity, "hard" | "soft" | "friction") {
+            return json!({"error": "severity must be hard, soft, or friction"});
+        }
+        let category = call
+            .arguments
+            .get("category")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !matches!(
+            category,
+            "environment" | "platform" | "dependency" | "host" | "tool"
+        ) {
+            return json!({
+                "error": "category must be environment, platform, dependency, host, or tool"
+            });
+        }
+        let payload = json!({
+            "call_id": call.id,
+            "severity": severity,
+            "category": category,
+            "summary": message,
+            "details": call.arguments.get("details").and_then(Value::as_str),
+            "attempted": call.arguments.get("attempted").and_then(Value::as_str),
+            "next_step": call.arguments.get("next_step").and_then(Value::as_str),
+        });
+        let mut audit_payload = payload.clone();
+        self.secret_scrubber.scrub(&mut audit_payload);
+        let event_id = match self.record_working_event("operational_blocker", "notice", payload) {
+            Ok(event_id) => event_id,
+            Err(_) => return json!({"error": "failed to persist operational blocker"}),
+        };
+        if self
+            .recorder
+            .append_audit("operational_blocker", &audit_payload)
+            .is_err()
+        {
+            return json!({"error": "failed to persist operational blocker"});
+        }
+        json!({
+            "status": "reported",
+            "event_id": event_id,
+            "severity": severity,
+            "control_flow": "unchanged",
+        })
     }
 
     async fn persist_artifact(
@@ -4306,6 +4401,7 @@ where
         payload: Value,
     ) -> Result<(), EngineError> {
         self.record_working_event(event_type, category, payload)
+            .map(|_| ())
     }
 
     fn record_working_event(
@@ -4313,7 +4409,7 @@ where
         event_type: &str,
         category: &str,
         payload: Value,
-    ) -> Result<(), EngineError> {
+    ) -> Result<String, EngineError> {
         let event = WorkingEvent {
             event_type: event_type.into(),
             category: category.into(),
@@ -4334,7 +4430,6 @@ where
                 ..StreamChunk::default()
             },
         )
-        .map(|_| ())
     }
 
     fn emit_event(&self, event_type: &str, mut chunk: StreamChunk) -> Result<String, EngineError> {
@@ -5172,6 +5267,8 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"recording_start","description":"Explicitly start a sampled screenshot timeline for UI-test evidence. Recording is never enabled by default. Frames are sampled, adjacent identical frames are deduplicated, and the recording stops at its frame or duration limit with truncation reported in the manifest.","parameters":{"type":"object","properties":{"source":{"type":"string","enum":["desktop","browser"]},"interval_ms":{"type":"integer","minimum":100},"max_frames":{"type":"integer","minimum":1},"max_duration_seconds":{"type":"integer","minimum":1}}}}}),
         json!({"type":"function","function":{"name":"recording_annotate","description":"Add one consolidated annotation to the active sampled screenshot timeline. Use setup for preparation, test_start for a named test (prefer the natural 'It should ...' wording), and assertion after checking one meaningful state change. Keep text under 80 characters; assertions must reference a prior test_start and include passed, failed, or untested.","parameters":{"type":"object","properties":{"recording_id":{"type":"string"},"type":{"type":"string","enum":["setup","test_start","assertion"]},"text":{"type":"string","maxLength":80},"test_start_id":{"type":"string"},"result":{"type":"string","enum":["passed","failed","untested"]}},"required":["recording_id","type","text"]}}}),
         json!({"type":"function","function":{"name":"recording_stop","description":"Explicitly stop the active sampled screenshot timeline and persist its manifest. The manifest states whether frame or duration limits truncated capture.","parameters":{"type":"object","properties":{"recording_id":{"type":"string"}},"required":["recording_id"]}}}),
+        json!({"type":"function","function":{"name":"send_user_message","description":"Tell the user about progress, a risk, or a finding without waiting for a response or interrupting execution.","parameters":{"type":"object","properties":{"message":{"type":"string"},"kind":{"type":"string","enum":["progress","risk","finding"]}},"required":["message"]}}}),
+        json!({"type":"function","function":{"name":"report_blocker","description":"Report an operational environment or platform problem that is impeding work. This records and visibly reports the problem without changing control flow; use ask_user separately when a user decision is required.","parameters":{"type":"object","properties":{"severity":{"type":"string","enum":["hard","soft","friction"]},"category":{"type":"string","enum":["environment","platform","dependency","host","tool"]},"summary":{"type":"string"},"details":{"type":"string"},"attempted":{"type":"string"},"next_step":{"type":"string"}},"required":["severity","category","summary"]}}}),
         json!({"type":"function","function":{"name":"linear_get_issue","description":"Read a Linear issue by identifier. Read-only.","parameters":{"type":"object","properties":{"identifier":{"type":"string"}},"required":["identifier"]}}}),
         json!({"type":"function","function":{"name":"linear_list_my_issues","description":"List Linear issues assigned to the current user. Read-only.","parameters":{"type":"object","properties":{"limit":{"type":"integer"}}}}}),
         json!({"type":"function","function":{"name":"linear_comment_issue","description":"Add a comment to a Linear issue. Requires approval.","parameters":{"type":"object","properties":{"issue_id":{"type":"string"},"body":{"type":"string"}},"required":["issue_id","body"]}}}),
@@ -5308,7 +5405,9 @@ fn filter_allowed_tools(mut tools: Vec<Value>, allowed: Option<&HashSet<String>>
             tool.get("function")
                 .and_then(|function| function.get("name"))
                 .and_then(Value::as_str)
-                .is_some_and(|name| allowed.contains(name))
+                .is_some_and(|name| {
+                    allowed.contains(name) || matches!(name, "send_user_message" | "report_blocker")
+                })
         });
     }
     tools
@@ -8138,6 +8237,82 @@ mod tests {
         assert_eq!(event.payload["payload"]["allow_multiple"], false);
     }
 
+    #[tokio::test]
+    async fn user_communication_tools_persist_and_emit_without_pending() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "communications",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let calls = vec![
+            ToolCall {
+                id: "message-1".into(),
+                name: "send_user_message".into(),
+                arguments: json!({
+                    "message": "I found the relevant workspace entry.",
+                    "kind": "finding",
+                }),
+            },
+            ToolCall {
+                id: "blocker-1".into(),
+                name: "report_blocker".into(),
+                arguments: json!({
+                    "severity": "hard",
+                    "category": "host",
+                    "summary": "The remote host is unavailable.",
+                    "details": "The last connection attempt failed.",
+                }),
+            },
+            ToolCall {
+                id: "read-1".into(),
+                name: "read_file".into(),
+                arguments: json!({"path": "README.md"}),
+            },
+        ];
+        for call in &calls {
+            store
+                .append_tool_call(&opcos_store::ToolCallRecord {
+                    session_id: "communications".into(),
+                    message_sequence: 1,
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    result: None,
+                })
+                .unwrap();
+        }
+
+        let results = engine.execute_tools(1, &calls).await.unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0]["status"], "delivered");
+        assert_eq!(results[1]["status"], "reported");
+        assert_eq!(results[1]["control_flow"], "unchanged");
+        assert_eq!(results[2], json!("ok"));
+        assert!(store.load_pending("communications").unwrap().is_empty());
+
+        let events = store.load_session_events("communications").unwrap();
+        assert!(events.iter().any(|event| {
+            event.event["type"] == "agent_message"
+                && event.event["working_event"]["payload"]["message"]
+                    == "I found the relevant workspace entry."
+        }));
+        assert!(events.iter().any(|event| {
+            event.event["type"] == "operational_blocker"
+                && event.event["working_event"]["payload"]["severity"] == "hard"
+        }));
+        assert_eq!(
+            store
+                .count_audit_kind("communications", "operational_blocker")
+                .unwrap(),
+            1
+        );
+    }
+
     #[test]
     fn ask_user_tool_schema_supports_discrete_options() {
         let definition = tool_definitions()
@@ -8151,6 +8326,21 @@ mod tests {
             "boolean"
         );
         assert_eq!(parameters["required"], json!(["question"]));
+    }
+
+    #[test]
+    fn user_communication_tool_schemas_are_registered() {
+        let names = builtin_tool_names();
+        assert!(names.contains("send_user_message"));
+        assert!(names.contains("report_blocker"));
+        let blocker = tool_definitions()
+            .into_iter()
+            .find(|tool| tool["function"]["name"] == "report_blocker")
+            .expect("report_blocker tool definition");
+        assert_eq!(
+            blocker["function"]["parameters"]["properties"]["severity"]["enum"],
+            json!(["hard", "soft", "friction"])
+        );
     }
 
     #[test]

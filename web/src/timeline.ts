@@ -39,6 +39,7 @@ export type TimelineNode =
   | {
       kind: "notice";
       text: string;
+      tone?: "info" | "warn";
       noticeKind?: string;
       retriable?: boolean;
       annotationType?: string;
@@ -402,6 +403,24 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
           ts: Number.isFinite(Date.parse(String(event.timestamp)))
             ? Date.parse(String(event.timestamp)) / 1000
             : undefined,
+        });
+      }
+      workStarted = 0;
+      workEnded = 0;
+    } else if (type === "agent_message" || type === "operational_blocker") {
+      flush(event.created_at_ms);
+      const rawText = String(data.message ?? data.summary ?? "").trim();
+      const severity = String(data.severity ?? "").trim();
+      const text =
+        type === "operational_blocker" && severity
+          ? `${severity === "hard" ? "Hard blocker" : severity}: ${rawText}`
+          : rawText;
+      if (text) {
+        nodes.push({
+          kind: "notice",
+          text,
+          tone: type === "operational_blocker" ? "warn" : "info",
+          noticeKind: type,
         });
       }
       workStarted = 0;
