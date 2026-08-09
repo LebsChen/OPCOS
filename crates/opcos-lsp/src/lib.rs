@@ -675,6 +675,7 @@ mod tests {
                     .map(|name| Capability {
                         name: (*name).into(),
                         available: true,
+                        state: opcos_hosts::CapabilityState::Available,
                         source: "stub".into(),
                         observed_at,
                         reason: None,

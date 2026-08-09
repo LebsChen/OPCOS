@@ -100,9 +100,23 @@ fn sanitized_environment_from_snapshot(
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CapabilityState {
+    Available,
+    Unavailable,
+    Unknown,
+}
+
+impl CapabilityState {
+    pub fn is_available(&self) -> bool {
+        matches!(self, Self::Available)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Capability {
     pub name: String,
     pub available: bool,
+    pub state: CapabilityState,
     pub source: String,
     pub observed_at: DateTime<Utc>,
     pub reason: Option<String>,
@@ -2068,6 +2082,12 @@ pub struct BrowserRequest {
 pub trait BrowserController: Send + Sync {
     async fn execute(&self, request: BrowserRequest) -> Result<Value, HostError>;
 
+    async fn probe(&self) -> Result<(), HostError> {
+        Err(HostError::Unsupported(
+            "browser capability probe is unavailable".into(),
+        ))
+    }
+
     async fn current_origin(&self) -> Option<String> {
         None
     }
@@ -2513,18 +2533,59 @@ impl LocalHost {
         Ok(canonical)
     }
 
-    fn capability_items(&self, observed_at: DateTime<Utc>) -> HostCapabilities {
-        let available = [
-            "exec",
-            "exec_sync",
-            "read",
-            "write",
-            "ls",
-            "shell_persistent",
-            "process_stream",
-            "stdio",
-            "lsp",
-        ];
+    async fn capability_items(&self, observed_at: DateTime<Utc>) -> HostCapabilities {
+        let probe_exec = self
+            .exec(ExecRequest {
+                command: "echo opcos-capability-probe".into(),
+                cwd: None,
+                timeout_seconds: 5,
+                session: None,
+                env: None,
+            })
+            .await
+            .map(|result| result.result.exit_code == 0)
+            .unwrap_or(false);
+        let (probe_read, probe_write) = if let Ok(path) = self.temp_file("opcos-capability") {
+            let result = self.write(&path, "opcos-capability-probe").await;
+            let read = if result.is_ok() {
+                self.read(&path).await.is_ok()
+            } else {
+                false
+            };
+            let _ = self
+                .exec(ExecRequest {
+                    command: format!("rm -f '{path}'"),
+                    cwd: None,
+                    timeout_seconds: 5,
+                    session: None,
+                    env: None,
+                })
+                .await;
+            (read, result.is_ok())
+        } else {
+            (false, false)
+        };
+        let probe_process_stream = self
+            .spawn(SpawnRequest {
+                command: "echo opcos-capability-probe".into(),
+                cwd: None,
+                env: None,
+                cols: 80,
+                rows: 24,
+            })
+            .await
+            .is_ok();
+        let probe_stdio = self
+            .spawn_stdio(SpawnRequest {
+                command: "echo opcos-capability-probe".into(),
+                cwd: None,
+                env: None,
+                cols: 80,
+                rows: 24,
+            })
+            .await
+            .is_ok();
+        let probe_lsp = probe_stdio && probe_exec;
         let (screenshot_reason, computer_use_reason) = self.desktop.capability_reasons();
         let unavailable = [
             ("pty", "not implemented by the in-process LocalHost"),
@@ -2532,21 +2593,36 @@ impl LocalHost {
             ("ide", "not available for the in-process LocalHost"),
             ("mcp", "not available for the in-process LocalHost"),
         ];
-        let mut items = available
-            .iter()
-            .map(|name| Capability {
-                name: (*name).into(),
-                available: true,
-                source: "static".into(),
+        let probed = [
+            ("exec", probe_exec),
+            ("exec_sync", probe_exec),
+            ("read", probe_read),
+            ("write", probe_write),
+            ("ls", probe_read),
+            ("shell_persistent", probe_exec),
+            ("process_stream", probe_process_stream),
+            ("stdio", probe_stdio),
+            ("lsp", probe_lsp),
+        ];
+        let mut items = probed
+            .into_iter()
+            .map(|(name, available)| Capability {
+                name: name.into(),
+                available,
+                state: if available {
+                    CapabilityState::Available
+                } else {
+                    CapabilityState::Unavailable
+                },
+                source: "runtime-probe".into(),
                 observed_at,
-                reason: (*name == "process_stream").then(|| {
-                    "uses local pipes without PTY echo; process exit codes are available".into()
-                }),
+                reason: (!available).then(|| format!("{name} probe failed")),
             })
             .collect::<Vec<_>>();
         items.extend(unavailable.into_iter().map(|(name, reason)| Capability {
             name: name.into(),
             available: false,
+            state: CapabilityState::Unavailable,
             source: "static".into(),
             observed_at,
             reason: Some(reason.into()),
@@ -2558,6 +2634,11 @@ impl LocalHost {
             items.push(Capability {
                 name: name.into(),
                 available: reason.is_none(),
+                state: if reason.is_none() {
+                    CapabilityState::Available
+                } else {
+                    CapabilityState::Unavailable
+                },
                 source: "runtime".into(),
                 observed_at,
                 reason,
@@ -2600,7 +2681,7 @@ impl Host for LocalHost {
     }
 
     async fn capabilities(&self) -> Result<HostCapabilities, HostError> {
-        Ok(self.capability_items(Utc::now()))
+        Ok(self.capability_items(Utc::now()).await)
     }
 
     async fn screenshot(&self) -> Result<Screenshot, HostError> {
@@ -3853,6 +3934,8 @@ fn remote_capabilities(
                 let advertised = capabilities.available.iter().any(|item| item == name);
                 let available = if name == "remote_lsp_declared" {
                     capabilities.available.iter().any(|item| item == "lsp")
+                } else if name == "lsp" {
+                    advertised && capabilities.available.iter().any(|item| item == "stdio")
                 } else {
                     name != "stdio"
                         && (advertised
@@ -3862,9 +3945,19 @@ fn remote_capabilities(
                 Capability {
                     name: name.into(),
                     available,
-                    source: "remote-probe".into(),
+                    state: if available {
+                        CapabilityState::Available
+                    } else {
+                        CapabilityState::Unavailable
+                    },
+                    source: "remote-declared".into(),
                     observed_at,
-                    reason: if name == "lsp" && available {
+                    reason: if name == "lsp" && advertised && !available {
+                        Some(
+                            "remote lsp is declared but OPCOS has no structured stdio proxy"
+                                .into(),
+                        )
+                    } else if name == "lsp" && available {
                         Some("uses the remote host's own LSP service over MCP".into())
                     } else if name == "remote_lsp_declared" && available {
                         Some("remote host exposes an lsp tool over MCP".into())
@@ -4008,7 +4101,13 @@ mod tests {
             .iter()
             .find(|item| item.name == "lsp")
             .unwrap();
-        assert!(lsp.available);
+        assert!(!lsp.available);
+        assert_eq!(lsp.state, CapabilityState::Unavailable);
+        assert!(
+            lsp.reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("structured stdio proxy"))
+        );
         let declared = capabilities
             .items
             .iter()
