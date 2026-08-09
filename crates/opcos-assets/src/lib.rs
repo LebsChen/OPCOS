@@ -961,27 +961,27 @@ mod tests {
         let bundle = AssetBundle {
             instructions: Some(InstructionSource {
                 path: "global".into(),
-                content: "global".into(),
+                content: "SECTION_GLOBAL".into(),
             }),
             agents: vec![InstructionSource {
                 path: "AGENTS.md".into(),
-                content: "agents".into(),
+                content: "SECTION_AGENTS".into(),
             }],
             knowledge: vec![KnowledgeEntry {
                 title: "K".into(),
-                body: "knowledge".into(),
+                body: "SECTION_KNOWLEDGE".into(),
                 trigger: "task".into(),
                 scope: "repo".into(),
                 enabled: true,
             }],
             playbook: Some(Playbook {
                 title: "P".into(),
-                body: "playbook".into(),
+                body: "SECTION_PLAYBOOK".into(),
             }),
             skills: vec![SkillEntry {
                 name: "S".into(),
                 path: ".agents/skills/s/SKILL.md".into(),
-                content: "skill".into(),
+                content: "SECTION_SKILL".into(),
                 active: true,
             }],
             commands: Vec::new(),
@@ -999,10 +999,19 @@ mod tests {
             repository: Some("/workspace"),
             project: None,
         });
-        assert!(rendered.find("global").unwrap() < rendered.find("agents").unwrap());
-        assert!(rendered.find("agents").unwrap() < rendered.find("knowledge").unwrap());
-        assert!(rendered.find("knowledge").unwrap() < rendered.find("playbook").unwrap());
-        assert!(rendered.find("playbook").unwrap() < rendered.find("skill").unwrap());
+        assert!(
+            rendered.find("SECTION_GLOBAL").unwrap() < rendered.find("SECTION_AGENTS").unwrap()
+        );
+        assert!(
+            rendered.find("SECTION_AGENTS").unwrap() < rendered.find("SECTION_KNOWLEDGE").unwrap()
+        );
+        assert!(
+            rendered.find("SECTION_KNOWLEDGE").unwrap()
+                < rendered.find("SECTION_PLAYBOOK").unwrap()
+        );
+        assert!(
+            rendered.find("SECTION_PLAYBOOK").unwrap() < rendered.find("SECTION_SKILL").unwrap()
+        );
     }
 
     #[test]
