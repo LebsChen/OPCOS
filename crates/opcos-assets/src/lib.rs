@@ -15,8 +15,12 @@ pub enum AssetError {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AssetBundle {
     pub instructions: Option<InstructionSource>,
+    #[serde(default)]
+    pub user_preferences: Vec<UserPreference>,
     pub agents: Vec<InstructionSource>,
     pub knowledge: Vec<KnowledgeEntry>,
+    #[serde(default)]
+    pub memories: Vec<MemoryEntry>,
     pub playbook: Option<Playbook>,
     pub skills: Vec<SkillEntry>,
     pub commands: Vec<CommandEntry>,
@@ -73,6 +77,32 @@ fn default_hook_type() -> String {
 pub struct InstructionSource {
     pub path: String,
     pub content: String,
+}
+
+/// A user preference is assembled as prompt context; it is not a policy rule.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct UserPreference {
+    pub identifier: String,
+    pub content: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+/// An automatic memory is prompt context only. Permission rules are kept in
+/// separate fields and are enforced by the policy layer at tool-call time.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MemoryEntry {
+    pub id: String,
+    pub identifier: String,
+    pub description: String,
+    pub source_session_id: String,
+    pub source_task: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -377,19 +407,44 @@ impl AssetBundle {
     /// `global` scopes are universal; repository/project scopes require the
     /// corresponding context, and other values must match that context exactly.
     pub fn system_instructions_for(&self, context: KnowledgeContext<'_>) -> String {
-        let mut sections = vec![format!(
-            "[Built-in Agent Instructions]\n{BUILTIN_AGENT_INSTRUCTIONS}"
+        let mut sections = vec![PrioritizedSection::new(
+            format!("[Built-in Agent Instructions]\n{BUILTIN_AGENT_INSTRUCTIONS}"),
+            1_000,
+            0,
+            "builtin",
         )];
         if let Some(instructions) = &self.instructions {
-            sections.push(format_asset_section(
-                "[Global Instructions]",
-                &instructions.content,
+            sections.push(PrioritizedSection::new(
+                format_asset_section("[Global Instructions]", &instructions.content),
+                800,
+                sections.len(),
+                &instructions.path,
+            ));
+        }
+        for preference in self
+            .user_preferences
+            .iter()
+            .filter(|preference| preference.enabled)
+        {
+            sections.push(PrioritizedSection::new(
+                format_asset_section(
+                    &format!("[User Preference: {}]", preference.identifier),
+                    &preference.content,
+                ),
+                900,
+                sections.len(),
+                &preference.identifier,
             ));
         }
         for source in &self.agents {
-            sections.push(format_asset_section(
-                &format!("[AGENTS source: {}]", source.path),
-                &source.content,
+            sections.push(PrioritizedSection::new(
+                format_asset_section(
+                    &format!("[AGENTS source: {}]", source.path),
+                    &source.content,
+                ),
+                700,
+                sections.len(),
+                &source.path,
             ));
         }
         let mut knowledge = self
@@ -428,23 +483,63 @@ impl AssetBundle {
             }
             knowledge_bytes += section.len();
             knowledge_count += 1;
-            sections.push(section);
+            sections.push(PrioritizedSection::new(
+                section,
+                600,
+                sections.len(),
+                &entry.title,
+            ));
+        }
+        let mut memories = self
+            .memories
+            .iter()
+            .filter(|memory| memory.enabled)
+            .collect::<Vec<_>>();
+        memories.sort_by(|left, right| {
+            (&left.identifier, &left.description, &left.id).cmp(&(
+                &right.identifier,
+                &right.description,
+                &right.id,
+            ))
+        });
+        for memory in memories {
+            sections.push(PrioritizedSection::new(
+                format!(
+                    "[Automatic Memory: {} | source session: {} | task: {}]\n{}",
+                    memory.identifier,
+                    memory.source_session_id,
+                    memory.source_task,
+                    memory.description
+                ),
+                550,
+                sections.len(),
+                &memory.id,
+            ));
         }
         if omitted_knowledge > 0 {
-            sections.push(format!(
-                "[{omitted_knowledge} knowledge sections omitted: trigger/scope filter or knowledge limit]"
+            sections.push(PrioritizedSection::new(
+                format!(
+                    "[{omitted_knowledge} knowledge sections omitted: trigger/scope filter or knowledge limit]"
+                ),
+                600,
+                sections.len(),
+                "knowledge-omissions",
             ));
         }
         if let Some(playbook) = &self.playbook {
-            sections.push(format_asset_section(
-                &format!("[Playbook: {}]", playbook.title),
-                &playbook.body,
+            sections.push(PrioritizedSection::new(
+                format_asset_section(&format!("[Playbook: {}]", playbook.title), &playbook.body),
+                500,
+                sections.len(),
+                &playbook.title,
             ));
         }
         for skill in self.skills.iter().filter(|skill| skill.active) {
-            sections.push(format_asset_section(
-                &format!("[Skill: {}]", skill.name),
-                &skill.content,
+            sections.push(PrioritizedSection::new(
+                format_asset_section(&format!("[Skill: {}]", skill.name), &skill.content),
+                400,
+                sections.len(),
+                &skill.name,
             ));
         }
         apply_system_instruction_budget(sections)
@@ -453,8 +548,6 @@ impl AssetBundle {
 
 const OMITTED_SECTIONS_MARKER: &str =
     "[{count} asset sections omitted: system instruction budget exceeded]";
-const TRUNCATED_SECTION_MARKER: &str =
-    "[Asset section truncated: system instruction budget exceeded]";
 const TRUNCATED_FILE_MARKER: &str = "[Asset file truncated: file size limit exceeded]";
 
 fn knowledge_entry_matches(entry: &KnowledgeEntry, context: KnowledgeContext<'_>) -> bool {
@@ -542,58 +635,82 @@ fn truncate_utf8(content: &str, max_bytes: usize) -> &str {
     &content[..end]
 }
 
-fn apply_system_instruction_budget(sections: Vec<String>) -> String {
-    let mut rendered = Vec::new();
-    let mut used = 0;
-    let section_count = sections.len();
-    for (index, section) in sections.into_iter().enumerate() {
-        let separator = if rendered.is_empty() { 0 } else { 2 };
-        if used + separator + section.len() <= MAX_SYSTEM_INSTRUCTION_BYTES {
-            used += separator + section.len();
-            rendered.push(section);
-            continue;
-        }
+#[derive(Clone, Debug)]
+struct PrioritizedSection {
+    content: String,
+    priority: u16,
+    order: usize,
+    key: String,
+}
 
-        let partially_retained_omitted = section_count - index - 1;
-        let marker =
-            OMITTED_SECTIONS_MARKER.replace("{count}", &partially_retained_omitted.to_string());
-        let prefix = if rendered.is_empty() {
-            String::new()
-        } else {
-            rendered.join("\n\n")
-        };
-        let separator = if prefix.is_empty() { 0 } else { 2 };
-        let remaining = MAX_SYSTEM_INSTRUCTION_BYTES
-            .saturating_sub(prefix.len() + separator + marker.len() + 2);
-        let truncated = if remaining > TRUNCATED_SECTION_MARKER.len() + 1 {
-            let keep = remaining - TRUNCATED_SECTION_MARKER.len() - 1;
-            format!(
-                "{}\n{}",
-                truncate_utf8(&section, keep),
-                TRUNCATED_SECTION_MARKER
-            )
-        } else {
-            String::new()
-        };
-        let marker = if truncated.is_empty() {
-            OMITTED_SECTIONS_MARKER.replace("{count}", &(section_count - index).to_string())
-        } else {
-            marker
-        };
-        let mut output = prefix;
-        if !truncated.is_empty() {
-            if !output.is_empty() {
-                output.push_str("\n\n");
-            }
-            output.push_str(&truncated);
+impl PrioritizedSection {
+    fn new(content: String, priority: u16, order: usize, key: &str) -> Self {
+        Self {
+            content,
+            priority,
+            order,
+            key: key.to_owned(),
         }
-        if !output.is_empty() {
-            output.push_str("\n\n");
-        }
-        output.push_str(&marker);
-        return output;
     }
-    rendered.join("\n\n")
+}
+
+fn apply_system_instruction_budget(sections: Vec<PrioritizedSection>) -> String {
+    let mut retained = vec![true; sections.len()];
+    let mut omitted = 0;
+    loop {
+        let current = sections
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| retained[*index])
+            .map(|(_, section)| section.content.len())
+            .sum::<usize>()
+            + retained
+                .iter()
+                .filter(|value| **value)
+                .count()
+                .saturating_sub(1)
+                * 2;
+        let marker = if omitted == 0 {
+            0
+        } else {
+            2 + OMITTED_SECTIONS_MARKER
+                .replace("{count}", &omitted.to_string())
+                .len()
+        };
+        if current + marker <= MAX_SYSTEM_INSTRUCTION_BYTES {
+            break;
+        }
+        let candidate = sections
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| retained[*index])
+            .min_by(|(_, left), (_, right)| {
+                (left.priority, std::cmp::Reverse(left.order), &left.key).cmp(&(
+                    right.priority,
+                    std::cmp::Reverse(right.order),
+                    &right.key,
+                ))
+            });
+        let Some((index, _)) = candidate else {
+            break;
+        };
+        retained[index] = false;
+        omitted += 1;
+    }
+    let mut rendered = sections
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| retained[*index])
+        .map(|(_, section)| section.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if omitted > 0 {
+        if !rendered.is_empty() {
+            rendered.push_str("\n\n");
+        }
+        rendered.push_str(&OMITTED_SECTIONS_MARKER.replace("{count}", &omitted.to_string()));
+    }
+    rendered
 }
 
 pub fn parse_knowledge(path: &str, markdown: &str) -> Result<KnowledgeEntry, AssetError> {
@@ -953,6 +1070,11 @@ mod tests {
                 path: "global".into(),
                 content: "global".into(),
             }),
+            user_preferences: vec![UserPreference {
+                identifier: "style".into(),
+                content: "preference".into(),
+                enabled: true,
+            }],
             agents: vec![InstructionSource {
                 path: "AGENTS.md".into(),
                 content: "agents".into(),
@@ -964,6 +1086,7 @@ mod tests {
                 scope: "repo".into(),
                 enabled: true,
             }],
+            memories: Vec::new(),
             playbook: Some(Playbook {
                 title: "P".into(),
                 body: "playbook".into(),
@@ -990,9 +1113,95 @@ mod tests {
             project: None,
         });
         assert!(rendered.find("global").unwrap() < rendered.find("agents").unwrap());
+        assert!(rendered.find("global").unwrap() < rendered.find("preference").unwrap());
+        assert!(rendered.find("preference").unwrap() < rendered.find("agents").unwrap());
         assert!(rendered.find("agents").unwrap() < rendered.find("knowledge").unwrap());
         assert!(rendered.find("knowledge").unwrap() < rendered.find("playbook").unwrap());
         assert!(rendered.find("playbook").unwrap() < rendered.find("skill").unwrap());
+    }
+
+    #[test]
+    fn user_preferences_and_memories_are_deterministic_and_reloadable() {
+        let bundle = AssetBundle {
+            user_preferences: vec![UserPreference {
+                identifier: "response-style".into(),
+                content: "Prefer concise responses.".into(),
+                enabled: true,
+            }],
+            memories: vec![
+                MemoryEntry {
+                    id: "memory-2".into(),
+                    identifier: "workflow".into(),
+                    description: "Second".into(),
+                    source_session_id: "session-2".into(),
+                    source_task: "task-2".into(),
+                    enabled: true,
+                },
+                MemoryEntry {
+                    id: "memory-1".into(),
+                    identifier: "workflow".into(),
+                    description: "First".into(),
+                    source_session_id: "session-1".into(),
+                    source_task: "task-1".into(),
+                    enabled: true,
+                },
+            ],
+            ..AssetBundle::default()
+        };
+        let reversed = AssetBundle {
+            user_preferences: bundle.user_preferences.clone(),
+            memories: bundle.memories.iter().cloned().rev().collect(),
+            ..AssetBundle::default()
+        };
+        let first = bundle.system_instructions();
+        assert_eq!(first, reversed.system_instructions());
+        assert!(first.find("response-style").unwrap() < first.find("Automatic Memory").unwrap());
+        assert!(first.contains("source session: session-1"));
+    }
+
+    #[test]
+    fn automatic_memories_are_prompt_context_separate_from_permissions() {
+        let bundle = AssetBundle {
+            memories: vec![MemoryEntry {
+                id: "memory-1".into(),
+                identifier: "review".into(),
+                description: "Check branch protection during review.".into(),
+                source_session_id: "session-1".into(),
+                source_task: "review".into(),
+                enabled: true,
+            }],
+            permissions: Some(PermissionRules {
+                allow: vec!["Exec(git status)".into()],
+                deny: vec!["Exec(git push)".into()],
+                mutating_api_gate: Some(true),
+            }),
+            ..AssetBundle::default()
+        };
+        let permissions_before = bundle.permissions.clone();
+        let rendered = bundle.system_instructions();
+        assert!(rendered.contains("Check branch protection during review."));
+        assert_eq!(bundle.permissions, permissions_before);
+    }
+
+    #[test]
+    fn budget_drops_low_priority_sections_whole() {
+        let rendered = apply_system_instruction_budget(vec![
+            PrioritizedSection::new(
+                format!("high\n{}", "h".repeat(MAX_SYSTEM_INSTRUCTION_BYTES / 2 - 5)),
+                100,
+                0,
+                "high",
+            ),
+            PrioritizedSection::new(
+                format!("low\n{}", "l".repeat(MAX_SYSTEM_INSTRUCTION_BYTES / 2 - 4)),
+                10,
+                1,
+                "low",
+            ),
+        ]);
+        assert!(rendered.contains("high"));
+        assert!(!rendered.contains("low"));
+        assert!(rendered.contains("asset sections omitted"));
     }
 
     #[test]
@@ -1291,11 +1500,15 @@ mod tests {
     #[test]
     fn budget_counts_only_fully_omitted_sections() {
         let rendered = apply_system_instruction_budget(vec![
-            "a".repeat(MAX_SYSTEM_INSTRUCTION_BYTES - 1_000),
-            "b".repeat(5_000),
-            "later".into(),
+            PrioritizedSection::new(
+                "a".repeat(MAX_SYSTEM_INSTRUCTION_BYTES - 6_000),
+                100,
+                0,
+                "a",
+            ),
+            PrioritizedSection::new("b".repeat(5_000), 50, 1, "b"),
+            PrioritizedSection::new("x".repeat(2_000), 10, 2, "later"),
         ]);
-        assert!(rendered.contains(TRUNCATED_SECTION_MARKER));
         assert!(
             rendered.contains("[1 asset sections omitted: system instruction budget exceeded]")
         );
