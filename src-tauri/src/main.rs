@@ -5183,8 +5183,11 @@ impl ToolExecutor for RemoteExecutor {
                 &arguments,
             );
         }
-        if matches!(name, "coordination_dispatch" | "coordination_status") {
-            if name == "coordination_dispatch"
+        if matches!(
+            name,
+            "coordination_dispatch" | "coordination_fan_out" | "coordination_status"
+        ) {
+            if matches!(name, "coordination_dispatch" | "coordination_fan_out")
                 && self.origin == ToolOrigin::User
                 && automatic_project_routing_active(&self.store, &self.session_id)?
             {
@@ -5687,8 +5690,11 @@ impl ToolExecutor for DesktopExecutor {
                 if name == "external_ingress_sources" {
                     return execute_external_ingress_tool(&executor.store, name, &arguments);
                 }
-                if matches!(name, "coordination_dispatch" | "coordination_status") {
-                    if name == "coordination_dispatch"
+                if matches!(
+                    name,
+                    "coordination_dispatch" | "coordination_fan_out" | "coordination_status"
+                ) {
+                    if matches!(name, "coordination_dispatch" | "coordination_fan_out")
                         && executor.origin == ToolOrigin::User
                         && automatic_project_routing_active(&executor.store, &executor.session_id)?
                     {
@@ -7095,6 +7101,28 @@ CREATE TABLE IF NOT EXISTS mcp_session_resources (
                task_id TEXT NOT NULL,
                depends_on TEXT NOT NULL,
                PRIMARY KEY(task_id,depends_on)
+             );
+             CREATE TABLE IF NOT EXISTS coord_batches (
+               batch_id TEXT PRIMARY KEY,
+               project_id TEXT NOT NULL,
+               status TEXT NOT NULL,
+               deadline_at TEXT NOT NULL,
+               acceptance_spec TEXT NOT NULL,
+               acceptance_spec_hash TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS coord_batch_members (
+               batch_id TEXT NOT NULL,
+               member_id TEXT NOT NULL,
+               worker_role_id TEXT NOT NULL,
+               status TEXT NOT NULL,
+               member_deadline_at TEXT NOT NULL,
+               reason TEXT,
+               started_at TEXT,
+               finished_at TEXT,
+               PRIMARY KEY(batch_id,member_id),
+               UNIQUE(batch_id,worker_role_id)
              );
              CREATE TABLE IF NOT EXISTS coordination_ingest_cursor (
                session_id TEXT PRIMARY KEY,
@@ -8682,6 +8710,28 @@ fn migrate_coordination(connection: &Connection) -> Result<(), String> {
                task_id TEXT NOT NULL,
                depends_on TEXT NOT NULL,
                PRIMARY KEY(task_id,depends_on)
+             );
+             CREATE TABLE IF NOT EXISTS coord_batches (
+               batch_id TEXT PRIMARY KEY,
+               project_id TEXT NOT NULL,
+               status TEXT NOT NULL,
+               deadline_at TEXT NOT NULL,
+               acceptance_spec TEXT NOT NULL,
+               acceptance_spec_hash TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS coord_batch_members (
+               batch_id TEXT NOT NULL,
+               member_id TEXT NOT NULL,
+               worker_role_id TEXT NOT NULL,
+               status TEXT NOT NULL,
+               member_deadline_at TEXT NOT NULL,
+               reason TEXT,
+               started_at TEXT,
+               finished_at TEXT,
+               PRIMARY KEY(batch_id,member_id),
+               UNIQUE(batch_id,worker_role_id)
              );
              CREATE TABLE IF NOT EXISTS coordination_ingest_cursor (
                session_id TEXT PRIMARY KEY,
@@ -12459,7 +12509,8 @@ async fn engine_for_with_context(
     if automatic_project_routing_active(&state.store, session_id)?
         && let Some(allowed_tools) = allowed_tools.as_mut()
     {
-        allowed_tools.retain(|tool| tool != "coordination_dispatch");
+        allowed_tools
+            .retain(|tool| tool != "coordination_dispatch" && tool != "coordination_fan_out");
     }
     let session_tools = session_external_tools(
         state,
@@ -15016,6 +15067,7 @@ fn builtin_allowed_tools(include_local_lsp: bool, include_edit_file: bool) -> Ve
         "work_queue_list",
         "external_ingress_sources",
         "coordination_dispatch",
+        "coordination_fan_out",
         "coordination_status",
         "computer_use",
         "desktop_show",
@@ -23501,6 +23553,22 @@ struct CoordinationStartInput {
     roles: Vec<Role>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct CoordinationFanOutMemberInput {
+    member_id: String,
+    worker_role_id: String,
+    message: String,
+    deadline_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CoordinationFanOutInput {
+    batch_id: String,
+    members: Vec<CoordinationFanOutMemberInput>,
+    acceptance_spec: Value,
+    deadline_seconds: u64,
+}
+
 #[tauri::command]
 async fn coordination_start(
     state: State<'_, DesktopState>,
@@ -24210,6 +24278,198 @@ fn reject_coordination_sensitive(text: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn refresh_coordination_batch(
+    connection: &Connection,
+    batch_id: &str,
+    now: DateTime<Utc>,
+) -> Result<Value, String> {
+    let now_text = now.to_rfc3339();
+    let batch_deadline: String = connection
+        .query_row(
+            "SELECT deadline_at FROM coord_batches WHERE batch_id=?1",
+            [batch_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let batch_expired = batch_deadline
+        .parse::<DateTime<Utc>>()
+        .map(|deadline| deadline <= now)
+        .unwrap_or(true);
+    connection
+        .execute(
+            "UPDATE coord_batch_members
+             SET status='timed_out', reason=COALESCE(reason,'member deadline expired'),
+                 finished_at=?1
+             WHERE batch_id=?2 AND status IN ('pending','dispatched','running')
+               AND member_deadline_at<=?1",
+            params![now_text, batch_id],
+        )
+        .map_err(|error| error.to_string())?;
+    if batch_expired {
+        connection
+            .execute(
+                "UPDATE coord_batch_members
+                 SET status='timed_out', reason=COALESCE(reason,'batch deadline expired'),
+                     finished_at=?1
+                 WHERE batch_id=?2 AND status IN ('pending','dispatched','running')",
+                params![now_text, batch_id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    let counts = connection
+        .query_row(
+            "SELECT
+                COUNT(*),
+                SUM(status IN ('pending','dispatched','running')),
+                SUM(status='succeeded'),
+                SUM(status='failed'),
+                SUM(status='timed_out'),
+                SUM(status='needs_human')
+             FROM coord_batch_members WHERE batch_id=?1",
+            [batch_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as usize,
+                    row.get::<_, Option<i64>>(1)?.unwrap_or(0) as usize,
+                    row.get::<_, Option<i64>>(2)?.unwrap_or(0) as usize,
+                    row.get::<_, Option<i64>>(3)?.unwrap_or(0) as usize,
+                    row.get::<_, Option<i64>>(4)?.unwrap_or(0) as usize,
+                    row.get::<_, Option<i64>>(5)?.unwrap_or(0) as usize,
+                ))
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let (total, active, succeeded, failed, timed_out, needs_human) = counts;
+    let status = if needs_human > 0 {
+        "needs_human"
+    } else if active > 0 {
+        if succeeded > 0 || failed > 0 || timed_out > 0 {
+            "partial"
+        } else {
+            "running"
+        }
+    } else if succeeded == total {
+        "succeeded"
+    } else if succeeded > 0 {
+        "partial"
+    } else if timed_out > 0 && failed == 0 {
+        "timed_out"
+    } else {
+        "failed"
+    };
+    connection
+        .execute(
+            "UPDATE coord_batches SET status=?1,updated_at=?2 WHERE batch_id=?3",
+            params![status, now_text, batch_id],
+        )
+        .map_err(|error| error.to_string())?;
+    load_coordination_batch(connection, batch_id)
+}
+
+fn load_coordination_batch(connection: &Connection, batch_id: &str) -> Result<Value, String> {
+    let batch = connection
+        .query_row(
+            "SELECT batch_id,project_id,status,deadline_at,acceptance_spec,
+                    acceptance_spec_hash,created_at,updated_at
+             FROM coord_batches WHERE batch_id=?1",
+            [batch_id],
+            |row| {
+                let spec: String = row.get(4)?;
+                Ok(json!({
+                    "batch_id": row.get::<_, String>(0)?,
+                    "project_id": row.get::<_, String>(1)?,
+                    "status": row.get::<_, String>(2)?,
+                    "deadline_at": row.get::<_, String>(3)?,
+                    "acceptance_spec": serde_json::from_str::<Value>(&spec).unwrap_or(Value::Null),
+                    "acceptance_spec_hash": row.get::<_, String>(5)?,
+                    "created_at": row.get::<_, String>(6)?,
+                    "updated_at": row.get::<_, String>(7)?,
+                    "evaluator_status": "not_started",
+                    "evaluator_consumed": false,
+                }))
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let mut statement = connection
+        .prepare(
+            "SELECT member_id,worker_role_id,status,member_deadline_at,reason,
+                    started_at,finished_at
+             FROM coord_batch_members WHERE batch_id=?1 ORDER BY member_id",
+        )
+        .map_err(|error| error.to_string())?;
+    let members = statement
+        .query_map([batch_id], |row| {
+            Ok(json!({
+                "member_id": row.get::<_, String>(0)?,
+                "worker_role_id": row.get::<_, String>(1)?,
+                "status": row.get::<_, String>(2)?,
+                "deadline_at": row.get::<_, String>(3)?,
+                "reason": row.get::<_, Option<String>>(4)?,
+                "started_at": row.get::<_, Option<String>>(5)?,
+                "finished_at": row.get::<_, Option<String>>(6)?,
+            }))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let total = members.len();
+    let completed = members
+        .iter()
+        .filter(|member| member["status"] == "succeeded")
+        .count();
+    let failed = members
+        .iter()
+        .filter(|member| member["status"] == "failed")
+        .count();
+    let timed_out = members
+        .iter()
+        .filter(|member| member["status"] == "timed_out")
+        .count();
+    let active = total.saturating_sub(completed + failed + timed_out);
+    if let Some(object) = batch.as_object().cloned() {
+        let mut object = object;
+        object.insert("members".into(), json!(members));
+        object.insert("member_count".into(), json!(total));
+        object.insert("completed_count".into(), json!(completed));
+        object.insert("failed_count".into(), json!(failed));
+        object.insert("timed_out_count".into(), json!(timed_out));
+        object.insert("active_count".into(), json!(active));
+        object.insert("barrier_released".into(), json!(active == 0));
+        Ok(Value::Object(object))
+    } else {
+        Err("coordination batch is not an object".to_owned())
+    }
+}
+
+fn update_coordination_batch_member(
+    connection: &Connection,
+    batch_id: &str,
+    worker_role_id: &str,
+    status: &str,
+    reason: Option<&str>,
+) -> Result<(), String> {
+    let changed = connection
+        .execute(
+            "UPDATE coord_batch_members
+             SET status=?1,reason=?2,finished_at=?3
+             WHERE batch_id=?4 AND worker_role_id=?5
+               AND status IN ('pending','dispatched','running')",
+            params![
+                status,
+                reason,
+                Utc::now().to_rfc3339(),
+                batch_id,
+                worker_role_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Ok(());
+    }
+    let _ = refresh_coordination_batch(connection, batch_id, Utc::now())?;
+    Ok(())
+}
+
 async fn execute_coordination_tool(
     store: &SqliteStore,
     database: &Arc<Mutex<Connection>>,
@@ -24223,7 +24483,261 @@ async fn execute_coordination_tool(
         .load_project_agent_by_session(session_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "coordination tools require a project agent session".to_owned())?;
-    if name == "coordination_dispatch" {
+    if name == "coordination_fan_out" {
+        if caller.sort_order != 0 || !caller.role.eq_ignore_ascii_case("lead") {
+            return Err(
+                "coordination fan-out denied: only the bound Leader session may dispatch"
+                    .to_owned(),
+            );
+        }
+        let input: CoordinationFanOutInput = serde_json::from_value(arguments.clone())
+            .map_err(|error| format!("invalid coordination fan-out input: {error}"))?;
+        if input.batch_id.trim().is_empty() || input.members.is_empty() {
+            return Err("batch_id and at least one member are required".to_owned());
+        }
+        let deadline_seconds = input.deadline_seconds.clamp(1, 604_800);
+        let now = Utc::now();
+        let deadline_at = now + ChronoDuration::seconds(deadline_seconds as i64);
+        let spec_bytes = serde_json::to_vec(&input.acceptance_spec)
+            .map_err(|error| format!("invalid acceptance spec: {error}"))?;
+        let acceptance_spec_hash = format!("{:x}", Sha256::digest(spec_bytes));
+        let agents = store
+            .load_project_agents(&caller.project_id)
+            .map_err(|error| error.to_string())?;
+        let mut seen_members = HashSet::new();
+        let mut seen_workers = HashSet::new();
+        let mut dispatches = Vec::with_capacity(input.members.len());
+        for member in &input.members {
+            if member.member_id.trim().is_empty()
+                || !seen_members.insert(member.member_id.clone())
+                || !seen_workers.insert(member.worker_role_id.clone())
+            {
+                return Err(
+                    "batch member IDs and Worker roles must be unique and non-empty".into(),
+                );
+            }
+            reject_coordination_sensitive(&member.message)?;
+            let worker = agents
+                .iter()
+                .find(|agent| agent.id == member.worker_role_id)
+                .ok_or_else(|| format!("Worker role does not exist: {}", member.worker_role_id))?
+                .clone();
+            if worker.project_id != caller.project_id
+                || worker.sort_order == 0
+                || worker.session_id.is_none()
+                || !worker.harness.eq_ignore_ascii_case("builtin")
+            {
+                return Err(format!(
+                    "coordination batch member is not an active builtin Worker: {}",
+                    member.worker_role_id
+                ));
+            }
+            let member_deadline = member
+                .deadline_seconds
+                .unwrap_or(deadline_seconds)
+                .clamp(1, deadline_seconds);
+            dispatches.push((member.clone(), worker, member_deadline));
+        }
+        {
+            let roles = agents
+                .iter()
+                .filter_map(|agent| {
+                    Some(Role {
+                        project_id: caller.project_id.clone(),
+                        id: agent.id.clone(),
+                        sort_order: agent.sort_order,
+                        session_id: agent.session_id.clone()?,
+                        state: RoleState::Active,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut runtimes = coordination.lock().await;
+            if !runtimes.contains_key(&input.batch_id) {
+                runtimes.insert(
+                    input.batch_id.clone(),
+                    CoordinationRuntime::new(roles).map_err(|error| error.to_string())?,
+                );
+            }
+        }
+        {
+            let connection = database.lock().map_err(|_| "database lock poisoned")?;
+            let exists = connection
+                .query_row(
+                    "SELECT 1 FROM coord_batches WHERE batch_id=?1",
+                    [&input.batch_id],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .unwrap_or(false);
+            if exists {
+                return Err("coordination batch already exists".to_owned());
+            }
+            connection
+                .execute_batch("BEGIN IMMEDIATE")
+                .map_err(|error| error.to_string())?;
+            let result = (|| -> Result<(), String> {
+                connection
+                    .execute(
+                        "INSERT INTO coord_batches
+                         (batch_id,project_id,status,deadline_at,acceptance_spec,
+                          acceptance_spec_hash,created_at,updated_at)
+                         VALUES (?1,?2,'running',?3,?4,?5,?6,?6)",
+                        params![
+                            input.batch_id,
+                            caller.project_id,
+                            deadline_at.to_rfc3339(),
+                            serde_json::to_string(&input.acceptance_spec)
+                                .map_err(|error| error.to_string())?,
+                            acceptance_spec_hash,
+                            now.to_rfc3339(),
+                        ],
+                    )
+                    .map_err(|error| error.to_string())?;
+                for (member, _, member_deadline) in &dispatches {
+                    connection
+                        .execute(
+                            "INSERT INTO coord_batch_members
+                             (batch_id,member_id,worker_role_id,status,member_deadline_at)
+                             VALUES (?1,?2,?3,'dispatched',?4)",
+                            params![
+                                input.batch_id,
+                                member.member_id,
+                                member.worker_role_id,
+                                (now + ChronoDuration::seconds(*member_deadline as i64))
+                                    .to_rfc3339(),
+                            ],
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => connection
+                    .execute_batch("COMMIT")
+                    .map_err(|error| error.to_string())?,
+                Err(error) => {
+                    let _ = connection.execute_batch("ROLLBACK");
+                    return Err(error);
+                }
+            }
+        }
+        let caller_id = caller.id.clone();
+        let fan_out_results = futures_util::future::join_all(dispatches.into_iter().map(
+            |(member, worker, _member_deadline)| {
+                let database = Arc::clone(database);
+                let engines = Arc::clone(engines);
+                let coordination = Arc::clone(coordination);
+                let batch_id = input.batch_id.clone();
+                let caller_id = caller_id.clone();
+                async move {
+                    let worker_session = worker.session_id.clone().unwrap_or_default();
+                    let worker_id = worker.id.clone();
+                    let outcome: Result<(), String> = async {
+                    let envelope = Envelope {
+                        v: 1,
+                        task_id: batch_id.clone(),
+                        from: caller_id,
+                        to: worker_id.clone(),
+                        kind: opcos_engine::orchestration::EnvelopeKind::Request,
+                        msg_id: format!("coord-{}", Uuid::new_v4()),
+                        reply_to: None,
+                        payload: json!({
+                            "message": member.message,
+                            "batch_id": batch_id,
+                            "member_id": member.member_id,
+                        }),
+                    };
+                    let validation = {
+                        let mut runtimes = coordination.lock().await;
+                        runtimes
+                            .get_mut(&envelope.task_id)
+                            .ok_or_else(|| "coordination batch runtime is not started".to_owned())
+                            .and_then(|runtime| {
+                                runtime
+                                    .validate_and_record(&envelope, Utc::now())
+                                    .map_err(|error| error.to_string())
+                            })
+                    };
+                    validation?;
+                    {
+                        let connection =
+                            database.lock().map_err(|_| "database lock poisoned")?;
+                        connection
+                            .execute(
+                                "INSERT INTO coord_messages
+                                 (project_id,task_id,msg_id,from_role,to_role,kind,reply_to,payload,created_at)
+                                 VALUES (?1,?2,?3,?4,?5,'request',?6,?7,?8)",
+                                params![
+                                    worker.project_id,
+                                    envelope.task_id,
+                                    envelope.msg_id,
+                                    envelope.from,
+                                    envelope.to,
+                                    envelope.reply_to,
+                                    envelope.payload.to_string(),
+                                    Utc::now().to_rfc3339(),
+                                ],
+                            )
+                            .map_err(|error| error.to_string())?;
+                    }
+                    let engine = engines
+                        .lock()
+                        .await
+                        .get(&worker_session)
+                        .cloned()
+                        .ok_or_else(|| "coordination Worker session is not running".to_owned());
+                    match engine {
+                        Ok(engine) => {
+                            engine
+                                .queue_steering(
+                                    envelope
+                                        .encode(None)
+                                        .map_err(|error| error.to_string())?,
+                                )
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            let connection =
+                                database.lock().map_err(|_| "database lock poisoned")?;
+                            connection
+                                .execute(
+                                    "UPDATE coord_batch_members
+                                     SET status='running',started_at=?1
+                                     WHERE batch_id=?2 AND member_id=?3",
+                                    params![
+                                        Utc::now().to_rfc3339(),
+                                        envelope.task_id,
+                                        member.member_id
+                                    ],
+                                )
+                                .map_err(|error| error.to_string())?;
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
+                    }
+                    }
+                    .await;
+                    (worker_id, outcome)
+                }
+            },
+        ))
+        .await;
+        {
+            let connection = database.lock().map_err(|_| "database lock poisoned")?;
+            for (worker_role_id, result) in fan_out_results {
+                if let Err(error) = result {
+                    update_coordination_batch_member(
+                        &connection,
+                        &input.batch_id,
+                        &worker_role_id,
+                        "failed",
+                        Some(&error),
+                    )?;
+                }
+            }
+            return refresh_coordination_batch(&connection, &input.batch_id, Utc::now());
+        }
+    } else if name == "coordination_dispatch" {
         if arguments.get("from_role").is_some() {
             return Err(
                 "coordination dispatch denied: from_role is system-bound and cannot be supplied"
@@ -24389,6 +24903,18 @@ async fn execute_coordination_tool(
             .unwrap_or(5)
             .clamp(1, 5) as usize;
         let connection = database.lock().map_err(|_| "database lock poisoned")?;
+        let is_batch = connection
+            .query_row(
+                "SELECT 1 FROM coord_batches WHERE batch_id=?1",
+                [task_id],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .unwrap_or(false);
+        if is_batch {
+            return refresh_coordination_batch(&connection, task_id, Utc::now());
+        }
         let task = load_coord_task(&connection, task_id)?;
         if task.project_id != caller.project_id {
             return Err("coordination task is outside the caller project".to_owned());
@@ -24467,15 +24993,27 @@ async fn execute_coordination_tool(
 }
 
 fn connection_project_for_task(state: &DesktopState, task_id: &str) -> Result<String, String> {
-    state
+    let connection = state
         .database
         .lock()
-        .map_err(|_| "database lock poisoned")?
+        .map_err(|_| "database lock poisoned")?;
+    connection
         .query_row(
             "SELECT project_id FROM coord_tasks WHERE id=?1",
             [task_id],
             |row| row.get(0),
         )
+        .or_else(|error| {
+            if matches!(error, rusqlite::Error::QueryReturnedNoRows) {
+                connection.query_row(
+                    "SELECT project_id FROM coord_batches WHERE batch_id=?1",
+                    [task_id],
+                    |row| row.get(0),
+                )
+            } else {
+                Err(error)
+            }
+        })
         .map_err(|error| error.to_string())
 }
 
@@ -24525,7 +25063,36 @@ async fn persist_coord_message(
             .map_err(|error| error.to_string())?;
     }
     if envelope.kind == opcos_engine::orchestration::EnvelopeKind::Result {
-        coordination_complete_task_inner(state, task_id, &envelope.from, None).await?;
+        let is_batch = {
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            connection
+                .query_row(
+                    "SELECT 1 FROM coord_batches WHERE batch_id=?1",
+                    [task_id],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .unwrap_or(false)
+        };
+        if is_batch {
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            update_coordination_batch_member(
+                &connection,
+                task_id,
+                &envelope.from,
+                "succeeded",
+                None,
+            )?;
+        } else {
+            coordination_complete_task_inner(state, task_id, &envelope.from, None).await?;
+        }
     }
     Ok(())
 }
@@ -31983,5 +32550,168 @@ agents:
             sink.terminal_status_at_emit.lock().unwrap().as_ref(),
             Some(&("error".into(), "harness_error".into()))
         );
+    }
+
+    #[test]
+    fn coordination_batch_barrier_tracks_members_and_deadlines() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE coord_batches (
+                   batch_id TEXT PRIMARY KEY,
+                   project_id TEXT NOT NULL,
+                   status TEXT NOT NULL,
+                   deadline_at TEXT NOT NULL,
+                   acceptance_spec TEXT NOT NULL,
+                   acceptance_spec_hash TEXT NOT NULL,
+                   created_at TEXT NOT NULL,
+                   updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE coord_batch_members (
+                   batch_id TEXT NOT NULL,
+                   member_id TEXT NOT NULL,
+                   worker_role_id TEXT NOT NULL,
+                   status TEXT NOT NULL,
+                   member_deadline_at TEXT NOT NULL,
+                   reason TEXT,
+                   started_at TEXT,
+                   finished_at TEXT,
+                   PRIMARY KEY(batch_id,member_id),
+                   UNIQUE(batch_id,worker_role_id)
+                 );",
+            )
+            .unwrap();
+        let now = Utc::now();
+        let spec = json!({"required_checks":["cargo test"]});
+        let spec_text = spec.to_string();
+        let spec_hash = format!("{:x}", Sha256::digest(spec_text.as_bytes()));
+        connection
+            .execute(
+                "INSERT INTO coord_batches
+                 VALUES ('batch-1','project-1','running',?1,?2,?3,?4,?4)",
+                params![
+                    (now + ChronoDuration::seconds(60)).to_rfc3339(),
+                    spec_text,
+                    spec_hash,
+                    now.to_rfc3339()
+                ],
+            )
+            .unwrap();
+        for (member_id, worker_id) in [("member-a", "worker-a"), ("member-b", "worker-b")] {
+            connection
+                .execute(
+                    "INSERT INTO coord_batch_members
+                     VALUES ('batch-1',?1,?2,'running',?3,NULL,NULL,NULL)",
+                    params![
+                        member_id,
+                        worker_id,
+                        (now + ChronoDuration::seconds(30)).to_rfc3339()
+                    ],
+                )
+                .unwrap();
+        }
+
+        let before_all = refresh_coordination_batch(&connection, "batch-1", now).unwrap();
+        assert_eq!(before_all["status"], "running");
+        assert_eq!(before_all["barrier_released"], false);
+        assert_eq!(before_all["active_count"], 2);
+        update_coordination_batch_member(&connection, "batch-1", "worker-a", "succeeded", None)
+            .unwrap();
+        let partial = refresh_coordination_batch(&connection, "batch-1", now).unwrap();
+        assert_eq!(partial["barrier_released"], false);
+        assert_eq!(partial["active_count"], 1);
+        update_coordination_batch_member(&connection, "batch-1", "worker-b", "succeeded", None)
+            .unwrap();
+        let complete = refresh_coordination_batch(&connection, "batch-1", now).unwrap();
+        assert_eq!(complete["status"], "succeeded");
+        assert_eq!(complete["barrier_released"], true);
+        assert_eq!(complete["completed_count"], 2);
+        assert_eq!(complete["acceptance_spec_hash"], spec_hash);
+        assert_eq!(complete["evaluator_consumed"], false);
+    }
+
+    #[test]
+    fn coordination_batch_member_and_batch_timeouts_are_terminal_without_waiting() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE coord_batches (
+                   batch_id TEXT PRIMARY KEY,
+                   project_id TEXT NOT NULL,
+                   status TEXT NOT NULL,
+                   deadline_at TEXT NOT NULL,
+                   acceptance_spec TEXT NOT NULL,
+                   acceptance_spec_hash TEXT NOT NULL,
+                   created_at TEXT NOT NULL,
+                   updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE coord_batch_members (
+                   batch_id TEXT NOT NULL,
+                   member_id TEXT NOT NULL,
+                   worker_role_id TEXT NOT NULL,
+                   status TEXT NOT NULL,
+                   member_deadline_at TEXT NOT NULL,
+                   reason TEXT,
+                   started_at TEXT,
+                   finished_at TEXT,
+                   PRIMARY KEY(batch_id,member_id),
+                   UNIQUE(batch_id,worker_role_id)
+                 );",
+            )
+            .unwrap();
+        let now = Utc::now();
+        connection
+            .execute(
+                "INSERT INTO coord_batches
+                 VALUES ('batch-2','project-1','running',?1,'{}','hash',?2,?2)",
+                params![
+                    (now + ChronoDuration::seconds(60)).to_rfc3339(),
+                    now.to_rfc3339()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO coord_batch_members
+                 VALUES ('batch-2','member-a','worker-a','running',?1,NULL,NULL,NULL)",
+                [(now - ChronoDuration::seconds(1)).to_rfc3339()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO coord_batch_members
+                 VALUES ('batch-2','member-b','worker-b','running',?1,NULL,NULL,NULL)",
+                [(now + ChronoDuration::seconds(30)).to_rfc3339()],
+            )
+            .unwrap();
+
+        let member_timeout = refresh_coordination_batch(&connection, "batch-2", now).unwrap();
+        assert_eq!(member_timeout["status"], "partial");
+        assert_eq!(member_timeout["barrier_released"], false);
+        assert_eq!(member_timeout["timed_out_count"], 1);
+        assert_eq!(member_timeout["active_count"], 1);
+        let member_reason = member_timeout["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|member| member["member_id"] == "member-a")
+            .unwrap();
+        assert_eq!(member_reason["status"], "timed_out");
+        assert!(
+            member_reason["reason"]
+                .as_str()
+                .unwrap()
+                .contains("member deadline")
+        );
+
+        let start = Instant::now();
+        let batch_timeout =
+            refresh_coordination_batch(&connection, "batch-2", now + ChronoDuration::seconds(61))
+                .unwrap();
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(batch_timeout["status"], "timed_out");
+        assert_eq!(batch_timeout["barrier_released"], true);
+        assert_eq!(batch_timeout["timed_out_count"], 2);
+        assert_eq!(batch_timeout["active_count"], 0);
     }
 }
