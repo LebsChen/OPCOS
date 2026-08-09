@@ -5324,11 +5324,21 @@ fn script_tool_class(name: &str) -> Option<ScriptToolClass> {
         | "work_queue_requeue"
         | "work_queue_list"
         | "coordination_dispatch"
+        | "coordination_fan_out"
         | "coordination_status"
         | "automation_manage" => ScriptToolClass::LongLivedExecution,
         "external_ingress_sources" | "local_gate_record" | "local_gate_status" => {
             ScriptToolClass::SessionStateWrite
         }
+        "config_asset_manage"
+        | "memory_save_automatic"
+        | "memory_list"
+        | "memory_disable"
+        | "memory_delete"
+        | "learned_skill_manage"
+        | "skill_save_learned"
+        | "skill_search_learned"
+        | "skill_get_learned" => ScriptToolClass::SessionStateWrite,
         "session_search" => ScriptToolClass::Allowed,
         "read_file"
         | "write_file"
