@@ -52,6 +52,7 @@ import {
   type McpTransport,
 } from "./mcp";
 import { summarizeIterationStats } from "./iterationStats";
+import { surfaceTabForWorkingEvent } from "./surfaceRequests";
 import { Sidebar } from "./components/Sidebar";
 import { sessionStatusLabel } from "./sessionStatus";
 import { Transcript } from "./components/Transcript";
@@ -11245,10 +11246,11 @@ function AppContent() {
           workingEvent?.payload && typeof workingEvent.payload === "object"
             ? (workingEvent.payload as Record<string, unknown>)
             : undefined;
-        if (workingPayload?.event_type === "desktop_view_requested") {
+        const requestedSurface = surfaceTabForWorkingEvent(workingEvent);
+        if (requestedSurface) {
           setSurfaceRequest({
             sessionId: payload.session_id || "",
-            tab: "desktop",
+            tab: requestedSurface,
           });
         }
         if (streamPayload.type === "user_question_answered") {
