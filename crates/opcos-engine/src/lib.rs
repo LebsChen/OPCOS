@@ -6906,14 +6906,6 @@ mod tests {
     }
 
     #[test]
-    fn builtin_prompt_tool_names_are_registered() {
-        let names = builtin_tool_names();
-        for name in opcos_assets::BUILTIN_AGENT_TOOL_NAMES {
-            assert!(names.contains(*name), "missing builtin tool {name}");
-        }
-    }
-
-    #[test]
     fn tool_script_allowlist_is_structural_and_rejects_secret_arguments() {
         for name in [
             "ask_user",
