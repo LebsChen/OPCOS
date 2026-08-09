@@ -525,6 +525,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
             environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture {
                 files: vec![],
                 tool_behavior: FixtureToolBehavior::ProgressiveCatalog,
+                hook_context: None,
             }),
             provider: ProviderSourceSpec::Scripted(vec![
                 turn(
@@ -555,6 +556,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
                 ..EngineOverrides::default()
             },
             interactions: vec![],
+            hooks: vec![],
             assertions: vec![
                 Assertion::RequiredToolCall {
                     tool: "tool_search".into(),
@@ -588,6 +590,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
             environment: ExecutionEnvironmentSpec::LocalFixture(WorkspaceFixture {
                 files: vec![],
                 tool_behavior: FixtureToolBehavior::ProgressiveCatalog,
+                hook_context: None,
             }),
             provider: ProviderSourceSpec::Scripted(vec![
                 turn(
@@ -614,6 +617,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
                 ..EngineOverrides::default()
             },
             interactions: vec![],
+            hooks: vec![],
             assertions: vec![
                 Assertion::RequiredToolCall {
                     tool: "tool_describe".into(),
