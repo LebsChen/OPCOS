@@ -4475,7 +4475,7 @@ fn external_context_content_block(attachment: &ExternalContextAttachment) -> Val
     json!({"type": "text", "text": format!("{header}{}", attachment.content)})
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScriptToolClass {
     Allowed,
     UserInteraction,
@@ -4483,6 +4483,7 @@ enum ScriptToolClass {
     SecretManagement,
     Recording,
     DesktopOrSessionState,
+    SessionStateWrite,
     LongLivedExecution,
     ScriptOrchestration,
 }
@@ -4517,7 +4518,7 @@ fn script_tool_class(name: &str) -> Option<ScriptToolClass> {
         | "coordination_status"
         | "automation_manage" => ScriptToolClass::LongLivedExecution,
         "external_ingress_sources" | "local_gate_record" | "local_gate_status" => {
-            ScriptToolClass::DesktopOrSessionState
+            ScriptToolClass::SessionStateWrite
         }
         "session_search" => ScriptToolClass::Allowed,
         "read_file"
@@ -5870,6 +5871,16 @@ mod tests {
             "session_search",
             &json!({"query": "approval"})
         ));
+        for name in [
+            "external_ingress_sources",
+            "local_gate_record",
+            "local_gate_status",
+        ] {
+            assert_eq!(
+                script_tool_class(name),
+                Some(ScriptToolClass::SessionStateWrite)
+            );
+        }
     }
 
     #[test]
