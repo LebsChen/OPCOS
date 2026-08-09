@@ -9,6 +9,20 @@
 //! evaluates engine-side orchestration (events, state transitions, approvals,
 //! steering, and compaction), not the production tool implementation in
 //! `src-tauri`.
+//!
+//! `internal_taskset` contains deterministic offline verifier tasks. Each task
+//! declares its initial workspace, prompt, scripted provider, expected
+//! artifacts, verifier script, and permanent held-in/held-out split. A task
+//! passes only when the generated verifier script exits successfully; expected
+//! artifact checks are rendered into that script. Live model providers and
+//! external execution environments remain adapter seams and are not required
+//! by this taskset.
+//!
+//! The opt-in live entry point is the `internal_taskset_live` binary. It reads
+//! `xinlicloud_KEY` only for the Authorization bearer header, with
+//! `OPCOS_TASKSET_MODEL`, `OPCOS_TASKSET_CONCURRENCY`, and
+//! `OPCOS_TASKSET_REPEATS` controlling the rollout. `OPCOS_TASKSET_LIVE=1` is
+//! required; live execution is never part of the normal test gates.
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -18,9 +32,10 @@ use opcos_engine::{
     builtin_tool_definition_tokens,
 };
 use opcos_policy::PermissionMode;
+use opcos_provider::openai::OpenAiProvider;
 use opcos_provider::{
-    AssistantTurn, Caps, Provider, ProviderError, ProviderRequest, StreamChunk, TokenUsage,
-    ToolCall,
+    AssistantTurn, Caps, Provider, ProviderConfig, ProviderError, ProviderRequest, StreamChunk,
+    TokenUsage, ToolCall,
 };
 use opcos_store::{SessionRecord, SessionStore, SqliteStore};
 use serde::{Deserialize, Serialize};
@@ -29,6 +44,7 @@ use std::{
     collections::{HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -229,6 +245,7 @@ pub struct EvalCase {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProviderSourceSpec {
     Scripted(Vec<ScriptedResponse>),
+    OpenAiCompatible { base_url: String, model: String },
     External,
 }
 
@@ -246,6 +263,197 @@ pub enum GraderSpec {
         fail_to_pass: Vec<String>,
         pass_to_pass: Vec<String>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TaskSplit {
+    HeldIn,
+    HeldOut,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExpectedArtifact {
+    pub path: String,
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerificationScript {
+    pub filename: String,
+    pub body: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VerifierTask {
+    pub name: String,
+    pub description: String,
+    pub split: TaskSplit,
+    pub initial_workspace: Vec<(String, String)>,
+    pub prompt: String,
+    pub provider: ProviderSourceSpec,
+    pub expected_artifacts: Vec<ExpectedArtifact>,
+    pub verifier: VerificationScript,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveRolloutConfig {
+    pub base_url: String,
+    pub model: String,
+    pub concurrency: usize,
+    pub repeats: usize,
+}
+
+impl LiveRolloutConfig {
+    pub fn from_env() -> Result<Self, EvalError> {
+        if std::env::var("OPCOS_TASKSET_LIVE").ok().as_deref() != Some("1") {
+            return Err(EvalError::Fixture(
+                "live rollout is disabled; set OPCOS_TASKSET_LIVE=1 explicitly".into(),
+            ));
+        }
+        let api_key = std::env::var("xinlicloud_KEY").map_err(|_| {
+            EvalError::Fixture("xinlicloud_KEY is required for live rollout".into())
+        })?;
+        if api_key.is_empty() {
+            return Err(EvalError::Fixture(
+                "xinlicloud_KEY must not be empty".into(),
+            ));
+        }
+        Ok(Self {
+            base_url: std::env::var("OPCOS_TASKSET_BASE_URL")
+                .unwrap_or_else(|_| "https://llm.xinlicloud.top/v1".into()),
+            model: std::env::var("OPCOS_TASKSET_MODEL").unwrap_or_else(|_| "glm-5.2".into()),
+            concurrency: parse_positive_env("OPCOS_TASKSET_CONCURRENCY", 1)?,
+            repeats: parse_positive_env("OPCOS_TASKSET_REPEATS", 1)?,
+        })
+    }
+}
+
+fn parse_positive_env(name: &str, default: usize) -> Result<usize, EvalError> {
+    let value = std::env::var(name).unwrap_or_else(|_| default.to_string());
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| EvalError::Fixture(format!("{name} must be a positive integer")))?;
+    (parsed > 0)
+        .then_some(parsed)
+        .ok_or_else(|| EvalError::Fixture(format!("{name} must be a positive integer")))
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerifierTaskReport {
+    pub task: String,
+    pub split: TaskSplit,
+    pub passed: bool,
+    pub verifier_exit_code: Option<i32>,
+    pub expected_artifacts: Vec<ExpectedArtifact>,
+    pub engine_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SplitPassCount {
+    pub total: usize,
+    pub passed: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TasksetRun {
+    pub reports: Vec<VerifierTaskReport>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AggregatedTaskset {
+    pub runs: usize,
+    pub task_passes: std::collections::BTreeMap<String, SplitPassCount>,
+    pub held_in: SplitPassCount,
+    pub held_out: SplitPassCount,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ComparisonResult {
+    pub accepted: bool,
+    pub reason: String,
+    pub baseline: AggregatedTaskset,
+    pub candidate: AggregatedTaskset,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CandidateEvaluationRecord {
+    pub candidate: String,
+    pub comparison: ComparisonResult,
+}
+
+pub fn aggregate_taskset_runs(runs: &[TasksetRun]) -> AggregatedTaskset {
+    let mut task_passes = std::collections::BTreeMap::<String, SplitPassCount>::new();
+    let mut held_in = SplitPassCount {
+        total: 0,
+        passed: 0,
+    };
+    let mut held_out = SplitPassCount {
+        total: 0,
+        passed: 0,
+    };
+    for run in runs {
+        for report in &run.reports {
+            let task = task_passes
+                .entry(report.task.clone())
+                .or_insert(SplitPassCount {
+                    total: 0,
+                    passed: 0,
+                });
+            task.total += 1;
+            task.passed += usize::from(report.passed);
+            let split = match report.split {
+                TaskSplit::HeldIn => &mut held_in,
+                TaskSplit::HeldOut => &mut held_out,
+            };
+            split.total += 1;
+            split.passed += usize::from(report.passed);
+        }
+    }
+    AggregatedTaskset {
+        runs: runs.len(),
+        task_passes,
+        held_in,
+        held_out,
+    }
+}
+
+pub fn compare_taskset_runs(
+    baseline: &AggregatedTaskset,
+    candidate: &AggregatedTaskset,
+) -> ComparisonResult {
+    let held_in_ok = pass_rate_not_lower(&baseline.held_in, &candidate.held_in);
+    let held_out_ok = pass_rate_not_lower(&baseline.held_out, &candidate.held_out);
+    let accepted = held_in_ok && held_out_ok;
+    let reason = match (held_in_ok, held_out_ok) {
+        (true, true) => "candidate does not regress held-in or held-out".into(),
+        (false, true) => "candidate regresses held-in".into(),
+        (true, false) => "candidate regresses held-out".into(),
+        (false, false) => "candidate regresses held-in and held-out".into(),
+    };
+    ComparisonResult {
+        accepted,
+        reason,
+        baseline: baseline.clone(),
+        candidate: candidate.clone(),
+    }
+}
+
+pub fn record_taskset_candidate(
+    candidate: impl Into<String>,
+    baseline: &AggregatedTaskset,
+    candidate_result: &AggregatedTaskset,
+) -> CandidateEvaluationRecord {
+    CandidateEvaluationRecord {
+        candidate: candidate.into(),
+        comparison: compare_taskset_runs(baseline, candidate_result),
+    }
+}
+
+fn pass_rate_not_lower(baseline: &SplitPassCount, candidate: &SplitPassCount) -> bool {
+    if baseline.total == 0 {
+        return true;
+    }
+    candidate.passed * baseline.total >= baseline.passed * candidate.total
 }
 
 /// A provider source can be a replay or a live model adapter supplied by a
@@ -398,6 +606,67 @@ impl ToolExecutor for FixtureTools {
                 let path = checked_path(&self.workspace, arguments["path"].as_str().unwrap_or(""))?;
                 let content = fs::read_to_string(path).map_err(|error| error.to_string())?;
                 Ok(json!({"content":content}))
+            }
+            "edit_file" => {
+                let path = checked_path(&self.workspace, arguments["path"].as_str().unwrap_or(""))?;
+                let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+                let edits = arguments
+                    .get("edits")
+                    .and_then(Value::as_array)
+                    .map(|edits| {
+                        edits
+                            .iter()
+                            .map(|edit| {
+                                (
+                                    edit["old_string"].as_str().unwrap_or_default(),
+                                    edit["new_string"].as_str().unwrap_or_default(),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_else(|| {
+                        vec![(
+                            arguments["old_string"].as_str().unwrap_or_default(),
+                            arguments["new_string"].as_str().unwrap_or_default(),
+                        )]
+                    });
+                let mut edited = content.clone();
+                for (old, new) in edits {
+                    if content.matches(old).count() != 1 {
+                        return Err("edit anchor must match exactly once".into());
+                    }
+                    edited = edited.replacen(old, new, 1);
+                }
+                fs::write(path, edited).map_err(|error| error.to_string())?;
+                Ok(json!({"status":"edited"}))
+            }
+            "append_file" => {
+                let path = checked_path(&self.workspace, arguments["path"].as_str().unwrap_or(""))?;
+                let content = arguments["content"].as_str().unwrap_or_default();
+                use std::io::Write;
+                let mut file = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .map_err(|error| error.to_string())?;
+                file.write_all(content.as_bytes())
+                    .map_err(|error| error.to_string())?;
+                Ok(json!({"status":"appended"}))
+            }
+            "run_shell" => {
+                let command = arguments["command"].as_str().unwrap_or_default();
+                let output = Command::new("sh")
+                    .args(["-c", command])
+                    .current_dir(&self.workspace)
+                    .output()
+                    .map_err(|error| error.to_string())?;
+                if !output.status.success() {
+                    return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+                }
+                Ok(json!({
+                    "status":"completed",
+                    "stdout":String::from_utf8_lossy(&output.stdout).to_string()
+                }))
             }
             "propose_plan" => Ok(json!({"status":"accepted"})),
             "browser_status" if self.behavior == FixtureToolBehavior::ProgressiveCatalog => {
@@ -1210,6 +1479,998 @@ pub fn builtin_cases() -> Vec<EvalCase> {
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
+fn verifier_task(
+    name: &str,
+    description: &str,
+    split: TaskSplit,
+    initial_workspace: Vec<(&str, &str)>,
+    prompt: &str,
+    turns: Vec<Vec<ToolCall>>,
+    expected_artifacts: Vec<(&str, &str)>,
+    verifier: &str,
+) -> VerifierTask {
+    verifier_task_owned(
+        name,
+        description,
+        split,
+        initial_workspace
+            .into_iter()
+            .map(|(path, content)| (path.into(), content.into()))
+            .collect(),
+        prompt,
+        turns,
+        expected_artifacts
+            .into_iter()
+            .map(|(path, content)| (path.into(), content.into()))
+            .collect(),
+        verifier,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verifier_task_owned(
+    name: &str,
+    description: &str,
+    split: TaskSplit,
+    initial_workspace: Vec<(String, String)>,
+    prompt: &str,
+    turns: Vec<Vec<ToolCall>>,
+    expected_artifacts: Vec<(String, String)>,
+    verifier: &str,
+) -> VerifierTask {
+    VerifierTask {
+        name: name.into(),
+        description: description.into(),
+        split,
+        initial_workspace,
+        prompt: prompt.into(),
+        provider: ProviderSourceSpec::Scripted(
+            turns
+                .into_iter()
+                .enumerate()
+                .map(|(index, calls)| turn(&format!("step {index}"), calls))
+                .chain(std::iter::once(turn("done", vec![])))
+                .collect(),
+        ),
+        expected_artifacts: expected_artifacts
+            .into_iter()
+            .map(|(path, content)| ExpectedArtifact { path, content })
+            .collect(),
+        verifier: VerificationScript {
+            filename: "verify.sh".into(),
+            body: verifier.into(),
+        },
+    }
+}
+
+pub fn baseline_internal_taskset() -> Vec<VerifierTask> {
+    use TaskSplit::{HeldIn, HeldOut};
+    vec![
+        verifier_task(
+            "nested_write",
+            "Write the requested content into a nested directory.",
+            HeldIn,
+            vec![],
+            "Create nested/result.txt containing exactly the single line alpha with no trailing newline.",
+            vec![vec![call(
+                "task-1",
+                "write_file",
+                json!({"path":"nested/result.txt","content":"alpha"}),
+            )]],
+            vec![("nested/result.txt", "alpha")],
+            "test \"$(cat nested/result.txt)\" = alpha",
+        ),
+        verifier_task(
+            "exact_edit",
+            "Replace one exact anchor without changing surrounding content.",
+            HeldIn,
+            vec![("config.txt", "mode=old\nkeep=yes\n")],
+            "Change mode from old to new and preserve keep.",
+            vec![vec![call(
+                "task-2",
+                "edit_file",
+                json!({"path":"config.txt","edits":[{"old_string":"mode=old","new_string":"mode=new"}]}),
+            )]],
+            vec![("config.txt", "mode=new\nkeep=yes\n")],
+            "grep -Fx 'mode=new' config.txt && grep -Fx 'keep=yes' config.txt",
+        ),
+        verifier_task(
+            "append_log",
+            "Append a record to an existing file.",
+            HeldIn,
+            vec![("log.txt", "start\n")],
+            "Append exactly the line done followed by a newline to log.txt, preserving its existing start line. The final bytes of log.txt must be exactly `start\\ndone\\n`.",
+            vec![vec![call(
+                "task-3",
+                "run_shell",
+                json!({"command":"printf 'done\\n' >> log.txt"}),
+            )]],
+            vec![("log.txt", "start\ndone\n")],
+            "test \"$(tail -n 1 log.txt)\" = done",
+        ),
+        verifier_task(
+            "read_then_write",
+            "Use an existing file's value to produce a derived artifact.",
+            HeldIn,
+            vec![("source.txt", "source-value")],
+            "Read source.txt and write its exact contents, source-value with no trailing newline, to copied.txt.",
+            vec![
+                vec![call("task-4a", "read_file", json!({"path":"source.txt"}))],
+                vec![call(
+                    "task-4b",
+                    "write_file",
+                    json!({"path":"copied.txt","content":"source-value"}),
+                )],
+            ],
+            vec![("copied.txt", "source-value")],
+            "test \"$(cat copied.txt)\" = source-value",
+        ),
+        verifier_task(
+            "parent_boundary_recovery",
+            "Recover from a parent traversal rejection by using a safe path.",
+            HeldIn,
+            vec![],
+            "Do not write outside the workspace; write safe.txt containing exactly safe with no trailing newline instead.",
+            vec![
+                vec![call(
+                    "task-5a",
+                    "write_file",
+                    json!({"path":"../unsafe.txt","content":"no"}),
+                )],
+                vec![call(
+                    "task-5b",
+                    "write_file",
+                    json!({"path":"safe.txt","content":"safe"}),
+                )],
+            ],
+            vec![("safe.txt", "safe")],
+            "test \"$(cat safe.txt)\" = safe && test ! -e ../unsafe.txt",
+        ),
+        verifier_task(
+            "absolute_boundary_recovery",
+            "Recover from an absolute path rejection without creating the target.",
+            HeldIn,
+            vec![],
+            "Write exactly local with no trailing newline to local.txt, never to an absolute path.",
+            vec![
+                vec![call(
+                    "task-6a",
+                    "write_file",
+                    json!({"path":"/tmp/not-allowed.txt","content":"no"}),
+                )],
+                vec![call(
+                    "task-6b",
+                    "write_file",
+                    json!({"path":"local.txt","content":"local"}),
+                )],
+            ],
+            vec![("local.txt", "local")],
+            "test \"$(cat local.txt)\" = local",
+        ),
+        verifier_task(
+            "shell_create_file",
+            "Use an offline shell command to create the requested artifact.",
+            HeldIn,
+            vec![],
+            "Create shell.txt with exactly shell and no trailing newline using an offline shell command.",
+            vec![vec![call(
+                "task-7",
+                "run_shell",
+                json!({"command":"printf shell > shell.txt"}),
+            )]],
+            vec![("shell.txt", "shell")],
+            "test \"$(cat shell.txt)\" = shell",
+        ),
+        verifier_task(
+            "shell_failure_recovery",
+            "Recover after a deterministic shell failure.",
+            HeldIn,
+            vec![],
+            "If the first command fails, correct it and create recovered.txt containing exactly recovered with no trailing newline.",
+            vec![
+                vec![call("task-8a", "run_shell", json!({"command":"false"}))],
+                vec![call(
+                    "task-8b",
+                    "run_shell",
+                    json!({"command":"printf recovered > recovered.txt"}),
+                )],
+            ],
+            vec![("recovered.txt", "recovered")],
+            "test \"$(cat recovered.txt)\" = recovered",
+        ),
+        verifier_task(
+            "multi_step_directory",
+            "Complete a dependent directory and file creation sequence.",
+            HeldIn,
+            vec![],
+            "Create reports/summary.txt containing exactly ready with no trailing newline.",
+            vec![
+                vec![call(
+                    "task-9a",
+                    "run_shell",
+                    json!({"command":"mkdir -p reports"}),
+                )],
+                vec![call(
+                    "task-9b",
+                    "write_file",
+                    json!({"path":"reports/summary.txt","content":"ready"}),
+                )],
+            ],
+            vec![("reports/summary.txt", "ready")],
+            "test -d reports && test \"$(cat reports/summary.txt)\" = ready",
+        ),
+        verifier_task(
+            "preserve_unrelated",
+            "Edit one field while preserving unrelated file content.",
+            HeldIn,
+            vec![("settings.ini", "a=1\nb=2\nc=3\n")],
+            "Change the line b=2 to exactly b=9 while preserving the exact lines a=1 and c=3 and their newlines.",
+            vec![vec![call(
+                "task-10",
+                "edit_file",
+                json!({"path":"settings.ini","edits":[{"old_string":"b=2","new_string":"b=9"}]}),
+            )]],
+            vec![("settings.ini", "a=1\nb=9\nc=3\n")],
+            "grep -Fx 'a=1' settings.ini && grep -Fx 'b=9' settings.ini && grep -Fx 'c=3' settings.ini",
+        ),
+        verifier_task(
+            "exact_newline",
+            "Persist exact multiline output including its final newline.",
+            HeldIn,
+            vec![],
+            "Write exact.txt with the exact byte sequence `one\\ntwo\\n`: first line one, second line two, and one final newline byte after two.",
+            vec![vec![call(
+                "task-11",
+                "write_file",
+                json!({"path":"exact.txt","content":"one\ntwo\n"}),
+            )]],
+            vec![("exact.txt", "one\ntwo\n")],
+            "test \"$(wc -l < exact.txt)\" -eq 2 && test \"$(tail -n 1 exact.txt)\" = two",
+        ),
+        verifier_task(
+            "multiple_artifacts",
+            "Produce two independent artifacts with exact contents.",
+            HeldIn,
+            vec![],
+            "Write left.txt with exactly left and no trailing newline, and right.txt with exactly right and no trailing newline.",
+            vec![vec![
+                call(
+                    "task-12a",
+                    "write_file",
+                    json!({"path":"left.txt","content":"left"}),
+                ),
+                call(
+                    "task-12b",
+                    "write_file",
+                    json!({"path":"right.txt","content":"right"}),
+                ),
+            ]],
+            vec![("left.txt", "left"), ("right.txt", "right")],
+            "test \"$(cat left.txt)\" = left && test \"$(cat right.txt)\" = right",
+        ),
+        verifier_task(
+            "heldout_nested_edit",
+            "Edit a file in a nested directory.",
+            HeldOut,
+            vec![("src/app.txt", "status=todo\n")],
+            "The existing src/app.txt contains exactly `status=todo\\n`. Replace that line so the complete file is exactly `status=done\\n`.",
+            vec![vec![call(
+                "task-13",
+                "edit_file",
+                json!({"path":"src/app.txt","edits":[{"old_string":"status=todo","new_string":"status=done"}]}),
+            )]],
+            vec![("src/app.txt", "status=done\n")],
+            "grep -Fx 'status=done' src/app.txt",
+        ),
+        verifier_task(
+            "heldout_sibling_boundary",
+            "Avoid a sibling path while producing the requested local artifact.",
+            HeldOut,
+            vec![],
+            "Recover from ../sibling.txt rejection and write child.txt containing exactly child with no trailing newline.",
+            vec![
+                vec![call(
+                    "task-14a",
+                    "write_file",
+                    json!({"path":"../sibling.txt","content":"bad"}),
+                )],
+                vec![call(
+                    "task-14b",
+                    "write_file",
+                    json!({"path":"child.txt","content":"child"}),
+                )],
+            ],
+            vec![("child.txt", "child")],
+            "test \"$(cat child.txt)\" = child && test ! -e ../sibling.txt",
+        ),
+        verifier_task(
+            "heldout_shell_pipeline",
+            "Use an offline shell pipeline to transform a file.",
+            HeldOut,
+            vec![("input.txt", "beta\nalpha\n")],
+            "Sort input.txt line-by-line in ascending order into sorted.txt; its exact contents must be alpha followed by a newline and then beta followed by a newline.",
+            vec![vec![call(
+                "task-15",
+                "run_shell",
+                json!({"command":"sort input.txt > sorted.txt"}),
+            )]],
+            vec![("sorted.txt", "alpha\nbeta\n")],
+            "test \"$(head -n 1 sorted.txt)\" = alpha && test \"$(tail -n 1 sorted.txt)\" = beta",
+        ),
+        verifier_task(
+            "heldout_shell_stderr_recovery",
+            "Recover from a shell command with deterministic stderr.",
+            HeldOut,
+            vec![],
+            "After the failing command, create fixed.txt containing exactly fixed with no trailing newline.",
+            vec![
+                vec![call(
+                    "task-16a",
+                    "run_shell",
+                    json!({"command":"echo expected-error >&2; exit 7"}),
+                )],
+                vec![call(
+                    "task-16b",
+                    "write_file",
+                    json!({"path":"fixed.txt","content":"fixed"}),
+                )],
+            ],
+            vec![("fixed.txt", "fixed")],
+            "test \"$(cat fixed.txt)\" = fixed",
+        ),
+        verifier_task(
+            "heldout_missing_parent",
+            "Create an artifact whose parent directory does not exist yet.",
+            HeldOut,
+            vec![],
+            "Write nested/deep/output.txt containing exactly deep with no trailing newline.",
+            vec![vec![call(
+                "task-17",
+                "write_file",
+                json!({"path":"nested/deep/output.txt","content":"deep"}),
+            )]],
+            vec![("nested/deep/output.txt", "deep")],
+            "test \"$(cat nested/deep/output.txt)\" = deep",
+        ),
+        verifier_task(
+            "heldout_overwrite",
+            "Replace an existing artifact with the requested exact content.",
+            HeldOut,
+            vec![("replace.txt", "old")],
+            "Replace replace.txt so its exact contents are new with no trailing newline.",
+            vec![vec![call(
+                "task-18",
+                "write_file",
+                json!({"path":"replace.txt","content":"new"}),
+            )]],
+            vec![("replace.txt", "new")],
+            "test \"$(cat replace.txt)\" = new",
+        ),
+        verifier_task(
+            "heldout_config_dependency",
+            "Read a config value and use it in a dependent output.",
+            HeldOut,
+            vec![("config.txt", "enabled")],
+            "Read config.txt and write its exact value, enabled with no trailing newline, to state.txt.",
+            vec![
+                vec![call("task-19a", "read_file", json!({"path":"config.txt"}))],
+                vec![call(
+                    "task-19b",
+                    "write_file",
+                    json!({"path":"state.txt","content":"enabled"}),
+                )],
+            ],
+            vec![("state.txt", "enabled")],
+            "test \"$(cat state.txt)\" = enabled",
+        ),
+        verifier_task(
+            "heldout_exact_json",
+            "Write a valid exact JSON artifact.",
+            HeldOut,
+            vec![],
+            "Write payload.json with exactly this one-line JSON and no trailing newline: {\"ok\":true,\"count\":2}",
+            vec![vec![call(
+                "task-20",
+                "write_file",
+                json!({"path":"payload.json","content":"{\"ok\":true,\"count\":2}"}),
+            )]],
+            vec![("payload.json", "{\"ok\":true,\"count\":2}")],
+            "grep -Fx '{\"ok\":true,\"count\":2}' payload.json",
+        ),
+        verifier_task(
+            "heldout_whitespace",
+            "Preserve meaningful whitespace in an output artifact.",
+            HeldOut,
+            vec![],
+            "Write padded.txt with exactly two leading spaces followed by the six letters padded, and no trailing newline: `  padded`.",
+            vec![vec![call(
+                "task-21",
+                "write_file",
+                json!({"path":"padded.txt","content":"  padded"}),
+            )]],
+            vec![("padded.txt", "  padded")],
+            "test \"$(cat padded.txt)\" = '  padded'",
+        ),
+        verifier_task(
+            "heldout_two_appends",
+            "Apply two ordered append operations.",
+            HeldOut,
+            vec![("events.txt", "one\n")],
+            "Append exactly the line two followed by a newline, then exactly the line three followed by a newline, to events.txt.",
+            vec![
+                vec![call(
+                    "task-22a",
+                    "run_shell",
+                    json!({"command":"printf 'two\\n' >> events.txt"}),
+                )],
+                vec![call(
+                    "task-22b",
+                    "run_shell",
+                    json!({"command":"printf 'three\\n' >> events.txt"}),
+                )],
+            ],
+            vec![("events.txt", "one\ntwo\nthree\n")],
+            "test \"$(tail -n 1 events.txt)\" = three",
+        ),
+        verifier_task(
+            "heldout_failure_alternate_path",
+            "Recover from a failed write by selecting an alternate output path.",
+            HeldOut,
+            vec![],
+            "Do not repeat the rejected path; write alternate.txt containing exactly alternate with no trailing newline.",
+            vec![
+                vec![call(
+                    "task-23a",
+                    "write_file",
+                    json!({"path":"../rejected.txt","content":"bad"}),
+                )],
+                vec![call(
+                    "task-23b",
+                    "write_file",
+                    json!({"path":"alternate.txt","content":"alternate"}),
+                )],
+            ],
+            vec![("alternate.txt", "alternate")],
+            "test \"$(cat alternate.txt)\" = alternate",
+        ),
+        verifier_task(
+            "heldout_independent_outputs",
+            "Create independent summary and checksum artifacts.",
+            HeldOut,
+            vec![],
+            "Write summary.txt with exactly summary and no trailing newline, and checksum.txt with exactly checksum and no trailing newline.",
+            vec![vec![
+                call(
+                    "task-24a",
+                    "write_file",
+                    json!({"path":"summary.txt","content":"summary"}),
+                ),
+                call(
+                    "task-24b",
+                    "write_file",
+                    json!({"path":"checksum.txt","content":"checksum"}),
+                ),
+            ]],
+            vec![("summary.txt", "summary"), ("checksum.txt", "checksum")],
+            "test -s summary.txt && test -s checksum.txt",
+        ),
+    ]
+}
+
+pub fn hard_internal_taskset() -> Vec<VerifierTask> {
+    use TaskSplit::{HeldIn, HeldOut};
+    vec![
+        verifier_task_owned(
+            "hard_large_targeted_edit",
+            "Edit one exact line in a large file while preserving all unrelated lines.",
+            HeldIn,
+            vec![(
+                "large.txt".into(),
+                (1..=80)
+                    .map(|index| format!("line-{index:02}=value-{index:02}\n"))
+                    .collect::<String>(),
+            )],
+            "Read large.txt first. An attempted edit using the nonexistent line-99=value-99 must fail; recover by replacing only the exact line line-47=value-47 with line-47=value-47-updated. Preserve every other line and the final newline.",
+            vec![
+                vec![call("hard-25a", "read_file", json!({"path":"large.txt"}))],
+                vec![call(
+                    "hard-25b",
+                    "edit_file",
+                    json!({"path":"large.txt","edits":[{"old_string":"line-99=value-99","new_string":"bad"}]}),
+                )],
+                vec![call(
+                    "hard-25c",
+                    "edit_file",
+                    json!({"path":"large.txt","edits":[{"old_string":"line-47=value-47","new_string":"line-47=value-47-updated"}]}),
+                )],
+            ],
+            vec![(
+                "large.txt".into(),
+                (1..=80)
+                    .map(|index| {
+                        if index == 47 {
+                            "line-47=value-47-updated\n".to_owned()
+                        } else {
+                            format!("line-{index:02}=value-{index:02}\n")
+                        }
+                    })
+                    .collect::<String>(),
+            )],
+            "test \"$(grep -c '^line-' large.txt)\" -eq 80 && grep -Fx 'line-47=value-47-updated' large.txt && test \"$(tail -n 1 large.txt)\" = 'line-80=value-80'",
+        ),
+        verifier_task(
+            "hard_ambiguous_anchor_recovery",
+            "Recover from a non-unique edit anchor by using a more specific anchor.",
+            HeldIn,
+            vec![("records.txt", "id=1\nstatus=todo\nid=2\nstatus=todo\n")],
+            "Change only record id=2 from status=todo to status=done. First inspect records.txt. A generic status=todo anchor is ambiguous; recover by using the unique adjacent id=2 and status=todo text. The final file must be exactly id=1\\nstatus=todo\\nid=2\\nstatus=done\\n.",
+            vec![
+                vec![call(
+                    "hard-26a",
+                    "edit_file",
+                    json!({"path":"records.txt","edits":[{"old_string":"status=todo","new_string":"status=done"}]}),
+                )],
+                vec![call(
+                    "hard-26b",
+                    "edit_file",
+                    json!({"path":"records.txt","edits":[{"old_string":"id=2\nstatus=todo","new_string":"id=2\nstatus=done"}]}),
+                )],
+            ],
+            vec![("records.txt", "id=1\nstatus=todo\nid=2\nstatus=done\n")],
+            "grep -Fx 'status=todo' records.txt && grep -Fx 'status=done' records.txt && test \"$(grep -c '^id=' records.txt)\" -eq 2",
+        ),
+        verifier_task(
+            "hard_probe_then_branch",
+            "Inspect workspace state before choosing a dependent output.",
+            HeldIn,
+            vec![("mode.txt", "beta")],
+            "Probe missing.txt first; that read will fail and must not stop the task. Then read mode.txt before acting. Because its exact value is beta, write branch.txt with exactly beta-path and no trailing newline. Do not overwrite mode.txt.",
+            vec![
+                vec![call("hard-27a", "read_file", json!({"path":"missing.txt"}))],
+                vec![call("hard-27b", "read_file", json!({"path":"mode.txt"}))],
+                vec![call(
+                    "hard-27c",
+                    "write_file",
+                    json!({"path":"branch.txt","content":"beta-path"}),
+                )],
+            ],
+            vec![("branch.txt", "beta-path"), ("mode.txt", "beta")],
+            "test \"$(cat branch.txt)\" = beta-path && test \"$(cat mode.txt)\" = beta",
+        ),
+        verifier_task(
+            "hard_failure_then_dependency",
+            "Recover from an intermediate tool failure before producing dependent artifacts.",
+            HeldIn,
+            vec![],
+            "A first attempt to read missing.txt will fail, and a first write to ../outside.txt will be rejected. Recover from both errors, then create intermediate.txt with exactly ready and dependent.txt with exactly ready-dependent.",
+            vec![
+                vec![call("hard-28a", "read_file", json!({"path":"missing.txt"}))],
+                vec![call(
+                    "hard-28b",
+                    "write_file",
+                    json!({"path":"../outside.txt","content":"bad"}),
+                )],
+                vec![call(
+                    "hard-28c",
+                    "write_file",
+                    json!({"path":"intermediate.txt","content":"ready"}),
+                )],
+                vec![call(
+                    "hard-28d",
+                    "read_file",
+                    json!({"path":"intermediate.txt"}),
+                )],
+                vec![call(
+                    "hard-28e",
+                    "write_file",
+                    json!({"path":"dependent.txt","content":"ready-dependent"}),
+                )],
+            ],
+            vec![
+                ("intermediate.txt", "ready"),
+                ("dependent.txt", "ready-dependent"),
+            ],
+            "test \"$(cat intermediate.txt)\" = ready && test \"$(cat dependent.txt)\" = ready-dependent",
+        ),
+        verifier_task(
+            "hard_consistent_index",
+            "Create artifacts and an index whose entries match the actual generated files.",
+            HeldIn,
+            vec![],
+            "A first write to ../outside.txt will be rejected. Recover, then create exactly these files with no trailing newlines: docs/a.txt containing alpha, docs/b.txt containing beta, and docs/index.txt containing exactly `a.txt\\nb.txt\\n`. The index must list the two generated data files in alphabetical order and must not list itself.",
+            vec![
+                vec![call(
+                    "hard-29a",
+                    "write_file",
+                    json!({"path":"../outside.txt","content":"bad"}),
+                )],
+                vec![call(
+                    "hard-29b",
+                    "write_file",
+                    json!({"path":"docs/a.txt","content":"alpha"}),
+                )],
+                vec![call(
+                    "hard-29c",
+                    "write_file",
+                    json!({"path":"docs/b.txt","content":"beta"}),
+                )],
+                vec![call(
+                    "hard-29d",
+                    "write_file",
+                    json!({"path":"docs/index.txt","content":"a.txt\nb.txt\n"}),
+                )],
+            ],
+            vec![
+                ("docs/a.txt", "alpha"),
+                ("docs/b.txt", "beta"),
+                ("docs/index.txt", "a.txt\nb.txt\n"),
+            ],
+            "grep -Fx 'a.txt' docs/index.txt && grep -Fx 'b.txt' docs/index.txt && test \"$(wc -l < docs/index.txt)\" -eq 2 && test \"$(find docs -maxdepth 1 -type f | wc -l)\" -eq 3",
+        ),
+        verifier_task_owned(
+            "hard_large_multiline_edit",
+            "Apply a precise multiline replacement in a large document while preserving unrelated sections.",
+            HeldIn,
+            vec![(
+                "document.txt".into(),
+                (0..30)
+                    .map(|index| format!("section-{index}\nkeep-{index}\n"))
+                    .collect::<String>(),
+            )],
+            "Read document.txt first. An attempted replacement of the nonexistent block `section-99\\nkeep-99\\n` must fail; recover by replacing exactly the two-line block `section-17\\nkeep-17\\n` with `section-17\\nupdated-17\\n`. Preserve all other 29 sections and the final newline.",
+            vec![
+                vec![call(
+                    "hard-30a",
+                    "read_file",
+                    json!({"path":"document.txt"}),
+                )],
+                vec![call(
+                    "hard-30b",
+                    "edit_file",
+                    json!({"path":"document.txt","edits":[{"old_string":"section-99\nkeep-99\n","new_string":"bad"}]}),
+                )],
+                vec![call(
+                    "hard-30c",
+                    "edit_file",
+                    json!({"path":"document.txt","edits":[{"old_string":"section-17\nkeep-17\n","new_string":"section-17\nupdated-17\n"}]}),
+                )],
+            ],
+            vec![(
+                "document.txt".into(),
+                (0..30)
+                    .map(|index| {
+                        if index == 17 {
+                            "section-17\nupdated-17\n".to_owned()
+                        } else {
+                            format!("section-{index}\nkeep-{index}\n")
+                        }
+                    })
+                    .collect::<String>(),
+            )],
+            "grep -Fx 'updated-17' document.txt && test \"$(grep -c '^section-' document.txt)\" -eq 30",
+        ),
+        verifier_task(
+            "hard_stale_anchor_recovery",
+            "Recover after a stale edit anchor by inspecting the current file.",
+            HeldOut,
+            vec![("version.txt", "version=2\n")],
+            "Read version.txt first. An attempt using the stale anchor version=1 will fail; recover by replacing the actual line version=2 with version=3. The final file must be exactly version=3 followed by one newline.",
+            vec![
+                vec![call(
+                    "hard-31a",
+                    "edit_file",
+                    json!({"path":"version.txt","edits":[{"old_string":"version=1","new_string":"version=3"}]}),
+                )],
+                vec![call("hard-31b", "read_file", json!({"path":"version.txt"}))],
+                vec![call(
+                    "hard-31c",
+                    "edit_file",
+                    json!({"path":"version.txt","edits":[{"old_string":"version=2","new_string":"version=3"}]}),
+                )],
+            ],
+            vec![("version.txt", "version=3\n")],
+            "grep -Fx 'version=3' version.txt && test \"$(wc -l < version.txt)\" -eq 1",
+        ),
+        verifier_task(
+            "hard_probe_existing_outputs",
+            "Inspect existing outputs and reconcile a manifest without stale entries.",
+            HeldOut,
+            vec![("a.txt", "a"), ("b.txt", "b")],
+            "Probe missing.txt first; that read will fail. Then inspect the workspace. The only existing data files are a.txt and b.txt. Write manifest.txt with exactly `a.txt\\nb.txt\\n`, in alphabetical order, and do not modify a.txt or b.txt.",
+            vec![
+                vec![call("hard-32a", "read_file", json!({"path":"missing.txt"}))],
+                vec![call(
+                    "hard-32b",
+                    "run_shell",
+                    json!({"command":"find . -maxdepth 1 -type f -printf '%f\\n' | sort"}),
+                )],
+                vec![call(
+                    "hard-32c",
+                    "write_file",
+                    json!({"path":"manifest.txt","content":"a.txt\nb.txt\n"}),
+                )],
+            ],
+            vec![
+                ("manifest.txt", "a.txt\nb.txt\n"),
+                ("a.txt", "a"),
+                ("b.txt", "b"),
+            ],
+            "grep -Fx 'a.txt' manifest.txt && grep -Fx 'b.txt' manifest.txt && test \"$(grep -c '^' manifest.txt)\" -eq 2",
+        ),
+        verifier_task(
+            "hard_boundary_then_nested_dependency",
+            "Recover from a rejected path before completing a nested dependent output.",
+            HeldOut,
+            vec![],
+            "First avoid writing outside the workspace after the rejected path error. Then create reports/raw.txt with exactly raw and reports/index.txt with exactly `raw.txt\\n`, both without extra content.",
+            vec![
+                vec![call(
+                    "hard-33a",
+                    "write_file",
+                    json!({"path":"../opcos-hard-boundary-output.txt","content":"bad"}),
+                )],
+                vec![call(
+                    "hard-33b",
+                    "write_file",
+                    json!({"path":"reports/raw.txt","content":"raw"}),
+                )],
+                vec![call(
+                    "hard-33c",
+                    "write_file",
+                    json!({"path":"reports/index.txt","content":"raw.txt\n"}),
+                )],
+            ],
+            vec![
+                ("reports/raw.txt", "raw"),
+                ("reports/index.txt", "raw.txt\n"),
+            ],
+            "test \"$(cat reports/raw.txt)\" = raw && test \"$(cat reports/index.txt)\" = raw.txt && test ! -e ../opcos-hard-boundary-output.txt",
+        ),
+        verifier_task(
+            "hard_data_checksum_consistency",
+            "Create data and a checksum that are mutually consistent.",
+            HeldOut,
+            vec![],
+            "A first checksum attempt for missing.txt will fail. Recover by writing data.txt with exactly checksum-input and no trailing newline. Then create checksum.txt containing the lowercase SHA-256 hexadecimal digest of data.txt, followed by one newline. The digest must be computed from the actual data.txt bytes.",
+            vec![
+                vec![call(
+                    "hard-34a",
+                    "run_shell",
+                    json!({"command":"sha256sum missing.txt | cut -d' ' -f1 > checksum.txt"}),
+                )],
+                vec![call(
+                    "hard-34b",
+                    "write_file",
+                    json!({"path":"data.txt","content":"checksum-input"}),
+                )],
+                vec![call(
+                    "hard-34c",
+                    "run_shell",
+                    json!({"command":"sha256sum data.txt | cut -d' ' -f1 > checksum.txt"}),
+                )],
+            ],
+            vec![("data.txt", "checksum-input")],
+            "test \"$(sha256sum data.txt | cut -d' ' -f1)\" = \"$(cat checksum.txt)\"",
+        ),
+        verifier_task_owned(
+            "hard_large_two_point_edit",
+            "Edit two exact points in a large file while preserving all other lines.",
+            HeldOut,
+            vec![(
+                "settings.txt".into(),
+                (1..=60)
+                    .map(|index| format!("setting-{index:02}=old\n"))
+                    .collect::<String>(),
+            )],
+            "Read settings.txt first. An attempted edit containing the nonexistent setting-99=old anchor must fail without changing the file. Recover by changing only setting-12=old to setting-12=new and setting-48=old to setting-48=new. Preserve all other 58 settings and the final newline.",
+            vec![
+                vec![call(
+                    "hard-35a",
+                    "read_file",
+                    json!({"path":"settings.txt"}),
+                )],
+                vec![call(
+                    "hard-35b",
+                    "edit_file",
+                    json!({"path":"settings.txt","edits":[{"old_string":"setting-12=old","new_string":"setting-12=new"},{"old_string":"setting-99=old","new_string":"bad"}]}),
+                )],
+                vec![call(
+                    "hard-35c",
+                    "edit_file",
+                    json!({"path":"settings.txt","edits":[{"old_string":"setting-12=old","new_string":"setting-12=new"},{"old_string":"setting-48=old","new_string":"setting-48=new"}]}),
+                )],
+            ],
+            vec![(
+                "settings.txt".into(),
+                (1..=60)
+                    .map(|index| {
+                        if index == 12 || index == 48 {
+                            format!("setting-{index:02}=new\n")
+                        } else {
+                            format!("setting-{index:02}=old\n")
+                        }
+                    })
+                    .collect::<String>(),
+            )],
+            "grep -Fx 'setting-12=new' settings.txt && grep -Fx 'setting-48=new' settings.txt && test \"$(grep -c '^setting-' settings.txt)\" -eq 60",
+        ),
+        verifier_task(
+            "hard_index_no_stale_entries",
+            "Probe a workspace and produce an index that exactly matches its data files.",
+            HeldOut,
+            vec![
+                ("input/a.txt", "a"),
+                ("input/b.txt", "b"),
+                ("input/c.txt", "c"),
+            ],
+            "A first write to ../outside.txt will be rejected. Then inspect input/. Write input/index.txt containing exactly `a.txt\\nb.txt\\nc.txt\\n`. It must list all three existing data files alphabetically, contain no stale entry, and leave their contents unchanged.",
+            vec![
+                vec![call(
+                    "hard-36a",
+                    "write_file",
+                    json!({"path":"../outside.txt","content":"bad"}),
+                )],
+                vec![call("hard-36b", "read_file", json!({"path":"input/a.txt"}))],
+                vec![call("hard-36c", "read_file", json!({"path":"input/b.txt"}))],
+                vec![call("hard-36d", "read_file", json!({"path":"input/c.txt"}))],
+                vec![call(
+                    "hard-36e",
+                    "write_file",
+                    json!({"path":"input/index.txt","content":"a.txt\nb.txt\nc.txt\n"}),
+                )],
+            ],
+            vec![("input/index.txt", "a.txt\nb.txt\nc.txt\n")],
+            "grep -Fx 'a.txt' input/index.txt && grep -Fx 'b.txt' input/index.txt && grep -Fx 'c.txt' input/index.txt && test \"$(wc -l < input/index.txt)\" -eq 3 && test \"$(find input -maxdepth 1 -type f | wc -l)\" -eq 4",
+        ),
+    ]
+}
+
+pub fn internal_taskset() -> Vec<VerifierTask> {
+    let mut tasks = baseline_internal_taskset();
+    tasks.extend(hard_internal_taskset());
+    tasks
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn render_verifier(task: &VerifierTask) -> String {
+    let mut script = String::from("set -eu\n");
+    for (index, artifact) in task.expected_artifacts.iter().enumerate() {
+        script.push_str(&format!(
+            "test -f {} || exit 1\n",
+            shell_quote(&artifact.path)
+        ));
+        script.push_str(&format!(
+            "cmp -s {} {} || exit 1\n",
+            shell_quote(&artifact.path),
+            shell_quote(&format!(".opcos-expected-{index}"))
+        ));
+    }
+    script.push_str(&task.verifier.body);
+    script.push('\n');
+    script
+}
+
+pub async fn run_verifier_task(task: &VerifierTask) -> Result<VerifierTaskReport, EvalError> {
+    let ProviderSourceSpec::Scripted(script) = &task.provider else {
+        return Err(EvalError::Fixture(
+            "run_verifier_task requires a scripted provider".into(),
+        ));
+    };
+    run_verifier_task_with_provider(task, ScriptedProvider::new(script.clone()), "taskset").await
+}
+
+async fn run_verifier_task_with_provider<P>(
+    task: &VerifierTask,
+    provider: P,
+    model: &str,
+) -> Result<VerifierTaskReport, EvalError>
+where
+    P: Provider + Send + Sync + 'static,
+{
+    let temp = TempDir::new().map_err(|error| EvalError::Fixture(error.to_string()))?;
+    for (path, content) in &task.initial_workspace {
+        let target = checked_path(temp.path(), path).map_err(EvalError::Fixture)?;
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|error| EvalError::Fixture(error.to_string()))?;
+        }
+        fs::write(target, content).map_err(|error| EvalError::Fixture(error.to_string()))?;
+    }
+    let store = Arc::new(
+        SqliteStore::open_in_memory().map_err(|error| EvalError::Store(error.to_string()))?,
+    );
+    let session_id = format!("taskset-{}", task.name);
+    session(&store, &session_id, temp.path())?;
+    let engine = TurnEngine::new(
+        provider,
+        store,
+        Arc::new(FixtureTools {
+            workspace: temp.path().to_path_buf(),
+            behavior: FixtureToolBehavior::Normal,
+        }),
+        &session_id,
+        temp.path().display().to_string(),
+        PermissionMode::Auto,
+        model,
+    );
+    let engine = Arc::new(engine);
+    let engine_result = engine.submit_text(task.prompt.clone()).await;
+
+    let script_path = temp.path().join(&task.verifier.filename);
+    for (index, artifact) in task.expected_artifacts.iter().enumerate() {
+        fs::write(
+            temp.path().join(format!(".opcos-expected-{index}")),
+            &artifact.content,
+        )
+        .map_err(|error| EvalError::Fixture(error.to_string()))?;
+    }
+    fs::write(&script_path, render_verifier(task))
+        .map_err(|error| EvalError::Fixture(error.to_string()))?;
+    let verifier = Command::new("sh")
+        .arg(&script_path)
+        .current_dir(temp.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| EvalError::Fixture(error.to_string()))?;
+    Ok(VerifierTaskReport {
+        task: task.name.clone(),
+        split: task.split,
+        passed: verifier.success(),
+        verifier_exit_code: verifier.code(),
+        expected_artifacts: task.expected_artifacts.clone(),
+        engine_error: engine_result.err().map(|error| error.to_string()),
+    })
+}
+
+pub async fn run_internal_taskset() -> Result<TasksetRun, EvalError> {
+    let mut reports = Vec::new();
+    for task in internal_taskset() {
+        reports.push(run_verifier_task(&task).await?);
+    }
+    Ok(TasksetRun { reports })
+}
+
+pub async fn run_live_internal_taskset(
+    config: &LiveRolloutConfig,
+) -> Result<Vec<TasksetRun>, EvalError> {
+    let api_key = std::env::var("xinlicloud_KEY")
+        .map_err(|_| EvalError::Fixture("xinlicloud_KEY is required for live rollout".into()))?;
+    if api_key.is_empty() {
+        return Err(EvalError::Fixture(
+            "xinlicloud_KEY must not be empty".into(),
+        ));
+    }
+    let mut runs = Vec::with_capacity(config.repeats);
+    for _ in 0..config.repeats {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(config.concurrency));
+        let mut tasks = tokio::task::JoinSet::new();
+        for task in internal_taskset() {
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|error| EvalError::Fixture(error.to_string()))?;
+            let provider = OpenAiProvider::new(ProviderConfig::new(&config.base_url, &api_key));
+            let model = config.model.clone();
+            tasks.spawn(async move {
+                let _permit = permit;
+                run_verifier_task_with_provider(&task, provider, &model).await
+            });
+        }
+        let mut reports = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            reports.push(result.map_err(|error| EvalError::Fixture(error.to_string()))??);
+        }
+        reports.sort_by(|left, right| left.task.cmp(&right.task));
+        runs.push(TasksetRun { reports });
+    }
+    Ok(runs)
+}
+
 pub async fn run_builtin_case(case: &EvalCase) -> Result<CaseReport, EvalError> {
     let temp = TempDir::new().map_err(|error| EvalError::Fixture(error.to_string()))?;
     let ExecutionEnvironmentSpec::LocalFixture(fixture) = &case.environment else {
@@ -1599,6 +2860,11 @@ mod tests {
         ));
         assert!(matches!(case.provider, ProviderSourceSpec::External));
         assert!(matches!(case.grader, GraderSpec::ExternalTests { .. }));
+        let live = ProviderSourceSpec::OpenAiCompatible {
+            base_url: "https://llm.xinlicloud.top/v1".into(),
+            model: "glm-5.2".into(),
+        };
+        assert!(matches!(live, ProviderSourceSpec::OpenAiCompatible { .. }));
     }
 
     #[test]
@@ -1626,5 +2892,177 @@ mod tests {
                 )
             }));
         }
+    }
+
+    #[test]
+    fn internal_taskset_has_stable_nonrandom_splits() {
+        let baseline = baseline_internal_taskset();
+        assert_eq!(baseline.len(), 24);
+        assert_eq!(
+            baseline
+                .iter()
+                .filter(|task| task.split == TaskSplit::HeldIn)
+                .count(),
+            12
+        );
+        assert_eq!(
+            baseline
+                .iter()
+                .filter(|task| task.split == TaskSplit::HeldOut)
+                .count(),
+            12
+        );
+        let tasks = internal_taskset();
+        assert_eq!(tasks.len(), 36);
+        assert_eq!(
+            tasks
+                .iter()
+                .filter(|task| task.split == TaskSplit::HeldIn)
+                .count(),
+            18
+        );
+        assert_eq!(
+            tasks
+                .iter()
+                .filter(|task| task.split == TaskSplit::HeldOut)
+                .count(),
+            18
+        );
+        let names = tasks
+            .iter()
+            .map(|task| task.name.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(names.len(), tasks.len());
+        assert!(tasks.iter().all(|task| {
+            !task.description.is_empty()
+                && !task.prompt.is_empty()
+                && !task.verifier.body.is_empty()
+                && !task.expected_artifacts.is_empty()
+        }));
+    }
+
+    #[tokio::test]
+    async fn verifier_exit_code_and_artifact_expectations_drive_results() {
+        let task = internal_taskset()
+            .into_iter()
+            .find(|task| task.name == "nested_write")
+            .unwrap();
+        let passed = run_verifier_task(&task).await.unwrap();
+        assert!(passed.passed);
+        assert_eq!(passed.verifier_exit_code, Some(0));
+
+        let mut failed_script = task.clone();
+        failed_script.verifier.body = "exit 1".into();
+        let failed = run_verifier_task(&failed_script).await.unwrap();
+        assert!(!failed.passed);
+        assert_eq!(failed.verifier_exit_code, Some(1));
+
+        let mut missing_artifact = task;
+        missing_artifact.expected_artifacts = vec![ExpectedArtifact {
+            path: "does-not-exist.txt".into(),
+            content: "claimed".into(),
+        }];
+        let missing = run_verifier_task(&missing_artifact).await.unwrap();
+        assert!(!missing.passed);
+        assert_eq!(missing.verifier_exit_code, Some(1));
+    }
+
+    #[tokio::test]
+    async fn every_internal_task_passes_its_offline_verifier() {
+        let run = run_internal_taskset().await.unwrap();
+        assert_eq!(run.reports.len(), 36);
+        for report in &run.reports {
+            assert!(
+                report.passed,
+                "{} failed with {:?}: {:?}",
+                report.task, report.verifier_exit_code, report.engine_error
+            );
+            assert_eq!(report.verifier_exit_code, Some(0));
+        }
+    }
+
+    #[test]
+    fn repeated_runs_aggregate_by_task_and_split() {
+        let tasks = internal_taskset();
+        let reports = tasks
+            .iter()
+            .map(|task| VerifierTaskReport {
+                task: task.name.clone(),
+                split: task.split,
+                passed: true,
+                verifier_exit_code: Some(0),
+                expected_artifacts: task.expected_artifacts.clone(),
+                engine_error: None,
+            })
+            .collect::<Vec<_>>();
+        let mut second = reports.clone();
+        second[0].passed = false;
+        let aggregate = aggregate_taskset_runs(&[
+            TasksetRun {
+                reports: reports.clone(),
+            },
+            TasksetRun { reports: second },
+        ]);
+        assert_eq!(aggregate.runs, 2);
+        assert_eq!(
+            aggregate.held_in,
+            SplitPassCount {
+                total: 36,
+                passed: 35,
+            }
+        );
+        assert_eq!(
+            aggregate.task_passes["nested_write"],
+            SplitPassCount {
+                total: 2,
+                passed: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn comparator_rejects_one_split_regression_and_accepts_no_regression() {
+        let baseline = AggregatedTaskset {
+            runs: 1,
+            task_passes: std::collections::BTreeMap::new(),
+            held_in: SplitPassCount {
+                total: 10,
+                passed: 8,
+            },
+            held_out: SplitPassCount {
+                total: 10,
+                passed: 8,
+            },
+        };
+        let regressed = AggregatedTaskset {
+            held_in: SplitPassCount {
+                total: 10,
+                passed: 9,
+            },
+            held_out: SplitPassCount {
+                total: 10,
+                passed: 7,
+            },
+            ..baseline.clone()
+        };
+        let rejected = compare_taskset_runs(&baseline, &regressed);
+        assert!(!rejected.accepted);
+        assert_eq!(rejected.reason, "candidate regresses held-out");
+
+        let improved = AggregatedTaskset {
+            held_in: SplitPassCount {
+                total: 10,
+                passed: 9,
+            },
+            held_out: SplitPassCount {
+                total: 10,
+                passed: 8,
+            },
+            ..baseline.clone()
+        };
+        assert!(compare_taskset_runs(&baseline, &improved).accepted);
+        let record = record_taskset_candidate("progressive-disclosure", &baseline, &regressed);
+        assert_eq!(record.candidate, "progressive-disclosure");
+        assert!(!record.comparison.accepted);
     }
 }
