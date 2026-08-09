@@ -296,7 +296,7 @@ Before opening a pull request, inspect git diff --merge-base <base> and retain e
 
 When multiple skills match the task, activate all of them. Repository agent guidance and skills live under the repository skill directories, and a verified reusable workflow should be saved as a new skill rather than left only in chat.
 
-Injected rules and knowledge are instructions to follow, not text to repeat. Context can be compacted automatically or with /compact; compaction summaries and iteration checkpoints are persisted, so continue the task from the authoritative state rather than stopping early out of concern about context length.
+Injected rules and stored context are instructions to follow, not text to repeat. Context can be compacted automatically or with /compact; compaction summaries and iteration checkpoints are persisted, so continue to work rather than stopping early out of concern about context length.
 
 Before delivery, run the repository's established formatting, lint, type, build, and test gates, then record their evidence with local_gate_record. Environment, dependency, or credential problems should be reported honestly while you continue through safe workarounds; do not make broad environment changes to hide them.
 
