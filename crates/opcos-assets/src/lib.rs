@@ -983,9 +983,26 @@ pub async fn discover<R: RemoteAssetReader>(
         for hook in &hooks.hooks {
             if !matches!(
                 hook.event.as_str(),
-                "PreToolUse" | "PostToolUse" | "PostCompaction" | "Stop"
+                "PreToolUse"
+                    | "PostToolUse"
+                    | "PostCompaction"
+                    | "PreCompact"
+                    | "SessionStart"
+                    | "SessionEnd"
+                    | "Stop"
             ) {
                 hook_errors.push(format!("unsupported lifecycle hook event: {}", hook.event));
+            }
+            if hook.matcher.is_some()
+                && matches!(
+                    hook.event.as_str(),
+                    "PostCompaction" | "PreCompact" | "SessionStart" | "SessionEnd" | "Stop"
+                )
+            {
+                hook_errors.push(format!(
+                    "matcher is only supported for tool lifecycle hook events: {}",
+                    hook.event
+                ));
             }
         }
     }
@@ -2028,7 +2045,7 @@ mod tests {
         async fn read(&self, path: &str) -> Result<String, AssetError> {
             match path {
                 "/repo/.agents/hooks.local.json" => Ok(
-                    r#"{"enabled":true,"hooks":[{"event":"SessionStart","command":"unsupported"}]}"#
+                    r#"{"enabled":true,"hooks":[{"event":"UnknownEvent","command":"unsupported"}]}"#
                         .into(),
                 ),
                 _ => Err(AssetError::Invalid("missing".into())),
@@ -2047,8 +2064,37 @@ mod tests {
             bundle
                 .hook_errors
                 .iter()
-                .any(|error| error.contains("unsupported lifecycle hook event: SessionStart"))
+                .any(|error| error.contains("unsupported lifecycle hook event: UnknownEvent"))
         );
+    }
+
+    struct LifecycleMatcherHookReader;
+
+    #[async_trait]
+    impl RemoteAssetReader for LifecycleMatcherHookReader {
+        async fn read(&self, path: &str) -> Result<String, AssetError> {
+            match path {
+                "/repo/.agents/hooks.local.json" => Ok(
+                    r#"{"enabled":true,"hooks":[{"event":"SessionStart","matcher":"anything","command":"hook"}]}"#
+                        .into(),
+                ),
+                _ => Err(AssetError::Invalid("missing".into())),
+            }
+        }
+
+        async fn list(&self, _path: Option<&str>) -> Result<Vec<(String, bool)>, AssetError> {
+            Err(AssetError::Invalid("missing".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn non_tool_hook_matchers_are_reported() {
+        let bundle = discover(&LifecycleMatcherHookReader, "/repo")
+            .await
+            .unwrap();
+        assert!(bundle.hook_errors.iter().any(|error| {
+            error.contains("matcher is only supported for tool lifecycle hook events: SessionStart")
+        }));
     }
 
     struct InvalidHookReader;
