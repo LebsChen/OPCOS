@@ -1000,6 +1000,23 @@ struct ActiveToolCallGuard<'a> {
     ids: Vec<String>,
 }
 
+struct ToolDispatchContext {
+    grants: Vec<DurableGrant>,
+    unattended: bool,
+    permission_rules: Option<PermissionRules>,
+    execute_readonly: bool,
+}
+
+enum ToolDispatchResult {
+    Completed(Value),
+    DeferredReadonly,
+    PreflightError(Value),
+    ApprovalPending {
+        preflight_reason: Option<String>,
+        current_pending_saved: bool,
+    },
+}
+
 impl Drop for ActiveToolCallGuard<'_> {
     fn drop(&mut self) {
         if let Ok(mut calls) = self.calls.lock() {
@@ -2660,14 +2677,10 @@ where
         }
     }
 
-    async fn execute_tools(
+    async fn tool_dispatch_context(
         &self,
-        assistant_sequence: i64,
-        calls: &[ToolCall],
-    ) -> Result<Vec<Value>, EngineError> {
-        let _active = self.track_tool_calls(calls);
-        let mut results: Vec<Option<Value>> = (0..calls.len()).map(|_| None).collect();
-        let mut readonly = Vec::new();
+        execute_readonly: bool,
+    ) -> Result<ToolDispatchContext, EngineError> {
         let grants = self
             .store
             .load_grants(&self.session_id)
@@ -2681,251 +2694,280 @@ where
             .collect::<Vec<_>>();
         let unattended = self.unattended.load(Ordering::SeqCst);
         let permission_rules = self.permission_rules.lock().await.clone();
-        for (index, call) in calls.iter().enumerate() {
-            if self.interrupted.load(Ordering::SeqCst) {
-                results[index] = Some(classify_tool_error(call, "tool call interrupted"));
-                continue;
-            }
-            let mode = *self.mode.lock().await;
-            if call.name == "ask_user"
-                || (call.name == "propose_plan" && mode == PermissionMode::Plan)
-            {
-                if call.name == "ask_user" {
-                    let options = call
-                        .arguments
-                        .get("options")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    let allow_multiple = call
-                        .arguments
-                        .get("allow_multiple")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    let _ = self
-                        .working_event(
-                            "ask_user_pending",
-                            "message",
-                            json!({
-                                "call_id": call.id,
-                                "tool": "ask_user",
-                                "options": options,
-                                "allow_multiple": allow_multiple,
-                            }),
-                        )
-                        .await;
-                } else {
-                    let _ = self
-                        .working_event(
-                            "approval_pending",
-                            "message",
-                            json!({
-                                "call_id": call.id,
-                                "tool": call.name,
-                                "arguments": call.arguments,
-                                "reason": "Plan mode requires plan confirmation",
-                            }),
-                        )
-                        .await;
-                }
-                self.save_pending(&PendingRecord {
-                    session_id: self.session_id.clone(),
-                    call_id: call.id.clone(),
-                    tool: call.name.clone(),
-                    arguments: call.arguments.clone(),
-                    state: call.name.clone(),
-                })?;
-                let completed_reads = futures_util::future::join_all(readonly.drain(..).map(
-                    |(read_index, read_call): (usize, &ToolCall)| async move {
-                        let result = self.execute_tool_interruptible(read_call).await;
-                        (read_index, result)
-                    },
-                ))
-                .await;
-                for (read_index, result) in completed_reads {
-                    results[read_index] = Some(result);
-                }
-                let completed = results
-                    .iter()
-                    .take(index)
-                    .enumerate()
-                    .filter_map(|(index, result)| {
-                        result
-                            .clone()
-                            .map(|result| (calls[index].id.clone(), result))
-                    })
-                    .collect::<Vec<_>>();
-                self.persist_tool_results(assistant_sequence, &calls[..index], completed)
-                    .await?;
-                for remaining in &calls[index + 1..] {
-                    self.save_pending(&PendingRecord {
-                        session_id: self.session_id.clone(),
-                        call_id: remaining.id.clone(),
-                        tool: remaining.name.clone(),
-                        arguments: remaining.arguments.clone(),
-                        state: "pending".into(),
-                    })?;
-                }
-                return Err(EngineError::ApprovalPending(call.id.clone()));
-            }
-            let mut risk = if call.name == "propose_plan" {
-                ToolRisk::Read
-            } else {
-                tool_risk(&call.name)
-            };
-            let argument_keys = call
-                .arguments
-                .as_object()
-                .map(|arguments| arguments.keys().cloned().collect::<Vec<_>>())
-                .unwrap_or_default();
-            let category = tool_event_category(&call.name);
-            if call.name == "run_shell" {
+        Ok(ToolDispatchContext {
+            grants,
+            unattended,
+            permission_rules,
+            execute_readonly,
+        })
+    }
+
+    async fn execute_tool_once(
+        &self,
+        call: &ToolCall,
+        context: &ToolDispatchContext,
+    ) -> Result<ToolDispatchResult, EngineError> {
+        let mode = *self.mode.lock().await;
+        if call.name == "ask_user" || (call.name == "propose_plan" && mode == PermissionMode::Plan)
+        {
+            if call.name == "ask_user" {
+                let options = call
+                    .arguments
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let allow_multiple = call
+                    .arguments
+                    .get("allow_multiple")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 let _ = self
                     .working_event(
-                        "shell_process_started",
-                        "shell",
+                        "ask_user_pending",
+                        "message",
                         json!({
                             "call_id": call.id,
-                            "shell_id": shell_id_for_session(&self.session_id),
-                            "command": call.arguments.get("command").and_then(Value::as_str).unwrap_or_default(),
-                            "starting_dir": self.workspace.clone(),
-                            "is_major_action": true,
+                            "tool": "ask_user",
+                            "options": options,
+                            "allow_multiple": allow_multiple,
                         }),
                     )
                     .await;
             } else {
                 let _ = self
                     .working_event(
-                        &format!("{}_started", call.name),
-                        category,
+                        "approval_pending",
+                        "message",
                         json!({
-                            "call_id":call.id,
-                            "tool":call.name,
-                            "argument_keys":argument_keys,
-                            "is_major_action": is_major_tool(&call.name, category),
+                            "call_id": call.id,
+                            "tool": call.name,
+                            "arguments": call.arguments,
+                            "reason": "Plan mode requires plan confirmation",
                         }),
                     )
                     .await;
             }
-            let mode = *self.mode.lock().await;
-            let target = self.executor.policy_target(&call.name, &call.arguments);
-            let mutating_api_target = if self.mutating_api_gate_enabled.load(Ordering::SeqCst)
-                && matches!(call.name.as_str(), "run_shell" | "exec")
-            {
-                call.arguments
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .and_then(mutating_http_target)
+            self.save_pending(&PendingRecord {
+                session_id: self.session_id.clone(),
+                call_id: call.id.clone(),
+                tool: call.name.clone(),
+                arguments: call.arguments.clone(),
+                state: call.name.clone(),
+            })?;
+            return Ok(ToolDispatchResult::ApprovalPending {
+                preflight_reason: None,
+                current_pending_saved: true,
+            });
+        }
+
+        let mut risk = if call.name == "propose_plan" {
+            ToolRisk::Read
+        } else {
+            tool_risk(&call.name)
+        };
+        let argument_keys = call
+            .arguments
+            .as_object()
+            .map(|arguments| arguments.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let category = tool_event_category(&call.name);
+        if call.name == "run_shell" {
+            let _ = self
+                .working_event(
+                    "shell_process_started",
+                    "shell",
+                    json!({
+                        "call_id": call.id,
+                        "shell_id": shell_id_for_session(&self.session_id),
+                        "command": call.arguments.get("command").and_then(Value::as_str).unwrap_or_default(),
+                        "starting_dir": self.workspace.clone(),
+                        "is_major_action": true,
+                    }),
+                )
+                .await;
+        } else {
+            let _ = self
+                .working_event(
+                    &format!("{}_started", call.name),
+                    category,
+                    json!({
+                        "call_id":call.id,
+                        "tool":call.name,
+                        "argument_keys":argument_keys,
+                        "is_major_action": is_major_tool(&call.name, category),
+                    }),
+                )
+                .await;
+        }
+        let mode = *self.mode.lock().await;
+        let target = self.executor.policy_target(&call.name, &call.arguments);
+        let mutating_api_target = if self.mutating_api_gate_enabled.load(Ordering::SeqCst)
+            && matches!(call.name.as_str(), "run_shell" | "exec")
+        {
+            call.arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .and_then(mutating_http_target)
+        } else {
+            None
+        };
+        let mut target = mutating_api_target.as_deref().unwrap_or(&target);
+        if call.name == "computer_use" {
+            let action = call
+                .arguments
+                .get("action")
+                .and_then(|value| value.get("action"))
+                .and_then(Value::as_str);
+            if action == Some("screenshot") {
+                risk = ToolRisk::External;
             } else {
-                None
-            };
-            let mut target = mutating_api_target.as_deref().unwrap_or(&target);
-            if call.name == "computer_use" {
-                let action = call
-                    .arguments
-                    .get("action")
-                    .and_then(|value| value.get("action"))
-                    .and_then(Value::as_str);
-                if action == Some("screenshot") {
-                    risk = ToolRisk::External;
-                } else {
-                    risk = ToolRisk::Execute;
-                }
+                risk = ToolRisk::Execute;
             }
-            let click_origin = if call.name == "browser_click" {
-                self.executor.browser_origin().await
+        }
+        let click_origin = if call.name == "browser_click" {
+            self.executor.browser_origin().await
+        } else {
+            None
+        };
+        let browser_target = if matches!(call.name.as_str(), "browser_navigate" | "browser_click") {
+            let origin = if call.name == "browser_navigate" {
+                call.arguments.get("url").and_then(Value::as_str)
             } else {
-                None
+                click_origin.as_deref()
             };
-            let browser_target =
-                if matches!(call.name.as_str(), "browser_navigate" | "browser_click") {
-                    let origin = if call.name == "browser_navigate" {
-                        call.arguments.get("url").and_then(Value::as_str)
-                    } else {
-                        click_origin.as_deref()
-                    };
-                    if call.name == "browser_navigate" {
-                        origin.and_then(browser_navigation_target)
-                    } else {
-                        origin.and_then(browser_click_target)
-                    }
+            if call.name == "browser_navigate" {
+                origin.and_then(browser_navigation_target)
+            } else {
+                origin.and_then(browser_click_target)
+            }
+        } else {
+            None
+        };
+        if let Some((browser_target, is_loopback)) = &browser_target {
+            target = browser_target;
+            if *is_loopback {
+                risk = ToolRisk::Execute;
+            }
+        }
+        let preflight = match self.executor.preflight(&call.name, &call.arguments).await {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                return Ok(ToolDispatchResult::PreflightError(preflight_tool_error(
+                    call, error,
+                )));
+            }
+        };
+        let mut preflight_reason = None;
+        let decision = match preflight {
+            PreflightDecision::Allow if self.executor.grant_allows(target) => {
+                let repair_grant = [DurableGrant {
+                    key: "repair-loop".into(),
+                    target: target.to_owned(),
+                    expires_at: None,
+                }];
+                decide_with_rules(
+                    mode,
+                    risk,
+                    context.unattended,
+                    &repair_grant,
+                    target,
+                    context.permission_rules.as_ref(),
+                )
+            }
+            PreflightDecision::Allow => decide_with_rules(
+                mode,
+                risk,
+                context.unattended,
+                &context.grants,
+                target,
+                context.permission_rules.as_ref(),
+            ),
+            PreflightDecision::NeedsUser(reason) if context.unattended => {
+                preflight_reason = Some(reason);
+                Decision::Deny
+            }
+            PreflightDecision::NeedsUser(reason) => {
+                preflight_reason = Some(reason);
+                Decision::NeedsUser
+            }
+            PreflightDecision::Deny(reason) => {
+                preflight_reason = Some(reason);
+                Decision::Deny
+            }
+        };
+        let decision = if mutating_api_target.is_some() {
+            if mode == PermissionMode::Discuss || context.unattended {
+                Decision::Deny
+            } else {
+                decide_with_rules(
+                    PermissionMode::Interactive,
+                    ToolRisk::External,
+                    context.unattended,
+                    &context.grants,
+                    target,
+                    context.permission_rules.as_ref(),
+                )
+            }
+        } else {
+            decision
+        };
+        if matches!(decision, Decision::Deny) && preflight_reason.is_some() {
+            let reason = preflight_reason
+                .as_deref()
+                .unwrap_or("tool call denied by preflight");
+            let mut result = preflight_tool_error(call, reason);
+            result["_opcos_not_executed"] = json!(true);
+            let _ = self
+                .working_event(
+                    "tool_call_denied",
+                    "message",
+                    json!({
+                        "call_id": call.id,
+                        "tool": call.name,
+                        "reason": reason,
+                    }),
+                )
+                .await;
+            return Ok(ToolDispatchResult::PreflightError(result));
+        }
+        match decision {
+            Decision::Allow
+                if matches!(risk, ToolRisk::Read | ToolRisk::Search | ToolRisk::GitRead)
+                    && call.name != "propose_plan"
+                    && !context.execute_readonly =>
+            {
+                Ok(ToolDispatchResult::DeferredReadonly)
+            }
+            Decision::Allow => {
+                let previous = if matches!(call.name.as_str(), "write_file" | "edit_file") {
+                    self.executor
+                        .execute(
+                            "read_file",
+                            json!({"path": call.arguments.get("path").and_then(Value::as_str).unwrap_or_default()}),
+                        )
+                        .await
+                        .ok()
+                        .and_then(|value| value.get("content").and_then(Value::as_str).map(str::to_owned))
                 } else {
                     None
                 };
-            if let Some((browser_target, is_loopback)) = &browser_target {
-                target = browser_target;
-                if *is_loopback {
-                    risk = ToolRisk::Execute;
-                }
-            }
-            let preflight = match self.executor.preflight(&call.name, &call.arguments).await {
-                Ok(preflight) => preflight,
-                Err(error) => {
-                    results[index] = Some(preflight_tool_error(call, error));
-                    continue;
-                }
-            };
-            let mut preflight_reason = None;
-            let decision = match preflight {
-                PreflightDecision::Allow if self.executor.grant_allows(target) => {
-                    let repair_grant = [DurableGrant {
-                        key: "repair-loop".into(),
-                        target: target.to_owned(),
-                        expires_at: None,
-                    }];
-                    decide_with_rules(
-                        mode,
-                        risk,
-                        unattended,
-                        &repair_grant,
-                        target,
-                        permission_rules.as_ref(),
-                    )
-                }
-                PreflightDecision::Allow => decide_with_rules(
-                    mode,
-                    risk,
-                    unattended,
-                    &grants,
-                    target,
-                    permission_rules.as_ref(),
-                ),
-                PreflightDecision::NeedsUser(reason) if unattended => {
-                    preflight_reason = Some(reason);
-                    Decision::Deny
-                }
-                PreflightDecision::NeedsUser(reason) => {
-                    preflight_reason = Some(reason);
-                    Decision::NeedsUser
-                }
-                PreflightDecision::Deny(reason) => {
-                    preflight_reason = Some(reason);
-                    Decision::Deny
-                }
-            };
-            let decision = if mutating_api_target.is_some() {
-                if mode == PermissionMode::Discuss || unattended {
-                    Decision::Deny
+                let result = if call.name == "propose_plan" {
+                    self.execute_proposed_plan(call)
                 } else {
-                    decide_with_rules(
-                        PermissionMode::Interactive,
-                        ToolRisk::External,
-                        unattended,
-                        &grants,
-                        target,
-                        permission_rules.as_ref(),
-                    )
+                    self.execute_tool_interruptible(call).await
+                };
+                if matches!(call.name.as_str(), "write_file" | "edit_file")
+                    && result.get("error").is_none()
+                {
+                    self.emit_file_change(call, previous.as_deref()).await;
                 }
-            } else {
-                decision
-            };
-            if matches!(decision, Decision::Deny) && preflight_reason.is_some() {
-                let reason = preflight_reason
-                    .as_deref()
-                    .unwrap_or("tool call denied by preflight");
-                let mut result = preflight_tool_error(call, reason);
+                Ok(ToolDispatchResult::Completed(result))
+            }
+            Decision::Deny => {
+                self.policy_denied.store(true, Ordering::SeqCst);
+                let mut result = policy_tool_error(call, "tool call denied by policy");
                 result["_opcos_not_executed"] = json!(true);
-                results[index] = Some(result);
                 let _ = self
                     .working_event(
                         "tool_call_denied",
@@ -2933,73 +2975,58 @@ where
                         json!({
                             "call_id": call.id,
                             "tool": call.name,
-                            "reason": reason,
+                            "reason": "denied by policy",
                         }),
                     )
                     .await;
+                Ok(ToolDispatchResult::Completed(result))
+            }
+            Decision::NeedsUser => {
+                let _ = self
+                    .working_event(
+                        "approval_pending",
+                        "message",
+                        json!({
+                            "call_id": call.id,
+                            "tool": call.name,
+                            "arguments": call.arguments,
+                        }),
+                    )
+                    .await;
+                Ok(ToolDispatchResult::ApprovalPending {
+                    preflight_reason,
+                    current_pending_saved: false,
+                })
+            }
+        }
+    }
+
+    async fn execute_tools(
+        &self,
+        assistant_sequence: i64,
+        calls: &[ToolCall],
+    ) -> Result<Vec<Value>, EngineError> {
+        let _active = self.track_tool_calls(calls);
+        let mut results: Vec<Option<Value>> = (0..calls.len()).map(|_| None).collect();
+        let mut readonly = Vec::new();
+        let context = self.tool_dispatch_context(false).await?;
+        for (index, call) in calls.iter().enumerate() {
+            if self.interrupted.load(Ordering::SeqCst) {
+                results[index] = Some(classify_tool_error(call, "tool call interrupted"));
                 continue;
-            };
-            match decision {
-                Decision::Allow
-                    if matches!(risk, ToolRisk::Read | ToolRisk::Search | ToolRisk::GitRead)
-                        && call.name != "propose_plan" =>
-                {
+            }
+            match self.execute_tool_once(call, &context).await? {
+                ToolDispatchResult::Completed(result)
+                | ToolDispatchResult::PreflightError(result) => {
+                    results[index] = Some(result);
+                }
+                ToolDispatchResult::DeferredReadonly => {
                     readonly.push((index, call));
                 }
-                Decision::Allow => {
-                    let previous = if matches!(call.name.as_str(), "write_file" | "edit_file") {
-                        self.executor
-                            .execute(
-                                "read_file",
-                                json!({"path": call.arguments.get("path").and_then(Value::as_str).unwrap_or_default()}),
-                            )
-                            .await
-                            .ok()
-                            .and_then(|value| value.get("content").and_then(Value::as_str).map(str::to_owned))
-                    } else {
-                        None
-                    };
-                    let result = if call.name == "propose_plan" {
-                        self.execute_proposed_plan(call)
-                    } else {
-                        self.execute_tool_interruptible(call).await
-                    };
-                    if matches!(call.name.as_str(), "write_file" | "edit_file")
-                        && result.get("error").is_none()
-                    {
-                        self.emit_file_change(call, previous.as_deref()).await;
-                    }
-                    results[index] = Some(result);
-                }
-                Decision::Deny => {
-                    self.policy_denied.store(true, Ordering::SeqCst);
-                    let mut result = policy_tool_error(call, "tool call denied by policy");
-                    result["_opcos_not_executed"] = json!(true);
-                    results[index] = Some(result);
-                    let _ = self
-                        .working_event(
-                            "tool_call_denied",
-                            "message",
-                            json!({
-                                "call_id": call.id,
-                                "tool": call.name,
-                                "reason": "denied by policy",
-                            }),
-                        )
-                        .await;
-                }
-                Decision::NeedsUser => {
-                    let _ = self
-                        .working_event(
-                            "approval_pending",
-                            "message",
-                            json!({
-                                "call_id": call.id,
-                                "tool": call.name,
-                                "arguments": call.arguments,
-                            }),
-                        )
-                        .await;
+                ToolDispatchResult::ApprovalPending {
+                    preflight_reason,
+                    current_pending_saved,
+                } => {
                     let completed_reads = futures_util::future::join_all(readonly.drain(..).map(
                         |(read_index, read_call): (usize, &ToolCall)| async move {
                             let result = self.execute_tool_interruptible(read_call).await;
@@ -3031,16 +3058,18 @@ where
                             state: "pending".into(),
                         })?;
                     }
-                    self.save_pending(&PendingRecord {
-                        session_id: self.session_id.clone(),
-                        call_id: call.id.clone(),
-                        tool: call.name.clone(),
-                        arguments: call.arguments.clone(),
-                        state: preflight_reason
-                            .as_deref()
-                            .map(|reason| format!("pending_approval: {reason}"))
-                            .unwrap_or_else(|| "pending".into()),
-                    })?;
+                    if !current_pending_saved {
+                        self.save_pending(&PendingRecord {
+                            session_id: self.session_id.clone(),
+                            call_id: call.id.clone(),
+                            tool: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                            state: preflight_reason
+                                .as_deref()
+                                .map(|reason| format!("pending_approval: {reason}"))
+                                .unwrap_or_else(|| "pending".into()),
+                        })?;
+                    }
                     return Err(EngineError::ApprovalPending(call.id.clone()));
                 }
             }
