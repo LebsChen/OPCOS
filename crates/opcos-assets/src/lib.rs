@@ -217,6 +217,8 @@ For local web verification, use the browser tools for functional interaction and
 
 Use recording_start and recording_stop explicitly when UI-test evidence needs an ordered sampled screenshot timeline; recording is not enabled by default. Use recording_annotate for setup, test_start, and assertion labels, keep each label under 80 characters, consolidate each assertion around one meaningful state change, and reference the earlier test_start with the assertion result. This is a sampled screenshot timeline, not continuous video.
 
+When acting as a testing Worker, execute only the assigned test, report only to the Lead, and reuse the same session, worktree, and running services for incremental instructions. Do not use ask_user, request or read secrets, create or update pull requests, or contact the user directly. Use recording_start, recording_annotate, and recording_stop for UI evidence; include the manifest_artifact_id in the final coordination report. If execution is impossible, record an assertion with result untested, stop the recording, and report the blocker to the Lead.
+
 Be honest about evidence and outcomes. Never invent data or fake tests, mock over a real failure just to make it pass, or describe broken code as working; report blockers that cannot be resolved.
 
 Keep all import and use statements at the top of the file rather than nesting them inside functions or classes.

@@ -532,6 +532,14 @@ pub enum ToolOrigin {
     RepairLoop,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AgentRole {
+    #[default]
+    Lead,
+    Worker,
+    TestingWorker,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PreflightDecision {
     Allow,
@@ -972,6 +980,7 @@ pub struct TurnEngine<P, S, E> {
     artifact_sink: Option<Arc<dyn ArtifactSink>>,
     recording_source: Option<Arc<dyn RecordingSource>>,
     recording: Arc<StdMutex<Option<RecordingRuntime>>>,
+    agent_role: AgentRole,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1143,6 +1152,7 @@ where
             artifact_sink: None,
             recording_source: None,
             recording: Arc::new(StdMutex::new(None)),
+            agent_role: AgentRole::Lead,
         }
     }
 
@@ -1156,6 +1166,10 @@ where
 
     pub fn set_recording_source(&mut self, source: Arc<dyn RecordingSource>) {
         self.recording_source = Some(source);
+    }
+
+    pub fn set_agent_role(&mut self, role: AgentRole) {
+        self.agent_role = role;
     }
 
     pub async fn set_system_instructions(&self, instructions: Option<String>) {
@@ -3102,6 +3116,13 @@ where
                 continue;
             }
             let mode = *self.mode.lock().await;
+            if call.name == "ask_user" && self.agent_role != AgentRole::Lead {
+                results[index] = Some(classify_tool_error(
+                    call,
+                    "testing Worker cannot ask the user; report to Lead instead",
+                ));
+                continue;
+            }
             if call.name == "ask_user"
                 || (call.name == "propose_plan" && mode == PermissionMode::Plan)
             {
@@ -3566,6 +3587,24 @@ where
             .trim();
         if message.is_empty() {
             return json!({"error": "missing string argument: message"});
+        }
+
+        if self.agent_role != AgentRole::Lead {
+            let mut report = call.arguments.clone();
+            if let Some(object) = report.as_object_mut() {
+                object.insert("call_id".into(), Value::String(call.id.clone()));
+                object.insert("report_type".into(), Value::String(call.name.clone()));
+                object.insert("message".into(), Value::String(message.to_owned()));
+                object.insert("audience".into(), Value::String("lead".into()));
+            }
+            let _ = self.record_working_event("worker_report", "coordination", report);
+            return json!({
+                "status": "reported",
+                "audience": "lead",
+                "delivery": "worker_report",
+                "message": message,
+                "note": "The Lead receives this report; it was not delivered directly to the user.",
+            });
         }
 
         if call.name == "send_user_message" {
@@ -8311,6 +8350,89 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn testing_worker_communication_reports_to_lead_without_user_delivery() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let mut engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "testing-worker",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine.set_agent_role(AgentRole::TestingWorker);
+        let call = ToolCall {
+            id: "worker-message".into(),
+            name: "send_user_message".into(),
+            arguments: json!({"message": "UI test is blocked", "kind": "risk"}),
+        };
+        store
+            .append_tool_call(&opcos_store::ToolCallRecord {
+                session_id: "testing-worker".into(),
+                message_sequence: 1,
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+                result: None,
+            })
+            .unwrap();
+        let result = engine.execute_tools(1, &[call]).await.unwrap();
+        assert_eq!(result[0]["status"], "reported");
+        assert_eq!(result[0]["audience"], "lead");
+        assert!(
+            result[0]["note"]
+                .as_str()
+                .unwrap()
+                .contains("not delivered")
+        );
+        assert!(
+            store
+                .load_session_events("testing-worker")
+                .unwrap()
+                .iter()
+                .any(|event| event.event["type"] == "worker_report")
+        );
+    }
+
+    #[tokio::test]
+    async fn testing_worker_ask_user_returns_structured_lead_error() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let mut engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "testing-worker-ask",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine.set_agent_role(AgentRole::TestingWorker);
+        let call = ToolCall {
+            id: "worker-ask".into(),
+            name: "ask_user".into(),
+            arguments: json!({"question": "Need a decision"}),
+        };
+        store
+            .append_tool_call(&opcos_store::ToolCallRecord {
+                session_id: "testing-worker-ask".into(),
+                message_sequence: 1,
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+                result: None,
+            })
+            .unwrap();
+        let result = engine.execute_tools(1, &[call]).await.unwrap();
+        assert_eq!(
+            result[0]["error"],
+            "testing Worker cannot ask the user; report to Lead instead"
+        );
+        assert_eq!(result[0]["error_details"]["code"], "unclassified");
+        assert!(store.load_pending("testing-worker-ask").unwrap().is_empty());
     }
 
     #[test]
