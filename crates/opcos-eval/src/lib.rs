@@ -2390,6 +2390,8 @@ where
         Arc::new(FixtureTools {
             workspace: temp.path().to_path_buf(),
             behavior: FixtureToolBehavior::Normal,
+            hook_context: None,
+            executed_tool_calls: Arc::new(Mutex::new(0)),
         }),
         &session_id,
         temp.path().display().to_string(),
