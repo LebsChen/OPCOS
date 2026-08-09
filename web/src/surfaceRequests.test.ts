@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { surfaceTabForWorkingEvent } from "./surfaceRequests";
+import {
+  surfaceRequestForWorkingEvent,
+  surfaceTabForWorkingEvent,
+} from "./surfaceRequests";
 
 describe("working event surface request contract", () => {
   it("reads event_type from the WorkingEvent envelope", () => {
@@ -24,5 +27,18 @@ describe("working event surface request contract", () => {
         payload: { event_type: "desktop_view_requested" },
       }),
     ).toBeNull();
+  });
+
+  it("gives repeated requests for the same tab distinct signals", () => {
+    const event = { event_type: "desktop_view_requested", payload: {} };
+
+    expect(surfaceRequestForWorkingEvent(event, 1)).toEqual({
+      tab: "desktop",
+      requestId: 1,
+    });
+    expect(surfaceRequestForWorkingEvent(event, 2)).toEqual({
+      tab: "desktop",
+      requestId: 2,
+    });
   });
 });

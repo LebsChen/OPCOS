@@ -52,7 +52,10 @@ import {
   type McpTransport,
 } from "./mcp";
 import { summarizeIterationStats } from "./iterationStats";
-import { surfaceTabForWorkingEvent } from "./surfaceRequests";
+import {
+  surfaceRequestForWorkingEvent,
+  type SurfaceRequestTab,
+} from "./surfaceRequests";
 import { Sidebar } from "./components/Sidebar";
 import { sessionStatusLabel } from "./sessionStatus";
 import { Transcript } from "./components/Transcript";
@@ -10072,7 +10075,7 @@ function SessionRightPanel({
   onWidthChange: (width: number) => void;
   eventRefreshKey: string;
   transcript: TimelineEvent[];
-  focusTabRequest?: PanelTab | null;
+  focusTabRequest?: { tab: PanelTab; requestId: number } | null;
 }) {
   const [panelTab, setPanelTab] = useState<PanelTab>("info");
   const [opened, setOpened] = useState<PanelTab[]>(["info"]);
@@ -10082,9 +10085,11 @@ function SessionRightPanel({
   const [iterationEvents, setIterationEvents] = useState<TimelineEvent[]>([]);
   useEffect(() => {
     if (!focusTabRequest) return;
-    setPanelTab(focusTabRequest);
+    setPanelTab(focusTabRequest.tab);
     setOpened((items) =>
-      items.includes(focusTabRequest) ? items : [...items, focusTabRequest],
+      items.includes(focusTabRequest.tab)
+        ? items
+        : [...items, focusTabRequest.tab],
     );
     onCollapsedChange?.(false);
   }, [focusTabRequest, onCollapsedChange]);
@@ -10927,8 +10932,10 @@ function AppContent() {
   const [secretBackend, setSecretBackend] = useState("");
   const [surfaceRequest, setSurfaceRequest] = useState<{
     sessionId: string;
-    tab: PanelTab;
+    tab: SurfaceRequestTab;
+    requestId: number;
   } | null>(null);
+  const surfaceRequestId = useRef(0);
   const generation = useRef(0);
   const showErrorToast = (reason: unknown) => {
     const runtime = (window as Window & { __TAURI_INTERNALS__?: unknown })
@@ -11246,11 +11253,14 @@ function AppContent() {
           workingEvent?.payload && typeof workingEvent.payload === "object"
             ? (workingEvent.payload as Record<string, unknown>)
             : undefined;
-        const requestedSurface = surfaceTabForWorkingEvent(workingEvent);
+        const requestedSurface = surfaceRequestForWorkingEvent(
+          workingEvent,
+          ++surfaceRequestId.current,
+        );
         if (requestedSurface) {
           setSurfaceRequest({
             sessionId: payload.session_id || "",
-            tab: requestedSurface,
+            ...requestedSurface,
           });
         }
         if (streamPayload.type === "user_question_answered") {
@@ -12288,9 +12298,7 @@ function AppContent() {
           }
           onError={onError}
           focusTabRequest={
-            surfaceRequest?.sessionId === selected.id
-              ? surfaceRequest.tab
-              : null
+            surfaceRequest?.sessionId === selected.id ? surfaceRequest : null
           }
           onCollapsedChange={setDrawerCollapsed}
           width={rightPanelWidth}
