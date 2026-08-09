@@ -12083,42 +12083,36 @@ async fn engine_for_with_context(
             .await
             .map_err(|error| error.to_string())?;
         let mut capabilities = capabilities;
-        let lsp_probe = if capabilities
-            .items
-            .iter()
-            .all(|item| item.name != "exec" && item.name != "stdio" && item.name != "lsp")
-        {
-            false
-        } else {
-            LspClient::start(
-                Arc::new(host.clone()),
-                workspace.display().to_string(),
-                "rust",
-            )
-            .await
-            .is_ok()
-        };
+        let (lsp_probe, lsp_reason) =
+            probe_local_lsp(&host, &workspace.display().to_string()).await;
         if let Some(item) = capabilities
             .items
             .iter_mut()
             .find(|item| item.name == "lsp")
         {
-            item.available = lsp_probe;
             item.state = if lsp_probe {
                 CapabilityState::Available
             } else {
                 CapabilityState::Unavailable
             };
-            if !lsp_probe {
-                item.reason = Some("LSP initialize probe failed".into());
-            }
+            item.reason = lsp_reason.clone();
             item.source = "runtime-probe".into();
         }
+        host.set_capability_state(
+            "lsp",
+            if lsp_probe {
+                CapabilityState::Available
+            } else {
+                CapabilityState::Unavailable
+            },
+            "runtime-probe",
+            lsp_reason,
+        )
+        .await;
         let browser_probe = state.local_browser.probe().await;
         let observed_at = Utc::now();
         capabilities.items.push(Capability {
             name: "browser".into(),
-            available: browser_probe.is_ok(),
             state: if browser_probe.is_ok() {
                 CapabilityState::Available
             } else {
@@ -14080,7 +14074,7 @@ async fn harness_options(
     };
     let capabilities = host.capabilities().await.map_err(|e| e.to_string())?;
     let stdio = capabilities.items.iter().find(|item| item.name == "stdio");
-    let acp_option = if stdio.is_some_and(|item| item.available) {
+    let acp_option = if stdio.is_some_and(|item| item.state.is_available()) {
         match acp_agent_config(&state, project_id.as_deref()) {
             Ok(config) => {
                 let executable = config.command.split_whitespace().next().unwrap_or_default();
@@ -14149,11 +14143,35 @@ async fn session_capabilities(
             .capabilities()
             .await
             .map_err(|error| error.to_string())?;
+        let (lsp_probe, lsp_reason) = probe_local_lsp(&host, &workspace).await;
+        if let Some(item) = capabilities
+            .items
+            .iter_mut()
+            .find(|item| item.name == "lsp")
+        {
+            item.state = if lsp_probe {
+                CapabilityState::Available
+            } else {
+                CapabilityState::Unavailable
+            };
+            item.source = "runtime-probe".into();
+            item.reason = lsp_reason.clone();
+        }
+        host.set_capability_state(
+            "lsp",
+            if lsp_probe {
+                CapabilityState::Available
+            } else {
+                CapabilityState::Unavailable
+            },
+            "runtime-probe",
+            lsp_reason,
+        )
+        .await;
         let browser_probe = state.local_browser.probe().await;
         let observed_at = Utc::now();
         capabilities.items.push(Capability {
             name: "browser".into(),
-            available: browser_probe.is_ok(),
             state: if browser_probe.is_ok() {
                 CapabilityState::Available
             } else {
@@ -15171,9 +15189,7 @@ fn allowed_builtin_tools(capabilities: &HostCapabilities) -> Vec<String> {
                     .items
                     .iter()
                     .find(|item| item.name == *required)
-                    .is_some_and(|item| {
-                        item.available && matches!(item.state, CapabilityState::Available)
-                    })
+                    .is_some_and(|item| item.state.is_available())
             })
         })
         .map(|(name, _)| name.to_owned())
@@ -15190,6 +15206,13 @@ fn is_connector_builtin_tool(name: &str) -> bool {
         || name.starts_with("gitlab_")
         || name.starts_with("jira_")
         || name.starts_with("stripe_")
+}
+
+async fn probe_local_lsp(host: &LocalHost, workspace: &str) -> (bool, Option<String>) {
+    match LspClient::start(Arc::new(host.clone()), workspace.to_owned(), "rust").await {
+        Ok(_) => (true, None),
+        Err(error) => (false, Some(format!("LSP initialize probe failed: {error}"))),
+    }
 }
 
 fn capability_preflight(capabilities: &HostCapabilities, tool: &str) -> Result<(), Value> {
@@ -15216,7 +15239,7 @@ fn capability_preflight(capabilities: &HostCapabilities, tool: &str) -> Result<(
                 true,
             ));
         };
-        if !item.available || !matches!(item.state, CapabilityState::Available) {
+        if !item.state.is_available() {
             let state = match item.state {
                 CapabilityState::Unavailable => "unavailable",
                 CapabilityState::Unknown => "unknown",
@@ -15278,7 +15301,6 @@ fn test_capabilities(lsp: bool, browser: bool, screenshot: bool) -> HostCapabili
                 };
                 Capability {
                     name: name.into(),
-                    available,
                     state: if available {
                         CapabilityState::Available
                     } else {
