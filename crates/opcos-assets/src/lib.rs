@@ -242,6 +242,8 @@ Persist Knowledge or Playbooks only when a pattern is durable and likely to help
 
 Use the learned-workflow lifecycle tool for explicitly saved workflows. Learned Skills are separate from repository Skill files: never claim a database Learned Skill changed repository files, and never write repository Skill files as a substitute for an audited asset mutation.
 
+Create automation only for durable, repeatable work that is worth running without a new prompt. Agent-managed automation inherits the current session's approval boundary: it cannot choose a permission mode, create unattended execution, change permissions, grants, approvals, gates, evaluators, tracers, models, providers, hooks, or secrets. Its only actions are bounded enqueue_bounded_work and request_plan_goal, with a low-risk task type, cadence, in-flight, trigger-window, retry, dead-letter, deduplication, idempotency, and cause-depth limits. Do not create automation recursively or use it for one-off work.
+
 Before writing a test for a behavior, smoke-run the behavior once and base the assertion on the real observed output rather than a guessed shape. If a task can reasonably mean more than one thing and a wrong choice would be costly, stop and ask ask_user even if the work is otherwise still progressing.
 
 Before writing a test for a behavior, smoke-run the behavior once and base the assertion on the real observed output rather than a guessed shape. If a task can reasonably mean more than one thing and a wrong choice would be costly, stop and ask ask_user even if the work is otherwise still progressing. If a user-stated precondition is false, report what was expected versus what you found instead of silently bypassing it, recreating it, or substituting something else.

@@ -23,10 +23,10 @@ use opcos_assets::{
 };
 use opcos_engine::SecretScrubber;
 use opcos_engine::{
-    AcpHarness, AcpHarnessConfig, AgentEngine, AgentRole, ArtifactReference, ArtifactRequest,
-    ArtifactSink, CapturedFrame, EngineError, ExternalContextAttachment, Harness, LifecycleHook,
-    LifecycleHookConfig, PreflightDecision, RecordingSource, SessionRecorder, ToolExecutor,
-    ToolOrigin, TurnEngine,
+    AcpHarness, AcpHarnessConfig, AgentAutomationAction, AgentEngine, AgentRole, ArtifactReference,
+    ArtifactRequest, ArtifactSink, BoundedWorkType, CapturedFrame, EngineError,
+    ExternalContextAttachment, Harness, LifecycleHook, LifecycleHookConfig, PreflightDecision,
+    RecordingSource, SessionRecorder, ToolExecutor, ToolOrigin, TurnEngine,
     computer_use::{
         BestEffortScreenshotChangedVerifier, ComputerUseLoopConfig, ComputerUseStep,
         run_computer_use_loop,
@@ -3958,6 +3958,431 @@ fn execute_action_ledger_tool(
     }
 }
 
+fn execute_agent_automation_tool(
+    store: &SqliteStore,
+    database: &Arc<Mutex<Connection>>,
+    session_id: &str,
+    project_id: Option<&str>,
+    arguments: &Value,
+) -> Result<Value, String> {
+    const MAX_CADENCE_SECONDS: u64 = 3600;
+    const MAX_IN_FLIGHT: u64 = 4;
+    const MAX_TRIGGERS: u64 = 20;
+    const MAX_WINDOW_SECONDS: u64 = 86_400;
+    const MAX_ATTEMPTS: u64 = 3;
+    const MAX_CAUSE_DEPTH: u64 = 8;
+    let action = arguments
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing automation action".to_owned())?;
+    let connection = database.lock().map_err(|_| "database lock poisoned")?;
+    match action {
+        "list" => {
+            let mut statement = connection
+                .prepare(
+                    "SELECT o.id,o.name,o.status,o.current_version_id,v.content,v.metadata_json
+                     FROM config_object o
+                     JOIN config_object_version v ON v.id=o.current_version_id
+                     WHERE o.kind='automation' AND json_extract(v.metadata_json,'$.agent_managed')=1
+                     ORDER BY o.name",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(json!({
+                        "id": row.get::<_, String>(0)?,
+                        "name": row.get::<_, String>(1)?,
+                        "status": row.get::<_, String>(2)?,
+                        "version_id": row.get::<_, String>(3)?,
+                        "automation": serde_json::from_str::<Value>(&row.get::<_, String>(4)?).unwrap_or_else(|_| json!({})),
+                        "metadata": serde_json::from_str::<Value>(&row.get::<_, String>(5)?).unwrap_or_else(|_| json!({})),
+                    }))
+                })
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            Ok(json!({"automations": rows}))
+        }
+        "get" | "versions" => {
+            let id = arguments
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "id is required".to_owned())?;
+            let object = connection
+                .query_row(
+                    "SELECT id,name,status,current_version_id FROM config_object
+                     WHERE id=?1 AND kind='automation'",
+                    [id],
+                    |row| {
+                        Ok(json!({
+                            "id": row.get::<_, String>(0)?,
+                            "name": row.get::<_, String>(1)?,
+                            "status": row.get::<_, String>(2)?,
+                            "current_version_id": row.get::<_, Option<String>>(3)?,
+                        }))
+                    },
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "automation not found".to_owned())?;
+            if action == "get" {
+                let version = connection
+                    .query_row(
+                        "SELECT content,metadata_json FROM config_object_version
+                         WHERE id=json_extract(?1,'$.current_version_id')",
+                        [object.to_string()],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()
+                    .map_err(|error| error.to_string())?;
+                return Ok(json!({
+                    "automation": object,
+                    "version": version.map(|(content, metadata)| json!({
+                        "content": serde_json::from_str::<Value>(&content).unwrap_or_else(|_| json!({})),
+                        "metadata": serde_json::from_str::<Value>(&metadata).unwrap_or_else(|_| json!({})),
+                    }))
+                }));
+            }
+            let mut statement = connection
+                .prepare(
+                    "SELECT id,version,content,metadata_json,created_at,note
+                     FROM config_object_version WHERE object_id=?1 ORDER BY version",
+                )
+                .map_err(|error| error.to_string())?;
+            let versions = statement
+                .query_map([id], |row| {
+                    Ok(json!({
+                        "id": row.get::<_, String>(0)?,
+                        "version": row.get::<_, i64>(1)?,
+                        "content": serde_json::from_str::<Value>(&row.get::<_, String>(2)?).unwrap_or_else(|_| json!({})),
+                        "metadata": serde_json::from_str::<Value>(&row.get::<_, String>(3)?).unwrap_or_else(|_| json!({})),
+                        "created_at": row.get::<_, String>(4)?,
+                        "note": row.get::<_, String>(5)?,
+                    }))
+                })
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            Ok(json!({"automation": object, "versions": versions}))
+        }
+        "create" | "update" => {
+            let trigger = arguments
+                .get("trigger")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "trigger must be schedule or event".to_owned())?;
+            if !matches!(trigger, "schedule" | "event") {
+                return Err("trigger must be schedule or event".into());
+            }
+            let effect = arguments
+                .get("effect")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "effect is required".to_owned())?;
+            let effect_kind = AgentAutomationAction::parse(effect)
+                .ok_or_else(|| "effect is not allowed".to_owned())?;
+            let task_type = arguments.get("task_type").and_then(Value::as_str);
+            if effect_kind == AgentAutomationAction::EnqueueBoundedWork {
+                let task_type = task_type.ok_or_else(|| "task_type is required".to_owned())?;
+                BoundedWorkType::parse(task_type)
+                    .ok_or_else(|| "task_type is not an allowed bounded task".to_owned())?;
+            }
+            if effect_kind == AgentAutomationAction::RequestPlanGoal
+                && arguments
+                    .get("payload")
+                    .and_then(|value| value.get("goal_id"))
+                    .and_then(Value::as_str)
+                    .is_none()
+            {
+                return Err("request_plan_goal requires payload.goal_id".into());
+            }
+            let max_cadence = arguments
+                .get("max_cadence_seconds")
+                .and_then(Value::as_u64)
+                .unwrap_or(900);
+            let max_in_flight = arguments
+                .get("max_in_flight")
+                .and_then(Value::as_u64)
+                .unwrap_or(1);
+            let max_triggers = arguments
+                .get("max_triggers")
+                .and_then(Value::as_u64)
+                .unwrap_or(1);
+            let window_seconds = arguments
+                .get("window_seconds")
+                .and_then(Value::as_u64)
+                .unwrap_or(3600);
+            let max_attempts = arguments
+                .get("max_attempts")
+                .and_then(Value::as_u64)
+                .unwrap_or(3);
+            if max_cadence == 0
+                || max_cadence > MAX_CADENCE_SECONDS
+                || max_in_flight == 0
+                || max_in_flight > MAX_IN_FLIGHT
+                || max_triggers == 0
+                || max_triggers > MAX_TRIGGERS
+                || window_seconds == 0
+                || window_seconds > MAX_WINDOW_SECONDS
+                || max_attempts == 0
+                || max_attempts > MAX_ATTEMPTS
+            {
+                return Err("automation limits exceed bounded policy".into());
+            }
+            let id = arguments
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("automation-{}", Uuid::new_v4()));
+            if action == "update" {
+                let managed = connection
+                    .query_row(
+                        "SELECT EXISTS(
+                           SELECT 1 FROM config_object o
+                           JOIN config_object_version v ON v.id=o.current_version_id
+                           WHERE o.id=?1 AND o.kind='automation'
+                             AND json_extract(v.metadata_json,'$.agent_managed')=1
+                         )",
+                        [&id],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if !managed {
+                    return Err("only agent-managed automations can be updated".into());
+                }
+            } else {
+                let exists = connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM config_object WHERE id=?1)",
+                        [&id],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if exists {
+                    return Err("automation id already exists".into());
+                }
+            }
+            let name = arguments
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "name is required".to_owned())?;
+            let mut payload = arguments
+                .get("payload")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            if !payload.is_object() {
+                return Err("payload must be an object".into());
+            }
+            if let Some(payload) = payload.as_object_mut() {
+                payload.insert("automation_depth".into(), json!(0));
+            }
+            let content = json!({
+                "trigger": trigger,
+                "cron": arguments.get("cron"),
+                "kind_pattern": arguments.get("kind_pattern"),
+                "effect": effect_kind.as_str(),
+                "task_type": task_type,
+                "payload": payload,
+                "max_cadence_seconds": max_cadence,
+                "max_in_flight": max_in_flight,
+                "max_triggers": max_triggers,
+                "window_seconds": window_seconds,
+                "max_attempts": max_attempts,
+                "dedup_key": arguments.get("dedup_key"),
+                "idempotency_key": arguments.get("idempotency_key"),
+                "project_id": project_id,
+            });
+            if trigger == "schedule" {
+                let cron = arguments
+                    .get("cron")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| "schedule automation requires cron".to_owned())?;
+                scheduler::Schedule::parse(cron).map_err(|_| "invalid schedule cron".to_owned())?;
+            } else if arguments
+                .get("kind_pattern")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return Err("event automation requires kind_pattern".into());
+            }
+            let now = Utc::now().to_rfc3339();
+            let current_version = connection
+                .query_row(
+                    "SELECT COALESCE(MAX(version),0) FROM config_object_version WHERE object_id=?1",
+                    [&id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| error.to_string())?;
+            let version = current_version + 1;
+            connection
+                .execute(
+                    "INSERT INTO config_object
+                     (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
+                     VALUES (?1,'automation',?2,?3,'project',?4,'active',?5,NULL)
+                     ON CONFLICT(id) DO UPDATE SET name=excluded.name",
+                    params![id, name, format!("agent:{id}"), project_id, now],
+                )
+                .map_err(|error| error.to_string())?;
+            let version_id = format!("{id}:v{version}");
+            let metadata = json!({
+                "agent_managed": true,
+                "source_session_id": session_id,
+                "max_cause_depth": MAX_CAUSE_DEPTH,
+            });
+            connection
+                .execute(
+                    "INSERT INTO config_object_version
+                     (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+                     VALUES (?1,?2,?3,?4,?5,?6,'agent automation',?7)",
+                    params![
+                        version_id,
+                        id,
+                        version,
+                        content.to_string(),
+                        content_hash(&content.to_string()),
+                        now,
+                        metadata.to_string()
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            connection
+                .execute(
+                    "UPDATE config_object SET current_version_id=?1 WHERE id=?2",
+                    params![version_id, id],
+                )
+                .map_err(|error| error.to_string())?;
+            if trigger == "schedule" {
+                connection
+                    .execute(
+                        "INSERT INTO schedules
+                         (id,name,session_id,playbook_id,config_object_id,cron,enabled,last_run,last_result)
+                         VALUES (?1,?2,?3,?1,?1,?4,1,NULL,NULL)
+                         ON CONFLICT(id) DO UPDATE SET name=excluded.name,session_id=excluded.session_id,
+                           cron=excluded.cron,enabled=1",
+                        params![id, name, session_id, arguments.get("cron").and_then(Value::as_str)],
+                    )
+                    .map_err(|error| error.to_string())?;
+            } else {
+                let effect = if effect_kind == AgentAutomationAction::EnqueueBoundedWork {
+                    json!({
+                        "task_type": task_type,
+                        "payload": payload,
+                        "max_attempts": max_attempts,
+                        "dedup_key": arguments.get("dedup_key"),
+                        "idempotency_key": arguments.get("idempotency_key"),
+                        "project_id": project_id,
+                    })
+                } else {
+                    json!({"goal_id": payload.get("goal_id"), "project_id": project_id})
+                };
+                connection
+                    .execute(
+                        "INSERT INTO event_rules
+                         (rule_id,kind_pattern,effect_kind,effect,enabled,max_triggers,window_seconds,failure_limit)
+                         VALUES (?1,?2,?3,?4,1,?5,?6,?7)
+                         ON CONFLICT(rule_id) DO UPDATE SET kind_pattern=excluded.kind_pattern,
+                           effect_kind=excluded.effect_kind,effect=excluded.effect,enabled=1",
+                        params![
+                            id,
+                            arguments.get("kind_pattern").and_then(Value::as_str),
+                            if effect_kind == AgentAutomationAction::EnqueueBoundedWork { "enqueue_work" } else { "plan_goal" },
+                            effect.to_string(),
+                            max_triggers as i64,
+                            window_seconds as i64,
+                            MAX_ATTEMPTS as i64
+                        ],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            drop(connection);
+            store
+                .append_audit(
+                    session_id,
+                    &format!("agent_automation_{action}"),
+                    &json!({"id": id}),
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(json!({"id":id,"status":"active","source_session_id":session_id}))
+        }
+        "enable" | "disable" | "archive" | "delete" => {
+            let id = arguments
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "id is required".to_owned())?;
+            let status = match action {
+                "enable" => "active",
+                "disable" => "disabled",
+                "archive" => "archived",
+                "delete" => "deleted",
+                _ => unreachable!(),
+            };
+            let changed = connection
+                .execute(
+                    "UPDATE config_object SET status=?1 WHERE id=?2 AND kind='automation'
+                     AND EXISTS (SELECT 1 FROM config_object_version v WHERE v.id=config_object.current_version_id
+                       AND json_extract(v.metadata_json,'$.agent_managed')=1)",
+                    params![status, id],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed == 0 {
+                return Err("agent automation not found or is not agent-managed".into());
+            }
+            connection
+                .execute(
+                    "UPDATE schedules SET enabled=?1 WHERE id=?2",
+                    params![status == "active", id],
+                )
+                .map_err(|error| error.to_string())?;
+            connection
+                .execute(
+                    "UPDATE event_rules SET enabled=?1 WHERE rule_id=?2",
+                    params![status == "active", id],
+                )
+                .map_err(|error| error.to_string())?;
+            drop(connection);
+            store
+                .append_audit(
+                    session_id,
+                    &format!("agent_automation_{action}"),
+                    &json!({"id": id}),
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(json!({"id":id,"status":status}))
+        }
+        "rollback" => {
+            let id = arguments
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "id is required".to_owned())?;
+            let version_id = arguments
+                .get("version_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "version_id is required".to_owned())?;
+            let changed = connection
+                .execute(
+                    "UPDATE config_object SET current_version_id=?1 WHERE id=?2 AND kind='automation'
+                     AND EXISTS (SELECT 1 FROM config_object_version v WHERE v.id=?1 AND v.object_id=?2
+                       AND json_extract(v.metadata_json,'$.agent_managed')=1)",
+                    params![version_id, id],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed == 0 {
+                return Err("automation version not found".into());
+            }
+            drop(connection);
+            store
+                .append_audit(
+                    session_id,
+                    "agent_automation_rollback",
+                    &json!({"id": id, "version_id": version_id}),
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(json!({"id":id,"version_id":version_id}))
+        }
+        _ => Err("automation action is unavailable".into()),
+    }
+}
+
 fn execute_work_queue_tool(
     store: &SqliteStore,
     session_id: &str,
@@ -4719,7 +5144,22 @@ impl ToolExecutor for RemoteExecutor {
                 arguments,
             );
         }
+        if name == "automation_manage" {
+            if self.origin == ToolOrigin::System {
+                return Err("automation-generated work cannot manage automation".into());
+            }
+            return execute_agent_automation_tool(
+                &self.store,
+                &self.database,
+                &self.session_id,
+                self.project_id.as_deref(),
+                &arguments,
+            );
+        }
         if name.starts_with("work_queue_") {
+            if self.origin == ToolOrigin::System {
+                return Err("automation-generated work cannot enqueue work".into());
+            }
             return execute_work_queue_tool(
                 &self.store,
                 &self.session_id,
@@ -5233,6 +5673,9 @@ impl ToolExecutor for DesktopExecutor {
                     );
                 }
                 if name.starts_with("work_queue_") {
+                    if executor.origin == ToolOrigin::System {
+                        return Err("automation-generated work cannot enqueue work".into());
+                    }
                     return execute_work_queue_tool(
                         &executor.store,
                         &executor.session_id,
@@ -5283,6 +5726,18 @@ impl ToolExecutor for DesktopExecutor {
                         &arguments,
                     )
                     .await;
+                }
+                if name == "automation_manage" {
+                    if executor.origin == ToolOrigin::System {
+                        return Err("automation-generated work cannot manage automation".into());
+                    }
+                    return execute_agent_automation_tool(
+                        &executor.store,
+                        &executor.database,
+                        &executor.session_id,
+                        executor.project_id.as_deref(),
+                        &arguments,
+                    );
                 }
                 if matches!(
                     name,
@@ -14534,6 +14989,7 @@ fn builtin_allowed_tools(include_local_lsp: bool, include_edit_file: bool) -> Ve
         "learned_skill_manage",
         "session_search",
         "config_asset_manage",
+        "automation_manage",
         "ask_user",
         "recording_start",
         "recording_annotate",
@@ -25516,20 +25972,36 @@ async fn run_schedule_for_inner(
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .map_err(|_| "enabled schedule not found".to_owned())?;
-    let (_trigger_version_id, trigger_content) = state
+    let (_trigger_version_id, trigger_content, trigger_kind) = state
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?
         .query_row(
-            "SELECT v.id,v.content FROM config_object o
+            "SELECT v.id,v.content,o.kind FROM config_object o
              JOIN config_object_version v ON v.id=o.current_version_id
-            WHERE o.id=?1 AND o.kind='trigger' AND o.status='active'",
+            WHERE o.id=?1 AND o.kind IN ('trigger','automation') AND o.status='active'",
             [&trigger_object_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
         .map_err(|_| "playbook not found".to_owned())?;
     let trigger: Value =
         serde_json::from_str(&trigger_content).map_err(|_| "invalid trigger configuration")?;
+    if trigger_kind == "automation" {
+        return run_agent_automation_schedule(
+            app,
+            state,
+            schedule_id,
+            &target_session_id,
+            &trigger,
+        )
+        .await;
+    }
     let runbook_id = trigger
         .get("runbook_id")
         .and_then(Value::as_str)
@@ -25634,6 +26106,95 @@ async fn run_schedule_for_inner(
         )
         .map_err(|error| error.to_string())?;
     result.map(|_| ()).map_err(engine_error_message)
+}
+
+async fn run_agent_automation_schedule(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    schedule_id: &str,
+    source_session_id: &str,
+    automation: &Value,
+) -> Result<(), String> {
+    let result = async {
+        let action = AgentAutomationAction::parse(
+            automation
+                .get("effect")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "automation effect is missing".to_owned())?,
+        )
+        .ok_or_else(|| "automation effect is not allowed".to_owned())?;
+        let payload = automation
+            .get("payload")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let depth = payload
+            .get("automation_depth")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if depth >= 8 {
+            return Err("automation cause depth limit reached".into());
+        }
+        match action {
+            AgentAutomationAction::EnqueueBoundedWork => {
+                let task_type = automation
+                    .get("task_type")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "automation task_type is missing".to_owned())?;
+                BoundedWorkType::parse(task_type)
+                    .ok_or_else(|| "automation task_type is not allowed".to_owned())?;
+                let mut next_payload = payload;
+                next_payload
+                    .as_object_mut()
+                    .ok_or_else(|| "automation payload must be an object".to_owned())?
+                    .insert("automation_depth".into(), json!(depth + 1));
+                state
+                    .store
+                    .enqueue_work_item(
+                        task_type,
+                        &next_payload,
+                        automation.get("dedup_key").and_then(Value::as_str),
+                        automation.get("idempotency_key").and_then(Value::as_str),
+                        automation
+                            .get("max_attempts")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(3) as u32,
+                        None,
+                        Some(source_session_id),
+                        automation.get("project_id").and_then(Value::as_str),
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            AgentAutomationAction::RequestPlanGoal => {
+                let goal_id = payload
+                    .get("goal_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "request_plan_goal requires payload.goal_id".to_owned())?;
+                run_goal_planner(app, state, goal_id).await?;
+            }
+        }
+        state
+            .store
+            .append_audit(
+                source_session_id,
+                "agent_automation.trigger",
+                &json!({"automation_id": schedule_id, "effect": action.as_str(), "cause_depth": depth}),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok::<(), String>(())
+    }
+    .await;
+    let result_label = if result.is_ok() { "ok" } else { "error" };
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    connection
+        .execute(
+            "UPDATE schedules SET last_run=?2,last_result=?3 WHERE id=?1",
+            params![schedule_id, Utc::now().to_rfc3339(), result_label],
+        )
+        .map_err(|error| error.to_string())?;
+    result
 }
 
 fn constant_time_token_eq(expected: &str, actual: &str) -> bool {

@@ -48,6 +48,49 @@ pub use acp::{AcpHarness, AcpHarnessConfig};
 const ASSUMED_CONTEXT_WINDOW: u64 = 128_000;
 const ASSUMED_OUTPUT_TOKENS: u64 = 4096;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentAutomationAction {
+    EnqueueBoundedWork,
+    RequestPlanGoal,
+}
+
+impl AgentAutomationAction {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "enqueue_bounded_work" => Some(Self::EnqueueBoundedWork),
+            "request_plan_goal" => Some(Self::RequestPlanGoal),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EnqueueBoundedWork => "enqueue_bounded_work",
+            Self::RequestPlanGoal => "request_plan_goal",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundedWorkType {
+    RepositoryIndexRefresh,
+}
+
+impl BoundedWorkType {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "repository_index_refresh" => Some(Self::RepositoryIndexRefresh),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RepositoryIndexRefresh => "repository_index_refresh",
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error("provider: {0}")]
@@ -5535,6 +5578,7 @@ fn tool_risk(name: &str) -> ToolRisk {
         "skill_save_learned" => ToolRisk::Write,
         "session_search" => ToolRisk::Read,
         "config_asset_manage" | "learned_skill_manage" => ToolRisk::Write,
+        "automation_manage" => ToolRisk::Write,
         "coordination_dispatch" => ToolRisk::External,
         "coordination_status" => ToolRisk::Read,
         "action_ledger_list" => ToolRisk::Read,
@@ -6306,6 +6350,7 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"session_search","description":"Search historical OPCOS sessions by title, metadata, time, or redacted transcript content. Read-only; secret-like values are redacted before results are returned.","parameters":{"type":"object","properties":{"query":{"type":"string"},"from":{"type":"string","description":"RFC3339 lower time bound."},"to":{"type":"string","description":"RFC3339 upper time bound."},"project_id":{"type":"string"},"status":{"type":"string"},"content_scope":{"type":"string","enum":["title","messages","events","tool_calls"]},"limit":{"type":"integer","minimum":1,"maximum":100}}}}}),
         json!({"type":"function","function":{"name":"config_asset_manage","description":"Manage agent-owned knowledge or playbook assets. Only knowledge and playbook kinds are structurally available; every mutation is versioned, auditable, reversible, and tied to the current session. Do not use this for one-off notes.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["list","get","create","update","archive","delete","enable","disable","versions","rollback"]},"kind":{"type":"string","enum":["knowledge","playbook"]},"id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"project_id":{"type":"string"},"version":{"type":"integer"}},"required":["action"]}}}),
         json!({"type":"function","function":{"name":"learned_skill_manage","description":"Manage explicitly learned workflows without touching user-authored .agents/skills files. Mutations are tied to the current session and audited; use archive/delete/restore or rollback for lifecycle changes.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["list","get","archive","delete","restore","rollback"]},"id":{"type":"string"},"supersedes_id":{"type":"string"}},"required":["action"]}}}),
+        json!({"type":"function","function":{"name":"automation_manage","description":"Manage bounded, auditable automation. Agent automations inherit the current session approval boundary; they cannot choose a permission mode or create unattended execution. Only enqueue_bounded_work and request_plan_goal are available.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["list","get","create","update","archive","delete","enable","disable","versions","rollback"]},"id":{"type":"string"},"name":{"type":"string"},"trigger":{"type":"string","enum":["schedule","event"]},"cron":{"type":"string"},"kind_pattern":{"type":"string"},"effect":{"type":"string","enum":["enqueue_bounded_work","request_plan_goal"]},"task_type":{"type":"string","enum":["repository_index_refresh"]},"payload":{"type":"object"},"max_cadence_seconds":{"type":"integer"},"max_in_flight":{"type":"integer"},"max_triggers":{"type":"integer"},"window_seconds":{"type":"integer"},"max_attempts":{"type":"integer"},"dedup_key":{"type":"string"},"idempotency_key":{"type":"string"}},"required":["action"]}}}),
         json!({"type":"function","function":{"name":"ask_user","description":"Ask the user a question and wait for an answer. When the user must choose from discrete answers, provide options; set allow_multiple to true when more than one option may be selected.","parameters":{"type":"object","properties":{"question":{"type":"string"},"options":{"type":"array","items":{"type":"string"},"description":"Optional discrete answer choices. Omit for an open-ended question."},"allow_multiple":{"type":"boolean","description":"Allow selecting more than one option from options."}},"required":["question"]}}}),
         json!({"type":"function","function":{"name":"send_user_message","description":"Tell the user about progress, a risk, or a finding without waiting for a response or interrupting execution.","parameters":{"type":"object","properties":{"message":{"type":"string"},"kind":{"type":"string","enum":["progress","risk","finding"]}},"required":["message"]}}}),
         json!({"type":"function","function":{"name":"report_blocker","description":"Report an operational environment or platform problem that is impeding work. This records and visibly reports the problem without changing control flow; use ask_user separately when a user decision is required.","parameters":{"type":"object","properties":{"severity":{"type":"string","enum":["hard","soft","friction"]},"category":{"type":"string","enum":["environment","platform","dependency","host","tool"]},"summary":{"type":"string"},"details":{"type":"string"},"attempted":{"type":"string"},"next_step":{"type":"string"}},"required":["severity","category","summary"]}}}),
@@ -6704,6 +6749,37 @@ mod tests {
             })
             .await;
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn agent_automation_has_structural_action_and_task_boundaries() {
+        assert_eq!(
+            AgentAutomationAction::parse("enqueue_bounded_work").map(AgentAutomationAction::as_str),
+            Some("enqueue_bounded_work")
+        );
+        assert_eq!(
+            AgentAutomationAction::parse("request_plan_goal").map(AgentAutomationAction::as_str),
+            Some("request_plan_goal")
+        );
+        assert!(AgentAutomationAction::parse("run_shell").is_none());
+        assert_eq!(
+            BoundedWorkType::parse("repository_index_refresh").map(BoundedWorkType::as_str),
+            Some("repository_index_refresh")
+        );
+        assert!(BoundedWorkType::parse("ci_repair_loop").is_none());
+        assert_eq!(tool_risk("automation_manage"), ToolRisk::Write);
+        let definition = tool_definitions()
+            .into_iter()
+            .find(|tool| tool["function"]["name"] == "automation_manage")
+            .unwrap();
+        assert_eq!(
+            definition["function"]["parameters"]["properties"]["effect"]["enum"],
+            json!(["enqueue_bounded_work", "request_plan_goal"])
+        );
+        assert_eq!(
+            definition["function"]["parameters"]["properties"]["task_type"]["enum"],
+            json!(["repository_index_refresh"])
+        );
     }
 
     #[test]
