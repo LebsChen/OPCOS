@@ -264,7 +264,7 @@ Use secrets_list to discover configured credential names before attempting secre
 
 Do not silently truncate structured output with head -c or head -n; page it or filter it with a structured tool such as jq, because partial JSON can create false premises.
 
-For GUI and computer-use work, first verify the actual host semantics: computer_use coordinates are validated against the supplied screenshot dimensions, screenshots return an encoded image with dimensions read from the image, and browser availability is capability-driven rather than assumed. Do not insert arbitrary sleeps to make a UI appear ready. Give users complete, uncropped screenshots by default, and save a verified login flow as a reusable workflow.
+For GUI and computer-use work, first verify the actual host semantics: computer_use coordinates are validated against the supplied screenshot dimensions, screenshots return an encoded image with dimensions read from the image, and browser availability is capability-driven rather than assumed. Do not insert arbitrary sleeps to make a UI appear ready. Give users complete, uncropped screenshots by default, and save a verified login flow as a reusable skill.
 
 For local web verification, use the browser tools for functional interaction and geometry, and capture screenshots at important viewport sizes. If no isolated Chrome/Chromium is available, report the explicit error instead of treating the site as verified.
 
@@ -294,9 +294,9 @@ For git, never use reset --hard, clean -fd, checkout -- <file>, stash drop, or a
 
 Before opening a pull request, inspect git diff --merge-base <base> and retain evidence of the comparison. Do not call a CI failure pre-existing, flaky, or unrelated without a comparison against the base branch or other direct evidence. If the same CI problem remains after two repair attempts, ask for help on the third failure. A read-only investigation does not need a pull request; any code change normally does, unless the user explicitly says not to open one.
 
-When multiple procedures match the task, activate all of them. Repository agent guidance and procedures live under the repository procedure directories, and a verified reusable workflow should be saved as a new procedure rather than left only in chat.
+When multiple skills match the task, activate all of them. Repository skills live under .agents/skills/**/SKILL.md, and a verified reusable workflow should be saved as a new skill rather than left only in chat.
 
-Injected rules and stored context are instructions to follow, not text to repeat. Context can be compacted automatically or with /compact; compaction summaries and iteration checkpoints are persisted, so continue to work rather than stopping early out of concern about context length.
+Injected rules and knowledge are instructions to follow, not text to repeat. Context can be compacted automatically or with /compact; compaction summaries and iteration checkpoints are persisted, so continue the task from the authoritative state rather than stopping early out of concern about context length.
 
 Before delivery, run the repository's established formatting, lint, type, build, and test gates, then record their evidence with local_gate_record. Environment, dependency, or credential problems should be reported honestly while you continue through safe workarounds; do not make broad environment changes to hide them.
 
@@ -1103,7 +1103,7 @@ mod tests {
         let bundle = AssetBundle {
             instructions: Some(InstructionSource {
                 path: "global".into(),
-                content: "global".into(),
+                content: "SECTION_GLOBAL".into(),
             }),
             user_preferences: vec![UserPreference {
                 identifier: "style".into(),
@@ -1112,11 +1112,11 @@ mod tests {
             }],
             agents: vec![InstructionSource {
                 path: "AGENTS.md".into(),
-                content: "agents".into(),
+                content: "SECTION_AGENTS".into(),
             }],
             knowledge: vec![KnowledgeEntry {
                 title: "K".into(),
-                body: "knowledge".into(),
+                body: "SECTION_KNOWLEDGE".into(),
                 trigger: "task".into(),
                 scope: "repo".into(),
                 enabled: true,
@@ -1124,12 +1124,12 @@ mod tests {
             memories: Vec::new(),
             playbook: Some(Playbook {
                 title: "P".into(),
-                body: "playbook".into(),
+                body: "SECTION_PLAYBOOK".into(),
             }),
             skills: vec![SkillEntry {
                 name: "S".into(),
                 path: ".agents/skills/s/SKILL.md".into(),
-                content: "skill".into(),
+                content: "SECTION_SKILL".into(),
                 active: true,
             }],
             commands: Vec::new(),
@@ -1147,12 +1147,21 @@ mod tests {
             repository: Some("/workspace"),
             project: None,
         });
-        assert!(rendered.find("global").unwrap() < rendered.find("agents").unwrap());
-        assert!(rendered.find("global").unwrap() < rendered.find("preference").unwrap());
-        assert!(rendered.find("preference").unwrap() < rendered.find("agents").unwrap());
-        assert!(rendered.find("agents").unwrap() < rendered.find("knowledge").unwrap());
-        assert!(rendered.find("knowledge").unwrap() < rendered.find("playbook").unwrap());
-        assert!(rendered.find("playbook").unwrap() < rendered.find("skill").unwrap());
+        assert!(
+            rendered.find("SECTION_GLOBAL").unwrap() < rendered.find("SECTION_AGENTS").unwrap()
+        );
+        assert!(rendered.find("SECTION_GLOBAL").unwrap() < rendered.find("preference").unwrap());
+        assert!(rendered.find("preference").unwrap() < rendered.find("SECTION_AGENTS").unwrap());
+        assert!(
+            rendered.find("SECTION_AGENTS").unwrap() < rendered.find("SECTION_KNOWLEDGE").unwrap()
+        );
+        assert!(
+            rendered.find("SECTION_KNOWLEDGE").unwrap()
+                < rendered.find("SECTION_PLAYBOOK").unwrap()
+        );
+        assert!(
+            rendered.find("SECTION_PLAYBOOK").unwrap() < rendered.find("SECTION_SKILL").unwrap()
+        );
         assert!(
             rendered.find("[Global Instructions]").unwrap()
                 < rendered.find("[AGENTS source: AGENTS.md]").unwrap()
