@@ -5057,6 +5057,30 @@ mod tests {
     }
 
     #[test]
+    fn builtin_prompt_tool_names_are_registered() {
+        let names = builtin_tool_names();
+        for name in opcos_assets::BUILTIN_AGENT_TOOL_NAMES {
+            assert!(
+                names.contains(*name),
+                "prompt tool is not registered: {name}"
+            );
+        }
+        for prefix in [
+            "repo_index_",
+            "lsp_",
+            "background_job_",
+            "action_ledger_",
+            "git_",
+            "github_",
+        ] {
+            assert!(
+                names.iter().any(|name| name.starts_with(prefix)),
+                "prompt tool prefix is not registered: {prefix}"
+            );
+        }
+    }
+
+    #[test]
     fn linear_read_tools_are_read_only_but_writes_require_external_approval() {
         assert_eq!(tool_risk("linear_get_issue"), ToolRisk::Read);
         assert_eq!(tool_risk("linear_list_my_issues"), ToolRisk::Read);
