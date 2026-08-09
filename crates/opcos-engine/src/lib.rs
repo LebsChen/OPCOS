@@ -3992,7 +3992,7 @@ fn tool_risk(name: &str) -> ToolRisk {
         "lsp_definition" | "lsp_references" | "lsp_diagnostics" => ToolRisk::Read,
         "skill_search_learned" | "skill_get_learned" => ToolRisk::Read,
         "skill_save_learned" => ToolRisk::Write,
-        "coordination_dispatch" => ToolRisk::External,
+        "coordination_dispatch" | "coordination_fan_out" => ToolRisk::External,
         "coordination_status" => ToolRisk::Read,
         "action_ledger_list" => ToolRisk::Read,
         "action_ledger_begin" | "action_ledger_finish" => ToolRisk::Write,
@@ -4785,6 +4785,7 @@ pub fn builtin_tool_names() -> HashSet<String> {
 pub fn coordination_tool_definitions() -> Vec<Value> {
     vec![
         json!({"type":"function","function":{"name":"coordination_dispatch","description":"Dispatch work asynchronously from the current builtin OPCOS Leader session to an existing Worker role. Only a Leader may call this tool; the caller role is derived from the bound session and cannot be supplied by the model. This never creates sessions or recursively spawns agents. Returns a task id and pending status; Worker reports are not completion evidence.","parameters":{"type":"object","properties":{"task_id":{"type":"string"},"worker_role_id":{"type":"string"},"message":{"type":"string"}},"required":["task_id","worker_role_id","message"]}}}),
+        json!({"type":"function","function":{"name":"coordination_fan_out","description":"Create a durable coordination batch and dispatch independent members concurrently to existing Worker roles. The acceptance spec is frozen at dispatch time and is informational until an evaluator is added. The barrier uses collect-all deadlines; Worker reports are not completion evidence.","parameters":{"type":"object","properties":{"batch_id":{"type":"string"},"members":{"type":"array","items":{"type":"object","properties":{"member_id":{"type":"string"},"worker_role_id":{"type":"string"},"message":{"type":"string"},"deadline_seconds":{"type":"integer"}},"required":["member_id","worker_role_id","message"]}},"acceptance_spec":{"type":"object"},"deadline_seconds":{"type":"integer"}},"required":["batch_id","members","acceptance_spec","deadline_seconds"]}}}),
         json!({"type":"function","function":{"name":"coordination_status","description":"Read bounded status for an asynchronously dispatched coordination task. Worker self-reports remain worker_reported/awaiting_verification; only verified branch, push, PR, and GitHub API checks can establish delivery. Returns recommended_after_seconds and does not block or encourage tight polling.","parameters":{"type":"object","properties":{"task_id":{"type":"string"},"limit":{"type":"integer"}},"required":["task_id"]}}}),
     ]
 }
