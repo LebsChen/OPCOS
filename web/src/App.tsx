@@ -9583,6 +9583,11 @@ function ArtifactsPane({ selected }: { selected: Session }) {
   const [artifacts, setArtifacts] = useState<ArtifactRecord[]>([]);
   const [opened, setOpened] = useState<ArtifactRecord | null>(null);
   const [content, setContent] = useState<Record<string, unknown> | null>(null);
+  const [frameIndex, setFrameIndex] = useState(0);
+  const [frameContent, setFrameContent] = useState<Record<
+    string,
+    unknown
+  > | null>(null);
   const [loadError, setLoadError] = useState("");
   const refresh = () =>
     void command<ArtifactRecord[]>("list_artifacts", { sessionId: selected.id })
@@ -9602,6 +9607,8 @@ function ArtifactsPane({ selected }: { selected: Session }) {
   useEffect(() => {
     if (!opened) return;
     setContent(null);
+    setFrameIndex(0);
+    setFrameContent(null);
     void command<Record<string, unknown>>("read_artifact", {
       sessionId: selected.id,
       artifactId: opened.id,
@@ -9609,6 +9616,41 @@ function ArtifactsPane({ selected }: { selected: Session }) {
       .then(setContent)
       .catch((error) => setContent({ error: errorMessage(error) }));
   }, [selected.id, opened?.id]);
+  const manifest =
+    opened?.kind === "recording_manifest" &&
+    typeof content?.content === "string"
+      ? (() => {
+          try {
+            return JSON.parse(content.content) as {
+              frames?: Array<{
+                timestamp_ms?: number;
+                artifact_id?: string;
+                reused?: boolean;
+              }>;
+              annotations?: Array<{
+                annotation_type?: string;
+                text?: string;
+                result?: string;
+                timestamp_ms?: number;
+              }>;
+              truncated?: boolean;
+            };
+          } catch {
+            return null;
+          }
+        })()
+      : null;
+  const selectedFrame = manifest?.frames?.[frameIndex];
+  useEffect(() => {
+    if (!selectedFrame?.artifact_id) return;
+    setFrameContent(null);
+    void command<Record<string, unknown>>("read_artifact", {
+      sessionId: selected.id,
+      artifactId: selectedFrame.artifact_id,
+    })
+      .then(setFrameContent)
+      .catch((error) => setFrameContent({ error: errorMessage(error) }));
+  }, [selected.id, selectedFrame?.artifact_id]);
   if (opened) {
     return (
       <div className="artifact-viewer">
@@ -9641,6 +9683,51 @@ function ArtifactsPane({ selected }: { selected: Session }) {
               src={`data:${String(content.mime ?? opened.mime ?? "image/png")};base64,${content.content_base64}`}
               alt={opened.path}
             />
+          ) : opened.kind === "recording_manifest" && manifest ? (
+            <div className="grid gap-3">
+              <div className="flex items-center justify-between text-sm">
+                <strong>Sampled screenshot timeline</strong>
+                <span>
+                  {manifest.frames?.length ?? 0} frames
+                  {manifest.truncated ? " · truncated at limit" : ""}
+                </span>
+              </div>
+              {selectedFrame &&
+                typeof frameContent?.content_base64 === "string" && (
+                  <img
+                    className="artifact-image max-w-full"
+                    src={`data:image/png;base64,${frameContent.content_base64}`}
+                    alt={`Recording frame ${frameIndex + 1}`}
+                  />
+                )}
+              <input
+                type="range"
+                min={0}
+                max={Math.max(0, (manifest.frames?.length ?? 1) - 1)}
+                value={frameIndex}
+                onChange={(event) => setFrameIndex(Number(event.target.value))}
+                disabled={!manifest.frames?.length}
+              />
+              <div className="grid gap-1 text-sm">
+                {(manifest.annotations ?? []).map((annotation, index) => (
+                  <button
+                    className="text-left"
+                    key={`${annotation.timestamp_ms ?? index}-${index}`}
+                    onClick={() => {
+                      const timestamp = annotation.timestamp_ms ?? 0;
+                      const nearest =
+                        manifest.frames?.findIndex(
+                          (frame) => (frame.timestamp_ms ?? 0) >= timestamp,
+                        ) ?? -1;
+                      if (nearest >= 0) setFrameIndex(nearest);
+                    }}
+                  >
+                    {annotation.annotation_type}: {annotation.text}
+                    {annotation.result ? ` · ${annotation.result}` : ""}
+                  </button>
+                ))}
+              </div>
+            </div>
           ) : opened.kind === "diff" ? (
             <DiffPreview text={String(content.content ?? "")} />
           ) : (

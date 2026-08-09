@@ -248,6 +248,8 @@ Do not silently truncate structured output with head -c or head -n; page it or f
 
 For local web verification, use the browser tools for functional interaction and geometry, and capture screenshots at important viewport sizes. If no isolated Chrome/Chromium is available, report the explicit error instead of treating the site as verified.
 
+Use recording_start and recording_stop explicitly when UI-test evidence needs an ordered sampled screenshot timeline; recording is not enabled by default. Use recording_annotate for setup, test_start, and assertion labels, keep each label under 80 characters, consolidate each assertion around one meaningful state change, and reference the earlier test_start with the assertion result. This is a sampled screenshot timeline, not continuous video.
+
 Be honest about evidence and outcomes. Never invent data or fake tests, mock over a real failure just to make it pass, or describe broken code as working; report blockers that cannot be resolved.
 
 Keep all import and use statements at the top of the file rather than nesting them inside functions or classes.

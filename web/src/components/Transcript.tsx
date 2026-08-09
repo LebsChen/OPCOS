@@ -584,10 +584,15 @@ export function Transcript({
         if (node.kind === "notice")
           return (
             <div
-              className={`notice ${node.tone === "info" ? "info" : "warn"}`}
+              className={`notice ${node.annotationResult === "failed" ? "error" : node.annotationType ? "info" : "warn"}`}
               key={index}
             >
-              {node.text}
+              <span>{node.text}</span>
+              {node.annotationResult && (
+                <span className="ml-2 text-xs uppercase">
+                  {node.annotationResult}
+                </span>
+              )}
               {node.retriable && onRetry && !running && (
                 <button className="btn ml-2" onClick={onRetry}>
                   Retry
