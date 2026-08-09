@@ -236,6 +236,7 @@ Choose tools deliberately: use repo_index_* and lsp_* for repository navigation 
 Choose tools deliberately: use repo_index_* and lsp_* for repository navigation and symbols; use background_job_* for long-running work; use edit_file for precise edits instead of rewriting whole files; use action_ledger_* for idempotent external side effects.
 
 Use tool_script when several calls to the same tool need looping, when large results need filtering or aggregation, or when a conditional chain has no useful CLI equivalent. Inside it, use tool_call(name, args) and stdout(text); only the script's stdout enters model context, while child calls still produce normal audit and working events. Its timeout_seconds, max_calls, and max_stdout_bytes options have engine-enforced defaults and hard upper bounds. For one or two calls, call the tool directly; for a one-line shell operation, use run_shell instead. Do not use tool_script for user questions, plan or session state, secrets, recording, or long-lived background work.
+Before writing a test for a behavior, smoke-run the behavior once and base the assertion on the real observed output rather than a guessed shape. If a task can reasonably mean more than one thing and a wrong choice would be costly, stop and ask ask_user even if the work is otherwise still progressing.
 
 Before writing a test for a behavior, smoke-run the behavior once and base the assertion on the real observed output rather than a guessed shape. If a task can reasonably mean more than one thing and a wrong choice would be costly, stop and ask ask_user even if the work is otherwise still progressing. If a user-stated precondition is false, report what was expected versus what you found instead of silently bypassing it, recreating it, or substituting something else.
 Use ask_user only for a genuine blocker such as missing credentials or a required human decision. Do not stop merely because work is lengthy or repetitive.
@@ -1068,6 +1069,7 @@ async fn discover_tree<R: RemoteAssetReader>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opcos_policy::PermissionMode;
 
     #[test]
     fn system_instruction_order_is_global_agents_knowledge_playbook_skill() {
@@ -1477,6 +1479,27 @@ mod tests {
         assert!(rendered.contains("import and use statements at the top"));
         assert!(rendered.contains("open and read it before describing its contents"));
         assert!(rendered.contains("same language the user uses"));
+    }
+
+    #[test]
+    fn permission_mode_prompt_names_every_policy_mode_once() {
+        let prompt = BUILTIN_AGENT_INSTRUCTIONS;
+        let start = prompt
+            .find("The current PermissionMode")
+            .expect("permission mode guidance");
+        let end = prompt[start..]
+            .find("Do not confuse PermissionMode")
+            .map(|offset| start + offset)
+            .expect("permission mode guidance terminator");
+        let section = &prompt[start..end];
+        for mode in PermissionMode::ALL {
+            assert_eq!(
+                section.matches(mode.name()).count(),
+                1,
+                "{} must appear exactly once in the prompt contract",
+                mode.name()
+            );
+        }
     }
 
     #[test]

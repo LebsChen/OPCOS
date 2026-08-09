@@ -13,3 +13,4 @@ async-trait.workspace = true
 tokio.workspace = true
 url.workspace = true
 opcos-rvm = { path = "../opcos-rvm" }
+opcos-policy = { path = "../opcos-policy" }

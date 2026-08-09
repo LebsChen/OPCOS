@@ -1343,6 +1343,81 @@ navigating away and back, the backend turn is not stuck; this is a live frontend
 Conversely, if remounting does not clear it, inspect engine state, persisted events, and fixture
 request counts before attributing it to rendering.
 
+## Agent execution surfaces
+
+Use short, isolated turns and record both the user-visible result and persisted evidence. A turn
+containing many tool calls can remain `Working` for minutes; one or two calls usually completes
+quickly. If a turn stalls, interrupt it, then inspect the store before repeating mutations because
+earlier calls may already have committed.
+
+### Bring-up and model controls
+
+1. Kill stale Vite processes before starting the app. A process left on port 1420 can make the new
+   Vite instance move to 1421 while Tauri continues loading the old bundle.
+2. Use a model known to work with the configured gateway (refresh Settings → Provider if needed).
+   Treat a model claiming that a tool is unavailable as a separate model-behavior observation; do
+   not conclude that the tool was unregistered until the actual request tool list is checked.
+3. Record the provider, model, host, workspace, and mode with every scenario.
+
+### SQLite evidence and WAL handling
+
+Rows may be in `opcos.db-wal` rather than the main database file. Never diagnose persistence from
+`cp opcos.db` alone:
+
+```bash
+cp opcos.db /tmp/opcos-check.db
+cp opcos.db-wal /tmp/opcos-check.db-wal
+cp opcos.db-shm /tmp/opcos-check.db-shm 2>/dev/null || true
+```
+
+Alternatively stop the app before copying. Snapshot immediately before and after a mutation, and
+identify which tables the code path actually writes.
+
+### Session rename and desktop surface
+
+- For user rename, hover a sidebar row, open its visible `⋯` menu, choose **Rename**, submit the
+  inline editor, then reload the app and verify the title remains changed. Confirm that opening the
+  menu does not select a different session.
+- For `desktop_show`, verify the persisted `desktop_view_requested` event and the visible right
+  drawer. The event type is on the `WorkingEvent` envelope (`event_type`), not under
+  `payload.event_type`.
+- Test three cases: first request from Info, two requests in one turn, and a request after the
+  drawer was collapsed with `✕`. The frontend request must carry a changing nonce/request ID, so
+  the last case re-opens the same Desktop tab instead of being swallowed as unchanged state.
+
+### Recording and session search
+
+- Recording is a sampled screenshot timeline, not a video. Verify the `recording_manifest` artifact,
+  frame count/slider, and annotation list. Use an unknown `test_start_id` as a fast negative case
+  for assertion annotations.
+- To prove `session_search` redaction, create a fresh short session and make the marker the first
+  tool call, for example `R3PROBE --api-key=LEAKCANARY777`. Search it from another session with
+  `content_scope: "tool_calls"`. The returned snippet must contain the marker while replacing or
+  omitting the secret value. If the marker is absent too, the probe was outside the snippet window
+  and the result is inconclusive. Raw tool-call storage may retain the value; redaction is expected
+  on the search output path.
+
+### Knowledge, playbook, and automation assets
+
+- `config_asset_manage` requires `kind` on every action, including `get` and `rollback`. Only
+  `knowledge` and `playbook` are valid; rejection of `permissions` or `provider` is structural.
+  Verify rollback through both `config_object.current_version_id` /
+  `config_object_version` and Settings → Knowledge → the asset editor body.
+- `automation_manage` schedules use the agent automation path, not the legacy trigger-session path.
+  After **Run now**, compare a work-queue count snapshot and inspect the new `ready` row,
+  `payload.automation_depth`, and `schedules.last_run` / `last_result`.
+  `schedule_runs` belongs to the legacy trigger path and is not evidence for agent automation.
+  Confirm no new session was created and no `session_preferences.unattended != 0` row appeared.
+  Disable live cron schedules or snapshot counts immediately before the run; otherwise background
+  enqueues can make a non-empty queue result meaningless.
+
+### Evidence checklist
+
+For each scenario record: session ID, provider/model/host/workspace/mode, prompt, visible result,
+event or artifact ID, relevant database query, and whether the app was restarted. Distinguish
+“not observed” from “negative”; a missing marker, missing row, or missing tool claim is only useful
+when the observation window and expected write path are known.
+
 ## External-agent bridge checklist
 
 For any bridge test, prove the external process connects to the already-running app rather than

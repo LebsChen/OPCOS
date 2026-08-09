@@ -454,6 +454,14 @@ const DEFAULT_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 pub trait ToolExecutor: Send + Sync {
     async fn execute(&self, name: &str, arguments: Value) -> Result<Value, String>;
 
+    async fn request_desktop_view(&self, _reason: Option<&str>) -> Result<Value, String> {
+        Err("desktop view requests are unavailable".into())
+    }
+
+    async fn rename_session(&self, _title: &str) -> Result<Value, String> {
+        Err("session rename is unavailable".into())
+    }
+
     async fn browser_origin(&self) -> Option<String> {
         None
     }
@@ -1682,6 +1690,7 @@ has failed {} times and the last error code was {}",
             self.remember_tool_result(call, &result).await;
             result
         };
+        let result = self.execute_tool_streaming(call).await;
         let post = self
             .lifecycle_hooks(
                 "PostToolUse",
@@ -5500,6 +5509,7 @@ fn run_tool_script(
 
 fn tool_risk(name: &str) -> ToolRisk {
     match name {
+        "desktop_show" | "session_rename" => ToolRisk::Read,
         "read_file"
         | "list_dir"
         | "git_status"
@@ -5576,6 +5586,8 @@ fn tool_event_category(name: &str) -> &'static str {
         "shell"
     } else if name == "propose_plan" || name.starts_with("plan_") {
         "todo"
+    } else if matches!(name, "desktop_show" | "session_rename") {
+        "session"
     } else {
         "other"
     }
@@ -6317,6 +6329,8 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"repo_index_find_symbol","description":"Find definitions and symbols in the repository index. Read-only.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}),
         json!({"type":"function","function":{"name":"repo_index_glob","description":"Find repository paths matching a glob. Read-only.","parameters":{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}}}),
         json!({"type":"function","function":{"name":"repo_index_search","description":"Search indexed symbol/content lines without loading whole files. Read-only.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}),
+        json!({"type":"function","function":{"name":"desktop_show","description":"Ask the OPCOS desktop to focus this session's Desktop/VNC surface so the user can inspect the live remote desktop. Use only when the user genuinely needs to see GUI actions or a running dev server. This is idempotent while Desktop is already focused; never send localhost URLs to the user.","parameters":{"type":"object","properties":{"reason":{"type":"string","description":"Why the user needs to inspect the desktop now."}}}}}),
+        json!({"type":"function","function":{"name":"session_rename","description":"Rename the current OPCOS session when its existing title is materially inconsistent with the work. Rename at most once for a coherent task; do not rename merely because the topic changes. This changes local session metadata and does not require user approval.","parameters":{"type":"object","properties":{"title":{"type":"string","description":"A concise non-empty session title, at most 80 Unicode characters."}},"required":["title"]}}}),
     ];
     tools.extend(action_ledger_tool_definitions());
     tools.extend(work_queue_tool_definitions());

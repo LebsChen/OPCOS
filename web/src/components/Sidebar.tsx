@@ -207,6 +207,9 @@ export function Sidebar(props: SidebarProps) {
     props.onOpenAudit ?? props.onActivity ?? (() => undefined);
   const onManagePersonas = props.onManagePersonas ?? (() => undefined);
   const onRenameSession = props.onRenameSession ?? (() => undefined);
+  const onDeleteSession = props.onDeleteSession ?? (() => undefined);
+  const onArchiveSession = props.onArchiveSession ?? (() => undefined);
+  const onTogglePin = props.onTogglePin ?? (() => undefined);
   const onOpenAutomation = props.onOpenAutomation ?? (() => undefined);
   const onNewProject = props.onNewProject ?? (() => undefined);
   const projectItems = props.projectItems ?? [];
@@ -454,7 +457,19 @@ export function Sidebar(props: SidebarProps) {
   // the menu offers Rename · Pin/Unpin · Archive/Unarchive · Delete, with the two-step delete
   // confirm kept inside it. Shared by BOTH row styles, so the chronological cardRow offers the
   // same actions as the persona accordion's sessionRow (owner ask 2026-07-09).
-  const rowActions = (_s: SessionInfo, _title: string) => null;
+  const rowActions = (s: SessionInfo, title: string) => (
+    <button
+      className="w-6 h-6 grid place-items-center rounded text-faint hover:text-ink hover:bg-paper opacity-0 group-hover:opacity-100 focus:opacity-100 shrink-0"
+      aria-label={`Actions for ${title}`}
+      title="Session actions"
+      onClick={(event) => {
+        event.stopPropagation();
+        openRowMenu(s.session_id, event.currentTarget);
+      }}
+    >
+      <Icon name="moreHorizontal" size={15} />
+    </button>
+  );
 
   // A compact session row (mock §141 grouped/recent rows): one-line title + right-side indicators,
   // with the ⋮ actions kebab revealed on hover. Used in accordion bodies + grouped cards.
@@ -961,6 +976,10 @@ export function Sidebar(props: SidebarProps) {
     );
   };
 
+  const rowMenuSession = rowMenu
+    ? props.sessions.find((session) => session.session_id === rowMenu.id)
+    : null;
+
   if (props.collapsed) {
     return (
       <aside className="sidebar sidebar--collapsed">
@@ -1248,6 +1267,73 @@ export function Sidebar(props: SidebarProps) {
           </div>
         </div>
       </div>
+
+      {rowMenu && rowMenuSession && (
+        <>
+          <button
+            className="fixed inset-0 z-40 cursor-default"
+            aria-label="Close session actions"
+            onClick={closeRowMenu}
+          />
+          <div
+            className="fixed z-50 w-40 rounded-xl border border-line bg-panel shadow-xl p-1.5"
+            style={{ top: rowMenu.top, left: rowMenu.left }}
+            role="menu"
+          >
+            <button
+              className="w-full px-2 py-1.5 rounded-lg text-[13px] text-left hover:bg-paper"
+              role="menuitem"
+              onClick={() => {
+                setEditValue(rowMenuSession.title || rowMenuSession.session_id);
+                setEditingId(rowMenuSession.session_id);
+                closeRowMenu();
+              }}
+            >
+              Rename
+            </button>
+            <button
+              className="w-full px-2 py-1.5 rounded-lg text-[13px] text-left hover:bg-paper"
+              role="menuitem"
+              onClick={() => {
+                onTogglePin(rowMenuSession.session_id, !rowMenuSession.pinned);
+                closeRowMenu();
+              }}
+            >
+              {rowMenuSession.pinned ? "Unpin" : "Pin"}
+            </button>
+            <button
+              className="w-full px-2 py-1.5 rounded-lg text-[13px] text-left hover:bg-paper"
+              role="menuitem"
+              onClick={() => {
+                onArchiveSession(
+                  rowMenuSession.session_id,
+                  !rowMenuSession.archived,
+                );
+                closeRowMenu();
+              }}
+            >
+              {rowMenuSession.archived ? "Unarchive" : "Archive"}
+            </button>
+            <div className="my-1 border-t border-line" />
+            <button
+              className="w-full px-2 py-1.5 rounded-lg text-[13px] text-left text-danger hover:bg-paper"
+              role="menuitem"
+              onClick={() => {
+                if (confirmDelId === rowMenuSession.session_id) {
+                  onDeleteSession(rowMenuSession.session_id);
+                  closeRowMenu();
+                } else {
+                  setConfirmDelId(rowMenuSession.session_id);
+                }
+              }}
+            >
+              {confirmDelId === rowMenuSession.session_id
+                ? "Delete?"
+                : "Delete"}
+            </button>
+          </div>
+        </>
+      )}
 
       {/* Bottom (§26): exactly ONE row — the account anchor. The inbox chip on it is
           state-driven with a sticky unlock (quiet when empty, accent + count when pending);
