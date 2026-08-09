@@ -1119,9 +1119,12 @@ const TOOL_SCRIPT_MAX_OPERATIONS: u64 = 100_000;
 const TOOL_SCRIPT_MAX_CALL_LEVELS: usize = 32;
 const TOOL_SCRIPT_MAX_STRING_SIZE: usize = 64 * 1024;
 const TOOL_SCRIPT_MAX_ARRAY_SIZE: usize = 4096;
-const TOOL_SCRIPT_MAX_CALLS: usize = 128;
-const TOOL_SCRIPT_MAX_STDOUT_BYTES: usize = 64 * 1024;
-const TOOL_SCRIPT_MAX_WALL_CLOCK: Duration = Duration::from_secs(30);
+const TOOL_SCRIPT_DEFAULT_TIMEOUT_SECONDS: u64 = 120;
+const TOOL_SCRIPT_MAX_TIMEOUT_SECONDS: u64 = 300;
+const TOOL_SCRIPT_DEFAULT_MAX_CALLS: usize = 128;
+const TOOL_SCRIPT_MAX_CALLS_LIMIT: usize = 512;
+const TOOL_SCRIPT_DEFAULT_MAX_STDOUT_BYTES: usize = 64 * 1024;
+const TOOL_SCRIPT_MAX_STDOUT_BYTES_LIMIT: usize = 1024 * 1024;
 
 impl Drop for ActiveToolCallGuard<'_> {
     fn drop(&mut self) {
@@ -3160,11 +3163,25 @@ where
     }
 
     async fn execute_tool_script(&self, call: &ToolCall) -> Value {
+        let limits = match tool_script_limits(&call.arguments) {
+            Ok(limits) => limits,
+            Err(error) => {
+                return json!({
+                    "error": error,
+                    "calls_made": 0,
+                    "stopped_reason": "invalid_limits",
+                    "stdout": "",
+                    "stdout_truncated": false,
+                    "stdout_total_bytes": 0,
+                    "stdout_omitted_bytes": 0,
+                });
+            }
+        };
         self.execute_tool_script_with_limits(
             call,
-            TOOL_SCRIPT_MAX_CALLS,
-            TOOL_SCRIPT_MAX_STDOUT_BYTES,
-            TOOL_SCRIPT_MAX_WALL_CLOCK,
+            limits.max_calls,
+            limits.max_stdout_bytes,
+            limits.timeout,
         )
         .await
     }
@@ -3252,6 +3269,8 @@ where
                             .expect("script abort mutex poisoned")
                             .clone()
                             .or_else(|| Some(json!({"error": error})));
+                    } else if output.truncated() && stopped_reason == "completed" {
+                        stopped_reason = "stdout_limit";
                     }
                     break;
                 }
@@ -3304,6 +3323,26 @@ where
                         match result {
                             Err(_) => {
                                 stopped_reason = "wall_clock_deadline";
+                                let _ = self.working_event(
+                                    "tool_script_call_abandoned",
+                                    "script",
+                                    json!({
+                                        "parent_call_id": call.id,
+                                        "call_id": child_call.id,
+                                        "tool": child_call.name,
+                                        "reason": "script_wall_clock_deadline",
+                                    }),
+                                ).await;
+                                let _ = self.store.append_audit(
+                                    &self.session_id,
+                                    "tool_script_call_abandoned",
+                                    &json!({
+                                        "parent_call_id": call.id,
+                                        "call_id": child_call.id,
+                                        "tool": child_call.name,
+                                        "reason": "script_wall_clock_deadline",
+                                    }),
+                                );
                                 ScriptResponse::Abort(json!({
                                     "error": "tool script wall-clock deadline exceeded",
                                     "tool": child_call.name,
@@ -3400,6 +3439,9 @@ where
                 .lock()
                 .expect("script abort mutex poisoned")
                 .clone();
+        }
+        if output.truncated() && stopped_reason == "completed" {
+            stopped_reason = "stdout_limit";
         }
         let mut result = abort.unwrap_or_else(|| json!({}));
         if let Some(object) = result.as_object_mut() {
@@ -4445,28 +4487,98 @@ enum ScriptToolClass {
     ScriptOrchestration,
 }
 
-fn script_tool_class(name: &str) -> ScriptToolClass {
-    if name == "tool_script" {
-        ScriptToolClass::ScriptOrchestration
-    } else if name == "ask_user" {
-        ScriptToolClass::UserInteraction
-    } else if name == "propose_plan" || name.starts_with("plan_") {
-        ScriptToolClass::PlanState
-    } else if name == "secrets_list" {
-        ScriptToolClass::SecretManagement
-    } else if name.starts_with("recording_") {
-        ScriptToolClass::Recording
-    } else if name.starts_with("desktop_") || name.starts_with("session_") {
-        ScriptToolClass::DesktopOrSessionState
-    } else if name.starts_with("work_queue_")
-        || name == "automation_manage"
-        || name.starts_with("action_ledger_")
-        || name.starts_with("background_job_")
-    {
-        ScriptToolClass::LongLivedExecution
-    } else {
-        ScriptToolClass::Allowed
-    }
+struct ScriptLimits {
+    max_calls: usize,
+    max_stdout_bytes: usize,
+    timeout: Duration,
+}
+
+fn script_tool_class(name: &str) -> Option<ScriptToolClass> {
+    let class = match name {
+        "tool_script" => ScriptToolClass::ScriptOrchestration,
+        "ask_user" => ScriptToolClass::UserInteraction,
+        "propose_plan" | "plan_get" | "plan_update" | "plan_revise" => ScriptToolClass::PlanState,
+        "secrets_list" => ScriptToolClass::SecretManagement,
+        "action_ledger_begin"
+        | "action_ledger_finish"
+        | "action_ledger_list"
+        | "background_job_start"
+        | "background_job_status"
+        | "background_job_output"
+        | "background_job_kill"
+        | "work_queue_enqueue"
+        | "work_queue_claim"
+        | "work_queue_renew"
+        | "work_queue_complete"
+        | "work_queue_cancel"
+        | "work_queue_requeue"
+        | "work_queue_list"
+        | "coordination_dispatch"
+        | "coordination_status"
+        | "automation_manage" => ScriptToolClass::LongLivedExecution,
+        "external_ingress_sources" | "local_gate_record" | "local_gate_status" => {
+            ScriptToolClass::DesktopOrSessionState
+        }
+        "session_search" => ScriptToolClass::Allowed,
+        "read_file"
+        | "write_file"
+        | "edit_file"
+        | "run_shell"
+        | "browser_status"
+        | "browser_navigate"
+        | "browser_set_viewport"
+        | "browser_click"
+        | "browser_read"
+        | "browser_measure"
+        | "browser_assert_geometry"
+        | "browser_screenshot"
+        | "computer_use"
+        | "list_dir"
+        | "git_status"
+        | "git_diff"
+        | "git_log"
+        | "git_rev_parse"
+        | "git_create_branch"
+        | "git_stage_commit"
+        | "git_push"
+        | "gitlab_list_projects"
+        | "gitlab_list_issues"
+        | "github_list_repositories"
+        | "github_list_issues"
+        | "github_get_pull_request"
+        | "github_create_issue"
+        | "github_create_pull_request"
+        | "github_ci_status"
+        | "github_ci_failure_log"
+        | "linear_get_issue"
+        | "linear_list_my_issues"
+        | "linear_comment_issue"
+        | "linear_update_issue_status"
+        | "telegram_send_message"
+        | "discord_send_message"
+        | "slack_list_channels"
+        | "slack_post_message"
+        | "notion_search"
+        | "jira_search_issues"
+        | "stripe_list_charges"
+        | "repo_index_find_symbol"
+        | "repo_index_glob"
+        | "repo_index_search"
+        | "lsp_definition"
+        | "lsp_references"
+        | "lsp_diagnostics"
+        | "skill_save_learned"
+        | "skill_search_learned"
+        | "skill_get_learned" => ScriptToolClass::Allowed,
+        name if name.starts_with("recording_") => ScriptToolClass::Recording,
+        name if name.starts_with("desktop_")
+            || (name.starts_with("session_") && name != "session_search") =>
+        {
+            ScriptToolClass::DesktopOrSessionState
+        }
+        _ => return None,
+    };
+    Some(class)
 }
 
 fn contains_secret_names(value: &Value) -> bool {
@@ -4480,7 +4592,51 @@ fn contains_secret_names(value: &Value) -> bool {
 }
 
 fn script_tool_allowed(name: &str, arguments: &Value) -> bool {
-    script_tool_class(name) == ScriptToolClass::Allowed && !contains_secret_names(arguments)
+    script_tool_class(name) == Some(ScriptToolClass::Allowed) && !contains_secret_names(arguments)
+}
+
+fn tool_script_limits(arguments: &Value) -> Result<ScriptLimits, String> {
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| "tool_script arguments must be an object".to_owned())?;
+    let optional_u64 = |name: &str| -> Result<Option<u64>, String> {
+        object
+            .get(name)
+            .map(|value| {
+                value
+                    .as_u64()
+                    .ok_or_else(|| format!("{name} must be a positive integer"))
+            })
+            .transpose()
+    };
+    let max_calls = optional_u64("max_calls")?
+        .map(|value| value as usize)
+        .unwrap_or(TOOL_SCRIPT_DEFAULT_MAX_CALLS);
+    let max_stdout_bytes = optional_u64("max_stdout_bytes")?
+        .map(|value| value as usize)
+        .unwrap_or(TOOL_SCRIPT_DEFAULT_MAX_STDOUT_BYTES);
+    let timeout_seconds =
+        optional_u64("timeout_seconds")?.unwrap_or(TOOL_SCRIPT_DEFAULT_TIMEOUT_SECONDS);
+    if !(1..=TOOL_SCRIPT_MAX_CALLS_LIMIT).contains(&max_calls) {
+        return Err(format!(
+            "max_calls must be between 1 and {TOOL_SCRIPT_MAX_CALLS_LIMIT}"
+        ));
+    }
+    if !(1..=TOOL_SCRIPT_MAX_STDOUT_BYTES_LIMIT).contains(&max_stdout_bytes) {
+        return Err(format!(
+            "max_stdout_bytes must be between 1 and {TOOL_SCRIPT_MAX_STDOUT_BYTES_LIMIT}"
+        ));
+    }
+    if !(1..=TOOL_SCRIPT_MAX_TIMEOUT_SECONDS).contains(&timeout_seconds) {
+        return Err(format!(
+            "timeout_seconds must be between 1 and {TOOL_SCRIPT_MAX_TIMEOUT_SECONDS}"
+        ));
+    }
+    Ok(ScriptLimits {
+        max_calls,
+        max_stdout_bytes,
+        timeout: Duration::from_secs(timeout_seconds),
+    })
 }
 
 fn run_tool_script(
@@ -4505,23 +4661,16 @@ fn run_tool_script(
         }
     });
     let stdout = output.clone();
-    engine.register_fn(
-        "stdout",
-        move |value: Dynamic| -> Result<(), Box<EvalAltResult>> {
-            let text = value.to_string();
-            if stdout.append(&text) {
-                Ok(())
-            } else {
-                Err(Box::new(EvalAltResult::ErrorRuntime(
-                    "tool script stdout limit exceeded".into(),
-                    Position::NONE,
-                )))
-            }
-        },
-    );
-    let stdout = output.clone();
-    engine.on_print(move |text| {
-        let _ = stdout.append(text);
+    engine.register_fn("stdout", move |value: Dynamic| -> String {
+        let text = value.to_string();
+        let _ = stdout.append(&text);
+        text
+    });
+    let print_output = output.clone();
+    engine.register_fn("print", move |value: Dynamic| -> String {
+        let text = value.to_string();
+        let _ = print_output.append(&text);
+        text
     });
     let debug_output = diagnostics.clone();
     engine.on_debug(move |message, source, position| {
@@ -5329,7 +5478,7 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"write_file","description":"Write a remote file. For changes to an existing file, prefer edit_file so unrelated content is preserved.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
         json!({"type":"function","function":{"name":"edit_file","description":"Apply one or more exact replacements to a remote UTF-8 text file. The required edits argument is an array of objects, each with old_string and new_string strings. Example: {\"path\":\"src/lib.rs\",\"edits\":[{\"old_string\":\"old code\",\"new_string\":\"new code\"}]}. Every old_string must match exactly once in the original file; ambiguous or missing matches fail with diagnostics. The whole call is atomic and preserves line endings. Prefer this over rewriting an existing file.","parameters":{"type":"object","examples":[{"path":"src/lib.rs","edits":[{"old_string":"old code","new_string":"new code"}]}],"properties":{"path":{"type":"string","description":"Remote workspace-relative file path."},"edits":{"type":"array","description":"One or more exact replacements, applied atomically.","minItems":1,"items":{"type":"object","properties":{"old_string":{"type":"string","description":"Exact existing text to replace, including whitespace and line breaks."},"new_string":{"type":"string","description":"Replacement text."}},"required":["old_string","new_string"],"additionalProperties":false}}},"required":["path","edits"],"additionalProperties":false}}}),
         json!({"type":"function","function":{"name":"run_shell","description":"Run a shell command. Use cwd to select the workspace directory. Credentials are available only by naming configured secret_names; injected values are redacted from output.","parameters":{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"},"secret_names":{"type":"array","items":{"type":"string"},"description":"Configured secret names to inject into the child environment. This is the only supported credential path; values are redacted from output."}},"required":["command"]}}}),
-        json!({"type":"function","function":{"name":"tool_script","description":"Run a bounded Rhai script that calls allowed OPCOS tools repeatedly. Only stdout enters model context; child calls still produce normal script-scoped audit and working events.","parameters":{"type":"object","properties":{"script":{"type":"string","description":"Rhai source using tool_call(name, args) and stdout(text)."}},"required":["script"],"additionalProperties":false}}}),
+        json!({"type":"function","function":{"name":"tool_script","description":"Run a bounded Rhai script that calls allowed OPCOS tools repeatedly. Only stdout enters model context; child calls still produce normal script-scoped audit and working events. Limits are bounded by the engine.","parameters":{"type":"object","properties":{"script":{"type":"string","description":"Rhai source using tool_call(name, args) and stdout(text)."},"timeout_seconds":{"type":"integer","minimum":1,"maximum":300,"default":120},"max_calls":{"type":"integer","minimum":1,"maximum":512,"default":128},"max_stdout_bytes":{"type":"integer","minimum":1,"maximum":1048576,"default":65536}},"required":["script"],"additionalProperties":false}}}),
         json!({"type":"function","function":{"name":"browser_status","description":"Check whether an isolated local Chrome/Chromium CDP session is available. Read-only.","parameters":{"type":"object","properties":{}}}}),
         json!({"type":"function","function":{"name":"browser_navigate","description":"Navigate the isolated local browser to an HTTP(S) URL. Loopback targets do not require external approval; remote origins use a host-scoped external policy target.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}}),
         json!({"type":"function","function":{"name":"browser_set_viewport","description":"Set the isolated browser viewport size for responsive verification. This changes only local browser state and is a read-level operation.","parameters":{"type":"object","properties":{"width":{"type":"integer"},"height":{"type":"integer"}},"required":["width","height"]}}}),
@@ -5717,6 +5866,37 @@ mod tests {
             &json!({"command": "echo safe"})
         ));
         assert!(script_tool_allowed("read_file", &json!({"path": "x"})));
+        assert!(script_tool_allowed(
+            "session_search",
+            &json!({"query": "approval"})
+        ));
+    }
+
+    #[test]
+    fn every_builtin_tool_has_an_explicit_script_classification() {
+        for name in builtin_tool_names() {
+            assert!(
+                script_tool_class(&name).is_some(),
+                "missing script classification for builtin tool {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_script_limits_use_defaults_and_reject_values_above_hard_bounds() {
+        let defaults = tool_script_limits(&json!({})).unwrap();
+        assert_eq!(defaults.max_calls, TOOL_SCRIPT_DEFAULT_MAX_CALLS);
+        assert_eq!(
+            defaults.max_stdout_bytes,
+            TOOL_SCRIPT_DEFAULT_MAX_STDOUT_BYTES
+        );
+        assert_eq!(
+            defaults.timeout,
+            Duration::from_secs(TOOL_SCRIPT_DEFAULT_TIMEOUT_SECONDS)
+        );
+        assert!(tool_script_limits(&json!({"timeout_seconds": 301})).is_err());
+        assert!(tool_script_limits(&json!({"max_calls": 513})).is_err());
+        assert!(tool_script_limits(&json!({"max_stdout_bytes": 1_048_577})).is_err());
     }
 
     #[tokio::test]
@@ -5735,10 +5915,10 @@ mod tests {
             .execute_tool_script(&ToolCall {
                 id: "script-1".into(),
                 name: "tool_script".into(),
-                arguments: json!({"script": r#"let value = tool_call("read_file", #{path: "x"}); stdout("hello");"#}),
+                arguments: json!({"script": r#"let value = tool_call("read_file", #{path: "x"}); stdout("hello"); print("world");"#}),
             })
             .await;
-        assert_eq!(result["stdout"], "hello");
+        assert_eq!(result["stdout"], "helloworld");
         assert_eq!(result["calls_made"], 1);
         assert_eq!(result["stopped_reason"], "completed");
         assert!(
@@ -5794,7 +5974,7 @@ mod tests {
                     arguments: json!({"script": r#"let x = 0; while x < 10 { tool_call("read_file", #{path: "x"}); x += 1; }"#}),
                 },
                 3,
-                TOOL_SCRIPT_MAX_STDOUT_BYTES,
+                TOOL_SCRIPT_DEFAULT_MAX_STDOUT_BYTES,
                 Duration::from_secs(1),
             )
             .await;
@@ -5809,7 +5989,7 @@ mod tests {
                     name: "tool_script".into(),
                     arguments: json!({"script": format!("let x = 0; while x < 100 {{ stdout(\"{text}\"); x += 1; }}")}),
                 },
-                TOOL_SCRIPT_MAX_CALLS,
+                TOOL_SCRIPT_DEFAULT_MAX_CALLS,
                 2048,
                 Duration::from_secs(1),
             )
@@ -5821,7 +6001,7 @@ mod tests {
         let deadline_store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let deadline_engine = TurnEngine::new(
             FakeProvider,
-            deadline_store,
+            deadline_store.clone(),
             Arc::new(TimingTools {
                 events: Arc::new(Mutex::new(Vec::new())),
             }),
@@ -5837,12 +6017,19 @@ mod tests {
                     name: "tool_script".into(),
                     arguments: json!({"script": r#"tool_call("read_file", #{path: "x"});"#}),
                 },
-                TOOL_SCRIPT_MAX_CALLS,
-                TOOL_SCRIPT_MAX_STDOUT_BYTES,
-                Duration::from_millis(1),
+                TOOL_SCRIPT_DEFAULT_MAX_CALLS,
+                TOOL_SCRIPT_DEFAULT_MAX_STDOUT_BYTES,
+                Duration::from_millis(20),
             )
             .await;
         assert_eq!(deadline["stopped_reason"], "wall_clock_deadline");
+        assert!(
+            deadline_store
+                .load_audit(Some("deadline-script"))
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "tool_script_call_abandoned")
+        );
     }
 
     #[tokio::test]
