@@ -14,9 +14,16 @@ use opcos_store::{
     TRANSIENT_SESSION_EVENT_TYPES, ToolCallRecord, UsageRecord,
 };
 use regex::Regex;
+use rhai::{
+    Dynamic, Engine as RhaiEngine, EvalAltResult, Position,
+    serde::{from_dynamic, to_dynamic},
+};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::mpsc as std_mpsc;
 use std::sync::{
     Arc, Mutex as StdMutex,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -161,6 +168,20 @@ fn policy_tool_error(call: &ToolCall, summary: impl Into<String>) -> Value {
             "the active permission policy must allow this tool target",
             tool_error_target(call),
             "request approval or adjust the permission policy before retrying",
+            ToolErrorRetry::Adjusted,
+            None,
+        ),
+    )
+}
+
+fn approval_tool_error(call: &ToolCall, reason: &str) -> Value {
+    structured_tool_error(
+        format!("tool {} requires approval: {reason}", call.name),
+        ToolErrorEnvelope::new(
+            ToolErrorCode::ApprovalDenied,
+            "the tool requires user approval that cannot be persisted by a script",
+            call.name.clone(),
+            "invoke the tool directly in an interactive turn",
             ToolErrorRetry::Adjusted,
             None,
         ),
@@ -1000,22 +1021,107 @@ struct ActiveToolCallGuard<'a> {
     ids: Vec<String>,
 }
 
+#[derive(Clone, Copy)]
+enum ToolApprovalBehavior {
+    PersistPending,
+    RejectWithoutPending,
+}
+
+#[derive(Clone, Copy)]
+enum ToolExecutionSource {
+    Model,
+    Script,
+}
+
+#[derive(Clone)]
 struct ToolDispatchContext {
     grants: Vec<DurableGrant>,
     unattended: bool,
     permission_rules: Option<PermissionRules>,
     execute_readonly: bool,
+    approval_behavior: ToolApprovalBehavior,
+    source: ToolExecutionSource,
 }
 
 enum ToolDispatchResult {
     Completed(Value),
     DeferredReadonly,
     PreflightError(Value),
+    ScriptAbort(Value),
     ApprovalPending {
         preflight_reason: Option<String>,
         current_pending_saved: bool,
     },
 }
+
+struct ScriptOutput {
+    text: StdMutex<String>,
+    total_bytes: AtomicU64,
+    omitted_bytes: AtomicU64,
+    max_bytes: usize,
+}
+
+impl ScriptOutput {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            text: StdMutex::new(String::new()),
+            total_bytes: AtomicU64::new(0),
+            omitted_bytes: AtomicU64::new(0),
+            max_bytes,
+        }
+    }
+
+    fn append(&self, text: &str) -> bool {
+        let bytes = text.len();
+        self.total_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        let mut output = self.text.lock().expect("script output mutex poisoned");
+        let remaining = self.max_bytes.saturating_sub(output.len());
+        let mut kept = 0;
+        for character in text.chars() {
+            let width = character.len_utf8();
+            if kept + width > remaining {
+                break;
+            }
+            kept += width;
+        }
+        if kept < text.len() {
+            self.omitted_bytes
+                .fetch_add((text.len() - kept) as u64, Ordering::Relaxed);
+        }
+        output.push_str(&text[..kept]);
+        kept == text.len()
+    }
+
+    fn truncated(&self) -> bool {
+        self.omitted_bytes.load(Ordering::Relaxed) > 0
+    }
+
+    fn value(&self) -> String {
+        self.text
+            .lock()
+            .expect("script output mutex poisoned")
+            .clone()
+    }
+}
+
+struct ScriptRequest {
+    name: String,
+    arguments: Value,
+    response: std_mpsc::SyncSender<ScriptResponse>,
+}
+
+enum ScriptResponse {
+    Result(Value),
+    Abort(Value),
+}
+
+const TOOL_SCRIPT_MAX_OPERATIONS: u64 = 100_000;
+const TOOL_SCRIPT_MAX_CALL_LEVELS: usize = 32;
+const TOOL_SCRIPT_MAX_STRING_SIZE: usize = 64 * 1024;
+const TOOL_SCRIPT_MAX_ARRAY_SIZE: usize = 4096;
+const TOOL_SCRIPT_MAX_CALLS: usize = 128;
+const TOOL_SCRIPT_MAX_STDOUT_BYTES: usize = 64 * 1024;
+const TOOL_SCRIPT_MAX_WALL_CLOCK: Duration = Duration::from_secs(30);
 
 impl Drop for ActiveToolCallGuard<'_> {
     fn drop(&mut self) {
@@ -2680,6 +2786,8 @@ where
     async fn tool_dispatch_context(
         &self,
         execute_readonly: bool,
+        approval_behavior: ToolApprovalBehavior,
+        source: ToolExecutionSource,
     ) -> Result<ToolDispatchContext, EngineError> {
         let grants = self
             .store
@@ -2699,6 +2807,8 @@ where
             unattended,
             permission_rules,
             execute_readonly,
+            approval_behavior,
+            source,
         })
     }
 
@@ -2710,6 +2820,15 @@ where
         let mode = *self.mode.lock().await;
         if call.name == "ask_user" || (call.name == "propose_plan" && mode == PermissionMode::Plan)
         {
+            if matches!(
+                context.approval_behavior,
+                ToolApprovalBehavior::RejectWithoutPending
+            ) {
+                return Ok(ToolDispatchResult::ScriptAbort(approval_tool_error(
+                    call,
+                    "this tool requires user interaction and cannot suspend a script",
+                )));
+            }
             if call.name == "ask_user" {
                 let options = call
                     .arguments
@@ -2771,7 +2890,10 @@ where
             .as_object()
             .map(|arguments| arguments.keys().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
-        let category = tool_event_category(&call.name);
+        let category = match context.source {
+            ToolExecutionSource::Model => tool_event_category(&call.name),
+            ToolExecutionSource::Script => "script",
+        };
         if call.name == "run_shell" {
             let _ = self
                 .working_event(
@@ -2931,6 +3053,29 @@ where
                 .await;
             return Ok(ToolDispatchResult::PreflightError(result));
         }
+        if matches!(
+            context.approval_behavior,
+            ToolApprovalBehavior::RejectWithoutPending
+        ) && matches!(decision, Decision::NeedsUser)
+        {
+            let reason = preflight_reason
+                .as_deref()
+                .unwrap_or("tool call requires user approval");
+            let _ = self
+                .working_event(
+                    "tool_script_approval_required",
+                    "script",
+                    json!({
+                        "call_id": call.id,
+                        "tool": call.name,
+                        "reason": reason,
+                    }),
+                )
+                .await;
+            return Ok(ToolDispatchResult::ScriptAbort(approval_tool_error(
+                call, reason,
+            )));
+        }
         match decision {
             Decision::Allow
                 if matches!(risk, ToolRisk::Read | ToolRisk::Search | ToolRisk::GitRead)
@@ -2940,6 +3085,11 @@ where
                 Ok(ToolDispatchResult::DeferredReadonly)
             }
             Decision::Allow => {
+                if call.name == "tool_script" {
+                    return Ok(ToolDispatchResult::Completed(
+                        self.execute_tool_script(call).await,
+                    ));
+                }
                 let previous = if matches!(call.name.as_str(), "write_file" | "edit_file") {
                     self.executor
                         .execute(
@@ -3001,6 +3151,285 @@ where
         }
     }
 
+    fn execute_tool_once_boxed<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        context: &'a ToolDispatchContext,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolDispatchResult, EngineError>> + Send + 'a>> {
+        Box::pin(self.execute_tool_once(call, context))
+    }
+
+    async fn execute_tool_script(&self, call: &ToolCall) -> Value {
+        self.execute_tool_script_with_limits(
+            call,
+            TOOL_SCRIPT_MAX_CALLS,
+            TOOL_SCRIPT_MAX_STDOUT_BYTES,
+            TOOL_SCRIPT_MAX_WALL_CLOCK,
+        )
+        .await
+    }
+
+    async fn execute_tool_script_with_limits(
+        &self,
+        call: &ToolCall,
+        max_calls: usize,
+        max_stdout_bytes: usize,
+        wall_clock: Duration,
+    ) -> Value {
+        let script = call
+            .arguments
+            .get("script")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let output = Arc::new(ScriptOutput::new(max_stdout_bytes));
+        let diagnostics = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let abort_value = Arc::new(StdMutex::new(None::<Value>));
+        let deadline = Instant::now() + wall_clock;
+        let (request_tx, mut request_rx) = mpsc::unbounded_channel::<ScriptRequest>();
+        let script_output = output.clone();
+        let script_diagnostics = diagnostics.clone();
+        let script_abort_value = abort_value.clone();
+        let script_task = tokio::task::spawn_blocking(move || {
+            run_tool_script(
+                &script,
+                request_tx,
+                script_output,
+                script_diagnostics,
+                script_abort_value,
+                deadline,
+            )
+        });
+        let context = match self
+            .tool_dispatch_context(
+                true,
+                ToolApprovalBehavior::RejectWithoutPending,
+                ToolExecutionSource::Script,
+            )
+            .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                return json!({
+                    "error": error.to_string(),
+                    "calls_made": 0,
+                    "stopped_reason": "dispatch_context_error",
+                    "stdout": "",
+                    "stdout_truncated": false,
+                    "stdout_total_bytes": 0,
+                    "stdout_omitted_bytes": 0,
+                });
+            }
+        };
+        let mut calls_made = 0usize;
+        let mut stopped_reason = "completed";
+        let mut abort = None;
+        let mut worker_done = false;
+        let mut script_task = std::pin::pin!(script_task);
+        loop {
+            tokio::select! {
+                result = &mut script_task => {
+                    worker_done = true;
+                    if let Err(error) = result {
+                        if stopped_reason == "completed" {
+                            stopped_reason = "script_worker_error";
+                        }
+                        abort = Some(json!({"error": format!("script worker failed: {error}")}));
+                    } else if let Ok(Err(error)) = result {
+                        if stopped_reason == "completed" {
+                            stopped_reason = if output.truncated() {
+                                "stdout_limit"
+                            } else if error.contains("deadline") {
+                                "wall_clock_deadline"
+                            } else if error.contains("operation") {
+                                "operation_limit"
+                            } else {
+                                "script_error"
+                            };
+                        }
+                        abort = abort_value
+                            .lock()
+                            .expect("script abort mutex poisoned")
+                            .clone()
+                            .or_else(|| Some(json!({"error": error})));
+                    }
+                    break;
+                }
+                request = request_rx.recv() => {
+                    let Some(request) = request else {
+                        break;
+                    };
+                    calls_made += 1;
+                    let response = if calls_made > max_calls {
+                        stopped_reason = "call_limit";
+                        ScriptResponse::Abort(json!({
+                            "error": "tool script call limit exceeded",
+                            "calls_made": calls_made - 1,
+                            "max_calls": max_calls,
+                        }))
+                    } else if !script_tool_allowed(&request.name, &request.arguments) {
+                        stopped_reason = "tool_not_allowed";
+                        ScriptResponse::Abort(json!({
+                            "error": format!("tool {} is not allowed inside tool_script", request.name),
+                            "tool": request.name,
+                            "reason": "script tool allowlist excludes user interaction, plan/session state, secrets, recording, and long-lived execution",
+                        }))
+                    } else {
+                        let child_call = ToolCall {
+                            id: format!("{}:{}", call.id, calls_made),
+                            name: request.name.clone(),
+                            arguments: request.arguments.clone(),
+                        };
+                        let mut audit_arguments = request.arguments.clone();
+                        self.secret_scrubber.scrub(&mut audit_arguments);
+                        let _ = self.store.append_audit(
+                            &self.session_id,
+                            "tool_script_call_started",
+                            &json!({
+                                "parent_call_id": call.id,
+                                "call_id": child_call.id,
+                                "tool": child_call.name,
+                                "arguments": audit_arguments,
+                            }),
+                        );
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        let result = tokio::time::timeout(
+                            remaining,
+                            async {
+                                let _active = self.track_tool_calls(std::slice::from_ref(&child_call));
+                                self.execute_tool_once_boxed(&child_call, &context).await
+                            },
+                        )
+                        .await;
+                        match result {
+                            Err(_) => {
+                                stopped_reason = "wall_clock_deadline";
+                                ScriptResponse::Abort(json!({
+                                    "error": "tool script wall-clock deadline exceeded",
+                                    "tool": child_call.name,
+                                }))
+                            }
+                            Ok(Err(error)) => {
+                                stopped_reason = "dispatch_error";
+                                ScriptResponse::Abort(json!({
+                                    "error": error.to_string(),
+                                    "tool": child_call.name,
+                                }))
+                            }
+                            Ok(Ok(ToolDispatchResult::Completed(mut value)))
+                            | Ok(Ok(ToolDispatchResult::PreflightError(mut value))) => {
+                                self.secret_scrubber.scrub(&mut value);
+                                let _ = self.working_event(
+                                    "tool_script_call_completed",
+                                    "script",
+                                    json!({
+                                        "parent_call_id": call.id,
+                                        "call_id": child_call.id,
+                                        "tool": child_call.name,
+                                        "ok": value.get("error").is_none(),
+                                    }),
+                                ).await;
+                                let mut audit_result = value.clone();
+                                self.secret_scrubber.scrub(&mut audit_result);
+                                let _ = self.store.append_audit(
+                                    &self.session_id,
+                                    "tool_script_call_completed",
+                                    &json!({
+                                        "parent_call_id": call.id,
+                                        "call_id": child_call.id,
+                                        "tool": child_call.name,
+                                        "result": audit_result,
+                                    }),
+                                );
+                                ScriptResponse::Result(value)
+                            }
+                            Ok(Ok(ToolDispatchResult::ScriptAbort(value))) => {
+                                stopped_reason = "approval_required";
+                                ScriptResponse::Abort(value)
+                            }
+                            Ok(Ok(ToolDispatchResult::DeferredReadonly))
+                            | Ok(Ok(ToolDispatchResult::ApprovalPending { .. })) => {
+                                stopped_reason = "invalid_script_dispatch";
+                                ScriptResponse::Abort(json!({
+                                    "error": "tool dispatch returned an unsupported script state",
+                                    "tool": child_call.name,
+                                }))
+                            }
+                        }
+                    };
+                    let abort_response = matches!(&response, ScriptResponse::Abort(_));
+                    if let ScriptResponse::Abort(value) = &response {
+                        abort = Some(value.clone());
+                    }
+                    let _ = request.response.send(response);
+                    if abort_response {
+                        stopped_reason = if stopped_reason == "completed" {
+                            "script_aborted"
+                        } else {
+                            stopped_reason
+                        };
+                    }
+                }
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                    stopped_reason = "wall_clock_deadline";
+                    abort = Some(json!({"error": "tool script wall-clock deadline exceeded"}));
+                    break;
+                }
+            }
+        }
+        drop(request_rx);
+        if !worker_done {
+            let _ = script_task.await;
+        }
+        let diagnostics = diagnostics
+            .lock()
+            .expect("script diagnostics mutex poisoned")
+            .clone();
+        if !diagnostics.is_empty() {
+            let _ = self.store.append_audit(
+                &self.session_id,
+                "tool_script_diagnostics",
+                &json!({
+                    "parent_call_id": call.id,
+                    "messages": diagnostics,
+                }),
+            );
+        }
+        if abort.is_none() {
+            abort = abort_value
+                .lock()
+                .expect("script abort mutex poisoned")
+                .clone();
+        }
+        let mut result = abort.unwrap_or_else(|| json!({}));
+        if let Some(object) = result.as_object_mut() {
+            object.insert("stdout".into(), Value::String(output.value()));
+            object.insert("calls_made".into(), json!(calls_made.min(max_calls)));
+            object.insert("stopped_reason".into(), json!(stopped_reason));
+            object.insert("stdout_truncated".into(), json!(output.truncated()));
+            object.insert(
+                "stdout_total_bytes".into(),
+                json!(output.total_bytes.load(Ordering::Relaxed)),
+            );
+            object.insert(
+                "stdout_omitted_bytes".into(),
+                json!(output.omitted_bytes.load(Ordering::Relaxed)),
+            );
+        }
+        if !result.is_object() {
+            result = json!({
+                "result": result,
+                    "stdout": output.value(),
+                "calls_made": calls_made.min(max_calls),
+                "stopped_reason": stopped_reason,
+                "stdout_truncated": output.truncated(),
+                "stdout_total_bytes": output.total_bytes.load(Ordering::Relaxed),
+                "stdout_omitted_bytes": output.omitted_bytes.load(Ordering::Relaxed),
+            });
+        }
+        result
+    }
+
     async fn execute_tools(
         &self,
         assistant_sequence: i64,
@@ -3009,7 +3438,13 @@ where
         let _active = self.track_tool_calls(calls);
         let mut results: Vec<Option<Value>> = (0..calls.len()).map(|_| None).collect();
         let mut readonly = Vec::new();
-        let context = self.tool_dispatch_context(false).await?;
+        let context = self
+            .tool_dispatch_context(
+                false,
+                ToolApprovalBehavior::PersistPending,
+                ToolExecutionSource::Model,
+            )
+            .await?;
         for (index, call) in calls.iter().enumerate() {
             if self.interrupted.load(Ordering::SeqCst) {
                 results[index] = Some(classify_tool_error(call, "tool call interrupted"));
@@ -3018,6 +3453,9 @@ where
             match self.execute_tool_once(call, &context).await? {
                 ToolDispatchResult::Completed(result)
                 | ToolDispatchResult::PreflightError(result) => {
+                    results[index] = Some(result);
+                }
+                ToolDispatchResult::ScriptAbort(result) => {
                     results[index] = Some(result);
                 }
                 ToolDispatchResult::DeferredReadonly => {
@@ -3995,6 +4433,163 @@ fn external_context_content_block(attachment: &ExternalContextAttachment) -> Val
     json!({"type": "text", "text": format!("{header}{}", attachment.content)})
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScriptToolClass {
+    Allowed,
+    UserInteraction,
+    PlanState,
+    SecretManagement,
+    Recording,
+    DesktopOrSessionState,
+    LongLivedExecution,
+    ScriptOrchestration,
+}
+
+fn script_tool_class(name: &str) -> ScriptToolClass {
+    if name == "tool_script" {
+        ScriptToolClass::ScriptOrchestration
+    } else if name == "ask_user" {
+        ScriptToolClass::UserInteraction
+    } else if name == "propose_plan" || name.starts_with("plan_") {
+        ScriptToolClass::PlanState
+    } else if name == "secrets_list" {
+        ScriptToolClass::SecretManagement
+    } else if name.starts_with("recording_") {
+        ScriptToolClass::Recording
+    } else if name.starts_with("desktop_") || name.starts_with("session_") {
+        ScriptToolClass::DesktopOrSessionState
+    } else if name.starts_with("work_queue_")
+        || name == "automation_manage"
+        || name.starts_with("action_ledger_")
+        || name.starts_with("background_job_")
+    {
+        ScriptToolClass::LongLivedExecution
+    } else {
+        ScriptToolClass::Allowed
+    }
+}
+
+fn contains_secret_names(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(contains_secret_names),
+        Value::Object(items) => items
+            .iter()
+            .any(|(key, value)| key == "secret_names" || contains_secret_names(value)),
+        _ => false,
+    }
+}
+
+fn script_tool_allowed(name: &str, arguments: &Value) -> bool {
+    script_tool_class(name) == ScriptToolClass::Allowed && !contains_secret_names(arguments)
+}
+
+fn run_tool_script(
+    script: &str,
+    request_tx: mpsc::UnboundedSender<ScriptRequest>,
+    output: Arc<ScriptOutput>,
+    diagnostics: Arc<StdMutex<Vec<String>>>,
+    abort_value: Arc<StdMutex<Option<Value>>>,
+    deadline: Instant,
+) -> Result<(), String> {
+    let mut engine = RhaiEngine::new_raw();
+    engine
+        .set_max_operations(TOOL_SCRIPT_MAX_OPERATIONS)
+        .set_max_call_levels(TOOL_SCRIPT_MAX_CALL_LEVELS)
+        .set_max_string_size(TOOL_SCRIPT_MAX_STRING_SIZE)
+        .set_max_array_size(TOOL_SCRIPT_MAX_ARRAY_SIZE);
+    engine.on_progress(move |_| {
+        if Instant::now() >= deadline {
+            Some("tool script wall-clock deadline exceeded".into())
+        } else {
+            None
+        }
+    });
+    let stdout = output.clone();
+    engine.register_fn(
+        "stdout",
+        move |value: Dynamic| -> Result<(), Box<EvalAltResult>> {
+            let text = value.to_string();
+            if stdout.append(&text) {
+                Ok(())
+            } else {
+                Err(Box::new(EvalAltResult::ErrorRuntime(
+                    "tool script stdout limit exceeded".into(),
+                    Position::NONE,
+                )))
+            }
+        },
+    );
+    let stdout = output.clone();
+    engine.on_print(move |text| {
+        let _ = stdout.append(text);
+    });
+    let debug_output = diagnostics.clone();
+    engine.on_debug(move |message, source, position| {
+        debug_output
+            .lock()
+            .expect("script diagnostics mutex poisoned")
+            .push(format!(
+                "{}:{}:{}: {}",
+                source.unwrap_or("<script>"),
+                position.line().unwrap_or(0),
+                position.position().unwrap_or(0),
+                message
+            ));
+    });
+    let abort_for_call = abort_value.clone();
+    engine.register_fn(
+        "tool_call",
+        move |name: &str, arguments: Dynamic| -> Result<Dynamic, Box<EvalAltResult>> {
+            let arguments: Value = from_dynamic(&arguments).map_err(|error| {
+                Box::new(EvalAltResult::ErrorRuntime(
+                    format!("invalid call arguments: {error}").into(),
+                    Position::NONE,
+                ))
+            })?;
+            let (response_tx, response_rx) = std_mpsc::sync_channel(1);
+            request_tx
+                .send(ScriptRequest {
+                    name: name.to_owned(),
+                    arguments,
+                    response: response_tx,
+                })
+                .map_err(|_| {
+                    Box::new(EvalAltResult::ErrorRuntime(
+                        "tool script dispatcher stopped".into(),
+                        Position::NONE,
+                    ))
+                })?;
+            let response = response_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .map_err(|_| {
+                    Box::new(EvalAltResult::ErrorRuntime(
+                        "tool script wall-clock deadline exceeded".into(),
+                        Position::NONE,
+                    ))
+                })?;
+            match response {
+                ScriptResponse::Result(value) => to_dynamic(value).map_err(|error| {
+                    Box::new(EvalAltResult::ErrorRuntime(
+                        format!("tool result conversion failed: {error}").into(),
+                        Position::NONE,
+                    ))
+                }),
+                ScriptResponse::Abort(value) => {
+                    *abort_for_call.lock().expect("script abort mutex poisoned") = Some(value);
+                    Err(Box::new(EvalAltResult::ErrorRuntime(
+                        "tool script aborted".into(),
+                        Position::NONE,
+                    )))
+                }
+            }
+        },
+    );
+    engine
+        .eval::<Dynamic>(script)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 fn tool_risk(name: &str) -> ToolRisk {
     match name {
         "read_file"
@@ -4040,6 +4635,7 @@ fn tool_risk(name: &str) -> ToolRisk {
         "git_push" | "github_create_pull_request" => ToolRisk::External,
         "github_get_pull_request" | "github_ci_status" | "github_ci_failure_log" => ToolRisk::Read,
         "run_shell" => ToolRisk::Execute,
+        "tool_script" => ToolRisk::Execute,
         "secrets_list" => ToolRisk::Read,
         "browser_status"
         | "browser_read"
@@ -4733,6 +5329,7 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"write_file","description":"Write a remote file. For changes to an existing file, prefer edit_file so unrelated content is preserved.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
         json!({"type":"function","function":{"name":"edit_file","description":"Apply one or more exact replacements to a remote UTF-8 text file. The required edits argument is an array of objects, each with old_string and new_string strings. Example: {\"path\":\"src/lib.rs\",\"edits\":[{\"old_string\":\"old code\",\"new_string\":\"new code\"}]}. Every old_string must match exactly once in the original file; ambiguous or missing matches fail with diagnostics. The whole call is atomic and preserves line endings. Prefer this over rewriting an existing file.","parameters":{"type":"object","examples":[{"path":"src/lib.rs","edits":[{"old_string":"old code","new_string":"new code"}]}],"properties":{"path":{"type":"string","description":"Remote workspace-relative file path."},"edits":{"type":"array","description":"One or more exact replacements, applied atomically.","minItems":1,"items":{"type":"object","properties":{"old_string":{"type":"string","description":"Exact existing text to replace, including whitespace and line breaks."},"new_string":{"type":"string","description":"Replacement text."}},"required":["old_string","new_string"],"additionalProperties":false}}},"required":["path","edits"],"additionalProperties":false}}}),
         json!({"type":"function","function":{"name":"run_shell","description":"Run a shell command. Use cwd to select the workspace directory. Credentials are available only by naming configured secret_names; injected values are redacted from output.","parameters":{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"},"secret_names":{"type":"array","items":{"type":"string"},"description":"Configured secret names to inject into the child environment. This is the only supported credential path; values are redacted from output."}},"required":["command"]}}}),
+        json!({"type":"function","function":{"name":"tool_script","description":"Run a bounded Rhai script that calls allowed OPCOS tools repeatedly. Only stdout enters model context; child calls still produce normal script-scoped audit and working events.","parameters":{"type":"object","properties":{"script":{"type":"string","description":"Rhai source using tool_call(name, args) and stdout(text)."}},"required":["script"],"additionalProperties":false}}}),
         json!({"type":"function","function":{"name":"browser_status","description":"Check whether an isolated local Chrome/Chromium CDP session is available. Read-only.","parameters":{"type":"object","properties":{}}}}),
         json!({"type":"function","function":{"name":"browser_navigate","description":"Navigate the isolated local browser to an HTTP(S) URL. Loopback targets do not require external approval; remote origins use a host-scoped external policy target.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}}),
         json!({"type":"function","function":{"name":"browser_set_viewport","description":"Set the isolated browser viewport size for responsive verification. This changes only local browser state and is a read-level operation.","parameters":{"type":"object","properties":{"width":{"type":"integer"},"height":{"type":"integer"}},"required":["width","height"]}}}),
@@ -5083,6 +5680,193 @@ mod tests {
         assert!(!names.contains("run_shell"));
         assert!(!names.contains("write_file"));
         assert!(!names.contains("list_dir"));
+    }
+
+    #[test]
+    fn builtin_prompt_tool_names_are_registered() {
+        let names = builtin_tool_names();
+        for name in opcos_assets::BUILTIN_AGENT_TOOL_NAMES {
+            assert!(names.contains(*name), "missing builtin tool {name}");
+        }
+    }
+
+    #[test]
+    fn tool_script_allowlist_is_structural_and_rejects_secret_arguments() {
+        for name in [
+            "ask_user",
+            "propose_plan",
+            "plan_update",
+            "secrets_list",
+            "recording_start",
+            "desktop_show",
+            "session_rename",
+            "work_queue_enqueue",
+            "automation_manage",
+            "action_ledger_begin",
+            "background_job_start",
+            "tool_script",
+        ] {
+            assert!(!script_tool_allowed(name, &json!({})), "{name} was allowed");
+        }
+        assert!(!script_tool_allowed(
+            "run_shell",
+            &json!({"command": "echo safe", "nested": {"secret_names": ["token"]}})
+        ));
+        assert!(script_tool_allowed(
+            "run_shell",
+            &json!({"command": "echo safe"})
+        ));
+        assert!(script_tool_allowed("read_file", &json!({"path": "x"})));
+    }
+
+    #[tokio::test]
+    async fn tool_script_only_returns_stdout_and_audits_child_calls() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "script-session",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let result = engine
+            .execute_tool_script(&ToolCall {
+                id: "script-1".into(),
+                name: "tool_script".into(),
+                arguments: json!({"script": r#"let value = tool_call("read_file", #{path: "x"}); stdout("hello");"#}),
+            })
+            .await;
+        assert_eq!(result["stdout"], "hello");
+        assert_eq!(result["calls_made"], 1);
+        assert_eq!(result["stopped_reason"], "completed");
+        assert!(
+            store
+                .load_audit(Some("script-session"))
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "tool_script_call_completed")
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_script_approval_aborts_without_pending() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(ApprovalQueueTools),
+            "approval-script",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let result = engine
+            .execute_tool_script(&ToolCall {
+                id: "script-approval".into(),
+                name: "tool_script".into(),
+                arguments: json!({"script": r#"tool_call("run_shell", #{command: "echo no"});"#}),
+            })
+            .await;
+        assert_eq!(result["stopped_reason"], "approval_required");
+        assert_eq!(result["error_details"]["code"], "approval_denied");
+        assert!(store.load_pending("approval-script").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_script_reports_call_stdout_and_deadline_limits() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(FakeTools),
+            "limit-script",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let calls = engine
+            .execute_tool_script_with_limits(
+                &ToolCall {
+                    id: "script-calls".into(),
+                    name: "tool_script".into(),
+                    arguments: json!({"script": r#"let x = 0; while x < 10 { tool_call("read_file", #{path: "x"}); x += 1; }"#}),
+                },
+                3,
+                TOOL_SCRIPT_MAX_STDOUT_BYTES,
+                Duration::from_secs(1),
+            )
+            .await;
+        assert_eq!(calls["stopped_reason"], "call_limit");
+        assert_eq!(calls["calls_made"], 3);
+
+        let text = "x".repeat(1000);
+        let stdout = engine
+            .execute_tool_script_with_limits(
+                &ToolCall {
+                    id: "script-stdout".into(),
+                    name: "tool_script".into(),
+                    arguments: json!({"script": format!("let x = 0; while x < 100 {{ stdout(\"{text}\"); x += 1; }}")}),
+                },
+                TOOL_SCRIPT_MAX_CALLS,
+                2048,
+                Duration::from_secs(1),
+            )
+            .await;
+        assert_eq!(stdout["stopped_reason"], "stdout_limit");
+        assert_eq!(stdout["stdout_truncated"], true);
+        assert!(stdout["stdout_omitted_bytes"].as_u64().unwrap() > 0);
+
+        let deadline_store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let deadline_engine = TurnEngine::new(
+            FakeProvider,
+            deadline_store,
+            Arc::new(TimingTools {
+                events: Arc::new(Mutex::new(Vec::new())),
+            }),
+            "deadline-script",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let deadline = deadline_engine
+            .execute_tool_script_with_limits(
+                &ToolCall {
+                    id: "script-deadline".into(),
+                    name: "tool_script".into(),
+                    arguments: json!({"script": r#"tool_call("read_file", #{path: "x"});"#}),
+                },
+                TOOL_SCRIPT_MAX_CALLS,
+                TOOL_SCRIPT_MAX_STDOUT_BYTES,
+                Duration::from_millis(1),
+            )
+            .await;
+        assert_eq!(deadline["stopped_reason"], "wall_clock_deadline");
+    }
+
+    #[tokio::test]
+    async fn tool_script_rejects_recursive_tool_script_calls() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(FakeTools),
+            "recursive-script",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let result = engine
+            .execute_tool_script(&ToolCall {
+                id: "script-recursive".into(),
+                name: "tool_script".into(),
+                arguments: json!({"script": r#"tool_call("tool_script", #{script: "stdout(\"bad\")"});"#}),
+            })
+            .await;
+        assert_eq!(result["stopped_reason"], "tool_not_allowed");
+        assert_eq!(result["calls_made"], 1);
+        assert_eq!(result["stdout"], "");
     }
 
     #[test]

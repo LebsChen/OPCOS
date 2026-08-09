@@ -71,3 +71,4 @@ tracing = "0.1"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+rhai = { version = "=1.25.1", default-features = false, features = ["std", "sync", "serde", "no_module", "no_custom_syntax"] }
