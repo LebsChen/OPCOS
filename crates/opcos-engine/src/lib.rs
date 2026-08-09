@@ -1690,7 +1690,6 @@ has failed {} times and the last error code was {}",
             self.remember_tool_result(call, &result).await;
             result
         };
-        let result = self.execute_tool_streaming(call).await;
         let post = self
             .lifecycle_hooks(
                 "PostToolUse",
