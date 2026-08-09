@@ -132,8 +132,6 @@ pub enum ToolErrorCode {
     HostIo,
     McpTransport,
     McpAuth,
-    CapabilityUnavailable,
-    CapabilityUnknown,
     ToolNotDescribed,
     RepeatedFailedCall,
     Unclassified,
@@ -156,16 +154,6 @@ pub struct ToolErrorEnvelope {
     pub retry: ToolErrorRetry,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retrieval: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub capability: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub capability_state: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub capability_source: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub capability_observed_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub operation_performed: Option<bool>,
 }
 
 impl ToolErrorEnvelope {
@@ -184,47 +172,8 @@ impl ToolErrorEnvelope {
             repair: repair.into(),
             retry,
             retrieval,
-            capability: None,
-            capability_state: None,
-            capability_source: None,
-            capability_observed_at: None,
-            operation_performed: None,
         }
     }
-}
-
-pub fn capability_tool_error(
-    summary: impl Into<String>,
-    tool: impl Into<String>,
-    capability: impl Into<String>,
-    state: impl Into<String>,
-    source: impl Into<String>,
-    observed_at: impl Into<String>,
-    retryable: bool,
-) -> Value {
-    let state = state.into();
-    let mut envelope = ToolErrorEnvelope::new(
-        if state == "unknown" {
-            ToolErrorCode::CapabilityUnknown
-        } else {
-            ToolErrorCode::CapabilityUnavailable
-        },
-        "the selected host capability must be available before execution",
-        tool,
-        "refresh capabilities or use a supported tool",
-        if retryable {
-            ToolErrorRetry::Same
-        } else {
-            ToolErrorRetry::No
-        },
-        Some("inspect the session capability evidence".into()),
-    );
-    envelope.capability = Some(capability.into());
-    envelope.capability_state = Some(state);
-    envelope.capability_source = Some(source.into());
-    envelope.capability_observed_at = Some(observed_at.into());
-    envelope.operation_performed = Some(false);
-    structured_tool_error(summary, envelope)
 }
 
 pub fn structured_tool_error(summary: impl Into<String>, envelope: ToolErrorEnvelope) -> Value {
@@ -463,24 +412,6 @@ const TOOL_ERROR_RULES: &[ToolErrorRule] = &[
         repair: "restore the MCP connection and retry the same call",
         retry: ToolErrorRetry::Same,
         retrieval: Some("inspect the MCP server connection status"),
-    },
-    ToolErrorRule {
-        pattern: "capability unknown",
-        matches: |text| contains(text, "capability_unknown"),
-        code: ToolErrorCode::CapabilityUnknown,
-        invariant: "the required host capability must be probed before execution",
-        repair: "refresh host capabilities and retry when the capability is available",
-        retry: ToolErrorRetry::Same,
-        retrieval: Some("inspect the session capability evidence"),
-    },
-    ToolErrorRule {
-        pattern: "capability unavailable",
-        matches: |text| contains(text, "capability_unavailable"),
-        code: ToolErrorCode::CapabilityUnavailable,
-        invariant: "the selected host must support the requested capability",
-        repair: "use a supported tool or switch to a host that exposes this capability",
-        retry: ToolErrorRetry::No,
-        retrieval: Some("inspect the session capability evidence"),
     },
     ToolErrorRule {
         pattern: "unsupported or unavailable non-MCP capability",
@@ -6462,140 +6393,6 @@ fn tool_definitions() -> Vec<Value> {
     tools.push(json!({"type":"function","function":{"name":"external_ingress_sources","description":"List configured external event sources and their health state. Read-only; secret values are never returned.","parameters":{"type":"object","properties":{}}}}));
     tools.extend(coordination_tool_definitions());
     tools
-}
-
-/// Host-capability requirements for every builtin tool.
-///
-/// An empty requirement list is intentional: it marks an engine-only or
-/// externally-gated tool and is not an implicit default.
-pub fn builtin_tool_capability_requirements() -> Vec<(&'static str, &'static [&'static str])> {
-    const NONE: &[&str] = &[];
-    const READ: &[&str] = &["read"];
-    const READ_LS: &[&str] = &["read", "ls"];
-    const READ_LS_EXEC: &[&str] = &["read", "ls", "exec"];
-    const WRITE: &[&str] = &["write"];
-    const READ_WRITE: &[&str] = &["read", "write"];
-    const LS: &[&str] = &["ls"];
-    const EXEC: &[&str] = &["exec"];
-    const PROCESS: &[&str] = &["exec", "process_stream"];
-    const STDIO_LSP: &[&str] = &["exec", "stdio", "lsp"];
-    const BROWSER: &[&str] = &["browser"];
-    const SCREENSHOT: &[&str] = &["screenshot"];
-    const COMPUTER_USE: &[&str] = &["computer_use"];
-    let mut requirements = vec![
-        ("tool_search", NONE),
-        ("tool_describe", NONE),
-        ("read_file", READ),
-        ("write_file", WRITE),
-        ("edit_file", READ_WRITE),
-        ("run_shell", EXEC),
-        ("tool_script", NONE),
-        ("browser_status", BROWSER),
-        ("browser_navigate", BROWSER),
-        ("browser_set_viewport", BROWSER),
-        ("browser_click", BROWSER),
-        ("browser_read", BROWSER),
-        ("browser_measure", BROWSER),
-        ("browser_assert_geometry", BROWSER),
-        ("browser_screenshot", BROWSER),
-        ("computer_use", COMPUTER_USE),
-        ("lsp_definition", STDIO_LSP),
-        ("lsp_references", STDIO_LSP),
-        ("lsp_diagnostics", STDIO_LSP),
-        ("list_dir", LS),
-        ("recording_start", SCREENSHOT),
-        ("recording_annotate", SCREENSHOT),
-        ("recording_stop", SCREENSHOT),
-        ("send_user_message", NONE),
-        ("report_blocker", NONE),
-        ("ask_user", NONE),
-        ("linear_get_issue", NONE),
-        ("linear_list_my_issues", NONE),
-        ("linear_comment_issue", NONE),
-        ("linear_update_issue_status", NONE),
-        ("github_list_repositories", NONE),
-        ("github_list_issues", NONE),
-        ("github_create_issue", NONE),
-        ("github_create_pull_request", NONE),
-        ("github_get_pull_request", NONE),
-        ("github_ci_status", NONE),
-        ("github_ci_failure_log", NONE),
-        ("telegram_send_message", NONE),
-        ("discord_send_message", NONE),
-        ("slack_list_channels", NONE),
-        ("slack_post_message", NONE),
-        ("notion_search", NONE),
-        ("gitlab_list_projects", NONE),
-        ("gitlab_list_issues", NONE),
-        ("jira_search_issues", NONE),
-        ("stripe_list_charges", NONE),
-        ("repo_index_find_symbol", READ_LS),
-        ("repo_index_glob", READ_LS),
-        ("repo_index_search", READ_LS_EXEC),
-        ("git_create_branch", EXEC),
-        ("git_diff", EXEC),
-        ("git_log", EXEC),
-        ("git_push", EXEC),
-        ("git_rev_parse", EXEC),
-        ("git_stage_commit", EXEC),
-        ("git_status", EXEC),
-        ("local_gate_record", NONE),
-        ("local_gate_status", NONE),
-        ("desktop_show", NONE),
-        ("session_rename", NONE),
-        ("secrets_list", NONE),
-        ("session_search", NONE),
-        ("config_asset_manage", NONE),
-        ("learned_skill_manage", NONE),
-        ("skill_save_learned", EXEC),
-        ("skill_search_learned", NONE),
-        ("skill_get_learned", NONE),
-        ("memory_save_automatic", NONE),
-        ("memory_list", NONE),
-        ("memory_disable", NONE),
-        ("memory_delete", NONE),
-        ("automation_manage", NONE),
-        ("external_ingress_sources", NONE),
-        ("coordination_dispatch", NONE),
-        ("coordination_fan_out", NONE),
-        ("coordination_status", NONE),
-        ("action_ledger_begin", NONE),
-        ("action_ledger_finish", NONE),
-        ("action_ledger_list", NONE),
-        ("work_queue_enqueue", NONE),
-        ("work_queue_claim", NONE),
-        ("work_queue_renew", NONE),
-        ("work_queue_complete", NONE),
-        ("work_queue_cancel", NONE),
-        ("work_queue_requeue", NONE),
-        ("work_queue_list", NONE),
-        ("background_job_start", PROCESS),
-        ("background_job_status", PROCESS),
-        ("background_job_output", PROCESS),
-        ("background_job_kill", PROCESS),
-        ("propose_plan", NONE),
-        ("plan_get", NONE),
-        ("plan_update", NONE),
-        ("plan_revise", NONE),
-    ];
-    requirements.sort_unstable_by_key(|(name, _)| *name);
-    requirements
-}
-
-#[cfg(test)]
-#[test]
-fn every_builtin_tool_has_explicit_capability_requirements() {
-    let mapped = builtin_tool_capability_requirements()
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect::<std::collections::HashSet<_>>();
-    for definition in tool_definitions() {
-        let name = tool_name(&definition).expect("builtin tool definition has a name");
-        assert!(
-            mapped.contains(name),
-            "missing capability mapping for builtin tool {name}"
-        );
-    }
 }
 
 fn tool_name(definition: &Value) -> Option<&str> {

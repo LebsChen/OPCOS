@@ -1431,7 +1431,7 @@ fn has_structured_stdio(capabilities: &opcos_hosts::HostCapabilities) -> bool {
     capabilities
         .items
         .iter()
-        .any(|item| item.name == "stdio" && item.state.is_available())
+        .any(|item| item.name == "stdio" && item.available)
 }
 
 fn permission_option_ids(params: &Value) -> Vec<String> {

@@ -475,10 +475,6 @@ impl BrowserController for LocalBrowser {
         self.operation(request).await
     }
 
-    async fn probe(&self) -> Result<(), HostError> {
-        self.ensure_session().await
-    }
-
     async fn current_origin(&self) -> Option<String> {
         let guard = self.session.lock().await;
         let url = Url::parse(&guard.as_ref()?.current_url).ok()?;

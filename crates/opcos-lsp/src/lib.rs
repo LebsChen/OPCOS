@@ -553,7 +553,7 @@ async fn host_provides_lsp_service(host: &Arc<dyn Host>) -> Result<bool, LspErro
         .await?
         .items
         .iter()
-        .any(|capability| capability.name == "lsp" && capability.state.is_available()))
+        .any(|capability| capability.name == "lsp" && capability.available))
 }
 
 async fn write_message(process: &mut dyn HostStdioProcess, value: &Value) -> Result<(), LspError> {
@@ -674,7 +674,7 @@ mod tests {
                     .iter()
                     .map(|name| Capability {
                         name: (*name).into(),
-                        state: opcos_hosts::CapabilityState::Available,
+                        available: true,
                         source: "stub".into(),
                         observed_at,
                         reason: None,
