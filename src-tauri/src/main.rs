@@ -4399,6 +4399,9 @@ impl ToolExecutor for RemoteExecutor {
             );
         }
         if name == "automation_manage" {
+            if self.origin == ToolOrigin::System {
+                return Err("automation-generated work cannot manage automation".into());
+            }
             return execute_agent_automation_tool(
                 &self.store,
                 &self.database,
@@ -4408,6 +4411,9 @@ impl ToolExecutor for RemoteExecutor {
             );
         }
         if name.starts_with("work_queue_") {
+            if self.origin == ToolOrigin::System {
+                return Err("automation-generated work cannot enqueue work".into());
+            }
             return execute_work_queue_tool(
                 &self.store,
                 &self.session_id,
@@ -4833,6 +4839,9 @@ impl ToolExecutor for DesktopExecutor {
                     );
                 }
                 if name.starts_with("work_queue_") {
+                    if executor.origin == ToolOrigin::System {
+                        return Err("automation-generated work cannot enqueue work".into());
+                    }
                     return execute_work_queue_tool(
                         &executor.store,
                         &executor.session_id,
@@ -4881,6 +4890,9 @@ impl ToolExecutor for DesktopExecutor {
                     .await;
                 }
                 if name == "automation_manage" {
+                    if executor.origin == ToolOrigin::System {
+                        return Err("automation-generated work cannot manage automation".into());
+                    }
                     return execute_agent_automation_tool(
                         &executor.store,
                         &executor.database,
