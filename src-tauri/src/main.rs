@@ -884,27 +884,6 @@ fn reject_automatic_memory(text: &str, known: &[String]) -> Result<(), String> {
             .replacen("learned skill", "automatic memory", 1)
             .to_owned()
     })?;
-    let lower = text.to_ascii_lowercase();
-    for marker in [
-        "permission rule",
-        "permissions:",
-        "approval policy",
-        "approval:",
-        "security boundary",
-        "security policy",
-        "safety boundary",
-        "gate configuration",
-        "gate policy",
-        "branch protection",
-        "access control",
-        "authorization policy",
-    ] {
-        if lower.contains(marker) {
-            return Err(format!(
-                "automatic memory rejected: protected policy content ({marker})"
-            ));
-        }
-    }
     Ok(())
 }
 
@@ -27699,10 +27678,10 @@ mod m7_tests {
     }
 
     #[test]
-    fn automatic_memory_rejects_secrets_and_protected_policy_content() {
+    fn automatic_memory_rejects_secrets_but_allows_policy_discussion() {
         assert!(reject_automatic_memory("remember token=abc", &[]).is_err());
-        assert!(reject_automatic_memory("remember the approval policy", &[]).is_err());
-        assert!(reject_automatic_memory("permissions: deny git push", &[]).is_err());
+        assert!(reject_automatic_memory("remember the approval policy", &[]).is_ok());
+        assert!(reject_automatic_memory("permissions: deny git push", &[]).is_ok());
         assert!(reject_automatic_memory("prefer compact summaries", &[]).is_ok());
     }
 

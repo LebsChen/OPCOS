@@ -79,6 +79,7 @@ pub struct InstructionSource {
     pub content: String,
 }
 
+/// A user preference is assembled as prompt context; it is not a policy rule.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct UserPreference {
     pub identifier: String,
@@ -91,6 +92,8 @@ fn default_enabled() -> bool {
     true
 }
 
+/// An automatic memory is prompt context only. Permission rules are kept in
+/// separate fields and are enforced by the policy layer at tool-call time.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct MemoryEntry {
     pub id: String,
@@ -1151,6 +1154,30 @@ mod tests {
         assert_eq!(first, reversed.system_instructions());
         assert!(first.find("response-style").unwrap() < first.find("Automatic Memory").unwrap());
         assert!(first.contains("source session: session-1"));
+    }
+
+    #[test]
+    fn automatic_memories_are_prompt_context_separate_from_permissions() {
+        let bundle = AssetBundle {
+            memories: vec![MemoryEntry {
+                id: "memory-1".into(),
+                identifier: "review".into(),
+                description: "Check branch protection during review.".into(),
+                source_session_id: "session-1".into(),
+                source_task: "review".into(),
+                enabled: true,
+            }],
+            permissions: Some(PermissionRules {
+                allow: vec!["Exec(git status)".into()],
+                deny: vec!["Exec(git push)".into()],
+                mutating_api_gate: Some(true),
+            }),
+            ..AssetBundle::default()
+        };
+        let permissions_before = bundle.permissions.clone();
+        let rendered = bundle.system_instructions();
+        assert!(rendered.contains("Check branch protection during review."));
+        assert_eq!(bundle.permissions, permissions_before);
     }
 
     #[test]

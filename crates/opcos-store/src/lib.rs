@@ -1681,28 +1681,10 @@ fn reject_automatic_memory_content(record: &AutomaticMemoryRecord) -> Result<(),
         record.identifier, record.description, record.source_task
     )
     .to_ascii_lowercase();
-    for marker in [
-        "bearer ",
-        "token=",
-        "key=",
-        "password=",
-        "secret=",
-        "permission rule",
-        "permissions:",
-        "approval policy",
-        "approval:",
-        "security boundary",
-        "security policy",
-        "safety boundary",
-        "gate configuration",
-        "gate policy",
-        "branch protection",
-        "access control",
-        "authorization policy",
-    ] {
+    for marker in ["bearer ", "token=", "key=", "password=", "secret="] {
         if content.contains(marker) {
             return Err(StoreError::Validation(format!(
-                "automatic memory rejected: protected or credential-like content ({marker})"
+                "automatic memory rejected: credential-like content ({marker})"
             )));
         }
     }
@@ -8416,11 +8398,6 @@ mod tests {
         assert!(
             store
                 .merge_automatic_memory(make("remember token=never-persist"))
-                .is_err()
-        );
-        assert!(
-            store
-                .merge_automatic_memory(make("permissions: deny all"))
                 .is_err()
         );
         let first = store
