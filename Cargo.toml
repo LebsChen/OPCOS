@@ -14,6 +14,7 @@ members = [
   "crates/opcos-acp-server",
   "crates/opcos-assets",
   "crates/opcos-eval",
+  "crates/opcos-trace",
   "src-tauri",
 ]
 

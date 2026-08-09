@@ -4116,6 +4116,7 @@ dependencies = [
  "opcos-provider",
  "opcos-rvm",
  "opcos-store",
+ "opcos-trace",
  "reqwest",
  "rusqlite",
  "serde",
@@ -4342,6 +4343,15 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.19",
  "uuid",
+]
+
+[[package]]
+name = "opcos-trace"
+version = "0.1.1"
+dependencies = [
+ "opcos-store",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

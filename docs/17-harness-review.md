@@ -249,6 +249,12 @@ OPCOS 现状：`ProviderRequest`/`AssistantTurn`/`TokenUsage` 是 provider-neutr
 - 当前骨架验证的是 engine 侧编排不变量；工具行为由 fixture executor 替身提供，不等同于 `src-tauri` 的生产工具实现。要覆盖真实工具语义，后续需将 `src-tauri` 工具实现抽成独立 crate，本次不做。
 - 验收：`cargo test -p opcos-eval` 在 CI 跑；每个 case 输出 outcome / proof / trajectory cost 三段结果。
 
+### P0-4 分层失败轨迹导出
+
+- `crates/opcos-trace` 将生产会话导出为 raw JSONL、确定性的 per-task analysis 和跨 run overview 三层产物；`src-tauri` 通过导出命令调用它。
+- analysis 机械提取终态、工具序列、重复调用、iteration/token 统计和 P0-1 `error_details.code` 序列；签名的因果地位与 agent 机制维度保留为空位，后续由独立分析步骤填写，不在导出器中启发式猜测。
+- 三层所有字段递归经过 scrubber；生产导出必须传入当前已知 secret 值做精确替换，启发式规则只作为第二层兜底。原始事件、分析报告和聚合总览都可直接作为模型输入或用户分享物。
+
 ### P1-4 恢复语义与故障分类（对应 §2.11）
 
 - 依据：“harness 中的 bug、事件流中的丢包、容器下线，呈现出的都是同一个症状。”+ session log 之外恢复。
