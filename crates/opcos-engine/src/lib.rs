@@ -5305,7 +5305,7 @@ struct ScriptLimits {
 
 fn script_tool_class(name: &str) -> Option<ScriptToolClass> {
     let class = match name {
-        "tool_script" => ScriptToolClass::ScriptOrchestration,
+        "tool_script" | "tool_search" | "tool_describe" => ScriptToolClass::ScriptOrchestration,
         "ask_user" | "send_user_message" | "report_blocker" => ScriptToolClass::UserInteraction,
         "propose_plan" | "plan_get" | "plan_update" | "plan_revise" => ScriptToolClass::PlanState,
         "secrets_list" => ScriptToolClass::SecretManagement,
@@ -5386,10 +5386,7 @@ fn script_tool_class(name: &str) -> Option<ScriptToolClass> {
         | "repo_index_search"
         | "lsp_definition"
         | "lsp_references"
-        | "lsp_diagnostics"
-        | "skill_save_learned"
-        | "skill_search_learned"
-        | "skill_get_learned" => ScriptToolClass::Allowed,
+        | "lsp_diagnostics" => ScriptToolClass::Allowed,
         name if name.starts_with("recording_") => ScriptToolClass::Recording,
         name if name.starts_with("desktop_")
             || (name.starts_with("session_") && name != "session_search") =>
