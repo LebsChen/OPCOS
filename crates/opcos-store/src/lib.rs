@@ -2016,6 +2016,68 @@ impl SqliteStore {
         Ok(connection.execute("DELETE FROM automatic_memories WHERE id=?1", [id])? > 0)
     }
 
+    pub fn record_learned_skill_source(
+        &self,
+        skill_id: &str,
+        session_id: &str,
+    ) -> Result<(), StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "INSERT INTO learned_skill_provenance(skill_id,source_session_id,created_at)
+             VALUES (?1,?2,?3)
+             ON CONFLICT(skill_id) DO UPDATE SET source_session_id=excluded.source_session_id",
+            params![skill_id, session_id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn learned_skill_provenance(&self, skill_id: &str) -> Result<Option<String>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .query_row(
+                "SELECT source_session_id FROM learned_skill_provenance WHERE skill_id=?1",
+                [skill_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn update_learned_skill_lifecycle(
+        &self,
+        skill_id: &str,
+        action: &str,
+    ) -> Result<LearnedSkillRecord, StoreError> {
+        let status = match action {
+            "archive" => "archived",
+            "delete" => "deleted",
+            "restore" | "rollback" => "active",
+            _ => {
+                return Err(StoreError::Validation(
+                    "unsupported learned skill lifecycle action".into(),
+                ));
+            }
+        };
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let changed = connection.execute(
+            "UPDATE learned_skills SET status=?1,updated_at=?2 WHERE id=?3",
+            params![status, Utc::now().to_rfc3339(), skill_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::Validation("learned skill not found".into()));
+        }
+        connection
+            .query_row(
+                "SELECT id,repository_identity,project_id,title,summary,applies_when,steps_json,
+                        verification,caveats,tags_json,source_commit,model_asserted_status,
+                        created_at,updated_at,status,supersedes_id,superseded_by_id,conflict_group
+                 FROM learned_skills WHERE id=?1",
+                [skill_id],
+                learned_skill_from_row,
+            )
+            .map_err(StoreError::from)
+    }
+
     pub fn bind_account_host(
         &self,
         account_id: &str,
@@ -4383,6 +4445,11 @@ impl SqliteStore {
                supersedes_id TEXT,
                superseded_by_id TEXT,
                conflict_group TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS learned_skill_provenance (
+               skill_id TEXT PRIMARY KEY,
+               source_session_id TEXT NOT NULL,
+               created_at TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_learned_skills_search
                ON learned_skills(repository_identity,status,updated_at DESC);
@@ -8418,6 +8485,57 @@ mod tests {
             .unwrap();
         assert!(results.len() <= 5);
         assert_eq!(results[0].source_commit, "def");
+    }
+
+    #[test]
+    fn learned_skill_provenance_and_lifecycle_are_persistent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let skill = store
+            .save_learned_skill(LearnedSkillRecord {
+                id: String::new(),
+                repository_identity: "project:test".into(),
+                project_id: Some("test".into()),
+                title: "workflow".into(),
+                summary: "repeatable workflow".into(),
+                applies_when: "when needed".into(),
+                steps: vec!["run it".into()],
+                verification: "observed".into(),
+                caveats: String::new(),
+                tags: vec![],
+                source_commit: "abc".into(),
+                model_asserted_status: "model_asserted_observed".into(),
+                created_at: String::new(),
+                updated_at: String::new(),
+                status: "active".into(),
+                supersedes_id: None,
+                superseded_by_id: None,
+                conflict_group: String::new(),
+            })
+            .unwrap();
+        store
+            .record_learned_skill_source(&skill.id, "session-1")
+            .unwrap();
+        assert_eq!(
+            store
+                .learned_skill_provenance(&skill.id)
+                .unwrap()
+                .as_deref(),
+            Some("session-1")
+        );
+        assert_eq!(
+            store
+                .update_learned_skill_lifecycle(&skill.id, "archive")
+                .unwrap()
+                .status,
+            "archived"
+        );
+        assert_eq!(
+            store
+                .update_learned_skill_lifecycle(&skill.id, "restore")
+                .unwrap()
+                .status,
+            "active"
+        );
     }
 
     #[test]

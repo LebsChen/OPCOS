@@ -1220,9 +1220,11 @@ fn learned_skill_json(record: &opcos_store::LearnedSkillRecord, current_commit: 
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_learned_skill_tool(
     store: &SqliteStore,
     secrets: &KeyringSecretStore,
+    session_id: &str,
     project_id: Option<&str>,
     host: &dyn Host,
     workspace: &str,
@@ -1344,6 +1346,16 @@ async fn execute_learned_skill_tool(
                     conflict_group: String::new(),
                 })
                 .map_err(|error| error.to_string())?;
+            store
+                .record_learned_skill_source(&record.id, session_id)
+                .map_err(|error| error.to_string())?;
+            store
+                .append_audit(
+                    session_id,
+                    "learned_skill_create",
+                    &json!({"id": record.id, "source_session_id": session_id}),
+                )
+                .map_err(|error| error.to_string())?;
             Ok(
                 json!({"saved": learned_skill_json(&record, &current_commit),
                 "warning": "model_asserted_status is not independently verified by OPCOS"}),
@@ -1397,9 +1409,430 @@ async fn execute_learned_skill_tool(
                 .get_learned_skill(id)
                 .map_err(|error| error.to_string())?
                 .ok_or("learned skill not found")?;
-            Ok(learned_skill_json(&record, &current_commit))
+            let mut value = learned_skill_json(&record, &current_commit);
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "source_session_id".into(),
+                    store
+                        .learned_skill_provenance(id)
+                        .map_err(|error| error.to_string())?
+                        .map(Value::String)
+                        .unwrap_or(Value::Null),
+                );
+            }
+            Ok(value)
+        }
+        "learned_skill_manage" => {
+            let action = arguments
+                .get("action")
+                .and_then(Value::as_str)
+                .ok_or("missing action")?;
+            if action == "list" {
+                let records = store
+                    .search_learned_skills(&repository_identity, "", &current_commit, 5)
+                    .map_err(|error| error.to_string())?;
+                return Ok(json!({
+                    "skills": records.iter().map(|record| learned_skill_json(record, &current_commit)).collect::<Vec<_>>(),
+                    "limit": 5
+                }));
+            }
+            let id = arguments
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or("missing learned skill id")?;
+            let record = store
+                .update_learned_skill_lifecycle(id, action)
+                .map_err(|error| error.to_string())?;
+            store
+                .append_audit(
+                    session_id,
+                    &format!("learned_skill_{action}"),
+                    &json!({"id": id, "source_session_id": session_id}),
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(json!({
+                "skill": learned_skill_json(&record, &current_commit),
+                "source_session_id": store.learned_skill_provenance(id)
+                    .map_err(|error| error.to_string())?,
+                "action": action
+            }))
         }
         _ => Err(format!("unsupported learned skill tool: {name}")),
+    }
+}
+
+fn execute_session_search_tool(
+    store: &SqliteStore,
+    known_secrets: &[String],
+    arguments: &Value,
+) -> Result<Value, String> {
+    let query = arguments
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase);
+    let from = arguments.get("from").and_then(Value::as_str);
+    let to = arguments.get("to").and_then(Value::as_str);
+    let project_id = arguments.get("project_id").and_then(Value::as_str);
+    let status = arguments.get("status").and_then(Value::as_str);
+    let scope = arguments
+        .get("content_scope")
+        .and_then(Value::as_str)
+        .unwrap_or("title");
+    if !matches!(scope, "title" | "messages" | "events" | "tool_calls") {
+        return Err("content_scope must be title, messages, events, or tool_calls".into());
+    }
+    let limit = arguments
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(20)
+        .clamp(1, 100) as usize;
+    let sessions = store.load_sessions().map_err(|error| error.to_string())?;
+    let mut results = Vec::new();
+    for session in sessions {
+        if project_id.is_some_and(|id| session.project_id.as_deref() != Some(id))
+            || status.is_some_and(|value| session.run_state != value)
+            || from.is_some_and(|value| session.updated_at.to_rfc3339().as_str() < value)
+            || to.is_some_and(|value| session.created_at.to_rfc3339().as_str() > value)
+        {
+            continue;
+        }
+        let haystack = match scope {
+            "title" => session.title.clone(),
+            "messages" => store
+                .load_messages(&session.session_id)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(|message| message.content.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "events" => store
+                .load_session_events(&session.session_id)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(|event| event.event.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "tool_calls" => store
+                .load_tool_calls(&session.session_id)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(|call| {
+                    json!({"name":call.name,"arguments":call.arguments,"result":call.result})
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => unreachable!(),
+        };
+        if query
+            .as_deref()
+            .is_some_and(|needle| !haystack.to_ascii_lowercase().contains(needle))
+        {
+            continue;
+        }
+        let mut redacted = Value::String(haystack);
+        for secret in known_secrets {
+            redact_json_strings(&mut redacted, secret);
+        }
+        redacted = redact_approval_value(&redacted);
+        let snippet = redacted.as_str().unwrap_or_default().to_owned();
+        results.push(json!({
+            "session_id": session.session_id,
+            "title": redact_secret_patterns(&session.title),
+            "project_id": session.project_id,
+            "status": session.run_state,
+            "created_at": session.created_at,
+            "updated_at": session.updated_at,
+            "content_scope": scope,
+            "snippet": snippet.chars().take(2000).collect::<String>(),
+        }));
+        if results.len() >= limit {
+            break;
+        }
+    }
+    Ok(json!({"sessions": results, "limit": limit, "content_scope": scope}))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AgentAssetKind {
+    Knowledge,
+    Playbook,
+}
+
+impl AgentAssetKind {
+    fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value {
+            Some("knowledge") => Ok(Self::Knowledge),
+            Some("playbook") => Ok(Self::Playbook),
+            _ => Err("kind must be knowledge or playbook".into()),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Knowledge => "knowledge",
+            Self::Playbook => "playbook",
+        }
+    }
+}
+
+fn execute_agent_asset_tool(
+    store: &SqliteStore,
+    database: &Arc<Mutex<Connection>>,
+    session_id: &str,
+    arguments: &Value,
+) -> Result<Value, String> {
+    let action = arguments
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or("missing action")?;
+    let connection = database.lock().map_err(|_| "database lock poisoned")?;
+    let kind = if matches!(action, "list" | "create") && arguments.get("kind").is_none() {
+        None
+    } else {
+        Some(AgentAssetKind::parse(
+            arguments.get("kind").and_then(Value::as_str),
+        )?)
+    };
+    let project_id = arguments.get("project_id").and_then(Value::as_str);
+    let scope_kind = if project_id.is_some() {
+        "project"
+    } else {
+        "global"
+    };
+    let scope_key = project_id.unwrap_or("");
+    let asset_id = arguments
+        .get("id")
+        .or_else(|| arguments.get("asset_id"))
+        .and_then(Value::as_str);
+    match action {
+        "list" => {
+            let kind = kind.map(|value| value.as_str().to_owned());
+            let mut statement = connection
+                .prepare(
+                    "SELECT o.id,o.kind,o.name,o.status,o.scope_kind,o.scope_key,
+                            o.current_version_id,v.content,v.metadata_json
+                     FROM config_object o
+                     JOIN config_object_version v ON v.id=o.current_version_id
+                     WHERE (?1 IS NULL OR o.kind=?1)
+                       AND o.scope_kind=?2
+                       AND COALESCE(o.scope_key,'')=?3
+                       AND o.status <> 'deleted'
+                     ORDER BY o.name",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map(params![kind, scope_kind, scope_key], |row| {
+                    let metadata: String = row.get(8)?;
+                    Ok(json!({
+                        "id": row.get::<_, String>(0)?,
+                        "kind": row.get::<_, String>(1)?,
+                        "title": row.get::<_, String>(2)?,
+                        "status": row.get::<_, String>(3)?,
+                        "scope_kind": row.get::<_, String>(4)?,
+                        "scope_key": row.get::<_, Option<String>>(5)?,
+                        "version_id": row.get::<_, String>(6)?,
+                        "body": redact_secret_patterns(&row.get::<_, String>(7)?),
+                        "agent_managed": serde_json::from_str::<Value>(&metadata)
+                            .ok()
+                            .and_then(|value| value.get("agent_managed").and_then(Value::as_bool))
+                            .unwrap_or(false),
+                    }))
+                })
+                .map_err(|error| error.to_string())?;
+            let items = rows
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            Ok(json!({"items": items}))
+        }
+        "create" | "update" => {
+            let kind = AgentAssetKind::parse(arguments.get("kind").and_then(Value::as_str))?;
+            let title = arguments
+                .get("title")
+                .and_then(Value::as_str)
+                .ok_or("missing title")?;
+            let body = arguments
+                .get("body")
+                .and_then(Value::as_str)
+                .ok_or("missing body")?;
+            if title.trim().is_empty() || body.trim().is_empty() {
+                return Err("title and body must be non-empty".into());
+            }
+            let id = asset_id
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("agent-{}-{}", kind.as_str(), Uuid::new_v4()));
+            let now = Utc::now().to_rfc3339();
+            let version: i64 = connection
+                .query_row(
+                    "SELECT COALESCE(MAX(version),0)+1 FROM config_object_version WHERE object_id=?1",
+                    [&id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            let version_id = format!("{id}:v{version}");
+            let metadata = json!({
+                "agent_managed": true,
+                "source_session_id": session_id,
+                "kind_boundary": "knowledge_or_playbook_only",
+            });
+            connection
+                .execute(
+                    "INSERT INTO config_object
+                     (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
+                     VALUES (?1,?2,?3,?4,?5,?6,'active',?7,?8)
+                     ON CONFLICT(id) DO UPDATE SET
+                       kind=excluded.kind,name=excluded.name,status='active',
+                       current_version_id=excluded.current_version_id",
+                    params![
+                        id,
+                        kind.as_str(),
+                        title,
+                        stable_server_key(&id),
+                        scope_kind,
+                        if project_id.is_some() { Some(scope_key) } else { None },
+                        now,
+                        version_id
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            connection
+                .execute(
+                    "INSERT INTO config_object_version
+                     (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![
+                        version_id,
+                        id,
+                        version,
+                        body,
+                        content_hash(body),
+                        now,
+                        format!("agent {action} from session {session_id}"),
+                        metadata.to_string()
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            store
+                .append_audit(
+                    session_id,
+                    &format!("agent_asset_{action}"),
+                    &json!({"id": id, "kind": kind.as_str(), "version": version}),
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(json!({"id": id, "kind": kind.as_str(), "version_id": version_id, "saved": true}))
+        }
+        "get" | "versions" | "rollback" | "archive" | "delete" | "enable" | "disable" => {
+            let id = asset_id.ok_or("missing id")?;
+            let (object_kind, status, current_version, scope_kind): (String, String, String, String) = connection
+                .query_row(
+                    "SELECT kind,status,current_version_id,scope_kind FROM config_object WHERE id=?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .map_err(|error| format!("agent asset not found: {error}"))?;
+            AgentAssetKind::parse(Some(&object_kind))?;
+            let agent_managed: bool = connection
+                .query_row(
+                    "SELECT metadata_json FROM config_object_version WHERE id=?1",
+                    [&current_version],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+                .and_then(|value| value.get("agent_managed").and_then(Value::as_bool))
+                .unwrap_or(false);
+            if status == "builtin" || scope_kind == "repo" || !agent_managed {
+                return Err("builtin and repository-authored assets are read-only".into());
+            }
+            let result = match action {
+                "get" => {
+                    let value: (String, String) = connection
+                        .query_row(
+                            "SELECT content,metadata_json FROM config_object_version WHERE id=?1",
+                            [current_version.as_str()],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    json!({"id": id, "kind": object_kind, "status": status,
+                        "version_id": current_version, "body": redact_secret_patterns(&value.0),
+                        "metadata": value.1})
+                }
+                "versions" => {
+                    let mut statement = connection
+                        .prepare(
+                            "SELECT id,version,created_at,note,metadata_json
+                             FROM config_object_version WHERE object_id=?1 ORDER BY version",
+                        )
+                        .map_err(|error| error.to_string())?;
+                    let rows = statement
+                        .query_map([id], |row| {
+                            Ok(
+                                json!({"id":row.get::<_,String>(0)?,"version":row.get::<_,i64>(1)?,
+                                "created_at":row.get::<_,String>(2)?,"note":row.get::<_,String>(3)?,
+                                "metadata":row.get::<_,String>(4)?}),
+                            )
+                        })
+                        .map_err(|error| error.to_string())?;
+                    json!({"id":id,"versions":rows.collect::<Result<Vec<_>,_>>().map_err(|error|error.to_string())?})
+                }
+                "rollback" => {
+                    let version = arguments
+                        .get("version")
+                        .and_then(Value::as_i64)
+                        .ok_or("missing version")?;
+                    let version_id: String = connection.query_row(
+                        "SELECT id FROM config_object_version WHERE object_id=?1 AND version=?2",
+                        params![id, version], |row| row.get(0)
+                    ).map_err(|error| error.to_string())?;
+                    connection.execute("UPDATE config_object SET current_version_id=?1,status='active' WHERE id=?2",
+                        params![version_id,id]).map_err(|error| error.to_string())?;
+                    json!({"id":id,"version_id":version_id,"rolled_back":true})
+                }
+                "archive" => {
+                    connection
+                        .execute(
+                            "UPDATE config_object SET status='archived' WHERE id=?1",
+                            [id],
+                        )
+                        .map_err(|error| error.to_string())?;
+                    json!({"id":id,"status":"archived"})
+                }
+                "delete" => {
+                    connection
+                        .execute(
+                            "UPDATE config_object SET status='deleted' WHERE id=?1",
+                            [id],
+                        )
+                        .map_err(|error| error.to_string())?;
+                    json!({"id":id,"status":"deleted"})
+                }
+                "enable" => {
+                    connection
+                        .execute("UPDATE config_object SET status='active' WHERE id=?1", [id])
+                        .map_err(|error| error.to_string())?;
+                    json!({"id":id,"status":"active"})
+                }
+                "disable" => {
+                    connection
+                        .execute(
+                            "UPDATE config_object SET status='disabled' WHERE id=?1",
+                            [id],
+                        )
+                        .map_err(|error| error.to_string())?;
+                    json!({"id":id,"status":"disabled"})
+                }
+                _ => unreachable!(),
+            };
+            store
+                .append_audit(
+                    session_id,
+                    &format!("agent_asset_{action}"),
+                    &json!({"id": id}),
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(result)
+        }
+        _ => Err("unsupported agent asset action".into()),
     }
 }
 
@@ -4298,6 +4731,18 @@ impl ToolExecutor for RemoteExecutor {
         if name == "external_ingress_sources" {
             return execute_external_ingress_tool(&self.store, name, &arguments);
         }
+        if name == "session_search" {
+            let known = load_secret_values(&self.database, &self.secrets).unwrap_or_default();
+            return execute_session_search_tool(&self.store, &known, &arguments);
+        }
+        if name == "config_asset_manage" {
+            return execute_agent_asset_tool(
+                &self.store,
+                &self.database,
+                &self.session_id,
+                &arguments,
+            );
+        }
         if matches!(name, "coordination_dispatch" | "coordination_status") {
             if name == "coordination_dispatch"
                 && self.origin == ToolOrigin::User
@@ -4321,7 +4766,10 @@ impl ToolExecutor for RemoteExecutor {
         }
         if matches!(
             name,
-            "skill_save_learned" | "skill_search_learned" | "skill_get_learned"
+            "skill_save_learned"
+                | "skill_search_learned"
+                | "skill_get_learned"
+                | "learned_skill_manage"
         ) {
             let host = RvmHost::new(
                 self.host_id.clone(),
@@ -4331,6 +4779,7 @@ impl ToolExecutor for RemoteExecutor {
             return execute_learned_skill_tool(
                 &self.store,
                 &self.secrets,
+                &self.session_id,
                 self.project_id.as_deref(),
                 &host,
                 &self.workspace,
@@ -4740,6 +5189,19 @@ impl ToolExecutor for DesktopExecutor {
                         .await
                         .map_err(|error| error.to_string());
                 }
+                if name == "session_search" {
+                    let known = load_secret_values(&executor.database, &executor.secrets)
+                        .unwrap_or_default();
+                    return execute_session_search_tool(&executor.store, &known, &arguments);
+                }
+                if name == "config_asset_manage" {
+                    return execute_agent_asset_tool(
+                        &executor.store,
+                        &executor.database,
+                        &executor.session_id,
+                        &arguments,
+                    );
+                }
                 if name == "secrets_list" {
                     return list_resolvable_secret_metadata(
                         &executor.database,
@@ -4805,11 +5267,15 @@ impl ToolExecutor for DesktopExecutor {
                 }
                 if matches!(
                     name,
-                    "skill_save_learned" | "skill_search_learned" | "skill_get_learned"
+                    "skill_save_learned"
+                        | "skill_search_learned"
+                        | "skill_get_learned"
+                        | "learned_skill_manage"
                 ) {
                     return execute_learned_skill_tool(
                         &executor.store,
                         &executor.secrets,
+                        &executor.session_id,
                         executor.project_id.as_deref(),
                         &executor.host,
                         &executor.workspace,
@@ -14065,6 +14531,9 @@ fn builtin_allowed_tools(include_local_lsp: bool, include_edit_file: bool) -> Ve
         "memory_list",
         "memory_disable",
         "memory_delete",
+        "learned_skill_manage",
+        "session_search",
+        "config_asset_manage",
         "ask_user",
         "recording_start",
         "recording_annotate",
