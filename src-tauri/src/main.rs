@@ -23,8 +23,8 @@ use opcos_assets::{
 };
 use opcos_engine::SecretScrubber;
 use opcos_engine::{
-    AcpHarness, AcpHarnessConfig, AgentEngine, ArtifactReference, ArtifactRequest, ArtifactSink,
-    CapturedFrame, EngineError, ExternalContextAttachment, Harness, LifecycleHook,
+    AcpHarness, AcpHarnessConfig, AgentEngine, AgentRole, ArtifactReference, ArtifactRequest,
+    ArtifactSink, CapturedFrame, EngineError, ExternalContextAttachment, Harness, LifecycleHook,
     LifecycleHookConfig, PreflightDecision, RecordingSource, SessionRecorder, ToolExecutor,
     ToolOrigin, TurnEngine,
     computer_use::{
@@ -11265,6 +11265,24 @@ async fn engine_for_with_context(
         host_id: host_id.clone(),
     }));
     engine.set_recording_source(recording_source);
+    let agent_role = state
+        .store
+        .load_project_agent_by_session(session_id)
+        .ok()
+        .flatten()
+        .map(|agent| {
+            if agent.sort_order == 0 || agent.role.eq_ignore_ascii_case("lead") {
+                AgentRole::Lead
+            } else if agent.role.eq_ignore_ascii_case("test")
+                || agent.role.eq_ignore_ascii_case("testing")
+            {
+                AgentRole::TestingWorker
+            } else {
+                AgentRole::Worker
+            }
+        })
+        .unwrap_or(AgentRole::Lead);
+    engine.set_agent_role(agent_role);
     let discovered_caps = provider_models_for_state(
         state,
         provider_id.clone(),
@@ -11435,6 +11453,20 @@ async fn engine_for_with_context(
             .map_err(|error| error.to_string())?,
     );
     let mut allowed_tools = allowed_tools;
+    if matches!(agent_role, AgentRole::Worker | AgentRole::TestingWorker)
+        && let Some(allowed) = allowed_tools.as_mut()
+    {
+        allowed.retain(|tool| {
+            !matches!(
+                tool.as_str(),
+                "ask_user"
+                    | "secrets_list"
+                    | "github_create_pull_request"
+                    | "github_create_issue"
+                    | "github_merge_pull_request"
+            )
+        });
+    }
     if automatic_project_routing_active(&state.store, session_id)?
         && let Some(allowed_tools) = allowed_tools.as_mut()
     {
@@ -23133,10 +23165,19 @@ async fn coordination_message(
             .get(&worker_session)
             .cloned()
             .ok_or_else(|| "coordination target session is not started".to_owned())?;
-        engine
-            .queue_steering(envelope.encode(None).map_err(|error| error.to_string())?)
-            .await
-            .map_err(|error| error.to_string())?;
+        let encoded = envelope.encode(None).map_err(|error| error.to_string())?;
+        if engine.has_active_turn() {
+            engine
+                .queue_steering(encoded)
+                .await
+                .map_err(|error| error.to_string())?;
+        } else {
+            wake_session_for_turn(&state.store, &worker_session)?;
+            let worker_engine = Arc::clone(&engine);
+            tokio::spawn(async move {
+                let _ = worker_engine.submit_text(encoded).await;
+            });
+        }
     }
     Ok(json!({"accepted":true,"msg_id":envelope.msg_id}))
 }
@@ -23302,10 +23343,19 @@ async fn execute_coordination_tool(
             .get(target_session)
             .cloned()
             .ok_or_else(|| "coordination target Worker session is not running".to_owned())?;
-        engine
-            .queue_steering(envelope.encode(None).map_err(|error| error.to_string())?)
-            .await
-            .map_err(|error| error.to_string())?;
+        let encoded = envelope.encode(None).map_err(|error| error.to_string())?;
+        if engine.has_active_turn() {
+            engine
+                .queue_steering(encoded)
+                .await
+                .map_err(|error| error.to_string())?;
+        } else {
+            wake_session_for_turn(store, target_session)?;
+            let worker_engine = Arc::clone(&engine);
+            tokio::spawn(async move {
+                let _ = worker_engine.submit_text(encoded).await;
+            });
+        }
         return Ok(json!({
             "task_id": task.id,
             "status": "dispatched",
@@ -23759,6 +23809,7 @@ async fn coordination_ingest_session_inner(
         .store
         .load_messages(session_id)
         .map_err(|error| error.to_string())?;
+    let worker_reports = route_worker_reports(state, session_id).await?;
     let mut accepted = 0usize;
     let mut skipped = 0usize;
     let mut rejected = Vec::new();
@@ -23863,9 +23914,132 @@ async fn coordination_ingest_session_inner(
     Ok(json!({
         "session_id": session_id,
         "accepted": accepted,
+        "worker_reports": worker_reports,
         "skipped": skipped,
         "rejected": rejected
     }))
+}
+
+async fn route_worker_reports(state: &DesktopState, session_id: &str) -> Result<usize, String> {
+    let Some((worker, task_id, project_id, leader, leader_session)) = ({
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        connection
+            .query_row(
+                "SELECT worker.id,task.id,task.project_id,leader.id,leader.session_id
+                 FROM coord_tasks task
+                 JOIN project_agents worker ON worker.id=task.assignee
+                 JOIN project_agents leader
+                   ON leader.project_id=task.project_id AND leader.sort_order=0
+                 WHERE worker.session_id=?1
+                 ORDER BY task.id DESC LIMIT 1",
+                [session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+    }) else {
+        return Ok(0);
+    };
+    let Some(leader_session) = leader_session else {
+        return Err("coordination Lead session is unavailable".into());
+    };
+    let events = state
+        .store
+        .load_session_events(session_id)
+        .map_err(|error| error.to_string())?;
+    let mut routed = 0;
+    for record in events {
+        let event = record.event;
+        let working = event.get("working_event");
+        if working
+            .and_then(|value| value.get("event_type"))
+            .and_then(Value::as_str)
+            != Some("worker_report")
+        {
+            continue;
+        }
+        let report_id = format!(
+            "worker-report-{}",
+            event
+                .get("event_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        );
+        let exists = {
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            connection
+                .query_row(
+                    "SELECT 1 FROM coord_messages WHERE msg_id=?1",
+                    [&report_id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .is_some()
+        };
+        if exists {
+            continue;
+        }
+        let payload = working
+            .and_then(|value| value.get("payload"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let envelope = Envelope {
+            v: 1,
+            task_id: task_id.clone(),
+            from: worker.clone(),
+            to: leader.clone(),
+            kind: opcos_engine::orchestration::EnvelopeKind::Status,
+            msg_id: report_id.clone(),
+            reply_to: None,
+            payload,
+        };
+        {
+            let mut runtimes = state.coordination.lock().await;
+            if let Some(runtime) = runtimes.get_mut(&task_id) {
+                runtime
+                    .validate_and_record(&envelope, Utc::now())
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        persist_coord_message(state, &project_id, &task_id, &envelope).await?;
+        let leader_event = json!({
+            "type": "coordination_report",
+            "event_id": format!("event-{}", Uuid::new_v4()),
+            "created_at_ms": Utc::now().timestamp_millis(),
+            "working_event": {
+                "event_type": "coordination_report",
+                "category": "coordination",
+                "direction": "incoming",
+                "payload": {
+                    "task_id": task_id,
+                    "worker_role_id": worker,
+                    "message_id": report_id,
+                    "payload": envelope.payload,
+                }
+            }
+        });
+        state
+            .store
+            .append_session_event(&leader_session, &leader_event)
+            .map_err(|error| error.to_string())?;
+        routed += 1;
+    }
+    Ok(routed)
 }
 
 fn coordination_text(content: &Value) -> Option<String> {

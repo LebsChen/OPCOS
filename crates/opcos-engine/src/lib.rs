@@ -577,6 +577,14 @@ pub enum ToolOrigin {
     RepairLoop,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AgentRole {
+    #[default]
+    Lead,
+    Worker,
+    TestingWorker,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PreflightDecision {
     Allow,
@@ -1026,6 +1034,7 @@ pub struct TurnEngine<P, S, E> {
     artifact_sink: Option<Arc<dyn ArtifactSink>>,
     recording_source: Option<Arc<dyn RecordingSource>>,
     recording: Arc<StdMutex<Option<RecordingRuntime>>>,
+    agent_role: AgentRole,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1305,6 +1314,7 @@ where
             artifact_sink: None,
             recording_source: None,
             recording: Arc::new(StdMutex::new(None)),
+            agent_role: AgentRole::Lead,
         }
     }
 
@@ -1318,6 +1328,10 @@ where
 
     pub fn set_recording_source(&mut self, source: Arc<dyn RecordingSource>) {
         self.recording_source = Some(source);
+    }
+
+    pub fn set_agent_role(&mut self, role: AgentRole) {
+        self.agent_role = role;
     }
 
     pub async fn set_system_instructions(&self, instructions: Option<String>) {
@@ -1668,6 +1682,7 @@ has failed {} times and the last error code was {}",
             self.remember_tool_result(call, &result).await;
             result
         };
+        let result = self.execute_tool_streaming(call).await;
         let post = self
             .lifecycle_hooks(
                 "PostToolUse",
@@ -3462,6 +3477,12 @@ has failed {} times and the last error code was {}",
     ) -> Result<ToolDispatchResult, EngineError> {
         if let Some(result) = self.execute_disclosure_tool(call).await {
             return Ok(ToolDispatchResult::Completed(result));
+        }
+        if call.name == "ask_user" && self.agent_role != AgentRole::Lead {
+            return Ok(ToolDispatchResult::Completed(classify_tool_error(
+                call,
+                "testing Worker cannot ask the user; report to Lead instead",
+            )));
         }
         let mode = *self.mode.lock().await;
         if call.name == "ask_user" || (call.name == "propose_plan" && mode == PermissionMode::Plan)
@@ -6276,6 +6297,8 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"recording_start","description":"Explicitly start a sampled screenshot timeline for UI-test evidence. Recording is never enabled by default. Frames are sampled, adjacent identical frames are deduplicated, and the recording stops at its frame or duration limit with truncation reported in the manifest.","parameters":{"type":"object","properties":{"source":{"type":"string","enum":["desktop","browser"]},"interval_ms":{"type":"integer","minimum":100},"max_frames":{"type":"integer","minimum":1},"max_duration_seconds":{"type":"integer","minimum":1}}}}}),
         json!({"type":"function","function":{"name":"recording_annotate","description":"Add one consolidated annotation to the active sampled screenshot timeline. Use setup for preparation, test_start for a named test (prefer the natural 'It should ...' wording), and assertion after checking one meaningful state change. Keep text under 80 characters; assertions must reference a prior test_start and include passed, failed, or untested.","parameters":{"type":"object","properties":{"recording_id":{"type":"string"},"type":{"type":"string","enum":["setup","test_start","assertion"]},"text":{"type":"string","maxLength":80},"test_start_id":{"type":"string"},"result":{"type":"string","enum":["passed","failed","untested"]}},"required":["recording_id","type","text"]}}}),
         json!({"type":"function","function":{"name":"recording_stop","description":"Explicitly stop the active sampled screenshot timeline and persist its manifest. The manifest states whether frame or duration limits truncated capture.","parameters":{"type":"object","properties":{"recording_id":{"type":"string"}},"required":["recording_id"]}}}),
+        json!({"type":"function","function":{"name":"send_user_message","description":"Tell the user about progress, a risk, or a finding without waiting for a response or interrupting execution.","parameters":{"type":"object","properties":{"message":{"type":"string"},"kind":{"type":"string","enum":["progress","risk","finding"]}},"required":["message"]}}}),
+        json!({"type":"function","function":{"name":"report_blocker","description":"Report an operational environment or platform problem that is impeding work. This records and visibly reports the problem without changing control flow; use ask_user separately when a user decision is required.","parameters":{"type":"object","properties":{"severity":{"type":"string","enum":["hard","soft","friction"]},"category":{"type":"string","enum":["environment","platform","dependency","host","tool"]},"summary":{"type":"string"},"details":{"type":"string"},"attempted":{"type":"string"},"next_step":{"type":"string"}},"required":["severity","category","summary"]}}}),
         json!({"type":"function","function":{"name":"linear_get_issue","description":"Read a Linear issue by identifier. Read-only.","parameters":{"type":"object","properties":{"identifier":{"type":"string"}},"required":["identifier"]}}}),
         json!({"type":"function","function":{"name":"linear_list_my_issues","description":"List Linear issues assigned to the current user. Read-only.","parameters":{"type":"object","properties":{"limit":{"type":"integer"}}}}}),
         json!({"type":"function","function":{"name":"linear_comment_issue","description":"Add a comment to a Linear issue. Requires approval.","parameters":{"type":"object","properties":{"issue_id":{"type":"string"},"body":{"type":"string"}},"required":["issue_id","body"]}}}),
@@ -6564,6 +6587,7 @@ fn filter_allowed_tools(mut tools: Vec<Value>, allowed: Option<&HashSet<String>>
                                 | "report_blocker"
                         )
                 })
+                .is_some_and(|name| allowed.contains(name))
         });
     }
     tools
