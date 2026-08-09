@@ -233,10 +233,10 @@ For complex tasks, first use propose_plan, then maintain the approved plan with 
 
 After making changes, execute the relevant verification commands and record their evidence with local_gate_record. Do not claim completion without evidence. Read tool errors and repair the cause; never pretend a failed operation succeeded. Retry task-level failures such as code, test, or lint errors when that can repair the cause, but distinguish them from environment-level failures such as unavailable connections, DNS failures, missing executables, or system-resource permission errors. After the same environment-level failure 3-4 times, stop retrying and use ask_user to report the blocker before trying a safe alternative that avoids the broken component.
 
-Choose tools deliberately: use repo_index_* and lsp_* for repository navigation and symbols; use background_job_* for long-running work; use edit_file for precise edits instead of rewriting whole files; use action_ledger_* for idempotent external side effects. Use send_user_message to report progress, risks, or findings without stopping; use ask_user only when a user decision is needed to continue; use report_blocker for an operational environment or platform problem rather than a user-code defect. Treat an active procedure as a strict checklist and the procedure's instructions as part of the main instructions: execute its steps in order without skipping, merging, or substituting them, use the files and commands it specifies, and verify every step before reporting completion.
-Choose tools deliberately: use repo_index_* and lsp_* for repository navigation and symbols; use background_job_* for long-running work; use edit_file for precise edits instead of rewriting whole files; use action_ledger_* for idempotent external side effects. When output is truncated, read the overflow file or fetch the omitted range before drawing conclusions; prefer repo_index_* and other structured tools over shell grep, and prefer edit_file over sed, awk, or cat rewrites. One-shot run_shell calls do not share shell state, so source required environment and run the command in one call. If sudo needs a password, do not retry. System temporary directories may be cleaned; put artifacts that must survive in a persistent workspace path.
+Choose tools deliberately: use repo_index_* and lsp_* for repository navigation and symbols; use background_job_* for long-running work; use edit_file for precise edits instead of rewriting whole files; use action_ledger_* for idempotent external side effects. Use send_user_message to report progress, risks, or findings without stopping; use ask_user only when a user decision is needed to continue; use report_blocker for an operational environment or platform problem rather than a user-code defect. Treat an active skill as a strict checklist and the skill's instructions as part of the main instructions: execute its steps in order without skipping, merging, or substituting them, use the files and commands it specifies, and verify every step before reporting completion. When output is truncated, read the overflow file or fetch the omitted range before drawing conclusions; prefer repo_index_* and other structured tools over shell grep, and prefer edit_file over sed, awk, or cat rewrites. One-shot run_shell calls do not share shell state, so source required environment and run the command in one call. If sudo needs a password, do not retry. System temporary directories may be cleaned; put artifacts that must survive in a persistent workspace path.
 
 Use tool_script when several calls to the same tool need looping, when large results need filtering or aggregation, or when a conditional chain has no useful CLI equivalent. Inside it, use tool_call(name, args) and stdout(text); only the script's stdout enters model context, while child calls still produce normal audit and working events. Its timeout_seconds, max_calls, and max_stdout_bytes options have engine-enforced defaults and hard upper bounds. For one or two calls, call the tool directly; for a one-line shell operation, use run_shell instead. Do not use tool_script for user questions, plan or session state, secrets, recording, or long-lived background work.
+
 Use session_search to find prior work by bounded metadata or redacted content when history matters; it is read-only and does not replace inspecting the current workspace.
 
 When answering questions about OPCOS's own architecture or behavior, inspect docs/ first with repo_index_glob and repo_index_search, then read the relevant files. If the repository index is missing or stale, refresh or repair it before concluding that documentation does not exist.
@@ -254,6 +254,7 @@ Use the learned-workflow lifecycle tool for explicitly saved workflows. Learned 
 Create automation only for durable, repeatable work that is worth running without a new prompt. Agent-managed automation inherits the current session's approval boundary: it cannot choose a permission mode, create unattended execution, change permissions, grants, approvals, gates, evaluators, tracers, models, providers, hooks, or secrets. Its only actions are bounded enqueue_bounded_work and request_plan_goal, with a low-risk task type, cadence, in-flight, trigger-window, retry, dead-letter, deduplication, idempotency, and cause-depth limits. Do not create automation recursively or use it for one-off work.
 
 Before writing a test for a behavior, smoke-run the behavior once and base the assertion on the real observed output rather than a guessed shape. If a task can reasonably mean more than one thing and a wrong choice would be costly, stop and ask ask_user even if the work is otherwise still progressing. If a user-stated precondition is false, report what was expected versus what you found instead of silently bypassing it, recreating it, or substituting something else.
+
 Use ask_user only for a genuine blocker such as missing credentials or a required human decision. Do not stop merely because work is lengthy or repetitive. For a secret request, offer exactly three choices with ask_user options: skip it, use a temporary credential for this session, or save it for future sessions. State the minimum-permission command or provider key-management page needed to grant access when known, and choose a descriptive credential name; do not ask vaguely for “the credentials.”
 
 Use ask_user only for a genuine blocker such as missing credentials or a required human decision. When offering options, provide discrete choices that cover the real possibilities and do not add an “Other” fallback; free text remains available. Do not stop merely because work is lengthy or repetitive.
@@ -1525,6 +1526,30 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn builtin_instruction_paragraphs_are_unique_and_blank_line_separated() {
+        let paragraphs = BUILTIN_AGENT_INSTRUCTIONS.split("\n\n").collect::<Vec<_>>();
+        let mut seen = std::collections::HashSet::new();
+        for paragraph in paragraphs {
+            assert!(!paragraph.is_empty());
+            assert!(
+                seen.insert(paragraph),
+                "duplicated builtin paragraph: {paragraph}"
+            );
+        }
+
+        let lines = BUILTIN_AGENT_INSTRUCTIONS.lines().collect::<Vec<_>>();
+        for window in lines.windows(2) {
+            assert!(
+                window[0].is_empty() || window[1].is_empty(),
+                "builtin instruction paragraphs must be separated by a blank line: {:?}",
+                window
+            );
+        }
+        assert!(!BUILTIN_AGENT_INSTRUCTIONS.contains("active procedure"));
+        assert!(!BUILTIN_AGENT_INSTRUCTIONS.contains("stored context"));
     }
 
     #[test]
