@@ -24,8 +24,9 @@ use opcos_assets::{
 use opcos_engine::SecretScrubber;
 use opcos_engine::{
     AcpHarness, AcpHarnessConfig, AgentEngine, ArtifactReference, ArtifactRequest, ArtifactSink,
-    EngineError, ExternalContextAttachment, Harness, LifecycleHook, LifecycleHookConfig,
-    PreflightDecision, SessionRecorder, ToolExecutor, ToolOrigin, TurnEngine,
+    CapturedFrame, EngineError, ExternalContextAttachment, Harness, LifecycleHook,
+    LifecycleHookConfig, PreflightDecision, RecordingSource, SessionRecorder, ToolExecutor,
+    ToolOrigin, TurnEngine,
     computer_use::{
         BestEffortScreenshotChangedVerifier, ComputerUseLoopConfig, ComputerUseStep,
         run_computer_use_loop,
@@ -849,6 +850,63 @@ struct LocalExecutor {
 enum DesktopExecutor {
     Remote(Box<RemoteExecutor>),
     Local(Box<LocalExecutor>),
+}
+
+#[async_trait]
+impl RecordingSource for DesktopExecutor {
+    async fn capture_frame(&self, source: &str) -> Result<CapturedFrame, String> {
+        let screenshot = match self {
+            Self::Remote(executor) => {
+                if source == "browser" {
+                    return Err("remote browser recording is unsupported".into());
+                }
+                let host = RvmHost::new(
+                    executor.host_id.clone(),
+                    executor.workspace.clone(),
+                    executor.client.clone(),
+                );
+                host.screenshot().await
+            }
+            Self::Local(executor) => {
+                if source == "browser" {
+                    let value = executor
+                        .browser
+                        .execute(BrowserRequest {
+                            operation: "screenshot".into(),
+                            arguments: json!({}),
+                        })
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let image = value
+                        .get("image")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "browser screenshot image is missing".to_owned())?;
+                    return Ok(CapturedFrame {
+                        content: base64::engine::general_purpose::STANDARD
+                            .decode(image)
+                            .map_err(|error| format!("screenshot base64 is invalid: {error}"))?,
+                        mime: "image/png".into(),
+                        source: "browser".into(),
+                    });
+                }
+                executor.host.screenshot().await
+            }
+        }
+        .map_err(|error| error.to_string())?;
+        let mime = match screenshot.format.as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            _ => "image/png",
+        };
+        let content = base64::engine::general_purpose::STANDARD
+            .decode(screenshot.image)
+            .map_err(|error| format!("screenshot base64 is invalid: {error}"))?;
+        Ok(CapturedFrame {
+            content,
+            mime: mime.into(),
+            source: source.into(),
+        })
+    }
 }
 
 fn reject_learned_secret(text: &str, known: &[String]) -> Result<(), String> {
@@ -4049,6 +4107,12 @@ impl ToolExecutor for RemoteExecutor {
         if name == "ask_user" {
             return Err("ask_user must be handled by the engine pending mechanism".into());
         }
+        if matches!(
+            name,
+            "recording_start" | "recording_annotate" | "recording_stop"
+        ) {
+            return Err("engine-native tool must be handled by the engine".into());
+        }
         let argument = |key: &str| {
             arguments
                 .get(key)
@@ -4459,6 +4523,12 @@ impl ToolExecutor for DesktopExecutor {
                 }
                 if name == "ask_user" {
                     return Err("ask_user must be handled by the engine pending mechanism".into());
+                }
+                if matches!(
+                    name,
+                    "recording_start" | "recording_annotate" | "recording_stop"
+                ) {
+                    return Err("engine-native tool must be handled by the engine".into());
                 }
                 if matches!(
                     name,
@@ -10906,6 +10976,7 @@ async fn engine_for_with_context(
     };
     let provider_defaults = provider.capabilities(&model);
     let permission_mode = parse_permission_mode(&mode).unwrap_or(PermissionMode::Interactive);
+    let recording_source = Arc::clone(&executor);
     let mut engine = TurnEngine::new(
         provider,
         Arc::clone(&state.store),
@@ -10922,6 +10993,7 @@ async fn engine_for_with_context(
         session_id: session_id.to_owned(),
         host_id: host_id.clone(),
     }));
+    engine.set_recording_source(recording_source);
     let discovered_caps = provider_models_for_state(
         state,
         provider_id.clone(),
@@ -13576,6 +13648,9 @@ fn builtin_allowed_tools(include_local_lsp: bool, include_edit_file: bool) -> Ve
         "skill_search_learned",
         "skill_get_learned",
         "ask_user",
+        "recording_start",
+        "recording_annotate",
+        "recording_stop",
         "secrets_list",
         "repo_index_find_symbol",
         "repo_index_glob",
