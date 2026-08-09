@@ -5306,7 +5306,7 @@ struct ScriptLimits {
 fn script_tool_class(name: &str) -> Option<ScriptToolClass> {
     let class = match name {
         "tool_script" => ScriptToolClass::ScriptOrchestration,
-        "ask_user" => ScriptToolClass::UserInteraction,
+        "ask_user" | "send_user_message" | "report_blocker" => ScriptToolClass::UserInteraction,
         "propose_plan" | "plan_get" | "plan_update" | "plan_revise" => ScriptToolClass::PlanState,
         "secrets_list" => ScriptToolClass::SecretManagement,
         "action_ledger_begin"
