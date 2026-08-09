@@ -88,6 +88,7 @@ pub enum ToolErrorCode {
     HostIo,
     McpTransport,
     McpAuth,
+    ToolNotDescribed,
     Unclassified,
 }
 
@@ -921,6 +922,8 @@ pub struct TurnEngine<P, S, E> {
     lifecycle_hooks: Mutex<Option<LifecycleHookConfig>>,
     hook_context: Mutex<Vec<String>>,
     external_tools: Mutex<Vec<Value>>,
+    progressive_tool_disclosure: AtomicBool,
+    described_tools: Mutex<HashSet<String>>,
     allowed_tools: Mutex<Option<HashSet<String>>>,
     linear_tools_enabled: AtomicBool,
     github_tools_enabled: AtomicBool,
@@ -1195,6 +1198,8 @@ where
             lifecycle_hooks: Mutex::new(None),
             hook_context: Mutex::new(Vec::new()),
             external_tools: Mutex::new(Vec::new()),
+            progressive_tool_disclosure: AtomicBool::new(false),
+            described_tools: Mutex::new(HashSet::new()),
             allowed_tools: Mutex::new(None),
             linear_tools_enabled: AtomicBool::new(false),
             github_tools_enabled: AtomicBool::new(false),
@@ -1264,16 +1269,32 @@ where
         self.external_tools.lock().await.extend(tools);
     }
 
+    pub fn set_progressive_tool_disclosure(&self, enabled: bool) {
+        self.progressive_tool_disclosure
+            .store(enabled, Ordering::SeqCst);
+    }
+
+    pub fn progressive_tool_disclosure(&self) -> bool {
+        self.progressive_tool_disclosure.load(Ordering::SeqCst)
+    }
+
     pub async fn set_allowed_tools(&self, tools: impl IntoIterator<Item = String>) {
         *self.allowed_tools.lock().await = Some(tools.into_iter().collect());
     }
 
     pub fn set_linear_tools_enabled(&self, enabled: bool) {
-        self.linear_tools_enabled.store(enabled, Ordering::SeqCst);
+        self.set_connector_tools_enabled("linear", enabled);
     }
 
     pub fn set_connector_tools_enabled(&self, kind: &str, enabled: bool) {
+        if !CONNECTOR_TOOL_PREFIXES
+            .iter()
+            .any(|(connector, _)| *connector == kind)
+        {
+            return;
+        }
         let target = match kind {
+            "linear" => &self.linear_tools_enabled,
             "github" => &self.github_tools_enabled,
             "telegram" => &self.telegram_tools_enabled,
             "discord" => &self.discord_tools_enabled,
@@ -1285,6 +1306,21 @@ where
             _ => return,
         };
         target.store(enabled, Ordering::SeqCst);
+    }
+
+    fn connector_tools_enabled(&self, kind: &str) -> bool {
+        match kind {
+            "linear" => self.linear_tools_enabled.load(Ordering::SeqCst),
+            "github" => self.github_tools_enabled.load(Ordering::SeqCst),
+            "telegram" => self.telegram_tools_enabled.load(Ordering::SeqCst),
+            "discord" => self.discord_tools_enabled.load(Ordering::SeqCst),
+            "slack" => self.slack_tools_enabled.load(Ordering::SeqCst),
+            "notion" => self.notion_tools_enabled.load(Ordering::SeqCst),
+            "gitlab" => self.gitlab_tools_enabled.load(Ordering::SeqCst),
+            "jira" => self.jira_tools_enabled.load(Ordering::SeqCst),
+            "stripe" => self.stripe_tools_enabled.load(Ordering::SeqCst),
+            _ => false,
+        }
     }
 
     pub fn set_message_usage_limit(&self, limit: u64) {
@@ -1374,6 +1410,95 @@ where
 
     async fn take_hook_context(&self) -> Vec<String> {
         std::mem::take(&mut *self.hook_context.lock().await)
+    }
+
+    async fn disclosure_definitions(&self) -> Vec<Value> {
+        let mut definitions = tool_definitions();
+        definitions.extend(
+            self.external_tools
+                .lock()
+                .await
+                .iter()
+                .cloned()
+                .map(mcp_tool_definition),
+        );
+        if let Some(allowed) = self.allowed_tools.lock().await.clone() {
+            definitions.retain(|definition| {
+                tool_name(definition).is_some_and(|name| allowed.contains(name))
+            });
+        }
+        for (kind, prefix) in CONNECTOR_TOOL_PREFIXES {
+            if !self.connector_tools_enabled(kind) {
+                definitions.retain(|definition| {
+                    !tool_name(definition).is_some_and(|name| name.starts_with(prefix))
+                });
+            }
+        }
+        definitions
+    }
+
+    async fn execute_disclosure_tool(&self, call: &ToolCall) -> Option<Value> {
+        if !self.progressive_tool_disclosure() {
+            return None;
+        }
+        if call.name == "tool_search" {
+            let query = call
+                .arguments
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let terms = query.split_whitespace().collect::<Vec<_>>();
+            let entries = self
+                .disclosure_definitions()
+                .await
+                .into_iter()
+                .filter(|definition| {
+                    tool_name(definition).is_some_and(|name| {
+                        is_progressive_catalog_tool(name)
+                            && (terms.is_empty()
+                                || terms.iter().all(|term| {
+                                    name.to_ascii_lowercase().contains(term)
+                                        || definition
+                                            .pointer("/function/description")
+                                            .and_then(Value::as_str)
+                                            .is_some_and(|purpose| {
+                                                purpose.to_ascii_lowercase().contains(term)
+                                            })
+                                }))
+                    })
+                })
+                .filter_map(|definition| catalog_entry(&definition))
+                .collect::<Vec<_>>();
+            return Some(json!({"tools": entries}));
+        }
+        if call.name == "tool_describe" {
+            let name = call.arguments.get("name").and_then(Value::as_str);
+            let Some(name) = name else {
+                return Some(classify_tool_error(call, "missing string argument: name"));
+            };
+            let definition = self
+                .disclosure_definitions()
+                .await
+                .into_iter()
+                .find(|definition| tool_name(definition) == Some(name));
+            let Some(definition) = definition else {
+                return Some(classify_tool_error(call, format!("unknown tool: {name}")));
+            };
+            self.described_tools.lock().await.insert(name.to_owned());
+            return Some(json!({"tool": definition}));
+        }
+        if self
+            .disclosure_definitions()
+            .await
+            .iter()
+            .any(|definition| tool_name(definition) == Some(call.name.as_str()))
+            && is_progressive_catalog_tool(&call.name)
+            && !self.described_tools.lock().await.contains(&call.name)
+        {
+            return Some(tool_not_described_error(call));
+        }
+        None
     }
 
     async fn execute_tool_with_hooks(&self, call: &ToolCall) -> Value {
@@ -2329,32 +2454,8 @@ where
                         tools,
                         allowed.as_ref().and_then(|value| value.as_ref()),
                     );
-                    if !self.linear_tools_enabled.load(Ordering::SeqCst) {
-                        tools.retain(|tool| {
-                            !tool
-                                .get("function")
-                                .and_then(|function| function.get("name"))
-                                .and_then(Value::as_str)
-                                .is_some_and(|name| name.starts_with("linear_"))
-                        });
-                    }
-                    for (prefix, enabled) in [
-                        ("github_", self.github_tools_enabled.load(Ordering::SeqCst)),
-                        (
-                            "telegram_",
-                            self.telegram_tools_enabled.load(Ordering::SeqCst),
-                        ),
-                        (
-                            "discord_",
-                            self.discord_tools_enabled.load(Ordering::SeqCst),
-                        ),
-                        ("slack_", self.slack_tools_enabled.load(Ordering::SeqCst)),
-                        ("notion_", self.notion_tools_enabled.load(Ordering::SeqCst)),
-                        ("gitlab_", self.gitlab_tools_enabled.load(Ordering::SeqCst)),
-                        ("jira_", self.jira_tools_enabled.load(Ordering::SeqCst)),
-                        ("stripe_", self.stripe_tools_enabled.load(Ordering::SeqCst)),
-                    ] {
-                        if !enabled {
+                    for (kind, prefix) in CONNECTOR_TOOL_PREFIXES {
+                        if !self.connector_tools_enabled(kind) {
                             tools.retain(|tool| {
                                 !tool
                                     .get("function")
@@ -2363,6 +2464,20 @@ where
                                     .is_some_and(|name| name.starts_with(prefix))
                             });
                         }
+                    }
+                    if !self.progressive_tool_disclosure() {
+                        tools.retain(|tool| {
+                            !matches!(tool_name(tool), Some("tool_search" | "tool_describe"))
+                        });
+                    } else {
+                        let described = self.described_tools.lock().await.clone();
+                        tools.retain(|tool| {
+                            tool_name(tool).is_some_and(|name| {
+                                !is_progressive_catalog_tool(name)
+                                    || described.contains(name)
+                                    || matches!(name, "tool_search" | "tool_describe")
+                            })
+                        });
                     }
                     tools
                 },
@@ -2820,6 +2935,9 @@ where
         call: &ToolCall,
         context: &ToolDispatchContext,
     ) -> Result<ToolDispatchResult, EngineError> {
+        if let Some(result) = self.execute_disclosure_tool(call).await {
+            return Ok(ToolDispatchResult::Completed(result));
+        }
         let mode = *self.mode.lock().await;
         if call.name == "ask_user" || (call.name == "propose_plan" && mode == PermissionMode::Plan)
         {
@@ -5475,6 +5593,8 @@ fn computer_use_parameters_schema() -> Value {
 
 fn tool_definitions() -> Vec<Value> {
     let mut tools = vec![
+        json!({"type":"function","function":{"name":"tool_search","description":"Search the compact catalog of deferred tools by name or purpose.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}),
+        json!({"type":"function","function":{"name":"tool_describe","description":"Load the complete schema for a deferred tool before calling it.","parameters":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}}}),
         json!({"type":"function","function":{"name":"read_file","description":"Read a remote file.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}),
         json!({"type":"function","function":{"name":"write_file","description":"Write a remote file. For changes to an existing file, prefer edit_file so unrelated content is preserved.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
         json!({"type":"function","function":{"name":"edit_file","description":"Apply one or more exact replacements to a remote UTF-8 text file. The required edits argument is an array of objects, each with old_string and new_string strings. Example: {\"path\":\"src/lib.rs\",\"edits\":[{\"old_string\":\"old code\",\"new_string\":\"new code\"}]}. Every old_string must match exactly once in the original file; ambiguous or missing matches fail with diagnostics. The whole call is atomic and preserves line endings. Prefer this over rewriting an existing file.","parameters":{"type":"object","examples":[{"path":"src/lib.rs","edits":[{"old_string":"old code","new_string":"new code"}]}],"properties":{"path":{"type":"string","description":"Remote workspace-relative file path."},"edits":{"type":"array","description":"One or more exact replacements, applied atomically.","minItems":1,"items":{"type":"object","properties":{"old_string":{"type":"string","description":"Exact existing text to replace, including whitespace and line breaks."},"new_string":{"type":"string","description":"Replacement text."}},"required":["old_string","new_string"],"additionalProperties":false}}},"required":["path","edits"],"additionalProperties":false}}}),
@@ -5546,6 +5666,111 @@ fn tool_definitions() -> Vec<Value> {
     tools
 }
 
+fn tool_name(definition: &Value) -> Option<&str> {
+    definition
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+}
+
+const CONNECTOR_TOOL_PREFIXES: &[(&str, &str)] = &[
+    ("linear", "linear_"),
+    ("github", "github_"),
+    ("telegram", "telegram_"),
+    ("discord", "discord_"),
+    ("slack", "slack_"),
+    ("notion", "notion_"),
+    ("gitlab", "gitlab_"),
+    ("jira", "jira_"),
+    ("stripe", "stripe_"),
+];
+
+fn is_progressive_catalog_tool(name: &str) -> bool {
+    name.starts_with("browser_")
+        || name.starts_with("mcp:")
+        || name.contains("__")
+        || CONNECTOR_TOOL_PREFIXES
+            .iter()
+            .any(|(_, prefix)| name.starts_with(prefix))
+}
+
+fn tool_input_shape(definition: &Value) -> String {
+    let parameters = definition
+        .pointer("/function/parameters")
+        .and_then(Value::as_object);
+    let properties = parameters
+        .and_then(|parameters| parameters.get("properties"))
+        .and_then(Value::as_object)
+        .map(|properties| properties.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if properties.is_empty() {
+        "no arguments".to_owned()
+    } else {
+        format!("object with fields: {}", properties.join(", "))
+    }
+}
+
+fn first_useful_call(definition: &Value) -> String {
+    let name = tool_name(definition).unwrap_or("tool");
+    let required = definition
+        .pointer("/function/parameters/required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|field| format!("{field}=…"))
+        .collect::<Vec<_>>();
+    format!("{name}({})", required.join(", "))
+}
+
+fn compact_purpose(definition: &Value) -> String {
+    const MAX_PURPOSE_CHARS: usize = 160;
+    let purpose = definition
+        .pointer("/function/description")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .split_once('.')
+        .map_or_else(
+            || {
+                definition
+                    .pointer("/function/description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            },
+            |(first_sentence, _)| first_sentence,
+        )
+        .trim();
+    purpose.chars().take(MAX_PURPOSE_CHARS).collect()
+}
+
+fn catalog_entry(definition: &Value) -> Option<Value> {
+    let function = definition.get("function")?;
+    let name = function.get("name")?.as_str()?;
+    Some(json!({
+        "name": name,
+        "purpose": compact_purpose(definition),
+        "input_shape": tool_input_shape(definition),
+        "first_useful_call": first_useful_call(definition),
+    }))
+}
+
+fn tool_not_described_error(call: &ToolCall) -> Value {
+    structured_tool_error(
+        format!(
+            "tool {} is available in the catalog but has not been described",
+            call.name
+        ),
+        ToolErrorEnvelope::new(
+            ToolErrorCode::ToolNotDescribed,
+            "catalog tools must be described before direct invocation",
+            call.name.clone(),
+            format!("call tool_describe(name=\"{}\") and then retry", call.name),
+            ToolErrorRetry::Adjusted,
+            Some("use tool_search(query) to find catalog entries".into()),
+        ),
+    )
+}
+
 pub fn builtin_tool_names() -> HashSet<String> {
     tool_definitions()
         .into_iter()
@@ -5556,6 +5781,43 @@ pub fn builtin_tool_names() -> HashSet<String> {
                 .map(str::to_owned)
         })
         .collect()
+}
+
+pub fn builtin_tool_definition_tokens() -> u64 {
+    serde_json::to_vec(&tool_definitions())
+        .map(|value| value.len() as u64 / 4)
+        .unwrap_or_default()
+}
+
+pub fn builtin_tool_catalog_tokens() -> u64 {
+    let entries = tool_definitions()
+        .iter()
+        .filter(|definition| tool_name(definition).is_some_and(is_progressive_catalog_tool))
+        .filter_map(catalog_entry)
+        .collect::<Vec<_>>();
+    serde_json::to_vec(&entries)
+        .map(|value| value.len() as u64 / 4)
+        .unwrap_or_default()
+}
+
+pub fn builtin_full_tool_catalog_tokens() -> u64 {
+    let entries = tool_definitions()
+        .iter()
+        .filter(|definition| tool_name(definition).is_some_and(is_progressive_catalog_tool))
+        .filter_map(|definition| {
+            let function = definition.get("function")?;
+            let name = function.get("name")?.as_str()?;
+            Some(json!({
+                "name": name,
+                "purpose": function.get("description").and_then(Value::as_str).unwrap_or(""),
+                "input_shape": tool_input_shape(definition),
+                "first_useful_call": first_useful_call(definition),
+            }))
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_vec(&entries)
+        .map(|value| value.len() as u64 / 4)
+        .unwrap_or_default()
 }
 
 pub fn coordination_tool_definitions() -> Vec<Value> {
@@ -5655,7 +5917,9 @@ fn filter_allowed_tools(mut tools: Vec<Value>, allowed: Option<&HashSet<String>>
             tool.get("function")
                 .and_then(|function| function.get("name"))
                 .and_then(Value::as_str)
-                .is_some_and(|name| allowed.contains(name))
+                .is_some_and(|name| {
+                    allowed.contains(name) || matches!(name, "tool_search" | "tool_describe")
+                })
         });
     }
     tools
@@ -5709,6 +5973,54 @@ struct PartialOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connector_tools_are_all_catalogued() {
+        let connector_tools = tool_definitions()
+            .into_iter()
+            .filter_map(|definition| tool_name(&definition).map(str::to_owned))
+            .filter(|name| {
+                CONNECTOR_TOOL_PREFIXES
+                    .iter()
+                    .any(|(_, prefix)| name.starts_with(prefix))
+            })
+            .collect::<Vec<_>>();
+        assert!(!connector_tools.is_empty());
+        assert!(
+            connector_tools
+                .iter()
+                .all(|name| is_progressive_catalog_tool(name))
+        );
+        let linear = tool_definitions()
+            .into_iter()
+            .find(|definition| tool_name(definition) == Some("linear_get_issue"))
+            .unwrap();
+        let entry = catalog_entry(&linear).unwrap();
+        assert_eq!(entry["first_useful_call"], "linear_get_issue(identifier=…)");
+        assert_eq!(entry["purpose"], "Read a Linear issue by identifier");
+    }
+
+    #[tokio::test]
+    async fn disabled_progressive_disclosure_does_not_execute_tool_search() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(FakeTools),
+            "session",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let result = engine
+            .execute_disclosure_tool(&ToolCall {
+                id: "call".into(),
+                name: "tool_search".into(),
+                arguments: json!({"query": "browser status"}),
+            })
+            .await;
+        assert!(result.is_none());
+    }
 
     #[test]
     fn external_context_content_blocks_use_standard_text_fields() {

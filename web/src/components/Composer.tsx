@@ -164,6 +164,8 @@ interface Props {
   // when" is one mental model. Absent handler = no toggle (e.g. Chat).
   unattended?: boolean;
   onUnattendedChange?: (on: boolean) => void;
+  progressiveToolDisclosure?: boolean;
+  onProgressiveToolDisclosureChange?: (on: boolean) => void;
   approvalSlot?: ReactNode;
   // Push text + attachments into the composer (e.g. a start-panel task card). The `nonce` makes
   // repeated identical prefills re-apply; the user can still edit before sending.
@@ -669,6 +671,10 @@ export function Composer(props: Props) {
               onModeChange={props.onModeChange}
               unattended={props.unattended}
               onUnattendedChange={props.onUnattendedChange}
+              progressiveToolDisclosure={props.progressiveToolDisclosure}
+              onProgressiveToolDisclosureChange={
+                props.onProgressiveToolDisclosureChange
+              }
             />
           ) : null}
           {props.harness === "acp" &&
@@ -1198,11 +1204,15 @@ function ModeMenu({
   onModeChange,
   unattended,
   onUnattendedChange,
+  progressiveToolDisclosure,
+  onProgressiveToolDisclosureChange,
 }: {
   mode: string;
   onModeChange: (mode: string) => void;
   unattended?: boolean;
   onUnattendedChange?: (on: boolean) => void;
+  progressiveToolDisclosure?: boolean;
+  onProgressiveToolDisclosureChange?: (on: boolean) => void;
 }) {
   const [open, setOpen] = useState(false);
   const current = PERMISSION_OPTIONS.find((o) => o.value === mode);
@@ -1273,6 +1283,27 @@ function ModeMenu({
                     checked={!!unattended}
                     onChange={onUnattendedChange}
                     title={translate("Send approvals to the Inbox")}
+                  />
+                </div>
+              </>
+            )}
+            {onProgressiveToolDisclosureChange && (
+              <>
+                <div className="my-1 border-t border-line" />
+                <div className="flex items-center gap-2 px-2.5 py-1.5">
+                  <span className="flex-1 min-w-0">
+                    <span className="block text-[13px] text-ink">
+                      Progressive tool disclosure
+                    </span>
+                    <span className="block text-[11px] text-faint leading-snug">
+                      Search the catalog before loading connector and browser
+                      schemas.
+                    </span>
+                  </span>
+                  <Toggle
+                    checked={!!progressiveToolDisclosure}
+                    onChange={onProgressiveToolDisclosureChange}
+                    title="Progressive tool disclosure"
                   />
                 </div>
               </>

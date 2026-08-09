@@ -1317,6 +1317,12 @@ pub trait SessionStore {
     ) -> Result<(), StoreError>;
     fn set_unattended(&self, session_id: &str, unattended: bool) -> Result<(), StoreError>;
     fn is_unattended(&self, session_id: &str) -> Result<bool, StoreError>;
+    fn set_progressive_tool_disclosure(
+        &self,
+        session_id: &str,
+        enabled: bool,
+    ) -> Result<(), StoreError>;
+    fn progressive_tool_disclosure(&self, session_id: &str) -> Result<bool, StoreError>;
     fn list_inbox(&self) -> Result<Vec<InboxRecord>, StoreError>;
     fn get_inbox(&self, session_id: &str, call_id: &str)
     -> Result<Option<InboxRecord>, StoreError>;
@@ -4378,9 +4384,19 @@ impl SqliteStore {
              );
              CREATE TABLE IF NOT EXISTS session_preferences (
                session_id TEXT PRIMARY KEY,
-               unattended INTEGER NOT NULL DEFAULT 0
+               unattended INTEGER NOT NULL DEFAULT 0,
+               progressive_tool_disclosure INTEGER NOT NULL DEFAULT 0
              );",
             )?;
+            if !table_columns(&connection, "session_preferences")?
+                .iter()
+                .any(|column| column == "progressive_tool_disclosure")
+            {
+                connection.execute(
+                    "ALTER TABLE session_preferences ADD COLUMN progressive_tool_disclosure INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
             if !table_columns(&connection, "project_agents")?
                 .iter()
                 .any(|column| column == "template_id")
@@ -5844,6 +5860,36 @@ impl SessionStore for SqliteStore {
         Ok(value.unwrap_or(0) != 0)
     }
 
+    fn set_progressive_tool_disclosure(
+        &self,
+        session_id: &str,
+        enabled: bool,
+    ) -> Result<(), StoreError> {
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "INSERT INTO session_preferences(session_id,progressive_tool_disclosure) VALUES (?1,?2)
+             ON CONFLICT(session_id) DO UPDATE SET progressive_tool_disclosure=excluded.progressive_tool_disclosure",
+                params![session_id, enabled],
+            )?;
+        Ok(())
+    }
+
+    fn progressive_tool_disclosure(&self, session_id: &str) -> Result<bool, StoreError> {
+        let value = self
+            .connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .query_row(
+                "SELECT progressive_tool_disclosure FROM session_preferences WHERE session_id=?1",
+                [session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(value.unwrap_or(0) != 0)
+    }
+
     fn list_inbox(&self) -> Result<Vec<InboxRecord>, StoreError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = connection.prepare(
@@ -7123,6 +7169,9 @@ mod tests {
         assert!(store.is_unattended("s").unwrap());
         store.set_unattended("s", false).unwrap();
         assert!(!store.is_unattended("s").unwrap());
+        assert!(!store.progressive_tool_disclosure("s").unwrap());
+        store.set_progressive_tool_disclosure("s", true).unwrap();
+        assert!(store.progressive_tool_disclosure("s").unwrap());
     }
 
     #[test]
