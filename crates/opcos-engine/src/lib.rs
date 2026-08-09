@@ -15,8 +15,8 @@ use opcos_store::{
 };
 use regex::Regex;
 use serde_json::{Value, json};
-use std::collections::HashMap;
-use std::collections::HashSet;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     Arc, Mutex as StdMutex,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -475,6 +475,57 @@ pub trait ArtifactSink: Send + Sync {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedFrame {
+    pub content: Vec<u8>,
+    pub mime: String,
+    pub source: String,
+}
+
+#[async_trait]
+pub trait RecordingSource: Send + Sync {
+    async fn capture_frame(&self, source: &str) -> Result<CapturedFrame, String>;
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct RecordingFrame {
+    timestamp_ms: i64,
+    artifact_id: String,
+    reused: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct RecordingAnnotation {
+    annotation_id: String,
+    annotation_type: String,
+    text: String,
+    test_start_id: Option<String>,
+    result: Option<String>,
+    timestamp_ms: i64,
+    frame_artifact_id: Option<String>,
+}
+
+struct RecordingData {
+    recording_id: String,
+    source: String,
+    started_at_ms: i64,
+    interval_ms: u64,
+    max_frames: usize,
+    max_duration_ms: u64,
+    frames: Vec<RecordingFrame>,
+    hashes: HashMap<String, String>,
+    annotations: Vec<RecordingAnnotation>,
+    test_starts: HashSet<String>,
+    truncated: bool,
+    truncation_reason: Option<String>,
+}
+
+struct RecordingRuntime {
+    data: Arc<StdMutex<RecordingData>>,
+    stop: Arc<AtomicBool>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolOrigin {
     User,
     System,
@@ -919,6 +970,8 @@ pub struct TurnEngine<P, S, E> {
     mutating_api_gate_enabled: AtomicBool,
     secret_scrubber: Arc<dyn SecretScrubber>,
     artifact_sink: Option<Arc<dyn ArtifactSink>>,
+    recording_source: Option<Arc<dyn RecordingSource>>,
+    recording: Arc<StdMutex<Option<RecordingRuntime>>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1088,6 +1141,8 @@ where
             mutating_api_gate_enabled: AtomicBool::new(true),
             secret_scrubber: Arc::new(NoopSecretScrubber),
             artifact_sink: None,
+            recording_source: None,
+            recording: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -1097,6 +1152,10 @@ where
 
     pub fn set_artifact_sink(&mut self, sink: Arc<dyn ArtifactSink>) {
         self.artifact_sink = Some(sink);
+    }
+
+    pub fn set_recording_source(&mut self, source: Arc<dyn RecordingSource>) {
+        self.recording_source = Some(source);
     }
 
     pub async fn set_system_instructions(&self, instructions: Option<String>) {
@@ -1284,6 +1343,358 @@ where
             result = self.execute_tool_with_hooks(call) => result,
             _ = self.interrupt_notify.notified() => classify_tool_error(call, "tool call interrupted"),
         }
+    }
+
+    async fn execute_recording_tool(&self, call: &ToolCall) -> Option<Value> {
+        match call.name.as_str() {
+            "recording_start" => Some(self.start_recording(call).await),
+            "recording_annotate" => Some(self.annotate_recording(call).await),
+            "recording_stop" => Some(self.stop_recording(call).await),
+            _ => None,
+        }
+    }
+
+    async fn start_recording(&self, call: &ToolCall) -> Value {
+        let Some(source) = self.recording_source.clone() else {
+            return classify_tool_error(call, "recording source is unavailable");
+        };
+        let Some(sink) = self.artifact_sink.clone() else {
+            return classify_tool_error(call, "artifact sink is unavailable");
+        };
+        let object = call.arguments.as_object();
+        let interval_ms = object
+            .and_then(|value| value.get("interval_ms"))
+            .and_then(Value::as_u64)
+            .unwrap_or(1000)
+            .max(100);
+        let max_frames = object
+            .and_then(|value| value.get("max_frames"))
+            .and_then(Value::as_u64)
+            .unwrap_or(600)
+            .clamp(1, 10_000) as usize;
+        let max_duration_ms = object
+            .and_then(|value| value.get("max_duration_seconds"))
+            .and_then(Value::as_u64)
+            .unwrap_or(600)
+            .clamp(1, 86_400)
+            .saturating_mul(1000);
+        let source_name = object
+            .and_then(|value| value.get("source"))
+            .and_then(Value::as_str)
+            .unwrap_or("desktop")
+            .to_owned();
+        if !matches!(source_name.as_str(), "desktop" | "browser") {
+            return classify_tool_error(call, "recording source must be desktop or browser");
+        }
+        let mut guard = self.recording.lock().expect("recording mutex poisoned");
+        if guard.is_some() {
+            return classify_tool_error(call, "a recording is already active");
+        }
+        let recording_id = format!("recording-{}", Uuid::new_v4());
+        let started_at_ms = now_millis();
+        let data = Arc::new(StdMutex::new(RecordingData {
+            recording_id: recording_id.clone(),
+            source: source_name.clone(),
+            started_at_ms,
+            interval_ms,
+            max_frames,
+            max_duration_ms,
+            frames: Vec::new(),
+            hashes: HashMap::new(),
+            annotations: Vec::new(),
+            test_starts: HashSet::new(),
+            truncated: false,
+            truncation_reason: None,
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let task_data = data.clone();
+        let task_stop = stop.clone();
+        let session_id = self.session_id.clone();
+        let task_source_name = source_name.clone();
+        let task_recording_id = recording_id.clone();
+        let join = tokio::spawn(async move {
+            loop {
+                if task_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let now = now_millis();
+                let (at_limit, frame_count) = {
+                    let state = task_data.lock().expect("recording data mutex poisoned");
+                    (
+                        now.saturating_sub(state.started_at_ms) as u64 >= state.max_duration_ms,
+                        state.frames.len(),
+                    )
+                };
+                if at_limit || frame_count >= max_frames {
+                    let mut state = task_data.lock().expect("recording data mutex poisoned");
+                    state.truncated = true;
+                    state.truncation_reason = Some(if at_limit {
+                        "maximum duration reached; recording truncated".into()
+                    } else {
+                        "maximum frame count reached; recording truncated".into()
+                    });
+                    break;
+                }
+                if let Ok(frame) = source.capture_frame(&task_source_name).await {
+                    let mut digest = Sha256::new();
+                    digest.update(&frame.content);
+                    let hash = format!("{:x}", digest.finalize());
+                    let previous = task_data
+                        .lock()
+                        .expect("recording data mutex poisoned")
+                        .hashes
+                        .get(&hash)
+                        .cloned();
+                    let (artifact_id, reused) = if let Some(id) = previous {
+                        (id, true)
+                    } else {
+                        let result = sink
+                            .persist(ArtifactRequest {
+                                session_id: session_id.clone(),
+                                call_id: format!("recording-frame-{task_recording_id}"),
+                                name: format!("{task_recording_id}-{hash}.png"),
+                                kind: "recording_frame".into(),
+                                mime: frame.mime,
+                                content: frame.content,
+                            })
+                            .await;
+                        let Ok(reference) = result else {
+                            continue;
+                        };
+                        let mut state = task_data.lock().expect("recording data mutex poisoned");
+                        state.hashes.insert(hash, reference.id.clone());
+                        (reference.id, false)
+                    };
+                    let limit_reached = {
+                        let mut state = task_data.lock().expect("recording data mutex poisoned");
+                        state.frames.push(RecordingFrame {
+                            timestamp_ms: now,
+                            artifact_id,
+                            reused,
+                        });
+                        if state.frames.len() >= state.max_frames {
+                            state.truncated = true;
+                            state.truncation_reason =
+                                Some("maximum frame count reached; recording truncated".into());
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if limit_reached {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+            }
+        });
+        *guard = Some(RecordingRuntime { data, stop, join });
+        drop(guard);
+        let _ = self.record_working_event(
+            "recording_started",
+            "recording",
+            json!({
+                "recording_id": recording_id,
+                "source": source_name,
+                "interval_ms": interval_ms,
+                "max_frames": max_frames,
+                "max_duration_seconds": max_duration_ms / 1000,
+            }),
+        );
+        json!({
+            "status": "started",
+            "recording_id": recording_id,
+            "interval_ms": interval_ms,
+            "max_frames": max_frames,
+            "max_duration_seconds": max_duration_ms / 1000,
+        })
+    }
+
+    async fn annotate_recording(&self, call: &ToolCall) -> Value {
+        let Some(object) = call.arguments.as_object() else {
+            return classify_tool_error(call, "recording annotation arguments must be an object");
+        };
+        let Some(recording_id) = object.get("recording_id").and_then(Value::as_str) else {
+            return classify_tool_error(call, "recording_id is required");
+        };
+        let annotation_type = object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !matches!(annotation_type, "setup" | "test_start" | "assertion") {
+            return classify_tool_error(
+                call,
+                "annotation type must be setup, test_start, or assertion",
+            );
+        }
+        let text = object
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if text.trim().is_empty() || text.chars().count() > 80 {
+            return classify_tool_error(
+                call,
+                "annotation text must be non-empty and at most 80 characters",
+            );
+        }
+        let test_start_id = object.get("test_start_id").and_then(Value::as_str);
+        let result = object.get("result").and_then(Value::as_str);
+        if annotation_type == "assertion" {
+            if !matches!(result, Some("passed" | "failed" | "untested")) {
+                return classify_tool_error(
+                    call,
+                    "assertion result must be passed, failed, or untested",
+                );
+            }
+            if test_start_id.is_none() {
+                return classify_tool_error(call, "assertion must reference a test_start");
+            }
+        }
+        let (annotation_id, frame_artifact_id) = {
+            let guard = self.recording.lock().expect("recording mutex poisoned");
+            let Some(runtime) = guard.as_ref() else {
+                return classify_tool_error(call, "no recording is active");
+            };
+            let mut state = runtime.data.lock().expect("recording data mutex poisoned");
+            if state.recording_id != recording_id {
+                return classify_tool_error(
+                    call,
+                    "recording_id does not identify the active recording",
+                );
+            }
+            if annotation_type == "assertion"
+                && !state
+                    .test_starts
+                    .contains(test_start_id.expect("checked above"))
+            {
+                return classify_tool_error(
+                    call,
+                    "assertion test_start_id was not previously recorded",
+                );
+            }
+            let annotation_id = format!("annotation-{}", Uuid::new_v4());
+            if annotation_type == "test_start" {
+                state.test_starts.insert(annotation_id.clone());
+            }
+            let frame_artifact_id = state.frames.last().map(|frame| frame.artifact_id.clone());
+            state.annotations.push(RecordingAnnotation {
+                annotation_id: annotation_id.clone(),
+                annotation_type: annotation_type.into(),
+                text: text.into(),
+                test_start_id: test_start_id.map(str::to_owned),
+                result: result.map(str::to_owned),
+                timestamp_ms: now_millis(),
+                frame_artifact_id: frame_artifact_id.clone(),
+            });
+            (annotation_id, frame_artifact_id)
+        };
+        let _ = self.record_working_event(
+            "recording_annotation",
+            "recording",
+            json!({
+                "recording_id": recording_id,
+                "annotation_id": annotation_id,
+                "annotation_type": annotation_type,
+                "text": text,
+                "test_start_id": test_start_id,
+                "result": result,
+                "frame_artifact_id": frame_artifact_id,
+            }),
+        );
+        json!({"status": "recorded", "annotation_id": annotation_id})
+    }
+
+    async fn stop_recording(&self, call: &ToolCall) -> Value {
+        let recording_id = call
+            .arguments
+            .get("recording_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let runtime = self
+            .recording
+            .lock()
+            .expect("recording mutex poisoned")
+            .take();
+        let Some(runtime) = runtime else {
+            return classify_tool_error(call, "no recording is active");
+        };
+        let data = runtime.data.clone();
+        if data
+            .lock()
+            .expect("recording data mutex poisoned")
+            .recording_id
+            != recording_id
+        {
+            *self.recording.lock().expect("recording mutex poisoned") = Some(runtime);
+            return classify_tool_error(
+                call,
+                "recording_id does not identify the active recording",
+            );
+        }
+        runtime.stop.store(true, Ordering::SeqCst);
+        let _ = runtime.join.await;
+        let (manifest, frame_count, annotation_count, truncated, truncation_reason) = {
+            let snapshot = data.lock().expect("recording data mutex poisoned");
+            let manifest = json!({
+            "recording_id": snapshot.recording_id,
+            "source": snapshot.source,
+            "started_at_ms": snapshot.started_at_ms,
+            "stopped_at_ms": now_millis(),
+            "interval_ms": snapshot.interval_ms,
+            "max_frames": snapshot.max_frames,
+            "max_duration_ms": snapshot.max_duration_ms,
+                "truncated": snapshot.truncated,
+            "truncation_reason": &snapshot.truncation_reason,
+            "frames": &snapshot.frames,
+            "annotations": &snapshot.annotations,
+            });
+            (
+                manifest,
+                snapshot.frames.len(),
+                snapshot.annotations.len(),
+                snapshot.truncated,
+                snapshot.truncation_reason.clone(),
+            )
+        };
+        let Some(sink) = self.artifact_sink.clone() else {
+            return classify_tool_error(call, "artifact sink is unavailable");
+        };
+        let content = serde_json::to_vec(&manifest).unwrap_or_default();
+        let reference = match sink
+            .persist(ArtifactRequest {
+                session_id: self.session_id.clone(),
+                call_id: call.id.clone(),
+                name: format!("{recording_id}.json"),
+                kind: "recording_manifest".into(),
+                mime: "application/json".into(),
+                content,
+            })
+            .await
+        {
+            Ok(reference) => reference,
+            Err(error) => return classify_tool_error(call, error),
+        };
+        let _ = self.record_working_event(
+            "recording_stopped",
+            "recording",
+            json!({
+                "recording_id": recording_id,
+                "manifest_artifact_id": reference.id,
+                "frame_count": frame_count,
+                "annotation_count": annotation_count,
+                "truncated": truncated,
+                "truncation_reason": truncation_reason,
+            }),
+        );
+        json!({
+            "status": "stopped",
+            "recording_id": recording_id,
+            "manifest_artifact_id": reference.id,
+            "frame_count": frame_count,
+            "annotation_count": annotation_count,
+            "truncated": truncated,
+            "truncation_reason": truncation_reason,
+        })
     }
 
     fn execute_proposed_plan(&self, call: &ToolCall) -> Value {
@@ -3082,6 +3493,9 @@ where
     }
 
     async fn execute_tool_streaming(&self, call: &ToolCall) -> Value {
+        if let Some(result) = self.execute_recording_tool(call).await {
+            return result;
+        }
         let emitted = Arc::new(AtomicUsize::new(0));
         let truncated = Arc::new(AtomicBool::new(false));
         let total_bytes = Arc::new(AtomicU64::new(0));
@@ -4012,7 +4426,10 @@ fn tool_risk(name: &str) -> ToolRisk {
         "github_get_pull_request" | "github_ci_status" | "github_ci_failure_log" => ToolRisk::Read,
         "run_shell" => ToolRisk::Execute,
         "secrets_list" => ToolRisk::Read,
-        "browser_status"
+        "recording_start"
+        | "recording_annotate"
+        | "recording_stop"
+        | "browser_status"
         | "browser_read"
         | "browser_measure"
         | "browser_assert_geometry"
@@ -4026,7 +4443,9 @@ fn tool_risk(name: &str) -> ToolRisk {
 }
 
 fn tool_event_category(name: &str) -> &'static str {
-    if name == "edit_file" {
+    if name.starts_with("recording_") {
+        "recording"
+    } else if name == "edit_file" {
         "file"
     } else if name.starts_with("repo_index_") || name == "list_dir" || name == "read_file" {
         "search"
@@ -4041,6 +4460,13 @@ fn tool_event_category(name: &str) -> &'static str {
     } else {
         "other"
     }
+}
+
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
 }
 
 fn is_major_tool(name: &str, category: &str) -> bool {
@@ -4743,6 +5169,9 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"skill_search_learned","description":"Search explicitly saved learned workflows for the current repository. Results are bounded to at most five and prominently mark source-commit mismatches as STALE CANDIDATE; model-asserted verification is not an objective fact.","parameters":{"type":"object","properties":{"query":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}}}}}}),
         json!({"type":"function","function":{"name":"skill_get_learned","description":"Read one explicitly saved learned workflow. The result includes its source commit, model-asserted verification status, version links, and stale/conflict warnings.","parameters":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}}),
         json!({"type":"function","function":{"name":"ask_user","description":"Ask the user a question and wait for an answer. When the user must choose from discrete answers, provide options; set allow_multiple to true when more than one option may be selected.","parameters":{"type":"object","properties":{"question":{"type":"string"},"options":{"type":"array","items":{"type":"string"},"description":"Optional discrete answer choices. Omit for an open-ended question."},"allow_multiple":{"type":"boolean","description":"Allow selecting more than one option from options."}},"required":["question"]}}}),
+        json!({"type":"function","function":{"name":"recording_start","description":"Explicitly start a sampled screenshot timeline for UI-test evidence. Recording is never enabled by default. Frames are sampled, adjacent identical frames are deduplicated, and the recording stops at its frame or duration limit with truncation reported in the manifest.","parameters":{"type":"object","properties":{"source":{"type":"string","enum":["desktop","browser"]},"interval_ms":{"type":"integer","minimum":100},"max_frames":{"type":"integer","minimum":1},"max_duration_seconds":{"type":"integer","minimum":1}}}}}),
+        json!({"type":"function","function":{"name":"recording_annotate","description":"Add one consolidated annotation to the active sampled screenshot timeline. Use setup for preparation, test_start for a named test (prefer the natural 'It should ...' wording), and assertion after checking one meaningful state change. Keep text under 80 characters; assertions must reference a prior test_start and include passed, failed, or untested.","parameters":{"type":"object","properties":{"recording_id":{"type":"string"},"type":{"type":"string","enum":["setup","test_start","assertion"]},"text":{"type":"string","maxLength":80},"test_start_id":{"type":"string"},"result":{"type":"string","enum":["passed","failed","untested"]}},"required":["recording_id","type","text"]}}}),
+        json!({"type":"function","function":{"name":"recording_stop","description":"Explicitly stop the active sampled screenshot timeline and persist its manifest. The manifest states whether frame or duration limits truncated capture.","parameters":{"type":"object","properties":{"recording_id":{"type":"string"}},"required":["recording_id"]}}}),
         json!({"type":"function","function":{"name":"linear_get_issue","description":"Read a Linear issue by identifier. Read-only.","parameters":{"type":"object","properties":{"identifier":{"type":"string"}},"required":["identifier"]}}}),
         json!({"type":"function","function":{"name":"linear_list_my_issues","description":"List Linear issues assigned to the current user. Read-only.","parameters":{"type":"object","properties":{"limit":{"type":"integer"}}}}}),
         json!({"type":"function","function":{"name":"linear_comment_issue","description":"Add a comment to a Linear issue. Requires approval.","parameters":{"type":"object","properties":{"issue_id":{"type":"string"},"body":{"type":"string"}},"required":["issue_id","body"]}}}),
@@ -9544,5 +9973,132 @@ mod tests {
         assert!(properties.get("from_role").is_none());
         assert_eq!(tool_risk("coordination_dispatch"), ToolRisk::External);
         assert_eq!(tool_risk("coordination_status"), ToolRisk::Read);
+    }
+
+    #[test]
+    fn recording_tools_are_registered_as_read_level_engine_tools() {
+        let tools = tool_definitions();
+        for name in ["recording_start", "recording_annotate", "recording_stop"] {
+            assert!(tools.iter().any(|tool| {
+                tool.pointer("/function/name").and_then(Value::as_str) == Some(name)
+            }));
+            assert_eq!(tool_risk(name), ToolRisk::Read);
+        }
+    }
+
+    #[tokio::test]
+    async fn recording_deduplicates_frames_and_requires_assertion_test_start() {
+        struct Source;
+        #[async_trait]
+        impl RecordingSource for Source {
+            async fn capture_frame(&self, _source: &str) -> Result<CapturedFrame, String> {
+                Ok(CapturedFrame {
+                    content: b"same-frame".to_vec(),
+                    mime: "image/png".into(),
+                    source: "desktop".into(),
+                })
+            }
+        }
+        struct Sink(Arc<StdMutex<Vec<ArtifactRequest>>>);
+        #[async_trait]
+        impl ArtifactSink for Sink {
+            async fn persist(&self, request: ArtifactRequest) -> Result<ArtifactReference, String> {
+                let id = format!("artifact-{}", self.0.lock().unwrap().len());
+                self.0.lock().unwrap().push(request.clone());
+                Ok(ArtifactReference {
+                    id,
+                    name: request.name,
+                    kind: request.kind,
+                    mime: request.mime,
+                    size_bytes: request.content.len() as u64,
+                })
+            }
+        }
+        let store = Arc::new(opcos_store::SqliteStore::open_in_memory().unwrap());
+        let artifacts = Arc::new(StdMutex::new(Vec::new()));
+        let mut engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(FakeTools),
+            "recording-test",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine.set_artifact_sink(Arc::new(Sink(artifacts.clone())));
+        engine.set_recording_source(Arc::new(Source));
+        let recording = engine
+            .start_recording(&ToolCall {
+                id: "start".into(),
+                name: "recording_start".into(),
+                arguments: json!({"interval_ms": 100, "max_frames": 3}),
+            })
+            .await;
+        let recording_id = recording["recording_id"].as_str().unwrap().to_owned();
+        let invalid = engine
+            .annotate_recording(&ToolCall {
+                id: "invalid".into(),
+                name: "recording_annotate".into(),
+                arguments: json!({
+                    "recording_id": recording_id,
+                    "type": "assertion",
+                    "text": "The state changed",
+                    "result": "passed",
+                    "test_start_id": "missing"
+                }),
+            })
+            .await;
+        assert!(invalid.get("error").is_some());
+        let start = engine
+            .annotate_recording(&ToolCall {
+                id: "annotation".into(),
+                name: "recording_annotate".into(),
+                arguments: json!({
+                    "recording_id": recording_id,
+                    "type": "test_start",
+                    "text": "It should show the result"
+                }),
+            })
+            .await;
+        let test_start_id = start["annotation_id"].as_str().unwrap().to_owned();
+        let assertion = engine
+            .annotate_recording(&ToolCall {
+                id: "assertion".into(),
+                name: "recording_annotate".into(),
+                arguments: json!({
+                    "recording_id": recording_id,
+                    "type": "assertion",
+                    "text": "Result is visible",
+                    "result": "passed",
+                    "test_start_id": test_start_id
+                }),
+            })
+            .await;
+        assert_eq!(assertion["status"], "recorded");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let stopped = engine
+            .stop_recording(&ToolCall {
+                id: "stop".into(),
+                name: "recording_stop".into(),
+                arguments: json!({"recording_id": recording_id}),
+            })
+            .await;
+        assert_eq!(stopped["status"], "stopped");
+        assert!(stopped["frame_count"].as_u64().unwrap_or_default() >= 1);
+        let requests = artifacts.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.kind == "recording_frame")
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.kind == "recording_manifest")
+                .count(),
+            1
+        );
     }
 }
