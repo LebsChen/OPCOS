@@ -3992,6 +3992,8 @@ fn tool_risk(name: &str) -> ToolRisk {
         "lsp_definition" | "lsp_references" | "lsp_diagnostics" => ToolRisk::Read,
         "skill_search_learned" | "skill_get_learned" => ToolRisk::Read,
         "skill_save_learned" => ToolRisk::Write,
+        "session_search" => ToolRisk::Read,
+        "config_asset_manage" | "learned_skill_manage" => ToolRisk::Write,
         "coordination_dispatch" => ToolRisk::External,
         "coordination_status" => ToolRisk::Read,
         "action_ledger_list" => ToolRisk::Read,
@@ -4742,6 +4744,9 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"skill_save_learned","description":"Persist a reusable workflow explicitly described by the model. Nothing is auto-captured. The verification field is only a model assertion, never an OPCOS verification; credentials or secret-like values are rejected. Learned skills never modify user-authored skills.","parameters":{"type":"object","properties":{"title":{"type":"string"},"summary":{"type":"string"},"applies_when":{"type":"string"},"steps":{"type":"array","items":{"type":"string"}},"verification":{"type":"string"},"caveats":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}},"source_commit":{"type":"string"},"model_asserted_status":{"type":"string","enum":["model_asserted_validated","model_asserted_observed","model_asserted_partial"]},"supersedes_id":{"type":"string"}},"required":["title","summary","applies_when","steps","verification","source_commit","model_asserted_status"]}}}),
         json!({"type":"function","function":{"name":"skill_search_learned","description":"Search explicitly saved learned workflows for the current repository. Results are bounded to at most five and prominently mark source-commit mismatches as STALE CANDIDATE; model-asserted verification is not an objective fact.","parameters":{"type":"object","properties":{"query":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}}}}}}),
         json!({"type":"function","function":{"name":"skill_get_learned","description":"Read one explicitly saved learned workflow. The result includes its source commit, model-asserted verification status, version links, and stale/conflict warnings.","parameters":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}}),
+        json!({"type":"function","function":{"name":"session_search","description":"Search historical OPCOS sessions by title, metadata, time, or redacted transcript content. Read-only; secret-like values are redacted before results are returned.","parameters":{"type":"object","properties":{"query":{"type":"string"},"from":{"type":"string","description":"RFC3339 lower time bound."},"to":{"type":"string","description":"RFC3339 upper time bound."},"project_id":{"type":"string"},"status":{"type":"string"},"content_scope":{"type":"string","enum":["title","messages","events","tool_calls"]},"limit":{"type":"integer","minimum":1,"maximum":100}}}}}),
+        json!({"type":"function","function":{"name":"config_asset_manage","description":"Manage agent-owned knowledge or playbook assets. Only knowledge and playbook kinds are structurally available; every mutation is versioned, auditable, reversible, and tied to the current session. Do not use this for one-off notes.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["list","get","create","update","archive","delete","enable","disable","versions","rollback"]},"kind":{"type":"string","enum":["knowledge","playbook"]},"id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"project_id":{"type":"string"},"version":{"type":"integer"}},"required":["action"]}}}),
+        json!({"type":"function","function":{"name":"learned_skill_manage","description":"Manage explicitly learned workflows without touching user-authored .agents/skills files. Mutations are tied to the current session and audited; use archive/delete/restore or rollback for lifecycle changes.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["list","get","archive","delete","restore","rollback"]},"id":{"type":"string"},"supersedes_id":{"type":"string"}},"required":["action"]}}}),
         json!({"type":"function","function":{"name":"ask_user","description":"Ask the user a question and wait for an answer. When the user must choose from discrete answers, provide options; set allow_multiple to true when more than one option may be selected.","parameters":{"type":"object","properties":{"question":{"type":"string"},"options":{"type":"array","items":{"type":"string"},"description":"Optional discrete answer choices. Omit for an open-ended question."},"allow_multiple":{"type":"boolean","description":"Allow selecting more than one option from options."}},"required":["question"]}}}),
         json!({"type":"function","function":{"name":"linear_get_issue","description":"Read a Linear issue by identifier. Read-only.","parameters":{"type":"object","properties":{"identifier":{"type":"string"}},"required":["identifier"]}}}),
         json!({"type":"function","function":{"name":"linear_list_my_issues","description":"List Linear issues assigned to the current user. Read-only.","parameters":{"type":"object","properties":{"limit":{"type":"integer"}}}}}),
@@ -5202,6 +5207,37 @@ mod tests {
         assert!(names.contains("skill_save_learned"));
         assert!(names.contains("skill_search_learned"));
         assert!(names.contains("skill_get_learned"));
+    }
+
+    #[test]
+    fn platform_management_tools_have_bounded_risk_and_surface() {
+        assert_eq!(tool_risk("session_search"), ToolRisk::Read);
+        assert_eq!(tool_risk("config_asset_manage"), ToolRisk::Write);
+        assert_eq!(tool_risk("learned_skill_manage"), ToolRisk::Write);
+        let names = tool_definitions()
+            .into_iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<HashSet<_>>();
+        for name in [
+            "session_search",
+            "config_asset_manage",
+            "learned_skill_manage",
+        ] {
+            assert!(names.contains(name), "missing builtin tool {name}");
+        }
+        let asset_kind = tool_definitions()
+            .into_iter()
+            .find(|tool| tool["function"]["name"] == "config_asset_manage")
+            .unwrap();
+        assert_eq!(
+            asset_kind["function"]["parameters"]["properties"]["kind"]["enum"],
+            json!(["knowledge", "playbook"])
+        );
     }
     #[derive(Clone)]
     struct FakeProvider;
