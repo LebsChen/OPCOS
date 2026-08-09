@@ -18,8 +18,8 @@ use futures_util::{SinkExt, StreamExt};
 use notify::Watcher;
 use opcos_assets::{
     AssetBundle, CommandArgument, CommandEntry, InstructionSource, KnowledgeContext,
-    KnowledgeEntry, Playbook, SkillEntry, builtin_mcp_catalog, discover as discover_assets,
-    expand_command, parse_blueprint, parse_command,
+    KnowledgeEntry, MemoryEntry, Playbook, SkillEntry, UserPreference, builtin_mcp_catalog,
+    discover as discover_assets, expand_command, parse_blueprint, parse_command,
 };
 use opcos_engine::SecretScrubber;
 use opcos_engine::{
@@ -876,6 +876,264 @@ fn reject_learned_secret(text: &str, known: &[String]) -> Result<(), String> {
         return Err("learned skill rejected: credential-bearing URL syntax".into());
     }
     Ok(())
+}
+
+fn reject_automatic_memory(text: &str, known: &[String]) -> Result<(), String> {
+    reject_learned_secret(text, known).map_err(|error| {
+        error
+            .replacen("learned skill", "automatic memory", 1)
+            .to_owned()
+    })?;
+    let lower = text.to_ascii_lowercase();
+    for marker in [
+        "permission rule",
+        "permissions:",
+        "approval policy",
+        "approval:",
+        "security boundary",
+        "security policy",
+        "safety boundary",
+        "gate configuration",
+        "gate policy",
+        "branch protection",
+        "access control",
+        "authorization policy",
+    ] {
+        if lower.contains(marker) {
+            return Err(format!(
+                "automatic memory rejected: protected policy content ({marker})"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn known_secret_values(secrets: &KeyringSecretStore, project_id: Option<&str>) -> Vec<String> {
+    let known_names = [
+        "github",
+        "gitlab",
+        "linear-pat",
+        "telegram",
+        "discord",
+        "slack",
+        "rvm-token",
+    ];
+    let mut known = known_names
+        .iter()
+        .flat_map(|name| {
+            [
+                scoped_secret_get_from_store(secrets, project_id, "connector-token", name),
+                scoped_secret_get_from_store(secrets, project_id, "asset-secret", name),
+                scoped_secret_get_from_store(secrets, project_id, "mcp-credential", name),
+            ]
+        })
+        .filter_map(Result::ok)
+        .flatten()
+        .collect::<Vec<_>>();
+    for provider in registry::descriptors() {
+        for prefix in ["provider-key", "asset-secret"] {
+            if let Ok(Some(value)) =
+                scoped_secret_get_from_store(secrets, project_id, prefix, &provider.name)
+            {
+                known.push(value);
+            }
+        }
+    }
+    known
+}
+
+fn automatic_memory_json(record: &opcos_store::AutomaticMemoryRecord) -> Value {
+    json!({
+        "id": record.id,
+        "repository_identity": record.repository_identity,
+        "project_id": record.project_id,
+        "identifier": record.identifier,
+        "description": record.description,
+        "source_session_id": record.source_session_id,
+        "source_task": record.source_task,
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
+        "status": record.status,
+        "supersedes_id": record.supersedes_id,
+        "superseded_by_id": record.superseded_by_id,
+        "conflict_group": record.conflict_group,
+    })
+}
+
+fn execute_automatic_memory_tool(
+    store: &SqliteStore,
+    secrets: &KeyringSecretStore,
+    project_id: Option<&str>,
+    session_id: &str,
+    workspace: &str,
+    name: &str,
+    arguments: &Value,
+) -> Result<Value, String> {
+    let repository_identity = project_id
+        .map(|id| format!("project:{id}"))
+        .unwrap_or_else(|| format!("workspace:{workspace}"));
+    match name {
+        "memory_save_automatic" => {
+            let identifier = arguments
+                .get("identifier")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or("missing memory identifier")?
+                .to_owned();
+            let description = arguments
+                .get("description")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or("missing memory description")?
+                .to_owned();
+            let source_task = arguments
+                .get("source_task")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or("missing memory source_task")?
+                .to_owned();
+            reject_automatic_memory(
+                &format!("{identifier}\n{description}\n{source_task}"),
+                &known_secret_values(secrets, project_id),
+            )?;
+            let record = store
+                .merge_automatic_memory(opcos_store::AutomaticMemoryRecord {
+                    id: String::new(),
+                    repository_identity,
+                    project_id: project_id.map(str::to_owned),
+                    identifier,
+                    description,
+                    source_session_id: session_id.to_owned(),
+                    source_task,
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                    status: "active".into(),
+                    supersedes_id: None,
+                    superseded_by_id: None,
+                    conflict_group: arguments
+                        .get("conflict_group")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                })
+                .map_err(|error| error.to_string())?;
+            Ok(json!({"saved": automatic_memory_json(&record)}))
+        }
+        "memory_list" => {
+            let records = store
+                .list_automatic_memories(
+                    &repository_identity,
+                    arguments
+                        .get("include_inactive")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(json!({
+                "memories": records.iter().map(automatic_memory_json).collect::<Vec<_>>()
+            }))
+        }
+        "memory_disable" => {
+            let id = arguments
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or("missing memory id")?;
+            store
+                .set_automatic_memory_status(id, "disabled")
+                .map_err(|error| error.to_string())?;
+            Ok(json!({"disabled": id}))
+        }
+        "memory_delete" => {
+            let id = arguments
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or("missing memory id")?;
+            let deleted = store
+                .delete_automatic_memory(id)
+                .map_err(|error| error.to_string())?;
+            Ok(json!({"deleted": deleted, "id": id}))
+        }
+        _ => Err(format!("unsupported automatic memory tool: {name}")),
+    }
+}
+
+#[tauri::command]
+fn list_automatic_memories_command(
+    state: State<'_, DesktopState>,
+    repository_identity: String,
+    include_inactive: Option<bool>,
+) -> Result<Vec<Value>, String> {
+    state
+        .store
+        .list_automatic_memories(&repository_identity, include_inactive.unwrap_or(false))
+        .map(|records| records.iter().map(automatic_memory_json).collect())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn save_automatic_memory_command(
+    state: State<'_, DesktopState>,
+    request: SaveAutomaticMemoryRequest,
+) -> Result<Value, String> {
+    reject_automatic_memory(
+        &format!(
+            "{}\n{}\n{}",
+            request.identifier, request.description, request.source_task
+        ),
+        &known_secret_values(&state.secrets, request.project_id.as_deref()),
+    )?;
+    state
+        .store
+        .merge_automatic_memory(opcos_store::AutomaticMemoryRecord {
+            id: String::new(),
+            repository_identity: request.repository_identity,
+            project_id: request.project_id,
+            identifier: request.identifier,
+            description: request.description,
+            source_session_id: request.source_session_id,
+            source_task: request.source_task,
+            created_at: String::new(),
+            updated_at: String::new(),
+            status: "active".into(),
+            supersedes_id: None,
+            superseded_by_id: None,
+            conflict_group: request.conflict_group.unwrap_or_default(),
+        })
+        .map(|record| automatic_memory_json(&record))
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+struct SaveAutomaticMemoryRequest {
+    repository_identity: String,
+    project_id: Option<String>,
+    source_session_id: String,
+    source_task: String,
+    identifier: String,
+    description: String,
+    conflict_group: Option<String>,
+}
+
+#[tauri::command]
+fn disable_automatic_memory_command(
+    state: State<'_, DesktopState>,
+    id: String,
+) -> Result<(), String> {
+    state
+        .store
+        .set_automatic_memory_status(&id, "disabled")
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn delete_automatic_memory_command(
+    state: State<'_, DesktopState>,
+    id: String,
+) -> Result<bool, String> {
+    state
+        .store
+        .delete_automatic_memory(&id)
+        .map_err(|error| error.to_string())
 }
 
 async fn learned_current_commit(host: &dyn Host, workspace: &str) -> String {
@@ -4027,6 +4285,20 @@ impl ToolExecutor for RemoteExecutor {
         }
         if matches!(
             name,
+            "memory_save_automatic" | "memory_list" | "memory_disable" | "memory_delete"
+        ) {
+            return execute_automatic_memory_tool(
+                &self.store,
+                &self.secrets,
+                self.project_id.as_deref(),
+                &self.session_id,
+                &self.workspace,
+                name,
+                &arguments,
+            );
+        }
+        if matches!(
+            name,
             "plan_get" | "plan_update" | "plan_revise" | "propose_plan"
         ) {
             return execute_plan_tool(
@@ -4444,6 +4716,20 @@ impl ToolExecutor for DesktopExecutor {
                         &arguments,
                     )
                     .await;
+                }
+                if matches!(
+                    name,
+                    "memory_save_automatic" | "memory_list" | "memory_disable" | "memory_delete"
+                ) {
+                    return execute_automatic_memory_tool(
+                        &executor.store,
+                        &executor.secrets,
+                        executor.project_id.as_deref(),
+                        &executor.session_id,
+                        &executor.workspace,
+                        name,
+                        &arguments,
+                    );
                 }
                 if matches!(
                     name,
@@ -9923,6 +10209,11 @@ fn append_session_config_assets(bundle: &mut AssetBundle, assets: Vec<SessionCon
                     content: body,
                 })
             }
+            "user_preference" => bundle.user_preferences.push(UserPreference {
+                identifier: title,
+                content: body,
+                enabled: true,
+            }),
             "rules" => bundle.agents.push(InstructionSource {
                 path: id,
                 content: body,
@@ -11125,6 +11416,27 @@ async fn engine_for_with_context(
         &mut bundle,
         load_session_config_assets(state, session_id).unwrap_or_default(),
     );
+    let repository_identity = session
+        .project_id
+        .as_deref()
+        .map(|id| format!("project:{id}"))
+        .unwrap_or_else(|| format!("workspace:{workspace}"));
+    if let Ok(memories) = state
+        .store
+        .list_automatic_memories(&repository_identity, false)
+    {
+        bundle.memories = memories
+            .into_iter()
+            .map(|memory| MemoryEntry {
+                id: memory.id,
+                identifier: memory.identifier,
+                description: memory.description,
+                source_session_id: memory.source_session_id,
+                source_task: memory.source_task,
+                enabled: memory.status == "active",
+            })
+            .collect();
+    }
     {
         let connection = state
             .database
@@ -13575,6 +13887,10 @@ fn builtin_allowed_tools(include_local_lsp: bool, include_edit_file: bool) -> Ve
         "skill_save_learned",
         "skill_search_learned",
         "skill_get_learned",
+        "memory_save_automatic",
+        "memory_list",
+        "memory_disable",
+        "memory_delete",
         "ask_user",
         "secrets_list",
         "repo_index_find_symbol",
@@ -17441,6 +17757,7 @@ fn save_asset_for_state(
         kind.as_str(),
         "instructions"
             | "knowledge"
+            | "user_preference"
             | "playbook"
             | "skill"
             | "command"
@@ -26604,6 +26921,10 @@ fn main() {
             delete_asset,
             set_asset_enabled,
             list_asset_versions,
+            list_automatic_memories_command,
+            save_automatic_memory_command,
+            disable_automatic_memory_command,
+            delete_automatic_memory_command,
             compare_asset_versions,
             rollback_asset,
             export_assets,
@@ -27375,6 +27696,14 @@ mod m7_tests {
         }
         assert!(reject_learned_secret("use known-secret here", &["known-secret".into()]).is_err());
         assert!(reject_learned_secret("safe workflow", &[]).is_ok());
+    }
+
+    #[test]
+    fn automatic_memory_rejects_secrets_and_protected_policy_content() {
+        assert!(reject_automatic_memory("remember token=abc", &[]).is_err());
+        assert!(reject_automatic_memory("remember the approval policy", &[]).is_err());
+        assert!(reject_automatic_memory("permissions: deny git push", &[]).is_err());
+        assert!(reject_automatic_memory("prefer compact summaries", &[]).is_ok());
     }
 
     #[test]
