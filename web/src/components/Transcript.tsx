@@ -583,7 +583,10 @@ export function Transcript({
           );
         if (node.kind === "notice")
           return (
-            <div className="notice warn" key={index}>
+            <div
+              className={`notice ${node.tone === "info" ? "info" : "warn"}`}
+              key={index}
+            >
               {node.text}
               {node.retriable && onRetry && !running && (
                 <button className="btn ml-2" onClick={onRetry}>

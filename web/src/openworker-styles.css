@@ -775,6 +775,9 @@ body {
 .notice.warn {
   color: var(--accent);
 }
+.notice.info {
+  color: var(--muted);
+}
 
 /* approval */
 .approval {

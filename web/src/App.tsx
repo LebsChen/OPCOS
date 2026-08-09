@@ -11389,6 +11389,24 @@ function AppContent() {
         typeof payload.payload.created_at_ms === "number" &&
         typeof payload.payload.type === "string"
       ) {
+        const streamPayload = payload.payload as {
+          working_event?: {
+            payload?: {
+              severity?: unknown;
+              summary?: unknown;
+            };
+          };
+        };
+        if (
+          payload.payload.type === "operational_blocker" &&
+          streamPayload.working_event?.payload?.severity === "hard"
+        ) {
+          const summary =
+            typeof streamPayload.working_event?.payload?.summary === "string"
+              ? streamPayload.working_event.payload.summary
+              : "An operational blocker was reported.";
+          showErrorToast(`Hard blocker: ${summary}`);
+        }
         setLiveTranscript((items) =>
           mergeEvents(items, payload.payload as unknown as TimelineEvent, true),
         );

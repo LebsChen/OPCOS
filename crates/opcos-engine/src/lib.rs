@@ -1601,6 +1601,8 @@ has failed {} times and the last error code was {}",
         }
         let result = if let Some(repeated) = self.repeated_failed_call_error(call).await {
             repeated
+        } else if matches!(call.name.as_str(), "send_user_message" | "report_blocker") {
+            self.execute_user_communication(call).await
         } else {
             let result = self.execute_tool_streaming(call).await;
             self.remember_tool_result(call, &result).await;
@@ -3317,6 +3319,11 @@ has failed {} times and the last error code was {}",
                 Ok(ToolDispatchResult::DeferredReadonly)
             }
             Decision::Allow => {
+                if matches!(call.name.as_str(), "send_user_message" | "report_blocker") {
+                    return Ok(ToolDispatchResult::Completed(
+                        self.execute_user_communication(call).await,
+                    ));
+                }
                 if call.name == "tool_script" {
                     return Ok(ToolDispatchResult::Completed(
                         self.execute_tool_script(call).await,
@@ -3870,6 +3877,93 @@ has failed {} times and the last error code was {}",
             );
         }
         result
+    }
+
+    async fn execute_user_communication(&self, call: &ToolCall) -> Value {
+        let message = call
+            .arguments
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| call.arguments.get("summary").and_then(Value::as_str))
+            .unwrap_or_default()
+            .trim();
+        if message.is_empty() {
+            return json!({"error": "missing string argument: message"});
+        }
+
+        if call.name == "send_user_message" {
+            let kind = call
+                .arguments
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("progress");
+            if !matches!(kind, "progress" | "risk" | "finding") {
+                return json!({"error": "kind must be progress, risk, or finding"});
+            }
+            let event_id = match self.record_working_event(
+                "agent_message",
+                "message",
+                json!({
+                    "call_id": call.id,
+                    "message": message,
+                    "kind": kind,
+                }),
+            ) {
+                Ok(event_id) => event_id,
+                Err(_) => return json!({"error": "failed to persist user message"}),
+            };
+            return json!({"status": "delivered", "event_id": event_id});
+        }
+
+        let severity = call
+            .arguments
+            .get("severity")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !matches!(severity, "hard" | "soft" | "friction") {
+            return json!({"error": "severity must be hard, soft, or friction"});
+        }
+        let category = call
+            .arguments
+            .get("category")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !matches!(
+            category,
+            "environment" | "platform" | "dependency" | "host" | "tool"
+        ) {
+            return json!({
+                "error": "category must be environment, platform, dependency, host, or tool"
+            });
+        }
+        let payload = json!({
+            "call_id": call.id,
+            "severity": severity,
+            "category": category,
+            "summary": message,
+            "details": call.arguments.get("details").and_then(Value::as_str),
+            "attempted": call.arguments.get("attempted").and_then(Value::as_str),
+            "next_step": call.arguments.get("next_step").and_then(Value::as_str),
+        });
+        let mut audit_payload = payload.clone();
+        self.secret_scrubber.scrub(&mut audit_payload);
+        let event_id = match self.record_working_event("operational_blocker", "notice", payload) {
+            Ok(event_id) => event_id,
+            Err(_) => return json!({"error": "failed to persist operational blocker"}),
+        };
+        if self
+            .recorder
+            .append_audit("operational_blocker", &audit_payload)
+            .is_err()
+        {
+            return json!({"error": "failed to persist operational blocker"});
+        }
+        json!({
+            "status": "reported",
+            "event_id": event_id,
+            "severity": severity,
+            "control_flow": "unchanged",
+        })
     }
 
     async fn persist_artifact(
@@ -4630,6 +4724,7 @@ has failed {} times and the last error code was {}",
         payload: Value,
     ) -> Result<(), EngineError> {
         self.record_working_event(event_type, category, payload)
+            .map(|_| ())
     }
 
     fn record_working_event(
@@ -4637,7 +4732,7 @@ has failed {} times and the last error code was {}",
         event_type: &str,
         category: &str,
         payload: Value,
-    ) -> Result<(), EngineError> {
+    ) -> Result<String, EngineError> {
         let event = WorkingEvent {
             event_type: event_type.into(),
             category: category.into(),
@@ -4658,7 +4753,6 @@ has failed {} times and the last error code was {}",
                 ..StreamChunk::default()
             },
         )
-        .map(|_| ())
     }
 
     fn emit_event(&self, event_type: &str, mut chunk: StreamChunk) -> Result<String, EngineError> {
@@ -5750,6 +5844,8 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"skill_search_learned","description":"Search explicitly saved learned workflows for the current repository. Results are bounded to at most five and prominently mark source-commit mismatches as STALE CANDIDATE; model-asserted verification is not an objective fact.","parameters":{"type":"object","properties":{"query":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}}}}}}),
         json!({"type":"function","function":{"name":"skill_get_learned","description":"Read one explicitly saved learned workflow. The result includes its source commit, model-asserted verification status, version links, and stale/conflict warnings.","parameters":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}}),
         json!({"type":"function","function":{"name":"ask_user","description":"Ask the user a question and wait for an answer. When the user must choose from discrete answers, provide options; set allow_multiple to true when more than one option may be selected.","parameters":{"type":"object","properties":{"question":{"type":"string"},"options":{"type":"array","items":{"type":"string"},"description":"Optional discrete answer choices. Omit for an open-ended question."},"allow_multiple":{"type":"boolean","description":"Allow selecting more than one option from options."}},"required":["question"]}}}),
+        json!({"type":"function","function":{"name":"send_user_message","description":"Tell the user about progress, a risk, or a finding without waiting for a response or interrupting execution.","parameters":{"type":"object","properties":{"message":{"type":"string"},"kind":{"type":"string","enum":["progress","risk","finding"]}},"required":["message"]}}}),
+        json!({"type":"function","function":{"name":"report_blocker","description":"Report an operational environment or platform problem that is impeding work. This records and visibly reports the problem without changing control flow; use ask_user separately when a user decision is required.","parameters":{"type":"object","properties":{"severity":{"type":"string","enum":["hard","soft","friction"]},"category":{"type":"string","enum":["environment","platform","dependency","host","tool"]},"summary":{"type":"string"},"details":{"type":"string"},"attempted":{"type":"string"},"next_step":{"type":"string"}},"required":["severity","category","summary"]}}}),
         json!({"type":"function","function":{"name":"linear_get_issue","description":"Read a Linear issue by identifier. Read-only.","parameters":{"type":"object","properties":{"identifier":{"type":"string"}},"required":["identifier"]}}}),
         json!({"type":"function","function":{"name":"linear_list_my_issues","description":"List Linear issues assigned to the current user. Read-only.","parameters":{"type":"object","properties":{"limit":{"type":"integer"}}}}}),
         json!({"type":"function","function":{"name":"linear_comment_issue","description":"Add a comment to a Linear issue. Requires approval.","parameters":{"type":"object","properties":{"issue_id":{"type":"string"},"body":{"type":"string"}},"required":["issue_id","body"]}}}),
@@ -6029,7 +6125,14 @@ fn filter_allowed_tools(mut tools: Vec<Value>, allowed: Option<&HashSet<String>>
                 .and_then(|function| function.get("name"))
                 .and_then(Value::as_str)
                 .is_some_and(|name| {
-                    allowed.contains(name) || matches!(name, "tool_search" | "tool_describe")
+                    allowed.contains(name)
+                        || matches!(
+                            name,
+                            "tool_search"
+                                | "tool_describe"
+                                | "send_user_message"
+                                | "report_blocker"
+                        )
                 })
         });
     }
@@ -9143,6 +9246,82 @@ mod tests {
         assert_eq!(event.payload["payload"]["allow_multiple"], false);
     }
 
+    #[tokio::test]
+    async fn user_communication_tools_persist_and_emit_without_pending() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "communications",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let calls = vec![
+            ToolCall {
+                id: "message-1".into(),
+                name: "send_user_message".into(),
+                arguments: json!({
+                    "message": "I found the relevant workspace entry.",
+                    "kind": "finding",
+                }),
+            },
+            ToolCall {
+                id: "blocker-1".into(),
+                name: "report_blocker".into(),
+                arguments: json!({
+                    "severity": "hard",
+                    "category": "host",
+                    "summary": "The remote host is unavailable.",
+                    "details": "The last connection attempt failed.",
+                }),
+            },
+            ToolCall {
+                id: "read-1".into(),
+                name: "read_file".into(),
+                arguments: json!({"path": "README.md"}),
+            },
+        ];
+        for call in &calls {
+            store
+                .append_tool_call(&opcos_store::ToolCallRecord {
+                    session_id: "communications".into(),
+                    message_sequence: 1,
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    result: None,
+                })
+                .unwrap();
+        }
+
+        let results = engine.execute_tools(1, &calls).await.unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0]["status"], "delivered");
+        assert_eq!(results[1]["status"], "reported");
+        assert_eq!(results[1]["control_flow"], "unchanged");
+        assert_eq!(results[2], json!("ok"));
+        assert!(store.load_pending("communications").unwrap().is_empty());
+
+        let events = store.load_session_events("communications").unwrap();
+        assert!(events.iter().any(|event| {
+            event.event["type"] == "agent_message"
+                && event.event["working_event"]["payload"]["message"]
+                    == "I found the relevant workspace entry."
+        }));
+        assert!(events.iter().any(|event| {
+            event.event["type"] == "operational_blocker"
+                && event.event["working_event"]["payload"]["severity"] == "hard"
+        }));
+        assert_eq!(
+            store
+                .count_audit_kind("communications", "operational_blocker")
+                .unwrap(),
+            1
+        );
+    }
+
     #[test]
     fn ask_user_tool_schema_supports_discrete_options() {
         let definition = tool_definitions()
@@ -9156,6 +9335,21 @@ mod tests {
             "boolean"
         );
         assert_eq!(parameters["required"], json!(["question"]));
+    }
+
+    #[test]
+    fn user_communication_tool_schemas_are_registered() {
+        let names = builtin_tool_names();
+        assert!(names.contains("send_user_message"));
+        assert!(names.contains("report_blocker"));
+        let blocker = tool_definitions()
+            .into_iter()
+            .find(|tool| tool["function"]["name"] == "report_blocker")
+            .expect("report_blocker tool definition");
+        assert_eq!(
+            blocker["function"]["parameters"]["properties"]["severity"]["enum"],
+            json!(["hard", "soft", "friction"])
+        );
     }
 
     #[test]
