@@ -1386,6 +1386,7 @@ pub trait SessionStore {
         stop_reason: &str,
     ) -> Result<(), StoreError>;
     fn update_session_mode(&self, session_id: &str, mode: &str) -> Result<(), StoreError>;
+    fn update_session_title(&self, session_id: &str, title: &str) -> Result<(), StoreError>;
     fn update_session_harness(&self, session_id: &str, harness: &str) -> Result<(), StoreError>;
     fn update_external_session_id(
         &self,
@@ -5519,6 +5520,21 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub fn update_session_title(&self, session_id: &str, title: &str) -> Result<(), StoreError> {
+        let changed = self
+            .connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "UPDATE sessions SET title=?1, updated_at=?2 WHERE session_id=?3",
+                params![title, Utc::now().to_rfc3339(), session_id],
+            )?;
+        if changed == 0 {
+            return Err(StoreError::SessionNotFound(session_id.into()));
+        }
+        Ok(())
+    }
+
     pub fn update_session_model(&self, session_id: &str, model: &str) -> Result<(), StoreError> {
         let changed = self
             .connection
@@ -5598,6 +5614,10 @@ impl SessionStore for SqliteStore {
 
     fn update_session_mode(&self, session_id: &str, mode: &str) -> Result<(), StoreError> {
         SqliteStore::update_session_mode(self, session_id, mode)
+    }
+
+    fn update_session_title(&self, session_id: &str, title: &str) -> Result<(), StoreError> {
+        SqliteStore::update_session_title(self, session_id, title)
     }
 
     fn update_session_harness(&self, session_id: &str, harness: &str) -> Result<(), StoreError> {

@@ -10058,6 +10058,7 @@ function SessionRightPanel({
   onWidthChange,
   eventRefreshKey,
   transcript,
+  focusTabRequest,
 }: {
   selected: Session;
   onError: (error: unknown) => void;
@@ -10070,6 +10071,7 @@ function SessionRightPanel({
   onWidthChange: (width: number) => void;
   eventRefreshKey: string;
   transcript: TimelineEvent[];
+  focusTabRequest?: PanelTab | null;
 }) {
   const [panelTab, setPanelTab] = useState<PanelTab>("info");
   const [opened, setOpened] = useState<PanelTab[]>(["info"]);
@@ -10077,6 +10079,14 @@ function SessionRightPanel({
     null,
   );
   const [iterationEvents, setIterationEvents] = useState<TimelineEvent[]>([]);
+  useEffect(() => {
+    if (!focusTabRequest) return;
+    setPanelTab(focusTabRequest);
+    setOpened((items) =>
+      items.includes(focusTabRequest) ? items : [...items, focusTabRequest],
+    );
+    onCollapsedChange?.(false);
+  }, [focusTabRequest, onCollapsedChange]);
   useEffect(() => {
     setInsights(null);
     void command<Record<string, unknown>>("session_insights", {
@@ -10914,6 +10924,10 @@ function AppContent() {
   }, [selected?.id]);
   const [homeWorkspace, setHomeWorkspace] = useState("");
   const [secretBackend, setSecretBackend] = useState("");
+  const [surfaceRequest, setSurfaceRequest] = useState<{
+    sessionId: string;
+    tab: PanelTab;
+  } | null>(null);
   const generation = useRef(0);
   const showErrorToast = (reason: unknown) => {
     const runtime = (window as Window & { __TAURI_INTERNALS__?: unknown })
@@ -11231,6 +11245,12 @@ function AppContent() {
           workingEvent?.payload && typeof workingEvent.payload === "object"
             ? (workingEvent.payload as Record<string, unknown>)
             : undefined;
+        if (workingPayload?.event_type === "desktop_view_requested") {
+          setSurfaceRequest({
+            sessionId: payload.session_id || "",
+            tab: "desktop",
+          });
+        }
         if (streamPayload.type === "user_question_answered") {
           const callId =
             typeof workingPayload?.call_id === "string"
@@ -11619,6 +11639,11 @@ function AppContent() {
           setSurface("session");
         }}
         onNew={openNewSessionHome}
+        onRenameSession={(id, title) =>
+          command("rename_session", { sessionId: id, title })
+            .then(() => refresh())
+            .catch(onError)
+        }
         onTest={(host: Host) =>
           command<Host>("test_host", { hostId: host.id })
             .then((next) =>
@@ -12260,6 +12285,11 @@ function AppContent() {
               .catch(onError)
           }
           onError={onError}
+          focusTabRequest={
+            surfaceRequest?.sessionId === selected.id
+              ? surfaceRequest.tab
+              : null
+          }
           onCollapsedChange={setDrawerCollapsed}
           width={rightPanelWidth}
           onWidthChange={setRightPanelWidth}

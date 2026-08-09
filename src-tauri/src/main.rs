@@ -3892,6 +3892,24 @@ struct IdeProxyState {
 
 #[async_trait]
 impl ToolExecutor for RemoteExecutor {
+    async fn request_desktop_view(&self, reason: Option<&str>) -> Result<Value, String> {
+        Ok(json!({
+            "status": "requested",
+            "session_id": self.session_id,
+            "surface": "desktop",
+            "reason": reason.unwrap_or_default(),
+            "idempotent": true,
+        }))
+    }
+
+    async fn rename_session(&self, title: &str) -> Result<Value, String> {
+        let title = validate_session_title(title)?;
+        self.store
+            .update_session_title(&self.session_id, &title)
+            .map_err(|error| error.to_string())?;
+        Ok(json!({"status": "renamed", "session_id": self.session_id, "title": title}))
+    }
+
     async fn run_hook_command(
         &self,
         command: &str,
@@ -4320,6 +4338,33 @@ impl ToolExecutor for RemoteExecutor {
 
 #[async_trait]
 impl ToolExecutor for DesktopExecutor {
+    async fn request_desktop_view(&self, reason: Option<&str>) -> Result<Value, String> {
+        match self {
+            Self::Remote(executor) => executor.request_desktop_view(reason).await,
+            Self::Local(_) => {
+                Err("local host does not support the remote Desktop/VNC surface".into())
+            }
+        }
+    }
+
+    async fn rename_session(&self, title: &str) -> Result<Value, String> {
+        match self {
+            Self::Remote(executor) => executor.rename_session(title).await,
+            Self::Local(executor) => {
+                let title = validate_session_title(title)?;
+                executor
+                    .store
+                    .update_session_title(&executor.session_id, &title)
+                    .map_err(|error| error.to_string())?;
+                Ok(json!({
+                    "status": "renamed",
+                    "session_id": executor.session_id,
+                    "title": title,
+                }))
+            }
+        }
+    }
+
     async fn browser_origin(&self) -> Option<String> {
         match self {
             Self::Remote(_) => None,
@@ -4350,6 +4395,18 @@ impl ToolExecutor for DesktopExecutor {
     }
 
     async fn execute(&self, name: &str, arguments: Value) -> Result<Value, String> {
+        if name == "desktop_show" {
+            return self
+                .request_desktop_view(arguments.get("reason").and_then(Value::as_str))
+                .await;
+        }
+        if name == "session_rename" {
+            let title = arguments
+                .get("title")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing string argument: title".to_owned())?;
+            return self.rename_session(title).await;
+        }
         match self {
             Self::Remote(executor) => executor.execute(name, arguments).await,
             Self::Local(executor) => {
@@ -4839,6 +4896,17 @@ impl ToolExecutor for DesktopExecutor {
             }
         }
     }
+}
+
+fn validate_session_title(title: &str) -> Result<String, String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("session title must not be empty".into());
+    }
+    if title.chars().count() > 80 {
+        return Err("session title must be at most 80 Unicode characters".into());
+    }
+    Ok(title.to_owned())
 }
 
 fn redact_json_strings(value: &mut Value, secret: &str) {
@@ -13600,6 +13668,8 @@ fn builtin_allowed_tools(include_local_lsp: bool, include_edit_file: bool) -> Ve
         "coordination_dispatch",
         "coordination_status",
         "computer_use",
+        "desktop_show",
+        "session_rename",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -15651,6 +15721,22 @@ fn get_unattended(state: State<'_, DesktopState>, session_id: String) -> Result<
         .store
         .is_unattended(&session_id)
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn rename_session(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    session_id: String,
+    title: String,
+) -> Result<(), String> {
+    let title = validate_session_title(&title)?;
+    state
+        .store
+        .update_session_title(&session_id, &title)
+        .map_err(|error| error.to_string())?;
+    emit(&app, "session_list_changed", None, json!({}));
+    Ok(())
 }
 
 #[tauri::command]
@@ -26580,6 +26666,7 @@ fn main() {
             list_inbox,
             list_pending,
             get_unattended,
+            rename_session,
             set_unattended,
             change_mode,
             resolve_inbox,
