@@ -1107,7 +1107,7 @@ mod tests {
             }),
             user_preferences: vec![UserPreference {
                 identifier: "style".into(),
-                content: "preference".into(),
+                content: "SECTION_PREFERENCE".into(),
                 enabled: true,
             }],
             agents: vec![InstructionSource {
@@ -1150,8 +1150,12 @@ mod tests {
         assert!(
             rendered.find("SECTION_GLOBAL").unwrap() < rendered.find("SECTION_AGENTS").unwrap()
         );
-        assert!(rendered.find("SECTION_GLOBAL").unwrap() < rendered.find("preference").unwrap());
-        assert!(rendered.find("preference").unwrap() < rendered.find("SECTION_AGENTS").unwrap());
+        assert!(
+            rendered.find("SECTION_GLOBAL").unwrap() < rendered.find("SECTION_PREFERENCE").unwrap()
+        );
+        assert!(
+            rendered.find("SECTION_PREFERENCE").unwrap() < rendered.find("SECTION_AGENTS").unwrap()
+        );
         assert!(
             rendered.find("SECTION_AGENTS").unwrap() < rendered.find("SECTION_KNOWLEDGE").unwrap()
         );
