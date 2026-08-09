@@ -1597,14 +1597,14 @@ where
             } else {
                 tool_risk(&call.name)
             };
-            if dispatch_attempted {
+            if matches!(risk, ToolRisk::Read | ToolRisk::Search | ToolRisk::GitRead) {
+                safe_to_retry.push(call.clone());
+            } else if dispatch_attempted {
                 blocked.push((
                     call.clone(),
                     "execution_state_unknown",
                     "The tool dispatch was attempted, but no durable result exists; execution may have completed.",
                 ));
-            } else if matches!(risk, ToolRisk::Read | ToolRisk::Search | ToolRisk::GitRead) {
-                safe_to_retry.push(call.clone());
             } else {
                 blocked.push((
                     call.clone(),
@@ -1633,10 +1633,15 @@ where
                         "dispatch_attempted": classification == &"execution_state_unknown",
                         "result_persisted": false,
                     });
+                    result["_opcos_not_executed"] = json!(true);
                     (call.id.clone(), result)
                 })
                 .collect::<Vec<_>>();
-            self.persist_tool_results(assistant.sequence, &calls, blocked_results)
+            let blocked_calls = blocked
+                .iter()
+                .map(|(call, _, _)| call.clone())
+                .collect::<Vec<_>>();
+            self.persist_tool_results(assistant.sequence, &blocked_calls, blocked_results)
                 .await?;
             let _ = self
                 .working_event(
@@ -1651,10 +1656,13 @@ where
                     }),
                 )
                 .await;
-            return Ok(Some(self.run_loop(self.provider_messages()?).await?));
         }
         if safe_to_retry.is_empty() {
-            Ok(None)
+            if blocked.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(self.run_loop(self.provider_messages()?).await?))
+            }
         } else {
             let sequence = assistant.sequence;
             for call in &safe_to_retry {
@@ -9296,6 +9304,154 @@ mod tests {
             .unwrap();
         assert!(result.contains("side_effecting_unresolved"));
         assert!(result.contains("cannot be replayed safely"));
+    }
+
+    #[tokio::test]
+    async fn mixed_recovery_persists_safe_and_blocked_results() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .save_session(&SessionRecord {
+                session_id: "mixed-recovery".into(),
+                workspace: "/workspace".into(),
+                model: "fake".into(),
+                mode: "Auto".into(),
+                harness: "builtin".into(),
+                title: "mixed-recovery".into(),
+                extra_roots: vec![],
+                grants: json!({}),
+                pinned: false,
+                archived: false,
+                origin: None,
+                origin_label: None,
+                compaction: json!({}),
+                host_id: "local".into(),
+                provider: None,
+                external_session_id: None,
+                run_state: "idle".into(),
+                stop_reason: "none".into(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                project_id: None,
+                agent_id: None,
+            })
+            .unwrap();
+        store
+            .append_message(&StoredMessage {
+                session_id: "mixed-recovery".into(),
+                sequence: 1,
+                role: "assistant".into(),
+                content: json!({"role":"assistant","tool_calls":[
+                    {"id":"read","name":"read_file","arguments":{"path":"x"}},
+                    {"id":"write","name":"write_file","arguments":{"path":"x","content":"changed"}}
+                ]}),
+                display_only: false,
+            })
+            .unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(CountingTools {
+                calls: calls.clone(),
+            }),
+            "mixed-recovery",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+
+        engine.resume_pending_turn().await.unwrap().unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let messages = store.load_messages("mixed-recovery").unwrap();
+        let results = messages
+            .iter()
+            .filter(|message| message.role == "tool")
+            .filter_map(|message| {
+                Some((
+                    message
+                        .content
+                        .pointer("/content/0/tool_use_id")?
+                        .as_str()?,
+                    message
+                        .content
+                        .pointer("/content/0/content/0/text")?
+                        .as_str()?,
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 2);
+        assert!(
+            results
+                .iter()
+                .any(|(id, result)| { *id == "read" && result.contains("unexpected execution") })
+        );
+        assert!(results.iter().any(|(id, result)| {
+            *id == "write" && result.contains("side_effecting_unresolved")
+        }));
+        let events = store.load_session_events("mixed-recovery").unwrap();
+        assert!(events.iter().any(|event| {
+            event.event["type"] == "read_file_completed"
+                && event.event["working_event"]["payload"]["call_id"] == "read"
+        }));
+        assert!(!events.iter().any(|event| {
+            event.event["type"] == "write_file_completed"
+                && event.event["working_event"]["payload"]["call_id"] == "write"
+        }));
+    }
+
+    #[tokio::test]
+    async fn dispatched_read_recovery_is_still_retryable() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .append_message(&StoredMessage {
+                session_id: "dispatched-read-recovery".into(),
+                sequence: 1,
+                role: "assistant".into(),
+                content: json!({"role":"assistant","tool_calls":[
+                    {"id":"read","name":"read_file","arguments":{"path":"x"}}
+                ]}),
+                display_only: false,
+            })
+            .unwrap();
+        store
+            .append_tool_call(&opcos_store::ToolCallRecord {
+                session_id: "dispatched-read-recovery".into(),
+                message_sequence: 1,
+                call_id: "read".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":"x"}),
+                result: None,
+            })
+            .unwrap();
+        store
+            .mark_tool_call_dispatch_attempted("dispatched-read-recovery", 1, "read")
+            .unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(CountingTools {
+                calls: calls.clone(),
+            }),
+            "dispatched-read-recovery",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+
+        engine.resume_pending_turn().await.unwrap().unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let messages = store.load_messages("dispatched-read-recovery").unwrap();
+        assert!(messages.iter().any(|message| {
+            message.role == "tool"
+                && message
+                    .content
+                    .pointer("/content/0/tool_use_id")
+                    .and_then(Value::as_str)
+                    == Some("read")
+        }));
     }
 
     #[tokio::test]
