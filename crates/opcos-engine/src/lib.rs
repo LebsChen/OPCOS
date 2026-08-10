@@ -6773,9 +6773,7 @@ pub fn builtin_full_tool_catalog_tokens() -> u64 {
 
 pub fn coordination_tool_definitions() -> Vec<Value> {
     vec![
-        json!({"type":"function","function":{"name":"coordination_dispatch","description":"Dispatch work asynchronously from the current builtin OPCOS Leader session to an existing Worker role. Only a Leader may call this tool; the caller role is derived from the bound session and cannot be supplied by the model. This never creates sessions or recursively spawns agents. Returns a task id and pending status; Worker reports are not completion evidence.","parameters":{"type":"object","properties":{"task_id":{"type":"string"},"worker_role_id":{"type":"string"},"message":{"type":"string"}},"required":["task_id","worker_role_id","message"]}}}),
-        json!({"type":"function","function":{"name":"coordination_fan_out","description":"Create a durable coordination batch and dispatch independent members concurrently to existing Worker roles. The acceptance spec is frozen at dispatch time and is informational until an evaluator is added. The barrier uses collect-all deadlines; Worker reports are not completion evidence.","parameters":{"type":"object","properties":{"batch_id":{"type":"string"},"members":{"type":"array","items":{"type":"object","properties":{"member_id":{"type":"string"},"worker_role_id":{"type":"string"},"message":{"type":"string"},"deadline_seconds":{"type":"integer"}},"required":["member_id","worker_role_id","message"]}},"acceptance_spec":{"type":"object"},"deadline_seconds":{"type":"integer"}},"required":["batch_id","members","acceptance_spec","deadline_seconds"]}}}),
-        json!({"type":"function","function":{"name":"coordination_status","description":"Read bounded status for an asynchronously dispatched coordination task. Worker self-reports remain worker_reported/awaiting_verification; only verified branch, push, PR, and GitHub API checks can establish delivery. Returns recommended_after_seconds and does not block or encourage tight polling.","parameters":{"type":"object","properties":{"task_id":{"type":"string"},"limit":{"type":"integer"}},"required":["task_id"]}}}),
+        json!({"type":"function","function":{"name":"coordination_status","description":"Read bounded status for an asynchronously routed coordination batch. This is the only model-facing coordination inspection tool; dispatch and fan-out are desktop-managed internals. Worker self-reports remain worker_reported/awaiting_verification; only verified evidence can establish delivery.","parameters":{"type":"object","properties":{"task_id":{"type":"string"},"limit":{"type":"integer"}},"required":["task_id"]}}}),
     ]
 }
 
@@ -12015,20 +12013,17 @@ mod tests {
     }
 
     #[test]
-    fn coordination_tools_are_leader_dispatch_only_and_do_not_accept_from_role() {
+    fn coordination_dispatch_and_fan_out_are_internal_not_model_tools() {
         let tools = coordination_tool_definitions();
-        let dispatch = tools
-            .iter()
-            .find(|tool| {
-                tool.pointer("/function/name").and_then(Value::as_str)
-                    == Some("coordination_dispatch")
-            })
-            .unwrap();
-        let properties = dispatch.pointer("/function/parameters/properties").unwrap();
-        assert!(properties.get("task_id").is_some());
-        assert!(properties.get("worker_role_id").is_some());
-        assert!(properties.get("message").is_some());
-        assert!(properties.get("from_role").is_none());
+        assert!(!tools.iter().any(|tool| {
+            matches!(
+                tool.pointer("/function/name").and_then(Value::as_str),
+                Some("coordination_dispatch" | "coordination_fan_out")
+            )
+        }));
+        assert!(tools.iter().any(|tool| {
+            tool.pointer("/function/name").and_then(Value::as_str) == Some("coordination_status")
+        }));
         assert_eq!(tool_risk("coordination_dispatch"), ToolRisk::External);
         assert_eq!(tool_risk("coordination_status"), ToolRisk::Read);
     }

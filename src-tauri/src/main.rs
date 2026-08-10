@@ -12551,12 +12551,6 @@ async fn engine_for_with_context(
             )
         });
     }
-    if automatic_project_routing_active(&state.store, session_id)?
-        && let Some(allowed_tools) = allowed_tools.as_mut()
-    {
-        allowed_tools
-            .retain(|tool| tool != "coordination_dispatch" && tool != "coordination_fan_out");
-    }
     let session_tools = session_external_tools(
         state,
         session_id,
@@ -24338,6 +24332,27 @@ fn worker_role_for_plan_step(step: &opcos_store::PlanStepRecord) -> &'static str
     }
 }
 
+fn select_plan_routing_wave(
+    steps: &[opcos_store::PlanStepRecord],
+    serial: bool,
+    worker_capacity: usize,
+) -> Vec<&opcos_store::PlanStepRecord> {
+    if serial {
+        steps.iter().take(1).collect()
+    } else {
+        steps.iter().take(worker_capacity).collect()
+    }
+}
+
+fn plan_batch_id(plan_id: &str, revision: u64, steps: &[&opcos_store::PlanStepRecord]) -> String {
+    let member_key = steps
+        .iter()
+        .map(|step| step.step_id.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("plan-batch:{plan_id}:{revision}:{member_key}")
+}
+
 fn step_has_routing_audit(
     state: &DesktopState,
     session_id: &str,
@@ -24351,7 +24366,12 @@ fn step_has_routing_audit(
         matches!(
             event.kind.as_str(),
             "coordination_auto_dispatch" | "coordination_local_execution"
-        ) && event.payload["step_id"].as_str() == Some(step_id)
+        ) && (event.payload["step_id"].as_str() == Some(step_id)
+            || event.payload["step_ids"]
+                .as_array()
+                .is_some_and(|step_ids| {
+                    step_ids.iter().any(|value| value.as_str() == Some(step_id))
+                }))
     }))
 }
 
@@ -24510,16 +24530,120 @@ async fn auto_route_project_plan(
     let steps = plan
         .steps
         .into_iter()
-        .filter(|step| step.status == "not_started");
-    for step in if serial {
-        steps.take(1).collect::<Vec<_>>()
-    } else {
-        steps.collect::<Vec<_>>()
-    } {
+        .filter(|step| step.status == "not_started")
+        .collect::<Vec<_>>();
+    if !serial {
+        let agents = state
+            .store
+            .load_project_agents(project_id)
+            .map_err(|e| e.to_string())?;
+        let mut available_workers = agents
+            .into_iter()
+            .filter(|agent| {
+                agent.sort_order != 0
+                    && agent.session_id.is_some()
+                    && agent.harness.eq_ignore_ascii_case("builtin")
+            })
+            .collect::<Vec<_>>();
+        if available_workers.is_empty() {
+            for step in &steps {
+                if step_has_routing_audit(state, leader_session_id, &step.step_id)? {
+                    continue;
+                }
+                record_local_plan_execution(
+                    app,
+                    state,
+                    leader_session_id,
+                    step,
+                    "no active builtin Worker session is available",
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+        let routing_wave = select_plan_routing_wave(&steps, false, available_workers.len());
+        let batch_id = plan_batch_id(&plan.plan_id, plan.revision, &routing_wave);
+        let mut members = Vec::new();
+        for step in routing_wave {
+            if step_has_routing_audit(state, leader_session_id, &step.step_id)? {
+                continue;
+            }
+            let preferred = worker_role_for_plan_step(step);
+            let worker_index = available_workers
+                .iter()
+                .position(|agent| agent.role.eq_ignore_ascii_case(preferred))
+                .or_else(|| (!available_workers.is_empty()).then_some(0));
+            let Some(worker_index) = worker_index else {
+                break;
+            };
+            let worker = available_workers.remove(worker_index);
+            let message = format!(
+                "Execute assigned independent plan step {} (coordination batch {}): {}. Work only \
+                 in your assigned workspace. When finished, send the Lead a coordination envelope \
+                 with taskId exactly '{}', kind='result', and a concrete report of the work and \
+                 verification; do not substitute a prose report for the envelope.",
+                step.step_id, batch_id, step.description, batch_id
+            );
+            members.push(json!({
+                "member_id": step.step_id,
+                "worker_role_id": worker.id,
+                "message": message,
+                "deadline_seconds": 300,
+            }));
+            state
+                .store
+                .update_plan_step(
+                    leader_session_id,
+                    &step.step_id,
+                    Some("in_progress"),
+                    None,
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        if !members.is_empty() {
+            let result = execute_coordination_tool(
+                &state.store,
+                &state.database,
+                &state.engines,
+                &state.coordination,
+                leader_session_id,
+                "coordination_fan_out",
+                &json!({
+                    "batch_id": batch_id,
+                    "members": members,
+                    "acceptance_spec": {
+                        "plan_id": plan.plan_id,
+                        "independent": true,
+                        "completion_evidence": "coordination result envelope plus persisted verification",
+                    },
+                    "deadline_seconds": 300,
+                }),
+            )
+            .await?;
+            audit(
+                state,
+                leader_session_id,
+                "coordination_auto_dispatch",
+                json!({
+                    "plan_id": plan.plan_id,
+                    "batch_id": batch_id,
+                    "step_ids": members
+                        .iter()
+                        .filter_map(|member| member["member_id"].as_str())
+                        .collect::<Vec<_>>(),
+                    "concurrency": "bounded",
+                    "dispatch": result,
+                }),
+            );
+        }
+        return Ok(());
+    }
+    for step in select_plan_routing_wave(&steps, serial, 1) {
         if step_has_routing_audit(state, leader_session_id, &step.step_id)? {
             continue;
         }
-        let role_name = worker_role_for_plan_step(&step);
+        let role_name = worker_role_for_plan_step(step);
         let worker = state
             .store
             .load_project_agents(project_id)
@@ -24534,7 +24658,7 @@ async fn auto_route_project_plan(
                 .find(|item| item["role"].as_str() == Some(role_name))
                 .and_then(|item| item["reason"].as_str())
                 .unwrap_or("worker session is unavailable");
-            record_local_plan_execution(app, state, leader_session_id, &step, reason).await?;
+            record_local_plan_execution(app, state, leader_session_id, step, reason).await?;
             continue;
         };
         let task_id = format!("plan-step:{}", step.step_id);
@@ -25097,8 +25221,10 @@ async fn execute_coordination_tool(
             }
         }
         let caller_id = caller.id.clone();
-        let fan_out_results = futures_util::future::join_all(dispatches.into_iter().map(
-            |(member, worker, _member_deadline)| {
+        const MAX_COORDINATION_CONCURRENCY: usize = 4;
+        let fan_out_results = futures_util::stream::iter(dispatches
+            .into_iter()
+            .map(|(member, worker, _member_deadline)| {
                 let database = Arc::clone(database);
                 let engines = Arc::clone(engines);
                 let coordination = Arc::clone(coordination);
@@ -25163,28 +25289,37 @@ async fn execute_coordination_tool(
                         .ok_or_else(|| "coordination Worker session is not running".to_owned());
                     match engine {
                         Ok(engine) => {
-                            engine
-                                .queue_steering(
-                                    envelope
-                                        .encode(None)
-                                        .map_err(|error| error.to_string())?,
-                                )
-                                .await
+                            {
+                                let connection =
+                                    database.lock().map_err(|_| "database lock poisoned")?;
+                                connection
+                                    .execute(
+                                        "UPDATE coord_batch_members
+                                         SET status='running',started_at=?1
+                                         WHERE batch_id=?2 AND member_id=?3",
+                                        params![
+                                            Utc::now().to_rfc3339(),
+                                            envelope.task_id,
+                                            member.member_id
+                                        ],
+                                    )
+                                    .map_err(|error| error.to_string())?;
+                            }
+                            let encoded = envelope
+                                .encode(None)
                                 .map_err(|error| error.to_string())?;
-                            let connection =
-                                database.lock().map_err(|_| "database lock poisoned")?;
-                            connection
-                                .execute(
-                                    "UPDATE coord_batch_members
-                                     SET status='running',started_at=?1
-                                     WHERE batch_id=?2 AND member_id=?3",
-                                    params![
-                                        Utc::now().to_rfc3339(),
-                                        envelope.task_id,
-                                        member.member_id
-                                    ],
-                                )
-                                .map_err(|error| error.to_string())?;
+                            if engine.has_active_turn() {
+                                engine
+                                    .queue_steering(encoded)
+                                    .await
+                                    .map_err(|error| error.to_string())?;
+                            } else {
+                                wake_session_for_turn(store, &worker_session)?;
+                                let worker_engine = Arc::clone(&engine);
+                                tokio::spawn(async move {
+                                    let _ = worker_engine.submit_text(encoded).await;
+                                });
+                            }
                             Ok(())
                         }
                         Err(error) => Err(error),
@@ -25193,9 +25328,10 @@ async fn execute_coordination_tool(
                     .await;
                     (worker_id, outcome)
                 }
-            },
-        ))
-        .await;
+            }))
+            .buffer_unordered(MAX_COORDINATION_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
         {
             let connection = database.lock().map_err(|_| "database lock poisoned")?;
             for (worker_role_id, result) in fan_out_results {
@@ -29751,6 +29887,77 @@ mod m7_tests {
     }
 
     #[test]
+    fn autonomous_plan_routing_parallel_wave_keeps_independent_steps_together() {
+        let steps = (0..3)
+            .map(|position| opcos_store::PlanStepRecord {
+                step_id: format!("step-{position}"),
+                plan_id: "plan".into(),
+                position,
+                description: format!("Implement part {position}"),
+                status: "not_started".into(),
+                failure_reason: None,
+                abandoned_reason: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .collect::<Vec<_>>();
+        let wave = select_plan_routing_wave(&steps, false, 2);
+        assert_eq!(
+            wave.iter()
+                .map(|step| step.step_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["step-0", "step-1"]
+        );
+    }
+
+    #[test]
+    fn autonomous_plan_routing_serial_wave_preserves_dependency_order() {
+        let steps = (0..3)
+            .map(|position| opcos_store::PlanStepRecord {
+                step_id: format!("step-{position}"),
+                plan_id: "plan".into(),
+                position,
+                description: format!("Implement part {position}"),
+                status: "not_started".into(),
+                failure_reason: None,
+                abandoned_reason: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .collect::<Vec<_>>();
+        let wave = select_plan_routing_wave(&steps, true, 3);
+        assert_eq!(wave.len(), 1);
+        assert_eq!(wave[0].step_id, "step-0");
+    }
+
+    #[test]
+    fn autonomous_plan_routing_waves_use_distinct_batches_for_deferred_steps() {
+        let steps = (0..3)
+            .map(|position| opcos_store::PlanStepRecord {
+                step_id: format!("step-{position}"),
+                plan_id: "plan".into(),
+                position,
+                description: format!("Implement part {position}"),
+                status: "not_started".into(),
+                failure_reason: None,
+                abandoned_reason: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .collect::<Vec<_>>();
+        let first_wave = select_plan_routing_wave(&steps, false, 2);
+        let second_wave = steps.iter().skip(2).collect::<Vec<_>>();
+        assert_ne!(
+            plan_batch_id("plan", 1, &first_wave),
+            plan_batch_id("plan", 1, &second_wave)
+        );
+        assert_eq!(
+            plan_batch_id("plan", 1, &second_wave),
+            "plan-batch:plan:1:step-2"
+        );
+    }
+
+    #[test]
     fn cloudflare_save_url_is_composed_without_manual_base_url() {
         assert_eq!(
             provider_base_url("cloudflare", None, Some("account-123"), None).unwrap(),
@@ -30350,23 +30557,17 @@ mod m7_tests {
     }
 
     #[test]
-    fn coordination_payload_rejects_credentials_and_from_role_is_not_a_tool_field() {
+    fn coordination_payload_rejects_credentials_and_internal_tools_are_hidden() {
         assert!(reject_coordination_sensitive("Bearer xxx").is_err());
         assert!(reject_coordination_sensitive("TOKEN=xxx").is_err());
         assert!(reject_coordination_sensitive("https://user:pass@example.com").is_err());
         let tools = opcos_engine::coordination_tool_definitions();
-        let dispatch = tools
-            .iter()
-            .find(|tool| {
-                tool.pointer("/function/name").and_then(Value::as_str)
-                    == Some("coordination_dispatch")
-            })
-            .unwrap();
-        assert!(
-            dispatch
-                .pointer("/function/parameters/properties/from_role")
-                .is_none()
-        );
+        assert!(!tools.iter().any(|tool| {
+            matches!(
+                tool.pointer("/function/name").and_then(Value::as_str),
+                Some("coordination_dispatch" | "coordination_fan_out")
+            )
+        }));
     }
 
     fn edit_test_host() -> (PathBuf, LocalHost) {
