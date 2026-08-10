@@ -24078,6 +24078,15 @@ fn select_plan_routing_wave(
     }
 }
 
+fn plan_batch_id(plan_id: &str, revision: u64, steps: &[&opcos_store::PlanStepRecord]) -> String {
+    let member_key = steps
+        .iter()
+        .map(|step| step.step_id.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("plan-batch:{plan_id}:{revision}:{member_key}")
+}
+
 fn step_has_routing_audit(
     state: &DesktopState,
     session_id: &str,
@@ -24091,7 +24100,12 @@ fn step_has_routing_audit(
         matches!(
             event.kind.as_str(),
             "coordination_auto_dispatch" | "coordination_local_execution"
-        ) && event.payload["step_id"].as_str() == Some(step_id)
+        ) && (event.payload["step_id"].as_str() == Some(step_id)
+            || event.payload["step_ids"]
+                .as_array()
+                .is_some_and(|step_ids| {
+                    step_ids.iter().any(|value| value.as_str() == Some(step_id))
+                }))
     }))
 }
 
@@ -24265,9 +24279,26 @@ async fn auto_route_project_plan(
                     && agent.harness.eq_ignore_ascii_case("builtin")
             })
             .collect::<Vec<_>>();
-        let batch_id = format!("plan-batch:{}:{}", plan.plan_id, plan.revision);
+        if available_workers.is_empty() {
+            for step in &steps {
+                if step_has_routing_audit(state, leader_session_id, &step.step_id)? {
+                    continue;
+                }
+                record_local_plan_execution(
+                    app,
+                    state,
+                    leader_session_id,
+                    step,
+                    "no active builtin Worker session is available",
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+        let routing_wave = select_plan_routing_wave(&steps, false, available_workers.len());
+        let batch_id = plan_batch_id(&plan.plan_id, plan.revision, &routing_wave);
         let mut members = Vec::new();
-        for step in select_plan_routing_wave(&steps, false, available_workers.len()) {
+        for step in routing_wave {
             if step_has_routing_audit(state, leader_session_id, &step.step_id)? {
                 continue;
             }
@@ -24331,6 +24362,10 @@ async fn auto_route_project_plan(
                 json!({
                     "plan_id": plan.plan_id,
                     "batch_id": batch_id,
+                    "step_ids": members
+                        .iter()
+                        .filter_map(|member| member["member_id"].as_str())
+                        .collect::<Vec<_>>(),
                     "concurrency": "bounded",
                     "dispatch": result,
                 }),
@@ -29607,6 +29642,33 @@ mod m7_tests {
         let wave = select_plan_routing_wave(&steps, true, 3);
         assert_eq!(wave.len(), 1);
         assert_eq!(wave[0].step_id, "step-0");
+    }
+
+    #[test]
+    fn autonomous_plan_routing_waves_use_distinct_batches_for_deferred_steps() {
+        let steps = (0..3)
+            .map(|position| opcos_store::PlanStepRecord {
+                step_id: format!("step-{position}"),
+                plan_id: "plan".into(),
+                position,
+                description: format!("Implement part {position}"),
+                status: "not_started".into(),
+                failure_reason: None,
+                abandoned_reason: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .collect::<Vec<_>>();
+        let first_wave = select_plan_routing_wave(&steps, false, 2);
+        let second_wave = steps.iter().skip(2).collect::<Vec<_>>();
+        assert_ne!(
+            plan_batch_id("plan", 1, &first_wave),
+            plan_batch_id("plan", 1, &second_wave)
+        );
+        assert_eq!(
+            plan_batch_id("plan", 1, &second_wave),
+            "plan-batch:plan:1:step-2"
+        );
     }
 
     #[test]
