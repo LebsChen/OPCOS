@@ -12869,6 +12869,7 @@ fn save_host(
     name: String,
     url: String,
     token: String,
+    vnc_password: String,
 ) -> Result<HostView, String> {
     let id = id.unwrap_or_else(|| {
         format!(
@@ -12904,6 +12905,17 @@ fn save_host(
             .secrets
             .set(&secret_key("rvm-url", &id), &url)
             .map_err(|error| error.to_string())?;
+        if vnc_password.is_empty() {
+            state
+                .secrets
+                .delete(&secret_key("rvm-vnc-password", &id))
+                .map_err(|error| error.to_string())?;
+        } else {
+            state
+                .secrets
+                .set(&secret_key("rvm-vnc-password", &id), &vnc_password)
+                .map_err(|error| error.to_string())?;
+        }
         audit(
             &state,
             "",
@@ -12941,6 +12953,18 @@ fn save_host(
         }
         return Err(error.to_string());
     }
+    if !vnc_password.is_empty()
+        && let Err(error) = state
+            .secrets
+            .set(&secret_key("rvm-vnc-password", &id), &vnc_password)
+    {
+        let _ = state.secrets.delete(&secret_key("rvm-token", &id));
+        let _ = state.secrets.delete(&secret_key("rvm-url", &id));
+        if let Ok(connection) = state.database.lock() {
+            let _ = connection.execute("DELETE FROM hosts WHERE id=?1", [&id]);
+        }
+        return Err(error.to_string());
+    }
     audit(
         &state,
         "",
@@ -12954,6 +12978,17 @@ fn save_host(
         online: None,
         reason: None,
     })
+}
+
+#[tauri::command]
+fn vnc_password(state: State<'_, DesktopState>, host_id: String) -> Result<Option<String>, String> {
+    if host_id == "local" {
+        return Ok(None);
+    }
+    state
+        .secrets
+        .get(&secret_key("rvm-vnc-password", &host_id))
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -13569,6 +13604,10 @@ fn delete_host(state: State<'_, DesktopState>, host_id: String) -> Result<(), St
     state
         .secrets
         .delete(&secret_key("rvm-url", &host_id))
+        .map_err(|error| error.to_string())?;
+    state
+        .secrets
+        .delete(&secret_key("rvm-vnc-password", &host_id))
         .map_err(|error| error.to_string())?;
     audit(&state, "", "host_deleted", json!({"host_id": host_id}));
     Ok(())
@@ -29448,6 +29487,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             list_hosts,
             save_host,
+            vnc_password,
             host_binding,
             bind_account_host,
             account_host_bindings,

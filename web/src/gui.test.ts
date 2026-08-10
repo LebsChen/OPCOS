@@ -284,4 +284,29 @@ describe("GUI boundary behavior", () => {
       /(?:ws|http)s?:\/\/[^"`]*\b(?:token|authorization|bearer)\b/i,
     );
   });
+
+  it("passes the configured VNC password to noVNC and surfaces handshake failures", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("./App.tsx", import.meta.url)),
+      "utf8",
+    );
+    expect(source).toContain('command<string | null>("vnc_password"');
+    expect(source).toContain("credentials: vncPassword");
+    expect(source).toContain('addEventListener("securityfailure"');
+    expect(source).toContain('addEventListener("credentialsrequired"');
+    expect(source).toContain('addEventListener("disconnect"');
+    expect(source).toContain("configure the host VNC password");
+  });
+
+  it("preserves an existing host VNC password when editing host metadata", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("./App.tsx", import.meta.url)),
+      "utf8",
+    );
+    expect(source).toContain(
+      'const password = await command<string | null>("vnc_password"',
+    );
+    expect(source).toContain('setHostVncPassword(password || "")');
+    expect(source).toContain("vncPassword: hostVncPassword");
+  });
 });

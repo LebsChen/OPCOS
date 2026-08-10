@@ -2490,6 +2490,8 @@ function SurfaceView({
   const terminalHost = useRef<HTMLDivElement>(null);
   const vncHost = useRef<HTMLDivElement>(null);
   const [port, setPort] = useState<number | null>(null);
+  const [vncPassword, setVncPassword] = useState<string | null>(null);
+  const [surfaceError, setSurfaceError] = useState("");
   const [idePort, setIdePort] = useState<number | null>(null);
   const [review, setReview] = useState<Record<string, unknown> | null>(null);
   const [diff, setDiff] = useState<Record<string, unknown> | null>(null);
@@ -2499,17 +2501,24 @@ function SurfaceView({
   const start = async (surface: string) => {
     try {
       setBusy(true);
-      setPort(
-        await command<number>("start_surface", {
-          hostId: selected.host_id,
-          surface,
-          cols: 100,
-          rows: 30,
-          cwd: selected.workspace || null,
-          projectId: selected.project_id || null,
-        }),
-      );
+      const nextPort = await command<number>("start_surface", {
+        hostId: selected.host_id,
+        surface,
+        cols: 100,
+        rows: 30,
+        cwd: selected.workspace || null,
+        projectId: selected.project_id || null,
+      });
+      setPort(nextPort);
+      if (surface === "vnc") {
+        setVncPassword(
+          await command<string | null>("vnc_password", {
+            hostId: selected.host_id,
+          }),
+        );
+      }
     } catch (error) {
+      setSurfaceError(errorMessage(error));
       onError(error);
     } finally {
       setBusy(false);
@@ -2517,6 +2526,8 @@ function SurfaceView({
   };
   useEffect(() => {
     setPort(null);
+    setVncPassword(null);
+    setSurfaceError("");
     setIdePort(null);
     setReview(null);
     setDiff(null);
@@ -2602,11 +2613,41 @@ function SurfaceView({
     };
   }, [selected.id, port]);
   useEffect(() => {
-    if (!port || !vncHost.current) return;
-    const rfb = new RFB(vncHost.current, `ws://127.0.0.1:${port}`);
+    if (tab !== "desktop" || !port || !vncHost.current) return;
+    const rfb = new RFB(vncHost.current, `ws://127.0.0.1:${port}`, {
+      credentials: vncPassword ? { password: vncPassword } : undefined,
+    });
     rfb.scaleViewport = true;
+    let connected = false;
+    const report = (message: string) => setSurfaceError(message);
+    rfb.addEventListener("connect", () => {
+      connected = true;
+      setSurfaceError("");
+    });
+    rfb.addEventListener("securityfailure", (event) => {
+      report(
+        `Remote VNC security negotiation failed: ${
+          (event as CustomEvent<{ status?: string }>).detail?.status ||
+          "authentication rejected"
+        }`,
+      );
+    });
+    rfb.addEventListener("credentialsrequired", () => {
+      report(
+        "Remote VNC requires a password; configure the host VNC password.",
+      );
+    });
+    rfb.addEventListener("disconnect", (event) => {
+      const detail = (event as CustomEvent<{ clean?: boolean }>).detail;
+      if (!detail?.clean)
+        report(
+          connected
+            ? "Remote VNC disconnected after the desktop handshake."
+            : "Remote VNC disconnected before the desktop loaded.",
+        );
+    });
     return () => rfb.disconnect();
-  }, [selected.id, port]);
+  }, [selected.id, port, tab, vncPassword]);
   if (tab === "terminal" || tab === "desktop" || tab === "browser")
     return (
       <div className="surface-panel">
@@ -2614,6 +2655,9 @@ function SurfaceView({
           <div className="surface-status muted">
             Connecting to the bound remote host…
           </div>
+        )}
+        {surfaceError && (
+          <div className="surface-status error">{surfaceError}</div>
         )}
         {!busy && !port && (
           <div className="surface-status warning">
@@ -3433,6 +3477,8 @@ function ManageSections({
   setHostUrl,
   hostToken,
   setHostToken,
+  vncPassword,
+  setVncPassword,
   editingHostId,
   setEditingHostId,
 }: {
@@ -3456,6 +3502,8 @@ function ManageSections({
   setHostUrl: (value: string) => void;
   hostToken: string;
   setHostToken: (value: string) => void;
+  vncPassword: string;
+  setVncPassword: (value: string) => void;
   editingHostId: string | null;
   setEditingHostId: (value: string | null) => void;
 }) {
@@ -5242,6 +5290,12 @@ function ManageSections({
                     type="password"
                     required={!editingHostId}
                   />
+                  <input
+                    value={vncPassword}
+                    onChange={(event) => setVncPassword(event.target.value)}
+                    placeholder="Optional VNC password"
+                    type="password"
+                  />
                   <Button type="submit" className="primary">
                     {editingHostId ? "Save" : "Add host"}
                   </Button>
@@ -5252,6 +5306,7 @@ function ManageSections({
                       setHostName("");
                       setHostUrl("");
                       setHostToken("");
+                      setVncPassword("");
                       setHostFormOpen(false);
                     }}
                   >
@@ -10941,6 +10996,7 @@ function AppContent() {
   const [hostName, setHostName] = useState("");
   const [hostUrl, setHostUrl] = useState("");
   const [hostToken, setHostToken] = useState("");
+  const [hostVncPassword, setHostVncPassword] = useState("");
   const [editingHostId, setEditingHostId] = useState<string | null>(null);
   const [assets, setAssets] = useState<Asset[]>([]);
   const [providers, setProviders] = useState<ProviderDescriptor[]>([]);
@@ -11543,10 +11599,12 @@ function AppContent() {
         name: hostName,
         url: hostUrl,
         token: hostToken,
+        vncPassword: hostVncPassword,
       });
       setHostName("");
       setHostUrl("");
       setHostToken("");
+      setHostVncPassword("");
       await refresh();
       setEditingHostId(null);
     } catch (reason) {
@@ -11555,9 +11613,13 @@ function AppContent() {
   };
   const editHost = async (host: Host) => {
     const url = await command<string>("host_binding", { hostId: host.id });
+    const password = await command<string | null>("vnc_password", {
+      hostId: host.id,
+    });
     setHostName(host.name);
     setHostUrl(url);
     setHostToken("");
+    setHostVncPassword(password || "");
     setEditingHostId(host.id);
   };
   const testHost = async (hostId: string) => {
@@ -12082,6 +12144,8 @@ function AppContent() {
               setHostUrl={setHostUrl}
               hostToken={hostToken}
               setHostToken={setHostToken}
+              vncPassword={hostVncPassword}
+              setVncPassword={setHostVncPassword}
               editingHostId={editingHostId}
               setEditingHostId={setEditingHostId}
             />

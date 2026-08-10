@@ -1682,6 +1682,9 @@ h3 {
 .surface-status {
   padding: 8px 0;
 }
+.surface-status.error {
+  color: var(--color-danger, #b42318);
+}
 /* Cloud-Dev home state: the first turn is entered directly in the hero composer. */
 .home {
   flex: 1;
