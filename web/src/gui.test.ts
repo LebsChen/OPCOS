@@ -297,4 +297,16 @@ describe("GUI boundary behavior", () => {
     expect(source).toContain('addEventListener("disconnect"');
     expect(source).toContain("configure the host VNC password");
   });
+
+  it("preserves an existing host VNC password when editing host metadata", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("./App.tsx", import.meta.url)),
+      "utf8",
+    );
+    expect(source).toContain(
+      'const password = await command<string | null>("vnc_password"',
+    );
+    expect(source).toContain('setHostVncPassword(password || "")');
+    expect(source).toContain("vncPassword: hostVncPassword");
+  });
 });
