@@ -253,4 +253,35 @@ describe("GUI boundary behavior", () => {
     );
     expect(source).not.toContain(["ai", "yaoshen", "de5", "net"].join("."));
   });
+
+  it("routes desktop and editor tiles through the real surface machinery", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("./App.tsx", import.meta.url)),
+      "utf8",
+    );
+    expect(source).toContain(
+      '{opened.includes("desktop") && panelTab === "desktop" && (',
+    );
+    expect(source).toContain('<SurfaceView\n                  tab="desktop"');
+    expect(source).toContain(
+      '{opened.includes("ide") && panelTab === "ide" && (',
+    );
+    expect(source).toContain(
+      '<SurfaceView tab="ide" selected={selected} onError={onError} />',
+    );
+    expect(source).not.toContain('<PlannedPane title="Desktop">');
+    expect(source).not.toContain('<PlannedPane title="Editor">');
+  });
+
+  it("keeps surface credentials out of browser-visible relay URLs", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("./App.tsx", import.meta.url)),
+      "utf8",
+    );
+    expect(source).toContain("ws://127.0.0.1:${port}");
+    expect(source).toContain("http://127.0.0.1:${idePort}/");
+    expect(source).not.toMatch(
+      /(?:ws|http)s?:\/\/[^"`]*\b(?:token|authorization|bearer)\b/i,
+    );
+  });
 });

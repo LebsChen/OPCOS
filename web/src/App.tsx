@@ -10430,18 +10430,16 @@ function SessionRightPanel({
             )}
             {opened.includes("desktop") && panelTab === "desktop" && (
               <div className="session-pane">
-                <PlannedPane title="Desktop">
-                  Desktop viewing and control is planned for the local VNC
-                  bridge and remote RVM /vnc-ws integration.
-                </PlannedPane>
+                <SurfaceView
+                  tab="desktop"
+                  selected={selected}
+                  onError={onError}
+                />
               </div>
             )}
             {opened.includes("ide") && panelTab === "ide" && (
               <div className="session-pane">
-                <PlannedPane title="Editor">
-                  Full machine editor control is planned for the host editor
-                  integration.
-                </PlannedPane>
+                <SurfaceView tab="ide" selected={selected} onError={onError} />
               </div>
             )}
             {tabs
