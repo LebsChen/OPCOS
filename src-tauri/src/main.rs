@@ -4203,7 +4203,7 @@ fn execute_agent_automation_tool(
                     .and_then(Value::as_str)
                     .filter(|value| !value.trim().is_empty())
                     .ok_or_else(|| "schedule automation requires cron".to_owned())?;
-                scheduler::Schedule::parse(cron).map_err(|_| "invalid schedule cron".to_owned())?;
+                scheduler::Schedule::parse_for_user(cron)?;
             } else if arguments
                 .get("kind_pattern")
                 .and_then(Value::as_str)
@@ -12063,10 +12063,10 @@ async fn engine_for_with_context(
     ]
     .into_iter()
     .map(|kind| {
-        scoped_secret_get(
-            state,
+        connector_credentials_config_for(
+            &state.secrets,
+            &state.store,
             session.project_id.as_deref(),
-            "connector-token",
             kind,
         )
         .map(|value| (kind, value.is_some()))
@@ -20686,19 +20686,9 @@ async fn linear_connection(state: State<'_, DesktopState>) -> Result<Value, Stri
 }
 
 fn connector_config(state: &DesktopState, kind: &str) -> Result<Value, String> {
-    if let Some(value) = state
-        .secrets
-        .get(&secret_key("connector-config", kind))
-        .map_err(|error| format!("{kind} credentials unavailable: {error}"))?
-    {
-        return serde_json::from_str(&value).map_err(|_| format!("{kind} credentials are invalid"));
-    }
-    state
-        .secrets
-        .get(&secret_key("connector-token", kind))
-        .map_err(|error| format!("{kind} token unavailable: {error}"))?
-        .map(|token| json!({"token": token}))
-        .ok_or_else(|| format!("{kind} credentials are not configured"))
+    let config = connector_credentials_config_for(&state.secrets, &state.store, None, kind)?
+        .ok_or_else(|| format!("{kind} credentials are not configured"))?;
+    serde_json::from_str(&config).map_err(|_| format!("{kind} credentials are invalid"))
 }
 
 async fn connector_json(request: reqwest::RequestBuilder, kind: &str) -> Result<Value, String> {
@@ -21777,16 +21767,36 @@ const SUPPORTED_CONNECTOR_KINDS: &[&str] = &[
 ];
 
 fn connector_credentials_configured(state: &DesktopState, kind: &str) -> Result<bool, String> {
-    Ok(state
-        .secrets
-        .get(&secret_key("connector-config", kind))
-        .map_err(|error| format!("{kind} credentials unavailable: {error}"))?
-        .is_some()
-        || state
-            .secrets
-            .get(&secret_key("connector-token", kind))
-            .map_err(|error| format!("{kind} token unavailable: {error}"))?
-            .is_some())
+    Ok(connector_credentials_config_for(&state.secrets, &state.store, None, kind)?.is_some())
+}
+
+fn connector_secret_kind(store: &SqliteStore, project_id: Option<&str>, kind: &str) -> String {
+    if kind == "github"
+        && let Ok(target) = project_github_repo(store, project_id)
+    {
+        return target.instance.connector_secret_name();
+    }
+    kind.to_owned()
+}
+
+fn connector_credentials_config_for(
+    secrets: &KeyringSecretStore,
+    store: &SqliteStore,
+    project_id: Option<&str>,
+    kind: &str,
+) -> Result<Option<String>, String> {
+    let secret_kind = connector_secret_kind(store, project_id, kind);
+    if let Some(config) =
+        scoped_secret_get_from_store(secrets, project_id, "connector-config", &secret_kind)
+            .map_err(|error| format!("{secret_kind} credentials unavailable: {error}"))?
+    {
+        return Ok(Some(config));
+    }
+    Ok(
+        scoped_secret_get_from_store(secrets, project_id, "connector-token", &secret_kind)
+            .map_err(|error| format!("{secret_kind} token unavailable: {error}"))?
+            .map(|token| json!({"token": token}).to_string()),
+    )
 }
 
 fn connector_kind_supported(
@@ -22213,20 +22223,7 @@ async fn execute_connector_tool(
     } else {
         GitHubInstance::dotcom()
     };
-    let kind = if kind == "github" {
-        github_instance.connector_secret_name()
-    } else {
-        kind.to_owned()
-    };
-    let kind = kind.as_str();
-    let config = scoped_secret_get_from_store(secrets, project_id, "connector-config", kind)
-        .map_err(|error| format!("{kind} credentials unavailable: {error}"))?
-        .or_else(|| {
-            scoped_secret_get_from_store(secrets, project_id, "connector-token", kind)
-                .ok()
-                .flatten()
-                .map(|token| json!({"token": token}).to_string())
-        })
+    let config = connector_credentials_config_for(secrets, store, project_id, kind)?
         .ok_or_else(|| format!("{kind} credentials are not configured"))?;
     let config: Value =
         serde_json::from_str(&config).map_err(|_| format!("{kind} credentials are invalid"))?;
@@ -26782,6 +26779,7 @@ fn save_schedule(state: State<'_, DesktopState>, schedule: ScheduleInput) -> Res
 }
 
 fn save_schedule_for_state(state: &DesktopState, schedule: ScheduleInput) -> Result<Value, String> {
+    scheduler::Schedule::parse_for_user(&schedule.cron)?;
     let id = schedule.id.unwrap_or_else(|| {
         format!(
             "schedule-{}",
@@ -30781,6 +30779,31 @@ mod m7_tests {
                 .connector_secret_name(),
             "github@ghe.example.com"
         );
+    }
+
+    #[test]
+    fn connector_config_only_credentials_are_exposed_with_project_scope() {
+        let path = std::env::temp_dir().join(format!(
+            "opcos-connector-test-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let secrets = KeyringSecretStore::with_fallback("opcos-test", path.clone());
+        let store = github_test_store(
+            &[("ghes", "https://ghe.example.com/acme/app.git")],
+            &[("ghe.example.com", Some("ghe-token"))],
+        );
+        secrets
+            .set(
+                &project_secret_key("ghes", "connector-config", "github@ghe.example.com"),
+                r#"{"token":"configured-only"}"#,
+            )
+            .unwrap();
+
+        let config =
+            connector_credentials_config_for(&secrets, &store, Some("ghes"), "github").unwrap();
+        assert_eq!(config.as_deref(), Some(r#"{"token":"configured-only"}"#));
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

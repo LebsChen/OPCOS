@@ -1,5 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
 
+pub const ACCEPTED_SYNTAX: &str = "@every N or */N * * * *";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Schedule {
     Every(Duration),
@@ -33,6 +35,12 @@ impl Schedule {
         Err("unsupported cron; use @every N or */N * * * *".into())
     }
 
+    pub fn parse_for_user(value: &str) -> Result<Self, String> {
+        Self::parse(value).map_err(|error| {
+            format!("invalid schedule cron: {error}; accepted forms: {ACCEPTED_SYNTAX}")
+        })
+    }
+
     pub fn due(&self, now: DateTime<Utc>, last: Option<DateTime<Utc>>) -> bool {
         match self {
             Self::Every(interval) => last.is_none_or(|value| now - value >= *interval),
@@ -62,6 +70,13 @@ mod tests {
             Schedule::parse("*/5 * * * *").unwrap(),
             Schedule::MinuteModulo(5)
         );
+    }
+
+    #[test]
+    fn parse_for_user_preserves_reason_and_documents_syntax() {
+        let error = Schedule::parse_for_user("not-a-schedule").unwrap_err();
+        assert!(error.contains("unsupported cron"), "{error}");
+        assert!(error.contains("@every N or */N * * * *"), "{error}");
     }
 
     #[test]
