@@ -441,55 +441,12 @@ pub struct HttpRvmClient {
 #[derive(Clone, Debug, Serialize)]
 pub struct IdeBootstrap {
     pub html: String,
-    pub proxy_token: String,
     #[serde(skip)]
     pub cookies: Vec<String>,
 }
 
-fn redact_workbench_token(html: &str, upstream_token: &str, proxy_token: &str) -> String {
-    let mut output = html.replace(upstream_token, proxy_token);
-    let marker = "\"connectionToken\"";
-    let mut cursor = 0;
-    while let Some(relative) = output[cursor..].find(marker) {
-        let start = cursor + relative;
-        let Some(colon) = output[start..].find(':') else {
-            break;
-        };
-        let value_start = start + colon + 1;
-        let Some(first_quote) = output[value_start..].find('"') else {
-            break;
-        };
-        let content_start = value_start + first_quote + 1;
-        let Some(end_quote) = output[content_start..].find('"') else {
-            break;
-        };
-        let content_end = content_start + end_quote;
-        output.replace_range(content_start..content_end, proxy_token);
-        cursor = content_start + proxy_token.len();
-    }
-    output
-}
-
 fn cookie_pair(set_cookie: &str) -> Option<String> {
     set_cookie.split(';').next().map(str::to_owned)
-}
-
-fn replace_bytes(payload: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
-    if from.is_empty() {
-        return payload.to_vec();
-    }
-    let mut output = Vec::with_capacity(payload.len());
-    let mut cursor = 0;
-    while cursor < payload.len() {
-        if payload[cursor..].starts_with(from) {
-            output.extend_from_slice(to);
-            cursor += from.len();
-        } else {
-            output.push(payload[cursor]);
-            cursor += 1;
-        }
-    }
-    output
 }
 
 pub fn has_encoded_traversal(path: &str) -> bool {
@@ -709,22 +666,9 @@ impl HttpRvmClient {
     }
 
     pub async fn ide_bootstrap(&self, folder: &str) -> Result<IdeBootstrap, RvmError> {
-        let proxy_token = format!(
-            "opcos-local-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|error| RvmError::WebSocket(RvmError::redact(
-                    &error.to_string(),
-                    &self.config.token,
-                )))?
-                .as_nanos()
-        );
         let mut cookies: Vec<String> = Vec::new();
         let mut url = self.config.base_url.clone();
         url.set_path("/ide/");
-        // The deployed RVM/serve-web path currently requires the connection
-        // token in its URL for IDE bootstrap compatibility; retain this until
-        // the host accepts the Bearer header for the complete IDE flow.
         url.query_pairs_mut()
             .append_pair("tkn", &self.config.token)
             .append_pair("folder", folder);
@@ -783,11 +727,7 @@ impl HttpRvmClient {
                 .await
                 .map_err(|error| RvmError::request(error, &self.config.token))?;
             let html = String::from_utf8_lossy(&bytes).into_owned();
-            return Ok(IdeBootstrap {
-                html: redact_workbench_token(&html, &self.config.token, &proxy_token),
-                proxy_token,
-                cookies,
-            });
+            return Ok(IdeBootstrap { html, cookies });
         }
         Err(RvmError::WebSocket("too many IDE redirects".into()))
     }
@@ -796,7 +736,6 @@ impl HttpRvmClient {
         &self,
         route: &str,
         cookies: &[String],
-        proxy_token: &str,
     ) -> Result<Bytes, RvmError> {
         let mut url = self
             .config
@@ -806,12 +745,9 @@ impl HttpRvmClient {
         let pairs = url
             .query_pairs()
             .map(|(key, value)| {
-                // The deployed RVM/serve-web path currently requires query
-                // authentication for IDE asset bridges.
                 let key_is_token = key.eq_ignore_ascii_case("token")
                     || key.eq_ignore_ascii_case("tkn")
-                    || key.eq_ignore_ascii_case("connectionToken")
-                    || key.eq_ignore_ascii_case("reconnectionToken");
+                    || key.eq_ignore_ascii_case("connectionToken");
                 (
                     key.into_owned(),
                     if key_is_token {
@@ -832,12 +768,19 @@ impl HttpRvmClient {
         let mut request = self
             .http
             .get(url)
-            .header(header::ACCEPT, "text/html")
+            .timeout(Duration::from_secs(120))
+            .header(header::ACCEPT, "*/*")
             .header(header::USER_AGENT, IDE_BROWSER_USER_AGENT)
-            .header("Sec-Fetch-Mode", "navigate");
-        if cookies.is_empty() {
-            request = request.header(header::AUTHORIZATION, self.config.auth_header());
-        }
+            .header("Sec-Fetch-Mode", "no-cors")
+            .header("Sec-Fetch-Dest", "empty")
+            .header(
+                header::REFERER,
+                format!(
+                    "{}/ide/",
+                    self.config.base_url.as_str().trim_end_matches('/')
+                ),
+            );
+        request = request.header(header::AUTHORIZATION, self.config.auth_header());
         if !cookies.is_empty() {
             request = request.header(header::COOKIE, cookies.join("; "));
         }
@@ -857,24 +800,7 @@ impl HttpRvmClient {
                 &self.config.token,
             ));
         }
-        Ok(replace_bytes(&bytes, self.config.token.as_bytes(), proxy_token.as_bytes()).into())
-    }
-
-    pub fn translate_ide_payload(
-        &self,
-        payload: &[u8],
-        proxy_token: &str,
-        to_upstream: bool,
-    ) -> Vec<u8> {
-        let (from, to) = if to_upstream {
-            (proxy_token.as_bytes(), self.config.token.as_bytes())
-        } else {
-            (self.config.token.as_bytes(), proxy_token.as_bytes())
-        };
-        if from.is_empty() {
-            return payload.to_vec();
-        }
-        replace_bytes(payload, from, to)
+        Ok(bytes)
     }
 
     pub async fn open_ide_ws(
@@ -893,25 +819,7 @@ impl HttpRvmClient {
             _ => "ws",
         })
         .map_err(|_| RvmError::InvalidUrl)?;
-        let pairs = url
-            .query_pairs()
-            .map(|(key, value)| {
-                // The deployed RVM/serve-web path currently requires query
-                // authentication for IDE WebSocket upgrades.
-                let key_is_token = key.eq_ignore_ascii_case("token")
-                    || key.eq_ignore_ascii_case("tkn")
-                    || key.eq_ignore_ascii_case("connectionToken")
-                    || key.eq_ignore_ascii_case("reconnectionToken");
-                (
-                    key.into_owned(),
-                    if key_is_token {
-                        self.config.token.clone()
-                    } else {
-                        value.into_owned()
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
+        let pairs = ide_ws_query_pairs(&url, &self.config.token);
         url.set_query(None);
         if !pairs.is_empty() {
             let mut query = url.query_pairs_mut();
@@ -946,15 +854,13 @@ impl HttpRvmClient {
                     .map_err(|_| RvmError::WebSocket("invalid IDE websocket protocol".into()))?,
             );
         }
-        if cookies.is_empty() {
-            request.headers_mut().insert(
-                header::AUTHORIZATION,
-                self.config
-                    .auth_header()
-                    .parse()
-                    .map_err(|_| RvmError::WebSocket("invalid authorization header".into()))?,
-            );
-        }
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            self.config
+                .auth_header()
+                .parse()
+                .map_err(|_| RvmError::WebSocket("invalid authorization header".into()))?,
+        );
         if !cookies.is_empty() {
             request.headers_mut().insert(
                 header::COOKIE,
@@ -964,12 +870,14 @@ impl HttpRvmClient {
                     .map_err(|_| RvmError::WebSocket("invalid IDE cookie".into()))?,
             );
         }
-        connect_async(request)
-            .await
-            .map(|(stream, _)| stream)
-            .map_err(|error| {
-                RvmError::WebSocket(RvmError::redact(&error.to_string(), &self.config.token))
-            })
+        let result = connect_async(request).await;
+        match result {
+            Ok((stream, _)) => Ok(stream),
+            Err(error) => Err(RvmError::WebSocket(RvmError::redact(
+                &error.to_string(),
+                &self.config.token,
+            ))),
+        }
     }
 
     fn remote_path(&self, path: &str) -> Result<String, RvmError> {
@@ -1098,6 +1006,17 @@ impl HttpRvmClient {
         }
         Ok(bytes)
     }
+}
+
+fn ide_ws_query_pairs(url: &Url, _token: &str) -> Vec<(String, String)> {
+    url.query_pairs()
+        .filter(|(key, _)| {
+            !key.eq_ignore_ascii_case("token")
+                && !key.eq_ignore_ascii_case("tkn")
+                && !key.eq_ignore_ascii_case("connectionToken")
+        })
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect()
 }
 
 #[async_trait]
@@ -2197,7 +2116,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ide_bootstrap_replays_redirect_cookies_and_redacts_upstream_token() {
+    async fn ide_bootstrap_replays_redirect_cookies_and_preserves_workbench_token() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -2206,7 +2125,7 @@ mod tests {
         let task = tokio::spawn(async move {
             let mut request = vec![0; 8192];
             for (index, expected) in [
-                "tkn=rvm-secret",
+                "folder=vscode-remote%3A%2F%2Fantec%2FC%3A%2FUsers%2FTeam",
                 "cookie:",
                 "cookie: rvm_ide_tkn=rvm-secret",
             ]
@@ -2254,16 +2173,11 @@ mod tests {
             .ide_bootstrap("vscode-remote://antec/C:/Users/Team")
             .await
             .unwrap();
-        assert!(!result.html.contains("rvm-secret"));
-        assert!(result.html.contains(&result.proxy_token));
+        assert!(result.html.contains("rvm-secret"));
         assert!(result.html.contains("remoteAuthority"));
         assert!(result.html.len() > "<html>bare workbench</html>".len());
         let asset = client
-            .ide_request_bytes(
-                "/ide/out/workbench.js",
-                &result.cookies,
-                &result.proxy_token,
-            )
+            .ide_request_bytes("/ide/out/workbench.js", &result.cookies)
             .await
             .unwrap();
         assert_eq!(&asset[..], b"asset");
@@ -2291,22 +2205,41 @@ mod tests {
     }
 
     #[test]
-    fn ide_payload_translation_redacts_assets_and_websocket_frames() {
-        assert_eq!(
-            replace_bytes(
-                b"asset=rvm-secret;again=rvm-secret",
-                b"rvm-secret",
-                b"local-token"
-            ),
-            b"asset=local-token;again=local-token"
+    fn ide_websocket_query_preserves_reconnection_token_without_exposing_auth() {
+        let url = Url::parse(
+            "https://linux.windevos.com/ide/?reconnectionToken=local-reconnect&reconnection=false&skipWebSocketFrames=false",
+        )
+        .unwrap();
+        let pairs = ide_ws_query_pairs(&url, "upstream-secret");
+        assert!(
+            pairs
+                .iter()
+                .any(|(key, value)| { key == "reconnectionToken" && value == "local-reconnect" })
         );
+        assert!(
+            pairs
+                .iter()
+                .any(|(key, value)| { key == "skipWebSocketFrames" && value == "false" })
+        );
+        assert!(pairs.iter().all(|(_, value)| value != "upstream-secret"));
     }
 
     #[test]
-    fn workbench_html_replaces_connection_token_without_cookie_output() {
-        let html = r#"<meta id="vscode-workbench-web-configuration" data-settings='{"connectionToken":"rvm-secret"}'>"#;
-        let sanitized = redact_workbench_token(html, "rvm-secret", "local-proxy");
-        assert!(!sanitized.contains("rvm-secret"));
-        assert!(sanitized.contains("local-proxy"));
+    fn ide_websocket_query_strips_browser_auth_tokens() {
+        let url = Url::parse(
+            "https://linux.windevos.com/ide/?tkn=local-token&reconnectionToken=local-reconnect",
+        )
+        .unwrap();
+        let pairs = ide_ws_query_pairs(&url, "upstream-secret");
+        assert!(
+            pairs
+                .iter()
+                .all(|(key, value)| { !key.eq_ignore_ascii_case("tkn") && value != "local-token" })
+        );
+        assert!(
+            pairs
+                .iter()
+                .any(|(key, value)| key == "reconnectionToken" && value == "local-reconnect")
+        );
     }
 }

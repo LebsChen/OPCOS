@@ -279,10 +279,9 @@ describe("GUI boundary behavior", () => {
       "utf8",
     );
     expect(source).toContain("ws://127.0.0.1:${port}");
-    expect(source).toContain("http://127.0.0.1:${idePort}/");
-    expect(source).not.toMatch(
-      /(?:ws|http)s?:\/\/[^"`]*\b(?:token|authorization|bearer)\b/i,
-    );
+    expect(source).toContain("http://127.0.0.1:${ideProxy.port}/ide/");
+    expect(source).not.toMatch(/(?:ws|http)s?:\/\/[^"`]*linux\.windevos\.com/i);
+    expect(source).not.toMatch(/Authorization:\s*Bearer/i);
   });
 
   it("passes the configured VNC password to noVNC and surfaces handshake failures", () => {
@@ -308,5 +307,17 @@ describe("GUI boundary behavior", () => {
     );
     expect(source).toContain('setHostVncPassword(password || "")');
     expect(source).toContain("vncPassword: hostVncPassword");
+  });
+
+  it("reports a bounded Web IDE stall after the relay upgrade", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("./App.tsx", import.meta.url)),
+      "utf8",
+    );
+    expect(source).toContain("/__opcos_status");
+    expect(source).toContain(
+      "Remote Web IDE workbench stalled after the WebSocket upgrade",
+    );
+    expect(source).toContain("Date.now() - started >= 60_000");
   });
 });
