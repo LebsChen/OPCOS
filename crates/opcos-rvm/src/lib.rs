@@ -1,5 +1,7 @@
 use async_trait::async_trait;
+use base64::Engine;
 use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
 pub use opcos_computer_use::{ComputerUseAction, ComputerUseResponse, ScreenBounds, Screenshot};
 use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -351,6 +353,14 @@ pub struct WsParams {
 
 pub type RvmWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CdpScreenshot {
+    pub image: Vec<u8>,
+    pub mime: String,
+    pub target_id: String,
+    pub target_url: String,
+}
+
 pub const DEFAULT_EXEC_TIMEOUT_SECONDS: u64 = 30;
 pub const MAX_EXEC_TIMEOUT_SECONDS: u64 = 300;
 pub const LIFECYCLE_EXEC_TIMEOUT_SECONDS: u64 = 30 * 60;
@@ -663,6 +673,36 @@ impl HttpRvmClient {
     pub fn with_workspace(mut self, workspace: impl Into<String>) -> Self {
         self.path_guard = Some(RemotePathGuard::new(workspace));
         self
+    }
+
+    pub async fn capture_cdp_screenshot(&self) -> Result<CdpScreenshot, RvmError> {
+        let mut socket = self.open_ws(WsKind::Cdp, WsParams::default()).await?;
+        let mut next_id = 1_u64;
+        let screenshot = cdp_command(
+            &mut socket,
+            &mut next_id,
+            "Page.captureScreenshot",
+            Some(serde_json::json!({"format": "png"})),
+            None,
+        )
+        .await?;
+        let image = screenshot
+            .get("data")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                RvmError::InvalidResponse("CDP screenshot returned no image data".into())
+            })?;
+        let image = base64::engine::general_purpose::STANDARD
+            .decode(image)
+            .map_err(|error| {
+                RvmError::InvalidResponse(format!("CDP screenshot base64 is invalid: {error}"))
+            })?;
+        Ok(CdpScreenshot {
+            image,
+            mime: "image/png".into(),
+            target_id: "page-socket".into(),
+            target_url: String::new(),
+        })
     }
 
     pub async fn ide_bootstrap(&self, folder: &str) -> Result<IdeBootstrap, RvmError> {
@@ -1375,6 +1415,24 @@ impl RvmClient for HttpRvmClient {
                 .parse()
                 .map_err(|_| RvmError::WebSocket("invalid authorization header".into()))?,
         );
+        if !matches!(kind, WsKind::Cdp) {
+            let mut origin = self.config.base_url.clone();
+            origin.set_path("");
+            origin.set_query(None);
+            request.headers_mut().insert(
+                header::ORIGIN,
+                origin
+                    .as_str()
+                    .parse()
+                    .map_err(|_| RvmError::WebSocket("invalid websocket origin".into()))?,
+            );
+            request.headers_mut().insert(
+                header::USER_AGENT,
+                IDE_BROWSER_USER_AGENT
+                    .parse()
+                    .map_err(|_| RvmError::WebSocket("invalid websocket user-agent".into()))?,
+            );
+        }
         connect_async(request)
             .await
             .map(|(stream, _)| stream)
@@ -1382,6 +1440,83 @@ impl RvmClient for HttpRvmClient {
                 RvmError::WebSocket(RvmError::redact(&error.to_string(), &self.config.token))
             })
     }
+}
+
+async fn cdp_command(
+    socket: &mut RvmWebSocket,
+    next_id: &mut u64,
+    method: &str,
+    params: Option<Value>,
+    session_id: Option<&str>,
+) -> Result<Value, RvmError> {
+    let id = *next_id;
+    *next_id = next_id.saturating_add(1);
+    let mut request = serde_json::json!({"id": id, "method": method});
+    if let Some(params) = params {
+        request["params"] = params;
+    }
+    if let Some(session_id) = session_id {
+        request["sessionId"] = Value::String(session_id.to_owned());
+    }
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            request.to_string().into(),
+        ))
+        .await
+        .map_err(|error| {
+            RvmError::WebSocket(format!("CDP connection lost sending {method}: {error}"))
+        })?;
+    while let Some(message) = socket.next().await {
+        let message = message.map_err(|error| {
+            RvmError::WebSocket(format!("CDP connection lost waiting for {method}: {error}"))
+        })?;
+        let text = match message {
+            tokio_tungstenite::tungstenite::Message::Text(text) => text.to_string(),
+            tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
+                String::from_utf8(bytes.to_vec()).map_err(|_| {
+                    RvmError::InvalidResponse("CDP returned non-UTF-8 binary data".into())
+                })?
+            }
+            tokio_tungstenite::tungstenite::Message::Ping(_)
+            | tokio_tungstenite::tungstenite::Message::Pong(_) => continue,
+            tokio_tungstenite::tungstenite::Message::Close(_) => {
+                return Err(RvmError::WebSocket(format!(
+                    "CDP connection closed while waiting for {method}"
+                )));
+            }
+            tokio_tungstenite::tungstenite::Message::Frame(_) => continue,
+        };
+        let response: Value = serde_json::from_str(&text)?;
+        if let Some(proxy_error) = response.get("error").and_then(Value::as_str) {
+            let message = response
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("remote CDP proxy failed");
+            return Err(RvmError::WebSocket(format!(
+                "remote CDP proxy failed ({proxy_error}): {message}"
+            )));
+        }
+        if response.get("id").and_then(Value::as_u64) != Some(id) {
+            continue;
+        }
+        if let Some(error) = response.get("error") {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("CDP command failed");
+            if message.to_ascii_lowercase().contains("target closed") {
+                return Err(RvmError::Unsupported("remote browser target closed".into()));
+            }
+            return Err(RvmError::JsonRpc {
+                code: error.get("code").and_then(Value::as_i64).unwrap_or(-32000),
+                message: message.to_owned(),
+            });
+        }
+        return Ok(response.get("result").cloned().unwrap_or(Value::Null));
+    }
+    Err(RvmError::WebSocket(format!(
+        "CDP connection closed while waiting for {method}"
+    )))
 }
 
 /// MCP tools the host may expose that map onto OPCOS host capabilities.
@@ -1521,6 +1656,7 @@ mod tests {
     use axum::{
         Router,
         body::Body,
+        extract::ws::{Message, WebSocket, WebSocketUpgrade},
         http::Request,
         routing::{get, post},
     };
@@ -2241,5 +2377,50 @@ mod tests {
                 .iter()
                 .any(|(key, value)| key == "reconnectionToken" && value == "local-reconnect")
         );
+    }
+
+    async fn cdp_test_socket(mut socket: WebSocket) {
+        while let Some(Ok(Message::Text(text))) = socket.recv().await {
+            let request: Value = serde_json::from_str(&text).unwrap();
+            let id = request.get("id").cloned().unwrap();
+            let method = request.get("method").and_then(Value::as_str).unwrap();
+            let response = match method {
+                "Page.captureScreenshot" => serde_json::json!({
+                    "id": id,
+                    "result": {"data": base64::engine::general_purpose::STANDARD.encode([137, 80, 78, 71])}
+                }),
+                _ => panic!("unexpected CDP method {method}"),
+            };
+            socket
+                .send(Message::Text(response.to_string().into()))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cdp_screenshot_client_selects_page_and_decodes_png() {
+        let app = Router::new().route(
+            "/cdp-ws",
+            get(|upgrade: WebSocketUpgrade| async { upgrade.on_upgrade(cdp_test_socket) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = HttpRvmClient::new(
+            RvmClientConfig::new(
+                Url::parse(&format!("http://{address}")).unwrap(),
+                "test-token",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let screenshot = client.capture_cdp_screenshot().await.unwrap();
+        assert_eq!(screenshot.image, [137, 80, 78, 71]);
+        assert_eq!(screenshot.target_id, "page-socket");
+        assert_eq!(screenshot.target_url, "");
+        server.abort();
     }
 }

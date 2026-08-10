@@ -2492,6 +2492,11 @@ function SurfaceView({
   const [port, setPort] = useState<number | null>(null);
   const [vncPassword, setVncPassword] = useState<string | null>(null);
   const [surfaceError, setSurfaceError] = useState("");
+  const [browserFrame, setBrowserFrame] = useState<{
+    image: string;
+    mime: string;
+    target_url: string;
+  } | null>(null);
   const [ideProxy, setIdeProxy] = useState<{ port: number } | null>(null);
   const [review, setReview] = useState<Record<string, unknown> | null>(null);
   const [diff, setDiff] = useState<Record<string, unknown> | null>(null);
@@ -2529,6 +2534,7 @@ function SurfaceView({
     setPort(null);
     setVncPassword(null);
     setSurfaceError("");
+    setBrowserFrame(null);
     setIdeProxy(null);
     setReview(null);
     setDiff(null);
@@ -2630,6 +2636,32 @@ function SurfaceView({
       if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [tab, ideProxy, ideError]);
+  useEffect(() => {
+    if (tab !== "browser") return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const frame = await command<{
+          image: string;
+          mime: string;
+          target_url: string;
+        }>("capture_remote_browser_frame", { sessionId: selected.id });
+        if (!cancelled) {
+          setBrowserFrame(frame);
+          setSurfaceError("");
+        }
+      } catch (error) {
+        if (!cancelled) setSurfaceError(errorMessage(error));
+      }
+      if (!cancelled) timer = window.setTimeout(() => void poll(), 1000);
+    };
+    void poll();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [tab, selected.id]);
   useEffect(() => {
     if (tab !== "terminal" || !port || !terminalHost.current) return;
     const terminal = new Terminal({
@@ -2735,11 +2767,25 @@ function SurfaceView({
         )}
         {tab === "desktop" && <div className="vnc-host" ref={vncHost} />}
         {tab === "browser" && (
-          <div className="empty-surface">
-            <Icon name="image" size={32} />
-            <p>
-              CDP relay started on demand. Connect a browser client to{" "}
-              <code>ws://127.0.0.1:{port || "…"}</code>.
+          <div className="browser-preview">
+            <div className="surface-status muted">
+              Read-only remote browser preview
+            </div>
+            {browserFrame ? (
+              <img
+                className="browser-preview-image"
+                src={`data:${browserFrame.mime};base64,${browserFrame.image}`}
+                alt={`Remote browser page ${browserFrame.target_url || ""}`}
+              />
+            ) : (
+              <div className="empty-surface">
+                <Icon name="image" size={32} />
+                <p>Waiting for a remote browser page target…</p>
+              </div>
+            )}
+            <p className="surface-status muted">
+              CDP relay for an external client:{" "}
+              <code>ws://127.0.0.1:{port || "…"}</code>
             </p>
           </div>
         )}
