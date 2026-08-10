@@ -441,6 +441,13 @@ select:focus {
   position: relative;
   padding-top: 0;
 }
+.transcript-viewport {
+  position: relative;
+  display: flex;
+  min-height: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+}
 .main-scroll {
   flex: 1 1 auto;
   min-height: 0;
@@ -456,7 +463,7 @@ select:focus {
 .transcript-jump-bottom {
   position: absolute;
   right: 24px;
-  bottom: 76px;
+  bottom: 16px;
   display: inline-flex;
   width: 32px;
   height: 32px;

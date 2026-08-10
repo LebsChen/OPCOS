@@ -547,6 +547,14 @@ body {
   line-height: 1.68;
   color: var(--ink);
 }
+.transcript-prose .md {
+  font-size: 14px;
+  line-height: 20px;
+  overflow-wrap: anywhere;
+}
+.transcript-prose .md code {
+  overflow-wrap: anywhere;
+}
 .md > :first-child {
   margin-top: 0;
 }
