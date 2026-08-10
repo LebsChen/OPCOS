@@ -43,9 +43,10 @@ use opcos_engine::{
     planner::{parse_planner_output, planner_dedup_key, planning_prompt},
 };
 use opcos_hosts::{
-    BackgroundJobManager, BrowserController, BrowserRequest, ComputerUseAction,
-    DEFAULT_EXEC_TIMEOUT_SECONDS, Host, LIFECYCLE_EXEC_TIMEOUT_SECONDS, LifecycleStage, LocalHost,
-    RvmHost, ScreenBounds, SecretValues, SpawnRequest, execute_lifecycle_stage,
+    BackgroundJobManager, BrowserController, BrowserRequest, Capability, CapabilityState,
+    ComputerUseAction, DEFAULT_EXEC_TIMEOUT_SECONDS, Host, HostCapabilities,
+    LIFECYCLE_EXEC_TIMEOUT_SECONDS, LifecycleStage, LocalHost, RvmHost, ScreenBounds, SecretValues,
+    SpawnRequest, execute_lifecycle_stage,
 };
 use opcos_lsp::LspClient;
 use opcos_mcp::{
@@ -827,6 +828,7 @@ struct RemoteExecutor {
     coordination: Arc<AsyncMutex<HashMap<String, CoordinationRuntime>>>,
     origin: ToolOrigin,
     repair_loop: Option<RepairLoopContext>,
+    capabilities: HostCapabilities,
 }
 
 struct LocalExecutor {
@@ -846,6 +848,7 @@ struct LocalExecutor {
     origin: ToolOrigin,
     repair_loop: Option<RepairLoopContext>,
     browser: Arc<dyn BrowserController>,
+    capabilities: HostCapabilities,
 }
 
 enum DesktopExecutor {
@@ -5088,6 +5091,9 @@ impl ToolExecutor for RemoteExecutor {
     }
 
     async fn execute(&self, name: &str, arguments: Value) -> Result<Value, String> {
+        if let Err(error) = capability_preflight(&self.capabilities, name) {
+            return Ok(error);
+        }
         if name == "computer_use" {
             let (action, bounds) = parse_computer_use_arguments(&arguments)?;
             let host = RvmHost::new(
@@ -5603,6 +5609,15 @@ impl ToolExecutor for DesktopExecutor {
     }
 
     async fn execute(&self, name: &str, arguments: Value) -> Result<Value, String> {
+        if let Self::Local(executor) = self {
+            if let Err(error) = capability_preflight(&executor.capabilities, name) {
+                return Ok(error);
+            }
+        } else if let Self::Remote(executor) = self
+            && let Err(error) = capability_preflight(&executor.capabilities, name)
+        {
+            return Ok(error);
+        }
         if name == "desktop_show" {
             return self
                 .request_desktop_view(arguments.get("reason").and_then(Value::as_str))
@@ -12067,21 +12082,47 @@ async fn engine_for_with_context(
             .capabilities()
             .await
             .map_err(|error| error.to_string())?;
-        let allowed_tools = capabilities
+        let mut capabilities = capabilities;
+        let (lsp_probe, lsp_reason) =
+            probe_local_lsp(&host, &workspace.display().to_string()).await;
+        if let Some(item) = capabilities
             .items
-            .iter()
-            .filter(|item| item.available)
-            .filter_map(|item| match item.name.as_str() {
-                "read" => Some("read_file".to_owned()),
-                "write" => Some("write_file".to_owned()),
-                "ls" => Some("list_dir".to_owned()),
-                "exec" | "exec_sync" => Some("run_shell".to_owned()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let mut allowed_tools = allowed_tools;
-        let supports_edit_file = allowed_tools.iter().any(|tool| tool == "write_file");
-        allowed_tools.extend(builtin_allowed_tools(true, supports_edit_file));
+            .iter_mut()
+            .find(|item| item.name == "lsp")
+        {
+            item.state = if lsp_probe {
+                CapabilityState::Available
+            } else {
+                CapabilityState::Unavailable
+            };
+            item.reason = lsp_reason.clone();
+            item.source = "runtime-probe".into();
+        }
+        host.set_capability_state(
+            "lsp",
+            if lsp_probe {
+                CapabilityState::Available
+            } else {
+                CapabilityState::Unavailable
+            },
+            "runtime-probe",
+            lsp_reason,
+        )
+        .await;
+        let browser_probe = state.local_browser.probe().await;
+        let observed_at = Utc::now();
+        capabilities.items.push(Capability {
+            name: "browser".into(),
+            state: if browser_probe.is_ok() {
+                CapabilityState::Available
+            } else {
+                CapabilityState::Unavailable
+            },
+            source: "runtime-probe".into(),
+            observed_at,
+            reason: browser_probe.err().map(|error| error.to_string()),
+        });
+        let mut allowed_tools = allowed_builtin_tools(&capabilities);
         if linear_tools_enabled {
             allowed_tools.extend([
                 "linear_get_issue".to_owned(),
@@ -12145,6 +12186,7 @@ async fn engine_for_with_context(
                 origin: origin.clone(),
                 repair_loop: repair_loop.clone(),
                 browser: Arc::clone(&state.local_browser),
+                capabilities: capabilities.clone(),
             }))),
             None,
             Some(allowed_tools),
@@ -12166,6 +12208,12 @@ async fn engine_for_with_context(
         };
         let executor_client = client.clone().with_workspace(workspace.clone());
         let asset_reader = SessionAssetReader::Remote(executor_client.clone());
+        let remote_host = RvmHost::new(host_id.clone(), workspace.clone(), executor_client.clone());
+        let capabilities = remote_host
+            .capabilities()
+            .await
+            .map_err(|error| format!("remote capabilities unavailable: {error}"))?;
+        let allowed_tools = allowed_builtin_tools(&capabilities);
         (
             workspace.clone(),
             Arc::new(DesktopExecutor::Remote(Box::new(RemoteExecutor {
@@ -12189,9 +12237,10 @@ async fn engine_for_with_context(
                 coordination: Arc::clone(&state.coordination),
                 origin: origin.clone(),
                 repair_loop: repair_loop.clone(),
+                capabilities: capabilities.clone(),
             }))),
             Some(executor_client),
-            None,
+            Some(allowed_tools),
             asset_reader,
         )
     };
@@ -14025,7 +14074,7 @@ async fn harness_options(
     };
     let capabilities = host.capabilities().await.map_err(|e| e.to_string())?;
     let stdio = capabilities.items.iter().find(|item| item.name == "stdio");
-    let acp_option = if stdio.is_some_and(|item| item.available) {
+    let acp_option = if stdio.is_some_and(|item| item.state.is_available()) {
         match acp_agent_config(&state, project_id.as_deref()) {
             Ok(config) => {
                 let executable = config.command.split_whitespace().next().unwrap_or_default();
@@ -14071,6 +14120,102 @@ async fn harness_options(
 #[tauri::command(rename = "list_sessions")]
 fn list_sessions_command(state: State<'_, DesktopState>) -> Result<Vec<SessionView>, String> {
     list_sessions_for_state(&state)
+}
+
+#[tauri::command]
+async fn session_capabilities(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Value, String> {
+    let session = session_for(&state, &session_id)?;
+    let capabilities = if session.host_id == "local" {
+        let workspace = if session.workspace.is_empty() {
+            local_workspace_path(&session_id)?
+        } else {
+            session.workspace.clone()
+        };
+        let host = LocalHost::with_secret_snapshot(
+            FsPath::new(&workspace),
+            Arc::clone(&state.secret_values),
+        )
+        .map_err(|error| error.to_string())?;
+        let mut capabilities = host
+            .capabilities()
+            .await
+            .map_err(|error| error.to_string())?;
+        let (lsp_probe, lsp_reason) = probe_local_lsp(&host, &workspace).await;
+        if let Some(item) = capabilities
+            .items
+            .iter_mut()
+            .find(|item| item.name == "lsp")
+        {
+            item.state = if lsp_probe {
+                CapabilityState::Available
+            } else {
+                CapabilityState::Unavailable
+            };
+            item.source = "runtime-probe".into();
+            item.reason = lsp_reason.clone();
+        }
+        host.set_capability_state(
+            "lsp",
+            if lsp_probe {
+                CapabilityState::Available
+            } else {
+                CapabilityState::Unavailable
+            },
+            "runtime-probe",
+            lsp_reason,
+        )
+        .await;
+        let browser_probe = state.local_browser.probe().await;
+        let observed_at = Utc::now();
+        capabilities.items.push(Capability {
+            name: "browser".into(),
+            state: if browser_probe.is_ok() {
+                CapabilityState::Available
+            } else {
+                CapabilityState::Unavailable
+            },
+            source: "runtime-probe".into(),
+            observed_at,
+            reason: browser_probe.err().map(|error| error.to_string()),
+        });
+        capabilities
+    } else {
+        let client = client_for(&state, &session.host_id)?;
+        let workspace = if session.workspace.is_empty() {
+            client
+                .health()
+                .await
+                .map_err(|error| error.to_string())?
+                .workspace
+                .unwrap_or_else(|| "/workspace".into())
+        } else {
+            session.workspace.clone()
+        };
+        RvmHost::new(
+            session.host_id.clone(),
+            workspace.clone(),
+            client.with_workspace(workspace),
+        )
+        .capabilities()
+        .await
+        .map_err(|error| error.to_string())?
+    };
+    let all_tools = opcos_engine::builtin_tool_names();
+    let allowed = allowed_builtin_tools(&capabilities);
+    let allowed_set = allowed.iter().collect::<HashSet<_>>();
+    let omitted = all_tools
+        .into_iter()
+        .filter(|name| !allowed_set.contains(name))
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "observed_at": capabilities.observed_at,
+        "items": capabilities.items,
+        "allowed_tools": allowed,
+        "omitted_tools": omitted,
+    }))
 }
 
 #[tauri::command]
@@ -15024,81 +15169,150 @@ pub(crate) async fn submit_turn_inner_with_origin(
     submit_turn_inner_with_context(app, state, request, origin, None).await
 }
 
-fn builtin_allowed_tools(include_local_lsp: bool, include_edit_file: bool) -> Vec<String> {
-    let mut tools = vec![
-        "propose_plan",
-        "plan_get",
-        "plan_update",
-        "plan_revise",
-        "skill_save_learned",
-        "skill_search_learned",
-        "skill_get_learned",
-        "memory_save_automatic",
-        "memory_list",
-        "memory_disable",
-        "memory_delete",
-        "learned_skill_manage",
-        "session_search",
-        "config_asset_manage",
-        "automation_manage",
-        "ask_user",
-        "recording_start",
-        "recording_annotate",
-        "recording_stop",
-        "secrets_list",
-        "repo_index_find_symbol",
-        "repo_index_glob",
-        "repo_index_search",
-        "background_job_start",
-        "background_job_status",
-        "background_job_output",
-        "background_job_kill",
-        "local_gate_record",
-        "local_gate_status",
-        "action_ledger_begin",
-        "action_ledger_finish",
-        "action_ledger_list",
-        "work_queue_enqueue",
-        "work_queue_claim",
-        "work_queue_renew",
-        "work_queue_complete",
-        "work_queue_cancel",
-        "work_queue_requeue",
-        "work_queue_list",
-        "external_ingress_sources",
-        "coordination_dispatch",
-        "coordination_fan_out",
-        "coordination_status",
+fn allowed_builtin_tools(capabilities: &HostCapabilities) -> Vec<String> {
+    opcos_engine::builtin_tool_capability_requirements()
+        .into_iter()
+        .filter(|(name, _)| !is_connector_builtin_tool(name))
+        .filter(|(name, _)| {
+            !matches!(
+                *name,
+                "tool_search"
+                    | "tool_describe"
+                    | "tool_script"
+                    | "send_user_message"
+                    | "report_blocker"
+            )
+        })
+        .filter(|(_, requirements)| {
+            requirements.iter().all(|required| {
+                capabilities
+                    .items
+                    .iter()
+                    .find(|item| item.name == *required)
+                    .is_some_and(|item| item.state.is_available())
+            })
+        })
+        .map(|(name, _)| name.to_owned())
+        .collect()
+}
+
+fn is_connector_builtin_tool(name: &str) -> bool {
+    name.starts_with("linear_")
+        || name.starts_with("github_")
+        || name.starts_with("telegram_")
+        || name.starts_with("discord_")
+        || name.starts_with("slack_")
+        || name.starts_with("notion_")
+        || name.starts_with("gitlab_")
+        || name.starts_with("jira_")
+        || name.starts_with("stripe_")
+}
+
+async fn probe_local_lsp(host: &LocalHost, workspace: &str) -> (bool, Option<String>) {
+    match LspClient::start(Arc::new(host.clone()), workspace.to_owned(), "rust").await {
+        Ok(_) => (true, None),
+        Err(error) => (false, Some(format!("LSP initialize probe failed: {error}"))),
+    }
+}
+
+fn capability_preflight(capabilities: &HostCapabilities, tool: &str) -> Result<(), Value> {
+    let requirements = opcos_engine::builtin_tool_capability_requirements()
+        .into_iter()
+        .find(|(name, _)| *name == tool)
+        .map(|(_, requirements)| requirements)
+        .unwrap_or(&[]);
+    for required in requirements {
+        let item = capabilities
+            .items
+            .iter()
+            .find(|item| item.name == *required);
+        let Some(item) = item else {
+            return Err(opcos_engine::capability_tool_error(
+                format!(
+                    "capability_unknown: capability={required} tool={tool} reason=capability evidence is missing"
+                ),
+                tool,
+                *required,
+                "unknown",
+                "not_probed",
+                capabilities.observed_at.to_rfc3339(),
+                true,
+            ));
+        };
+        if !item.state.is_available() {
+            let state = match item.state {
+                CapabilityState::Unavailable => "unavailable",
+                CapabilityState::Unknown => "unknown",
+                CapabilityState::Available => "available",
+            };
+            let code = if state == "unknown" {
+                "capability_unknown"
+            } else {
+                "capability_unavailable"
+            };
+            return Err(opcos_engine::capability_tool_error(
+                format!(
+                    "{code}: capability={required} tool={tool} state={state} reason={}",
+                    item.reason.as_deref().unwrap_or("no reason provided")
+                ),
+                tool,
+                *required,
+                state,
+                &item.source,
+                item.observed_at.to_rfc3339(),
+                state == "unknown",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn test_capabilities(lsp: bool, browser: bool, screenshot: bool) -> HostCapabilities {
+    let observed_at = Utc::now();
+    let names = [
+        "exec",
+        "read",
+        "write",
+        "ls",
+        "process_stream",
+        "stdio",
+        "lsp",
+        "browser",
+        "screenshot",
         "computer_use",
-        "desktop_show",
-        "session_rename",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect::<Vec<_>>();
-    if include_local_lsp {
-        tools.extend([
-            "lsp_definition".to_owned(),
-            "lsp_references".to_owned(),
-            "lsp_diagnostics".to_owned(),
-        ]);
+    ];
+    HostCapabilities {
+        observed_at,
+        items: names
+            .into_iter()
+            .map(|name| {
+                let available = match name {
+                    "lsp" => lsp,
+                    "computer_use" => screenshot,
+                    "browser" | "screenshot" => {
+                        if name == "screenshot" {
+                            screenshot
+                        } else {
+                            browser
+                        }
+                    }
+                    _ => true,
+                };
+                Capability {
+                    name: name.into(),
+                    state: if available {
+                        CapabilityState::Available
+                    } else {
+                        CapabilityState::Unavailable
+                    },
+                    source: "test".into(),
+                    observed_at,
+                    reason: (!available).then(|| "test unavailable".into()),
+                }
+            })
+            .collect(),
     }
-    if include_edit_file {
-        tools.push("edit_file".to_owned());
-    }
-    if include_local_lsp {
-        tools.extend([
-            "browser_status".to_owned(),
-            "browser_navigate".to_owned(),
-            "browser_set_viewport".to_owned(),
-            "browser_click".to_owned(),
-            "browser_read".to_owned(),
-            "browser_measure".to_owned(),
-            "browser_assert_geometry".to_owned(),
-            "browser_screenshot".to_owned(),
-        ]);
-    }
-    tools
 }
 
 pub(crate) async fn submit_turn_inner_with_context(
@@ -21543,17 +21757,11 @@ async fn connector_browser_check(
     host_id: String,
 ) -> Result<Value, String> {
     let available = if host_id == "local" {
-        let capabilities = LocalHost::new(FsPath::new("/"))
-            .map_err(|error| error.to_string())?
-            .capabilities()
-            .await
-            .map_err(|error| error.to_string())?;
-        capabilities
-            .items
-            .iter()
-            .filter(|item| item.available)
-            .map(|item| item.name.to_ascii_lowercase())
-            .collect::<Vec<_>>()
+        if state.local_browser.probe().await.is_ok() {
+            vec!["browser".to_owned()]
+        } else {
+            Vec::new()
+        }
     } else {
         client_for(&state, &host_id)?
             .capabilities()
@@ -28847,6 +29055,7 @@ fn main() {
             harness_options,
             change_harness,
             list_sessions_command,
+            session_capabilities,
             set_session_archived,
             read_session_events_command,
             export_session_trace,
@@ -29287,7 +29496,7 @@ mod m7_tests {
 
     #[test]
     fn builtin_prompt_tools_are_present_in_local_tool_catalog_and_allowlist() {
-        let allowed = builtin_allowed_tools(true, true)
+        let allowed = allowed_builtin_tools(&test_capabilities(true, true, true))
             .into_iter()
             .collect::<HashSet<_>>();
         let catalog = opcos_engine::builtin_tool_names();
@@ -29326,12 +29535,68 @@ mod m7_tests {
                 "{name} is missing from local allowlist"
             );
         }
-        let remote_allowed = builtin_allowed_tools(false, false)
+        let remote_allowed = allowed_builtin_tools(&test_capabilities(false, false, true))
             .into_iter()
             .collect::<HashSet<_>>();
         for name in ["lsp_definition", "lsp_references", "lsp_diagnostics"] {
             assert!(!remote_allowed.contains(name));
         }
+    }
+
+    #[test]
+    fn capability_allowlist_gates_host_tools_without_host_type_flags() {
+        let no_screenshot = allowed_builtin_tools(&test_capabilities(true, true, false));
+        for name in [
+            "recording_start",
+            "recording_annotate",
+            "recording_stop",
+            "computer_use",
+        ] {
+            assert!(!no_screenshot.contains(&name.to_owned()), "{name} leaked");
+        }
+
+        let browser_without_lsp = allowed_builtin_tools(&test_capabilities(false, true, true));
+        for name in [
+            "browser_status",
+            "browser_navigate",
+            "browser_set_viewport",
+            "browser_click",
+            "browser_read",
+            "browser_measure",
+            "browser_assert_geometry",
+            "browser_screenshot",
+        ] {
+            assert!(
+                browser_without_lsp.contains(&name.to_owned()),
+                "{name} incorrectly depends on lsp"
+            );
+        }
+
+        let no_browser = allowed_builtin_tools(&test_capabilities(true, false, true));
+        assert!(!no_browser.iter().any(|name| name.starts_with("browser_")));
+
+        let remote_read_write = test_capabilities(false, false, false);
+        let remote_allowed = allowed_builtin_tools(&remote_read_write);
+        assert!(remote_allowed.contains(&"edit_file".to_owned()));
+        assert!(!remote_allowed.iter().any(|name| name.starts_with("lsp_")));
+    }
+
+    #[test]
+    fn capability_preflight_returns_distinct_structured_error_markers() {
+        let unavailable = test_capabilities(true, false, false);
+        let error = capability_preflight(&unavailable, "browser_status").unwrap_err();
+        assert_eq!(
+            error["error_details"]["code"],
+            json!("capability_unavailable")
+        );
+        assert_eq!(error["error_details"]["operation_performed"], json!(false));
+
+        let unknown = HostCapabilities {
+            observed_at: Utc::now(),
+            items: vec![],
+        };
+        let error = capability_preflight(&unknown, "browser_status").unwrap_err();
+        assert_eq!(error["error_details"]["code"], json!("capability_unknown"));
     }
 
     #[test]
@@ -29546,6 +29811,7 @@ mod m7_tests {
             origin: ToolOrigin::User,
             repair_loop: None,
             browser: browser::shared_local_browser(None),
+            capabilities: test_capabilities(true, true, true),
         }));
         let result = executor
             .execute("ask_user", json!({"question": "Which format?"}))
@@ -29554,7 +29820,7 @@ mod m7_tests {
             result,
             Err("ask_user must be handled by the engine pending mechanism".into())
         );
-        for name in builtin_allowed_tools(true, true) {
+        for name in allowed_builtin_tools(&test_capabilities(true, true, true)) {
             match name.as_str() {
                 // Starts a persistent process.
                 "background_job_start" => continue,
@@ -29617,8 +29883,9 @@ mod m7_tests {
             coordination: Arc::new(AsyncMutex::new(HashMap::new())),
             origin: ToolOrigin::User,
             repair_loop: None,
+            capabilities: test_capabilities(false, false, true),
         }));
-        for name in builtin_allowed_tools(false, false) {
+        for name in allowed_builtin_tools(&test_capabilities(false, false, true)) {
             match name.as_str() {
                 // Starts a persistent remote process.
                 "background_job_start" => continue,
