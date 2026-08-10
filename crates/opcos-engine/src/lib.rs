@@ -345,9 +345,12 @@ fn mcp_transport(text: &str) -> bool {
 }
 
 fn host_timeout(text: &str) -> bool {
-    contains(text, "host operation timed out")
+    (contains(text, "host operation timed out")
         || contains(text, "operation timed out")
-        || contains(text, "request timed out")
+        || contains(text, "request timed out"))
+        && !contains(text, "unsupported")
+        && !contains(text, "unavailable")
+        && !contains(text, "host i/o failed")
 }
 
 fn remote_unsupported(text: &str) -> bool {
@@ -9227,6 +9230,16 @@ mod tests {
                 "host operation timed out after 30 seconds",
                 "timeout",
                 "adjusted",
+            ),
+            (
+                "unsupported operation timed out",
+                "remote_unsupported",
+                "no",
+            ),
+            (
+                "local host I/O failed: request timed out",
+                "host_io",
+                "same",
             ),
             ("MCP server authentication required", "mcp_auth", "adjusted"),
             ("tool call denied by user", "approval_denied", "no"),
