@@ -67,6 +67,10 @@ export function projectAgentRosterValue(
   return value?.trim() || "Unknown";
 }
 
+export function projectAgentRosterHost(session: Session | null): string {
+  return projectAgentRosterValue(session?.host_name);
+}
+
 export function projectAgentRosterRows(
   agents: ProjectAgent[],
   sessions: Session[],

@@ -16,6 +16,7 @@ import {
   selectedSessionFromList,
   sessionViewSelection,
   updateSessionRunState,
+  projectAgentRosterHost,
   projectAgentRosterValue,
   projectAgentRosterRows,
 } from "./gui";
@@ -55,6 +56,8 @@ describe("GUI boundary behavior", () => {
     expect(projectAgentRosterRows(agents, [session])[0].session).toEqual(
       session,
     );
+    expect(projectAgentRosterHost(session)).toBe("Remote");
+    expect(projectAgentRosterHost(session)).not.toBe("Viewing session host");
   });
 
   it("keeps unknown agent session fields absent instead of inventing defaults", () => {

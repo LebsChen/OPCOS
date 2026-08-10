@@ -19,6 +19,7 @@ import {
   Session,
   Project,
   ProjectAgent,
+  projectAgentRosterHost,
   projectAgentRosterValue,
   projectAgentRosterRows,
   SurfaceTab,
@@ -10345,7 +10346,7 @@ function AgentRosterPane({
                     </div>
                     <div>
                       <dt>Host</dt>
-                      <dd>{projectAgentRosterValue(selected.host_name)}</dd>
+                      <dd>{projectAgentRosterHost(session)}</dd>
                     </div>
                     <div>
                       <dt>Branch</dt>
