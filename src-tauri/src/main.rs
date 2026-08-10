@@ -4665,15 +4665,17 @@ async fn execute_lsp_tool(
                 })
         })
         .ok_or("could not detect language from path; provide language explicitly")?;
-    let key = format!("{language}:{root}");
+    let resolved_root = opcos_lsp::resolve_project_root(host.as_ref(), root, &language, path).await;
+    let key = format!("{language}:{resolved_root}");
     let session = {
         let mut active = sessions.lock().await;
         if let Some(session) = active.get(&key) {
             session.clone()
         } else {
-            let session = LspClient::start(Arc::clone(&host), root.to_owned(), &language)
-                .await
-                .map_err(|error| error.to_string())?;
+            let session =
+                LspClient::start_for_path(Arc::clone(&host), root.to_owned(), &language, path)
+                    .await
+                    .map_err(|error| error.to_string())?;
             active.insert(key, session.clone());
             session
         }
@@ -5091,7 +5093,7 @@ impl ToolExecutor for RemoteExecutor {
     }
 
     async fn execute(&self, name: &str, arguments: Value) -> Result<Value, String> {
-        if let Err(error) = capability_preflight(&self.capabilities, name) {
+        if let Err(error) = capability_preflight(&self.capabilities, name, &arguments) {
             return Ok(error);
         }
         if name == "computer_use" {
@@ -5610,11 +5612,11 @@ impl ToolExecutor for DesktopExecutor {
 
     async fn execute(&self, name: &str, arguments: Value) -> Result<Value, String> {
         if let Self::Local(executor) = self {
-            if let Err(error) = capability_preflight(&executor.capabilities, name) {
+            if let Err(error) = capability_preflight(&executor.capabilities, name, &arguments) {
                 return Ok(error);
             }
         } else if let Self::Remote(executor) = self
-            && let Err(error) = capability_preflight(&executor.capabilities, name)
+            && let Err(error) = capability_preflight(&executor.capabilities, name, &arguments)
         {
             return Ok(error);
         }
@@ -12083,32 +12085,7 @@ async fn engine_for_with_context(
             .await
             .map_err(|error| error.to_string())?;
         let mut capabilities = capabilities;
-        let (lsp_probe, lsp_reason) =
-            probe_local_lsp(&host, &workspace.display().to_string()).await;
-        if let Some(item) = capabilities
-            .items
-            .iter_mut()
-            .find(|item| item.name == "lsp")
-        {
-            item.state = if lsp_probe {
-                CapabilityState::Available
-            } else {
-                CapabilityState::Unavailable
-            };
-            item.reason = lsp_reason.clone();
-            item.source = "runtime-probe".into();
-        }
-        host.set_capability_state(
-            "lsp",
-            if lsp_probe {
-                CapabilityState::Available
-            } else {
-                CapabilityState::Unavailable
-            },
-            "runtime-probe",
-            lsp_reason,
-        )
-        .await;
+        probe_local_lsp_languages(&host, &workspace, &mut capabilities).await;
         let browser_probe = state.local_browser.probe().await;
         let observed_at = Utc::now();
         capabilities.items.push(Capability {
@@ -14143,31 +14120,7 @@ async fn session_capabilities(
             .capabilities()
             .await
             .map_err(|error| error.to_string())?;
-        let (lsp_probe, lsp_reason) = probe_local_lsp(&host, &workspace).await;
-        if let Some(item) = capabilities
-            .items
-            .iter_mut()
-            .find(|item| item.name == "lsp")
-        {
-            item.state = if lsp_probe {
-                CapabilityState::Available
-            } else {
-                CapabilityState::Unavailable
-            };
-            item.source = "runtime-probe".into();
-            item.reason = lsp_reason.clone();
-        }
-        host.set_capability_state(
-            "lsp",
-            if lsp_probe {
-                CapabilityState::Available
-            } else {
-                CapabilityState::Unavailable
-            },
-            "runtime-probe",
-            lsp_reason,
-        )
-        .await;
+        probe_local_lsp_languages(&host, FsPath::new(&workspace), &mut capabilities).await;
         let browser_probe = state.local_browser.probe().await;
         let observed_at = Utc::now();
         capabilities.items.push(Capability {
@@ -15170,6 +15123,20 @@ pub(crate) async fn submit_turn_inner_with_origin(
 }
 
 fn allowed_builtin_tools(capabilities: &HostCapabilities) -> Vec<String> {
+    let has_language_lsp = capabilities
+        .items
+        .iter()
+        .any(|item| item.name.starts_with("lsp:") && item.state.is_available());
+    let has_language_entries = capabilities
+        .items
+        .iter()
+        .any(|item| item.name.starts_with("lsp:"));
+    let coarse_lsp_available = capabilities
+        .items
+        .iter()
+        .any(|item| item.name == "lsp" && item.state.is_available());
+    let lsp_available = has_language_lsp || (!has_language_entries && coarse_lsp_available);
+
     opcos_engine::builtin_tool_capability_requirements()
         .into_iter()
         .filter(|(name, _)| !is_connector_builtin_tool(name))
@@ -15183,14 +15150,24 @@ fn allowed_builtin_tools(capabilities: &HostCapabilities) -> Vec<String> {
                     | "report_blocker"
             )
         })
-        .filter(|(_, requirements)| {
-            requirements.iter().all(|required| {
-                capabilities
-                    .items
-                    .iter()
-                    .find(|item| item.name == *required)
-                    .is_some_and(|item| item.state.is_available())
-            })
+        .filter(|(name, requirements)| {
+            let base_requirements = requirements
+                .iter()
+                .filter(|required| **required != "lsp")
+                .all(|required| {
+                    capabilities
+                        .items
+                        .iter()
+                        .find(|item| item.name == *required)
+                        .is_some_and(|item| item.state.is_available())
+                });
+            if !base_requirements {
+                return false;
+            }
+            if name.starts_with("lsp_") {
+                return lsp_available;
+            }
+            true
         })
         .map(|(name, _)| name.to_owned())
         .collect()
@@ -15208,14 +15185,235 @@ fn is_connector_builtin_tool(name: &str) -> bool {
         || name.starts_with("stripe_")
 }
 
-async fn probe_local_lsp(host: &LocalHost, workspace: &str) -> (bool, Option<String>) {
-    match LspClient::start(Arc::new(host.clone()), workspace.to_owned(), "rust").await {
-        Ok(_) => (true, None),
-        Err(error) => (false, Some(format!("LSP initialize probe failed: {error}"))),
+fn workspace_lsp_projects(workspace: &std::path::Path) -> Vec<(&'static str, std::path::PathBuf)> {
+    const MAX_DEPTH: usize = 4;
+    const SKIPPED_DIRECTORIES: &[&str] = &[
+        ".git",
+        "build",
+        "coverage",
+        "dist",
+        "node_modules",
+        "out",
+        "target",
+        "vendor",
+    ];
+    let mut projects = Vec::new();
+    if workspace.join("Cargo.toml").is_file() {
+        projects.push(("rust", workspace.to_owned()));
     }
+    let mut queue = std::collections::VecDeque::from([(workspace.to_owned(), 0)]);
+    while let Some((path, depth)) = queue.pop_front() {
+        let Ok(mut entries) = std::fs::read_dir(&path).map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>()
+        }) else {
+            continue;
+        };
+        entries.sort();
+        if let Some(manifest) = entries.iter().find(|path| {
+            matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("package.json" | "tsconfig.json" | "jsconfig.json")
+            )
+        }) {
+            projects.push((
+                "typescript",
+                manifest.parent().unwrap_or(workspace).to_owned(),
+            ));
+            break;
+        }
+        if depth >= MAX_DEPTH {
+            continue;
+        }
+        for child in entries {
+            if child.is_dir()
+                && !SKIPPED_DIRECTORIES
+                    .iter()
+                    .any(|name| child.file_name().and_then(|name| name.to_str()) == Some(name))
+            {
+                queue.push_back((child, depth + 1));
+            }
+        }
+    }
+    projects
 }
 
-fn capability_preflight(capabilities: &HostCapabilities, tool: &str) -> Result<(), Value> {
+async fn probe_local_lsp_languages(
+    host: &LocalHost,
+    workspace: &std::path::Path,
+    capabilities: &mut HostCapabilities,
+) {
+    let projects = workspace_lsp_projects(workspace);
+    let local_host = host;
+    let host: Arc<dyn Host> = Arc::new(local_host.clone());
+    let mut outcomes = Vec::new();
+    for (language, project_root) in projects {
+        let result = LspClient::start(
+            Arc::clone(&host),
+            project_root.display().to_string(),
+            language,
+        )
+        .await;
+        let (state, reason) = match result {
+            Ok(_) => (CapabilityState::Available, None),
+            Err(error) => (
+                CapabilityState::Unavailable,
+                Some(format!(
+                    "LSP {language} initialization probe failed: {error}"
+                )),
+            ),
+        };
+        let observed_at = Utc::now();
+        capabilities.items.push(Capability {
+            name: format!("lsp:{language}"),
+            state: state.clone(),
+            source: "runtime-probe".into(),
+            observed_at,
+            reason: reason.clone(),
+        });
+        outcomes.push((language, state, reason));
+    }
+    let summary = if outcomes
+        .iter()
+        .any(|(_, state, _)| *state == CapabilityState::Available)
+    {
+        CapabilityState::Available
+    } else if outcomes
+        .iter()
+        .all(|(_, state, _)| *state == CapabilityState::Unavailable)
+        && !outcomes.is_empty()
+    {
+        CapabilityState::Unavailable
+    } else {
+        CapabilityState::Unknown
+    };
+    let reason = if outcomes.is_empty() {
+        Some("no supported language manifests detected in workspace".into())
+    } else {
+        let failures = outcomes
+            .iter()
+            .filter(|(_, state, _)| *state != CapabilityState::Available)
+            .map(|(language, _, reason)| {
+                format!("{language}: {}", reason.as_deref().unwrap_or("unknown"))
+            })
+            .collect::<Vec<_>>();
+        (!failures.is_empty()).then(|| failures.join("; "))
+    };
+    if let Some(item) = capabilities
+        .items
+        .iter_mut()
+        .find(|item| item.name == "lsp")
+    {
+        item.state = summary.clone();
+        item.source = "runtime-probe".into();
+        item.reason = reason.clone();
+    }
+    local_host
+        .set_capability_state("lsp", summary, "runtime-probe", reason)
+        .await;
+}
+
+fn lsp_language_from_arguments(arguments: &Value, path: &str) -> Option<String> {
+    arguments
+        .get("language")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .or_else(|| {
+            std::path::Path::new(path)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .and_then(|extension| match extension {
+                    "rs" => Some("rust"),
+                    "ts" | "tsx" => Some("typescript"),
+                    "js" | "jsx" => Some("javascript"),
+                    "py" => Some("python"),
+                    _ => None,
+                })
+                .map(str::to_owned)
+        })
+}
+
+fn lsp_capability_name(language: &str) -> String {
+    let language = language.to_ascii_lowercase();
+    let language = match language.as_str() {
+        "typescriptreact" | "javascript" => "typescript",
+        _ => language.as_str(),
+    };
+    format!("lsp:{language}")
+}
+
+fn lsp_capability_preflight(
+    capabilities: &HostCapabilities,
+    tool: &str,
+    arguments: &Value,
+) -> Result<(), Value> {
+    let path = arguments.get("path").and_then(Value::as_str).unwrap_or("");
+    let Some(language) = lsp_language_from_arguments(arguments, path) else {
+        return Err(opcos_engine::capability_tool_error(
+            format!("capability_unknown: capability=lsp tool={tool} reason=language is missing"),
+            tool,
+            "lsp",
+            "unknown",
+            "not-probed",
+            capabilities.observed_at.to_rfc3339(),
+            true,
+        ));
+    };
+    let capability = lsp_capability_name(&language);
+    let item = capabilities
+        .items
+        .iter()
+        .find(|item| item.name == capability);
+    let Some(item) = item else {
+        return Err(opcos_engine::capability_tool_error(
+            format!(
+                "capability_unknown: capability={capability} tool={tool} language={language} reason=language was not probed"
+            ),
+            tool,
+            &capability,
+            "unknown",
+            "not-probed",
+            capabilities.observed_at.to_rfc3339(),
+            true,
+        ));
+    };
+    if item.state.is_available() {
+        return Ok(());
+    }
+    let state = match item.state {
+        CapabilityState::Unavailable => "unavailable",
+        CapabilityState::Unknown => "unknown",
+        CapabilityState::Available => "available",
+    };
+    let code = if state == "unknown" {
+        "capability_unknown"
+    } else {
+        "capability_unavailable"
+    };
+    Err(opcos_engine::capability_tool_error(
+        format!(
+            "{code}: capability={capability} tool={tool} language={language} state={state} reason={}",
+            item.reason.as_deref().unwrap_or("no reason provided")
+        ),
+        tool,
+        &capability,
+        state,
+        &item.source,
+        item.observed_at.to_rfc3339(),
+        state == "unknown",
+    ))
+}
+
+fn capability_preflight(
+    capabilities: &HostCapabilities,
+    tool: &str,
+    arguments: &Value,
+) -> Result<(), Value> {
+    if tool.starts_with("lsp_") {
+        return lsp_capability_preflight(capabilities, tool, arguments);
+    }
     let requirements = opcos_engine::builtin_tool_capability_requirements()
         .into_iter()
         .find(|(name, _)| *name == tool)
@@ -29582,9 +29780,28 @@ mod m7_tests {
     }
 
     #[test]
+    fn workspace_lsp_projects_prefers_shallow_lexicographic_project() {
+        let root = std::env::temp_dir().join(format!("opcos-lsp-projects-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("z-project")).unwrap();
+        std::fs::create_dir_all(root.join("a-project")).unwrap();
+        std::fs::create_dir_all(root.join("target/nested")).unwrap();
+        std::fs::create_dir_all(root.join("deep/one/two/three/four/five")).unwrap();
+        std::fs::write(root.join("z-project/package.json"), "{}").unwrap();
+        std::fs::write(root.join("a-project/package.json"), "{}").unwrap();
+        std::fs::write(root.join("target/nested/package.json"), "{}").unwrap();
+        std::fs::write(root.join("deep/one/two/three/four/five/package.json"), "{}").unwrap();
+
+        assert_eq!(
+            workspace_lsp_projects(&root),
+            vec![("typescript", root.join("a-project"))]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn capability_preflight_returns_distinct_structured_error_markers() {
         let unavailable = test_capabilities(true, false, false);
-        let error = capability_preflight(&unavailable, "browser_status").unwrap_err();
+        let error = capability_preflight(&unavailable, "browser_status", &json!({})).unwrap_err();
         assert_eq!(
             error["error_details"]["code"],
             json!("capability_unavailable")
@@ -29595,8 +29812,65 @@ mod m7_tests {
             observed_at: Utc::now(),
             items: vec![],
         };
-        let error = capability_preflight(&unknown, "browser_status").unwrap_err();
+        let error = capability_preflight(&unknown, "browser_status", &json!({})).unwrap_err();
         assert_eq!(error["error_details"]["code"], json!("capability_unknown"));
+    }
+
+    #[test]
+    fn lsp_capabilities_are_language_specific_for_mixed_results() {
+        let observed_at = Utc::now();
+        let capabilities = HostCapabilities {
+            observed_at,
+            items: [
+                ("exec", CapabilityState::Available, None),
+                ("stdio", CapabilityState::Available, None),
+                (
+                    "lsp",
+                    CapabilityState::Unavailable,
+                    Some("rust probe failed".into()),
+                ),
+                (
+                    "lsp:rust",
+                    CapabilityState::Unavailable,
+                    Some("rust-analyzer exited with code 1".into()),
+                ),
+                ("lsp:typescript", CapabilityState::Available, None),
+            ]
+            .into_iter()
+            .map(|(name, state, reason)| Capability {
+                name: name.into(),
+                state,
+                source: "runtime-probe".into(),
+                observed_at,
+                reason,
+            })
+            .collect(),
+        };
+        assert!(
+            allowed_builtin_tools(&capabilities)
+                .iter()
+                .any(|tool| tool == "lsp_definition")
+        );
+        let rust_error = lsp_capability_preflight(
+            &capabilities,
+            "lsp_definition",
+            &json!({"language": "rust", "path": "src/main.rs"}),
+        )
+        .unwrap_err();
+        assert!(rust_error.to_string().contains("language=rust"));
+        assert!(
+            rust_error
+                .to_string()
+                .contains("rust-analyzer exited with code 1")
+        );
+        assert!(
+            lsp_capability_preflight(
+                &capabilities,
+                "lsp_definition",
+                &json!({"language": "typescript", "path": "web/src/App.ts"}),
+            )
+            .is_ok()
+        );
     }
 
     #[test]

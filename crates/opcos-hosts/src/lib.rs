@@ -2052,6 +2052,9 @@ pub trait Host: Send + Sync {
             "host lacks a structured LSP service".into(),
         ))
     }
+    async fn provides_structured_lsp_service(&self) -> Result<bool, HostError> {
+        Ok(false)
+    }
     async fn spawn(&self, request: SpawnRequest) -> Result<Box<dyn HostProcess>, HostError>;
     async fn spawn_stdio(
         &self,
@@ -2238,6 +2241,15 @@ impl Host for RvmHost {
 
     async fn storage_exists(&self, path: &str) -> Result<bool, HostError> {
         Ok(self.client.storage_exists(path).await?)
+    }
+
+    async fn provides_structured_lsp_service(&self) -> Result<bool, HostError> {
+        Ok(self
+            .capabilities()
+            .await?
+            .items
+            .iter()
+            .any(|capability| capability.name == "lsp" && capability.state.is_available()))
     }
 
     async fn screenshot(&self) -> Result<Screenshot, HostError> {
@@ -2877,6 +2889,10 @@ impl Host for LocalHost {
                 shell: None,
             },
         })
+    }
+
+    async fn storage_exists(&self, path: &str) -> Result<bool, HostError> {
+        Ok(self.secure_path(path)?.exists())
     }
 
     async fn spawn(&self, request: SpawnRequest) -> Result<Box<dyn HostProcess>, HostError> {

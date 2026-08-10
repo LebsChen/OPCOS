@@ -3,11 +3,18 @@ use opcos_hosts::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
 const MAX_ITEMS: usize = 200;
+const MAX_STDERR_BYTES: usize = 8 * 1024;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Error)]
 pub enum LspError {
@@ -15,8 +22,10 @@ pub enum LspError {
     Host(#[from] HostError),
     #[error("language server is unavailable for {language}: {command}")]
     ServerUnavailable { language: String, command: String },
-    #[error("language server exited before replying")]
-    ServerExited,
+    #[error("language server exited before replying (exit code: {code:?}; stderr: {stderr})")]
+    ServerExited { code: Option<i32>, stderr: String },
+    #[error("language server timed out waiting for {method} (stderr: {stderr})")]
+    ServerTimeout { method: String, stderr: String },
     #[error("language server protocol error: {0}")]
     Protocol(String),
     #[error("language server returned an error: {0}")]
@@ -72,6 +81,8 @@ struct JsonRpcProcess {
     initialized: bool,
     progress_tokens: HashMap<String, bool>,
     buffer: Vec<u8>,
+    stderr: Vec<u8>,
+    published_diagnostics: HashMap<String, Vec<Value>>,
 }
 
 #[derive(Clone)]
@@ -89,12 +100,31 @@ impl LspSession {
         root: impl Into<String>,
         language: &str,
     ) -> Result<Self, LspError> {
+        let root = root.into();
+        Self::start_at_root(host, root, language).await
+    }
+
+    pub async fn start_for_path(
+        host: Arc<dyn Host>,
+        session_root: impl Into<String>,
+        language: &str,
+        path: &str,
+    ) -> Result<Self, LspError> {
+        let session_root = session_root.into();
+        let root = resolve_project_root(host.as_ref(), &session_root, language, path).await;
+        Self::start_at_root(host, root, language).await
+    }
+
+    async fn start_at_root(
+        host: Arc<dyn Host>,
+        root: String,
+        language: &str,
+    ) -> Result<Self, LspError> {
         let language = language.to_ascii_lowercase();
         let command = server_command(&language).ok_or_else(|| LspError::ServerUnavailable {
             language: language.clone(),
             command: format!("no configured language server for {language}"),
         })?;
-        let root = root.into();
         let binary =
             command
                 .split_whitespace()
@@ -119,9 +149,24 @@ impl LspSession {
         if availability.result.exit_code != 0 {
             return Err(LspError::ServerUnavailable { language, command });
         }
+        let executable = availability
+            .result
+            .stdout
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .map(str::trim)
+            .ok_or_else(|| LspError::ServerUnavailable {
+                language: language.clone(),
+                command: command.clone(),
+            })?;
+        let launch_command = format!(
+            "{}{}",
+            shell_quote(executable),
+            command.strip_prefix(binary).unwrap_or_default()
+        );
         let process = host
             .spawn_stdio(SpawnRequest {
-                command: command.clone(),
+                command: launch_command.clone(),
                 cwd: Some(root.clone()),
                 env: None,
                 cols: 120,
@@ -131,7 +176,7 @@ impl LspSession {
             .map_err(|error| match error {
                 HostError::Io(_) => LspError::ServerUnavailable {
                     language: language.clone(),
-                    command: command.clone(),
+                    command: launch_command.clone(),
                 },
                 other => LspError::Host(other),
             })?;
@@ -144,11 +189,13 @@ impl LspSession {
                 initialized: false,
                 progress_tokens: HashMap::new(),
                 buffer: Vec::new(),
+                stderr: Vec::new(),
+                published_diagnostics: HashMap::new(),
             })),
             host,
             root,
             language,
-            command,
+            command: launch_command,
         };
         session.initialize().await?;
         Ok(session)
@@ -237,7 +284,17 @@ impl LspSession {
                 "textDocument/diagnostic",
                 json!({"textDocument":{"uri":uri}}),
             )
-            .await?;
+            .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(LspError::Server(error)) if error.contains("\"code\":-32601") => {
+                let state = self.inner.lock().await;
+                json!({
+                    "items": state.published_diagnostics.get(&uri).cloned().unwrap_or_default()
+                })
+            }
+            Err(error) => return Err(error),
+        };
         self.ensure_current(path, version).await?;
         let diagnostics = result
             .get("items")
@@ -350,8 +407,17 @@ impl LspSession {
         )
         .await?;
         loop {
-            let Some(event) = state.process.next_event().await? else {
-                return Err(LspError::ServerExited);
+            let event = tokio::time::timeout(REQUEST_TIMEOUT, state.process.next_event())
+                .await
+                .map_err(|_| LspError::ServerTimeout {
+                    method: method.to_owned(),
+                    stderr: stderr_tail(&state.stderr),
+                })??;
+            let Some(event) = event else {
+                return Err(LspError::ServerExited {
+                    code: None,
+                    stderr: stderr_tail(&state.stderr),
+                });
             };
             match event {
                 StdioEvent::Stdout(bytes) => {
@@ -369,6 +435,18 @@ impl LspSession {
                             state.indexing =
                                 state.progress_tokens.values().any(|complete| !complete);
                         }
+                        if message.get("method").and_then(Value::as_str)
+                            == Some("textDocument/publishDiagnostics")
+                            && let Some(uri) =
+                                message.pointer("/params/uri").and_then(Value::as_str)
+                            && let Some(diagnostics) = message
+                                .pointer("/params/diagnostics")
+                                .and_then(Value::as_array)
+                        {
+                            state
+                                .published_diagnostics
+                                .insert(uri.to_owned(), diagnostics.clone());
+                        }
                         if message.get("id").and_then(Value::as_u64) == Some(id) {
                             if let Some(error) = message.get("error") {
                                 return Err(LspError::Server(error.to_string()));
@@ -377,8 +455,13 @@ impl LspSession {
                         }
                     }
                 }
-                StdioEvent::Stderr(_) => {}
-                StdioEvent::Exited(_) => return Err(LspError::ServerExited),
+                StdioEvent::Stderr(bytes) => append_stderr(&mut state.stderr, &bytes),
+                StdioEvent::Exited(code) => {
+                    return Err(LspError::ServerExited {
+                        code,
+                        stderr: stderr_tail(&state.stderr),
+                    });
+                }
             }
         }
     }
@@ -508,6 +591,22 @@ impl LspClient {
             .map(Self::Local)
     }
 
+    pub async fn start_for_path(
+        host: Arc<dyn Host>,
+        session_root: impl Into<String>,
+        language: &str,
+        path: &str,
+    ) -> Result<Self, LspError> {
+        let session_root = session_root.into();
+        if host_provides_lsp_service(&host).await? {
+            let root = resolve_project_root(host.as_ref(), &session_root, language, path).await;
+            return Ok(Self::Remote(RemoteLspSession::new(host, root, language)));
+        }
+        LspSession::start_for_path(host, session_root, language, path)
+            .await
+            .map(Self::Local)
+    }
+
     pub fn language(&self) -> &str {
         match self {
             Self::Local(session) => session.language(),
@@ -548,12 +647,7 @@ impl LspClient {
 }
 
 async fn host_provides_lsp_service(host: &Arc<dyn Host>) -> Result<bool, LspError> {
-    Ok(host
-        .capabilities()
-        .await?
-        .items
-        .iter()
-        .any(|capability| capability.name == "lsp" && capability.state.is_available()))
+    Ok(host.provides_structured_lsp_service().await?)
 }
 
 async fn write_message(process: &mut dyn HostStdioProcess, value: &Value) -> Result<(), LspError> {
@@ -600,6 +694,67 @@ fn bounded_items(items: &[Value]) -> BoundedItems {
     }
 }
 
+fn append_stderr(buffer: &mut Vec<u8>, bytes: &[u8]) {
+    buffer.extend_from_slice(bytes);
+    if buffer.len() > MAX_STDERR_BYTES {
+        let start = buffer.len() - MAX_STDERR_BYTES;
+        buffer.drain(..start);
+    }
+}
+
+fn stderr_tail(buffer: &[u8]) -> String {
+    String::from_utf8_lossy(buffer).trim().to_owned()
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+pub async fn resolve_project_root(
+    host: &dyn Host,
+    session_root: &str,
+    language: &str,
+    path: &str,
+) -> String {
+    let session_root = PathBuf::from(session_root);
+    let target = {
+        let path = Path::new(path);
+        if path.is_absolute() {
+            path.to_owned()
+        } else {
+            session_root.join(path)
+        }
+    };
+    let mut current = if target.extension().is_some() {
+        target.parent().unwrap_or(&session_root).to_owned()
+    } else {
+        target
+    };
+    let manifest_names: &[&str] = match language.to_ascii_lowercase().as_str() {
+        "rust" | "rust-analyzer" => &["Cargo.toml"],
+        "typescript" | "typescriptreact" | "javascript" => {
+            &["tsconfig.json", "jsconfig.json", "package.json"]
+        }
+        _ => &[],
+    };
+    loop {
+        let candidate = current.display().to_string();
+        for name in manifest_names {
+            let manifest = format!("{candidate}/{name}");
+            if host.storage_exists(&manifest).await.unwrap_or(false) {
+                return candidate;
+            }
+        }
+        if current == session_root || !current.starts_with(&session_root) {
+            break;
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    session_root.display().to_string()
+}
+
 fn server_command(language: &str) -> Option<String> {
     match language {
         "rust" | "rust-analyzer" => Some("rust-analyzer".into()),
@@ -633,25 +788,58 @@ mod tests {
     use async_trait::async_trait;
     use opcos_hosts::{
         Capability, DirectoryListing, ExecResult, FileContent, Health, HostCapabilities,
-        HostProcess,
+        HostProcess, HostStdioProcess, SpawnRequest, StdioEvent,
     };
-    use std::sync::Mutex as StdMutex;
+    use std::{collections::VecDeque, sync::Mutex as StdMutex};
 
     /// A host that reports the capabilities under test and records the LSP
     /// calls it receives.
     struct StubHost {
         capabilities: Vec<&'static str>,
+        structured_lsp: bool,
         calls: StdMutex<Vec<LspCallRequest>>,
         response: Value,
+        files: Vec<String>,
+        executable: String,
+        events: StdMutex<VecDeque<Result<StdioEvent, HostError>>>,
     }
 
     impl StubHost {
         fn new(capabilities: Vec<&'static str>, response: Value) -> Arc<Self> {
             Arc::new(Self {
                 capabilities,
+                structured_lsp: false,
                 calls: StdMutex::new(Vec::new()),
                 response,
+                files: Vec::new(),
+                executable: "/usr/bin/fake-language-server".into(),
+                events: StdMutex::new(VecDeque::new()),
             })
+        }
+
+        fn with_structured_lsp(mut self: Arc<Self>) -> Arc<Self> {
+            Arc::get_mut(&mut self)
+                .expect("host is uniquely owned during setup")
+                .structured_lsp = true;
+            self
+        }
+
+        fn with_files(mut self: Arc<Self>, files: &[&str]) -> Arc<Self> {
+            Arc::get_mut(&mut self)
+                .expect("host is uniquely owned during setup")
+                .files = files.iter().map(|file| (*file).into()).collect();
+            self
+        }
+
+        fn with_process(
+            mut self: Arc<Self>,
+            executable: &str,
+            events: Vec<Result<StdioEvent, HostError>>,
+        ) -> Arc<Self> {
+            let host = Arc::get_mut(&mut self).expect("host is uniquely owned during setup");
+            host.executable = executable.into();
+            *host.events.lock().unwrap() = events.into_iter().collect();
+            self
         }
     }
 
@@ -683,7 +871,20 @@ mod tests {
             })
         }
 
-        async fn exec(&self, _request: ExecRequest) -> Result<ExecResult, HostError> {
+        async fn exec(&self, request: ExecRequest) -> Result<ExecResult, HostError> {
+            if request.command.starts_with("command -v") {
+                return Ok(serde_json::from_value(json!({
+                    "status": "completed",
+                    "result": {
+                        "stdout": format!("{}\n", self.executable),
+                        "stderr": "",
+                        "exit_code": 0,
+                        "timed_out": false,
+                        "cwd": request.cwd
+                    }
+                }))
+                .unwrap());
+            }
             Err(HostError::Unsupported("stub exec".into()))
         }
 
@@ -692,12 +893,36 @@ mod tests {
             Ok(self.response.clone())
         }
 
+        async fn provides_structured_lsp_service(&self) -> Result<bool, HostError> {
+            Ok(self.structured_lsp)
+        }
+
         async fn spawn(&self, _request: SpawnRequest) -> Result<Box<dyn HostProcess>, HostError> {
             Err(HostError::Unsupported("stub spawn".into()))
         }
 
-        async fn read(&self, _path: &str) -> Result<FileContent, HostError> {
+        async fn spawn_stdio(
+            &self,
+            _request: SpawnRequest,
+        ) -> Result<Box<dyn HostStdioProcess>, HostError> {
+            Ok(Box::new(FakeStdioProcess {
+                events: StdMutex::new(self.events.lock().unwrap().drain(..).collect()),
+            }))
+        }
+
+        async fn read(&self, path: &str) -> Result<FileContent, HostError> {
+            if self.files.iter().any(|file| path == file) {
+                return Ok(FileContent {
+                    path: path.into(),
+                    content: String::new(),
+                    size: 0,
+                });
+            }
             Err(HostError::Unsupported("stub read".into()))
+        }
+
+        async fn storage_exists(&self, path: &str) -> Result<bool, HostError> {
+            Ok(self.files.iter().any(|file| path == file))
         }
 
         async fn write(&self, _path: &str, _content: &str) -> Result<Value, HostError> {
@@ -725,9 +950,28 @@ mod tests {
         }
     }
 
+    struct FakeStdioProcess {
+        events: StdMutex<VecDeque<Result<StdioEvent, HostError>>>,
+    }
+
+    #[async_trait]
+    impl HostStdioProcess for FakeStdioProcess {
+        async fn next_event(&self) -> Result<Option<StdioEvent>, HostError> {
+            Ok(self.events.lock().unwrap().pop_front().transpose()?)
+        }
+
+        async fn write_stdin(&self, _input: &[u8]) -> Result<(), HostError> {
+            Ok(())
+        }
+
+        async fn interrupt(&self) -> Result<(), HostError> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn hosts_advertising_lsp_use_the_remote_backend() {
-        let host = StubHost::new(vec!["exec", "mcp", "lsp"], json!([]));
+        let host = StubHost::new(vec!["exec", "mcp", "lsp"], json!([])).with_structured_lsp();
         let Ok(client) = LspClient::start(host as Arc<dyn Host>, "/workspace", "Rust").await else {
             panic!("a host advertising lsp starts a remote session");
         };
@@ -740,7 +984,8 @@ mod tests {
         let host = StubHost::new(
             vec!["lsp"],
             json!([{"uri": "file:///workspace/src/main.rs", "range": {"start": {"line": 4, "character": 2}}}]),
-        );
+        )
+        .with_structured_lsp();
         let client = LspClient::start(Arc::clone(&host) as Arc<dyn Host>, "/workspace", "rust")
             .await
             .unwrap();
@@ -764,7 +1009,7 @@ mod tests {
             json!({"kind": "full", "items": [{"message": "unused"}]}),
             json!({"uri": "file:///workspace/a.rs", "diagnostics": [{"message": "unused"}]}),
         ] {
-            let host = StubHost::new(vec!["lsp"], payload);
+            let host = StubHost::new(vec!["lsp"], payload).with_structured_lsp();
             let client = LspClient::start(host as Arc<dyn Host>, "/workspace", "rust")
                 .await
                 .unwrap();
@@ -784,7 +1029,22 @@ mod tests {
         // Falls through to the local stdio backend, which this host lacks.
         assert!(matches!(
             error,
-            LspError::Host(_) | LspError::ServerUnavailable { .. }
+            LspError::Host(_) | LspError::ServerUnavailable { .. } | LspError::ServerExited { .. }
+        ));
+        assert!(host.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn capability_source_does_not_select_remote_backend() {
+        let host = StubHost::new(vec!["lsp"], json!([]));
+        let Err(error) =
+            LspClient::start(Arc::clone(&host) as Arc<dyn Host>, "/workspace", "rust").await
+        else {
+            panic!("a capability label must not select the remote backend");
+        };
+        assert!(matches!(
+            error,
+            LspError::Host(_) | LspError::ServerUnavailable { .. } | LspError::ServerExited { .. }
         ));
         assert!(host.calls.lock().unwrap().is_empty());
     }
@@ -822,5 +1082,39 @@ mod tests {
         let messages = parse_messages(&mut buffer).unwrap();
         assert_eq!(messages.len(), 2);
         assert!(buffer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_root_resolution_uses_nearest_language_manifest() {
+        let host = StubHost::new(vec!["exec", "stdio"], json!([]))
+            .with_files(&["/workspace/web/package.json", "/workspace/Cargo.toml"]);
+        assert_eq!(
+            resolve_project_root(host.as_ref(), "/workspace", "typescript", "web/src/App.tsx")
+                .await,
+            "/workspace/web"
+        );
+        assert_eq!(
+            resolve_project_root(host.as_ref(), "/workspace", "rust", "src/main.rs").await,
+            "/workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn exited_language_server_error_carries_stderr_and_exit_code() {
+        let host = StubHost::new(vec!["exec", "stdio"], Value::Array(Vec::new())).with_process(
+            "/opt/rust-analyzer",
+            vec![
+                Ok(StdioEvent::Stderr(
+                    b"error: language server unavailable\n".to_vec(),
+                )),
+                Ok(StdioEvent::Exited(Some(17))),
+            ],
+        );
+        let error = match LspSession::start(host, "/workspace", "rust").await {
+            Ok(_) => panic!("the fake language server should exit"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("exit code: Some(17)"));
+        assert!(error.contains("error: language server unavailable"));
     }
 }
