@@ -15123,6 +15123,20 @@ pub(crate) async fn submit_turn_inner_with_origin(
 }
 
 fn allowed_builtin_tools(capabilities: &HostCapabilities) -> Vec<String> {
+    let has_language_lsp = capabilities
+        .items
+        .iter()
+        .any(|item| item.name.starts_with("lsp:") && item.state.is_available());
+    let has_language_entries = capabilities
+        .items
+        .iter()
+        .any(|item| item.name.starts_with("lsp:"));
+    let coarse_lsp_available = capabilities
+        .items
+        .iter()
+        .any(|item| item.name == "lsp" && item.state.is_available());
+    let lsp_available = has_language_lsp || (!has_language_entries && coarse_lsp_available);
+
     opcos_engine::builtin_tool_capability_requirements()
         .into_iter()
         .filter(|(name, _)| !is_connector_builtin_tool(name))
@@ -15151,23 +15165,9 @@ fn allowed_builtin_tools(capabilities: &HostCapabilities) -> Vec<String> {
                 return false;
             }
             if name.starts_with("lsp_") {
-                return capabilities.items.iter().any(|item| {
-                    item.name.starts_with("lsp:") && item.state.is_available()
-                        || item.name == "lsp"
-                            && item.state.is_available()
-                            && !capabilities
-                                .items
-                                .iter()
-                                .any(|candidate| candidate.name.starts_with("lsp:"))
-                });
+                return lsp_available;
             }
-            requirements.iter().all(|required| {
-                capabilities
-                    .items
-                    .iter()
-                    .find(|item| item.name == *required)
-                    .is_some_and(|item| item.state.is_available())
-            })
+            true
         })
         .map(|(name, _)| name.to_owned())
         .collect()
@@ -15186,38 +15186,55 @@ fn is_connector_builtin_tool(name: &str) -> bool {
 }
 
 fn workspace_lsp_projects(workspace: &std::path::Path) -> Vec<(&'static str, std::path::PathBuf)> {
+    const MAX_DEPTH: usize = 4;
+    const SKIPPED_DIRECTORIES: &[&str] = &[
+        ".git",
+        "build",
+        "coverage",
+        "dist",
+        "node_modules",
+        "out",
+        "target",
+        "vendor",
+    ];
     let mut projects = Vec::new();
     if workspace.join("Cargo.toml").is_file() {
         projects.push(("rust", workspace.to_owned()));
     }
-    let mut stack = vec![workspace.to_owned()];
-    while let Some(path) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&path) else {
+    let mut queue = std::collections::VecDeque::from([(workspace.to_owned(), 0)]);
+    while let Some((path, depth)) = queue.pop_front() {
+        let Ok(mut entries) = std::fs::read_dir(&path).map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>()
+        }) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.file_name().and_then(|name| name.to_str()) == Some("node_modules") {
-                continue;
-            }
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            let name = path.file_name().and_then(|name| name.to_str());
-            if matches!(
-                name,
+        entries.sort();
+        if let Some(manifest) = entries.iter().find(|path| {
+            matches!(
+                path.file_name().and_then(|name| name.to_str()),
                 Some("package.json" | "tsconfig.json" | "jsconfig.json")
-            ) {
-                projects.push(("typescript", path.parent().unwrap_or(workspace).to_owned()));
-                break;
-            }
-        }
-        if projects
-            .iter()
-            .any(|(language, _)| *language == "typescript")
-        {
+            )
+        }) {
+            projects.push((
+                "typescript",
+                manifest.parent().unwrap_or(workspace).to_owned(),
+            ));
             break;
+        }
+        if depth >= MAX_DEPTH {
+            continue;
+        }
+        for child in entries {
+            if child.is_dir()
+                && !SKIPPED_DIRECTORIES
+                    .iter()
+                    .any(|name| child.file_name().and_then(|name| name.to_str()) == Some(name))
+            {
+                queue.push_back((child, depth + 1));
+            }
         }
     }
     projects
@@ -29760,6 +29777,25 @@ mod m7_tests {
         let remote_allowed = allowed_builtin_tools(&remote_read_write);
         assert!(remote_allowed.contains(&"edit_file".to_owned()));
         assert!(!remote_allowed.iter().any(|name| name.starts_with("lsp_")));
+    }
+
+    #[test]
+    fn workspace_lsp_projects_prefers_shallow_lexicographic_project() {
+        let root = std::env::temp_dir().join(format!("opcos-lsp-projects-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("z-project")).unwrap();
+        std::fs::create_dir_all(root.join("a-project")).unwrap();
+        std::fs::create_dir_all(root.join("target/nested")).unwrap();
+        std::fs::create_dir_all(root.join("deep/one/two/three/four/five")).unwrap();
+        std::fs::write(root.join("z-project/package.json"), "{}").unwrap();
+        std::fs::write(root.join("a-project/package.json"), "{}").unwrap();
+        std::fs::write(root.join("target/nested/package.json"), "{}").unwrap();
+        std::fs::write(root.join("deep/one/two/three/four/five/package.json"), "{}").unwrap();
+
+        assert_eq!(
+            workspace_lsp_projects(&root),
+            vec![("typescript", root.join("a-project"))]
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

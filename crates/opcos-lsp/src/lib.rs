@@ -647,12 +647,7 @@ impl LspClient {
 }
 
 async fn host_provides_lsp_service(host: &Arc<dyn Host>) -> Result<bool, LspError> {
-    Ok(host.capabilities().await?.items.iter().any(|capability| {
-        capability.name == "lsp"
-            && capability.state.is_available()
-            && capability.source != "runtime-probe"
-            && capability.source != "not-probed"
-    }))
+    Ok(host.provides_structured_lsp_service().await?)
 }
 
 async fn write_message(process: &mut dyn HostStdioProcess, value: &Value) -> Result<(), LspError> {
@@ -746,7 +741,7 @@ pub async fn resolve_project_root(
         let candidate = current.display().to_string();
         for name in manifest_names {
             let manifest = format!("{candidate}/{name}");
-            if host.read(&manifest).await.is_ok() {
+            if host.storage_exists(&manifest).await.unwrap_or(false) {
                 return candidate;
             }
         }
@@ -801,6 +796,7 @@ mod tests {
     /// calls it receives.
     struct StubHost {
         capabilities: Vec<&'static str>,
+        structured_lsp: bool,
         calls: StdMutex<Vec<LspCallRequest>>,
         response: Value,
         files: Vec<String>,
@@ -812,12 +808,20 @@ mod tests {
         fn new(capabilities: Vec<&'static str>, response: Value) -> Arc<Self> {
             Arc::new(Self {
                 capabilities,
+                structured_lsp: false,
                 calls: StdMutex::new(Vec::new()),
                 response,
                 files: Vec::new(),
                 executable: "/usr/bin/fake-language-server".into(),
                 events: StdMutex::new(VecDeque::new()),
             })
+        }
+
+        fn with_structured_lsp(mut self: Arc<Self>) -> Arc<Self> {
+            Arc::get_mut(&mut self)
+                .expect("host is uniquely owned during setup")
+                .structured_lsp = true;
+            self
         }
 
         fn with_files(mut self: Arc<Self>, files: &[&str]) -> Arc<Self> {
@@ -889,6 +893,10 @@ mod tests {
             Ok(self.response.clone())
         }
 
+        async fn provides_structured_lsp_service(&self) -> Result<bool, HostError> {
+            Ok(self.structured_lsp)
+        }
+
         async fn spawn(&self, _request: SpawnRequest) -> Result<Box<dyn HostProcess>, HostError> {
             Err(HostError::Unsupported("stub spawn".into()))
         }
@@ -911,6 +919,10 @@ mod tests {
                 });
             }
             Err(HostError::Unsupported("stub read".into()))
+        }
+
+        async fn storage_exists(&self, path: &str) -> Result<bool, HostError> {
+            Ok(self.files.iter().any(|file| path == file))
         }
 
         async fn write(&self, _path: &str, _content: &str) -> Result<Value, HostError> {
@@ -959,7 +971,7 @@ mod tests {
 
     #[tokio::test]
     async fn hosts_advertising_lsp_use_the_remote_backend() {
-        let host = StubHost::new(vec!["exec", "mcp", "lsp"], json!([]));
+        let host = StubHost::new(vec!["exec", "mcp", "lsp"], json!([])).with_structured_lsp();
         let Ok(client) = LspClient::start(host as Arc<dyn Host>, "/workspace", "Rust").await else {
             panic!("a host advertising lsp starts a remote session");
         };
@@ -972,7 +984,8 @@ mod tests {
         let host = StubHost::new(
             vec!["lsp"],
             json!([{"uri": "file:///workspace/src/main.rs", "range": {"start": {"line": 4, "character": 2}}}]),
-        );
+        )
+        .with_structured_lsp();
         let client = LspClient::start(Arc::clone(&host) as Arc<dyn Host>, "/workspace", "rust")
             .await
             .unwrap();
@@ -996,7 +1009,7 @@ mod tests {
             json!({"kind": "full", "items": [{"message": "unused"}]}),
             json!({"uri": "file:///workspace/a.rs", "diagnostics": [{"message": "unused"}]}),
         ] {
-            let host = StubHost::new(vec!["lsp"], payload);
+            let host = StubHost::new(vec!["lsp"], payload).with_structured_lsp();
             let client = LspClient::start(host as Arc<dyn Host>, "/workspace", "rust")
                 .await
                 .unwrap();
@@ -1014,6 +1027,21 @@ mod tests {
             panic!("a host without an lsp service must not start a remote session");
         };
         // Falls through to the local stdio backend, which this host lacks.
+        assert!(matches!(
+            error,
+            LspError::Host(_) | LspError::ServerUnavailable { .. } | LspError::ServerExited { .. }
+        ));
+        assert!(host.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn capability_source_does_not_select_remote_backend() {
+        let host = StubHost::new(vec!["lsp"], json!([]));
+        let Err(error) =
+            LspClient::start(Arc::clone(&host) as Arc<dyn Host>, "/workspace", "rust").await
+        else {
+            panic!("a capability label must not select the remote backend");
+        };
         assert!(matches!(
             error,
             LspError::Host(_) | LspError::ServerUnavailable { .. } | LspError::ServerExited { .. }
