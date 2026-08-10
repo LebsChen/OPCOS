@@ -56,6 +56,34 @@ export type Project = {
   agents: ProjectAgent[];
 };
 
+export type ProjectAgentRosterRow = {
+  agent: ProjectAgent;
+  session: Session | null;
+};
+
+export function projectAgentRosterValue(
+  value: string | null | undefined,
+): string {
+  return value?.trim() || "Unknown";
+}
+
+export function projectAgentRosterRows(
+  agents: ProjectAgent[],
+  sessions: Session[],
+): ProjectAgentRosterRow[] {
+  return agents.map((agent) => ({
+    agent,
+    session:
+      sessions.find((session) => session.id === agent.session_id) ||
+      sessions.find(
+        (session) =>
+          session.project_id === agent.project_id &&
+          session.agent_id === agent.id,
+      ) ||
+      null,
+  }));
+}
+
 export type TranscriptItem = {
   kind: string;
   payload: Record<string, unknown>;

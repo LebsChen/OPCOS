@@ -19,6 +19,8 @@ import {
   Session,
   Project,
   ProjectAgent,
+  projectAgentRosterValue,
+  projectAgentRosterRows,
   SurfaceTab,
   hostFailureMessage,
   hostStatusLabel,
@@ -10209,14 +10211,192 @@ function ProgressPane({ selected }: { selected: Session }) {
   );
 }
 
-function PlannedPane({ title, children }: { title: string; children: string }) {
+function AgentRosterPane({
+  selected,
+  onError,
+  onOpenSession,
+}: {
+  selected: Session;
+  onError: (error: unknown) => void;
+  onOpenSession: (session: Session) => void;
+}) {
+  const [agents, setAgents] = useState<ProjectAgent[]>([]);
+  const [sessions, setSessions] = useState<Session[]>([]);
+  const [workflow, setWorkflow] = useState<{
+    stage_index?: number;
+    status?: string;
+    tasks?: unknown[];
+  } | null>(null);
+  const [error, setError] = useState("");
+  const [busyAgentId, setBusyAgentId] = useState<string | null>(null);
+
+  const refresh = () => {
+    if (!selected.project_id) return;
+    setError("");
+    void Promise.all([
+      command<ProjectAgent[]>("list_project_agents", {
+        projectId: selected.project_id,
+      }),
+      command<Session[]>("list_sessions"),
+      command<{
+        stage_index?: number;
+        status?: string;
+        tasks?: unknown[];
+      }>("project_workflow_snapshot", {
+        projectId: selected.project_id,
+      }),
+    ])
+      .then(([nextAgents, nextSessions, nextWorkflow]) => {
+        setAgents(nextAgents);
+        setSessions(nextSessions);
+        setWorkflow(nextWorkflow);
+      })
+      .catch((reason) => {
+        const message = errorMessage(reason);
+        setError(message);
+        onError(reason);
+      });
+  };
+
+  useEffect(refresh, [selected.project_id]);
+
+  if (!selected.project_id) {
+    return (
+      <section className="rail-section">
+        <div className="rail-section-head">
+          <strong>Agents</strong>
+        </div>
+        <div className="rail-section-body">
+          <div className="rail-muted">
+            This session is not associated with a project, so no project agent
+            roster is available.
+          </div>
+        </div>
+      </section>
+    );
+  }
+
+  const rows = projectAgentRosterRows(agents, sessions);
+  const startSession = async (agent: ProjectAgent) => {
+    setBusyAgentId(agent.id);
+    try {
+      const session = await command<Session>("create_session", {
+        title: agent.name,
+        projectId: agent.project_id,
+        agentId: agent.id,
+        provider: agent.provider || null,
+        model: agent.model,
+        harness: agent.harness,
+        mode: agent.mode,
+      });
+      onOpenSession(session);
+      refresh();
+    } catch (reason) {
+      setError(errorMessage(reason));
+      onError(reason);
+    } finally {
+      setBusyAgentId(null);
+    }
+  };
+
   return (
     <section className="rail-section">
       <div className="rail-section-head">
-        <strong>{title}</strong>
+        <strong>Agents</strong>
+        <button
+          className="rail-mini-btn"
+          onClick={refresh}
+          title="Refresh agents"
+          aria-label="Refresh agents"
+        >
+          <Icon name="refresh" size={16} />
+        </button>
       </div>
       <div className="rail-section-body">
-        <div className="rail-muted">{children}</div>
+        {error && <div className="rail-error">{error}</div>}
+        {workflow && (
+          <div className="rail-muted agent-roster-workflow">
+            Workflow stage:{" "}
+            {typeof workflow.stage_index === "number"
+              ? workflow.stage_index + 1
+              : "Unknown"}{" "}
+            · Status: {workflow.status?.trim() || "Unknown"}
+            {Array.isArray(workflow.tasks) &&
+              ` · Tasks: ${workflow.tasks.length}`}
+          </div>
+        )}
+        {rows.length === 0 ? (
+          <div className="rail-muted">This project has no agents.</div>
+        ) : (
+          <div className="rail-event-list">
+            {rows.map(({ agent, session }) => {
+              return (
+                <div className="rail-event-card" key={agent.id}>
+                  <div className="rail-event-head">
+                    <strong>{projectAgentRosterValue(agent.name)}</strong>
+                    <span className="rail-muted">
+                      {projectAgentRosterValue(agent.state)}
+                    </span>
+                  </div>
+                  <dl className="agent-roster-details">
+                    <div>
+                      <dt>Role</dt>
+                      <dd>{projectAgentRosterValue(agent.role)}</dd>
+                    </div>
+                    <div>
+                      <dt>Host</dt>
+                      <dd>{projectAgentRosterValue(selected.host_name)}</dd>
+                    </div>
+                    <div>
+                      <dt>Branch</dt>
+                      <dd title={agent.branch}>
+                        {projectAgentRosterValue(agent.branch)}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Worktree</dt>
+                      <dd title={agent.worktree_path}>
+                        {projectAgentRosterValue(agent.worktree_path)}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Session</dt>
+                      <dd>{session ? "Exists" : "None"}</dd>
+                    </div>
+                    <div>
+                      <dt>Run state</dt>
+                      <dd>{projectAgentRosterValue(session?.run_state)}</dd>
+                    </div>
+                    <div>
+                      <dt>Stop reason</dt>
+                      <dd>{projectAgentRosterValue(session?.stop_reason)}</dd>
+                    </div>
+                  </dl>
+                  <div className="inline-actions">
+                    {session ? (
+                      <button
+                        className="btn approval-primary"
+                        onClick={() => onOpenSession(session)}
+                      >
+                        Open session
+                      </button>
+                    ) : (
+                      <button
+                        className="btn approval-primary"
+                        disabled={busyAgentId === agent.id}
+                        onClick={() => void startSession(agent)}
+                      >
+                        {busyAgentId === agent.id
+                          ? "Starting…"
+                          : "Start session"}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
     </section>
   );
@@ -10276,6 +10456,7 @@ function SessionRightPanel({
   eventRefreshKey,
   transcript,
   focusTabRequest,
+  onOpenSession,
 }: {
   selected: Session;
   onError: (error: unknown) => void;
@@ -10289,6 +10470,7 @@ function SessionRightPanel({
   eventRefreshKey: string;
   transcript: TimelineEvent[];
   focusTabRequest?: { tab: PanelTab; requestId: number } | null;
+  onOpenSession: (session: Session) => void;
 }) {
   const [panelTab, setPanelTab] = useState<PanelTab>("info");
   const [opened, setOpened] = useState<PanelTab[]>(["info"]);
@@ -10548,10 +10730,11 @@ function SessionRightPanel({
             )}
             {opened.includes("agents") && panelTab === "agents" && (
               <div className="session-pane">
-                <PlannedPane title="Agents">
-                  Agents and child-session management are planned for the
-                  project_agents/sub-session integration.
-                </PlannedPane>
+                <AgentRosterPane
+                  selected={selected}
+                  onError={onError}
+                  onOpenSession={onOpenSession}
+                />
               </div>
             )}
             {opened.includes("desktop") && panelTab === "desktop" && (
@@ -12555,6 +12738,10 @@ function AppContent() {
           focusTabRequest={
             surfaceRequest?.sessionId === selected.id ? surfaceRequest : null
           }
+          onOpenSession={(session) => {
+            setSelected(session);
+            setSurface("session");
+          }}
           onCollapsedChange={setDrawerCollapsed}
           width={rightPanelWidth}
           onWidthChange={setRightPanelWidth}

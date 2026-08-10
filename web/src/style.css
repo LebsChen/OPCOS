@@ -2412,6 +2412,26 @@ input.workspace-chip {
   background: transparent;
   color: inherit;
 }
+.agent-roster-details {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px 12px;
+  margin-top: 12px;
+  font-size: 12px;
+}
+.agent-roster-workflow {
+  margin-bottom: 12px;
+}
+.agent-roster-details dt {
+  color: var(--color-muted);
+}
+.agent-roster-details dd {
+  overflow: hidden;
+  margin: 2px 0 0;
+  color: var(--color-ink);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 @keyframes spin {
   to {
     transform: rotate(360deg);
