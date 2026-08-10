@@ -320,4 +320,16 @@ describe("GUI boundary behavior", () => {
     );
     expect(source).toContain("Date.now() - started >= 60_000");
   });
+
+  it("offers a system-browser Web IDE when WebKit cannot start the workbench", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("./App.tsx", import.meta.url)),
+      "utf8",
+    );
+    expect(source).toContain("open_ide_external");
+    expect(source).toContain("This embedded WebKit webview cannot run");
+    expect(source).toContain("Open remote IDE in system browser");
+    expect(source).toContain("navigator.userAgent");
+    expect(source).toContain("latest?.total_sockets ?? 0) === 0");
+  });
 });

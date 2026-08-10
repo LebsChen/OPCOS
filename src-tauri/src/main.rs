@@ -13807,6 +13807,13 @@ async fn start_ide_proxy(
     Ok(IdeProxyInfo { port })
 }
 
+#[tauri::command]
+fn open_ide_external(app: tauri::AppHandle, port: u16) -> Result<(), String> {
+    app.opener()
+        .open_url(format!("http://127.0.0.1:{port}/ide/"), None::<&str>)
+        .map_err(|_| "could not open the system browser".to_owned())
+}
+
 #[tauri::command(rename = "create_session")]
 #[allow(clippy::too_many_arguments)]
 fn create_session_command(
@@ -29761,7 +29768,8 @@ fn main() {
             validate_provider_key,
             start_surface,
             ide_bootstrap,
-            start_ide_proxy
+            start_ide_proxy,
+            open_ide_external
         ])
         .build(tauri::generate_context!())
         .expect("error while building OPCOS")

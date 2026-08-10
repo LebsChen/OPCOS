@@ -2498,6 +2498,7 @@ function SurfaceView({
   const [worklog, setWorklog] = useState<Record<string, unknown> | null>(null);
   const [busy, setBusy] = useState(false);
   const [ideError, setIdeError] = useState("");
+  const [ideWebviewUnsupported, setIdeWebviewUnsupported] = useState(false);
   const start = async (surface: string) => {
     try {
       setBusy(true);
@@ -2533,6 +2534,7 @@ function SurfaceView({
     setDiff(null);
     setWorklog(null);
     setIdeError("");
+    setIdeWebviewUnsupported(false);
   }, [selected.id]);
   useEffect(() => {
     if (tab === "terminal" || tab === "desktop" || tab === "browser") {
@@ -2599,11 +2601,25 @@ function SurfaceView({
       }
       if (cancelled) return;
       if (Date.now() - started >= 60_000) {
-        setIdeError(
-          `Remote Web IDE workbench stalled after the WebSocket upgrade (sockets: ${
-            latest?.total_sockets ?? 0
-          }, upstream frames: ${latest?.upstream_frames ?? 0}).`,
-        );
+        const isWebKitWebView =
+          /AppleWebKit/i.test(navigator.userAgent) &&
+          !/Chrome|Chromium|CriOS|Edg/i.test(navigator.userAgent);
+        if (
+          isWebKitWebView &&
+          (latest?.total_sockets ?? 0) === 0 &&
+          (latest?.upstream_frames ?? 0) === 0
+        ) {
+          setIdeWebviewUnsupported(true);
+          setIdeError(
+            "This embedded WebKit webview cannot run the remote Web IDE workbench. Open it in your system browser instead.",
+          );
+        } else {
+          setIdeError(
+            `Remote Web IDE workbench stalled after the WebSocket upgrade (sockets: ${
+              latest?.total_sockets ?? 0
+            }, upstream frames: ${latest?.upstream_frames ?? 0}).`,
+          );
+        }
         return;
       }
       timer = window.setTimeout(() => void poll(), 250);
@@ -2761,6 +2777,16 @@ function SurfaceView({
             <Icon name="code" size={32} />
             <p>{ideError}</p>
             <p className="muted">No local fallback is used.</p>
+            {ideWebviewUnsupported && ideProxy && (
+              <button
+                type="button"
+                onClick={() =>
+                  void command("open_ide_external", { port: ideProxy.port })
+                }
+              >
+                Open remote IDE in system browser
+              </button>
+            )}
           </div>
         ) : (
           <div className="empty-surface">
