@@ -391,9 +391,12 @@ where
             let server_task = tokio::spawn(async move {
                 let protocol = opcos_acp_server::OpcosAcpServer::new(control_plane);
                 let (reader, writer) = tokio::io::split(server_io);
-                let _ = protocol
+                if let Err(error) = protocol
                     .serve_stdio(tokio::io::BufReader::new(reader), writer)
-                    .await;
+                    .await
+                {
+                    eprintln!("ACP connection terminated: {error}");
+                }
             });
             let (mut ws_writer, mut ws_reader) = socket.split();
             let (client_reader, mut client_writer) = tokio::io::split(client);
@@ -16366,6 +16369,20 @@ struct DesktopControlPlane {
     app: tauri::AppHandle,
 }
 
+const MCP_SESSION_TURN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+
+async fn await_mcp_turn_with_deadline<F>(turn: F, timeout: Duration) -> Result<bool, String>
+where
+    F: Future<Output = Result<(), String>> + Send + 'static,
+{
+    let task = tauri::async_runtime::spawn(turn);
+    match tokio::time::timeout(timeout, task).await {
+        Ok(Ok(result)) => result.map(|()| true),
+        Ok(Err(error)) => Err(format!("MCP session turn task failed: {error}")),
+        Err(_) => Ok(false),
+    }
+}
+
 fn mcp_session_view(view: SessionView) -> Value {
     let mut value = serde_json::to_value(view).expect("session view serializes");
     if let Some(object) = value.as_object_mut()
@@ -16812,17 +16829,46 @@ impl opcos_mcp_server::OpcosControlPlane for DesktopControlPlane {
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
         {
-            submit_turn_inner_with_origin(
-                self.app.clone(),
-                &state,
-                SubmitRequest {
-                    session_id: session_id.clone(),
-                    text: prompt.to_owned(),
-                    attachments: vec![],
+            let app = self.app.clone();
+            let turn_session_id = session_id.clone();
+            let turn_text = prompt.to_owned();
+            let completed = await_mcp_turn_with_deadline(
+                async move {
+                    let state = app.state::<DesktopState>();
+                    submit_turn_inner_with_origin(
+                        app.clone(),
+                        &state,
+                        SubmitRequest {
+                            session_id: turn_session_id,
+                            text: turn_text,
+                            attachments: vec![],
+                        },
+                        ToolOrigin::User,
+                    )
+                    .await
                 },
-                ToolOrigin::User,
+                MCP_SESSION_TURN_RESPONSE_TIMEOUT,
             )
             .await?;
+            if !completed {
+                let current = state
+                    .store
+                    .load_session(&session_id)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| format!("session not found: {session_id}"))?;
+                let current = {
+                    let connection = state
+                        .database
+                        .lock()
+                        .map_err(|_| "database lock poisoned".to_owned())?;
+                    session_view_for_host(&connection, current)?
+                        .ok_or_else(|| format!("session host not found: {session_id}"))?
+                };
+                return Ok(json!({
+                    "session_id": session_id,
+                    "session": mcp_session_view(current),
+                }));
+            }
         }
         Ok(json!({"session_id": session_id, "session": mcp_session_view(view)}))
     }
@@ -16876,15 +16922,24 @@ impl opcos_mcp_server::OpcosControlPlane for DesktopControlPlane {
             })),
             "message" => {
                 let message = Self::required_string(&arguments, "message")?;
-                submit_turn_inner_with_origin(
-                    self.app.clone(),
-                    &state,
-                    SubmitRequest {
-                        session_id: session_id.clone(),
-                        text: message,
-                        attachments: vec![],
+                let app = self.app.clone();
+                let turn_session_id = session_id.clone();
+                await_mcp_turn_with_deadline(
+                    async move {
+                        let state = app.state::<DesktopState>();
+                        submit_turn_inner_with_origin(
+                            app.clone(),
+                            &state,
+                            SubmitRequest {
+                                session_id: turn_session_id,
+                                text: message,
+                                attachments: vec![],
+                            },
+                            ToolOrigin::User,
+                        )
+                        .await
                     },
-                    ToolOrigin::User,
+                    MCP_SESSION_TURN_RESPONSE_TIMEOUT,
                 )
                 .await?;
                 let session = list_sessions_for_state(&state)?
@@ -29469,6 +29524,25 @@ fn main() {
 #[cfg(test)]
 mod m7_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mcp_turn_deadline_returns_without_cancelling_background_work() {
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let marker = Arc::clone(&completed);
+        let returned = await_mcp_turn_with_deadline(
+            async move {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                marker.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+        assert!(!returned);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     fn wake_test_session(store: &SqliteStore, session_id: &str, harness: &str) {
         let now = Utc::now();
