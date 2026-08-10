@@ -705,6 +705,7 @@ struct RecordingAnnotation {
 struct RecordingData {
     recording_id: String,
     source: String,
+    capture_scope: String,
     started_at_ms: i64,
     interval_ms: u64,
     max_frames: usize,
@@ -1927,6 +1928,11 @@ has failed {} times and the last error code was {}",
         let data = Arc::new(StdMutex::new(RecordingData {
             recording_id: recording_id.clone(),
             source: source_name.clone(),
+            capture_scope: if source_name == "browser" {
+                "browser_page".into()
+            } else {
+                "desktop".into()
+            },
             started_at_ms,
             interval_ms,
             max_frames,
@@ -2170,6 +2176,7 @@ has failed {} times and the last error code was {}",
             let manifest = json!({
             "recording_id": snapshot.recording_id,
             "source": snapshot.source,
+            "capture_scope": snapshot.capture_scope,
             "started_at_ms": snapshot.started_at_ms,
             "stopped_at_ms": now_millis(),
             "interval_ms": snapshot.interval_ms,
@@ -12088,11 +12095,11 @@ mod tests {
         struct Source;
         #[async_trait]
         impl RecordingSource for Source {
-            async fn capture_frame(&self, _source: &str) -> Result<CapturedFrame, String> {
+            async fn capture_frame(&self, source: &str) -> Result<CapturedFrame, String> {
                 Ok(CapturedFrame {
                     content: b"same-frame".to_vec(),
                     mime: "image/png".into(),
-                    source: "desktop".into(),
+                    source: source.into(),
                 })
             }
         }
@@ -12128,7 +12135,7 @@ mod tests {
             .start_recording(&ToolCall {
                 id: "start".into(),
                 name: "recording_start".into(),
-                arguments: json!({"interval_ms": 100, "max_frames": 3}),
+                arguments: json!({"source": "browser", "interval_ms": 100, "max_frames": 3}),
             })
             .await;
         let recording_id = recording["recording_id"].as_str().unwrap().to_owned();
@@ -12197,5 +12204,11 @@ mod tests {
                 .count(),
             1
         );
+        let manifest = requests
+            .iter()
+            .find(|request| request.kind == "recording_manifest")
+            .and_then(|request| serde_json::from_slice::<Value>(&request.content).ok())
+            .unwrap();
+        assert_eq!(manifest["capture_scope"], "browser_page");
     }
 }

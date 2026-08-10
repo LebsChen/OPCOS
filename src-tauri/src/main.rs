@@ -868,7 +868,16 @@ impl RecordingSource for DesktopExecutor {
         let screenshot = match self {
             Self::Remote(executor) => {
                 if source == "browser" {
-                    return Err("remote browser recording is unsupported".into());
+                    let screenshot = executor
+                        .client
+                        .capture_cdp_screenshot()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    return Ok(CapturedFrame {
+                        content: screenshot.image,
+                        mime: screenshot.mime,
+                        source: "browser".into(),
+                    });
                 }
                 let host = RvmHost::new(
                     executor.host_id.clone(),
@@ -13730,6 +13739,29 @@ async fn start_surface(
     let task = tauri::async_runtime::spawn(relay_surface(listener, client, kind, params));
     state.surfaces.lock().await.insert(port, task);
     Ok(port)
+}
+
+#[tauri::command]
+async fn capture_remote_browser_frame(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Value, String> {
+    let host_id = session_host_id(&state, &session_id)?;
+    if host_id == "local" {
+        return Err("本机 host 使用本地 browser controller，不支持远程 CDP preview".into());
+    }
+    let screenshot = client_for(&state, &host_id)?
+        .capture_cdp_screenshot()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(json!({
+        "image": base64::engine::general_purpose::STANDARD.encode(screenshot.image),
+        "mime": screenshot.mime,
+        "target_id": screenshot.target_id,
+        "target_url": screenshot.target_url,
+        "capture_scope": "browser_page",
+        "read_only": true,
+    }))
 }
 
 #[tauri::command]
@@ -29760,6 +29792,7 @@ fn main() {
             delete_provider_key,
             validate_provider_key,
             start_surface,
+            capture_remote_browser_frame,
             ide_bootstrap,
             start_ide_proxy
         ])
