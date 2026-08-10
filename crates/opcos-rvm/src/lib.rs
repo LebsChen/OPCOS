@@ -676,95 +676,8 @@ impl HttpRvmClient {
     }
 
     pub async fn capture_cdp_screenshot(&self) -> Result<CdpScreenshot, RvmError> {
-        match self.capture_cdp_screenshot_via_target().await {
-            Ok(screenshot) => Ok(screenshot),
-            Err(RvmError::WebSocket(_)) => self.capture_cdp_screenshot_from_page_socket().await,
-            Err(error @ RvmError::JsonRpc { .. }) if is_cdp_method_not_found(&error) => {
-                self.capture_cdp_screenshot_from_page_socket().await
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    async fn capture_cdp_screenshot_via_target(&self) -> Result<CdpScreenshot, RvmError> {
         let mut socket = self.open_ws(WsKind::Cdp, WsParams::default()).await?;
         let mut next_id = 1_u64;
-        let targets =
-            cdp_command(&mut socket, &mut next_id, "Target.getTargets", None, None).await?;
-        let target = select_cdp_page_target(&targets)?;
-        let target_id = target
-            .get("targetId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| RvmError::InvalidResponse("CDP page target has no targetId".into()))?
-            .to_owned();
-        let target_url = target
-            .get("url")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        let attach = cdp_command(
-            &mut socket,
-            &mut next_id,
-            "Target.attachToTarget",
-            Some(serde_json::json!({"targetId": target_id, "flatten": true})),
-            None,
-        )
-        .await?;
-        let session_id = attach
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                RvmError::InvalidResponse("CDP target attach returned no sessionId".into())
-            })?
-            .to_owned();
-        cdp_command(
-            &mut socket,
-            &mut next_id,
-            "Page.enable",
-            None,
-            Some(&session_id),
-        )
-        .await?;
-        cdp_command(
-            &mut socket,
-            &mut next_id,
-            "Page.bringToFront",
-            None,
-            Some(&session_id),
-        )
-        .await?;
-        let screenshot = cdp_command(
-            &mut socket,
-            &mut next_id,
-            "Page.captureScreenshot",
-            Some(serde_json::json!({"format": "png"})),
-            Some(&session_id),
-        )
-        .await?;
-        let image = screenshot
-            .get("data")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                RvmError::InvalidResponse("CDP screenshot returned no image data".into())
-            })?;
-        let image = base64::engine::general_purpose::STANDARD
-            .decode(image)
-            .map_err(|error| {
-                RvmError::InvalidResponse(format!("CDP screenshot base64 is invalid: {error}"))
-            })?;
-        Ok(CdpScreenshot {
-            image,
-            mime: "image/png".into(),
-            target_id,
-            target_url,
-        })
-    }
-
-    async fn capture_cdp_screenshot_from_page_socket(&self) -> Result<CdpScreenshot, RvmError> {
-        let mut socket = self.open_ws(WsKind::Cdp, WsParams::default()).await?;
-        let mut next_id = 1_u64;
-        cdp_command(&mut socket, &mut next_id, "Page.enable", None, None).await?;
-        cdp_command(&mut socket, &mut next_id, "Page.bringToFront", None, None).await?;
         let screenshot = cdp_command(
             &mut socket,
             &mut next_id,
@@ -1527,10 +1440,6 @@ impl RvmClient for HttpRvmClient {
     }
 }
 
-fn is_cdp_method_not_found(error: &RvmError) -> bool {
-    matches!(error, RvmError::JsonRpc { message, .. } if message.to_ascii_lowercase().contains("method not found"))
-}
-
 async fn cdp_command(
     socket: &mut RvmWebSocket,
     next_id: &mut u64,
@@ -1576,6 +1485,15 @@ async fn cdp_command(
             tokio_tungstenite::tungstenite::Message::Frame(_) => continue,
         };
         let response: Value = serde_json::from_str(&text)?;
+        if let Some(proxy_error) = response.get("error").and_then(Value::as_str) {
+            let message = response
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("remote CDP proxy failed");
+            return Err(RvmError::WebSocket(format!(
+                "remote CDP proxy failed ({proxy_error}): {message}"
+            )));
+        }
         if response.get("id").and_then(Value::as_u64) != Some(id) {
             continue;
         }
@@ -1597,21 +1515,6 @@ async fn cdp_command(
     Err(RvmError::WebSocket(format!(
         "CDP connection closed while waiting for {method}"
     )))
-}
-
-fn select_cdp_page_target(targets: &Value) -> Result<&serde_json::Map<String, Value>, RvmError> {
-    targets
-        .get("targetInfos")
-        .and_then(Value::as_array)
-        .and_then(|items| {
-            items.iter().find_map(|item| {
-                (item.get("type").and_then(Value::as_str) == Some("page")
-                    && item.get("targetId").and_then(Value::as_str).is_some())
-                .then(|| item.as_object())
-                .flatten()
-            })
-        })
-        .ok_or_else(|| RvmError::Unsupported("remote browser has no page target".into()))
 }
 
 /// MCP tools the host may expose that map onto OPCOS host capabilities.
@@ -2474,50 +2377,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cdp_target_selection_ignores_non_page_targets() {
-        let targets = serde_json::json!({
-            "targetInfos": [
-                {"targetId": "browser", "type": "browser"},
-                {"targetId": "page-1", "type": "page", "url": "https://example.test"}
-            ]
-        });
-        let target = select_cdp_page_target(&targets).unwrap();
-        assert_eq!(
-            target.get("targetId").and_then(Value::as_str),
-            Some("page-1")
-        );
-    }
-
-    #[test]
-    fn cdp_target_selection_reports_missing_page() {
-        let error = select_cdp_page_target(&serde_json::json!({
-            "targetInfos": [{"targetId": "worker", "type": "service_worker"}]
-        }))
-        .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "RVM capability is unavailable: remote browser has no page target"
-        );
-    }
-
     async fn cdp_test_socket(mut socket: WebSocket) {
         while let Some(Ok(Message::Text(text))) = socket.recv().await {
             let request: Value = serde_json::from_str(&text).unwrap();
             let id = request.get("id").cloned().unwrap();
             let method = request.get("method").and_then(Value::as_str).unwrap();
             let response = match method {
-                "Target.getTargets" => serde_json::json!({
-                    "id": id,
-                    "result": {"targetInfos": [
-                        {"targetId": "page-1", "type": "page", "url": "https://example.test"}
-                    ]}
-                }),
-                "Target.attachToTarget" => {
-                    serde_json::json!({"id": id, "result": {"sessionId": "session-1"}})
-                }
-                "Page.enable" => serde_json::json!({"id": id, "result": {}}),
-                "Page.bringToFront" => serde_json::json!({"id": id, "result": {}}),
                 "Page.captureScreenshot" => serde_json::json!({
                     "id": id,
                     "result": {"data": base64::engine::general_purpose::STANDARD.encode([137, 80, 78, 71])}
@@ -2552,8 +2417,8 @@ mod tests {
         .unwrap();
         let screenshot = client.capture_cdp_screenshot().await.unwrap();
         assert_eq!(screenshot.image, [137, 80, 78, 71]);
-        assert_eq!(screenshot.target_id, "page-1");
-        assert_eq!(screenshot.target_url, "https://example.test");
+        assert_eq!(screenshot.target_id, "page-socket");
+        assert_eq!(screenshot.target_url, "");
         server.abort();
     }
 }
