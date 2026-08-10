@@ -15,6 +15,9 @@ use url::Url;
 pub mod path_guard;
 pub use path_guard::{PathGuardError, RemotePathGuard, join_remote_path};
 
+const IDE_BROWSER_USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36";
+
 #[derive(Clone)]
 pub struct RvmClientConfig {
     pub base_url: Url,
@@ -731,7 +734,7 @@ impl HttpRvmClient {
                 .get(url.clone())
                 .header(header::AUTHORIZATION, self.config.auth_header())
                 .header(header::ACCEPT, "text/html")
-                .header(header::USER_AGENT, "OPCOS/0.1")
+                .header(header::USER_AGENT, IDE_BROWSER_USER_AGENT)
                 .header("Sec-Fetch-Mode", "navigate");
             if !cookies.is_empty() {
                 request = request.header(header::COOKIE, cookies.join("; "));
@@ -830,7 +833,7 @@ impl HttpRvmClient {
             .http
             .get(url)
             .header(header::ACCEPT, "text/html")
-            .header(header::USER_AGENT, "OPCOS/0.1")
+            .header(header::USER_AGENT, IDE_BROWSER_USER_AGENT)
             .header("Sec-Fetch-Mode", "navigate");
         if cookies.is_empty() {
             request = request.header(header::AUTHORIZATION, self.config.auth_header());
@@ -878,6 +881,7 @@ impl HttpRvmClient {
         &self,
         route: &str,
         cookies: &[String],
+        protocol: Option<&str>,
     ) -> Result<RvmWebSocket, RvmError> {
         let mut url = self
             .config
@@ -918,6 +922,30 @@ impl HttpRvmClient {
         let mut request = url.as_str().into_client_request().map_err(|error| {
             RvmError::WebSocket(RvmError::redact(&error.to_string(), &self.config.token))
         })?;
+        let mut origin = self.config.base_url.clone();
+        origin.set_path("");
+        origin.set_query(None);
+        request.headers_mut().insert(
+            header::ORIGIN,
+            origin
+                .as_str()
+                .parse()
+                .map_err(|_| RvmError::WebSocket("invalid IDE origin".into()))?,
+        );
+        request.headers_mut().insert(
+            header::USER_AGENT,
+            IDE_BROWSER_USER_AGENT
+                .parse()
+                .map_err(|_| RvmError::WebSocket("invalid IDE user-agent".into()))?,
+        );
+        if let Some(protocol) = protocol {
+            request.headers_mut().insert(
+                header::SEC_WEBSOCKET_PROTOCOL,
+                protocol
+                    .parse()
+                    .map_err(|_| RvmError::WebSocket("invalid IDE websocket protocol".into()))?,
+            );
+        }
         if cookies.is_empty() {
             request.headers_mut().insert(
                 header::AUTHORIZATION,
@@ -2177,12 +2205,21 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
             let mut request = vec![0; 8192];
-            for (index, expected) in ["tkn=rvm-secret", "cookie:"].iter().enumerate() {
+            for (index, expected) in [
+                "tkn=rvm-secret",
+                "cookie:",
+                "cookie: rvm_ide_tkn=rvm-secret",
+            ]
+            .iter()
+            .enumerate()
+            {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let size = socket.read(&mut request).await.unwrap();
                 let received = String::from_utf8_lossy(&request[..size]);
                 assert!(received.contains(expected));
-                assert!(received.contains("user-agent: OPCOS/0.1"));
+                assert!(received.contains(
+                    "user-agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
+                ));
                 if index == 0 {
                     socket
                         .write_all(
@@ -2190,10 +2227,17 @@ mod tests {
                         )
                         .await
                         .unwrap();
-                } else {
+                } else if index == 1 {
                     socket
                         .write_all(
                             b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<meta id=\"vscode-workbench-web-configuration\" data-settings='{\"remoteAuthority\":\"antec\",\"connectionToken\":\"rvm-secret\"}'>",
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nConnection: close\r\n\r\nasset",
                         )
                         .await
                         .unwrap();
@@ -2214,6 +2258,15 @@ mod tests {
         assert!(result.html.contains(&result.proxy_token));
         assert!(result.html.contains("remoteAuthority"));
         assert!(result.html.len() > "<html>bare workbench</html>".len());
+        let asset = client
+            .ide_request_bytes(
+                "/ide/out/workbench.js",
+                &result.cookies,
+                &result.proxy_token,
+            )
+            .await
+            .unwrap();
+        assert_eq!(&asset[..], b"asset");
         task.await.unwrap();
     }
 

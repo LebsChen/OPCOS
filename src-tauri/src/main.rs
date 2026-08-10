@@ -10983,12 +10983,19 @@ async fn ide_root(AxumState(state): AxumState<IdeProxyState>, request: Request) 
         let (mut parts, _) = request.into_parts();
         let uri = parts.uri.clone();
         if let Ok(ws) = WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
+            let protocols = ws
+                .requested_protocols()
+                .filter_map(|value| value.to_str().ok().map(str::to_owned))
+                .collect::<Vec<_>>();
+            let upstream_protocol = protocols.first().cloned();
             return ws
+                .protocols(protocols)
                 .on_upgrade(move |socket| {
                     ide_relay_socket(
                         socket,
                         state,
                         format!("/ide/?{}", uri.query().unwrap_or_default()),
+                        upstream_protocol,
                     )
                 })
                 .into_response();
@@ -11010,7 +11017,7 @@ async fn ide_out_asset(
     Path(path): Path<String>,
     uri: Uri,
 ) -> Response {
-    ide_asset_route(state, path, uri, "/ide/out/").await
+    ide_asset_route(state, path, uri, "/ide/static/out/").await
 }
 
 async fn ide_resources_asset(
@@ -11018,7 +11025,7 @@ async fn ide_resources_asset(
     Path(path): Path<String>,
     uri: Uri,
 ) -> Response {
-    ide_asset_route(state, path, uri, "/ide/resources/").await
+    ide_asset_route(state, path, uri, "/ide/static/resources/").await
 }
 
 async fn ide_asset_route(state: IdeProxyState, path: String, uri: Uri, prefix: &str) -> Response {
@@ -11048,10 +11055,10 @@ async fn ide_asset_route(state: IdeProxyState, path: String, uri: Uri, prefix: &
 
 fn ide_asset_upstream_route(route: &str) -> String {
     if let Some(path) = route.strip_prefix("/out/") {
-        return format!("/ide/out/{path}");
+        return format!("/ide/static/out/{path}");
     }
     if let Some(path) = route.strip_prefix("/resources/") {
-        return format!("/ide/resources/{path}");
+        return format!("/ide/static/resources/{path}");
     }
     if let Some(path) = route.strip_prefix("/static/") {
         return format!("/ide/static/{path}");
@@ -11059,10 +11066,15 @@ fn ide_asset_upstream_route(route: &str) -> String {
     route.to_owned()
 }
 
-async fn ide_relay_socket(mut browser: WebSocket, state: IdeProxyState, route: String) {
+async fn ide_relay_socket(
+    mut browser: WebSocket,
+    state: IdeProxyState,
+    route: String,
+    protocol: Option<String>,
+) {
     let Ok(upstream) = state
         .client
-        .open_ide_ws(&route, &state.bootstrap.cookies)
+        .open_ide_ws(&route, &state.bootstrap.cookies, protocol.as_deref())
         .await
     else {
         let _ = browser.close().await;
@@ -13661,10 +13673,7 @@ async fn start_ide_proxy(
             &bootstrap.proxy_token,
         )
         .await
-        .map_err(|_| {
-            "Remote Web IDE bootstrap succeeded, but the bound host rejected its workbench assets."
-                .to_owned()
-        })?;
+        .map_err(|error| format!("Remote Web IDE workbench asset request failed: {error}"))?;
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .map_err(|error| error.to_string())?;
@@ -32445,11 +32454,11 @@ agents:
     fn ide_preflight_uses_the_same_upstream_prefix_as_asset_proxy() {
         assert_eq!(
             ide_asset_upstream_route("/out/nls.messages.js"),
-            "/ide/out/nls.messages.js"
+            "/ide/static/out/nls.messages.js"
         );
         assert_eq!(
             ide_asset_upstream_route("/resources/workbench.css?x=1"),
-            "/ide/resources/workbench.css?x=1"
+            "/ide/static/resources/workbench.css?x=1"
         );
         assert_eq!(
             ide_asset_upstream_route("/static/out/workbench.js"),

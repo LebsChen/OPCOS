@@ -2655,9 +2655,7 @@ function SurfaceView({
                 if (
                   /bad gateway|upstream|forbidden|not available/i.test(body)
                 ) {
-                  setIdeError(
-                    "Remote Web IDE bootstrap succeeded, but the bound host rejected its workbench assets.",
-                  );
+                  setIdeError("Remote Web IDE workbench asset request failed.");
                 }
               } catch {
                 // Cross-origin frames cannot be inspected; browser errors remain visible.
