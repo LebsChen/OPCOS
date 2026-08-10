@@ -16,9 +16,81 @@ import {
   selectedSessionFromList,
   sessionViewSelection,
   updateSessionRunState,
+  projectAgentRosterHost,
+  projectAgentRosterValue,
+  projectAgentRosterRows,
 } from "./gui";
 
 describe("GUI boundary behavior", () => {
+  it("matches project agents to existing sessions without inferring hierarchy", () => {
+    const agents = [
+      {
+        id: "agent-1",
+        project_id: "project-1",
+        sort_order: 0,
+        name: "Builder",
+        role: "Code",
+        session_id: null,
+        model: "auto",
+        harness: "builtin",
+        mode: "Auto",
+        system_prompt: "",
+        worktree_path: "/repo",
+        branch: "dev",
+        state: "Active",
+      },
+    ];
+    const session = {
+      id: "session-1",
+      title: "Builder",
+      host_id: "host-1",
+      host_name: "Remote",
+      model: "auto",
+      mode: "Auto",
+      harness: "builtin",
+      project_id: "project-1",
+      agent_id: "agent-1",
+      run_state: "idle",
+      stop_reason: "finished",
+    };
+    expect(projectAgentRosterRows(agents, [session])[0].session).toEqual(
+      session,
+    );
+    expect(projectAgentRosterHost(session)).toBe("Remote");
+    expect(projectAgentRosterHost(session)).not.toBe("Viewing session host");
+  });
+
+  it("keeps unknown agent session fields absent instead of inventing defaults", () => {
+    const rows = projectAgentRosterRows(
+      [
+        {
+          id: "agent-1",
+          project_id: "project-1",
+          sort_order: 0,
+          name: "Builder",
+          role: "Code",
+          session_id: null,
+          model: "auto",
+          harness: "builtin",
+          mode: "Auto",
+          system_prompt: "",
+          worktree_path: "/repo",
+          branch: "dev",
+          state: "Active",
+        },
+      ],
+      [],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].session).toBeNull();
+    expect(projectAgentRosterValue("")).toBe("Unknown");
+    expect(projectAgentRosterValue(null)).toBe("Unknown");
+  });
+
+  it("renders an empty project roster as an empty list", () => {
+    expect(projectAgentRosterRows([], [])).toEqual([]);
+  });
+
   it("does not offer local fallback for an offline remote host", () => {
     expect(
       hostFailureMessage({
