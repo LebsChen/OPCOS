@@ -650,6 +650,8 @@ struct DesktopState {
     secret_values: SecretValues,
     store: Arc<SqliteStore>,
     engines: Arc<AsyncMutex<HashMap<String, Arc<GuiEngine>>>>,
+    engine_capability_observed_at: AsyncMutex<HashMap<String, DateTime<Utc>>>,
+    engine_hosts: AsyncMutex<HashMap<String, String>>,
     acp_engines: AsyncMutex<HashMap<String, Arc<opcos_engine::AcpHarness<SqliteStore>>>>,
     acp_event_sessions: AsyncMutex<HashSet<String>>,
     acp_streams: Mutex<HashMap<String, UnboundedSender<(String, Value)>>>,
@@ -674,6 +676,38 @@ struct DesktopState {
     ci_monitor_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     runner_shutdown: tokio::sync::watch::Sender<bool>,
     runner_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+}
+
+const CAPABILITY_RECHECK_INTERVAL: ChronoDuration = ChronoDuration::seconds(30);
+
+fn capability_recheck_due(observed_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    observed_at.is_none_or(|observed_at| {
+        now.signed_duration_since(observed_at) >= CAPABILITY_RECHECK_INTERVAL
+    })
+}
+
+async fn invalidate_engines_for_host(state: &DesktopState, host_id: &str) {
+    let session_ids = {
+        let mut engine_hosts = state.engine_hosts.lock().await;
+        let session_ids = engine_hosts
+            .iter()
+            .filter(|(_, bound_host)| bound_host == &host_id)
+            .map(|(session_id, _)| session_id.clone())
+            .collect::<Vec<_>>();
+        for session_id in &session_ids {
+            engine_hosts.remove(session_id);
+        }
+        session_ids
+    };
+    if session_ids.is_empty() {
+        return;
+    }
+    let mut engines = state.engines.lock().await;
+    let mut observed_at = state.engine_capability_observed_at.lock().await;
+    for session_id in session_ids {
+        engines.remove(&session_id);
+        observed_at.remove(&session_id);
+    }
 }
 
 struct SessionArtifactSink {
@@ -12042,9 +12076,26 @@ async fn engine_for_with_context(
     initial_task: Option<&str>,
 ) -> Result<Arc<GuiEngine>, String> {
     if origin == ToolOrigin::User {
-        let engines = state.engines.lock().await;
-        if let Some(engine) = engines.get(session_id) {
-            return Ok(Arc::clone(engine));
+        let observed_at = state
+            .engine_capability_observed_at
+            .lock()
+            .await
+            .get(session_id)
+            .copied();
+        if !capability_recheck_due(observed_at, Utc::now()) {
+            let engines = state.engines.lock().await;
+            if let Some(engine) = engines.get(session_id) {
+                return Ok(Arc::clone(engine));
+            }
+        } else {
+            let mut engines = state.engines.lock().await;
+            engines.remove(session_id);
+            state
+                .engine_capability_observed_at
+                .lock()
+                .await
+                .remove(session_id);
+            state.engine_hosts.lock().await.remove(session_id);
         }
     }
     let session = session_for(state, session_id)?;
@@ -12207,6 +12258,16 @@ async fn engine_for_with_context(
             observed_at,
             reason: browser_probe.err().map(|error| error.to_string()),
         });
+        state
+            .engine_capability_observed_at
+            .lock()
+            .await
+            .insert(session_id.to_owned(), capabilities.observed_at);
+        state
+            .engine_hosts
+            .lock()
+            .await
+            .insert(session_id.to_owned(), host_id.clone());
         let mut allowed_tools = allowed_builtin_tools(&capabilities);
         if linear_tools_enabled {
             allowed_tools.extend([
@@ -12298,6 +12359,16 @@ async fn engine_for_with_context(
             .capabilities()
             .await
             .map_err(|error| format!("remote capabilities unavailable: {error}"))?;
+        state
+            .engine_capability_observed_at
+            .lock()
+            .await
+            .insert(session_id.to_owned(), capabilities.observed_at);
+        state
+            .engine_hosts
+            .lock()
+            .await
+            .insert(session_id.to_owned(), host_id.clone());
         let allowed_tools = allowed_builtin_tools(&capabilities);
         (
             workspace.clone(),
@@ -13600,6 +13671,7 @@ async fn execute_computer_use_action(
 
 #[tauri::command]
 async fn test_host(state: State<'_, DesktopState>, host_id: String) -> Result<HostView, String> {
+    invalidate_engines_for_host(&state, &host_id).await;
     if host_id == "local" {
         return Ok(HostView {
             id: host_id,
@@ -29404,6 +29476,8 @@ fn main() {
                 secret_values,
                 store,
                 engines: Arc::clone(&engines),
+                engine_capability_observed_at: AsyncMutex::new(HashMap::new()),
+                engine_hosts: AsyncMutex::new(HashMap::new()),
                 acp_engines: AsyncMutex::new(HashMap::new()),
                 acp_event_sessions: AsyncMutex::new(HashSet::new()),
                 acp_streams: Mutex::new(HashMap::new()),
@@ -30245,6 +30319,47 @@ mod m7_tests {
         };
         let error = capability_preflight(&unknown, "browser_status", &json!({})).unwrap_err();
         assert_eq!(error["error_details"]["code"], json!("capability_unknown"));
+    }
+
+    #[test]
+    fn capability_recheck_is_bounded_and_retries_after_the_interval() {
+        let now = Utc::now();
+        assert!(!capability_recheck_due(
+            Some(now - ChronoDuration::seconds(29)),
+            now
+        ));
+        assert!(capability_recheck_due(
+            Some(now - ChronoDuration::seconds(30)),
+            now
+        ));
+        assert!(capability_recheck_due(None, now));
+        assert!(!capability_recheck_due(
+            Some(now + ChronoDuration::seconds(1)),
+            now
+        ));
+    }
+
+    #[test]
+    fn capability_reprobe_failure_replaces_previous_success() {
+        let available = test_capabilities(true, true, true);
+        assert!(capability_preflight(&available, "browser_status", &json!({})).is_ok());
+
+        let unavailable = test_capabilities(true, false, true);
+        let error = capability_preflight(&unavailable, "browser_status", &json!({})).unwrap_err();
+        assert_eq!(
+            error["error_details"]["code"],
+            json!("capability_unavailable")
+        );
+        assert_eq!(error["error_details"]["operation_performed"], json!(false));
+    }
+
+    #[test]
+    fn refreshed_capabilities_update_the_allowed_tool_list() {
+        let before = allowed_builtin_tools(&test_capabilities(true, false, true));
+        assert!(!before.contains(&"browser_status".to_owned()));
+
+        let after = allowed_builtin_tools(&test_capabilities(true, true, true));
+        assert!(after.contains(&"browser_status".to_owned()));
     }
 
     #[test]
