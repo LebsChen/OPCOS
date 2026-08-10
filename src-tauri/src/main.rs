@@ -650,6 +650,8 @@ struct DesktopState {
     secret_values: SecretValues,
     store: Arc<SqliteStore>,
     engines: Arc<AsyncMutex<HashMap<String, Arc<GuiEngine>>>>,
+    engine_capabilities: AsyncMutex<HashMap<String, HostCapabilities>>,
+    engine_hosts: AsyncMutex<HashMap<String, String>>,
     acp_engines: AsyncMutex<HashMap<String, Arc<opcos_engine::AcpHarness<SqliteStore>>>>,
     acp_event_sessions: AsyncMutex<HashSet<String>>,
     acp_streams: Mutex<HashMap<String, UnboundedSender<(String, Value)>>>,
@@ -674,6 +676,111 @@ struct DesktopState {
     ci_monitor_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     runner_shutdown: tokio::sync::watch::Sender<bool>,
     runner_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+}
+
+const CAPABILITY_RECHECK_INTERVAL: ChronoDuration = ChronoDuration::minutes(2);
+
+fn capability_recheck_due(observed_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    observed_at.is_none_or(|observed_at| {
+        now.signed_duration_since(observed_at) >= CAPABILITY_RECHECK_INTERVAL
+    })
+}
+
+async fn invalidate_engines_for_host(state: &DesktopState, host_id: &str) {
+    let session_ids = {
+        let mut engine_hosts = state.engine_hosts.lock().await;
+        let session_ids = engine_hosts
+            .iter()
+            .filter(|(_, bound_host)| bound_host == &host_id)
+            .map(|(session_id, _)| session_id.clone())
+            .collect::<Vec<_>>();
+        for session_id in &session_ids {
+            engine_hosts.remove(session_id);
+        }
+        session_ids
+    };
+    if session_ids.is_empty() {
+        return;
+    }
+    let mut engines = state.engines.lock().await;
+    let mut capabilities = state.engine_capabilities.lock().await;
+    for session_id in session_ids {
+        engines.remove(&session_id);
+        capabilities.remove(&session_id);
+    }
+}
+
+fn capabilities_changed(previous: &HostCapabilities, current: &HostCapabilities) -> bool {
+    if previous.items.len() != current.items.len() {
+        return true;
+    }
+    previous
+        .items
+        .iter()
+        .zip(&current.items)
+        .any(|(left, right)| {
+            left.name != right.name
+                || left.state != right.state
+                || left.source != right.source
+                || left.reason != right.reason
+        })
+}
+
+async fn probe_session_capabilities(
+    state: &DesktopState,
+    session: &SessionRecord,
+) -> Result<HostCapabilities, String> {
+    if session.host_id == "local" {
+        let workspace = if session.workspace.is_empty() {
+            default_local_workspace(state, &session.session_id)?
+        } else {
+            session.workspace.clone()
+        };
+        let host = LocalHost::with_secret_snapshot(
+            FsPath::new(&workspace),
+            Arc::clone(&state.secret_values),
+        )
+        .map_err(|error| error.to_string())?;
+        let mut capabilities = host
+            .capabilities()
+            .await
+            .map_err(|error| error.to_string())?;
+        probe_local_lsp_languages(&host, FsPath::new(&workspace), &mut capabilities).await;
+        let browser_probe = state.local_browser.probe().await;
+        let observed_at = Utc::now();
+        capabilities.items.push(Capability {
+            name: "browser".into(),
+            state: if browser_probe.is_ok() {
+                CapabilityState::Available
+            } else {
+                CapabilityState::Unavailable
+            },
+            source: "runtime-probe".into(),
+            observed_at,
+            reason: browser_probe.err().map(|error| error.to_string()),
+        });
+        capabilities.observed_at = observed_at;
+        Ok(capabilities)
+    } else {
+        let client = client_for(state, &session.host_id)?;
+        let health = client
+            .health()
+            .await
+            .map_err(|error| format!("remote host unavailable: {error}"))?;
+        let workspace = if session.workspace.is_empty() {
+            health.workspace.unwrap_or_else(|| "/workspace".into())
+        } else {
+            session.workspace.clone()
+        };
+        RvmHost::new(
+            session.host_id.clone(),
+            workspace.clone(),
+            client.with_workspace(workspace),
+        )
+        .capabilities()
+        .await
+        .map_err(|error| format!("remote capabilities unavailable: {error}"))
+    }
 }
 
 struct SessionArtifactSink {
@@ -12050,13 +12157,50 @@ async fn engine_for_with_context(
     repair_loop: Option<RepairLoopContext>,
     initial_task: Option<&str>,
 ) -> Result<Arc<GuiEngine>, String> {
+    let session = session_for(state, session_id)?;
     if origin == ToolOrigin::User {
-        let engines = state.engines.lock().await;
-        if let Some(engine) = engines.get(session_id) {
-            return Ok(Arc::clone(engine));
+        let existing = state.engines.lock().await.get(session_id).cloned();
+        let previous = state
+            .engine_capabilities
+            .lock()
+            .await
+            .get(session_id)
+            .cloned();
+        if let Some(engine) = existing {
+            if !capability_recheck_due(
+                previous
+                    .as_ref()
+                    .map(|capabilities| capabilities.observed_at),
+                Utc::now(),
+            ) {
+                return Ok(engine);
+            }
+            match probe_session_capabilities(state, &session).await {
+                Ok(current)
+                    if previous
+                        .as_ref()
+                        .is_some_and(|previous| !capabilities_changed(previous, &current)) =>
+                {
+                    state
+                        .engine_capabilities
+                        .lock()
+                        .await
+                        .insert(session_id.to_owned(), current);
+                    return Ok(engine);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    state.engines.lock().await.remove(session_id);
+                    state.engine_capabilities.lock().await.remove(session_id);
+                    state.engine_hosts.lock().await.remove(session_id);
+                    return Err(error);
+                }
+            }
+            state.engines.lock().await.remove(session_id);
+            state.engine_capabilities.lock().await.remove(session_id);
+            state.engine_hosts.lock().await.remove(session_id);
         }
     }
-    let session = session_for(state, session_id)?;
     if session.harness != "builtin" {
         return Err("this session uses an unavailable harness and cannot start a new turn".into());
     }
@@ -12216,6 +12360,16 @@ async fn engine_for_with_context(
             observed_at,
             reason: browser_probe.err().map(|error| error.to_string()),
         });
+        state
+            .engine_capabilities
+            .lock()
+            .await
+            .insert(session_id.to_owned(), capabilities.clone());
+        state
+            .engine_hosts
+            .lock()
+            .await
+            .insert(session_id.to_owned(), host_id.clone());
         let mut allowed_tools = allowed_builtin_tools(&capabilities);
         if linear_tools_enabled {
             allowed_tools.extend([
@@ -12307,6 +12461,16 @@ async fn engine_for_with_context(
             .capabilities()
             .await
             .map_err(|error| format!("remote capabilities unavailable: {error}"))?;
+        state
+            .engine_capabilities
+            .lock()
+            .await
+            .insert(session_id.to_owned(), capabilities.clone());
+        state
+            .engine_hosts
+            .lock()
+            .await
+            .insert(session_id.to_owned(), host_id.clone());
         let allowed_tools = allowed_builtin_tools(&capabilities);
         (
             workspace.clone(),
@@ -13609,6 +13773,7 @@ async fn execute_computer_use_action(
 
 #[tauri::command]
 async fn test_host(state: State<'_, DesktopState>, host_id: String) -> Result<HostView, String> {
+    invalidate_engines_for_host(&state, &host_id).await;
     if host_id == "local" {
         return Ok(HostView {
             id: host_id,
@@ -15075,6 +15240,14 @@ struct RepoIndexStatus {
     reason: Option<String>,
 }
 
+fn repo_index_should_retry(status: &repo_index::RepoIndex) -> bool {
+    status.status == "unavailable"
+        && status
+            .error
+            .as_deref()
+            .is_some_and(|reason| reason.contains("missing ripgrep (rg)"))
+}
+
 async fn repository_index_host(
     state: &DesktopState,
     session_id: &str,
@@ -15098,6 +15271,24 @@ async fn repo_index_status(
             reason: Some("Repository index has not been built.".into()),
         });
     };
+    if repo_index_should_retry(&index) {
+        index =
+            match repo_index::build(&state.index_root, &host_id, &workspace, host.as_ref()).await {
+                Ok(index) => index,
+                Err(error) => repo_index::load(&state.index_root, &host_id, &workspace)?.unwrap_or(
+                    repo_index::RepoIndex {
+                        host_id: host_id.clone(),
+                        workspace: workspace.clone(),
+                        built_at: Utc::now(),
+                        status: "unavailable".into(),
+                        files: Vec::new(),
+                        symbols: Vec::new(),
+                        truncated: false,
+                        error: Some(error),
+                    },
+                ),
+            };
+    }
     if host_id == "local"
         && let Ok(result) = host
             .exec(ExecRequest {
@@ -29436,6 +29627,8 @@ fn main() {
                 secret_values,
                 store,
                 engines: Arc::clone(&engines),
+                engine_capabilities: AsyncMutex::new(HashMap::new()),
+                engine_hosts: AsyncMutex::new(HashMap::new()),
                 acp_engines: AsyncMutex::new(HashMap::new()),
                 acp_event_sessions: AsyncMutex::new(HashSet::new()),
                 acp_streams: Mutex::new(HashMap::new()),
@@ -30278,6 +30471,82 @@ mod m7_tests {
         };
         let error = capability_preflight(&unknown, "browser_status", &json!({})).unwrap_err();
         assert_eq!(error["error_details"]["code"], json!("capability_unknown"));
+    }
+
+    #[test]
+    fn capability_recheck_is_bounded_and_retries_after_the_interval() {
+        let now = Utc::now();
+        assert!(!capability_recheck_due(
+            Some(now - ChronoDuration::minutes(1) - ChronoDuration::seconds(59)),
+            now
+        ));
+        assert!(capability_recheck_due(
+            Some(now - ChronoDuration::minutes(2)),
+            now
+        ));
+        assert!(capability_recheck_due(None, now));
+        assert!(!capability_recheck_due(
+            Some(now + ChronoDuration::seconds(1)),
+            now
+        ));
+    }
+
+    #[test]
+    fn capability_preflight_reports_current_failure_after_snapshot_replacement() {
+        let available = test_capabilities(true, true, true);
+        assert!(capability_preflight(&available, "browser_status", &json!({})).is_ok());
+
+        let unavailable = test_capabilities(true, false, true);
+        let error = capability_preflight(&unavailable, "browser_status", &json!({})).unwrap_err();
+        assert_eq!(
+            error["error_details"]["code"],
+            json!("capability_unavailable")
+        );
+        assert_eq!(error["error_details"]["operation_performed"], json!(false));
+    }
+
+    #[test]
+    fn allowed_builtin_tools_reflect_the_supplied_capability_snapshot() {
+        let before = allowed_builtin_tools(&test_capabilities(true, false, true));
+        assert!(!before.contains(&"browser_status".to_owned()));
+
+        let after = allowed_builtin_tools(&test_capabilities(true, true, true));
+        assert!(after.contains(&"browser_status".to_owned()));
+    }
+
+    #[test]
+    fn capability_snapshot_comparison_ignores_observation_time() {
+        let previous = test_capabilities(true, true, true);
+        let mut current = previous.clone();
+        current.observed_at = Utc::now() + ChronoDuration::minutes(1);
+        for item in &mut current.items {
+            item.observed_at = current.observed_at;
+        }
+        assert!(!capabilities_changed(&previous, &current));
+
+        current.items[0].state = CapabilityState::Unavailable;
+        assert!(capabilities_changed(&previous, &current));
+    }
+
+    #[test]
+    fn unavailable_ripgrep_index_is_eligible_for_automatic_retry() {
+        let retryable = repo_index::RepoIndex {
+            host_id: "linux".into(),
+            workspace: "/workspace".into(),
+            built_at: Utc::now(),
+            status: "unavailable".into(),
+            files: Vec::new(),
+            symbols: Vec::new(),
+            truncated: false,
+            error: Some("repository index is unavailable: host is missing ripgrep (rg)".into()),
+        };
+        assert!(repo_index_should_retry(&retryable));
+
+        let other_failure = repo_index::RepoIndex {
+            error: Some("repository index host check failed: disconnected".into()),
+            ..retryable
+        };
+        assert!(!repo_index_should_retry(&other_failure));
     }
 
     #[test]
