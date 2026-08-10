@@ -135,8 +135,8 @@ pub enum HostError {
     Io(#[from] std::io::Error),
     #[error("local host path rejected: {0}")]
     Path(String),
-    #[error("host operation timed out")]
-    Timeout,
+    #[error("host operation timed out after {timeout_seconds} seconds")]
+    Timeout { timeout_seconds: u64 },
     #[error("unsupported host capability: {0}")]
     Unsupported(String),
     #[error("invalid host response: {0}")]
@@ -2151,7 +2151,7 @@ pub async fn execute_lifecycle_stage(
                 -1,
                 String::new(),
                 error.to_string(),
-                matches!(error, HostError::Timeout),
+                matches!(error, HostError::Timeout { .. }),
             ),
         };
         let failed = timed_out || exit_code != 0;
@@ -2864,7 +2864,9 @@ impl Host for LocalHost {
             command.output(),
         )
         .await
-        .map_err(|_| HostError::Timeout)??;
+        .map_err(|_| HostError::Timeout {
+            timeout_seconds: request.timeout_seconds.max(1),
+        })??;
         Ok(ExecResult {
             status: "completed".into(),
             result: CommandResult {
@@ -3290,7 +3292,9 @@ impl LocalHost {
                     },
                 )
                 .await
-                .map_err(|_| HostError::Timeout)??;
+        .map_err(|_| HostError::Timeout {
+            timeout_seconds: request.timeout_seconds.max(1),
+        })??;
                 tail_output_file(
                     &output_path,
                     &mut file_offset,
@@ -3450,7 +3454,9 @@ impl LocalHost {
                 }
             })
             .await
-            .map_err(|_| HostError::Timeout)
+            .map_err(|_| HostError::Timeout {
+                timeout_seconds: timeout_seconds.max(1),
+            })
         };
         let (stdout, exit_code, actual_cwd) = match result {
             Ok(Ok(result)) => result,
@@ -5148,7 +5154,10 @@ mod tests {
                 env: None,
             })
             .await;
-        assert!(matches!(timed_out, Err(HostError::Timeout)));
+        assert!(matches!(
+            timed_out,
+            Err(HostError::Timeout { timeout_seconds: 1 })
+        ));
         let next = host
             .exec(ExecRequest {
                 command: "printf clean".into(),

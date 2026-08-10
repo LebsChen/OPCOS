@@ -132,6 +132,7 @@ pub enum ToolErrorCode {
     HostIo,
     McpTransport,
     McpAuth,
+    Timeout,
     CapabilityUnavailable,
     CapabilityUnknown,
     ToolNotDescribed,
@@ -343,6 +344,12 @@ fn mcp_transport(text: &str) -> bool {
         .any(|pattern| contains(text, pattern))
 }
 
+fn host_timeout(text: &str) -> bool {
+    contains(text, "host operation timed out")
+        || contains(text, "operation timed out")
+        || contains(text, "request timed out")
+}
+
 fn remote_unsupported(text: &str) -> bool {
     contains(text, "unsupported") || contains(text, "unavailable")
 }
@@ -463,6 +470,15 @@ const TOOL_ERROR_RULES: &[ToolErrorRule] = &[
         repair: "restore the MCP connection and retry the same call",
         retry: ToolErrorRetry::Same,
         retrieval: Some("inspect the MCP server connection status"),
+    },
+    ToolErrorRule {
+        pattern: "host or remote operation timeout",
+        matches: host_timeout,
+        code: ToolErrorCode::Timeout,
+        invariant: "the host must complete the command within the requested deadline",
+        repair: "retry with a larger timeout_seconds up to 300 seconds, or use background_job_start for genuinely long work",
+        retry: ToolErrorRetry::Adjusted,
+        retrieval: Some("background_job_start runs long-lived commands asynchronously"),
     },
     ToolErrorRule {
         pattern: "capability unknown",
@@ -6383,7 +6399,7 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"read_file","description":"Read a remote file.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}),
         json!({"type":"function","function":{"name":"write_file","description":"Write a remote file. For changes to an existing file, prefer edit_file so unrelated content is preserved.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
         json!({"type":"function","function":{"name":"edit_file","description":"Apply one or more exact replacements to a remote UTF-8 text file. The required edits argument is an array of objects, each with old_string and new_string strings. Example: {\"path\":\"src/lib.rs\",\"edits\":[{\"old_string\":\"old code\",\"new_string\":\"new code\"}]}. Every old_string must match exactly once in the original file; ambiguous or missing matches fail with diagnostics. The whole call is atomic and preserves line endings. Prefer this over rewriting an existing file.","parameters":{"type":"object","examples":[{"path":"src/lib.rs","edits":[{"old_string":"old code","new_string":"new code"}]}],"properties":{"path":{"type":"string","description":"Remote workspace-relative file path."},"edits":{"type":"array","description":"One or more exact replacements, applied atomically.","minItems":1,"items":{"type":"object","properties":{"old_string":{"type":"string","description":"Exact existing text to replace, including whitespace and line breaks."},"new_string":{"type":"string","description":"Replacement text."}},"required":["old_string","new_string"],"additionalProperties":false}}},"required":["path","edits"],"additionalProperties":false}}}),
-        json!({"type":"function","function":{"name":"run_shell","description":"Run a shell command. Use cwd to select the workspace directory. Credentials are available only by naming configured secret_names; injected values are redacted from output.","parameters":{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"},"secret_names":{"type":"array","items":{"type":"string"},"description":"Configured secret names to inject into the child environment. This is the only supported credential path; values are redacted from output."}},"required":["command"]}}}),
+        json!({"type":"function","function":{"name":"run_shell","description":"Run a shell command with a 30-second default deadline. Set timeout_seconds up to 300 seconds when a command needs more time; genuinely long-running work belongs in background_job_start. Use cwd to select the workspace directory. Credentials are available only by naming configured secret_names; injected values are redacted from output.","parameters":{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":300,"default":30,"description":"Maximum command runtime in seconds; defaults to 30 and is capped at 300."},"secret_names":{"type":"array","items":{"type":"string"},"description":"Configured secret names to inject into the child environment. This is the only supported credential path; values are redacted from output."}},"required":["command"],"additionalProperties":false}}}),
         json!({"type":"function","function":{"name":"tool_script","description":"Run a bounded Rhai script that calls allowed OPCOS tools repeatedly. Only stdout enters model context; child calls still produce normal script-scoped audit and working events. Limits are bounded by the engine.","parameters":{"type":"object","properties":{"script":{"type":"string","description":"Rhai source using tool_call(name, args) and stdout(text)."},"timeout_seconds":{"type":"integer","minimum":1,"maximum":300,"default":120},"max_calls":{"type":"integer","minimum":1,"maximum":512,"default":128},"max_stdout_bytes":{"type":"integer","minimum":1,"maximum":1048576,"default":65536}},"required":["script"],"additionalProperties":false}}}),
         json!({"type":"function","function":{"name":"browser_status","description":"Check whether an isolated local Chrome/Chromium CDP session is available. Read-only.","parameters":{"type":"object","properties":{}}}}),
         json!({"type":"function","function":{"name":"browser_navigate","description":"Navigate the isolated local browser to an HTTP(S) URL. Loopback targets do not require external approval; remote origins use a host-scoped external policy target.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}}),
@@ -9207,6 +9223,11 @@ mod tests {
             ),
             ("MCP transport unavailable", "mcp_transport", "same"),
             ("MCP transport error", "mcp_transport", "same"),
+            (
+                "host operation timed out after 30 seconds",
+                "timeout",
+                "adjusted",
+            ),
             ("MCP server authentication required", "mcp_auth", "adjusted"),
             ("tool call denied by user", "approval_denied", "no"),
             (
@@ -10166,6 +10187,17 @@ mod tests {
             let properties = &definition["function"]["parameters"]["properties"];
             assert_eq!(properties["cwd"]["type"], "string");
             assert_eq!(properties["secret_names"]["type"], "array");
+            if name == "run_shell" {
+                assert_eq!(properties["timeout_seconds"]["minimum"], 1);
+                assert_eq!(properties["timeout_seconds"]["maximum"], 300);
+                assert_eq!(properties["timeout_seconds"]["default"], 30);
+                assert!(
+                    definition["function"]["description"]
+                        .as_str()
+                        .unwrap()
+                        .contains("background_job_start")
+                );
+            }
         }
     }
 

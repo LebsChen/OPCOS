@@ -59,8 +59,8 @@ use opcos_provider::openai::OpenAiProvider;
 use opcos_provider::registry;
 use opcos_provider::{Provider, ProviderConfig};
 use opcos_rvm::{
-    ExecRequest, HttpRvmClient, IdeBootstrap, PersistentShell, RemotePathGuard, RvmClient,
-    RvmClientConfig, WsKind, WsParams, join_remote_path,
+    ExecRequest, HttpRvmClient, IdeBootstrap, MAX_EXEC_TIMEOUT_SECONDS, PersistentShell,
+    RemotePathGuard, RvmClient, RvmClientConfig, WsKind, WsParams, join_remote_path,
 };
 use opcos_store::{
     ActionBeginResult, ArtifactRecord, CiMonitor, KeyringSecretStore, LoginProfileRecord,
@@ -5338,7 +5338,15 @@ impl ToolExecutor for RemoteExecutor {
                     .shell
                     .lock()
                     .await
-                    .exec_with_env(argument("command")?, Some(Value::Object(env)))
+                    .exec_with_env_timeout(
+                        argument("command")?,
+                        Some(Value::Object(env)),
+                        arguments
+                            .get("timeout_seconds")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(DEFAULT_EXEC_TIMEOUT_SECONDS)
+                            .clamp(1, MAX_EXEC_TIMEOUT_SECONDS),
+                    )
                     .await
                     .map_err(|error| error.to_string())?;
                 let mut output = serde_json::to_value(result).unwrap_or(Value::Null);
@@ -5865,7 +5873,11 @@ impl ToolExecutor for DesktopExecutor {
                                     .get("cwd")
                                     .and_then(Value::as_str)
                                     .map(str::to_owned),
-                                timeout_seconds: DEFAULT_EXEC_TIMEOUT_SECONDS,
+                                timeout_seconds: arguments
+                                    .get("timeout_seconds")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(DEFAULT_EXEC_TIMEOUT_SECONDS)
+                                    .clamp(1, MAX_EXEC_TIMEOUT_SECONDS),
                                 session: Some(format!("opcos-local-{}", executor.session_id)),
                                 env: Some(Value::Object(env)),
                             })
@@ -6041,7 +6053,11 @@ impl ToolExecutor for DesktopExecutor {
                 .get("cwd")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            timeout_seconds: DEFAULT_EXEC_TIMEOUT_SECONDS,
+            timeout_seconds: arguments
+                .get("timeout_seconds")
+                .and_then(Value::as_u64)
+                .unwrap_or(DEFAULT_EXEC_TIMEOUT_SECONDS)
+                .clamp(1, MAX_EXEC_TIMEOUT_SECONDS),
             session: Some(format!("opcos-local-{}", executor.session_id)),
             env: Some(Value::Object(env)),
         };
