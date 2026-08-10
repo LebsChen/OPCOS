@@ -552,7 +552,7 @@ body {
   line-height: 20px;
   overflow-wrap: anywhere;
 }
-.transcript-prose .md code {
+.transcript-prose .md :not(pre) > code {
   overflow-wrap: anywhere;
 }
 .md > :first-child {
