@@ -39,8 +39,12 @@ export type TimelineNode =
   | {
       kind: "notice";
       text: string;
+      tone?: "info" | "warn";
       noticeKind?: string;
       retriable?: boolean;
+      annotationType?: string;
+      annotationResult?: string;
+      frameArtifactId?: string;
     }
   | {
       kind: "work";
@@ -403,6 +407,24 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
       }
       workStarted = 0;
       workEnded = 0;
+    } else if (type === "agent_message" || type === "operational_blocker") {
+      flush(event.created_at_ms);
+      const rawText = String(data.message ?? data.summary ?? "").trim();
+      const severity = String(data.severity ?? "").trim();
+      const text =
+        type === "operational_blocker" && severity
+          ? `${severity === "hard" ? "Hard blocker" : severity}: ${rawText}`
+          : rawText;
+      if (text) {
+        nodes.push({
+          kind: "notice",
+          text,
+          tone: type === "operational_blocker" ? "warn" : "info",
+          noticeKind: type,
+        });
+      }
+      workStarted = 0;
+      workEnded = 0;
     } else if (type === "approval_pending" || type === "ask_user_pending") {
       if (type === "ask_user_pending") {
         continue;
@@ -447,6 +469,38 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
         flush(event.created_at_ms);
         sleepPending = true;
       }
+    } else if (
+      [
+        "recording_started",
+        "recording_annotation",
+        "recording_stopped",
+      ].includes(type)
+    ) {
+      flush(event.created_at_ms);
+      const annotationType =
+        typeof data.annotation_type === "string"
+          ? data.annotation_type
+          : undefined;
+      const result = typeof data.result === "string" ? data.result : undefined;
+      const text =
+        annotationType && typeof data.text === "string"
+          ? `${annotationType}: ${data.text}`
+          : type === "recording_started"
+            ? `Recording started · ${String(data.recording_id ?? "")}`
+            : type === "recording_stopped"
+              ? `Recording stopped${data.truncated ? " · truncated" : ""}`
+              : "Recording event";
+      nodes.push({
+        kind: "notice",
+        text,
+        noticeKind: type,
+        annotationType,
+        annotationResult: result,
+        frameArtifactId:
+          typeof data.frame_artifact_id === "string"
+            ? data.frame_artifact_id
+            : undefined,
+      });
     } else if (
       [
         "error",

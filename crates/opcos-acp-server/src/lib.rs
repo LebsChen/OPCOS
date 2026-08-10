@@ -7,7 +7,7 @@ use agent_client_protocol::schema::{
     },
 };
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{
@@ -24,6 +24,8 @@ pub const PROTOCOL_VERSION: u16 = 1;
 pub enum ServerError {
     #[error("invalid ACP request: {0}")]
     InvalidRequest(String),
+    #[error("invalid ACP parameters: {0}")]
+    InvalidParams(String),
     #[error("unsupported ACP method: {0}")]
     UnsupportedMethod(String),
     #[error("{0}")]
@@ -175,12 +177,9 @@ where
         };
         let Some(id) = request.id else {
             if method == "session/cancel" {
-                let session_id = request
-                    .params
-                    .get("sessionId")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| ServerError::InvalidRequest("sessionId is required".into()))?
-                    .to_owned();
+                let Ok(session_id) = required_string(&request.params, "sessionId") else {
+                    return Ok(());
+                };
                 self.control_plane
                     .session_cancel(session_id)
                     .await
@@ -190,7 +189,13 @@ where
         };
         match method {
             "initialize" => {
-                let _: InitializeRequest = serde_json::from_value(request.params)?;
+                let _: InitializeRequest = match parse_params(&request.params, method) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        send_response(&outgoing, id, Err(error))?;
+                        return Ok(());
+                    }
+                };
                 let version = ProtocolVersion::V1;
                 let capabilities =
                     AgentCapabilities::default().prompt_capabilities(PromptCapabilities::new());
@@ -204,7 +209,13 @@ where
                 )?;
             }
             "session/new" => {
-                let new_session: NewSessionRequest = serde_json::from_value(request.params)?;
+                let new_session: NewSessionRequest = match parse_params(&request.params, method) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        send_response(&outgoing, id, Err(error))?;
+                        return Ok(());
+                    }
+                };
                 let result = self
                     .control_plane
                     .session_new(new_session)
@@ -214,7 +225,13 @@ where
                 send_response(&outgoing, id, result)?;
             }
             "session/prompt" => {
-                let prompt: PromptRequest = serde_json::from_value(request.params)?;
+                let prompt: PromptRequest = match parse_params(&request.params, method) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        send_response(&outgoing, id, Err(error))?;
+                        return Ok(());
+                    }
+                };
                 let control_plane = Arc::clone(&self.control_plane);
                 let sink = Arc::clone(&sink);
                 prompts.spawn(async move {
@@ -231,7 +248,13 @@ where
                 });
             }
             "session/cancel" => {
-                let session_id = required_string(&request.params, "sessionId")?;
+                let session_id = match required_string(&request.params, "sessionId") {
+                    Ok(session_id) => session_id,
+                    Err(error) => {
+                        send_response(&outgoing, id, Err(error))?;
+                        return Ok(());
+                    }
+                };
                 let result = self
                     .control_plane
                     .session_cancel(session_id)
@@ -348,9 +371,21 @@ fn response_value(id: Value, result: Result<Value, ServerError>) -> Value {
         Err(error) => json!({
             "jsonrpc":"2.0",
             "id":id,
-            "error":{"code": -32000, "message": error.to_string()}
+            "error":{
+                "code": match &error {
+                    ServerError::InvalidParams(_) => -32602,
+                    _ => -32000,
+                },
+                "message": error.to_string()
+            }
         }),
     }
+}
+
+fn parse_params<T: DeserializeOwned>(params: &Value, method: &str) -> Result<T, ServerError> {
+    serde_json::from_value(params.clone()).map_err(|error| {
+        ServerError::InvalidParams(format!("{method} params could not be decoded: {error}"))
+    })
 }
 
 fn required_string(params: &Value, key: &str) -> Result<String, ServerError> {
@@ -359,7 +394,7 @@ fn required_string(params: &Value, key: &str) -> Result<String, ServerError> {
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned)
-        .ok_or_else(|| ServerError::InvalidRequest(format!("{key} is required")))
+        .ok_or_else(|| ServerError::InvalidParams(format!("{key} is required")))
 }
 
 fn id_key(id: &Value) -> String {
@@ -509,6 +544,37 @@ mod tests {
         assert_eq!(response["id"], 7);
         assert_eq!(response["result"], json!({}));
         assert!(fake.cancelled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn malformed_params_return_invalid_params_and_connection_survives() {
+        let server = OpcosAcpServer::new(Arc::new(FakeControlPlane {
+            cancelled: AtomicBool::new(false),
+        }));
+        let input = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"session/prompt\",\"params\":{\"sessionId\":\"session-fake\",\"prompt\":\"not-an-array\"}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"session/new\",\"params\":{\"cwd\":\"/tmp\",\"mcpServers\":[]}}\n"
+        );
+        let mut output = Vec::new();
+        server
+            .serve_stdio(BufReader::new(input.as_bytes()), &mut output)
+            .await
+            .unwrap();
+        let values = output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let error = values.iter().find(|value| value["id"] == 7).unwrap();
+        assert_eq!(error["error"]["code"], -32602);
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("session/prompt params could not be decoded")
+        );
+        let response = values.iter().find(|value| value["id"] == 8).unwrap();
+        assert_eq!(response["result"]["sessionId"], "session-fake");
     }
 
     struct PermissionControlPlane {

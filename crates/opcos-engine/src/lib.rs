@@ -14,9 +14,17 @@ use opcos_store::{
     TRANSIENT_SESSION_EVENT_TYPES, ToolCallRecord, UsageRecord,
 };
 use regex::Regex;
+use rhai::{
+    Dynamic, Engine as RhaiEngine, EvalAltResult, Position,
+    serde::{from_dynamic, to_dynamic},
+};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::mpsc as std_mpsc;
 use std::sync::{
     Arc, Mutex as StdMutex,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -39,6 +47,49 @@ pub use acp::{AcpHarness, AcpHarnessConfig};
 
 const ASSUMED_CONTEXT_WINDOW: u64 = 128_000;
 const ASSUMED_OUTPUT_TOKENS: u64 = 4096;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentAutomationAction {
+    EnqueueBoundedWork,
+    RequestPlanGoal,
+}
+
+impl AgentAutomationAction {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "enqueue_bounded_work" => Some(Self::EnqueueBoundedWork),
+            "request_plan_goal" => Some(Self::RequestPlanGoal),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EnqueueBoundedWork => "enqueue_bounded_work",
+            Self::RequestPlanGoal => "request_plan_goal",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundedWorkType {
+    RepositoryIndexRefresh,
+}
+
+impl BoundedWorkType {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "repository_index_refresh" => Some(Self::RepositoryIndexRefresh),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RepositoryIndexRefresh => "repository_index_refresh",
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -79,8 +130,14 @@ pub enum ToolErrorCode {
     InvalidArguments,
     RemoteUnsupported,
     HostIo,
+    RemoteTransport,
     McpTransport,
     McpAuth,
+    Timeout,
+    CapabilityUnavailable,
+    CapabilityUnknown,
+    ToolNotDescribed,
+    RepeatedFailedCall,
     Unclassified,
 }
 
@@ -101,6 +158,16 @@ pub struct ToolErrorEnvelope {
     pub retry: ToolErrorRetry,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retrieval: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability_observed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_performed: Option<bool>,
 }
 
 impl ToolErrorEnvelope {
@@ -119,8 +186,47 @@ impl ToolErrorEnvelope {
             repair: repair.into(),
             retry,
             retrieval,
+            capability: None,
+            capability_state: None,
+            capability_source: None,
+            capability_observed_at: None,
+            operation_performed: None,
         }
     }
+}
+
+pub fn capability_tool_error(
+    summary: impl Into<String>,
+    tool: impl Into<String>,
+    capability: impl Into<String>,
+    state: impl Into<String>,
+    source: impl Into<String>,
+    observed_at: impl Into<String>,
+    retryable: bool,
+) -> Value {
+    let state = state.into();
+    let mut envelope = ToolErrorEnvelope::new(
+        if state == "unknown" {
+            ToolErrorCode::CapabilityUnknown
+        } else {
+            ToolErrorCode::CapabilityUnavailable
+        },
+        "the selected host capability must be available before execution",
+        tool,
+        "refresh capabilities or use a supported tool",
+        if retryable {
+            ToolErrorRetry::Same
+        } else {
+            ToolErrorRetry::No
+        },
+        Some("inspect the session capability evidence".into()),
+    );
+    envelope.capability = Some(capability.into());
+    envelope.capability_state = Some(state);
+    envelope.capability_source = Some(source.into());
+    envelope.capability_observed_at = Some(observed_at.into());
+    envelope.operation_performed = Some(false);
+    structured_tool_error(summary, envelope)
 }
 
 pub fn structured_tool_error(summary: impl Into<String>, envelope: ToolErrorEnvelope) -> Value {
@@ -161,6 +267,20 @@ fn policy_tool_error(call: &ToolCall, summary: impl Into<String>) -> Value {
             "the active permission policy must allow this tool target",
             tool_error_target(call),
             "request approval or adjust the permission policy before retrying",
+            ToolErrorRetry::Adjusted,
+            None,
+        ),
+    )
+}
+
+fn approval_tool_error(call: &ToolCall, reason: &str) -> Value {
+    structured_tool_error(
+        format!("tool {} requires approval: {reason}", call.name),
+        ToolErrorEnvelope::new(
+            ToolErrorCode::ApprovalDenied,
+            "the tool requires user approval that cannot be persisted by a script",
+            call.name.clone(),
+            "invoke the tool directly in an interactive turn",
             ToolErrorRetry::Adjusted,
             None,
         ),
@@ -225,6 +345,15 @@ fn mcp_transport(text: &str) -> bool {
         .any(|pattern| contains(text, pattern))
 }
 
+fn host_timeout(text: &str) -> bool {
+    (contains(text, "host operation timed out")
+        || contains(text, "operation timed out")
+        || contains(text, "request timed out"))
+        && !contains(text, "unsupported")
+        && !contains(text, "unavailable")
+        && !contains(text, "host i/o failed")
+}
+
 fn remote_unsupported(text: &str) -> bool {
     contains(text, "unsupported") || contains(text, "unavailable")
 }
@@ -233,6 +362,10 @@ fn host_io(text: &str) -> bool {
     contains(text, "host i/o failed")
         || contains(text, "could not verify edit version")
         || contains(text, "failed to apply atomic edit")
+}
+
+fn remote_transport(text: &str) -> bool {
+    contains(text, "rvm request failed: error sending request for url")
 }
 
 // These rules classify summaries across ToolExecutor's String boundary.
@@ -329,6 +462,15 @@ const TOOL_ERROR_RULES: &[ToolErrorRule] = &[
         retrieval: None,
     },
     ToolErrorRule {
+        pattern: "remote RVM request transport failure",
+        matches: remote_transport,
+        code: ToolErrorCode::RemoteTransport,
+        invariant: "the remote host transport must be reachable and accept requests",
+        repair: "retry the remote operation and verify that the host is online before retrying again",
+        retry: ToolErrorRetry::Same,
+        retrieval: Some("check the remote host health and capability status"),
+    },
+    ToolErrorRule {
         pattern: "mcp authentication",
         matches: mcp_auth,
         code: ToolErrorCode::McpAuth,
@@ -345,6 +487,33 @@ const TOOL_ERROR_RULES: &[ToolErrorRule] = &[
         repair: "restore the MCP connection and retry the same call",
         retry: ToolErrorRetry::Same,
         retrieval: Some("inspect the MCP server connection status"),
+    },
+    ToolErrorRule {
+        pattern: "host or remote operation timeout",
+        matches: host_timeout,
+        code: ToolErrorCode::Timeout,
+        invariant: "the host must complete the command within the requested deadline",
+        repair: "retry with a larger timeout_seconds up to 300 seconds, or use background_job_start for genuinely long work",
+        retry: ToolErrorRetry::Adjusted,
+        retrieval: Some("background_job_start runs long-lived commands asynchronously"),
+    },
+    ToolErrorRule {
+        pattern: "capability unknown",
+        matches: |text| contains(text, "capability_unknown"),
+        code: ToolErrorCode::CapabilityUnknown,
+        invariant: "the required host capability must be probed before execution",
+        repair: "refresh host capabilities and retry when the capability is available",
+        retry: ToolErrorRetry::Same,
+        retrieval: Some("inspect the session capability evidence"),
+    },
+    ToolErrorRule {
+        pattern: "capability unavailable",
+        matches: |text| contains(text, "capability_unavailable"),
+        code: ToolErrorCode::CapabilityUnavailable,
+        invariant: "the selected host must support the requested capability",
+        repair: "use a supported tool or switch to a host that exposes this capability",
+        retry: ToolErrorRetry::No,
+        retrieval: Some("inspect the session capability evidence"),
     },
     ToolErrorRule {
         pattern: "unsupported or unavailable non-MCP capability",
@@ -394,6 +563,27 @@ fn classify_tool_error(call: &ToolCall, summary: impl Into<String>) -> Value {
     )
 }
 
+fn tool_result_failed(result: &Value) -> bool {
+    result.get("error_details").is_some()
+        || result.get("error").is_some_and(|error| error.is_string())
+}
+
+fn canonical_json(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            Value::Object(
+                keys.into_iter()
+                    .map(|key| (key.clone(), canonical_json(&object[key])))
+                    .collect(),
+            )
+        }
+        Value::Array(array) => Value::Array(array.iter().map(canonical_json).collect()),
+        value => value.clone(),
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ExternalContextAttachment {
     pub source: String,
@@ -408,6 +598,14 @@ const DEFAULT_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
     async fn execute(&self, name: &str, arguments: Value) -> Result<Value, String>;
+
+    async fn request_desktop_view(&self, _reason: Option<&str>) -> Result<Value, String> {
+        Err("desktop view requests are unavailable".into())
+    }
+
+    async fn rename_session(&self, _title: &str) -> Result<Value, String> {
+        Err("session rename is unavailable".into())
+    }
 
     async fn browser_origin(&self) -> Option<String> {
         None
@@ -475,10 +673,69 @@ pub trait ArtifactSink: Send + Sync {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedFrame {
+    pub content: Vec<u8>,
+    pub mime: String,
+    pub source: String,
+}
+
+#[async_trait]
+pub trait RecordingSource: Send + Sync {
+    async fn capture_frame(&self, source: &str) -> Result<CapturedFrame, String>;
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct RecordingFrame {
+    timestamp_ms: i64,
+    artifact_id: String,
+    reused: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct RecordingAnnotation {
+    annotation_id: String,
+    annotation_type: String,
+    text: String,
+    test_start_id: Option<String>,
+    result: Option<String>,
+    timestamp_ms: i64,
+    frame_artifact_id: Option<String>,
+}
+
+struct RecordingData {
+    recording_id: String,
+    source: String,
+    started_at_ms: i64,
+    interval_ms: u64,
+    max_frames: usize,
+    max_duration_ms: u64,
+    frames: Vec<RecordingFrame>,
+    hashes: HashMap<String, String>,
+    annotations: Vec<RecordingAnnotation>,
+    test_starts: HashSet<String>,
+    truncated: bool,
+    truncation_reason: Option<String>,
+}
+
+struct RecordingRuntime {
+    data: Arc<StdMutex<RecordingData>>,
+    stop: Arc<AtomicBool>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolOrigin {
     User,
     System,
     RepairLoop,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AgentRole {
+    #[default]
+    Lead,
+    Worker,
+    TestingWorker,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -506,6 +763,12 @@ pub struct LifecycleHookConfig {
 struct HookEffects {
     blocked: Option<String>,
     additional_context: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct FailedToolCall {
+    count: u32,
+    last_error_code: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -899,7 +1162,10 @@ pub struct TurnEngine<P, S, E> {
     hook_permission_rules: Mutex<Option<PermissionRules>>,
     lifecycle_hooks: Mutex<Option<LifecycleHookConfig>>,
     hook_context: Mutex<Vec<String>>,
+    failed_tool_calls: Mutex<HashMap<String, FailedToolCall>>,
     external_tools: Mutex<Vec<Value>>,
+    progressive_tool_disclosure: AtomicBool,
+    described_tools: Mutex<HashSet<String>>,
     allowed_tools: Mutex<Option<HashSet<String>>>,
     linear_tools_enabled: AtomicBool,
     github_tools_enabled: AtomicBool,
@@ -919,6 +1185,9 @@ pub struct TurnEngine<P, S, E> {
     mutating_api_gate_enabled: AtomicBool,
     secret_scrubber: Arc<dyn SecretScrubber>,
     artifact_sink: Option<Arc<dyn ArtifactSink>>,
+    recording_source: Option<Arc<dyn RecordingSource>>,
+    recording: Arc<StdMutex<Option<RecordingRuntime>>>,
+    agent_role: AgentRole,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1000,6 +1269,111 @@ struct ActiveToolCallGuard<'a> {
     ids: Vec<String>,
 }
 
+#[derive(Clone, Copy)]
+enum ToolApprovalBehavior {
+    PersistPending,
+    RejectWithoutPending,
+}
+
+#[derive(Clone, Copy)]
+enum ToolExecutionSource {
+    Model,
+    Script,
+}
+
+#[derive(Clone)]
+struct ToolDispatchContext {
+    grants: Vec<DurableGrant>,
+    unattended: bool,
+    permission_rules: Option<PermissionRules>,
+    execute_readonly: bool,
+    approval_behavior: ToolApprovalBehavior,
+    source: ToolExecutionSource,
+}
+
+enum ToolDispatchResult {
+    Completed(Value),
+    DeferredReadonly,
+    PreflightError(Value),
+    ScriptAbort(Value),
+    ApprovalPending {
+        preflight_reason: Option<String>,
+        current_pending_saved: bool,
+    },
+}
+
+struct ScriptOutput {
+    text: StdMutex<String>,
+    total_bytes: AtomicU64,
+    omitted_bytes: AtomicU64,
+    max_bytes: usize,
+}
+
+impl ScriptOutput {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            text: StdMutex::new(String::new()),
+            total_bytes: AtomicU64::new(0),
+            omitted_bytes: AtomicU64::new(0),
+            max_bytes,
+        }
+    }
+
+    fn append(&self, text: &str) -> bool {
+        let bytes = text.len();
+        self.total_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        let mut output = self.text.lock().expect("script output mutex poisoned");
+        let remaining = self.max_bytes.saturating_sub(output.len());
+        let mut kept = 0;
+        for character in text.chars() {
+            let width = character.len_utf8();
+            if kept + width > remaining {
+                break;
+            }
+            kept += width;
+        }
+        if kept < text.len() {
+            self.omitted_bytes
+                .fetch_add((text.len() - kept) as u64, Ordering::Relaxed);
+        }
+        output.push_str(&text[..kept]);
+        kept == text.len()
+    }
+
+    fn truncated(&self) -> bool {
+        self.omitted_bytes.load(Ordering::Relaxed) > 0
+    }
+
+    fn value(&self) -> String {
+        self.text
+            .lock()
+            .expect("script output mutex poisoned")
+            .clone()
+    }
+}
+
+struct ScriptRequest {
+    name: String,
+    arguments: Value,
+    response: std_mpsc::SyncSender<ScriptResponse>,
+}
+
+enum ScriptResponse {
+    Result(Value),
+    Abort(Value),
+}
+
+const TOOL_SCRIPT_MAX_OPERATIONS: u64 = 100_000;
+const TOOL_SCRIPT_MAX_CALL_LEVELS: usize = 32;
+const TOOL_SCRIPT_MAX_STRING_SIZE: usize = 64 * 1024;
+const TOOL_SCRIPT_MAX_ARRAY_SIZE: usize = 4096;
+const TOOL_SCRIPT_DEFAULT_TIMEOUT_SECONDS: u64 = 120;
+const TOOL_SCRIPT_MAX_TIMEOUT_SECONDS: u64 = 300;
+const TOOL_SCRIPT_DEFAULT_MAX_CALLS: usize = 128;
+const TOOL_SCRIPT_MAX_CALLS_LIMIT: usize = 512;
+const TOOL_SCRIPT_DEFAULT_MAX_STDOUT_BYTES: usize = 64 * 1024;
+const TOOL_SCRIPT_MAX_STDOUT_BYTES_LIMIT: usize = 1024 * 1024;
+
 impl Drop for ActiveToolCallGuard<'_> {
     fn drop(&mut self) {
         if let Ok(mut calls) = self.calls.lock() {
@@ -1068,7 +1442,10 @@ where
             hook_permission_rules: Mutex::new(None),
             lifecycle_hooks: Mutex::new(None),
             hook_context: Mutex::new(Vec::new()),
+            failed_tool_calls: Mutex::new(HashMap::new()),
             external_tools: Mutex::new(Vec::new()),
+            progressive_tool_disclosure: AtomicBool::new(false),
+            described_tools: Mutex::new(HashSet::new()),
             allowed_tools: Mutex::new(None),
             linear_tools_enabled: AtomicBool::new(false),
             github_tools_enabled: AtomicBool::new(false),
@@ -1088,6 +1465,9 @@ where
             mutating_api_gate_enabled: AtomicBool::new(true),
             secret_scrubber: Arc::new(NoopSecretScrubber),
             artifact_sink: None,
+            recording_source: None,
+            recording: Arc::new(StdMutex::new(None)),
+            agent_role: AgentRole::Lead,
         }
     }
 
@@ -1097,6 +1477,14 @@ where
 
     pub fn set_artifact_sink(&mut self, sink: Arc<dyn ArtifactSink>) {
         self.artifact_sink = Some(sink);
+    }
+
+    pub fn set_recording_source(&mut self, source: Arc<dyn RecordingSource>) {
+        self.recording_source = Some(source);
+    }
+
+    pub fn set_agent_role(&mut self, role: AgentRole) {
+        self.agent_role = role;
     }
 
     pub async fn set_system_instructions(&self, instructions: Option<String>) {
@@ -1138,16 +1526,32 @@ where
         self.external_tools.lock().await.extend(tools);
     }
 
+    pub fn set_progressive_tool_disclosure(&self, enabled: bool) {
+        self.progressive_tool_disclosure
+            .store(enabled, Ordering::SeqCst);
+    }
+
+    pub fn progressive_tool_disclosure(&self) -> bool {
+        self.progressive_tool_disclosure.load(Ordering::SeqCst)
+    }
+
     pub async fn set_allowed_tools(&self, tools: impl IntoIterator<Item = String>) {
         *self.allowed_tools.lock().await = Some(tools.into_iter().collect());
     }
 
     pub fn set_linear_tools_enabled(&self, enabled: bool) {
-        self.linear_tools_enabled.store(enabled, Ordering::SeqCst);
+        self.set_connector_tools_enabled("linear", enabled);
     }
 
     pub fn set_connector_tools_enabled(&self, kind: &str, enabled: bool) {
+        if !CONNECTOR_TOOL_PREFIXES
+            .iter()
+            .any(|(connector, _)| *connector == kind)
+        {
+            return;
+        }
         let target = match kind {
+            "linear" => &self.linear_tools_enabled,
             "github" => &self.github_tools_enabled,
             "telegram" => &self.telegram_tools_enabled,
             "discord" => &self.discord_tools_enabled,
@@ -1159,6 +1563,21 @@ where
             _ => return,
         };
         target.store(enabled, Ordering::SeqCst);
+    }
+
+    fn connector_tools_enabled(&self, kind: &str) -> bool {
+        match kind {
+            "linear" => self.linear_tools_enabled.load(Ordering::SeqCst),
+            "github" => self.github_tools_enabled.load(Ordering::SeqCst),
+            "telegram" => self.telegram_tools_enabled.load(Ordering::SeqCst),
+            "discord" => self.discord_tools_enabled.load(Ordering::SeqCst),
+            "slack" => self.slack_tools_enabled.load(Ordering::SeqCst),
+            "notion" => self.notion_tools_enabled.load(Ordering::SeqCst),
+            "gitlab" => self.gitlab_tools_enabled.load(Ordering::SeqCst),
+            "jira" => self.jira_tools_enabled.load(Ordering::SeqCst),
+            "stripe" => self.stripe_tools_enabled.load(Ordering::SeqCst),
+            _ => false,
+        }
     }
 
     pub fn set_message_usage_limit(&self, limit: u64) {
@@ -1250,6 +1669,150 @@ where
         std::mem::take(&mut *self.hook_context.lock().await)
     }
 
+    async fn disclosure_definitions(&self) -> Vec<Value> {
+        let mut definitions = tool_definitions();
+        definitions.extend(
+            self.external_tools
+                .lock()
+                .await
+                .iter()
+                .cloned()
+                .map(mcp_tool_definition),
+        );
+        if let Some(allowed) = self.allowed_tools.lock().await.clone() {
+            definitions.retain(|definition| {
+                tool_name(definition).is_some_and(|name| allowed.contains(name))
+            });
+        }
+        for (kind, prefix) in CONNECTOR_TOOL_PREFIXES {
+            if !self.connector_tools_enabled(kind) {
+                definitions.retain(|definition| {
+                    !tool_name(definition).is_some_and(|name| name.starts_with(prefix))
+                });
+            }
+        }
+        definitions
+    }
+
+    async fn execute_disclosure_tool(&self, call: &ToolCall) -> Option<Value> {
+        if !self.progressive_tool_disclosure() {
+            return None;
+        }
+        if call.name == "tool_search" {
+            let query = call
+                .arguments
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let terms = query.split_whitespace().collect::<Vec<_>>();
+            let entries = self
+                .disclosure_definitions()
+                .await
+                .into_iter()
+                .filter(|definition| {
+                    tool_name(definition).is_some_and(|name| {
+                        is_progressive_catalog_tool(name)
+                            && (terms.is_empty()
+                                || terms.iter().all(|term| {
+                                    name.to_ascii_lowercase().contains(term)
+                                        || definition
+                                            .pointer("/function/description")
+                                            .and_then(Value::as_str)
+                                            .is_some_and(|purpose| {
+                                                purpose.to_ascii_lowercase().contains(term)
+                                            })
+                                }))
+                    })
+                })
+                .filter_map(|definition| catalog_entry(&definition))
+                .collect::<Vec<_>>();
+            return Some(json!({"tools": entries}));
+        }
+        if call.name == "tool_describe" {
+            let name = call.arguments.get("name").and_then(Value::as_str);
+            let Some(name) = name else {
+                return Some(classify_tool_error(call, "missing string argument: name"));
+            };
+            let definition = self
+                .disclosure_definitions()
+                .await
+                .into_iter()
+                .find(|definition| tool_name(definition) == Some(name));
+            let Some(definition) = definition else {
+                return Some(classify_tool_error(call, format!("unknown tool: {name}")));
+            };
+            self.described_tools.lock().await.insert(name.to_owned());
+            return Some(json!({"tool": definition}));
+        }
+        if self
+            .disclosure_definitions()
+            .await
+            .iter()
+            .any(|definition| tool_name(definition) == Some(call.name.as_str()))
+            && is_progressive_catalog_tool(&call.name)
+            && !self.described_tools.lock().await.contains(&call.name)
+        {
+            return Some(tool_not_described_error(call));
+        }
+        None
+    }
+
+    fn failed_tool_call_key(call: &ToolCall) -> String {
+        format!(
+            "{}\u{0}{}",
+            call.name,
+            serde_json::to_string(&canonical_json(&call.arguments)).unwrap_or_default()
+        )
+    }
+
+    async fn repeated_failed_call_error(&self, call: &ToolCall) -> Option<Value> {
+        let key = Self::failed_tool_call_key(call);
+        let failed = self.failed_tool_calls.lock().await;
+        let record = failed.get(&key)?;
+        // This intentionally covers every classified failure: retrying a transient
+        // error remains possible only by changing the call or choosing another path.
+        (record.count >= 2).then(|| {
+            structured_tool_error(
+                format!(
+                    "{} has already failed {} times with the same arguments",
+                    call.name, record.count
+                ),
+                ToolErrorEnvelope::new(
+                    ToolErrorCode::RepeatedFailedCall,
+                    "the same tool call and arguments have failed repeatedly",
+                    tool_error_target(call),
+                    format!(
+                        "change the arguments or use a different path/tool; this exact call \
+has failed {} times and the last error code was {}",
+                        record.count, record.last_error_code
+                    ),
+                    ToolErrorRetry::Adjusted,
+                    None,
+                ),
+            )
+        })
+    }
+
+    async fn remember_tool_result(&self, call: &ToolCall, result: &Value) {
+        let key = Self::failed_tool_call_key(call);
+        let mut failed = self.failed_tool_calls.lock().await;
+        if !tool_result_failed(result) {
+            failed.remove(&key);
+            return;
+        }
+        let error_code = result
+            .pointer("/error_details/code")
+            .and_then(Value::as_str)
+            .unwrap_or("unclassified")
+            .to_owned();
+        let record = failed.entry(key).or_insert(FailedToolCall {
+            count: 0,
+            last_error_code: error_code.clone(),
+        });
+        record.count += 1;
+        record.last_error_code = error_code;
+    }
     async fn execute_tool_with_hooks(&self, call: &ToolCall) -> Value {
         let pre = self
             .lifecycle_hooks(
@@ -1259,9 +1822,19 @@ where
             )
             .await;
         if let Some(reason) = pre.blocked {
-            return classify_tool_error(call, reason);
+            let result = classify_tool_error(call, reason);
+            self.remember_tool_result(call, &result).await;
+            return result;
         }
-        let result = self.execute_tool_streaming(call).await;
+        let result = if let Some(repeated) = self.repeated_failed_call_error(call).await {
+            repeated
+        } else if matches!(call.name.as_str(), "send_user_message" | "report_blocker") {
+            self.execute_user_communication(call).await
+        } else {
+            let result = self.execute_tool_streaming(call).await;
+            self.remember_tool_result(call, &result).await;
+            result
+        };
         let post = self
             .lifecycle_hooks(
                 "PostToolUse",
@@ -1273,6 +1846,24 @@ where
             .lock()
             .await
             .extend(post.additional_context);
+        if tool_result_failed(&result) {
+            let failure = self
+                .lifecycle_hooks(
+                    "PostToolUseFailure",
+                    Some(&call.name),
+                    json!({
+                        "event":"PostToolUseFailure",
+                        "tool":call.name,
+                        "arguments":call.arguments,
+                        "result":result
+                    }),
+                )
+                .await;
+            self.hook_context
+                .lock()
+                .await
+                .extend(failure.additional_context);
+        }
         result
     }
 
@@ -1284,6 +1875,358 @@ where
             result = self.execute_tool_with_hooks(call) => result,
             _ = self.interrupt_notify.notified() => classify_tool_error(call, "tool call interrupted"),
         }
+    }
+
+    async fn execute_recording_tool(&self, call: &ToolCall) -> Option<Value> {
+        match call.name.as_str() {
+            "recording_start" => Some(self.start_recording(call).await),
+            "recording_annotate" => Some(self.annotate_recording(call).await),
+            "recording_stop" => Some(self.stop_recording(call).await),
+            _ => None,
+        }
+    }
+
+    async fn start_recording(&self, call: &ToolCall) -> Value {
+        let Some(source) = self.recording_source.clone() else {
+            return classify_tool_error(call, "recording source is unavailable");
+        };
+        let Some(sink) = self.artifact_sink.clone() else {
+            return classify_tool_error(call, "artifact sink is unavailable");
+        };
+        let object = call.arguments.as_object();
+        let interval_ms = object
+            .and_then(|value| value.get("interval_ms"))
+            .and_then(Value::as_u64)
+            .unwrap_or(1000)
+            .max(100);
+        let max_frames = object
+            .and_then(|value| value.get("max_frames"))
+            .and_then(Value::as_u64)
+            .unwrap_or(600)
+            .clamp(1, 10_000) as usize;
+        let max_duration_ms = object
+            .and_then(|value| value.get("max_duration_seconds"))
+            .and_then(Value::as_u64)
+            .unwrap_or(600)
+            .clamp(1, 86_400)
+            .saturating_mul(1000);
+        let source_name = object
+            .and_then(|value| value.get("source"))
+            .and_then(Value::as_str)
+            .unwrap_or("desktop")
+            .to_owned();
+        if !matches!(source_name.as_str(), "desktop" | "browser") {
+            return classify_tool_error(call, "recording source must be desktop or browser");
+        }
+        let mut guard = self.recording.lock().expect("recording mutex poisoned");
+        if guard.is_some() {
+            return classify_tool_error(call, "a recording is already active");
+        }
+        let recording_id = format!("recording-{}", Uuid::new_v4());
+        let started_at_ms = now_millis();
+        let data = Arc::new(StdMutex::new(RecordingData {
+            recording_id: recording_id.clone(),
+            source: source_name.clone(),
+            started_at_ms,
+            interval_ms,
+            max_frames,
+            max_duration_ms,
+            frames: Vec::new(),
+            hashes: HashMap::new(),
+            annotations: Vec::new(),
+            test_starts: HashSet::new(),
+            truncated: false,
+            truncation_reason: None,
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let task_data = data.clone();
+        let task_stop = stop.clone();
+        let session_id = self.session_id.clone();
+        let task_source_name = source_name.clone();
+        let task_recording_id = recording_id.clone();
+        let join = tokio::spawn(async move {
+            loop {
+                if task_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let now = now_millis();
+                let (at_limit, frame_count) = {
+                    let state = task_data.lock().expect("recording data mutex poisoned");
+                    (
+                        now.saturating_sub(state.started_at_ms) as u64 >= state.max_duration_ms,
+                        state.frames.len(),
+                    )
+                };
+                if at_limit || frame_count >= max_frames {
+                    let mut state = task_data.lock().expect("recording data mutex poisoned");
+                    state.truncated = true;
+                    state.truncation_reason = Some(if at_limit {
+                        "maximum duration reached; recording truncated".into()
+                    } else {
+                        "maximum frame count reached; recording truncated".into()
+                    });
+                    break;
+                }
+                if let Ok(frame) = source.capture_frame(&task_source_name).await {
+                    let mut digest = Sha256::new();
+                    digest.update(&frame.content);
+                    let hash = format!("{:x}", digest.finalize());
+                    let previous = task_data
+                        .lock()
+                        .expect("recording data mutex poisoned")
+                        .hashes
+                        .get(&hash)
+                        .cloned();
+                    let (artifact_id, reused) = if let Some(id) = previous {
+                        (id, true)
+                    } else {
+                        let result = sink
+                            .persist(ArtifactRequest {
+                                session_id: session_id.clone(),
+                                call_id: format!("recording-frame-{task_recording_id}"),
+                                name: format!("{task_recording_id}-{hash}.png"),
+                                kind: "recording_frame".into(),
+                                mime: frame.mime,
+                                content: frame.content,
+                            })
+                            .await;
+                        let Ok(reference) = result else {
+                            continue;
+                        };
+                        let mut state = task_data.lock().expect("recording data mutex poisoned");
+                        state.hashes.insert(hash, reference.id.clone());
+                        (reference.id, false)
+                    };
+                    let limit_reached = {
+                        let mut state = task_data.lock().expect("recording data mutex poisoned");
+                        state.frames.push(RecordingFrame {
+                            timestamp_ms: now,
+                            artifact_id,
+                            reused,
+                        });
+                        if state.frames.len() >= state.max_frames {
+                            state.truncated = true;
+                            state.truncation_reason =
+                                Some("maximum frame count reached; recording truncated".into());
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if limit_reached {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+            }
+        });
+        *guard = Some(RecordingRuntime { data, stop, join });
+        drop(guard);
+        let _ = self.record_working_event(
+            "recording_started",
+            "recording",
+            json!({
+                "recording_id": recording_id,
+                "source": source_name,
+                "interval_ms": interval_ms,
+                "max_frames": max_frames,
+                "max_duration_seconds": max_duration_ms / 1000,
+            }),
+        );
+        json!({
+            "status": "started",
+            "recording_id": recording_id,
+            "interval_ms": interval_ms,
+            "max_frames": max_frames,
+            "max_duration_seconds": max_duration_ms / 1000,
+        })
+    }
+
+    async fn annotate_recording(&self, call: &ToolCall) -> Value {
+        let Some(object) = call.arguments.as_object() else {
+            return classify_tool_error(call, "recording annotation arguments must be an object");
+        };
+        let Some(recording_id) = object.get("recording_id").and_then(Value::as_str) else {
+            return classify_tool_error(call, "recording_id is required");
+        };
+        let annotation_type = object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !matches!(annotation_type, "setup" | "test_start" | "assertion") {
+            return classify_tool_error(
+                call,
+                "annotation type must be setup, test_start, or assertion",
+            );
+        }
+        let text = object
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if text.trim().is_empty() || text.chars().count() > 80 {
+            return classify_tool_error(
+                call,
+                "annotation text must be non-empty and at most 80 characters",
+            );
+        }
+        let test_start_id = object.get("test_start_id").and_then(Value::as_str);
+        let result = object.get("result").and_then(Value::as_str);
+        if annotation_type == "assertion" {
+            if !matches!(result, Some("passed" | "failed" | "untested")) {
+                return classify_tool_error(
+                    call,
+                    "assertion result must be passed, failed, or untested",
+                );
+            }
+            if test_start_id.is_none() {
+                return classify_tool_error(call, "assertion must reference a test_start");
+            }
+        }
+        let (annotation_id, frame_artifact_id) = {
+            let guard = self.recording.lock().expect("recording mutex poisoned");
+            let Some(runtime) = guard.as_ref() else {
+                return classify_tool_error(call, "no recording is active");
+            };
+            let mut state = runtime.data.lock().expect("recording data mutex poisoned");
+            if state.recording_id != recording_id {
+                return classify_tool_error(
+                    call,
+                    "recording_id does not identify the active recording",
+                );
+            }
+            if annotation_type == "assertion"
+                && !state
+                    .test_starts
+                    .contains(test_start_id.expect("checked above"))
+            {
+                return classify_tool_error(
+                    call,
+                    "assertion test_start_id was not previously recorded",
+                );
+            }
+            let annotation_id = format!("annotation-{}", Uuid::new_v4());
+            if annotation_type == "test_start" {
+                state.test_starts.insert(annotation_id.clone());
+            }
+            let frame_artifact_id = state.frames.last().map(|frame| frame.artifact_id.clone());
+            state.annotations.push(RecordingAnnotation {
+                annotation_id: annotation_id.clone(),
+                annotation_type: annotation_type.into(),
+                text: text.into(),
+                test_start_id: test_start_id.map(str::to_owned),
+                result: result.map(str::to_owned),
+                timestamp_ms: now_millis(),
+                frame_artifact_id: frame_artifact_id.clone(),
+            });
+            (annotation_id, frame_artifact_id)
+        };
+        let _ = self.record_working_event(
+            "recording_annotation",
+            "recording",
+            json!({
+                "recording_id": recording_id,
+                "annotation_id": annotation_id,
+                "annotation_type": annotation_type,
+                "text": text,
+                "test_start_id": test_start_id,
+                "result": result,
+                "frame_artifact_id": frame_artifact_id,
+            }),
+        );
+        json!({"status": "recorded", "annotation_id": annotation_id})
+    }
+
+    async fn stop_recording(&self, call: &ToolCall) -> Value {
+        let recording_id = call
+            .arguments
+            .get("recording_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let runtime = self
+            .recording
+            .lock()
+            .expect("recording mutex poisoned")
+            .take();
+        let Some(runtime) = runtime else {
+            return classify_tool_error(call, "no recording is active");
+        };
+        let data = runtime.data.clone();
+        if data
+            .lock()
+            .expect("recording data mutex poisoned")
+            .recording_id
+            != recording_id
+        {
+            *self.recording.lock().expect("recording mutex poisoned") = Some(runtime);
+            return classify_tool_error(
+                call,
+                "recording_id does not identify the active recording",
+            );
+        }
+        runtime.stop.store(true, Ordering::SeqCst);
+        let _ = runtime.join.await;
+        let (manifest, frame_count, annotation_count, truncated, truncation_reason) = {
+            let snapshot = data.lock().expect("recording data mutex poisoned");
+            let manifest = json!({
+            "recording_id": snapshot.recording_id,
+            "source": snapshot.source,
+            "started_at_ms": snapshot.started_at_ms,
+            "stopped_at_ms": now_millis(),
+            "interval_ms": snapshot.interval_ms,
+            "max_frames": snapshot.max_frames,
+            "max_duration_ms": snapshot.max_duration_ms,
+                "truncated": snapshot.truncated,
+            "truncation_reason": &snapshot.truncation_reason,
+            "frames": &snapshot.frames,
+            "annotations": &snapshot.annotations,
+            });
+            (
+                manifest,
+                snapshot.frames.len(),
+                snapshot.annotations.len(),
+                snapshot.truncated,
+                snapshot.truncation_reason.clone(),
+            )
+        };
+        let Some(sink) = self.artifact_sink.clone() else {
+            return classify_tool_error(call, "artifact sink is unavailable");
+        };
+        let content = serde_json::to_vec(&manifest).unwrap_or_default();
+        let reference = match sink
+            .persist(ArtifactRequest {
+                session_id: self.session_id.clone(),
+                call_id: call.id.clone(),
+                name: format!("{recording_id}.json"),
+                kind: "recording_manifest".into(),
+                mime: "application/json".into(),
+                content,
+            })
+            .await
+        {
+            Ok(reference) => reference,
+            Err(error) => return classify_tool_error(call, error),
+        };
+        let _ = self.record_working_event(
+            "recording_stopped",
+            "recording",
+            json!({
+                "recording_id": recording_id,
+                "manifest_artifact_id": reference.id,
+                "frame_count": frame_count,
+                "annotation_count": annotation_count,
+                "truncated": truncated,
+                "truncation_reason": truncation_reason,
+            }),
+        );
+        json!({
+            "status": "stopped",
+            "recording_id": recording_id,
+            "manifest_artifact_id": reference.id,
+            "frame_count": frame_count,
+            "annotation_count": annotation_count,
+            "truncated": truncated,
+            "truncation_reason": truncation_reason,
+        })
     }
 
     fn execute_proposed_plan(&self, call: &ToolCall) -> Value {
@@ -2203,32 +3146,8 @@ where
                         tools,
                         allowed.as_ref().and_then(|value| value.as_ref()),
                     );
-                    if !self.linear_tools_enabled.load(Ordering::SeqCst) {
-                        tools.retain(|tool| {
-                            !tool
-                                .get("function")
-                                .and_then(|function| function.get("name"))
-                                .and_then(Value::as_str)
-                                .is_some_and(|name| name.starts_with("linear_"))
-                        });
-                    }
-                    for (prefix, enabled) in [
-                        ("github_", self.github_tools_enabled.load(Ordering::SeqCst)),
-                        (
-                            "telegram_",
-                            self.telegram_tools_enabled.load(Ordering::SeqCst),
-                        ),
-                        (
-                            "discord_",
-                            self.discord_tools_enabled.load(Ordering::SeqCst),
-                        ),
-                        ("slack_", self.slack_tools_enabled.load(Ordering::SeqCst)),
-                        ("notion_", self.notion_tools_enabled.load(Ordering::SeqCst)),
-                        ("gitlab_", self.gitlab_tools_enabled.load(Ordering::SeqCst)),
-                        ("jira_", self.jira_tools_enabled.load(Ordering::SeqCst)),
-                        ("stripe_", self.stripe_tools_enabled.load(Ordering::SeqCst)),
-                    ] {
-                        if !enabled {
+                    for (kind, prefix) in CONNECTOR_TOOL_PREFIXES {
+                        if !self.connector_tools_enabled(kind) {
                             tools.retain(|tool| {
                                 !tool
                                     .get("function")
@@ -2237,6 +3156,20 @@ where
                                     .is_some_and(|name| name.starts_with(prefix))
                             });
                         }
+                    }
+                    if !self.progressive_tool_disclosure() {
+                        tools.retain(|tool| {
+                            !matches!(tool_name(tool), Some("tool_search" | "tool_describe"))
+                        });
+                    } else {
+                        let described = self.described_tools.lock().await.clone();
+                        tools.retain(|tool| {
+                            tool_name(tool).is_some_and(|name| {
+                                !is_progressive_catalog_tool(name)
+                                    || described.contains(name)
+                                    || matches!(name, "tool_search" | "tool_describe")
+                            })
+                        });
                     }
                     tools
                 },
@@ -2660,14 +3593,12 @@ where
         }
     }
 
-    async fn execute_tools(
+    async fn tool_dispatch_context(
         &self,
-        assistant_sequence: i64,
-        calls: &[ToolCall],
-    ) -> Result<Vec<Value>, EngineError> {
-        let _active = self.track_tool_calls(calls);
-        let mut results: Vec<Option<Value>> = (0..calls.len()).map(|_| None).collect();
-        let mut readonly = Vec::new();
+        execute_readonly: bool,
+        approval_behavior: ToolApprovalBehavior,
+        source: ToolExecutionSource,
+    ) -> Result<ToolDispatchContext, EngineError> {
         let grants = self
             .store
             .load_grants(&self.session_id)
@@ -2681,251 +3612,336 @@ where
             .collect::<Vec<_>>();
         let unattended = self.unattended.load(Ordering::SeqCst);
         let permission_rules = self.permission_rules.lock().await.clone();
-        for (index, call) in calls.iter().enumerate() {
-            if self.interrupted.load(Ordering::SeqCst) {
-                results[index] = Some(classify_tool_error(call, "tool call interrupted"));
-                continue;
+        Ok(ToolDispatchContext {
+            grants,
+            unattended,
+            permission_rules,
+            execute_readonly,
+            approval_behavior,
+            source,
+        })
+    }
+
+    async fn execute_tool_once(
+        &self,
+        call: &ToolCall,
+        context: &ToolDispatchContext,
+    ) -> Result<ToolDispatchResult, EngineError> {
+        if let Some(result) = self.execute_disclosure_tool(call).await {
+            return Ok(ToolDispatchResult::Completed(result));
+        }
+        if call.name == "ask_user" && self.agent_role != AgentRole::Lead {
+            return Ok(ToolDispatchResult::Completed(classify_tool_error(
+                call,
+                "testing Worker cannot ask the user; report to Lead instead",
+            )));
+        }
+        let mode = *self.mode.lock().await;
+        if call.name == "ask_user" || (call.name == "propose_plan" && mode == PermissionMode::Plan)
+        {
+            if matches!(
+                context.approval_behavior,
+                ToolApprovalBehavior::RejectWithoutPending
+            ) {
+                return Ok(ToolDispatchResult::ScriptAbort(approval_tool_error(
+                    call,
+                    "this tool requires user interaction and cannot suspend a script",
+                )));
             }
-            let mode = *self.mode.lock().await;
-            if call.name == "ask_user"
-                || (call.name == "propose_plan" && mode == PermissionMode::Plan)
-            {
-                if call.name == "ask_user" {
-                    let options = call
-                        .arguments
-                        .get("options")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    let allow_multiple = call
-                        .arguments
-                        .get("allow_multiple")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    let _ = self
-                        .working_event(
-                            "ask_user_pending",
-                            "message",
-                            json!({
-                                "call_id": call.id,
-                                "tool": "ask_user",
-                                "options": options,
-                                "allow_multiple": allow_multiple,
-                            }),
-                        )
-                        .await;
-                } else {
-                    let _ = self
-                        .working_event(
-                            "approval_pending",
-                            "message",
-                            json!({
-                                "call_id": call.id,
-                                "tool": call.name,
-                                "arguments": call.arguments,
-                                "reason": "Plan mode requires plan confirmation",
-                            }),
-                        )
-                        .await;
-                }
-                self.save_pending(&PendingRecord {
-                    session_id: self.session_id.clone(),
-                    call_id: call.id.clone(),
-                    tool: call.name.clone(),
-                    arguments: call.arguments.clone(),
-                    state: call.name.clone(),
-                })?;
-                let completed_reads = futures_util::future::join_all(readonly.drain(..).map(
-                    |(read_index, read_call): (usize, &ToolCall)| async move {
-                        let result = self.execute_tool_interruptible(read_call).await;
-                        (read_index, result)
-                    },
-                ))
-                .await;
-                for (read_index, result) in completed_reads {
-                    results[read_index] = Some(result);
-                }
-                let completed = results
-                    .iter()
-                    .take(index)
-                    .enumerate()
-                    .filter_map(|(index, result)| {
-                        result
-                            .clone()
-                            .map(|result| (calls[index].id.clone(), result))
-                    })
-                    .collect::<Vec<_>>();
-                self.persist_tool_results(assistant_sequence, &calls[..index], completed)
-                    .await?;
-                for remaining in &calls[index + 1..] {
-                    self.save_pending(&PendingRecord {
-                        session_id: self.session_id.clone(),
-                        call_id: remaining.id.clone(),
-                        tool: remaining.name.clone(),
-                        arguments: remaining.arguments.clone(),
-                        state: "pending".into(),
-                    })?;
-                }
-                return Err(EngineError::ApprovalPending(call.id.clone()));
-            }
-            let mut risk = if call.name == "propose_plan" {
-                ToolRisk::Read
-            } else {
-                tool_risk(&call.name)
-            };
-            let argument_keys = call
-                .arguments
-                .as_object()
-                .map(|arguments| arguments.keys().cloned().collect::<Vec<_>>())
-                .unwrap_or_default();
-            let category = tool_event_category(&call.name);
-            if call.name == "run_shell" {
+            if call.name == "ask_user" {
+                let options = call
+                    .arguments
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let allow_multiple = call
+                    .arguments
+                    .get("allow_multiple")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 let _ = self
                     .working_event(
-                        "shell_process_started",
-                        "shell",
+                        "ask_user_pending",
+                        "message",
                         json!({
                             "call_id": call.id,
-                            "shell_id": shell_id_for_session(&self.session_id),
-                            "command": call.arguments.get("command").and_then(Value::as_str).unwrap_or_default(),
-                            "starting_dir": self.workspace.clone(),
-                            "is_major_action": true,
+                            "tool": "ask_user",
+                            "options": options,
+                            "allow_multiple": allow_multiple,
                         }),
                     )
                     .await;
             } else {
                 let _ = self
                     .working_event(
-                        &format!("{}_started", call.name),
-                        category,
+                        "approval_pending",
+                        "message",
                         json!({
-                            "call_id":call.id,
-                            "tool":call.name,
-                            "argument_keys":argument_keys,
-                            "is_major_action": is_major_tool(&call.name, category),
+                            "call_id": call.id,
+                            "tool": call.name,
+                            "arguments": call.arguments,
+                            "reason": "Plan mode requires plan confirmation",
                         }),
                     )
                     .await;
             }
-            let mode = *self.mode.lock().await;
-            let target = self.executor.policy_target(&call.name, &call.arguments);
-            let mutating_api_target = if self.mutating_api_gate_enabled.load(Ordering::SeqCst)
-                && matches!(call.name.as_str(), "run_shell" | "exec")
-            {
-                call.arguments
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .and_then(mutating_http_target)
+            self.save_pending(&PendingRecord {
+                session_id: self.session_id.clone(),
+                call_id: call.id.clone(),
+                tool: call.name.clone(),
+                arguments: call.arguments.clone(),
+                state: call.name.clone(),
+            })?;
+            return Ok(ToolDispatchResult::ApprovalPending {
+                preflight_reason: None,
+                current_pending_saved: true,
+            });
+        }
+
+        let mut risk = if call.name == "propose_plan" {
+            ToolRisk::Read
+        } else {
+            tool_risk(&call.name)
+        };
+        let argument_keys = call
+            .arguments
+            .as_object()
+            .map(|arguments| arguments.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let category = match context.source {
+            ToolExecutionSource::Model => tool_event_category(&call.name),
+            ToolExecutionSource::Script => "script",
+        };
+        if call.name == "run_shell" {
+            let _ = self
+                .working_event(
+                    "shell_process_started",
+                    "shell",
+                    json!({
+                        "call_id": call.id,
+                        "shell_id": shell_id_for_session(&self.session_id),
+                        "command": call.arguments.get("command").and_then(Value::as_str).unwrap_or_default(),
+                        "starting_dir": self.workspace.clone(),
+                        "is_major_action": true,
+                    }),
+                )
+                .await;
+        } else {
+            let _ = self
+                .working_event(
+                    &format!("{}_started", call.name),
+                    category,
+                    json!({
+                        "call_id":call.id,
+                        "tool":call.name,
+                        "argument_keys":argument_keys,
+                        "is_major_action": is_major_tool(&call.name, category),
+                    }),
+                )
+                .await;
+        }
+        let mode = *self.mode.lock().await;
+        let target = self.executor.policy_target(&call.name, &call.arguments);
+        let mutating_api_target = if self.mutating_api_gate_enabled.load(Ordering::SeqCst)
+            && matches!(call.name.as_str(), "run_shell" | "exec")
+        {
+            call.arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .and_then(mutating_http_target)
+        } else {
+            None
+        };
+        let mut target = mutating_api_target.as_deref().unwrap_or(&target);
+        if call.name == "computer_use" {
+            let action = call
+                .arguments
+                .get("action")
+                .and_then(|value| value.get("action"))
+                .and_then(Value::as_str);
+            if action == Some("screenshot") {
+                risk = ToolRisk::External;
             } else {
-                None
-            };
-            let mut target = mutating_api_target.as_deref().unwrap_or(&target);
-            if call.name == "computer_use" {
-                let action = call
-                    .arguments
-                    .get("action")
-                    .and_then(|value| value.get("action"))
-                    .and_then(Value::as_str);
-                if action == Some("screenshot") {
-                    risk = ToolRisk::External;
-                } else {
-                    risk = ToolRisk::Execute;
-                }
+                risk = ToolRisk::Execute;
             }
-            let click_origin = if call.name == "browser_click" {
-                self.executor.browser_origin().await
+        }
+        let click_origin = if call.name == "browser_click" {
+            self.executor.browser_origin().await
+        } else {
+            None
+        };
+        let browser_target = if matches!(call.name.as_str(), "browser_navigate" | "browser_click") {
+            let origin = if call.name == "browser_navigate" {
+                call.arguments.get("url").and_then(Value::as_str)
             } else {
-                None
+                click_origin.as_deref()
             };
-            let browser_target =
-                if matches!(call.name.as_str(), "browser_navigate" | "browser_click") {
-                    let origin = if call.name == "browser_navigate" {
-                        call.arguments.get("url").and_then(Value::as_str)
-                    } else {
-                        click_origin.as_deref()
-                    };
-                    if call.name == "browser_navigate" {
-                        origin.and_then(browser_navigation_target)
-                    } else {
-                        origin.and_then(browser_click_target)
-                    }
+            if call.name == "browser_navigate" {
+                origin.and_then(browser_navigation_target)
+            } else {
+                origin.and_then(browser_click_target)
+            }
+        } else {
+            None
+        };
+        if let Some((browser_target, is_loopback)) = &browser_target {
+            target = browser_target;
+            if *is_loopback {
+                risk = ToolRisk::Execute;
+            }
+        }
+        let preflight = match self.executor.preflight(&call.name, &call.arguments).await {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                return Ok(ToolDispatchResult::PreflightError(preflight_tool_error(
+                    call, error,
+                )));
+            }
+        };
+        let mut preflight_reason = None;
+        let decision = match preflight {
+            PreflightDecision::Allow if self.executor.grant_allows(target) => {
+                let repair_grant = [DurableGrant {
+                    key: "repair-loop".into(),
+                    target: target.to_owned(),
+                    expires_at: None,
+                }];
+                decide_with_rules(
+                    mode,
+                    risk,
+                    context.unattended,
+                    &repair_grant,
+                    target,
+                    context.permission_rules.as_ref(),
+                )
+            }
+            PreflightDecision::Allow => decide_with_rules(
+                mode,
+                risk,
+                context.unattended,
+                &context.grants,
+                target,
+                context.permission_rules.as_ref(),
+            ),
+            PreflightDecision::NeedsUser(reason) if context.unattended => {
+                preflight_reason = Some(reason);
+                Decision::Deny
+            }
+            PreflightDecision::NeedsUser(reason) => {
+                preflight_reason = Some(reason);
+                Decision::NeedsUser
+            }
+            PreflightDecision::Deny(reason) => {
+                preflight_reason = Some(reason);
+                Decision::Deny
+            }
+        };
+        let decision = if mutating_api_target.is_some() {
+            if mode == PermissionMode::Discuss || context.unattended {
+                Decision::Deny
+            } else {
+                decide_with_rules(
+                    PermissionMode::Interactive,
+                    ToolRisk::External,
+                    context.unattended,
+                    &context.grants,
+                    target,
+                    context.permission_rules.as_ref(),
+                )
+            }
+        } else {
+            decision
+        };
+        if matches!(decision, Decision::Deny) && preflight_reason.is_some() {
+            let reason = preflight_reason
+                .as_deref()
+                .unwrap_or("tool call denied by preflight");
+            let mut result = preflight_tool_error(call, reason);
+            result["_opcos_not_executed"] = json!(true);
+            let _ = self
+                .working_event(
+                    "tool_call_denied",
+                    "message",
+                    json!({
+                        "call_id": call.id,
+                        "tool": call.name,
+                        "reason": reason,
+                    }),
+                )
+                .await;
+            return Ok(ToolDispatchResult::PreflightError(result));
+        }
+        if matches!(
+            context.approval_behavior,
+            ToolApprovalBehavior::RejectWithoutPending
+        ) && matches!(decision, Decision::NeedsUser)
+        {
+            let reason = preflight_reason
+                .as_deref()
+                .unwrap_or("tool call requires user approval");
+            let _ = self
+                .working_event(
+                    "tool_script_approval_required",
+                    "script",
+                    json!({
+                        "call_id": call.id,
+                        "tool": call.name,
+                        "reason": reason,
+                    }),
+                )
+                .await;
+            return Ok(ToolDispatchResult::ScriptAbort(approval_tool_error(
+                call, reason,
+            )));
+        }
+        match decision {
+            Decision::Allow
+                if matches!(risk, ToolRisk::Read | ToolRisk::Search | ToolRisk::GitRead)
+                    && call.name != "propose_plan"
+                    && !context.execute_readonly =>
+            {
+                Ok(ToolDispatchResult::DeferredReadonly)
+            }
+            Decision::Allow => {
+                if matches!(call.name.as_str(), "send_user_message" | "report_blocker") {
+                    return Ok(ToolDispatchResult::Completed(
+                        self.execute_user_communication(call).await,
+                    ));
+                }
+                if call.name == "tool_script" {
+                    return Ok(ToolDispatchResult::Completed(
+                        self.execute_tool_script(call).await,
+                    ));
+                }
+                let previous = if matches!(call.name.as_str(), "write_file" | "edit_file") {
+                    self.executor
+                        .execute(
+                            "read_file",
+                            json!({"path": call.arguments.get("path").and_then(Value::as_str).unwrap_or_default()}),
+                        )
+                        .await
+                        .ok()
+                        .and_then(|value| value.get("content").and_then(Value::as_str).map(str::to_owned))
                 } else {
                     None
                 };
-            if let Some((browser_target, is_loopback)) = &browser_target {
-                target = browser_target;
-                if *is_loopback {
-                    risk = ToolRisk::Execute;
-                }
-            }
-            let preflight = match self.executor.preflight(&call.name, &call.arguments).await {
-                Ok(preflight) => preflight,
-                Err(error) => {
-                    results[index] = Some(preflight_tool_error(call, error));
-                    continue;
-                }
-            };
-            let mut preflight_reason = None;
-            let decision = match preflight {
-                PreflightDecision::Allow if self.executor.grant_allows(target) => {
-                    let repair_grant = [DurableGrant {
-                        key: "repair-loop".into(),
-                        target: target.to_owned(),
-                        expires_at: None,
-                    }];
-                    decide_with_rules(
-                        mode,
-                        risk,
-                        unattended,
-                        &repair_grant,
-                        target,
-                        permission_rules.as_ref(),
-                    )
-                }
-                PreflightDecision::Allow => decide_with_rules(
-                    mode,
-                    risk,
-                    unattended,
-                    &grants,
-                    target,
-                    permission_rules.as_ref(),
-                ),
-                PreflightDecision::NeedsUser(reason) if unattended => {
-                    preflight_reason = Some(reason);
-                    Decision::Deny
-                }
-                PreflightDecision::NeedsUser(reason) => {
-                    preflight_reason = Some(reason);
-                    Decision::NeedsUser
-                }
-                PreflightDecision::Deny(reason) => {
-                    preflight_reason = Some(reason);
-                    Decision::Deny
-                }
-            };
-            let decision = if mutating_api_target.is_some() {
-                if mode == PermissionMode::Discuss || unattended {
-                    Decision::Deny
+                let result = if call.name == "propose_plan" {
+                    self.execute_proposed_plan(call)
                 } else {
-                    decide_with_rules(
-                        PermissionMode::Interactive,
-                        ToolRisk::External,
-                        unattended,
-                        &grants,
-                        target,
-                        permission_rules.as_ref(),
-                    )
+                    self.execute_tool_interruptible(call).await
+                };
+                if matches!(call.name.as_str(), "write_file" | "edit_file")
+                    && result.get("error").is_none()
+                {
+                    self.emit_file_change(call, previous.as_deref()).await;
                 }
-            } else {
-                decision
-            };
-            if matches!(decision, Decision::Deny) && preflight_reason.is_some() {
-                let reason = preflight_reason
-                    .as_deref()
-                    .unwrap_or("tool call denied by preflight");
-                let mut result = preflight_tool_error(call, reason);
+                Ok(ToolDispatchResult::Completed(result))
+            }
+            Decision::Deny => {
+                self.policy_denied.store(true, Ordering::SeqCst);
+                let mut result = policy_tool_error(call, "tool call denied by policy");
                 result["_opcos_not_executed"] = json!(true);
-                results[index] = Some(result);
                 let _ = self
                     .working_event(
                         "tool_call_denied",
@@ -2933,73 +3949,385 @@ where
                         json!({
                             "call_id": call.id,
                             "tool": call.name,
-                            "reason": reason,
+                            "reason": "denied by policy",
                         }),
                     )
                     .await;
+                Ok(ToolDispatchResult::Completed(result))
+            }
+            Decision::NeedsUser => {
+                let _ = self
+                    .working_event(
+                        "approval_pending",
+                        "message",
+                        json!({
+                            "call_id": call.id,
+                            "tool": call.name,
+                            "arguments": call.arguments,
+                        }),
+                    )
+                    .await;
+                Ok(ToolDispatchResult::ApprovalPending {
+                    preflight_reason,
+                    current_pending_saved: false,
+                })
+            }
+        }
+    }
+
+    fn execute_tool_once_boxed<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        context: &'a ToolDispatchContext,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolDispatchResult, EngineError>> + Send + 'a>> {
+        Box::pin(self.execute_tool_once(call, context))
+    }
+
+    async fn execute_tool_script(&self, call: &ToolCall) -> Value {
+        let limits = match tool_script_limits(&call.arguments) {
+            Ok(limits) => limits,
+            Err(error) => {
+                return json!({
+                    "error": error,
+                    "calls_made": 0,
+                    "stopped_reason": "invalid_limits",
+                    "stdout": "",
+                    "stdout_truncated": false,
+                    "stdout_total_bytes": 0,
+                    "stdout_omitted_bytes": 0,
+                });
+            }
+        };
+        self.execute_tool_script_with_limits(
+            call,
+            limits.max_calls,
+            limits.max_stdout_bytes,
+            limits.timeout,
+        )
+        .await
+    }
+
+    async fn execute_tool_script_with_limits(
+        &self,
+        call: &ToolCall,
+        max_calls: usize,
+        max_stdout_bytes: usize,
+        wall_clock: Duration,
+    ) -> Value {
+        let script = call
+            .arguments
+            .get("script")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let output = Arc::new(ScriptOutput::new(max_stdout_bytes));
+        let diagnostics = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let abort_value = Arc::new(StdMutex::new(None::<Value>));
+        let deadline = Instant::now() + wall_clock;
+        let (request_tx, mut request_rx) = mpsc::unbounded_channel::<ScriptRequest>();
+        let script_output = output.clone();
+        let script_diagnostics = diagnostics.clone();
+        let script_abort_value = abort_value.clone();
+        let script_task = tokio::task::spawn_blocking(move || {
+            run_tool_script(
+                &script,
+                request_tx,
+                script_output,
+                script_diagnostics,
+                script_abort_value,
+                deadline,
+            )
+        });
+        let context = match self
+            .tool_dispatch_context(
+                true,
+                ToolApprovalBehavior::RejectWithoutPending,
+                ToolExecutionSource::Script,
+            )
+            .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                return json!({
+                    "error": error.to_string(),
+                    "calls_made": 0,
+                    "stopped_reason": "dispatch_context_error",
+                    "stdout": "",
+                    "stdout_truncated": false,
+                    "stdout_total_bytes": 0,
+                    "stdout_omitted_bytes": 0,
+                });
+            }
+        };
+        let mut calls_made = 0usize;
+        let mut stopped_reason = "completed";
+        let mut abort = None;
+        let mut worker_done = false;
+        let mut script_task = std::pin::pin!(script_task);
+        loop {
+            tokio::select! {
+                result = &mut script_task => {
+                    worker_done = true;
+                    if let Err(error) = result {
+                        if stopped_reason == "completed" {
+                            stopped_reason = "script_worker_error";
+                        }
+                        abort = Some(json!({"error": format!("script worker failed: {error}")}));
+                    } else if let Ok(Err(error)) = result {
+                        if stopped_reason == "completed" {
+                            stopped_reason = if output.truncated() {
+                                "stdout_limit"
+                            } else if error.contains("deadline") {
+                                "wall_clock_deadline"
+                            } else if error.contains("operation") {
+                                "operation_limit"
+                            } else {
+                                "script_error"
+                            };
+                        }
+                        abort = abort_value
+                            .lock()
+                            .expect("script abort mutex poisoned")
+                            .clone()
+                            .or_else(|| Some(json!({"error": error})));
+                    } else if output.truncated() && stopped_reason == "completed" {
+                        stopped_reason = "stdout_limit";
+                    }
+                    break;
+                }
+                request = request_rx.recv() => {
+                    let Some(request) = request else {
+                        break;
+                    };
+                    calls_made += 1;
+                    let response = if calls_made > max_calls {
+                        stopped_reason = "call_limit";
+                        ScriptResponse::Abort(json!({
+                            "error": "tool script call limit exceeded",
+                            "calls_made": calls_made - 1,
+                            "max_calls": max_calls,
+                        }))
+                    } else if !script_tool_allowed(&request.name, &request.arguments) {
+                        stopped_reason = "tool_not_allowed";
+                        ScriptResponse::Abort(json!({
+                            "error": format!("tool {} is not allowed inside tool_script", request.name),
+                            "tool": request.name,
+                            "reason": "script tool allowlist excludes user interaction, plan/session state, secrets, recording, and long-lived execution",
+                        }))
+                    } else {
+                        let child_call = ToolCall {
+                            id: format!("{}:{}", call.id, calls_made),
+                            name: request.name.clone(),
+                            arguments: request.arguments.clone(),
+                        };
+                        let mut audit_arguments = request.arguments.clone();
+                        self.secret_scrubber.scrub(&mut audit_arguments);
+                        let _ = self.store.append_audit(
+                            &self.session_id,
+                            "tool_script_call_started",
+                            &json!({
+                                "parent_call_id": call.id,
+                                "call_id": child_call.id,
+                                "tool": child_call.name,
+                                "arguments": audit_arguments,
+                            }),
+                        );
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        let result = tokio::time::timeout(
+                            remaining,
+                            async {
+                                let _active = self.track_tool_calls(std::slice::from_ref(&child_call));
+                                self.execute_tool_once_boxed(&child_call, &context).await
+                            },
+                        )
+                        .await;
+                        match result {
+                            Err(_) => {
+                                stopped_reason = "wall_clock_deadline";
+                                let _ = self.working_event(
+                                    "tool_script_call_abandoned",
+                                    "script",
+                                    json!({
+                                        "parent_call_id": call.id,
+                                        "call_id": child_call.id,
+                                        "tool": child_call.name,
+                                        "reason": "script_wall_clock_deadline",
+                                    }),
+                                ).await;
+                                let _ = self.store.append_audit(
+                                    &self.session_id,
+                                    "tool_script_call_abandoned",
+                                    &json!({
+                                        "parent_call_id": call.id,
+                                        "call_id": child_call.id,
+                                        "tool": child_call.name,
+                                        "reason": "script_wall_clock_deadline",
+                                    }),
+                                );
+                                ScriptResponse::Abort(json!({
+                                    "error": "tool script wall-clock deadline exceeded",
+                                    "tool": child_call.name,
+                                }))
+                            }
+                            Ok(Err(error)) => {
+                                stopped_reason = "dispatch_error";
+                                ScriptResponse::Abort(json!({
+                                    "error": error.to_string(),
+                                    "tool": child_call.name,
+                                }))
+                            }
+                            Ok(Ok(ToolDispatchResult::Completed(mut value)))
+                            | Ok(Ok(ToolDispatchResult::PreflightError(mut value))) => {
+                                self.secret_scrubber.scrub(&mut value);
+                                let _ = self.working_event(
+                                    "tool_script_call_completed",
+                                    "script",
+                                    json!({
+                                        "parent_call_id": call.id,
+                                        "call_id": child_call.id,
+                                        "tool": child_call.name,
+                                        "ok": value.get("error").is_none(),
+                                    }),
+                                ).await;
+                                let mut audit_result = value.clone();
+                                self.secret_scrubber.scrub(&mut audit_result);
+                                let _ = self.store.append_audit(
+                                    &self.session_id,
+                                    "tool_script_call_completed",
+                                    &json!({
+                                        "parent_call_id": call.id,
+                                        "call_id": child_call.id,
+                                        "tool": child_call.name,
+                                        "result": audit_result,
+                                    }),
+                                );
+                                ScriptResponse::Result(value)
+                            }
+                            Ok(Ok(ToolDispatchResult::ScriptAbort(value))) => {
+                                stopped_reason = "approval_required";
+                                ScriptResponse::Abort(value)
+                            }
+                            Ok(Ok(ToolDispatchResult::DeferredReadonly))
+                            | Ok(Ok(ToolDispatchResult::ApprovalPending { .. })) => {
+                                stopped_reason = "invalid_script_dispatch";
+                                ScriptResponse::Abort(json!({
+                                    "error": "tool dispatch returned an unsupported script state",
+                                    "tool": child_call.name,
+                                }))
+                            }
+                        }
+                    };
+                    let abort_response = matches!(&response, ScriptResponse::Abort(_));
+                    if let ScriptResponse::Abort(value) = &response {
+                        abort = Some(value.clone());
+                    }
+                    let _ = request.response.send(response);
+                    if abort_response {
+                        stopped_reason = if stopped_reason == "completed" {
+                            "script_aborted"
+                        } else {
+                            stopped_reason
+                        };
+                    }
+                }
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                    stopped_reason = "wall_clock_deadline";
+                    abort = Some(json!({"error": "tool script wall-clock deadline exceeded"}));
+                    break;
+                }
+            }
+        }
+        drop(request_rx);
+        if !worker_done {
+            let _ = script_task.await;
+        }
+        let diagnostics = diagnostics
+            .lock()
+            .expect("script diagnostics mutex poisoned")
+            .clone();
+        if !diagnostics.is_empty() {
+            let _ = self.store.append_audit(
+                &self.session_id,
+                "tool_script_diagnostics",
+                &json!({
+                    "parent_call_id": call.id,
+                    "messages": diagnostics,
+                }),
+            );
+        }
+        if abort.is_none() {
+            abort = abort_value
+                .lock()
+                .expect("script abort mutex poisoned")
+                .clone();
+        }
+        if output.truncated() && stopped_reason == "completed" {
+            stopped_reason = "stdout_limit";
+        }
+        let mut result = abort.unwrap_or_else(|| json!({}));
+        if let Some(object) = result.as_object_mut() {
+            object.insert("stdout".into(), Value::String(output.value()));
+            object.insert("calls_made".into(), json!(calls_made.min(max_calls)));
+            object.insert("stopped_reason".into(), json!(stopped_reason));
+            object.insert("stdout_truncated".into(), json!(output.truncated()));
+            object.insert(
+                "stdout_total_bytes".into(),
+                json!(output.total_bytes.load(Ordering::Relaxed)),
+            );
+            object.insert(
+                "stdout_omitted_bytes".into(),
+                json!(output.omitted_bytes.load(Ordering::Relaxed)),
+            );
+        }
+        if !result.is_object() {
+            result = json!({
+                "result": result,
+                    "stdout": output.value(),
+                "calls_made": calls_made.min(max_calls),
+                "stopped_reason": stopped_reason,
+                "stdout_truncated": output.truncated(),
+                "stdout_total_bytes": output.total_bytes.load(Ordering::Relaxed),
+                "stdout_omitted_bytes": output.omitted_bytes.load(Ordering::Relaxed),
+            });
+        }
+        result
+    }
+
+    async fn execute_tools(
+        &self,
+        assistant_sequence: i64,
+        calls: &[ToolCall],
+    ) -> Result<Vec<Value>, EngineError> {
+        let _active = self.track_tool_calls(calls);
+        let mut results: Vec<Option<Value>> = (0..calls.len()).map(|_| None).collect();
+        let mut readonly = Vec::new();
+        let context = self
+            .tool_dispatch_context(
+                false,
+                ToolApprovalBehavior::PersistPending,
+                ToolExecutionSource::Model,
+            )
+            .await?;
+        for (index, call) in calls.iter().enumerate() {
+            if self.interrupted.load(Ordering::SeqCst) {
+                results[index] = Some(classify_tool_error(call, "tool call interrupted"));
                 continue;
-            };
-            match decision {
-                Decision::Allow
-                    if matches!(risk, ToolRisk::Read | ToolRisk::Search | ToolRisk::GitRead)
-                        && call.name != "propose_plan" =>
-                {
+            }
+            match self.execute_tool_once(call, &context).await? {
+                ToolDispatchResult::Completed(result)
+                | ToolDispatchResult::PreflightError(result) => {
+                    results[index] = Some(result);
+                }
+                ToolDispatchResult::ScriptAbort(result) => {
+                    results[index] = Some(result);
+                }
+                ToolDispatchResult::DeferredReadonly => {
                     readonly.push((index, call));
                 }
-                Decision::Allow => {
-                    let previous = if matches!(call.name.as_str(), "write_file" | "edit_file") {
-                        self.executor
-                            .execute(
-                                "read_file",
-                                json!({"path": call.arguments.get("path").and_then(Value::as_str).unwrap_or_default()}),
-                            )
-                            .await
-                            .ok()
-                            .and_then(|value| value.get("content").and_then(Value::as_str).map(str::to_owned))
-                    } else {
-                        None
-                    };
-                    let result = if call.name == "propose_plan" {
-                        self.execute_proposed_plan(call)
-                    } else {
-                        self.execute_tool_interruptible(call).await
-                    };
-                    if matches!(call.name.as_str(), "write_file" | "edit_file")
-                        && result.get("error").is_none()
-                    {
-                        self.emit_file_change(call, previous.as_deref()).await;
-                    }
-                    results[index] = Some(result);
-                }
-                Decision::Deny => {
-                    self.policy_denied.store(true, Ordering::SeqCst);
-                    let mut result = policy_tool_error(call, "tool call denied by policy");
-                    result["_opcos_not_executed"] = json!(true);
-                    results[index] = Some(result);
-                    let _ = self
-                        .working_event(
-                            "tool_call_denied",
-                            "message",
-                            json!({
-                                "call_id": call.id,
-                                "tool": call.name,
-                                "reason": "denied by policy",
-                            }),
-                        )
-                        .await;
-                }
-                Decision::NeedsUser => {
-                    let _ = self
-                        .working_event(
-                            "approval_pending",
-                            "message",
-                            json!({
-                                "call_id": call.id,
-                                "tool": call.name,
-                                "arguments": call.arguments,
-                            }),
-                        )
-                        .await;
+                ToolDispatchResult::ApprovalPending {
+                    preflight_reason,
+                    current_pending_saved,
+                } => {
                     let completed_reads = futures_util::future::join_all(readonly.drain(..).map(
                         |(read_index, read_call): (usize, &ToolCall)| async move {
                             let result = self.execute_tool_interruptible(read_call).await;
@@ -3031,16 +4359,18 @@ where
                             state: "pending".into(),
                         })?;
                     }
-                    self.save_pending(&PendingRecord {
-                        session_id: self.session_id.clone(),
-                        call_id: call.id.clone(),
-                        tool: call.name.clone(),
-                        arguments: call.arguments.clone(),
-                        state: preflight_reason
-                            .as_deref()
-                            .map(|reason| format!("pending_approval: {reason}"))
-                            .unwrap_or_else(|| "pending".into()),
-                    })?;
+                    if !current_pending_saved {
+                        self.save_pending(&PendingRecord {
+                            session_id: self.session_id.clone(),
+                            call_id: call.id.clone(),
+                            tool: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                            state: preflight_reason
+                                .as_deref()
+                                .map(|reason| format!("pending_approval: {reason}"))
+                                .unwrap_or_else(|| "pending".into()),
+                        })?;
+                    }
                     return Err(EngineError::ApprovalPending(call.id.clone()));
                 }
             }
@@ -3082,6 +4412,9 @@ where
     }
 
     async fn execute_tool_streaming(&self, call: &ToolCall) -> Value {
+        if let Some(result) = self.execute_recording_tool(call).await {
+            return result;
+        }
         let emitted = Arc::new(AtomicUsize::new(0));
         let truncated = Arc::new(AtomicBool::new(false));
         let total_bytes = Arc::new(AtomicU64::new(0));
@@ -3132,6 +4465,93 @@ where
             );
         }
         result
+    }
+
+    async fn execute_user_communication(&self, call: &ToolCall) -> Value {
+        let message = call
+            .arguments
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| call.arguments.get("summary").and_then(Value::as_str))
+            .unwrap_or_default()
+            .trim();
+        if message.is_empty() {
+            return json!({"error": "missing string argument: message"});
+        }
+
+        if call.name == "send_user_message" {
+            let kind = call
+                .arguments
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("progress");
+            if !matches!(kind, "progress" | "risk" | "finding") {
+                return json!({"error": "kind must be progress, risk, or finding"});
+            }
+            let event_id = match self.record_working_event(
+                "agent_message",
+                "message",
+                json!({
+                    "call_id": call.id,
+                    "message": message,
+                    "kind": kind,
+                }),
+            ) {
+                Ok(event_id) => event_id,
+                Err(_) => return json!({"error": "failed to persist user message"}),
+            };
+            return json!({"status": "delivered", "event_id": event_id});
+        }
+
+        let severity = call
+            .arguments
+            .get("severity")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !matches!(severity, "hard" | "soft" | "friction") {
+            return json!({"error": "severity must be hard, soft, or friction"});
+        }
+        let category = call
+            .arguments
+            .get("category")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !matches!(
+            category,
+            "environment" | "platform" | "dependency" | "host" | "tool"
+        ) {
+            return json!({
+                "error": "category must be environment, platform, dependency, host, or tool"
+            });
+        }
+        let payload = json!({
+            "call_id": call.id,
+            "severity": severity,
+            "category": category,
+            "summary": message,
+            "details": call.arguments.get("details").and_then(Value::as_str),
+            "attempted": call.arguments.get("attempted").and_then(Value::as_str),
+            "next_step": call.arguments.get("next_step").and_then(Value::as_str),
+        });
+        let mut audit_payload = payload.clone();
+        self.secret_scrubber.scrub(&mut audit_payload);
+        let event_id = match self.record_working_event("operational_blocker", "notice", payload) {
+            Ok(event_id) => event_id,
+            Err(_) => return json!({"error": "failed to persist operational blocker"}),
+        };
+        if self
+            .recorder
+            .append_audit("operational_blocker", &audit_payload)
+            .is_err()
+        {
+            return json!({"error": "failed to persist operational blocker"});
+        }
+        json!({
+            "status": "reported",
+            "event_id": event_id,
+            "severity": severity,
+            "control_flow": "unchanged",
+        })
     }
 
     async fn persist_artifact(
@@ -3892,6 +5312,7 @@ where
         payload: Value,
     ) -> Result<(), EngineError> {
         self.record_working_event(event_type, category, payload)
+            .map(|_| ())
     }
 
     fn record_working_event(
@@ -3899,7 +5320,7 @@ where
         event_type: &str,
         category: &str,
         payload: Value,
-    ) -> Result<(), EngineError> {
+    ) -> Result<String, EngineError> {
         let event = WorkingEvent {
             event_type: event_type.into(),
             category: category.into(),
@@ -3920,7 +5341,6 @@ where
                 ..StreamChunk::default()
             },
         )
-        .map(|_| ())
     }
 
     fn emit_event(&self, event_type: &str, mut chunk: StreamChunk) -> Result<String, EngineError> {
@@ -3966,8 +5386,281 @@ fn external_context_content_block(attachment: &ExternalContextAttachment) -> Val
     json!({"type": "text", "text": format!("{header}{}", attachment.content)})
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScriptToolClass {
+    Allowed,
+    UserInteraction,
+    PlanState,
+    SecretManagement,
+    Recording,
+    DesktopOrSessionState,
+    SessionStateWrite,
+    LongLivedExecution,
+    ScriptOrchestration,
+}
+
+struct ScriptLimits {
+    max_calls: usize,
+    max_stdout_bytes: usize,
+    timeout: Duration,
+}
+
+fn script_tool_class(name: &str) -> Option<ScriptToolClass> {
+    let class = match name {
+        "tool_script" | "tool_search" | "tool_describe" => ScriptToolClass::ScriptOrchestration,
+        "ask_user" | "send_user_message" | "report_blocker" => ScriptToolClass::UserInteraction,
+        "propose_plan" | "plan_get" | "plan_update" | "plan_revise" => ScriptToolClass::PlanState,
+        "secrets_list" => ScriptToolClass::SecretManagement,
+        "action_ledger_begin"
+        | "action_ledger_finish"
+        | "action_ledger_list"
+        | "background_job_start"
+        | "background_job_status"
+        | "background_job_output"
+        | "background_job_kill"
+        | "work_queue_enqueue"
+        | "work_queue_claim"
+        | "work_queue_renew"
+        | "work_queue_complete"
+        | "work_queue_cancel"
+        | "work_queue_requeue"
+        | "work_queue_list"
+        | "coordination_dispatch"
+        | "coordination_fan_out"
+        | "coordination_status"
+        | "automation_manage" => ScriptToolClass::LongLivedExecution,
+        "external_ingress_sources" | "local_gate_record" | "local_gate_status" => {
+            ScriptToolClass::SessionStateWrite
+        }
+        "config_asset_manage"
+        | "memory_save_automatic"
+        | "memory_list"
+        | "memory_disable"
+        | "memory_delete"
+        | "learned_skill_manage"
+        | "skill_save_learned"
+        | "skill_search_learned"
+        | "skill_get_learned" => ScriptToolClass::SessionStateWrite,
+        "session_search" => ScriptToolClass::Allowed,
+        "read_file"
+        | "write_file"
+        | "edit_file"
+        | "run_shell"
+        | "browser_status"
+        | "browser_navigate"
+        | "browser_set_viewport"
+        | "browser_click"
+        | "browser_read"
+        | "browser_measure"
+        | "browser_assert_geometry"
+        | "browser_screenshot"
+        | "computer_use"
+        | "list_dir"
+        | "git_status"
+        | "git_diff"
+        | "git_log"
+        | "git_rev_parse"
+        | "git_create_branch"
+        | "git_stage_commit"
+        | "git_push"
+        | "gitlab_list_projects"
+        | "gitlab_list_issues"
+        | "github_list_repositories"
+        | "github_list_issues"
+        | "github_get_pull_request"
+        | "github_create_issue"
+        | "github_create_pull_request"
+        | "github_ci_status"
+        | "github_ci_failure_log"
+        | "linear_get_issue"
+        | "linear_list_my_issues"
+        | "linear_comment_issue"
+        | "linear_update_issue_status"
+        | "telegram_send_message"
+        | "discord_send_message"
+        | "slack_list_channels"
+        | "slack_post_message"
+        | "notion_search"
+        | "jira_search_issues"
+        | "stripe_list_charges"
+        | "repo_index_find_symbol"
+        | "repo_index_glob"
+        | "repo_index_search"
+        | "lsp_definition"
+        | "lsp_references"
+        | "lsp_diagnostics" => ScriptToolClass::Allowed,
+        name if name.starts_with("recording_") => ScriptToolClass::Recording,
+        name if name.starts_with("desktop_")
+            || (name.starts_with("session_") && name != "session_search") =>
+        {
+            ScriptToolClass::DesktopOrSessionState
+        }
+        _ => return None,
+    };
+    Some(class)
+}
+
+fn contains_secret_names(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(contains_secret_names),
+        Value::Object(items) => items
+            .iter()
+            .any(|(key, value)| key == "secret_names" || contains_secret_names(value)),
+        _ => false,
+    }
+}
+
+fn script_tool_allowed(name: &str, arguments: &Value) -> bool {
+    script_tool_class(name) == Some(ScriptToolClass::Allowed) && !contains_secret_names(arguments)
+}
+
+fn tool_script_limits(arguments: &Value) -> Result<ScriptLimits, String> {
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| "tool_script arguments must be an object".to_owned())?;
+    let optional_u64 = |name: &str| -> Result<Option<u64>, String> {
+        object
+            .get(name)
+            .map(|value| {
+                value
+                    .as_u64()
+                    .ok_or_else(|| format!("{name} must be a positive integer"))
+            })
+            .transpose()
+    };
+    let max_calls = optional_u64("max_calls")?
+        .map(|value| value as usize)
+        .unwrap_or(TOOL_SCRIPT_DEFAULT_MAX_CALLS);
+    let max_stdout_bytes = optional_u64("max_stdout_bytes")?
+        .map(|value| value as usize)
+        .unwrap_or(TOOL_SCRIPT_DEFAULT_MAX_STDOUT_BYTES);
+    let timeout_seconds =
+        optional_u64("timeout_seconds")?.unwrap_or(TOOL_SCRIPT_DEFAULT_TIMEOUT_SECONDS);
+    if !(1..=TOOL_SCRIPT_MAX_CALLS_LIMIT).contains(&max_calls) {
+        return Err(format!(
+            "max_calls must be between 1 and {TOOL_SCRIPT_MAX_CALLS_LIMIT}"
+        ));
+    }
+    if !(1..=TOOL_SCRIPT_MAX_STDOUT_BYTES_LIMIT).contains(&max_stdout_bytes) {
+        return Err(format!(
+            "max_stdout_bytes must be between 1 and {TOOL_SCRIPT_MAX_STDOUT_BYTES_LIMIT}"
+        ));
+    }
+    if !(1..=TOOL_SCRIPT_MAX_TIMEOUT_SECONDS).contains(&timeout_seconds) {
+        return Err(format!(
+            "timeout_seconds must be between 1 and {TOOL_SCRIPT_MAX_TIMEOUT_SECONDS}"
+        ));
+    }
+    Ok(ScriptLimits {
+        max_calls,
+        max_stdout_bytes,
+        timeout: Duration::from_secs(timeout_seconds),
+    })
+}
+
+fn run_tool_script(
+    script: &str,
+    request_tx: mpsc::UnboundedSender<ScriptRequest>,
+    output: Arc<ScriptOutput>,
+    diagnostics: Arc<StdMutex<Vec<String>>>,
+    abort_value: Arc<StdMutex<Option<Value>>>,
+    deadline: Instant,
+) -> Result<(), String> {
+    let mut engine = RhaiEngine::new_raw();
+    engine
+        .set_max_operations(TOOL_SCRIPT_MAX_OPERATIONS)
+        .set_max_call_levels(TOOL_SCRIPT_MAX_CALL_LEVELS)
+        .set_max_string_size(TOOL_SCRIPT_MAX_STRING_SIZE)
+        .set_max_array_size(TOOL_SCRIPT_MAX_ARRAY_SIZE);
+    engine.on_progress(move |_| {
+        if Instant::now() >= deadline {
+            Some("tool script wall-clock deadline exceeded".into())
+        } else {
+            None
+        }
+    });
+    let stdout = output.clone();
+    engine.register_fn("stdout", move |value: Dynamic| -> String {
+        let text = value.to_string();
+        let _ = stdout.append(&text);
+        text
+    });
+    let print_output = output.clone();
+    engine.register_fn("print", move |value: Dynamic| -> String {
+        let text = value.to_string();
+        let _ = print_output.append(&text);
+        text
+    });
+    let debug_output = diagnostics.clone();
+    engine.on_debug(move |message, source, position| {
+        debug_output
+            .lock()
+            .expect("script diagnostics mutex poisoned")
+            .push(format!(
+                "{}:{}:{}: {}",
+                source.unwrap_or("<script>"),
+                position.line().unwrap_or(0),
+                position.position().unwrap_or(0),
+                message
+            ));
+    });
+    let abort_for_call = abort_value.clone();
+    engine.register_fn(
+        "tool_call",
+        move |name: &str, arguments: Dynamic| -> Result<Dynamic, Box<EvalAltResult>> {
+            let arguments: Value = from_dynamic(&arguments).map_err(|error| {
+                Box::new(EvalAltResult::ErrorRuntime(
+                    format!("invalid call arguments: {error}").into(),
+                    Position::NONE,
+                ))
+            })?;
+            let (response_tx, response_rx) = std_mpsc::sync_channel(1);
+            request_tx
+                .send(ScriptRequest {
+                    name: name.to_owned(),
+                    arguments,
+                    response: response_tx,
+                })
+                .map_err(|_| {
+                    Box::new(EvalAltResult::ErrorRuntime(
+                        "tool script dispatcher stopped".into(),
+                        Position::NONE,
+                    ))
+                })?;
+            let response = response_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .map_err(|_| {
+                    Box::new(EvalAltResult::ErrorRuntime(
+                        "tool script wall-clock deadline exceeded".into(),
+                        Position::NONE,
+                    ))
+                })?;
+            match response {
+                ScriptResponse::Result(value) => to_dynamic(value).map_err(|error| {
+                    Box::new(EvalAltResult::ErrorRuntime(
+                        format!("tool result conversion failed: {error}").into(),
+                        Position::NONE,
+                    ))
+                }),
+                ScriptResponse::Abort(value) => {
+                    *abort_for_call.lock().expect("script abort mutex poisoned") = Some(value);
+                    Err(Box::new(EvalAltResult::ErrorRuntime(
+                        "tool script aborted".into(),
+                        Position::NONE,
+                    )))
+                }
+            }
+        },
+    );
+    engine
+        .eval::<Dynamic>(script)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 fn tool_risk(name: &str) -> ToolRisk {
     match name {
+        "desktop_show" | "session_rename" => ToolRisk::Read,
         "read_file"
         | "list_dir"
         | "git_status"
@@ -3992,7 +5685,10 @@ fn tool_risk(name: &str) -> ToolRisk {
         "lsp_definition" | "lsp_references" | "lsp_diagnostics" => ToolRisk::Read,
         "skill_search_learned" | "skill_get_learned" => ToolRisk::Read,
         "skill_save_learned" => ToolRisk::Write,
-        "coordination_dispatch" => ToolRisk::External,
+        "session_search" => ToolRisk::Read,
+        "config_asset_manage" | "learned_skill_manage" => ToolRisk::Write,
+        "automation_manage" => ToolRisk::Write,
+        "coordination_dispatch" | "coordination_fan_out" => ToolRisk::External,
         "coordination_status" => ToolRisk::Read,
         "action_ledger_list" => ToolRisk::Read,
         "action_ledger_begin" | "action_ledger_finish" => ToolRisk::Write,
@@ -4011,8 +5707,12 @@ fn tool_risk(name: &str) -> ToolRisk {
         "git_push" | "github_create_pull_request" => ToolRisk::External,
         "github_get_pull_request" | "github_ci_status" | "github_ci_failure_log" => ToolRisk::Read,
         "run_shell" => ToolRisk::Execute,
+        "tool_script" => ToolRisk::Execute,
         "secrets_list" => ToolRisk::Read,
-        "browser_status"
+        "recording_start"
+        | "recording_annotate"
+        | "recording_stop"
+        | "browser_status"
         | "browser_read"
         | "browser_measure"
         | "browser_assert_geometry"
@@ -4026,7 +5726,9 @@ fn tool_risk(name: &str) -> ToolRisk {
 }
 
 fn tool_event_category(name: &str) -> &'static str {
-    if name == "edit_file" {
+    if name.starts_with("recording_") {
+        "recording"
+    } else if name == "edit_file" {
         "file"
     } else if name.starts_with("repo_index_") || name == "list_dir" || name == "read_file" {
         "search"
@@ -4038,9 +5740,18 @@ fn tool_event_category(name: &str) -> &'static str {
         "shell"
     } else if name == "propose_plan" || name.starts_with("plan_") {
         "todo"
+    } else if matches!(name, "desktop_show" | "session_rename") {
+        "session"
     } else {
         "other"
     }
+}
+
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
 }
 
 fn is_major_tool(name: &str, category: &str) -> bool {
@@ -4700,10 +6411,13 @@ fn computer_use_parameters_schema() -> Value {
 
 fn tool_definitions() -> Vec<Value> {
     let mut tools = vec![
+        json!({"type":"function","function":{"name":"tool_search","description":"Search the compact catalog of deferred tools by name or purpose.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}),
+        json!({"type":"function","function":{"name":"tool_describe","description":"Load the complete schema for a deferred tool before calling it.","parameters":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}}}),
         json!({"type":"function","function":{"name":"read_file","description":"Read a remote file.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}),
         json!({"type":"function","function":{"name":"write_file","description":"Write a remote file. For changes to an existing file, prefer edit_file so unrelated content is preserved.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
         json!({"type":"function","function":{"name":"edit_file","description":"Apply one or more exact replacements to a remote UTF-8 text file. The required edits argument is an array of objects, each with old_string and new_string strings. Example: {\"path\":\"src/lib.rs\",\"edits\":[{\"old_string\":\"old code\",\"new_string\":\"new code\"}]}. Every old_string must match exactly once in the original file; ambiguous or missing matches fail with diagnostics. The whole call is atomic and preserves line endings. Prefer this over rewriting an existing file.","parameters":{"type":"object","examples":[{"path":"src/lib.rs","edits":[{"old_string":"old code","new_string":"new code"}]}],"properties":{"path":{"type":"string","description":"Remote workspace-relative file path."},"edits":{"type":"array","description":"One or more exact replacements, applied atomically.","minItems":1,"items":{"type":"object","properties":{"old_string":{"type":"string","description":"Exact existing text to replace, including whitespace and line breaks."},"new_string":{"type":"string","description":"Replacement text."}},"required":["old_string","new_string"],"additionalProperties":false}}},"required":["path","edits"],"additionalProperties":false}}}),
-        json!({"type":"function","function":{"name":"run_shell","description":"Run a shell command. Use cwd to select the workspace directory. Credentials are available only by naming configured secret_names; injected values are redacted from output.","parameters":{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"},"secret_names":{"type":"array","items":{"type":"string"},"description":"Configured secret names to inject into the child environment. This is the only supported credential path; values are redacted from output."}},"required":["command"]}}}),
+        json!({"type":"function","function":{"name":"run_shell","description":"Run a shell command with a 30-second default deadline. Set timeout_seconds up to 300 seconds when a command needs more time; genuinely long-running work belongs in background_job_start. Use cwd to select the workspace directory. Credentials are available only by naming configured secret_names; injected values are redacted from output.","parameters":{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":300,"default":30,"description":"Maximum command runtime in seconds; defaults to 30 and is capped at 300."},"secret_names":{"type":"array","items":{"type":"string"},"description":"Configured secret names to inject into the child environment. This is the only supported credential path; values are redacted from output."}},"required":["command"],"additionalProperties":false}}}),
+        json!({"type":"function","function":{"name":"tool_script","description":"Run a bounded Rhai script that calls allowed OPCOS tools repeatedly. Only stdout enters model context; child calls still produce normal script-scoped audit and working events. Limits are bounded by the engine.","parameters":{"type":"object","properties":{"script":{"type":"string","description":"Rhai source using tool_call(name, args) and stdout(text)."},"timeout_seconds":{"type":"integer","minimum":1,"maximum":300,"default":120},"max_calls":{"type":"integer","minimum":1,"maximum":512,"default":128},"max_stdout_bytes":{"type":"integer","minimum":1,"maximum":1048576,"default":65536}},"required":["script"],"additionalProperties":false}}}),
         json!({"type":"function","function":{"name":"browser_status","description":"Check whether an isolated local Chrome/Chromium CDP session is available. Read-only.","parameters":{"type":"object","properties":{}}}}),
         json!({"type":"function","function":{"name":"browser_navigate","description":"Navigate the isolated local browser to an HTTP(S) URL. Loopback targets do not require external approval; remote origins use a host-scoped external policy target.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}}),
         json!({"type":"function","function":{"name":"browser_set_viewport","description":"Set the isolated browser viewport size for responsive verification. This changes only local browser state and is a read-level operation.","parameters":{"type":"object","properties":{"width":{"type":"integer"},"height":{"type":"integer"}},"required":["width","height"]}}}),
@@ -4742,7 +6456,18 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"skill_save_learned","description":"Persist a reusable workflow explicitly described by the model. Nothing is auto-captured. The verification field is only a model assertion, never an OPCOS verification; credentials or secret-like values are rejected. Learned skills never modify user-authored skills.","parameters":{"type":"object","properties":{"title":{"type":"string"},"summary":{"type":"string"},"applies_when":{"type":"string"},"steps":{"type":"array","items":{"type":"string"}},"verification":{"type":"string"},"caveats":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}},"source_commit":{"type":"string"},"model_asserted_status":{"type":"string","enum":["model_asserted_validated","model_asserted_observed","model_asserted_partial"]},"supersedes_id":{"type":"string"}},"required":["title","summary","applies_when","steps","verification","source_commit","model_asserted_status"]}}}),
         json!({"type":"function","function":{"name":"skill_search_learned","description":"Search explicitly saved learned workflows for the current repository. Results are bounded to at most five and prominently mark source-commit mismatches as STALE CANDIDATE; model-asserted verification is not an objective fact.","parameters":{"type":"object","properties":{"query":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}}}}}}),
         json!({"type":"function","function":{"name":"skill_get_learned","description":"Read one explicitly saved learned workflow. The result includes its source commit, model-asserted verification status, version links, and stale/conflict warnings.","parameters":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}}),
+        json!({"type":"function","function":{"name":"session_search","description":"Search historical OPCOS sessions by title, metadata, time, or redacted transcript content. Read-only; secret-like values are redacted before results are returned.","parameters":{"type":"object","properties":{"query":{"type":"string"},"from":{"type":"string","description":"RFC3339 lower time bound."},"to":{"type":"string","description":"RFC3339 upper time bound."},"project_id":{"type":"string"},"status":{"type":"string"},"content_scope":{"type":"string","enum":["title","messages","events","tool_calls"]},"limit":{"type":"integer","minimum":1,"maximum":100}}}}}),
+        json!({"type":"function","function":{"name":"config_asset_manage","description":"Manage agent-owned knowledge or playbook assets. Only knowledge and playbook kinds are structurally available; every mutation is versioned, auditable, reversible, and tied to the current session. Do not use this for one-off notes.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["list","get","create","update","archive","delete","enable","disable","versions","rollback"]},"kind":{"type":"string","enum":["knowledge","playbook"]},"id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"project_id":{"type":"string"},"version":{"type":"integer"}},"required":["action"]}}}),
+        json!({"type":"function","function":{"name":"learned_skill_manage","description":"Manage explicitly learned workflows without touching user-authored .agents/skills files. Mutations are tied to the current session and audited; use archive/delete/restore or rollback for lifecycle changes.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["list","get","archive","delete","restore","rollback"]},"id":{"type":"string"},"supersedes_id":{"type":"string"}},"required":["action"]}}}),
+        json!({"type":"function","function":{"name":"automation_manage","description":"Manage bounded, auditable automation. Agent automations inherit the current session approval boundary; they cannot choose a permission mode or create unattended execution. Only enqueue_bounded_work and request_plan_goal are available. For schedule triggers, cron accepts @every N or */N * * * *.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["list","get","create","update","archive","delete","enable","disable","versions","rollback"]},"id":{"type":"string"},"name":{"type":"string"},"trigger":{"type":"string","enum":["schedule","event"]},"cron":{"type":"string","description":"Schedule syntax: @every N or */N * * * *"},"kind_pattern":{"type":"string"},"effect":{"type":"string","enum":["enqueue_bounded_work","request_plan_goal"]},"task_type":{"type":"string","enum":["repository_index_refresh"]},"payload":{"type":"object"},"max_cadence_seconds":{"type":"integer"},"max_in_flight":{"type":"integer"},"max_triggers":{"type":"integer"},"window_seconds":{"type":"integer"},"max_attempts":{"type":"integer"},"dedup_key":{"type":"string"},"idempotency_key":{"type":"string"}},"required":["action"]}}}),
         json!({"type":"function","function":{"name":"ask_user","description":"Ask the user a question and wait for an answer. When the user must choose from discrete answers, provide options; set allow_multiple to true when more than one option may be selected.","parameters":{"type":"object","properties":{"question":{"type":"string"},"options":{"type":"array","items":{"type":"string"},"description":"Optional discrete answer choices. Omit for an open-ended question."},"allow_multiple":{"type":"boolean","description":"Allow selecting more than one option from options."}},"required":["question"]}}}),
+        json!({"type":"function","function":{"name":"send_user_message","description":"Tell the user about progress, a risk, or a finding without waiting for a response or interrupting execution.","parameters":{"type":"object","properties":{"message":{"type":"string"},"kind":{"type":"string","enum":["progress","risk","finding"]}},"required":["message"]}}}),
+        json!({"type":"function","function":{"name":"report_blocker","description":"Report an operational environment or platform problem that is impeding work. This records and visibly reports the problem without changing control flow; use ask_user separately when a user decision is required.","parameters":{"type":"object","properties":{"severity":{"type":"string","enum":["hard","soft","friction"]},"category":{"type":"string","enum":["environment","platform","dependency","host","tool"]},"summary":{"type":"string"},"details":{"type":"string"},"attempted":{"type":"string"},"next_step":{"type":"string"}},"required":["severity","category","summary"]}}}),
+        json!({"type":"function","function":{"name":"recording_start","description":"Explicitly start a sampled screenshot timeline for UI-test evidence. Recording is never enabled by default. Frames are sampled, adjacent identical frames are deduplicated, and the recording stops at its frame or duration limit with truncation reported in the manifest.","parameters":{"type":"object","properties":{"source":{"type":"string","enum":["desktop","browser"]},"interval_ms":{"type":"integer","minimum":100},"max_frames":{"type":"integer","minimum":1},"max_duration_seconds":{"type":"integer","minimum":1}}}}}),
+        json!({"type":"function","function":{"name":"recording_annotate","description":"Add one consolidated annotation to the active sampled screenshot timeline. Use setup for preparation, test_start for a named test (prefer the natural 'It should ...' wording), and assertion after checking one meaningful state change. Keep text under 80 characters; assertions must reference a prior test_start and include passed, failed, or untested.","parameters":{"type":"object","properties":{"recording_id":{"type":"string"},"type":{"type":"string","enum":["setup","test_start","assertion"]},"text":{"type":"string","maxLength":80},"test_start_id":{"type":"string"},"result":{"type":"string","enum":["passed","failed","untested"]}},"required":["recording_id","type","text"]}}}),
+        json!({"type":"function","function":{"name":"recording_stop","description":"Explicitly stop the active sampled screenshot timeline and persist its manifest. The manifest states whether frame or duration limits truncated capture.","parameters":{"type":"object","properties":{"recording_id":{"type":"string"}},"required":["recording_id"]}}}),
+        json!({"type":"function","function":{"name":"send_user_message","description":"Tell the user about progress, a risk, or a finding without waiting for a response or interrupting execution.","parameters":{"type":"object","properties":{"message":{"type":"string"},"kind":{"type":"string","enum":["progress","risk","finding"]}},"required":["message"]}}}),
+        json!({"type":"function","function":{"name":"report_blocker","description":"Report an operational environment or platform problem that is impeding work. This records and visibly reports the problem without changing control flow; use ask_user separately when a user decision is required.","parameters":{"type":"object","properties":{"severity":{"type":"string","enum":["hard","soft","friction"]},"category":{"type":"string","enum":["environment","platform","dependency","host","tool"]},"summary":{"type":"string"},"details":{"type":"string"},"attempted":{"type":"string"},"next_step":{"type":"string"}},"required":["severity","category","summary"]}}}),
         json!({"type":"function","function":{"name":"linear_get_issue","description":"Read a Linear issue by identifier. Read-only.","parameters":{"type":"object","properties":{"identifier":{"type":"string"}},"required":["identifier"]}}}),
         json!({"type":"function","function":{"name":"linear_list_my_issues","description":"List Linear issues assigned to the current user. Read-only.","parameters":{"type":"object","properties":{"limit":{"type":"integer"}}}}}),
         json!({"type":"function","function":{"name":"linear_comment_issue","description":"Add a comment to a Linear issue. Requires approval.","parameters":{"type":"object","properties":{"issue_id":{"type":"string"},"body":{"type":"string"}},"required":["issue_id","body"]}}}),
@@ -4762,12 +6487,253 @@ fn tool_definitions() -> Vec<Value> {
         json!({"type":"function","function":{"name":"repo_index_find_symbol","description":"Find definitions and symbols in the repository index. Read-only.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}),
         json!({"type":"function","function":{"name":"repo_index_glob","description":"Find repository paths matching a glob. Read-only.","parameters":{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}}}),
         json!({"type":"function","function":{"name":"repo_index_search","description":"Search indexed symbol/content lines without loading whole files. Read-only.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}),
+        json!({"type":"function","function":{"name":"desktop_show","description":"Ask the OPCOS desktop to focus this session's Desktop/VNC surface so the user can inspect the live remote desktop. Use only when the user genuinely needs to see GUI actions or a running dev server. This is idempotent while Desktop is already focused; never send localhost URLs to the user.","parameters":{"type":"object","properties":{"reason":{"type":"string","description":"Why the user needs to inspect the desktop now."}}}}}),
+        json!({"type":"function","function":{"name":"session_rename","description":"Rename the current OPCOS session when its existing title is materially inconsistent with the work. Rename at most once for a coherent task; do not rename merely because the topic changes. This changes local session metadata and does not require user approval.","parameters":{"type":"object","properties":{"title":{"type":"string","description":"A concise non-empty session title, at most 80 Unicode characters."}},"required":["title"]}}}),
     ];
     tools.extend(action_ledger_tool_definitions());
     tools.extend(work_queue_tool_definitions());
     tools.push(json!({"type":"function","function":{"name":"external_ingress_sources","description":"List configured external event sources and their health state. Read-only; secret values are never returned.","parameters":{"type":"object","properties":{}}}}));
     tools.extend(coordination_tool_definitions());
     tools
+}
+
+/// Host-capability requirements for every builtin tool.
+///
+/// An empty requirement list is intentional: it marks an engine-only or
+/// externally-gated tool and is not an implicit default.
+pub fn builtin_tool_capability_requirements() -> Vec<(&'static str, &'static [&'static str])> {
+    const NONE: &[&str] = &[];
+    const READ: &[&str] = &["read"];
+    const READ_LS: &[&str] = &["read", "ls"];
+    const READ_LS_EXEC: &[&str] = &["read", "ls", "exec"];
+    const WRITE: &[&str] = &["write"];
+    const READ_WRITE: &[&str] = &["read", "write"];
+    const LS: &[&str] = &["ls"];
+    const EXEC: &[&str] = &["exec"];
+    const PROCESS: &[&str] = &["exec", "process_stream"];
+    const STDIO_LSP: &[&str] = &["exec", "stdio", "lsp"];
+    const BROWSER: &[&str] = &["browser"];
+    const SCREENSHOT: &[&str] = &["screenshot"];
+    const COMPUTER_USE: &[&str] = &["computer_use"];
+    let mut requirements = vec![
+        ("tool_search", NONE),
+        ("tool_describe", NONE),
+        ("read_file", READ),
+        ("write_file", WRITE),
+        ("edit_file", READ_WRITE),
+        ("run_shell", EXEC),
+        ("tool_script", NONE),
+        ("browser_status", BROWSER),
+        ("browser_navigate", BROWSER),
+        ("browser_set_viewport", BROWSER),
+        ("browser_click", BROWSER),
+        ("browser_read", BROWSER),
+        ("browser_measure", BROWSER),
+        ("browser_assert_geometry", BROWSER),
+        ("browser_screenshot", BROWSER),
+        ("computer_use", COMPUTER_USE),
+        ("lsp_definition", STDIO_LSP),
+        ("lsp_references", STDIO_LSP),
+        ("lsp_diagnostics", STDIO_LSP),
+        ("list_dir", LS),
+        ("recording_start", SCREENSHOT),
+        ("recording_annotate", SCREENSHOT),
+        ("recording_stop", SCREENSHOT),
+        ("send_user_message", NONE),
+        ("report_blocker", NONE),
+        ("ask_user", NONE),
+        ("linear_get_issue", NONE),
+        ("linear_list_my_issues", NONE),
+        ("linear_comment_issue", NONE),
+        ("linear_update_issue_status", NONE),
+        ("github_list_repositories", NONE),
+        ("github_list_issues", NONE),
+        ("github_create_issue", NONE),
+        ("github_create_pull_request", NONE),
+        ("github_get_pull_request", NONE),
+        ("github_ci_status", NONE),
+        ("github_ci_failure_log", NONE),
+        ("telegram_send_message", NONE),
+        ("discord_send_message", NONE),
+        ("slack_list_channels", NONE),
+        ("slack_post_message", NONE),
+        ("notion_search", NONE),
+        ("gitlab_list_projects", NONE),
+        ("gitlab_list_issues", NONE),
+        ("jira_search_issues", NONE),
+        ("stripe_list_charges", NONE),
+        ("repo_index_find_symbol", READ_LS),
+        ("repo_index_glob", READ_LS),
+        ("repo_index_search", READ_LS_EXEC),
+        ("git_create_branch", EXEC),
+        ("git_diff", EXEC),
+        ("git_log", EXEC),
+        ("git_push", EXEC),
+        ("git_rev_parse", EXEC),
+        ("git_stage_commit", EXEC),
+        ("git_status", EXEC),
+        ("local_gate_record", NONE),
+        ("local_gate_status", NONE),
+        ("desktop_show", NONE),
+        ("session_rename", NONE),
+        ("secrets_list", NONE),
+        ("session_search", NONE),
+        ("config_asset_manage", NONE),
+        ("learned_skill_manage", NONE),
+        ("skill_save_learned", EXEC),
+        ("skill_search_learned", NONE),
+        ("skill_get_learned", NONE),
+        ("memory_save_automatic", NONE),
+        ("memory_list", NONE),
+        ("memory_disable", NONE),
+        ("memory_delete", NONE),
+        ("automation_manage", NONE),
+        ("external_ingress_sources", NONE),
+        ("coordination_dispatch", NONE),
+        ("coordination_fan_out", NONE),
+        ("coordination_status", NONE),
+        ("action_ledger_begin", NONE),
+        ("action_ledger_finish", NONE),
+        ("action_ledger_list", NONE),
+        ("work_queue_enqueue", NONE),
+        ("work_queue_claim", NONE),
+        ("work_queue_renew", NONE),
+        ("work_queue_complete", NONE),
+        ("work_queue_cancel", NONE),
+        ("work_queue_requeue", NONE),
+        ("work_queue_list", NONE),
+        ("background_job_start", PROCESS),
+        ("background_job_status", PROCESS),
+        ("background_job_output", PROCESS),
+        ("background_job_kill", PROCESS),
+        ("propose_plan", NONE),
+        ("plan_get", NONE),
+        ("plan_update", NONE),
+        ("plan_revise", NONE),
+    ];
+    requirements.sort_unstable_by_key(|(name, _)| *name);
+    requirements
+}
+
+#[cfg(test)]
+#[test]
+fn every_builtin_tool_has_explicit_capability_requirements() {
+    let mapped = builtin_tool_capability_requirements()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<std::collections::HashSet<_>>();
+    for definition in tool_definitions() {
+        let name = tool_name(&definition).expect("builtin tool definition has a name");
+        assert!(
+            mapped.contains(name),
+            "missing capability mapping for builtin tool {name}"
+        );
+    }
+}
+
+fn tool_name(definition: &Value) -> Option<&str> {
+    definition
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+}
+
+const CONNECTOR_TOOL_PREFIXES: &[(&str, &str)] = &[
+    ("linear", "linear_"),
+    ("github", "github_"),
+    ("telegram", "telegram_"),
+    ("discord", "discord_"),
+    ("slack", "slack_"),
+    ("notion", "notion_"),
+    ("gitlab", "gitlab_"),
+    ("jira", "jira_"),
+    ("stripe", "stripe_"),
+];
+
+fn is_progressive_catalog_tool(name: &str) -> bool {
+    name.starts_with("browser_")
+        || name.starts_with("mcp:")
+        || name.contains("__")
+        || CONNECTOR_TOOL_PREFIXES
+            .iter()
+            .any(|(_, prefix)| name.starts_with(prefix))
+}
+
+fn tool_input_shape(definition: &Value) -> String {
+    let parameters = definition
+        .pointer("/function/parameters")
+        .and_then(Value::as_object);
+    let properties = parameters
+        .and_then(|parameters| parameters.get("properties"))
+        .and_then(Value::as_object)
+        .map(|properties| properties.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if properties.is_empty() {
+        "no arguments".to_owned()
+    } else {
+        format!("object with fields: {}", properties.join(", "))
+    }
+}
+
+fn first_useful_call(definition: &Value) -> String {
+    let name = tool_name(definition).unwrap_or("tool");
+    let required = definition
+        .pointer("/function/parameters/required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|field| format!("{field}=…"))
+        .collect::<Vec<_>>();
+    format!("{name}({})", required.join(", "))
+}
+
+fn compact_purpose(definition: &Value) -> String {
+    const MAX_PURPOSE_CHARS: usize = 160;
+    let purpose = definition
+        .pointer("/function/description")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .split_once('.')
+        .map_or_else(
+            || {
+                definition
+                    .pointer("/function/description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            },
+            |(first_sentence, _)| first_sentence,
+        )
+        .trim();
+    purpose.chars().take(MAX_PURPOSE_CHARS).collect()
+}
+
+fn catalog_entry(definition: &Value) -> Option<Value> {
+    let function = definition.get("function")?;
+    let name = function.get("name")?.as_str()?;
+    Some(json!({
+        "name": name,
+        "purpose": compact_purpose(definition),
+        "input_shape": tool_input_shape(definition),
+        "first_useful_call": first_useful_call(definition),
+    }))
+}
+
+fn tool_not_described_error(call: &ToolCall) -> Value {
+    structured_tool_error(
+        format!(
+            "tool {} is available in the catalog but has not been described",
+            call.name
+        ),
+        ToolErrorEnvelope::new(
+            ToolErrorCode::ToolNotDescribed,
+            "catalog tools must be described before direct invocation",
+            call.name.clone(),
+            format!("call tool_describe(name=\"{}\") and then retry", call.name),
+            ToolErrorRetry::Adjusted,
+            Some("use tool_search(query) to find catalog entries".into()),
+        ),
+    )
 }
 
 pub fn builtin_tool_names() -> HashSet<String> {
@@ -4782,10 +6748,46 @@ pub fn builtin_tool_names() -> HashSet<String> {
         .collect()
 }
 
+pub fn builtin_tool_definition_tokens() -> u64 {
+    serde_json::to_vec(&tool_definitions())
+        .map(|value| value.len() as u64 / 4)
+        .unwrap_or_default()
+}
+
+pub fn builtin_tool_catalog_tokens() -> u64 {
+    let entries = tool_definitions()
+        .iter()
+        .filter(|definition| tool_name(definition).is_some_and(is_progressive_catalog_tool))
+        .filter_map(catalog_entry)
+        .collect::<Vec<_>>();
+    serde_json::to_vec(&entries)
+        .map(|value| value.len() as u64 / 4)
+        .unwrap_or_default()
+}
+
+pub fn builtin_full_tool_catalog_tokens() -> u64 {
+    let entries = tool_definitions()
+        .iter()
+        .filter(|definition| tool_name(definition).is_some_and(is_progressive_catalog_tool))
+        .filter_map(|definition| {
+            let function = definition.get("function")?;
+            let name = function.get("name")?.as_str()?;
+            Some(json!({
+                "name": name,
+                "purpose": function.get("description").and_then(Value::as_str).unwrap_or(""),
+                "input_shape": tool_input_shape(definition),
+                "first_useful_call": first_useful_call(definition),
+            }))
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_vec(&entries)
+        .map(|value| value.len() as u64 / 4)
+        .unwrap_or_default()
+}
+
 pub fn coordination_tool_definitions() -> Vec<Value> {
     vec![
-        json!({"type":"function","function":{"name":"coordination_dispatch","description":"Dispatch work asynchronously from the current builtin OPCOS Leader session to an existing Worker role. Only a Leader may call this tool; the caller role is derived from the bound session and cannot be supplied by the model. This never creates sessions or recursively spawns agents. Returns a task id and pending status; Worker reports are not completion evidence.","parameters":{"type":"object","properties":{"task_id":{"type":"string"},"worker_role_id":{"type":"string"},"message":{"type":"string"}},"required":["task_id","worker_role_id","message"]}}}),
-        json!({"type":"function","function":{"name":"coordination_status","description":"Read bounded status for an asynchronously dispatched coordination task. Worker self-reports remain worker_reported/awaiting_verification; only verified branch, push, PR, and GitHub API checks can establish delivery. Returns recommended_after_seconds and does not block or encourage tight polling.","parameters":{"type":"object","properties":{"task_id":{"type":"string"},"limit":{"type":"integer"}},"required":["task_id"]}}}),
+        json!({"type":"function","function":{"name":"coordination_status","description":"Read bounded status for an asynchronously routed coordination batch. This is the only model-facing coordination inspection tool; dispatch and fan-out are desktop-managed internals. Worker self-reports remain worker_reported/awaiting_verification; only verified evidence can establish delivery.","parameters":{"type":"object","properties":{"task_id":{"type":"string"},"limit":{"type":"integer"}},"required":["task_id"]}}}),
     ]
 }
 
@@ -4879,7 +6881,16 @@ fn filter_allowed_tools(mut tools: Vec<Value>, allowed: Option<&HashSet<String>>
             tool.get("function")
                 .and_then(|function| function.get("name"))
                 .and_then(Value::as_str)
-                .is_some_and(|name| allowed.contains(name))
+                .is_some_and(|name| {
+                    allowed.contains(name)
+                        || matches!(
+                            name,
+                            "tool_search"
+                                | "tool_describe"
+                                | "send_user_message"
+                                | "report_blocker"
+                        )
+                })
         });
     }
     tools
@@ -4933,6 +6944,95 @@ struct PartialOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connector_tools_are_all_catalogued() {
+        let connector_tools = tool_definitions()
+            .into_iter()
+            .filter_map(|definition| tool_name(&definition).map(str::to_owned))
+            .filter(|name| {
+                CONNECTOR_TOOL_PREFIXES
+                    .iter()
+                    .any(|(_, prefix)| name.starts_with(prefix))
+            })
+            .collect::<Vec<_>>();
+        assert!(!connector_tools.is_empty());
+        assert!(
+            connector_tools
+                .iter()
+                .all(|name| is_progressive_catalog_tool(name))
+        );
+        let linear = tool_definitions()
+            .into_iter()
+            .find(|definition| tool_name(definition) == Some("linear_get_issue"))
+            .unwrap();
+        let entry = catalog_entry(&linear).unwrap();
+        assert_eq!(entry["first_useful_call"], "linear_get_issue(identifier=…)");
+        assert_eq!(entry["purpose"], "Read a Linear issue by identifier");
+    }
+
+    #[tokio::test]
+    async fn disabled_progressive_disclosure_does_not_execute_tool_search() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(FakeTools),
+            "session",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let result = engine
+            .execute_disclosure_tool(&ToolCall {
+                id: "call".into(),
+                name: "tool_search".into(),
+                arguments: json!({"query": "browser status"}),
+            })
+            .await;
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn agent_automation_has_structural_action_and_task_boundaries() {
+        assert_eq!(
+            AgentAutomationAction::parse("enqueue_bounded_work").map(AgentAutomationAction::as_str),
+            Some("enqueue_bounded_work")
+        );
+        assert_eq!(
+            AgentAutomationAction::parse("request_plan_goal").map(AgentAutomationAction::as_str),
+            Some("request_plan_goal")
+        );
+        assert!(AgentAutomationAction::parse("run_shell").is_none());
+        assert_eq!(
+            BoundedWorkType::parse("repository_index_refresh").map(BoundedWorkType::as_str),
+            Some("repository_index_refresh")
+        );
+        assert!(BoundedWorkType::parse("ci_repair_loop").is_none());
+        assert_eq!(tool_risk("automation_manage"), ToolRisk::Write);
+        let definition = tool_definitions()
+            .into_iter()
+            .find(|tool| tool["function"]["name"] == "automation_manage")
+            .unwrap();
+        assert_eq!(
+            definition["function"]["parameters"]["properties"]["effect"]["enum"],
+            json!(["enqueue_bounded_work", "request_plan_goal"])
+        );
+        assert_eq!(
+            definition["function"]["parameters"]["properties"]["task_type"]["enum"],
+            json!(["repository_index_refresh"])
+        );
+        assert_eq!(
+            definition["function"]["parameters"]["properties"]["cron"]["description"],
+            "Schedule syntax: @every N or */N * * * *"
+        );
+        assert!(
+            definition["function"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("@every N or */N * * * *")
+        );
+    }
 
     #[test]
     fn external_context_content_blocks_use_standard_text_fields() {
@@ -5054,6 +7154,257 @@ mod tests {
         assert!(!names.contains("run_shell"));
         assert!(!names.contains("write_file"));
         assert!(!names.contains("list_dir"));
+    }
+
+    #[test]
+    fn tool_script_allowlist_is_structural_and_rejects_secret_arguments() {
+        for name in [
+            "ask_user",
+            "propose_plan",
+            "plan_update",
+            "secrets_list",
+            "recording_start",
+            "desktop_show",
+            "session_rename",
+            "work_queue_enqueue",
+            "automation_manage",
+            "action_ledger_begin",
+            "background_job_start",
+            "tool_script",
+        ] {
+            assert!(!script_tool_allowed(name, &json!({})), "{name} was allowed");
+        }
+        assert!(!script_tool_allowed(
+            "run_shell",
+            &json!({"command": "echo safe", "nested": {"secret_names": ["token"]}})
+        ));
+        assert!(script_tool_allowed(
+            "run_shell",
+            &json!({"command": "echo safe"})
+        ));
+        assert!(script_tool_allowed("read_file", &json!({"path": "x"})));
+        assert!(script_tool_allowed(
+            "session_search",
+            &json!({"query": "approval"})
+        ));
+        for name in [
+            "external_ingress_sources",
+            "local_gate_record",
+            "local_gate_status",
+        ] {
+            assert_eq!(
+                script_tool_class(name),
+                Some(ScriptToolClass::SessionStateWrite)
+            );
+        }
+    }
+
+    #[test]
+    fn every_builtin_tool_has_an_explicit_script_classification() {
+        for name in builtin_tool_names() {
+            assert!(
+                script_tool_class(&name).is_some(),
+                "missing script classification for builtin tool {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_script_limits_use_defaults_and_reject_values_above_hard_bounds() {
+        let defaults = tool_script_limits(&json!({})).unwrap();
+        assert_eq!(defaults.max_calls, TOOL_SCRIPT_DEFAULT_MAX_CALLS);
+        assert_eq!(
+            defaults.max_stdout_bytes,
+            TOOL_SCRIPT_DEFAULT_MAX_STDOUT_BYTES
+        );
+        assert_eq!(
+            defaults.timeout,
+            Duration::from_secs(TOOL_SCRIPT_DEFAULT_TIMEOUT_SECONDS)
+        );
+        assert!(tool_script_limits(&json!({"timeout_seconds": 301})).is_err());
+        assert!(tool_script_limits(&json!({"max_calls": 513})).is_err());
+        assert!(tool_script_limits(&json!({"max_stdout_bytes": 1_048_577})).is_err());
+    }
+
+    #[tokio::test]
+    async fn tool_script_only_returns_stdout_and_audits_child_calls() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "script-session",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let result = engine
+            .execute_tool_script(&ToolCall {
+                id: "script-1".into(),
+                name: "tool_script".into(),
+                arguments: json!({"script": r#"let value = tool_call("read_file", #{path: "x"}); stdout("hello"); print("world");"#}),
+            })
+            .await;
+        assert_eq!(result["stdout"], "helloworld");
+        assert_eq!(result["calls_made"], 1);
+        assert_eq!(result["stopped_reason"], "completed");
+        assert!(
+            store
+                .load_audit(Some("script-session"))
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "tool_script_call_completed")
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_script_approval_aborts_without_pending() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(ApprovalQueueTools),
+            "approval-script",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let result = engine
+            .execute_tool_script(&ToolCall {
+                id: "script-approval".into(),
+                name: "tool_script".into(),
+                arguments: json!({"script": r#"tool_call("run_shell", #{command: "echo no"});"#}),
+            })
+            .await;
+        assert_eq!(result["stopped_reason"], "approval_required");
+        assert_eq!(result["error_details"]["code"], "approval_denied");
+        assert!(store.load_pending("approval-script").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_script_reports_call_stdout_and_deadline_limits() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(FakeTools),
+            "limit-script",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let calls = engine
+            .execute_tool_script_with_limits(
+                &ToolCall {
+                    id: "script-calls".into(),
+                    name: "tool_script".into(),
+                    arguments: json!({"script": r#"let x = 0; while x < 10 { tool_call("read_file", #{path: "x"}); x += 1; }"#}),
+                },
+                3,
+                TOOL_SCRIPT_DEFAULT_MAX_STDOUT_BYTES,
+                Duration::from_secs(1),
+            )
+            .await;
+        assert_eq!(calls["stopped_reason"], "call_limit");
+        assert_eq!(calls["calls_made"], 3);
+
+        let text = "x".repeat(1000);
+        let stdout = engine
+            .execute_tool_script_with_limits(
+                &ToolCall {
+                    id: "script-stdout".into(),
+                    name: "tool_script".into(),
+                    arguments: json!({"script": format!("let x = 0; while x < 100 {{ stdout(\"{text}\"); x += 1; }}")}),
+                },
+                TOOL_SCRIPT_DEFAULT_MAX_CALLS,
+                2048,
+                Duration::from_secs(1),
+            )
+            .await;
+        assert_eq!(stdout["stopped_reason"], "stdout_limit");
+        assert_eq!(stdout["stdout_truncated"], true);
+        assert!(stdout["stdout_omitted_bytes"].as_u64().unwrap() > 0);
+
+        let deadline_store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let deadline_engine = TurnEngine::new(
+            FakeProvider,
+            deadline_store.clone(),
+            Arc::new(TimingTools {
+                events: Arc::new(Mutex::new(Vec::new())),
+            }),
+            "deadline-script",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let deadline = deadline_engine
+            .execute_tool_script_with_limits(
+                &ToolCall {
+                    id: "script-deadline".into(),
+                    name: "tool_script".into(),
+                    arguments: json!({"script": r#"tool_call("read_file", #{path: "x"});"#}),
+                },
+                TOOL_SCRIPT_DEFAULT_MAX_CALLS,
+                TOOL_SCRIPT_DEFAULT_MAX_STDOUT_BYTES,
+                Duration::from_millis(20),
+            )
+            .await;
+        assert_eq!(deadline["stopped_reason"], "wall_clock_deadline");
+        assert!(
+            deadline_store
+                .load_audit(Some("deadline-script"))
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "tool_script_call_abandoned")
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_script_rejects_recursive_tool_script_calls() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(FakeTools),
+            "recursive-script",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let result = engine
+            .execute_tool_script(&ToolCall {
+                id: "script-recursive".into(),
+                name: "tool_script".into(),
+                arguments: json!({"script": r#"tool_call("tool_script", #{script: "stdout(\"bad\")"});"#}),
+            })
+            .await;
+        assert_eq!(result["stopped_reason"], "tool_not_allowed");
+        assert_eq!(result["calls_made"], 1);
+        assert_eq!(result["stdout"], "");
+    }
+
+    #[test]
+    fn builtin_prompt_tool_names_are_registered() {
+        let names = builtin_tool_names();
+        for name in opcos_assets::BUILTIN_AGENT_TOOL_NAMES {
+            assert!(
+                names.contains(*name),
+                "prompt tool is not registered: {name}"
+            );
+        }
+        for prefix in [
+            "repo_index_",
+            "lsp_",
+            "background_job_",
+            "action_ledger_",
+            "git_",
+            "github_",
+        ] {
+            assert!(
+                names.iter().any(|name| name.starts_with(prefix)),
+                "prompt tool prefix is not registered: {prefix}"
+            );
+        }
     }
 
     #[test]
@@ -5202,6 +7553,37 @@ mod tests {
         assert!(names.contains("skill_save_learned"));
         assert!(names.contains("skill_search_learned"));
         assert!(names.contains("skill_get_learned"));
+    }
+
+    #[test]
+    fn platform_management_tools_have_bounded_risk_and_surface() {
+        assert_eq!(tool_risk("session_search"), ToolRisk::Read);
+        assert_eq!(tool_risk("config_asset_manage"), ToolRisk::Write);
+        assert_eq!(tool_risk("learned_skill_manage"), ToolRisk::Write);
+        let names = tool_definitions()
+            .into_iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<HashSet<_>>();
+        for name in [
+            "session_search",
+            "config_asset_manage",
+            "learned_skill_manage",
+        ] {
+            assert!(names.contains(name), "missing builtin tool {name}");
+        }
+        let asset_kind = tool_definitions()
+            .into_iter()
+            .find(|tool| tool["function"]["name"] == "config_asset_manage")
+            .unwrap();
+        assert_eq!(
+            asset_kind["function"]["parameters"]["properties"]["kind"]["enum"],
+            json!(["knowledge", "playbook"])
+        );
     }
     #[derive(Clone)]
     struct FakeProvider;
@@ -6866,6 +9248,51 @@ mod tests {
             ),
             ("MCP transport unavailable", "mcp_transport", "same"),
             ("MCP transport error", "mcp_transport", "same"),
+            (
+                "host operation timed out after 30 seconds",
+                "timeout",
+                "adjusted",
+            ),
+            (
+                "unsupported operation timed out",
+                "remote_unsupported",
+                "no",
+            ),
+            (
+                "local host I/O failed: request timed out",
+                "host_io",
+                "same",
+            ),
+            (
+                "RVM request failed: error sending request for url (https://devbox.windevos.com/api/exec-sync): error trying to connect: tcp connect error: Connection refused",
+                "remote_transport",
+                "same",
+            ),
+            (
+                "RVM request failed: error sending request for url (https://devbox.windevos.com/api/health): error trying to connect: invalid peer certificate: UnknownIssuer",
+                "remote_transport",
+                "same",
+            ),
+            (
+                "RVM request failed: error sending request for url (https://devbox.windevos.com/api/exec-sync): operation timed out",
+                "remote_transport",
+                "same",
+            ),
+            (
+                "RVM returned HTTP 401 Unauthorized: unauthorized",
+                "unclassified",
+                "same",
+            ),
+            (
+                "RVM returned HTTP 404 Not Found: capability unavailable",
+                "remote_unsupported",
+                "no",
+            ),
+            (
+                "RVM request failed: computer-use rejected: unsupported action",
+                "remote_unsupported",
+                "no",
+            ),
             ("MCP server authentication required", "mcp_auth", "adjusted"),
             ("tool call denied by user", "approval_denied", "no"),
             (
@@ -7709,6 +10136,82 @@ mod tests {
         assert_eq!(event.payload["payload"]["allow_multiple"], false);
     }
 
+    #[tokio::test]
+    async fn user_communication_tools_persist_and_emit_without_pending() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "communications",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let calls = vec![
+            ToolCall {
+                id: "message-1".into(),
+                name: "send_user_message".into(),
+                arguments: json!({
+                    "message": "I found the relevant workspace entry.",
+                    "kind": "finding",
+                }),
+            },
+            ToolCall {
+                id: "blocker-1".into(),
+                name: "report_blocker".into(),
+                arguments: json!({
+                    "severity": "hard",
+                    "category": "host",
+                    "summary": "The remote host is unavailable.",
+                    "details": "The last connection attempt failed.",
+                }),
+            },
+            ToolCall {
+                id: "read-1".into(),
+                name: "read_file".into(),
+                arguments: json!({"path": "README.md"}),
+            },
+        ];
+        for call in &calls {
+            store
+                .append_tool_call(&opcos_store::ToolCallRecord {
+                    session_id: "communications".into(),
+                    message_sequence: 1,
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    result: None,
+                })
+                .unwrap();
+        }
+
+        let results = engine.execute_tools(1, &calls).await.unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0]["status"], "delivered");
+        assert_eq!(results[1]["status"], "reported");
+        assert_eq!(results[1]["control_flow"], "unchanged");
+        assert_eq!(results[2], json!("ok"));
+        assert!(store.load_pending("communications").unwrap().is_empty());
+
+        let events = store.load_session_events("communications").unwrap();
+        assert!(events.iter().any(|event| {
+            event.event["type"] == "agent_message"
+                && event.event["working_event"]["payload"]["message"]
+                    == "I found the relevant workspace entry."
+        }));
+        assert!(events.iter().any(|event| {
+            event.event["type"] == "operational_blocker"
+                && event.event["working_event"]["payload"]["severity"] == "hard"
+        }));
+        assert_eq!(
+            store
+                .count_audit_kind("communications", "operational_blocker")
+                .unwrap(),
+            1
+        );
+    }
+
     #[test]
     fn ask_user_tool_schema_supports_discrete_options() {
         let definition = tool_definitions()
@@ -7725,6 +10228,21 @@ mod tests {
     }
 
     #[test]
+    fn user_communication_tool_schemas_are_registered() {
+        let names = builtin_tool_names();
+        assert!(names.contains("send_user_message"));
+        assert!(names.contains("report_blocker"));
+        let blocker = tool_definitions()
+            .into_iter()
+            .find(|tool| tool["function"]["name"] == "report_blocker")
+            .expect("report_blocker tool definition");
+        assert_eq!(
+            blocker["function"]["parameters"]["properties"]["severity"]["enum"],
+            json!(["hard", "soft", "friction"])
+        );
+    }
+
+    #[test]
     fn shell_tool_schemas_expose_workspace_and_secret_injection() {
         for name in ["run_shell", "background_job_start"] {
             let definition = tool_definitions()
@@ -7734,6 +10252,17 @@ mod tests {
             let properties = &definition["function"]["parameters"]["properties"];
             assert_eq!(properties["cwd"]["type"], "string");
             assert_eq!(properties["secret_names"]["type"], "array");
+            if name == "run_shell" {
+                assert_eq!(properties["timeout_seconds"]["minimum"], 1);
+                assert_eq!(properties["timeout_seconds"]["maximum"], 300);
+                assert_eq!(properties["timeout_seconds"]["default"], 30);
+                assert!(
+                    definition["function"]["description"]
+                        .as_str()
+                        .unwrap()
+                        .contains("background_job_start")
+                );
+            }
         }
     }
 
@@ -9528,21 +12057,145 @@ mod tests {
     }
 
     #[test]
-    fn coordination_tools_are_leader_dispatch_only_and_do_not_accept_from_role() {
+    fn coordination_dispatch_and_fan_out_are_internal_not_model_tools() {
         let tools = coordination_tool_definitions();
-        let dispatch = tools
-            .iter()
-            .find(|tool| {
-                tool.pointer("/function/name").and_then(Value::as_str)
-                    == Some("coordination_dispatch")
-            })
-            .unwrap();
-        let properties = dispatch.pointer("/function/parameters/properties").unwrap();
-        assert!(properties.get("task_id").is_some());
-        assert!(properties.get("worker_role_id").is_some());
-        assert!(properties.get("message").is_some());
-        assert!(properties.get("from_role").is_none());
+        assert!(!tools.iter().any(|tool| {
+            matches!(
+                tool.pointer("/function/name").and_then(Value::as_str),
+                Some("coordination_dispatch" | "coordination_fan_out")
+            )
+        }));
+        assert!(tools.iter().any(|tool| {
+            tool.pointer("/function/name").and_then(Value::as_str) == Some("coordination_status")
+        }));
         assert_eq!(tool_risk("coordination_dispatch"), ToolRisk::External);
         assert_eq!(tool_risk("coordination_status"), ToolRisk::Read);
+    }
+
+    #[test]
+    fn recording_tools_are_registered_as_read_level_engine_tools() {
+        let tools = tool_definitions();
+        for name in ["recording_start", "recording_annotate", "recording_stop"] {
+            assert!(tools.iter().any(|tool| {
+                tool.pointer("/function/name").and_then(Value::as_str) == Some(name)
+            }));
+            assert_eq!(tool_risk(name), ToolRisk::Read);
+        }
+    }
+
+    #[tokio::test]
+    async fn recording_deduplicates_frames_and_requires_assertion_test_start() {
+        struct Source;
+        #[async_trait]
+        impl RecordingSource for Source {
+            async fn capture_frame(&self, _source: &str) -> Result<CapturedFrame, String> {
+                Ok(CapturedFrame {
+                    content: b"same-frame".to_vec(),
+                    mime: "image/png".into(),
+                    source: "desktop".into(),
+                })
+            }
+        }
+        struct Sink(Arc<StdMutex<Vec<ArtifactRequest>>>);
+        #[async_trait]
+        impl ArtifactSink for Sink {
+            async fn persist(&self, request: ArtifactRequest) -> Result<ArtifactReference, String> {
+                let id = format!("artifact-{}", self.0.lock().unwrap().len());
+                self.0.lock().unwrap().push(request.clone());
+                Ok(ArtifactReference {
+                    id,
+                    name: request.name,
+                    kind: request.kind,
+                    mime: request.mime,
+                    size_bytes: request.content.len() as u64,
+                })
+            }
+        }
+        let store = Arc::new(opcos_store::SqliteStore::open_in_memory().unwrap());
+        let artifacts = Arc::new(StdMutex::new(Vec::new()));
+        let mut engine = TurnEngine::new(
+            FakeProvider,
+            store,
+            Arc::new(FakeTools),
+            "recording-test",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine.set_artifact_sink(Arc::new(Sink(artifacts.clone())));
+        engine.set_recording_source(Arc::new(Source));
+        let recording = engine
+            .start_recording(&ToolCall {
+                id: "start".into(),
+                name: "recording_start".into(),
+                arguments: json!({"interval_ms": 100, "max_frames": 3}),
+            })
+            .await;
+        let recording_id = recording["recording_id"].as_str().unwrap().to_owned();
+        let invalid = engine
+            .annotate_recording(&ToolCall {
+                id: "invalid".into(),
+                name: "recording_annotate".into(),
+                arguments: json!({
+                    "recording_id": recording_id,
+                    "type": "assertion",
+                    "text": "The state changed",
+                    "result": "passed",
+                    "test_start_id": "missing"
+                }),
+            })
+            .await;
+        assert!(invalid.get("error").is_some());
+        let start = engine
+            .annotate_recording(&ToolCall {
+                id: "annotation".into(),
+                name: "recording_annotate".into(),
+                arguments: json!({
+                    "recording_id": recording_id,
+                    "type": "test_start",
+                    "text": "It should show the result"
+                }),
+            })
+            .await;
+        let test_start_id = start["annotation_id"].as_str().unwrap().to_owned();
+        let assertion = engine
+            .annotate_recording(&ToolCall {
+                id: "assertion".into(),
+                name: "recording_annotate".into(),
+                arguments: json!({
+                    "recording_id": recording_id,
+                    "type": "assertion",
+                    "text": "Result is visible",
+                    "result": "passed",
+                    "test_start_id": test_start_id
+                }),
+            })
+            .await;
+        assert_eq!(assertion["status"], "recorded");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let stopped = engine
+            .stop_recording(&ToolCall {
+                id: "stop".into(),
+                name: "recording_stop".into(),
+                arguments: json!({"recording_id": recording_id}),
+            })
+            .await;
+        assert_eq!(stopped["status"], "stopped");
+        assert!(stopped["frame_count"].as_u64().unwrap_or_default() >= 1);
+        let requests = artifacts.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.kind == "recording_frame")
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.kind == "recording_manifest")
+                .count(),
+            1
+        );
     }
 }

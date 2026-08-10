@@ -349,6 +349,7 @@ pub struct WsParams {
 pub type RvmWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 pub const DEFAULT_EXEC_TIMEOUT_SECONDS: u64 = 30;
+pub const MAX_EXEC_TIMEOUT_SECONDS: u64 = 300;
 pub const LIFECYCLE_EXEC_TIMEOUT_SECONDS: u64 = 30 * 60;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -585,13 +586,35 @@ where
         command: impl Into<String>,
         env: Option<Value>,
     ) -> Result<ExecResult, RvmError> {
+        self.exec_with_env_timeout(command, env, DEFAULT_EXEC_TIMEOUT_SECONDS)
+            .await
+    }
+
+    pub async fn exec_with_env_timeout(
+        &mut self,
+        command: impl Into<String>,
+        env: Option<Value>,
+        timeout_seconds: u64,
+    ) -> Result<ExecResult, RvmError> {
         let command = command.into();
         let result = self
-            .exec_once(&command, self.cwd.clone(), env.clone())
+            .exec_once(
+                &command,
+                self.cwd.clone(),
+                env.clone(),
+                timeout_seconds.clamp(1, MAX_EXEC_TIMEOUT_SECONDS),
+            )
             .await?;
         if self.session_lost(&result) {
             self.rebuild_cwd().await?;
-            let retry = self.exec_once(&command, None, env).await?;
+            let retry = self
+                .exec_once(
+                    &command,
+                    None,
+                    env,
+                    timeout_seconds.clamp(1, MAX_EXEC_TIMEOUT_SECONDS),
+                )
+                .await?;
             if self.session_lost(&retry) {
                 return Err(RvmError::Session(retry.result.stderr.trim().to_owned()));
             }
@@ -607,12 +630,13 @@ where
         command: &str,
         cwd: Option<String>,
         env: Option<Value>,
+        timeout_seconds: u64,
     ) -> Result<ExecResult, RvmError> {
         self.client
             .exec_sync(ExecRequest {
                 command: command.to_owned(),
                 cwd,
-                timeout_seconds: DEFAULT_EXEC_TIMEOUT_SECONDS,
+                timeout_seconds,
                 session: Some(self.session.clone()),
                 env,
             })
@@ -643,7 +667,9 @@ where
             } else {
                 format!("cd -- '{cwd}'")
             };
-            let result = self.exec_once(&command, None, None).await?;
+            let result = self
+                .exec_once(&command, None, None, DEFAULT_EXEC_TIMEOUT_SECONDS)
+                .await?;
             if result.result.exit_code != 0 || self.session_lost(&result) {
                 return Err(RvmError::Session(result.result.stderr.trim().to_owned()));
             }
@@ -2010,6 +2036,7 @@ mod tests {
     struct MockShellClient {
         responses: Arc<Mutex<VecDeque<ExecResult>>>,
         calls: Arc<AtomicUsize>,
+        timeouts: Arc<Mutex<Vec<u64>>>,
     }
 
     impl MockShellClient {
@@ -2017,6 +2044,7 @@ mod tests {
             Self {
                 responses: Arc::new(Mutex::new(responses.into())),
                 calls: Arc::new(AtomicUsize::new(0)),
+                timeouts: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -2032,8 +2060,9 @@ mod tests {
         async fn capabilities(&self) -> Result<Capabilities, RvmError> {
             unreachable!()
         }
-        async fn exec_sync(&self, _: ExecRequest) -> Result<ExecResult, RvmError> {
+        async fn exec_sync(&self, request: ExecRequest) -> Result<ExecResult, RvmError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
+            self.timeouts.lock().unwrap().push(request.timeout_seconds);
             self.responses
                 .lock()
                 .unwrap()
@@ -2125,6 +2154,18 @@ mod tests {
         let result = shell.exec("cd subdir").await.unwrap();
         assert_eq!(result.result.cwd.as_deref(), Some("/workspace/subdir"));
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn persistent_shell_forwards_explicit_timeout() {
+        let client = MockShellClient::new(vec![shell_result(None, Some("/workspace"), "")]);
+        let timeouts = client.timeouts.clone();
+        let mut shell = PersistentShell::new(client, "shell-1", Some("/workspace".into()));
+        shell
+            .exec_with_env_timeout("sleep 40", None, 60)
+            .await
+            .unwrap();
+        assert_eq!(&*timeouts.lock().unwrap(), &[60]);
     }
 
     #[tokio::test]

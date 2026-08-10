@@ -18,14 +18,15 @@ use futures_util::{SinkExt, StreamExt};
 use notify::Watcher;
 use opcos_assets::{
     AssetBundle, CommandArgument, CommandEntry, InstructionSource, KnowledgeContext,
-    KnowledgeEntry, Playbook, SkillEntry, builtin_mcp_catalog, discover as discover_assets,
-    expand_command, parse_blueprint, parse_command,
+    KnowledgeEntry, MemoryEntry, Playbook, SkillEntry, UserPreference, builtin_mcp_catalog,
+    discover as discover_assets, expand_command, parse_blueprint, parse_command,
 };
 use opcos_engine::SecretScrubber;
 use opcos_engine::{
-    AcpHarness, AcpHarnessConfig, AgentEngine, ArtifactReference, ArtifactRequest, ArtifactSink,
-    EngineError, ExternalContextAttachment, Harness, LifecycleHook, LifecycleHookConfig,
-    PreflightDecision, SessionRecorder, ToolExecutor, ToolOrigin, TurnEngine,
+    AcpHarness, AcpHarnessConfig, AgentAutomationAction, AgentEngine, AgentRole, ArtifactReference,
+    ArtifactRequest, ArtifactSink, BoundedWorkType, CapturedFrame, EngineError,
+    ExternalContextAttachment, Harness, LifecycleHook, LifecycleHookConfig, PreflightDecision,
+    RecordingSource, SessionRecorder, ToolExecutor, ToolOrigin, TurnEngine,
     computer_use::{
         BestEffortScreenshotChangedVerifier, ComputerUseLoopConfig, ComputerUseStep,
         run_computer_use_loop,
@@ -42,9 +43,10 @@ use opcos_engine::{
     planner::{parse_planner_output, planner_dedup_key, planning_prompt},
 };
 use opcos_hosts::{
-    BackgroundJobManager, BrowserController, BrowserRequest, ComputerUseAction,
-    DEFAULT_EXEC_TIMEOUT_SECONDS, Host, LIFECYCLE_EXEC_TIMEOUT_SECONDS, LifecycleStage, LocalHost,
-    RvmHost, ScreenBounds, SecretValues, SpawnRequest, execute_lifecycle_stage,
+    BackgroundJobManager, BrowserController, BrowserRequest, Capability, CapabilityState,
+    ComputerUseAction, DEFAULT_EXEC_TIMEOUT_SECONDS, Host, HostCapabilities,
+    LIFECYCLE_EXEC_TIMEOUT_SECONDS, LifecycleStage, LocalHost, RvmHost, ScreenBounds, SecretValues,
+    SpawnRequest, execute_lifecycle_stage,
 };
 use opcos_lsp::LspClient;
 use opcos_mcp::{
@@ -57,14 +59,15 @@ use opcos_provider::openai::OpenAiProvider;
 use opcos_provider::registry;
 use opcos_provider::{Provider, ProviderConfig};
 use opcos_rvm::{
-    ExecRequest, HttpRvmClient, IdeBootstrap, PersistentShell, RemotePathGuard, RvmClient,
-    RvmClientConfig, WsKind, WsParams, join_remote_path,
+    ExecRequest, HttpRvmClient, IdeBootstrap, MAX_EXEC_TIMEOUT_SECONDS, PersistentShell,
+    RemotePathGuard, RvmClient, RvmClientConfig, WsKind, WsParams, join_remote_path,
 };
 use opcos_store::{
     ActionBeginResult, ArtifactRecord, CiMonitor, KeyringSecretStore, LoginProfileRecord,
     LoginStateBackupRecord, ProjectAgentRecord, ProjectRecord, SecretStore, SessionRecord,
     SessionStore, SqliteStore, ToolCallRecord,
 };
+use opcos_trace::export_session as export_trace_session;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -388,9 +391,12 @@ where
             let server_task = tokio::spawn(async move {
                 let protocol = opcos_acp_server::OpcosAcpServer::new(control_plane);
                 let (reader, writer) = tokio::io::split(server_io);
-                let _ = protocol
+                if let Err(error) = protocol
                     .serve_stdio(tokio::io::BufReader::new(reader), writer)
-                    .await;
+                    .await
+                {
+                    eprintln!("ACP connection terminated: {error}");
+                }
             });
             let (mut ws_writer, mut ws_reader) = socket.split();
             let (client_reader, mut client_writer) = tokio::io::split(client);
@@ -825,6 +831,7 @@ struct RemoteExecutor {
     coordination: Arc<AsyncMutex<HashMap<String, CoordinationRuntime>>>,
     origin: ToolOrigin,
     repair_loop: Option<RepairLoopContext>,
+    capabilities: HostCapabilities,
 }
 
 struct LocalExecutor {
@@ -844,11 +851,69 @@ struct LocalExecutor {
     origin: ToolOrigin,
     repair_loop: Option<RepairLoopContext>,
     browser: Arc<dyn BrowserController>,
+    capabilities: HostCapabilities,
 }
 
 enum DesktopExecutor {
     Remote(Box<RemoteExecutor>),
     Local(Box<LocalExecutor>),
+}
+
+#[async_trait]
+impl RecordingSource for DesktopExecutor {
+    async fn capture_frame(&self, source: &str) -> Result<CapturedFrame, String> {
+        let screenshot = match self {
+            Self::Remote(executor) => {
+                if source == "browser" {
+                    return Err("remote browser recording is unsupported".into());
+                }
+                let host = RvmHost::new(
+                    executor.host_id.clone(),
+                    executor.workspace.clone(),
+                    executor.client.clone(),
+                );
+                host.screenshot().await
+            }
+            Self::Local(executor) => {
+                if source == "browser" {
+                    let value = executor
+                        .browser
+                        .execute(BrowserRequest {
+                            operation: "screenshot".into(),
+                            arguments: json!({}),
+                        })
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let image = value
+                        .get("image")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "browser screenshot image is missing".to_owned())?;
+                    return Ok(CapturedFrame {
+                        content: base64::engine::general_purpose::STANDARD
+                            .decode(image)
+                            .map_err(|error| format!("screenshot base64 is invalid: {error}"))?,
+                        mime: "image/png".into(),
+                        source: "browser".into(),
+                    });
+                }
+                executor.host.screenshot().await
+            }
+        }
+        .map_err(|error| error.to_string())?;
+        let mime = match screenshot.format.as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            _ => "image/png",
+        };
+        let content = base64::engine::general_purpose::STANDARD
+            .decode(screenshot.image)
+            .map_err(|error| format!("screenshot base64 is invalid: {error}"))?;
+        Ok(CapturedFrame {
+            content,
+            mime: mime.into(),
+            source: source.into(),
+        })
+    }
 }
 
 fn reject_learned_secret(text: &str, known: &[String]) -> Result<(), String> {
@@ -876,6 +941,243 @@ fn reject_learned_secret(text: &str, known: &[String]) -> Result<(), String> {
         return Err("learned skill rejected: credential-bearing URL syntax".into());
     }
     Ok(())
+}
+
+fn reject_automatic_memory(text: &str, known: &[String]) -> Result<(), String> {
+    reject_learned_secret(text, known).map_err(|error| {
+        error
+            .replacen("learned skill", "automatic memory", 1)
+            .to_owned()
+    })?;
+    Ok(())
+}
+
+fn known_secret_values(secrets: &KeyringSecretStore, project_id: Option<&str>) -> Vec<String> {
+    let known_names = [
+        "github",
+        "gitlab",
+        "linear-pat",
+        "telegram",
+        "discord",
+        "slack",
+        "rvm-token",
+    ];
+    let mut known = known_names
+        .iter()
+        .flat_map(|name| {
+            [
+                scoped_secret_get_from_store(secrets, project_id, "connector-token", name),
+                scoped_secret_get_from_store(secrets, project_id, "asset-secret", name),
+                scoped_secret_get_from_store(secrets, project_id, "mcp-credential", name),
+            ]
+        })
+        .filter_map(Result::ok)
+        .flatten()
+        .collect::<Vec<_>>();
+    for provider in registry::descriptors() {
+        for prefix in ["provider-key", "asset-secret"] {
+            if let Ok(Some(value)) =
+                scoped_secret_get_from_store(secrets, project_id, prefix, &provider.name)
+            {
+                known.push(value);
+            }
+        }
+    }
+    known
+}
+
+fn automatic_memory_json(record: &opcos_store::AutomaticMemoryRecord) -> Value {
+    json!({
+        "id": record.id,
+        "repository_identity": record.repository_identity,
+        "project_id": record.project_id,
+        "identifier": record.identifier,
+        "description": record.description,
+        "source_session_id": record.source_session_id,
+        "source_task": record.source_task,
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
+        "status": record.status,
+        "supersedes_id": record.supersedes_id,
+        "superseded_by_id": record.superseded_by_id,
+        "conflict_group": record.conflict_group,
+    })
+}
+
+fn execute_automatic_memory_tool(
+    store: &SqliteStore,
+    secrets: &KeyringSecretStore,
+    project_id: Option<&str>,
+    session_id: &str,
+    workspace: &str,
+    name: &str,
+    arguments: &Value,
+) -> Result<Value, String> {
+    let repository_identity = project_id
+        .map(|id| format!("project:{id}"))
+        .unwrap_or_else(|| format!("workspace:{workspace}"));
+    match name {
+        "memory_save_automatic" => {
+            let identifier = arguments
+                .get("identifier")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or("missing memory identifier")?
+                .to_owned();
+            let description = arguments
+                .get("description")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or("missing memory description")?
+                .to_owned();
+            let source_task = arguments
+                .get("source_task")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or("missing memory source_task")?
+                .to_owned();
+            reject_automatic_memory(
+                &format!("{identifier}\n{description}\n{source_task}"),
+                &known_secret_values(secrets, project_id),
+            )?;
+            let record = store
+                .merge_automatic_memory(opcos_store::AutomaticMemoryRecord {
+                    id: String::new(),
+                    repository_identity,
+                    project_id: project_id.map(str::to_owned),
+                    identifier,
+                    description,
+                    source_session_id: session_id.to_owned(),
+                    source_task,
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                    status: "active".into(),
+                    supersedes_id: None,
+                    superseded_by_id: None,
+                    conflict_group: arguments
+                        .get("conflict_group")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                })
+                .map_err(|error| error.to_string())?;
+            Ok(json!({"saved": automatic_memory_json(&record)}))
+        }
+        "memory_list" => {
+            let records = store
+                .list_automatic_memories(
+                    &repository_identity,
+                    arguments
+                        .get("include_inactive")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(json!({
+                "memories": records.iter().map(automatic_memory_json).collect::<Vec<_>>()
+            }))
+        }
+        "memory_disable" => {
+            let id = arguments
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or("missing memory id")?;
+            store
+                .set_automatic_memory_status(id, "disabled")
+                .map_err(|error| error.to_string())?;
+            Ok(json!({"disabled": id}))
+        }
+        "memory_delete" => {
+            let id = arguments
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or("missing memory id")?;
+            let deleted = store
+                .delete_automatic_memory(id)
+                .map_err(|error| error.to_string())?;
+            Ok(json!({"deleted": deleted, "id": id}))
+        }
+        _ => Err(format!("unsupported automatic memory tool: {name}")),
+    }
+}
+
+#[tauri::command]
+fn list_automatic_memories_command(
+    state: State<'_, DesktopState>,
+    repository_identity: String,
+    include_inactive: Option<bool>,
+) -> Result<Vec<Value>, String> {
+    state
+        .store
+        .list_automatic_memories(&repository_identity, include_inactive.unwrap_or(false))
+        .map(|records| records.iter().map(automatic_memory_json).collect())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn save_automatic_memory_command(
+    state: State<'_, DesktopState>,
+    request: SaveAutomaticMemoryRequest,
+) -> Result<Value, String> {
+    reject_automatic_memory(
+        &format!(
+            "{}\n{}\n{}",
+            request.identifier, request.description, request.source_task
+        ),
+        &known_secret_values(&state.secrets, request.project_id.as_deref()),
+    )?;
+    state
+        .store
+        .merge_automatic_memory(opcos_store::AutomaticMemoryRecord {
+            id: String::new(),
+            repository_identity: request.repository_identity,
+            project_id: request.project_id,
+            identifier: request.identifier,
+            description: request.description,
+            source_session_id: request.source_session_id,
+            source_task: request.source_task,
+            created_at: String::new(),
+            updated_at: String::new(),
+            status: "active".into(),
+            supersedes_id: None,
+            superseded_by_id: None,
+            conflict_group: request.conflict_group.unwrap_or_default(),
+        })
+        .map(|record| automatic_memory_json(&record))
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+struct SaveAutomaticMemoryRequest {
+    repository_identity: String,
+    project_id: Option<String>,
+    source_session_id: String,
+    source_task: String,
+    identifier: String,
+    description: String,
+    conflict_group: Option<String>,
+}
+
+#[tauri::command]
+fn disable_automatic_memory_command(
+    state: State<'_, DesktopState>,
+    id: String,
+) -> Result<(), String> {
+    state
+        .store
+        .set_automatic_memory_status(&id, "disabled")
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn delete_automatic_memory_command(
+    state: State<'_, DesktopState>,
+    id: String,
+) -> Result<bool, String> {
+    state
+        .store
+        .delete_automatic_memory(&id)
+        .map_err(|error| error.to_string())
 }
 
 async fn learned_current_commit(host: &dyn Host, workspace: &str) -> String {
@@ -924,9 +1226,11 @@ fn learned_skill_json(record: &opcos_store::LearnedSkillRecord, current_commit: 
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_learned_skill_tool(
     store: &SqliteStore,
     secrets: &KeyringSecretStore,
+    session_id: &str,
     project_id: Option<&str>,
     host: &dyn Host,
     workspace: &str,
@@ -1048,6 +1352,16 @@ async fn execute_learned_skill_tool(
                     conflict_group: String::new(),
                 })
                 .map_err(|error| error.to_string())?;
+            store
+                .record_learned_skill_source(&record.id, session_id)
+                .map_err(|error| error.to_string())?;
+            store
+                .append_audit(
+                    session_id,
+                    "learned_skill_create",
+                    &json!({"id": record.id, "source_session_id": session_id}),
+                )
+                .map_err(|error| error.to_string())?;
             Ok(
                 json!({"saved": learned_skill_json(&record, &current_commit),
                 "warning": "model_asserted_status is not independently verified by OPCOS"}),
@@ -1101,9 +1415,430 @@ async fn execute_learned_skill_tool(
                 .get_learned_skill(id)
                 .map_err(|error| error.to_string())?
                 .ok_or("learned skill not found")?;
-            Ok(learned_skill_json(&record, &current_commit))
+            let mut value = learned_skill_json(&record, &current_commit);
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "source_session_id".into(),
+                    store
+                        .learned_skill_provenance(id)
+                        .map_err(|error| error.to_string())?
+                        .map(Value::String)
+                        .unwrap_or(Value::Null),
+                );
+            }
+            Ok(value)
+        }
+        "learned_skill_manage" => {
+            let action = arguments
+                .get("action")
+                .and_then(Value::as_str)
+                .ok_or("missing action")?;
+            if action == "list" {
+                let records = store
+                    .search_learned_skills(&repository_identity, "", &current_commit, 5)
+                    .map_err(|error| error.to_string())?;
+                return Ok(json!({
+                    "skills": records.iter().map(|record| learned_skill_json(record, &current_commit)).collect::<Vec<_>>(),
+                    "limit": 5
+                }));
+            }
+            let id = arguments
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or("missing learned skill id")?;
+            let record = store
+                .update_learned_skill_lifecycle(id, action)
+                .map_err(|error| error.to_string())?;
+            store
+                .append_audit(
+                    session_id,
+                    &format!("learned_skill_{action}"),
+                    &json!({"id": id, "source_session_id": session_id}),
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(json!({
+                "skill": learned_skill_json(&record, &current_commit),
+                "source_session_id": store.learned_skill_provenance(id)
+                    .map_err(|error| error.to_string())?,
+                "action": action
+            }))
         }
         _ => Err(format!("unsupported learned skill tool: {name}")),
+    }
+}
+
+fn execute_session_search_tool(
+    store: &SqliteStore,
+    known_secrets: &[String],
+    arguments: &Value,
+) -> Result<Value, String> {
+    let query = arguments
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase);
+    let from = arguments.get("from").and_then(Value::as_str);
+    let to = arguments.get("to").and_then(Value::as_str);
+    let project_id = arguments.get("project_id").and_then(Value::as_str);
+    let status = arguments.get("status").and_then(Value::as_str);
+    let scope = arguments
+        .get("content_scope")
+        .and_then(Value::as_str)
+        .unwrap_or("title");
+    if !matches!(scope, "title" | "messages" | "events" | "tool_calls") {
+        return Err("content_scope must be title, messages, events, or tool_calls".into());
+    }
+    let limit = arguments
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(20)
+        .clamp(1, 100) as usize;
+    let sessions = store.load_sessions().map_err(|error| error.to_string())?;
+    let mut results = Vec::new();
+    for session in sessions {
+        if project_id.is_some_and(|id| session.project_id.as_deref() != Some(id))
+            || status.is_some_and(|value| session.run_state != value)
+            || from.is_some_and(|value| session.updated_at.to_rfc3339().as_str() < value)
+            || to.is_some_and(|value| session.created_at.to_rfc3339().as_str() > value)
+        {
+            continue;
+        }
+        let haystack = match scope {
+            "title" => session.title.clone(),
+            "messages" => store
+                .load_messages(&session.session_id)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(|message| message.content.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "events" => store
+                .load_session_events(&session.session_id)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(|event| event.event.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "tool_calls" => store
+                .load_tool_calls(&session.session_id)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(|call| {
+                    json!({"name":call.name,"arguments":call.arguments,"result":call.result})
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => unreachable!(),
+        };
+        if query
+            .as_deref()
+            .is_some_and(|needle| !haystack.to_ascii_lowercase().contains(needle))
+        {
+            continue;
+        }
+        let mut redacted = Value::String(haystack);
+        for secret in known_secrets {
+            redact_json_strings(&mut redacted, secret);
+        }
+        redacted = redact_approval_value(&redacted);
+        let snippet = redacted.as_str().unwrap_or_default().to_owned();
+        results.push(json!({
+            "session_id": session.session_id,
+            "title": redact_secret_patterns(&session.title),
+            "project_id": session.project_id,
+            "status": session.run_state,
+            "created_at": session.created_at,
+            "updated_at": session.updated_at,
+            "content_scope": scope,
+            "snippet": snippet.chars().take(2000).collect::<String>(),
+        }));
+        if results.len() >= limit {
+            break;
+        }
+    }
+    Ok(json!({"sessions": results, "limit": limit, "content_scope": scope}))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AgentAssetKind {
+    Knowledge,
+    Playbook,
+}
+
+impl AgentAssetKind {
+    fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value {
+            Some("knowledge") => Ok(Self::Knowledge),
+            Some("playbook") => Ok(Self::Playbook),
+            _ => Err("kind must be knowledge or playbook".into()),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Knowledge => "knowledge",
+            Self::Playbook => "playbook",
+        }
+    }
+}
+
+fn execute_agent_asset_tool(
+    store: &SqliteStore,
+    database: &Arc<Mutex<Connection>>,
+    session_id: &str,
+    arguments: &Value,
+) -> Result<Value, String> {
+    let action = arguments
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or("missing action")?;
+    let connection = database.lock().map_err(|_| "database lock poisoned")?;
+    let kind = if matches!(action, "list" | "create") && arguments.get("kind").is_none() {
+        None
+    } else {
+        Some(AgentAssetKind::parse(
+            arguments.get("kind").and_then(Value::as_str),
+        )?)
+    };
+    let project_id = arguments.get("project_id").and_then(Value::as_str);
+    let scope_kind = if project_id.is_some() {
+        "project"
+    } else {
+        "global"
+    };
+    let scope_key = project_id.unwrap_or("");
+    let asset_id = arguments
+        .get("id")
+        .or_else(|| arguments.get("asset_id"))
+        .and_then(Value::as_str);
+    match action {
+        "list" => {
+            let kind = kind.map(|value| value.as_str().to_owned());
+            let mut statement = connection
+                .prepare(
+                    "SELECT o.id,o.kind,o.name,o.status,o.scope_kind,o.scope_key,
+                            o.current_version_id,v.content,v.metadata_json
+                     FROM config_object o
+                     JOIN config_object_version v ON v.id=o.current_version_id
+                     WHERE (?1 IS NULL OR o.kind=?1)
+                       AND o.scope_kind=?2
+                       AND COALESCE(o.scope_key,'')=?3
+                       AND o.status <> 'deleted'
+                     ORDER BY o.name",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map(params![kind, scope_kind, scope_key], |row| {
+                    let metadata: String = row.get(8)?;
+                    Ok(json!({
+                        "id": row.get::<_, String>(0)?,
+                        "kind": row.get::<_, String>(1)?,
+                        "title": row.get::<_, String>(2)?,
+                        "status": row.get::<_, String>(3)?,
+                        "scope_kind": row.get::<_, String>(4)?,
+                        "scope_key": row.get::<_, Option<String>>(5)?,
+                        "version_id": row.get::<_, String>(6)?,
+                        "body": redact_secret_patterns(&row.get::<_, String>(7)?),
+                        "agent_managed": serde_json::from_str::<Value>(&metadata)
+                            .ok()
+                            .and_then(|value| value.get("agent_managed").and_then(Value::as_bool))
+                            .unwrap_or(false),
+                    }))
+                })
+                .map_err(|error| error.to_string())?;
+            let items = rows
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            Ok(json!({"items": items}))
+        }
+        "create" | "update" => {
+            let kind = AgentAssetKind::parse(arguments.get("kind").and_then(Value::as_str))?;
+            let title = arguments
+                .get("title")
+                .and_then(Value::as_str)
+                .ok_or("missing title")?;
+            let body = arguments
+                .get("body")
+                .and_then(Value::as_str)
+                .ok_or("missing body")?;
+            if title.trim().is_empty() || body.trim().is_empty() {
+                return Err("title and body must be non-empty".into());
+            }
+            let id = asset_id
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("agent-{}-{}", kind.as_str(), Uuid::new_v4()));
+            let now = Utc::now().to_rfc3339();
+            let version: i64 = connection
+                .query_row(
+                    "SELECT COALESCE(MAX(version),0)+1 FROM config_object_version WHERE object_id=?1",
+                    [&id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            let version_id = format!("{id}:v{version}");
+            let metadata = json!({
+                "agent_managed": true,
+                "source_session_id": session_id,
+                "kind_boundary": "knowledge_or_playbook_only",
+            });
+            connection
+                .execute(
+                    "INSERT INTO config_object
+                     (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
+                     VALUES (?1,?2,?3,?4,?5,?6,'active',?7,?8)
+                     ON CONFLICT(id) DO UPDATE SET
+                       kind=excluded.kind,name=excluded.name,status='active',
+                       current_version_id=excluded.current_version_id",
+                    params![
+                        id,
+                        kind.as_str(),
+                        title,
+                        stable_server_key(&id),
+                        scope_kind,
+                        if project_id.is_some() { Some(scope_key) } else { None },
+                        now,
+                        version_id
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            connection
+                .execute(
+                    "INSERT INTO config_object_version
+                     (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![
+                        version_id,
+                        id,
+                        version,
+                        body,
+                        content_hash(body),
+                        now,
+                        format!("agent {action} from session {session_id}"),
+                        metadata.to_string()
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            store
+                .append_audit(
+                    session_id,
+                    &format!("agent_asset_{action}"),
+                    &json!({"id": id, "kind": kind.as_str(), "version": version}),
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(json!({"id": id, "kind": kind.as_str(), "version_id": version_id, "saved": true}))
+        }
+        "get" | "versions" | "rollback" | "archive" | "delete" | "enable" | "disable" => {
+            let id = asset_id.ok_or("missing id")?;
+            let (object_kind, status, current_version, scope_kind): (String, String, String, String) = connection
+                .query_row(
+                    "SELECT kind,status,current_version_id,scope_kind FROM config_object WHERE id=?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .map_err(|error| format!("agent asset not found: {error}"))?;
+            AgentAssetKind::parse(Some(&object_kind))?;
+            let agent_managed: bool = connection
+                .query_row(
+                    "SELECT metadata_json FROM config_object_version WHERE id=?1",
+                    [&current_version],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+                .and_then(|value| value.get("agent_managed").and_then(Value::as_bool))
+                .unwrap_or(false);
+            if status == "builtin" || scope_kind == "repo" || !agent_managed {
+                return Err("builtin and repository-authored assets are read-only".into());
+            }
+            let result = match action {
+                "get" => {
+                    let value: (String, String) = connection
+                        .query_row(
+                            "SELECT content,metadata_json FROM config_object_version WHERE id=?1",
+                            [current_version.as_str()],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    json!({"id": id, "kind": object_kind, "status": status,
+                        "version_id": current_version, "body": redact_secret_patterns(&value.0),
+                        "metadata": value.1})
+                }
+                "versions" => {
+                    let mut statement = connection
+                        .prepare(
+                            "SELECT id,version,created_at,note,metadata_json
+                             FROM config_object_version WHERE object_id=?1 ORDER BY version",
+                        )
+                        .map_err(|error| error.to_string())?;
+                    let rows = statement
+                        .query_map([id], |row| {
+                            Ok(
+                                json!({"id":row.get::<_,String>(0)?,"version":row.get::<_,i64>(1)?,
+                                "created_at":row.get::<_,String>(2)?,"note":row.get::<_,String>(3)?,
+                                "metadata":row.get::<_,String>(4)?}),
+                            )
+                        })
+                        .map_err(|error| error.to_string())?;
+                    json!({"id":id,"versions":rows.collect::<Result<Vec<_>,_>>().map_err(|error|error.to_string())?})
+                }
+                "rollback" => {
+                    let version = arguments
+                        .get("version")
+                        .and_then(Value::as_i64)
+                        .ok_or("missing version")?;
+                    let version_id: String = connection.query_row(
+                        "SELECT id FROM config_object_version WHERE object_id=?1 AND version=?2",
+                        params![id, version], |row| row.get(0)
+                    ).map_err(|error| error.to_string())?;
+                    connection.execute("UPDATE config_object SET current_version_id=?1,status='active' WHERE id=?2",
+                        params![version_id,id]).map_err(|error| error.to_string())?;
+                    json!({"id":id,"version_id":version_id,"rolled_back":true})
+                }
+                "archive" => {
+                    connection
+                        .execute(
+                            "UPDATE config_object SET status='archived' WHERE id=?1",
+                            [id],
+                        )
+                        .map_err(|error| error.to_string())?;
+                    json!({"id":id,"status":"archived"})
+                }
+                "delete" => {
+                    connection
+                        .execute(
+                            "UPDATE config_object SET status='deleted' WHERE id=?1",
+                            [id],
+                        )
+                        .map_err(|error| error.to_string())?;
+                    json!({"id":id,"status":"deleted"})
+                }
+                "enable" => {
+                    connection
+                        .execute("UPDATE config_object SET status='active' WHERE id=?1", [id])
+                        .map_err(|error| error.to_string())?;
+                    json!({"id":id,"status":"active"})
+                }
+                "disable" => {
+                    connection
+                        .execute(
+                            "UPDATE config_object SET status='disabled' WHERE id=?1",
+                            [id],
+                        )
+                        .map_err(|error| error.to_string())?;
+                    json!({"id":id,"status":"disabled"})
+                }
+                _ => unreachable!(),
+            };
+            store
+                .append_audit(
+                    session_id,
+                    &format!("agent_asset_{action}"),
+                    &json!({"id": id}),
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(result)
+        }
+        _ => Err("unsupported agent asset action".into()),
     }
 }
 
@@ -3229,6 +3964,431 @@ fn execute_action_ledger_tool(
     }
 }
 
+fn execute_agent_automation_tool(
+    store: &SqliteStore,
+    database: &Arc<Mutex<Connection>>,
+    session_id: &str,
+    project_id: Option<&str>,
+    arguments: &Value,
+) -> Result<Value, String> {
+    const MAX_CADENCE_SECONDS: u64 = 3600;
+    const MAX_IN_FLIGHT: u64 = 4;
+    const MAX_TRIGGERS: u64 = 20;
+    const MAX_WINDOW_SECONDS: u64 = 86_400;
+    const MAX_ATTEMPTS: u64 = 3;
+    const MAX_CAUSE_DEPTH: u64 = 8;
+    let action = arguments
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing automation action".to_owned())?;
+    let connection = database.lock().map_err(|_| "database lock poisoned")?;
+    match action {
+        "list" => {
+            let mut statement = connection
+                .prepare(
+                    "SELECT o.id,o.name,o.status,o.current_version_id,v.content,v.metadata_json
+                     FROM config_object o
+                     JOIN config_object_version v ON v.id=o.current_version_id
+                     WHERE o.kind='automation' AND json_extract(v.metadata_json,'$.agent_managed')=1
+                     ORDER BY o.name",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(json!({
+                        "id": row.get::<_, String>(0)?,
+                        "name": row.get::<_, String>(1)?,
+                        "status": row.get::<_, String>(2)?,
+                        "version_id": row.get::<_, String>(3)?,
+                        "automation": serde_json::from_str::<Value>(&row.get::<_, String>(4)?).unwrap_or_else(|_| json!({})),
+                        "metadata": serde_json::from_str::<Value>(&row.get::<_, String>(5)?).unwrap_or_else(|_| json!({})),
+                    }))
+                })
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            Ok(json!({"automations": rows}))
+        }
+        "get" | "versions" => {
+            let id = arguments
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "id is required".to_owned())?;
+            let object = connection
+                .query_row(
+                    "SELECT id,name,status,current_version_id FROM config_object
+                     WHERE id=?1 AND kind='automation'",
+                    [id],
+                    |row| {
+                        Ok(json!({
+                            "id": row.get::<_, String>(0)?,
+                            "name": row.get::<_, String>(1)?,
+                            "status": row.get::<_, String>(2)?,
+                            "current_version_id": row.get::<_, Option<String>>(3)?,
+                        }))
+                    },
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "automation not found".to_owned())?;
+            if action == "get" {
+                let version = connection
+                    .query_row(
+                        "SELECT content,metadata_json FROM config_object_version
+                         WHERE id=json_extract(?1,'$.current_version_id')",
+                        [object.to_string()],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()
+                    .map_err(|error| error.to_string())?;
+                return Ok(json!({
+                    "automation": object,
+                    "version": version.map(|(content, metadata)| json!({
+                        "content": serde_json::from_str::<Value>(&content).unwrap_or_else(|_| json!({})),
+                        "metadata": serde_json::from_str::<Value>(&metadata).unwrap_or_else(|_| json!({})),
+                    }))
+                }));
+            }
+            let mut statement = connection
+                .prepare(
+                    "SELECT id,version,content,metadata_json,created_at,note
+                     FROM config_object_version WHERE object_id=?1 ORDER BY version",
+                )
+                .map_err(|error| error.to_string())?;
+            let versions = statement
+                .query_map([id], |row| {
+                    Ok(json!({
+                        "id": row.get::<_, String>(0)?,
+                        "version": row.get::<_, i64>(1)?,
+                        "content": serde_json::from_str::<Value>(&row.get::<_, String>(2)?).unwrap_or_else(|_| json!({})),
+                        "metadata": serde_json::from_str::<Value>(&row.get::<_, String>(3)?).unwrap_or_else(|_| json!({})),
+                        "created_at": row.get::<_, String>(4)?,
+                        "note": row.get::<_, String>(5)?,
+                    }))
+                })
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            Ok(json!({"automation": object, "versions": versions}))
+        }
+        "create" | "update" => {
+            let trigger = arguments
+                .get("trigger")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "trigger must be schedule or event".to_owned())?;
+            if !matches!(trigger, "schedule" | "event") {
+                return Err("trigger must be schedule or event".into());
+            }
+            let effect = arguments
+                .get("effect")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "effect is required".to_owned())?;
+            let effect_kind = AgentAutomationAction::parse(effect)
+                .ok_or_else(|| "effect is not allowed".to_owned())?;
+            let task_type = arguments.get("task_type").and_then(Value::as_str);
+            if effect_kind == AgentAutomationAction::EnqueueBoundedWork {
+                let task_type = task_type.ok_or_else(|| "task_type is required".to_owned())?;
+                BoundedWorkType::parse(task_type)
+                    .ok_or_else(|| "task_type is not an allowed bounded task".to_owned())?;
+            }
+            if effect_kind == AgentAutomationAction::RequestPlanGoal
+                && arguments
+                    .get("payload")
+                    .and_then(|value| value.get("goal_id"))
+                    .and_then(Value::as_str)
+                    .is_none()
+            {
+                return Err("request_plan_goal requires payload.goal_id".into());
+            }
+            let max_cadence = arguments
+                .get("max_cadence_seconds")
+                .and_then(Value::as_u64)
+                .unwrap_or(900);
+            let max_in_flight = arguments
+                .get("max_in_flight")
+                .and_then(Value::as_u64)
+                .unwrap_or(1);
+            let max_triggers = arguments
+                .get("max_triggers")
+                .and_then(Value::as_u64)
+                .unwrap_or(1);
+            let window_seconds = arguments
+                .get("window_seconds")
+                .and_then(Value::as_u64)
+                .unwrap_or(3600);
+            let max_attempts = arguments
+                .get("max_attempts")
+                .and_then(Value::as_u64)
+                .unwrap_or(3);
+            if max_cadence == 0
+                || max_cadence > MAX_CADENCE_SECONDS
+                || max_in_flight == 0
+                || max_in_flight > MAX_IN_FLIGHT
+                || max_triggers == 0
+                || max_triggers > MAX_TRIGGERS
+                || window_seconds == 0
+                || window_seconds > MAX_WINDOW_SECONDS
+                || max_attempts == 0
+                || max_attempts > MAX_ATTEMPTS
+            {
+                return Err("automation limits exceed bounded policy".into());
+            }
+            let id = arguments
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("automation-{}", Uuid::new_v4()));
+            if action == "update" {
+                let managed = connection
+                    .query_row(
+                        "SELECT EXISTS(
+                           SELECT 1 FROM config_object o
+                           JOIN config_object_version v ON v.id=o.current_version_id
+                           WHERE o.id=?1 AND o.kind='automation'
+                             AND json_extract(v.metadata_json,'$.agent_managed')=1
+                         )",
+                        [&id],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if !managed {
+                    return Err("only agent-managed automations can be updated".into());
+                }
+            } else {
+                let exists = connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM config_object WHERE id=?1)",
+                        [&id],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if exists {
+                    return Err("automation id already exists".into());
+                }
+            }
+            let name = arguments
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "name is required".to_owned())?;
+            let mut payload = arguments
+                .get("payload")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            if !payload.is_object() {
+                return Err("payload must be an object".into());
+            }
+            if let Some(payload) = payload.as_object_mut() {
+                payload.insert("automation_depth".into(), json!(0));
+            }
+            let content = json!({
+                "trigger": trigger,
+                "cron": arguments.get("cron"),
+                "kind_pattern": arguments.get("kind_pattern"),
+                "effect": effect_kind.as_str(),
+                "task_type": task_type,
+                "payload": payload,
+                "max_cadence_seconds": max_cadence,
+                "max_in_flight": max_in_flight,
+                "max_triggers": max_triggers,
+                "window_seconds": window_seconds,
+                "max_attempts": max_attempts,
+                "dedup_key": arguments.get("dedup_key"),
+                "idempotency_key": arguments.get("idempotency_key"),
+                "project_id": project_id,
+            });
+            if trigger == "schedule" {
+                let cron = arguments
+                    .get("cron")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| "schedule automation requires cron".to_owned())?;
+                scheduler::Schedule::parse_for_user(cron)?;
+            } else if arguments
+                .get("kind_pattern")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return Err("event automation requires kind_pattern".into());
+            }
+            let now = Utc::now().to_rfc3339();
+            let current_version = connection
+                .query_row(
+                    "SELECT COALESCE(MAX(version),0) FROM config_object_version WHERE object_id=?1",
+                    [&id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| error.to_string())?;
+            let version = current_version + 1;
+            connection
+                .execute(
+                    "INSERT INTO config_object
+                     (id,kind,name,server_key,scope_kind,scope_key,status,created_at,current_version_id)
+                     VALUES (?1,'automation',?2,?3,'project',?4,'active',?5,NULL)
+                     ON CONFLICT(id) DO UPDATE SET name=excluded.name",
+                    params![id, name, format!("agent:{id}"), project_id, now],
+                )
+                .map_err(|error| error.to_string())?;
+            let version_id = format!("{id}:v{version}");
+            let metadata = json!({
+                "agent_managed": true,
+                "source_session_id": session_id,
+                "max_cause_depth": MAX_CAUSE_DEPTH,
+            });
+            connection
+                .execute(
+                    "INSERT INTO config_object_version
+                     (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+                     VALUES (?1,?2,?3,?4,?5,?6,'agent automation',?7)",
+                    params![
+                        version_id,
+                        id,
+                        version,
+                        content.to_string(),
+                        content_hash(&content.to_string()),
+                        now,
+                        metadata.to_string()
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            connection
+                .execute(
+                    "UPDATE config_object SET current_version_id=?1 WHERE id=?2",
+                    params![version_id, id],
+                )
+                .map_err(|error| error.to_string())?;
+            if trigger == "schedule" {
+                connection
+                    .execute(
+                        "INSERT INTO schedules
+                         (id,name,session_id,playbook_id,config_object_id,cron,enabled,last_run,last_result)
+                         VALUES (?1,?2,?3,?1,?1,?4,1,NULL,NULL)
+                         ON CONFLICT(id) DO UPDATE SET name=excluded.name,session_id=excluded.session_id,
+                           cron=excluded.cron,enabled=1",
+                        params![id, name, session_id, arguments.get("cron").and_then(Value::as_str)],
+                    )
+                    .map_err(|error| error.to_string())?;
+            } else {
+                let effect = if effect_kind == AgentAutomationAction::EnqueueBoundedWork {
+                    json!({
+                        "task_type": task_type,
+                        "payload": payload,
+                        "max_attempts": max_attempts,
+                        "dedup_key": arguments.get("dedup_key"),
+                        "idempotency_key": arguments.get("idempotency_key"),
+                        "project_id": project_id,
+                    })
+                } else {
+                    json!({"goal_id": payload.get("goal_id"), "project_id": project_id})
+                };
+                connection
+                    .execute(
+                        "INSERT INTO event_rules
+                         (rule_id,kind_pattern,effect_kind,effect,enabled,max_triggers,window_seconds,failure_limit)
+                         VALUES (?1,?2,?3,?4,1,?5,?6,?7)
+                         ON CONFLICT(rule_id) DO UPDATE SET kind_pattern=excluded.kind_pattern,
+                           effect_kind=excluded.effect_kind,effect=excluded.effect,enabled=1",
+                        params![
+                            id,
+                            arguments.get("kind_pattern").and_then(Value::as_str),
+                            if effect_kind == AgentAutomationAction::EnqueueBoundedWork { "enqueue_work" } else { "plan_goal" },
+                            effect.to_string(),
+                            max_triggers as i64,
+                            window_seconds as i64,
+                            MAX_ATTEMPTS as i64
+                        ],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            drop(connection);
+            store
+                .append_audit(
+                    session_id,
+                    &format!("agent_automation_{action}"),
+                    &json!({"id": id}),
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(json!({"id":id,"status":"active","source_session_id":session_id}))
+        }
+        "enable" | "disable" | "archive" | "delete" => {
+            let id = arguments
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "id is required".to_owned())?;
+            let status = match action {
+                "enable" => "active",
+                "disable" => "disabled",
+                "archive" => "archived",
+                "delete" => "deleted",
+                _ => unreachable!(),
+            };
+            let changed = connection
+                .execute(
+                    "UPDATE config_object SET status=?1 WHERE id=?2 AND kind='automation'
+                     AND EXISTS (SELECT 1 FROM config_object_version v WHERE v.id=config_object.current_version_id
+                       AND json_extract(v.metadata_json,'$.agent_managed')=1)",
+                    params![status, id],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed == 0 {
+                return Err("agent automation not found or is not agent-managed".into());
+            }
+            connection
+                .execute(
+                    "UPDATE schedules SET enabled=?1 WHERE id=?2",
+                    params![status == "active", id],
+                )
+                .map_err(|error| error.to_string())?;
+            connection
+                .execute(
+                    "UPDATE event_rules SET enabled=?1 WHERE rule_id=?2",
+                    params![status == "active", id],
+                )
+                .map_err(|error| error.to_string())?;
+            drop(connection);
+            store
+                .append_audit(
+                    session_id,
+                    &format!("agent_automation_{action}"),
+                    &json!({"id": id}),
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(json!({"id":id,"status":status}))
+        }
+        "rollback" => {
+            let id = arguments
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "id is required".to_owned())?;
+            let version_id = arguments
+                .get("version_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "version_id is required".to_owned())?;
+            let changed = connection
+                .execute(
+                    "UPDATE config_object SET current_version_id=?1 WHERE id=?2 AND kind='automation'
+                     AND EXISTS (SELECT 1 FROM config_object_version v WHERE v.id=?1 AND v.object_id=?2
+                       AND json_extract(v.metadata_json,'$.agent_managed')=1)",
+                    params![version_id, id],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed == 0 {
+                return Err("automation version not found".into());
+            }
+            drop(connection);
+            store
+                .append_audit(
+                    session_id,
+                    "agent_automation_rollback",
+                    &json!({"id": id, "version_id": version_id}),
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(json!({"id":id,"version_id":version_id}))
+        }
+        _ => Err("automation action is unavailable".into()),
+    }
+}
+
 fn execute_work_queue_tool(
     store: &SqliteStore,
     session_id: &str,
@@ -3508,15 +4668,17 @@ async fn execute_lsp_tool(
                 })
         })
         .ok_or("could not detect language from path; provide language explicitly")?;
-    let key = format!("{language}:{root}");
+    let resolved_root = opcos_lsp::resolve_project_root(host.as_ref(), root, &language, path).await;
+    let key = format!("{language}:{resolved_root}");
     let session = {
         let mut active = sessions.lock().await;
         if let Some(session) = active.get(&key) {
             session.clone()
         } else {
-            let session = LspClient::start(Arc::clone(&host), root.to_owned(), &language)
-                .await
-                .map_err(|error| error.to_string())?;
+            let session =
+                LspClient::start_for_path(Arc::clone(&host), root.to_owned(), &language, path)
+                    .await
+                    .map_err(|error| error.to_string())?;
             active.insert(key, session.clone());
             session
         }
@@ -3892,6 +5054,24 @@ struct IdeProxyState {
 
 #[async_trait]
 impl ToolExecutor for RemoteExecutor {
+    async fn request_desktop_view(&self, reason: Option<&str>) -> Result<Value, String> {
+        Ok(json!({
+            "status": "requested",
+            "session_id": self.session_id,
+            "surface": "desktop",
+            "reason": reason.unwrap_or_default(),
+            "idempotent": true,
+        }))
+    }
+
+    async fn rename_session(&self, title: &str) -> Result<Value, String> {
+        let title = validate_session_title(title)?;
+        self.store
+            .update_session_title(&self.session_id, &title)
+            .map_err(|error| error.to_string())?;
+        Ok(json!({"status": "renamed", "session_id": self.session_id, "title": title}))
+    }
+
     async fn run_hook_command(
         &self,
         command: &str,
@@ -3916,6 +5096,9 @@ impl ToolExecutor for RemoteExecutor {
     }
 
     async fn execute(&self, name: &str, arguments: Value) -> Result<Value, String> {
+        if let Err(error) = capability_preflight(&self.capabilities, name, &arguments) {
+            return Ok(error);
+        }
         if name == "computer_use" {
             let (action, bounds) = parse_computer_use_arguments(&arguments)?;
             let host = RvmHost::new(
@@ -3972,7 +5155,22 @@ impl ToolExecutor for RemoteExecutor {
                 arguments,
             );
         }
+        if name == "automation_manage" {
+            if self.origin == ToolOrigin::System {
+                return Err("automation-generated work cannot manage automation".into());
+            }
+            return execute_agent_automation_tool(
+                &self.store,
+                &self.database,
+                &self.session_id,
+                self.project_id.as_deref(),
+                &arguments,
+            );
+        }
         if name.starts_with("work_queue_") {
+            if self.origin == ToolOrigin::System {
+                return Err("automation-generated work cannot enqueue work".into());
+            }
             return execute_work_queue_tool(
                 &self.store,
                 &self.session_id,
@@ -3984,8 +5182,23 @@ impl ToolExecutor for RemoteExecutor {
         if name == "external_ingress_sources" {
             return execute_external_ingress_tool(&self.store, name, &arguments);
         }
-        if matches!(name, "coordination_dispatch" | "coordination_status") {
-            if name == "coordination_dispatch"
+        if name == "session_search" {
+            let known = load_secret_values(&self.database, &self.secrets).unwrap_or_default();
+            return execute_session_search_tool(&self.store, &known, &arguments);
+        }
+        if name == "config_asset_manage" {
+            return execute_agent_asset_tool(
+                &self.store,
+                &self.database,
+                &self.session_id,
+                &arguments,
+            );
+        }
+        if matches!(
+            name,
+            "coordination_dispatch" | "coordination_fan_out" | "coordination_status"
+        ) {
+            if matches!(name, "coordination_dispatch" | "coordination_fan_out")
                 && self.origin == ToolOrigin::User
                 && automatic_project_routing_active(&self.store, &self.session_id)?
             {
@@ -4007,7 +5220,10 @@ impl ToolExecutor for RemoteExecutor {
         }
         if matches!(
             name,
-            "skill_save_learned" | "skill_search_learned" | "skill_get_learned"
+            "skill_save_learned"
+                | "skill_search_learned"
+                | "skill_get_learned"
+                | "learned_skill_manage"
         ) {
             let host = RvmHost::new(
                 self.host_id.clone(),
@@ -4017,6 +5233,7 @@ impl ToolExecutor for RemoteExecutor {
             return execute_learned_skill_tool(
                 &self.store,
                 &self.secrets,
+                &self.session_id,
                 self.project_id.as_deref(),
                 &host,
                 &self.workspace,
@@ -4024,6 +5241,20 @@ impl ToolExecutor for RemoteExecutor {
                 &arguments,
             )
             .await;
+        }
+        if matches!(
+            name,
+            "memory_save_automatic" | "memory_list" | "memory_disable" | "memory_delete"
+        ) {
+            return execute_automatic_memory_tool(
+                &self.store,
+                &self.secrets,
+                self.project_id.as_deref(),
+                &self.session_id,
+                &self.workspace,
+                name,
+                &arguments,
+            );
         }
         if matches!(
             name,
@@ -4048,6 +5279,12 @@ impl ToolExecutor for RemoteExecutor {
         }
         if name == "ask_user" {
             return Err("ask_user must be handled by the engine pending mechanism".into());
+        }
+        if matches!(
+            name,
+            "recording_start" | "recording_annotate" | "recording_stop"
+        ) {
+            return Err("engine-native tool must be handled by the engine".into());
         }
         let argument = |key: &str| {
             arguments
@@ -4106,7 +5343,15 @@ impl ToolExecutor for RemoteExecutor {
                     .shell
                     .lock()
                     .await
-                    .exec_with_env(argument("command")?, Some(Value::Object(env)))
+                    .exec_with_env_timeout(
+                        argument("command")?,
+                        Some(Value::Object(env)),
+                        arguments
+                            .get("timeout_seconds")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(DEFAULT_EXEC_TIMEOUT_SECONDS)
+                            .clamp(1, MAX_EXEC_TIMEOUT_SECONDS),
+                    )
                     .await
                     .map_err(|error| error.to_string())?;
                 let mut output = serde_json::to_value(result).unwrap_or(Value::Null);
@@ -4320,6 +5565,33 @@ impl ToolExecutor for RemoteExecutor {
 
 #[async_trait]
 impl ToolExecutor for DesktopExecutor {
+    async fn request_desktop_view(&self, reason: Option<&str>) -> Result<Value, String> {
+        match self {
+            Self::Remote(executor) => executor.request_desktop_view(reason).await,
+            Self::Local(_) => {
+                Err("local host does not support the remote Desktop/VNC surface".into())
+            }
+        }
+    }
+
+    async fn rename_session(&self, title: &str) -> Result<Value, String> {
+        match self {
+            Self::Remote(executor) => executor.rename_session(title).await,
+            Self::Local(executor) => {
+                let title = validate_session_title(title)?;
+                executor
+                    .store
+                    .update_session_title(&executor.session_id, &title)
+                    .map_err(|error| error.to_string())?;
+                Ok(json!({
+                    "status": "renamed",
+                    "session_id": executor.session_id,
+                    "title": title,
+                }))
+            }
+        }
+    }
+
     async fn browser_origin(&self) -> Option<String> {
         match self {
             Self::Remote(_) => None,
@@ -4350,6 +5622,27 @@ impl ToolExecutor for DesktopExecutor {
     }
 
     async fn execute(&self, name: &str, arguments: Value) -> Result<Value, String> {
+        if let Self::Local(executor) = self {
+            if let Err(error) = capability_preflight(&executor.capabilities, name, &arguments) {
+                return Ok(error);
+            }
+        } else if let Self::Remote(executor) = self
+            && let Err(error) = capability_preflight(&executor.capabilities, name, &arguments)
+        {
+            return Ok(error);
+        }
+        if name == "desktop_show" {
+            return self
+                .request_desktop_view(arguments.get("reason").and_then(Value::as_str))
+                .await;
+        }
+        if name == "session_rename" {
+            let title = arguments
+                .get("title")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing string argument: title".to_owned())?;
+            return self.rename_session(title).await;
+        }
         match self {
             Self::Remote(executor) => executor.execute(name, arguments).await,
             Self::Local(executor) => {
@@ -4366,6 +5659,19 @@ impl ToolExecutor for DesktopExecutor {
                         })
                         .await
                         .map_err(|error| error.to_string());
+                }
+                if name == "session_search" {
+                    let known = load_secret_values(&executor.database, &executor.secrets)
+                        .unwrap_or_default();
+                    return execute_session_search_tool(&executor.store, &known, &arguments);
+                }
+                if name == "config_asset_manage" {
+                    return execute_agent_asset_tool(
+                        &executor.store,
+                        &executor.database,
+                        &executor.session_id,
+                        &arguments,
+                    );
                 }
                 if name == "secrets_list" {
                     return list_resolvable_secret_metadata(
@@ -4398,6 +5704,9 @@ impl ToolExecutor for DesktopExecutor {
                     );
                 }
                 if name.starts_with("work_queue_") {
+                    if executor.origin == ToolOrigin::System {
+                        return Err("automation-generated work cannot enqueue work".into());
+                    }
                     return execute_work_queue_tool(
                         &executor.store,
                         &executor.session_id,
@@ -4409,8 +5718,11 @@ impl ToolExecutor for DesktopExecutor {
                 if name == "external_ingress_sources" {
                     return execute_external_ingress_tool(&executor.store, name, &arguments);
                 }
-                if matches!(name, "coordination_dispatch" | "coordination_status") {
-                    if name == "coordination_dispatch"
+                if matches!(
+                    name,
+                    "coordination_dispatch" | "coordination_fan_out" | "coordination_status"
+                ) {
+                    if matches!(name, "coordination_dispatch" | "coordination_fan_out")
                         && executor.origin == ToolOrigin::User
                         && automatic_project_routing_active(&executor.store, &executor.session_id)?
                     {
@@ -4432,11 +5744,15 @@ impl ToolExecutor for DesktopExecutor {
                 }
                 if matches!(
                     name,
-                    "skill_save_learned" | "skill_search_learned" | "skill_get_learned"
+                    "skill_save_learned"
+                        | "skill_search_learned"
+                        | "skill_get_learned"
+                        | "learned_skill_manage"
                 ) {
                     return execute_learned_skill_tool(
                         &executor.store,
                         &executor.secrets,
+                        &executor.session_id,
                         executor.project_id.as_deref(),
                         &executor.host,
                         &executor.workspace,
@@ -4444,6 +5760,32 @@ impl ToolExecutor for DesktopExecutor {
                         &arguments,
                     )
                     .await;
+                }
+                if name == "automation_manage" {
+                    if executor.origin == ToolOrigin::System {
+                        return Err("automation-generated work cannot manage automation".into());
+                    }
+                    return execute_agent_automation_tool(
+                        &executor.store,
+                        &executor.database,
+                        &executor.session_id,
+                        executor.project_id.as_deref(),
+                        &arguments,
+                    );
+                }
+                if matches!(
+                    name,
+                    "memory_save_automatic" | "memory_list" | "memory_disable" | "memory_delete"
+                ) {
+                    return execute_automatic_memory_tool(
+                        &executor.store,
+                        &executor.secrets,
+                        executor.project_id.as_deref(),
+                        &executor.session_id,
+                        &executor.workspace,
+                        name,
+                        &arguments,
+                    );
                 }
                 if matches!(
                     name,
@@ -4459,6 +5801,12 @@ impl ToolExecutor for DesktopExecutor {
                 }
                 if name == "ask_user" {
                     return Err("ask_user must be handled by the engine pending mechanism".into());
+                }
+                if matches!(
+                    name,
+                    "recording_start" | "recording_annotate" | "recording_stop"
+                ) {
+                    return Err("engine-native tool must be handled by the engine".into());
                 }
                 if matches!(
                     name,
@@ -4530,7 +5878,11 @@ impl ToolExecutor for DesktopExecutor {
                                     .get("cwd")
                                     .and_then(Value::as_str)
                                     .map(str::to_owned),
-                                timeout_seconds: DEFAULT_EXEC_TIMEOUT_SECONDS,
+                                timeout_seconds: arguments
+                                    .get("timeout_seconds")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(DEFAULT_EXEC_TIMEOUT_SECONDS)
+                                    .clamp(1, MAX_EXEC_TIMEOUT_SECONDS),
                                 session: Some(format!("opcos-local-{}", executor.session_id)),
                                 env: Some(Value::Object(env)),
                             })
@@ -4706,7 +6058,11 @@ impl ToolExecutor for DesktopExecutor {
                 .get("cwd")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            timeout_seconds: DEFAULT_EXEC_TIMEOUT_SECONDS,
+            timeout_seconds: arguments
+                .get("timeout_seconds")
+                .and_then(Value::as_u64)
+                .unwrap_or(DEFAULT_EXEC_TIMEOUT_SECONDS)
+                .clamp(1, MAX_EXEC_TIMEOUT_SECONDS),
             session: Some(format!("opcos-local-{}", executor.session_id)),
             env: Some(Value::Object(env)),
         };
@@ -4839,6 +6195,17 @@ impl ToolExecutor for DesktopExecutor {
             }
         }
     }
+}
+
+fn validate_session_title(title: &str) -> Result<String, String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("session title must not be empty".into());
+    }
+    if title.chars().count() > 80 {
+        return Err("session title must be at most 80 Unicode characters".into());
+    }
+    Ok(title.to_owned())
 }
 
 fn redact_json_strings(value: &mut Value, secret: &str) {
@@ -5770,6 +7137,28 @@ CREATE TABLE IF NOT EXISTS mcp_session_resources (
                task_id TEXT NOT NULL,
                depends_on TEXT NOT NULL,
                PRIMARY KEY(task_id,depends_on)
+             );
+             CREATE TABLE IF NOT EXISTS coord_batches (
+               batch_id TEXT PRIMARY KEY,
+               project_id TEXT NOT NULL,
+               status TEXT NOT NULL,
+               deadline_at TEXT NOT NULL,
+               acceptance_spec TEXT NOT NULL,
+               acceptance_spec_hash TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS coord_batch_members (
+               batch_id TEXT NOT NULL,
+               member_id TEXT NOT NULL,
+               worker_role_id TEXT NOT NULL,
+               status TEXT NOT NULL,
+               member_deadline_at TEXT NOT NULL,
+               reason TEXT,
+               started_at TEXT,
+               finished_at TEXT,
+               PRIMARY KEY(batch_id,member_id),
+               UNIQUE(batch_id,worker_role_id)
              );
              CREATE TABLE IF NOT EXISTS coordination_ingest_cursor (
                session_id TEXT PRIMARY KEY,
@@ -7357,6 +8746,28 @@ fn migrate_coordination(connection: &Connection) -> Result<(), String> {
                task_id TEXT NOT NULL,
                depends_on TEXT NOT NULL,
                PRIMARY KEY(task_id,depends_on)
+             );
+             CREATE TABLE IF NOT EXISTS coord_batches (
+               batch_id TEXT PRIMARY KEY,
+               project_id TEXT NOT NULL,
+               status TEXT NOT NULL,
+               deadline_at TEXT NOT NULL,
+               acceptance_spec TEXT NOT NULL,
+               acceptance_spec_hash TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS coord_batch_members (
+               batch_id TEXT NOT NULL,
+               member_id TEXT NOT NULL,
+               worker_role_id TEXT NOT NULL,
+               status TEXT NOT NULL,
+               member_deadline_at TEXT NOT NULL,
+               reason TEXT,
+               started_at TEXT,
+               finished_at TEXT,
+               PRIMARY KEY(batch_id,member_id),
+               UNIQUE(batch_id,worker_role_id)
              );
              CREATE TABLE IF NOT EXISTS coordination_ingest_cursor (
                session_id TEXT PRIMARY KEY,
@@ -9923,6 +11334,11 @@ fn append_session_config_assets(bundle: &mut AssetBundle, assets: Vec<SessionCon
                     content: body,
                 })
             }
+            "user_preference" => bundle.user_preferences.push(UserPreference {
+                identifier: title,
+                content: body,
+                enabled: true,
+            }),
             "rules" => bundle.agents.push(InstructionSource {
                 path: id,
                 content: body,
@@ -10663,10 +12079,10 @@ async fn engine_for_with_context(
     ]
     .into_iter()
     .map(|kind| {
-        scoped_secret_get(
-            state,
+        connector_credentials_config_for(
+            &state.secrets,
+            &state.store,
             session.project_id.as_deref(),
-            "connector-token",
             kind,
         )
         .map(|value| (kind, value.is_some()))
@@ -10687,21 +12103,22 @@ async fn engine_for_with_context(
             .capabilities()
             .await
             .map_err(|error| error.to_string())?;
-        let allowed_tools = capabilities
-            .items
-            .iter()
-            .filter(|item| item.available)
-            .filter_map(|item| match item.name.as_str() {
-                "read" => Some("read_file".to_owned()),
-                "write" => Some("write_file".to_owned()),
-                "ls" => Some("list_dir".to_owned()),
-                "exec" | "exec_sync" => Some("run_shell".to_owned()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let mut allowed_tools = allowed_tools;
-        let supports_edit_file = allowed_tools.iter().any(|tool| tool == "write_file");
-        allowed_tools.extend(builtin_allowed_tools(true, supports_edit_file));
+        let mut capabilities = capabilities;
+        probe_local_lsp_languages(&host, &workspace, &mut capabilities).await;
+        let browser_probe = state.local_browser.probe().await;
+        let observed_at = Utc::now();
+        capabilities.items.push(Capability {
+            name: "browser".into(),
+            state: if browser_probe.is_ok() {
+                CapabilityState::Available
+            } else {
+                CapabilityState::Unavailable
+            },
+            source: "runtime-probe".into(),
+            observed_at,
+            reason: browser_probe.err().map(|error| error.to_string()),
+        });
+        let mut allowed_tools = allowed_builtin_tools(&capabilities);
         if linear_tools_enabled {
             allowed_tools.extend([
                 "linear_get_issue".to_owned(),
@@ -10765,6 +12182,7 @@ async fn engine_for_with_context(
                 origin: origin.clone(),
                 repair_loop: repair_loop.clone(),
                 browser: Arc::clone(&state.local_browser),
+                capabilities: capabilities.clone(),
             }))),
             None,
             Some(allowed_tools),
@@ -10786,6 +12204,12 @@ async fn engine_for_with_context(
         };
         let executor_client = client.clone().with_workspace(workspace.clone());
         let asset_reader = SessionAssetReader::Remote(executor_client.clone());
+        let remote_host = RvmHost::new(host_id.clone(), workspace.clone(), executor_client.clone());
+        let capabilities = remote_host
+            .capabilities()
+            .await
+            .map_err(|error| format!("remote capabilities unavailable: {error}"))?;
+        let allowed_tools = allowed_builtin_tools(&capabilities);
         (
             workspace.clone(),
             Arc::new(DesktopExecutor::Remote(Box::new(RemoteExecutor {
@@ -10809,9 +12233,10 @@ async fn engine_for_with_context(
                 coordination: Arc::clone(&state.coordination),
                 origin: origin.clone(),
                 repair_loop: repair_loop.clone(),
+                capabilities: capabilities.clone(),
             }))),
             Some(executor_client),
-            None,
+            Some(allowed_tools),
             asset_reader,
         )
     };
@@ -10906,6 +12331,7 @@ async fn engine_for_with_context(
     };
     let provider_defaults = provider.capabilities(&model);
     let permission_mode = parse_permission_mode(&mode).unwrap_or(PermissionMode::Interactive);
+    let recording_source = Arc::clone(&executor);
     let mut engine = TurnEngine::new(
         provider,
         Arc::clone(&state.store),
@@ -10922,6 +12348,25 @@ async fn engine_for_with_context(
         session_id: session_id.to_owned(),
         host_id: host_id.clone(),
     }));
+    engine.set_recording_source(recording_source);
+    let agent_role = state
+        .store
+        .load_project_agent_by_session(session_id)
+        .ok()
+        .flatten()
+        .map(|agent| {
+            if agent.sort_order == 0 || agent.role.eq_ignore_ascii_case("lead") {
+                AgentRole::Lead
+            } else if agent.role.eq_ignore_ascii_case("test")
+                || agent.role.eq_ignore_ascii_case("testing")
+            {
+                AgentRole::TestingWorker
+            } else {
+                AgentRole::Worker
+            }
+        })
+        .unwrap_or(AgentRole::Lead);
+    engine.set_agent_role(agent_role);
     let discovered_caps = provider_models_for_state(
         state,
         provider_id.clone(),
@@ -11085,11 +12530,26 @@ async fn engine_for_with_context(
             .is_unattended(session_id)
             .map_err(|error| error.to_string())?,
     );
+    engine.set_progressive_tool_disclosure(
+        state
+            .store
+            .progressive_tool_disclosure(session_id)
+            .map_err(|error| error.to_string())?,
+    );
     let mut allowed_tools = allowed_tools;
-    if automatic_project_routing_active(&state.store, session_id)?
-        && let Some(allowed_tools) = allowed_tools.as_mut()
+    if matches!(agent_role, AgentRole::Worker | AgentRole::TestingWorker)
+        && let Some(allowed) = allowed_tools.as_mut()
     {
-        allowed_tools.retain(|tool| tool != "coordination_dispatch");
+        allowed.retain(|tool| {
+            !matches!(
+                tool.as_str(),
+                "ask_user"
+                    | "secrets_list"
+                    | "github_create_pull_request"
+                    | "github_create_issue"
+                    | "github_merge_pull_request"
+            )
+        });
     }
     let session_tools = session_external_tools(
         state,
@@ -11125,6 +12585,27 @@ async fn engine_for_with_context(
         &mut bundle,
         load_session_config_assets(state, session_id).unwrap_or_default(),
     );
+    let repository_identity = session
+        .project_id
+        .as_deref()
+        .map(|id| format!("project:{id}"))
+        .unwrap_or_else(|| format!("workspace:{workspace}"));
+    if let Ok(memories) = state
+        .store
+        .list_automatic_memories(&repository_identity, false)
+    {
+        bundle.memories = memories
+            .into_iter()
+            .map(|memory| MemoryEntry {
+                id: memory.id,
+                identifier: memory.identifier,
+                description: memory.description,
+                source_session_id: memory.source_session_id,
+                source_task: memory.source_task,
+                enabled: memory.status == "active",
+            })
+            .collect();
+    }
     {
         let connection = state
             .database
@@ -12583,7 +14064,7 @@ async fn harness_options(
     };
     let capabilities = host.capabilities().await.map_err(|e| e.to_string())?;
     let stdio = capabilities.items.iter().find(|item| item.name == "stdio");
-    let acp_option = if stdio.is_some_and(|item| item.available) {
+    let acp_option = if stdio.is_some_and(|item| item.state.is_available()) {
         match acp_agent_config(&state, project_id.as_deref()) {
             Ok(config) => {
                 let executable = config.command.split_whitespace().next().unwrap_or_default();
@@ -12629,6 +14110,78 @@ async fn harness_options(
 #[tauri::command(rename = "list_sessions")]
 fn list_sessions_command(state: State<'_, DesktopState>) -> Result<Vec<SessionView>, String> {
     list_sessions_for_state(&state)
+}
+
+#[tauri::command]
+async fn session_capabilities(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<Value, String> {
+    let session = session_for(&state, &session_id)?;
+    let capabilities = if session.host_id == "local" {
+        let workspace = if session.workspace.is_empty() {
+            local_workspace_path(&session_id)?
+        } else {
+            session.workspace.clone()
+        };
+        let host = LocalHost::with_secret_snapshot(
+            FsPath::new(&workspace),
+            Arc::clone(&state.secret_values),
+        )
+        .map_err(|error| error.to_string())?;
+        let mut capabilities = host
+            .capabilities()
+            .await
+            .map_err(|error| error.to_string())?;
+        probe_local_lsp_languages(&host, FsPath::new(&workspace), &mut capabilities).await;
+        let browser_probe = state.local_browser.probe().await;
+        let observed_at = Utc::now();
+        capabilities.items.push(Capability {
+            name: "browser".into(),
+            state: if browser_probe.is_ok() {
+                CapabilityState::Available
+            } else {
+                CapabilityState::Unavailable
+            },
+            source: "runtime-probe".into(),
+            observed_at,
+            reason: browser_probe.err().map(|error| error.to_string()),
+        });
+        capabilities
+    } else {
+        let client = client_for(&state, &session.host_id)?;
+        let workspace = if session.workspace.is_empty() {
+            client
+                .health()
+                .await
+                .map_err(|error| error.to_string())?
+                .workspace
+                .unwrap_or_else(|| "/workspace".into())
+        } else {
+            session.workspace.clone()
+        };
+        RvmHost::new(
+            session.host_id.clone(),
+            workspace.clone(),
+            client.with_workspace(workspace),
+        )
+        .capabilities()
+        .await
+        .map_err(|error| error.to_string())?
+    };
+    let all_tools = opcos_engine::builtin_tool_names();
+    let allowed = allowed_builtin_tools(&capabilities);
+    let allowed_set = allowed.iter().collect::<HashSet<_>>();
+    let omitted = all_tools
+        .into_iter()
+        .filter(|name| !allowed_set.contains(name))
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "observed_at": capabilities.observed_at,
+        "items": capabilities.items,
+        "allowed_tools": allowed,
+        "omitted_tools": omitted,
+    }))
 }
 
 #[tauri::command]
@@ -12861,6 +14414,22 @@ fn read_session_events_command(
     session_id: String,
 ) -> Result<Vec<Value>, String> {
     read_session_events_for_state(&state, session_id)
+}
+
+#[tauri::command]
+fn export_session_trace(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    output_dir: String,
+) -> Result<Value, String> {
+    let known_secrets = state
+        .secret_values
+        .read()
+        .map_err(|_| "secret snapshot lock poisoned".to_owned())?
+        .clone();
+    let manifest = export_trace_session(&state.store, &session_id, output_dir, &known_secrets)
+        .map_err(|error| error.to_string())?;
+    serde_json::to_value(manifest).map_err(|error| error.to_string())
 }
 
 fn read_session_events_for_state(
@@ -13566,67 +15135,395 @@ pub(crate) async fn submit_turn_inner_with_origin(
     submit_turn_inner_with_context(app, state, request, origin, None).await
 }
 
-fn builtin_allowed_tools(include_local_lsp: bool, include_edit_file: bool) -> Vec<String> {
-    let mut tools = vec![
-        "propose_plan",
-        "plan_get",
-        "plan_update",
-        "plan_revise",
-        "skill_save_learned",
-        "skill_search_learned",
-        "skill_get_learned",
-        "ask_user",
-        "secrets_list",
-        "repo_index_find_symbol",
-        "repo_index_glob",
-        "repo_index_search",
-        "background_job_start",
-        "background_job_status",
-        "background_job_output",
-        "background_job_kill",
-        "local_gate_record",
-        "local_gate_status",
-        "action_ledger_begin",
-        "action_ledger_finish",
-        "action_ledger_list",
-        "work_queue_enqueue",
-        "work_queue_claim",
-        "work_queue_renew",
-        "work_queue_complete",
-        "work_queue_cancel",
-        "work_queue_requeue",
-        "work_queue_list",
-        "external_ingress_sources",
-        "coordination_dispatch",
-        "coordination_status",
+fn allowed_builtin_tools(capabilities: &HostCapabilities) -> Vec<String> {
+    let has_language_lsp = capabilities
+        .items
+        .iter()
+        .any(|item| item.name.starts_with("lsp:") && item.state.is_available());
+    let has_language_entries = capabilities
+        .items
+        .iter()
+        .any(|item| item.name.starts_with("lsp:"));
+    let coarse_lsp_available = capabilities
+        .items
+        .iter()
+        .any(|item| item.name == "lsp" && item.state.is_available());
+    let lsp_available = has_language_lsp || (!has_language_entries && coarse_lsp_available);
+
+    opcos_engine::builtin_tool_capability_requirements()
+        .into_iter()
+        .filter(|(name, _)| !is_connector_builtin_tool(name))
+        .filter(|(name, _)| {
+            !matches!(
+                *name,
+                "tool_search"
+                    | "tool_describe"
+                    | "tool_script"
+                    | "send_user_message"
+                    | "report_blocker"
+            )
+        })
+        .filter(|(name, requirements)| {
+            let base_requirements = requirements
+                .iter()
+                .filter(|required| **required != "lsp")
+                .all(|required| {
+                    capabilities
+                        .items
+                        .iter()
+                        .find(|item| item.name == *required)
+                        .is_some_and(|item| item.state.is_available())
+                });
+            if !base_requirements {
+                return false;
+            }
+            if name.starts_with("lsp_") {
+                return lsp_available;
+            }
+            true
+        })
+        .map(|(name, _)| name.to_owned())
+        .collect()
+}
+
+fn is_connector_builtin_tool(name: &str) -> bool {
+    name.starts_with("linear_")
+        || name.starts_with("github_")
+        || name.starts_with("telegram_")
+        || name.starts_with("discord_")
+        || name.starts_with("slack_")
+        || name.starts_with("notion_")
+        || name.starts_with("gitlab_")
+        || name.starts_with("jira_")
+        || name.starts_with("stripe_")
+}
+
+fn workspace_lsp_projects(workspace: &std::path::Path) -> Vec<(&'static str, std::path::PathBuf)> {
+    const MAX_DEPTH: usize = 4;
+    const SKIPPED_DIRECTORIES: &[&str] = &[
+        ".git",
+        "build",
+        "coverage",
+        "dist",
+        "node_modules",
+        "out",
+        "target",
+        "vendor",
+    ];
+    let mut projects = Vec::new();
+    if workspace.join("Cargo.toml").is_file() {
+        projects.push(("rust", workspace.to_owned()));
+    }
+    let mut queue = std::collections::VecDeque::from([(workspace.to_owned(), 0)]);
+    while let Some((path, depth)) = queue.pop_front() {
+        let Ok(mut entries) = std::fs::read_dir(&path).map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>()
+        }) else {
+            continue;
+        };
+        entries.sort();
+        if let Some(manifest) = entries.iter().find(|path| {
+            matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("package.json" | "tsconfig.json" | "jsconfig.json")
+            )
+        }) {
+            projects.push((
+                "typescript",
+                manifest.parent().unwrap_or(workspace).to_owned(),
+            ));
+            break;
+        }
+        if depth >= MAX_DEPTH {
+            continue;
+        }
+        for child in entries {
+            if child.is_dir()
+                && !SKIPPED_DIRECTORIES
+                    .iter()
+                    .any(|name| child.file_name().and_then(|name| name.to_str()) == Some(name))
+            {
+                queue.push_back((child, depth + 1));
+            }
+        }
+    }
+    projects
+}
+
+async fn probe_local_lsp_languages(
+    host: &LocalHost,
+    workspace: &std::path::Path,
+    capabilities: &mut HostCapabilities,
+) {
+    let projects = workspace_lsp_projects(workspace);
+    let local_host = host;
+    let host: Arc<dyn Host> = Arc::new(local_host.clone());
+    let mut outcomes = Vec::new();
+    for (language, project_root) in projects {
+        let result = LspClient::start(
+            Arc::clone(&host),
+            project_root.display().to_string(),
+            language,
+        )
+        .await;
+        let (state, reason) = match result {
+            Ok(_) => (CapabilityState::Available, None),
+            Err(error) => (
+                CapabilityState::Unavailable,
+                Some(format!(
+                    "LSP {language} initialization probe failed: {error}"
+                )),
+            ),
+        };
+        let observed_at = Utc::now();
+        capabilities.items.push(Capability {
+            name: format!("lsp:{language}"),
+            state: state.clone(),
+            source: "runtime-probe".into(),
+            observed_at,
+            reason: reason.clone(),
+        });
+        outcomes.push((language, state, reason));
+    }
+    let summary = if outcomes
+        .iter()
+        .any(|(_, state, _)| *state == CapabilityState::Available)
+    {
+        CapabilityState::Available
+    } else if outcomes
+        .iter()
+        .all(|(_, state, _)| *state == CapabilityState::Unavailable)
+        && !outcomes.is_empty()
+    {
+        CapabilityState::Unavailable
+    } else {
+        CapabilityState::Unknown
+    };
+    let reason = if outcomes.is_empty() {
+        Some("no supported language manifests detected in workspace".into())
+    } else {
+        let failures = outcomes
+            .iter()
+            .filter(|(_, state, _)| *state != CapabilityState::Available)
+            .map(|(language, _, reason)| {
+                format!("{language}: {}", reason.as_deref().unwrap_or("unknown"))
+            })
+            .collect::<Vec<_>>();
+        (!failures.is_empty()).then(|| failures.join("; "))
+    };
+    if let Some(item) = capabilities
+        .items
+        .iter_mut()
+        .find(|item| item.name == "lsp")
+    {
+        item.state = summary.clone();
+        item.source = "runtime-probe".into();
+        item.reason = reason.clone();
+    }
+    local_host
+        .set_capability_state("lsp", summary, "runtime-probe", reason)
+        .await;
+}
+
+fn lsp_language_from_arguments(arguments: &Value, path: &str) -> Option<String> {
+    arguments
+        .get("language")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .or_else(|| {
+            std::path::Path::new(path)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .and_then(|extension| match extension {
+                    "rs" => Some("rust"),
+                    "ts" | "tsx" => Some("typescript"),
+                    "js" | "jsx" => Some("javascript"),
+                    "py" => Some("python"),
+                    _ => None,
+                })
+                .map(str::to_owned)
+        })
+}
+
+fn lsp_capability_name(language: &str) -> String {
+    let language = language.to_ascii_lowercase();
+    let language = match language.as_str() {
+        "typescriptreact" | "javascript" => "typescript",
+        _ => language.as_str(),
+    };
+    format!("lsp:{language}")
+}
+
+fn lsp_capability_preflight(
+    capabilities: &HostCapabilities,
+    tool: &str,
+    arguments: &Value,
+) -> Result<(), Value> {
+    let path = arguments.get("path").and_then(Value::as_str).unwrap_or("");
+    let Some(language) = lsp_language_from_arguments(arguments, path) else {
+        return Err(opcos_engine::capability_tool_error(
+            format!("capability_unknown: capability=lsp tool={tool} reason=language is missing"),
+            tool,
+            "lsp",
+            "unknown",
+            "not-probed",
+            capabilities.observed_at.to_rfc3339(),
+            true,
+        ));
+    };
+    let capability = lsp_capability_name(&language);
+    let item = capabilities
+        .items
+        .iter()
+        .find(|item| item.name == capability);
+    let Some(item) = item else {
+        return Err(opcos_engine::capability_tool_error(
+            format!(
+                "capability_unknown: capability={capability} tool={tool} language={language} reason=language was not probed"
+            ),
+            tool,
+            &capability,
+            "unknown",
+            "not-probed",
+            capabilities.observed_at.to_rfc3339(),
+            true,
+        ));
+    };
+    if item.state.is_available() {
+        return Ok(());
+    }
+    let state = match item.state {
+        CapabilityState::Unavailable => "unavailable",
+        CapabilityState::Unknown => "unknown",
+        CapabilityState::Available => "available",
+    };
+    let code = if state == "unknown" {
+        "capability_unknown"
+    } else {
+        "capability_unavailable"
+    };
+    Err(opcos_engine::capability_tool_error(
+        format!(
+            "{code}: capability={capability} tool={tool} language={language} state={state} reason={}",
+            item.reason.as_deref().unwrap_or("no reason provided")
+        ),
+        tool,
+        &capability,
+        state,
+        &item.source,
+        item.observed_at.to_rfc3339(),
+        state == "unknown",
+    ))
+}
+
+fn capability_preflight(
+    capabilities: &HostCapabilities,
+    tool: &str,
+    arguments: &Value,
+) -> Result<(), Value> {
+    if tool.starts_with("lsp_") {
+        return lsp_capability_preflight(capabilities, tool, arguments);
+    }
+    let requirements = opcos_engine::builtin_tool_capability_requirements()
+        .into_iter()
+        .find(|(name, _)| *name == tool)
+        .map(|(_, requirements)| requirements)
+        .unwrap_or(&[]);
+    for required in requirements {
+        let item = capabilities
+            .items
+            .iter()
+            .find(|item| item.name == *required);
+        let Some(item) = item else {
+            return Err(opcos_engine::capability_tool_error(
+                format!(
+                    "capability_unknown: capability={required} tool={tool} reason=capability evidence is missing"
+                ),
+                tool,
+                *required,
+                "unknown",
+                "not_probed",
+                capabilities.observed_at.to_rfc3339(),
+                true,
+            ));
+        };
+        if !item.state.is_available() {
+            let state = match item.state {
+                CapabilityState::Unavailable => "unavailable",
+                CapabilityState::Unknown => "unknown",
+                CapabilityState::Available => "available",
+            };
+            let code = if state == "unknown" {
+                "capability_unknown"
+            } else {
+                "capability_unavailable"
+            };
+            return Err(opcos_engine::capability_tool_error(
+                format!(
+                    "{code}: capability={required} tool={tool} state={state} reason={}",
+                    item.reason.as_deref().unwrap_or("no reason provided")
+                ),
+                tool,
+                *required,
+                state,
+                &item.source,
+                item.observed_at.to_rfc3339(),
+                state == "unknown",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn test_capabilities(lsp: bool, browser: bool, screenshot: bool) -> HostCapabilities {
+    let observed_at = Utc::now();
+    let names = [
+        "exec",
+        "read",
+        "write",
+        "ls",
+        "process_stream",
+        "stdio",
+        "lsp",
+        "browser",
+        "screenshot",
         "computer_use",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect::<Vec<_>>();
-    if include_local_lsp {
-        tools.extend([
-            "lsp_definition".to_owned(),
-            "lsp_references".to_owned(),
-            "lsp_diagnostics".to_owned(),
-        ]);
+    ];
+    HostCapabilities {
+        observed_at,
+        items: names
+            .into_iter()
+            .map(|name| {
+                let available = match name {
+                    "lsp" => lsp,
+                    "computer_use" => screenshot,
+                    "browser" | "screenshot" => {
+                        if name == "screenshot" {
+                            screenshot
+                        } else {
+                            browser
+                        }
+                    }
+                    _ => true,
+                };
+                Capability {
+                    name: name.into(),
+                    state: if available {
+                        CapabilityState::Available
+                    } else {
+                        CapabilityState::Unavailable
+                    },
+                    source: "test".into(),
+                    observed_at,
+                    reason: (!available).then(|| "test unavailable".into()),
+                }
+            })
+            .collect(),
     }
-    if include_edit_file {
-        tools.push("edit_file".to_owned());
-    }
-    if include_local_lsp {
-        tools.extend([
-            "browser_status".to_owned(),
-            "browser_navigate".to_owned(),
-            "browser_set_viewport".to_owned(),
-            "browser_click".to_owned(),
-            "browser_read".to_owned(),
-            "browser_measure".to_owned(),
-            "browser_assert_geometry".to_owned(),
-            "browser_screenshot".to_owned(),
-        ]);
-    }
-    tools
 }
 
 pub(crate) async fn submit_turn_inner_with_context(
@@ -14482,6 +16379,20 @@ struct DesktopControlPlane {
     app: tauri::AppHandle,
 }
 
+const MCP_SESSION_TURN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+
+async fn await_mcp_turn_with_deadline<F>(turn: F, timeout: Duration) -> Result<bool, String>
+where
+    F: Future<Output = Result<(), String>> + Send + 'static,
+{
+    let task = tauri::async_runtime::spawn(turn);
+    match tokio::time::timeout(timeout, task).await {
+        Ok(Ok(result)) => result.map(|()| true),
+        Ok(Err(error)) => Err(format!("MCP session turn task failed: {error}")),
+        Err(_) => Ok(false),
+    }
+}
+
 fn mcp_session_view(view: SessionView) -> Value {
     let mut value = serde_json::to_value(view).expect("session view serializes");
     if let Some(object) = value.as_object_mut()
@@ -14928,17 +16839,46 @@ impl opcos_mcp_server::OpcosControlPlane for DesktopControlPlane {
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
         {
-            submit_turn_inner_with_origin(
-                self.app.clone(),
-                &state,
-                SubmitRequest {
-                    session_id: session_id.clone(),
-                    text: prompt.to_owned(),
-                    attachments: vec![],
+            let app = self.app.clone();
+            let turn_session_id = session_id.clone();
+            let turn_text = prompt.to_owned();
+            let completed = await_mcp_turn_with_deadline(
+                async move {
+                    let state = app.state::<DesktopState>();
+                    submit_turn_inner_with_origin(
+                        app.clone(),
+                        &state,
+                        SubmitRequest {
+                            session_id: turn_session_id,
+                            text: turn_text,
+                            attachments: vec![],
+                        },
+                        ToolOrigin::User,
+                    )
+                    .await
                 },
-                ToolOrigin::User,
+                MCP_SESSION_TURN_RESPONSE_TIMEOUT,
             )
             .await?;
+            if !completed {
+                let current = state
+                    .store
+                    .load_session(&session_id)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| format!("session not found: {session_id}"))?;
+                let current = {
+                    let connection = state
+                        .database
+                        .lock()
+                        .map_err(|_| "database lock poisoned".to_owned())?;
+                    session_view_for_host(&connection, current)?
+                        .ok_or_else(|| format!("session host not found: {session_id}"))?
+                };
+                return Ok(json!({
+                    "session_id": session_id,
+                    "session": mcp_session_view(current),
+                }));
+            }
         }
         Ok(json!({"session_id": session_id, "session": mcp_session_view(view)}))
     }
@@ -14992,15 +16932,24 @@ impl opcos_mcp_server::OpcosControlPlane for DesktopControlPlane {
             })),
             "message" => {
                 let message = Self::required_string(&arguments, "message")?;
-                submit_turn_inner_with_origin(
-                    self.app.clone(),
-                    &state,
-                    SubmitRequest {
-                        session_id: session_id.clone(),
-                        text: message,
-                        attachments: vec![],
+                let app = self.app.clone();
+                let turn_session_id = session_id.clone();
+                await_mcp_turn_with_deadline(
+                    async move {
+                        let state = app.state::<DesktopState>();
+                        submit_turn_inner_with_origin(
+                            app.clone(),
+                            &state,
+                            SubmitRequest {
+                                session_id: turn_session_id,
+                                text: message,
+                                attachments: vec![],
+                            },
+                            ToolOrigin::User,
+                        )
+                        .await
                     },
-                    ToolOrigin::User,
+                    MCP_SESSION_TURN_RESPONSE_TIMEOUT,
                 )
                 .await?;
                 let session = list_sessions_for_state(&state)?
@@ -15654,6 +17603,22 @@ fn get_unattended(state: State<'_, DesktopState>, session_id: String) -> Result<
 }
 
 #[tauri::command]
+fn rename_session(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    session_id: String,
+    title: String,
+) -> Result<(), String> {
+    let title = validate_session_title(&title)?;
+    state
+        .store
+        .update_session_title(&session_id, &title)
+        .map_err(|error| error.to_string())?;
+    emit(&app, "session_list_changed", None, json!({}));
+    Ok(())
+}
+
+#[tauri::command]
 async fn set_unattended(
     app: tauri::AppHandle,
     state: State<'_, DesktopState>,
@@ -15678,6 +17643,40 @@ async fn set_unattended(
         "unattended_changed",
         Some(&session_id),
         json!({"unattended": unattended}),
+    );
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_progressive_tool_disclosure(
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<bool, String> {
+    state
+        .store
+        .progressive_tool_disclosure(&session_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn set_progressive_tool_disclosure(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    session_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    state
+        .store
+        .set_progressive_tool_disclosure(&session_id, enabled)
+        .map_err(|error| error.to_string())?;
+    if let Some(engine) = state.engines.lock().await.get(&session_id).cloned() {
+        engine.set_progressive_tool_disclosure(enabled);
+    }
+    emit(
+        &app,
+        "progressive_tool_disclosure_changed",
+        Some(&session_id),
+        json!({"enabled": enabled}),
     );
     Ok(())
 }
@@ -17441,6 +19440,7 @@ fn save_asset_for_state(
         kind.as_str(),
         "instructions"
             | "knowledge"
+            | "user_preference"
             | "playbook"
             | "skill"
             | "command"
@@ -18696,19 +20696,9 @@ async fn linear_connection(state: State<'_, DesktopState>) -> Result<Value, Stri
 }
 
 fn connector_config(state: &DesktopState, kind: &str) -> Result<Value, String> {
-    if let Some(value) = state
-        .secrets
-        .get(&secret_key("connector-config", kind))
-        .map_err(|error| format!("{kind} credentials unavailable: {error}"))?
-    {
-        return serde_json::from_str(&value).map_err(|_| format!("{kind} credentials are invalid"));
-    }
-    state
-        .secrets
-        .get(&secret_key("connector-token", kind))
-        .map_err(|error| format!("{kind} token unavailable: {error}"))?
-        .map(|token| json!({"token": token}))
-        .ok_or_else(|| format!("{kind} credentials are not configured"))
+    let config = connector_credentials_config_for(&state.secrets, &state.store, None, kind)?
+        .ok_or_else(|| format!("{kind} credentials are not configured"))?;
+    serde_json::from_str(&config).map_err(|_| format!("{kind} credentials are invalid"))
 }
 
 async fn connector_json(request: reqwest::RequestBuilder, kind: &str) -> Result<Value, String> {
@@ -19787,16 +21777,36 @@ const SUPPORTED_CONNECTOR_KINDS: &[&str] = &[
 ];
 
 fn connector_credentials_configured(state: &DesktopState, kind: &str) -> Result<bool, String> {
-    Ok(state
-        .secrets
-        .get(&secret_key("connector-config", kind))
-        .map_err(|error| format!("{kind} credentials unavailable: {error}"))?
-        .is_some()
-        || state
-            .secrets
-            .get(&secret_key("connector-token", kind))
-            .map_err(|error| format!("{kind} token unavailable: {error}"))?
-            .is_some())
+    Ok(connector_credentials_config_for(&state.secrets, &state.store, None, kind)?.is_some())
+}
+
+fn connector_secret_kind(store: &SqliteStore, project_id: Option<&str>, kind: &str) -> String {
+    if kind == "github"
+        && let Ok(target) = project_github_repo(store, project_id)
+    {
+        return target.instance.connector_secret_name();
+    }
+    kind.to_owned()
+}
+
+fn connector_credentials_config_for(
+    secrets: &KeyringSecretStore,
+    store: &SqliteStore,
+    project_id: Option<&str>,
+    kind: &str,
+) -> Result<Option<String>, String> {
+    let secret_kind = connector_secret_kind(store, project_id, kind);
+    if let Some(config) =
+        scoped_secret_get_from_store(secrets, project_id, "connector-config", &secret_kind)
+            .map_err(|error| format!("{secret_kind} credentials unavailable: {error}"))?
+    {
+        return Ok(Some(config));
+    }
+    Ok(
+        scoped_secret_get_from_store(secrets, project_id, "connector-token", &secret_kind)
+            .map_err(|error| format!("{secret_kind} token unavailable: {error}"))?
+            .map(|token| json!({"token": token}).to_string()),
+    )
 }
 
 fn connector_kind_supported(
@@ -20020,17 +22030,11 @@ async fn connector_browser_check(
     host_id: String,
 ) -> Result<Value, String> {
     let available = if host_id == "local" {
-        let capabilities = LocalHost::new(FsPath::new("/"))
-            .map_err(|error| error.to_string())?
-            .capabilities()
-            .await
-            .map_err(|error| error.to_string())?;
-        capabilities
-            .items
-            .iter()
-            .filter(|item| item.available)
-            .map(|item| item.name.to_ascii_lowercase())
-            .collect::<Vec<_>>()
+        if state.local_browser.probe().await.is_ok() {
+            vec!["browser".to_owned()]
+        } else {
+            Vec::new()
+        }
     } else {
         client_for(&state, &host_id)?
             .capabilities()
@@ -20229,20 +22233,7 @@ async fn execute_connector_tool(
     } else {
         GitHubInstance::dotcom()
     };
-    let kind = if kind == "github" {
-        github_instance.connector_secret_name()
-    } else {
-        kind.to_owned()
-    };
-    let kind = kind.as_str();
-    let config = scoped_secret_get_from_store(secrets, project_id, "connector-config", kind)
-        .map_err(|error| format!("{kind} credentials unavailable: {error}"))?
-        .or_else(|| {
-            scoped_secret_get_from_store(secrets, project_id, "connector-token", kind)
-                .ok()
-                .flatten()
-                .map(|token| json!({"token": token}).to_string())
-        })
+    let config = connector_credentials_config_for(secrets, store, project_id, kind)?
         .ok_or_else(|| format!("{kind} credentials are not configured"))?;
     let config: Value =
         serde_json::from_str(&config).map_err(|_| format!("{kind} credentials are invalid"))?;
@@ -22030,6 +24021,22 @@ struct CoordinationStartInput {
     roles: Vec<Role>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct CoordinationFanOutMemberInput {
+    member_id: String,
+    worker_role_id: String,
+    message: String,
+    deadline_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CoordinationFanOutInput {
+    batch_id: String,
+    members: Vec<CoordinationFanOutMemberInput>,
+    acceptance_spec: Value,
+    deadline_seconds: u64,
+}
+
 #[tauri::command]
 async fn coordination_start(
     state: State<'_, DesktopState>,
@@ -22325,6 +24332,27 @@ fn worker_role_for_plan_step(step: &opcos_store::PlanStepRecord) -> &'static str
     }
 }
 
+fn select_plan_routing_wave(
+    steps: &[opcos_store::PlanStepRecord],
+    serial: bool,
+    worker_capacity: usize,
+) -> Vec<&opcos_store::PlanStepRecord> {
+    if serial {
+        steps.iter().take(1).collect()
+    } else {
+        steps.iter().take(worker_capacity).collect()
+    }
+}
+
+fn plan_batch_id(plan_id: &str, revision: u64, steps: &[&opcos_store::PlanStepRecord]) -> String {
+    let member_key = steps
+        .iter()
+        .map(|step| step.step_id.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("plan-batch:{plan_id}:{revision}:{member_key}")
+}
+
 fn step_has_routing_audit(
     state: &DesktopState,
     session_id: &str,
@@ -22338,7 +24366,12 @@ fn step_has_routing_audit(
         matches!(
             event.kind.as_str(),
             "coordination_auto_dispatch" | "coordination_local_execution"
-        ) && event.payload["step_id"].as_str() == Some(step_id)
+        ) && (event.payload["step_id"].as_str() == Some(step_id)
+            || event.payload["step_ids"]
+                .as_array()
+                .is_some_and(|step_ids| {
+                    step_ids.iter().any(|value| value.as_str() == Some(step_id))
+                }))
     }))
 }
 
@@ -22497,16 +24530,120 @@ async fn auto_route_project_plan(
     let steps = plan
         .steps
         .into_iter()
-        .filter(|step| step.status == "not_started");
-    for step in if serial {
-        steps.take(1).collect::<Vec<_>>()
-    } else {
-        steps.collect::<Vec<_>>()
-    } {
+        .filter(|step| step.status == "not_started")
+        .collect::<Vec<_>>();
+    if !serial {
+        let agents = state
+            .store
+            .load_project_agents(project_id)
+            .map_err(|e| e.to_string())?;
+        let mut available_workers = agents
+            .into_iter()
+            .filter(|agent| {
+                agent.sort_order != 0
+                    && agent.session_id.is_some()
+                    && agent.harness.eq_ignore_ascii_case("builtin")
+            })
+            .collect::<Vec<_>>();
+        if available_workers.is_empty() {
+            for step in &steps {
+                if step_has_routing_audit(state, leader_session_id, &step.step_id)? {
+                    continue;
+                }
+                record_local_plan_execution(
+                    app,
+                    state,
+                    leader_session_id,
+                    step,
+                    "no active builtin Worker session is available",
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+        let routing_wave = select_plan_routing_wave(&steps, false, available_workers.len());
+        let batch_id = plan_batch_id(&plan.plan_id, plan.revision, &routing_wave);
+        let mut members = Vec::new();
+        for step in routing_wave {
+            if step_has_routing_audit(state, leader_session_id, &step.step_id)? {
+                continue;
+            }
+            let preferred = worker_role_for_plan_step(step);
+            let worker_index = available_workers
+                .iter()
+                .position(|agent| agent.role.eq_ignore_ascii_case(preferred))
+                .or_else(|| (!available_workers.is_empty()).then_some(0));
+            let Some(worker_index) = worker_index else {
+                break;
+            };
+            let worker = available_workers.remove(worker_index);
+            let message = format!(
+                "Execute assigned independent plan step {} (coordination batch {}): {}. Work only \
+                 in your assigned workspace. When finished, send the Lead a coordination envelope \
+                 with taskId exactly '{}', kind='result', and a concrete report of the work and \
+                 verification; do not substitute a prose report for the envelope.",
+                step.step_id, batch_id, step.description, batch_id
+            );
+            members.push(json!({
+                "member_id": step.step_id,
+                "worker_role_id": worker.id,
+                "message": message,
+                "deadline_seconds": 300,
+            }));
+            state
+                .store
+                .update_plan_step(
+                    leader_session_id,
+                    &step.step_id,
+                    Some("in_progress"),
+                    None,
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        if !members.is_empty() {
+            let result = execute_coordination_tool(
+                &state.store,
+                &state.database,
+                &state.engines,
+                &state.coordination,
+                leader_session_id,
+                "coordination_fan_out",
+                &json!({
+                    "batch_id": batch_id,
+                    "members": members,
+                    "acceptance_spec": {
+                        "plan_id": plan.plan_id,
+                        "independent": true,
+                        "completion_evidence": "coordination result envelope plus persisted verification",
+                    },
+                    "deadline_seconds": 300,
+                }),
+            )
+            .await?;
+            audit(
+                state,
+                leader_session_id,
+                "coordination_auto_dispatch",
+                json!({
+                    "plan_id": plan.plan_id,
+                    "batch_id": batch_id,
+                    "step_ids": members
+                        .iter()
+                        .filter_map(|member| member["member_id"].as_str())
+                        .collect::<Vec<_>>(),
+                    "concurrency": "bounded",
+                    "dispatch": result,
+                }),
+            );
+        }
+        return Ok(());
+    }
+    for step in select_plan_routing_wave(&steps, serial, 1) {
         if step_has_routing_audit(state, leader_session_id, &step.step_id)? {
             continue;
         }
-        let role_name = worker_role_for_plan_step(&step);
+        let role_name = worker_role_for_plan_step(step);
         let worker = state
             .store
             .load_project_agents(project_id)
@@ -22521,7 +24658,7 @@ async fn auto_route_project_plan(
                 .find(|item| item["role"].as_str() == Some(role_name))
                 .and_then(|item| item["reason"].as_str())
                 .unwrap_or("worker session is unavailable");
-            record_local_plan_execution(app, state, leader_session_id, &step, reason).await?;
+            record_local_plan_execution(app, state, leader_session_id, step, reason).await?;
             continue;
         };
         let task_id = format!("plan-step:{}", step.step_id);
@@ -22705,10 +24842,19 @@ async fn coordination_message(
             .get(&worker_session)
             .cloned()
             .ok_or_else(|| "coordination target session is not started".to_owned())?;
-        engine
-            .queue_steering(envelope.encode(None).map_err(|error| error.to_string())?)
-            .await
-            .map_err(|error| error.to_string())?;
+        let encoded = envelope.encode(None).map_err(|error| error.to_string())?;
+        if engine.has_active_turn() {
+            engine
+                .queue_steering(encoded)
+                .await
+                .map_err(|error| error.to_string())?;
+        } else {
+            wake_session_for_turn(&state.store, &worker_session)?;
+            let worker_engine = Arc::clone(&engine);
+            tokio::spawn(async move {
+                let _ = worker_engine.submit_text(encoded).await;
+            });
+        }
     }
     Ok(json!({"accepted":true,"msg_id":envelope.msg_id}))
 }
@@ -22730,6 +24876,198 @@ fn reject_coordination_sensitive(text: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn refresh_coordination_batch(
+    connection: &Connection,
+    batch_id: &str,
+    now: DateTime<Utc>,
+) -> Result<Value, String> {
+    let now_text = now.to_rfc3339();
+    let batch_deadline: String = connection
+        .query_row(
+            "SELECT deadline_at FROM coord_batches WHERE batch_id=?1",
+            [batch_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let batch_expired = batch_deadline
+        .parse::<DateTime<Utc>>()
+        .map(|deadline| deadline <= now)
+        .unwrap_or(true);
+    connection
+        .execute(
+            "UPDATE coord_batch_members
+             SET status='timed_out', reason=COALESCE(reason,'member deadline expired'),
+                 finished_at=?1
+             WHERE batch_id=?2 AND status IN ('pending','dispatched','running')
+               AND member_deadline_at<=?1",
+            params![now_text, batch_id],
+        )
+        .map_err(|error| error.to_string())?;
+    if batch_expired {
+        connection
+            .execute(
+                "UPDATE coord_batch_members
+                 SET status='timed_out', reason=COALESCE(reason,'batch deadline expired'),
+                     finished_at=?1
+                 WHERE batch_id=?2 AND status IN ('pending','dispatched','running')",
+                params![now_text, batch_id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    let counts = connection
+        .query_row(
+            "SELECT
+                COUNT(*),
+                SUM(status IN ('pending','dispatched','running')),
+                SUM(status='succeeded'),
+                SUM(status='failed'),
+                SUM(status='timed_out'),
+                SUM(status='needs_human')
+             FROM coord_batch_members WHERE batch_id=?1",
+            [batch_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as usize,
+                    row.get::<_, Option<i64>>(1)?.unwrap_or(0) as usize,
+                    row.get::<_, Option<i64>>(2)?.unwrap_or(0) as usize,
+                    row.get::<_, Option<i64>>(3)?.unwrap_or(0) as usize,
+                    row.get::<_, Option<i64>>(4)?.unwrap_or(0) as usize,
+                    row.get::<_, Option<i64>>(5)?.unwrap_or(0) as usize,
+                ))
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let (total, active, succeeded, failed, timed_out, needs_human) = counts;
+    let status = if needs_human > 0 {
+        "needs_human"
+    } else if active > 0 {
+        if succeeded > 0 || failed > 0 || timed_out > 0 {
+            "partial"
+        } else {
+            "running"
+        }
+    } else if succeeded == total {
+        "succeeded"
+    } else if succeeded > 0 {
+        "partial"
+    } else if timed_out > 0 && failed == 0 {
+        "timed_out"
+    } else {
+        "failed"
+    };
+    connection
+        .execute(
+            "UPDATE coord_batches SET status=?1,updated_at=?2 WHERE batch_id=?3",
+            params![status, now_text, batch_id],
+        )
+        .map_err(|error| error.to_string())?;
+    load_coordination_batch(connection, batch_id)
+}
+
+fn load_coordination_batch(connection: &Connection, batch_id: &str) -> Result<Value, String> {
+    let batch = connection
+        .query_row(
+            "SELECT batch_id,project_id,status,deadline_at,acceptance_spec,
+                    acceptance_spec_hash,created_at,updated_at
+             FROM coord_batches WHERE batch_id=?1",
+            [batch_id],
+            |row| {
+                let spec: String = row.get(4)?;
+                Ok(json!({
+                    "batch_id": row.get::<_, String>(0)?,
+                    "project_id": row.get::<_, String>(1)?,
+                    "status": row.get::<_, String>(2)?,
+                    "deadline_at": row.get::<_, String>(3)?,
+                    "acceptance_spec": serde_json::from_str::<Value>(&spec).unwrap_or(Value::Null),
+                    "acceptance_spec_hash": row.get::<_, String>(5)?,
+                    "created_at": row.get::<_, String>(6)?,
+                    "updated_at": row.get::<_, String>(7)?,
+                    "evaluator_status": "not_started",
+                    "evaluator_consumed": false,
+                }))
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let mut statement = connection
+        .prepare(
+            "SELECT member_id,worker_role_id,status,member_deadline_at,reason,
+                    started_at,finished_at
+             FROM coord_batch_members WHERE batch_id=?1 ORDER BY member_id",
+        )
+        .map_err(|error| error.to_string())?;
+    let members = statement
+        .query_map([batch_id], |row| {
+            Ok(json!({
+                "member_id": row.get::<_, String>(0)?,
+                "worker_role_id": row.get::<_, String>(1)?,
+                "status": row.get::<_, String>(2)?,
+                "deadline_at": row.get::<_, String>(3)?,
+                "reason": row.get::<_, Option<String>>(4)?,
+                "started_at": row.get::<_, Option<String>>(5)?,
+                "finished_at": row.get::<_, Option<String>>(6)?,
+            }))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let total = members.len();
+    let completed = members
+        .iter()
+        .filter(|member| member["status"] == "succeeded")
+        .count();
+    let failed = members
+        .iter()
+        .filter(|member| member["status"] == "failed")
+        .count();
+    let timed_out = members
+        .iter()
+        .filter(|member| member["status"] == "timed_out")
+        .count();
+    let active = total.saturating_sub(completed + failed + timed_out);
+    if let Some(object) = batch.as_object().cloned() {
+        let mut object = object;
+        object.insert("members".into(), json!(members));
+        object.insert("member_count".into(), json!(total));
+        object.insert("completed_count".into(), json!(completed));
+        object.insert("failed_count".into(), json!(failed));
+        object.insert("timed_out_count".into(), json!(timed_out));
+        object.insert("active_count".into(), json!(active));
+        object.insert("barrier_released".into(), json!(active == 0));
+        Ok(Value::Object(object))
+    } else {
+        Err("coordination batch is not an object".to_owned())
+    }
+}
+
+fn update_coordination_batch_member(
+    connection: &Connection,
+    batch_id: &str,
+    worker_role_id: &str,
+    status: &str,
+    reason: Option<&str>,
+) -> Result<(), String> {
+    let changed = connection
+        .execute(
+            "UPDATE coord_batch_members
+             SET status=?1,reason=?2,finished_at=?3
+             WHERE batch_id=?4 AND worker_role_id=?5
+               AND status IN ('pending','dispatched','running')",
+            params![
+                status,
+                reason,
+                Utc::now().to_rfc3339(),
+                batch_id,
+                worker_role_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Ok(());
+    }
+    let _ = refresh_coordination_batch(connection, batch_id, Utc::now())?;
+    Ok(())
+}
+
 async fn execute_coordination_tool(
     store: &SqliteStore,
     database: &Arc<Mutex<Connection>>,
@@ -22743,7 +25081,273 @@ async fn execute_coordination_tool(
         .load_project_agent_by_session(session_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "coordination tools require a project agent session".to_owned())?;
-    if name == "coordination_dispatch" {
+    if name == "coordination_fan_out" {
+        if caller.sort_order != 0 || !caller.role.eq_ignore_ascii_case("lead") {
+            return Err(
+                "coordination fan-out denied: only the bound Leader session may dispatch"
+                    .to_owned(),
+            );
+        }
+        let input: CoordinationFanOutInput = serde_json::from_value(arguments.clone())
+            .map_err(|error| format!("invalid coordination fan-out input: {error}"))?;
+        if input.batch_id.trim().is_empty() || input.members.is_empty() {
+            return Err("batch_id and at least one member are required".to_owned());
+        }
+        let deadline_seconds = input.deadline_seconds.clamp(1, 604_800);
+        let now = Utc::now();
+        let deadline_at = now + ChronoDuration::seconds(deadline_seconds as i64);
+        let spec_bytes = serde_json::to_vec(&input.acceptance_spec)
+            .map_err(|error| format!("invalid acceptance spec: {error}"))?;
+        let acceptance_spec_hash = format!("{:x}", Sha256::digest(spec_bytes));
+        let agents = store
+            .load_project_agents(&caller.project_id)
+            .map_err(|error| error.to_string())?;
+        let mut seen_members = HashSet::new();
+        let mut seen_workers = HashSet::new();
+        let mut dispatches = Vec::with_capacity(input.members.len());
+        for member in &input.members {
+            if member.member_id.trim().is_empty()
+                || !seen_members.insert(member.member_id.clone())
+                || !seen_workers.insert(member.worker_role_id.clone())
+            {
+                return Err(
+                    "batch member IDs and Worker roles must be unique and non-empty".into(),
+                );
+            }
+            reject_coordination_sensitive(&member.message)?;
+            let worker = agents
+                .iter()
+                .find(|agent| agent.id == member.worker_role_id)
+                .ok_or_else(|| format!("Worker role does not exist: {}", member.worker_role_id))?
+                .clone();
+            if worker.project_id != caller.project_id
+                || worker.sort_order == 0
+                || worker.session_id.is_none()
+                || !worker.harness.eq_ignore_ascii_case("builtin")
+            {
+                return Err(format!(
+                    "coordination batch member is not an active builtin Worker: {}",
+                    member.worker_role_id
+                ));
+            }
+            let member_deadline = member
+                .deadline_seconds
+                .unwrap_or(deadline_seconds)
+                .clamp(1, deadline_seconds);
+            dispatches.push((member.clone(), worker, member_deadline));
+        }
+        {
+            let roles = agents
+                .iter()
+                .filter_map(|agent| {
+                    Some(Role {
+                        project_id: caller.project_id.clone(),
+                        id: agent.id.clone(),
+                        sort_order: agent.sort_order,
+                        session_id: agent.session_id.clone()?,
+                        state: RoleState::Active,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut runtimes = coordination.lock().await;
+            if !runtimes.contains_key(&input.batch_id) {
+                runtimes.insert(
+                    input.batch_id.clone(),
+                    CoordinationRuntime::new(roles).map_err(|error| error.to_string())?,
+                );
+            }
+        }
+        {
+            let connection = database.lock().map_err(|_| "database lock poisoned")?;
+            let exists = connection
+                .query_row(
+                    "SELECT 1 FROM coord_batches WHERE batch_id=?1",
+                    [&input.batch_id],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .unwrap_or(false);
+            if exists {
+                return Err("coordination batch already exists".to_owned());
+            }
+            connection
+                .execute_batch("BEGIN IMMEDIATE")
+                .map_err(|error| error.to_string())?;
+            let result = (|| -> Result<(), String> {
+                connection
+                    .execute(
+                        "INSERT INTO coord_batches
+                         (batch_id,project_id,status,deadline_at,acceptance_spec,
+                          acceptance_spec_hash,created_at,updated_at)
+                         VALUES (?1,?2,'running',?3,?4,?5,?6,?6)",
+                        params![
+                            input.batch_id,
+                            caller.project_id,
+                            deadline_at.to_rfc3339(),
+                            serde_json::to_string(&input.acceptance_spec)
+                                .map_err(|error| error.to_string())?,
+                            acceptance_spec_hash,
+                            now.to_rfc3339(),
+                        ],
+                    )
+                    .map_err(|error| error.to_string())?;
+                for (member, _, member_deadline) in &dispatches {
+                    connection
+                        .execute(
+                            "INSERT INTO coord_batch_members
+                             (batch_id,member_id,worker_role_id,status,member_deadline_at)
+                             VALUES (?1,?2,?3,'dispatched',?4)",
+                            params![
+                                input.batch_id,
+                                member.member_id,
+                                member.worker_role_id,
+                                (now + ChronoDuration::seconds(*member_deadline as i64))
+                                    .to_rfc3339(),
+                            ],
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => connection
+                    .execute_batch("COMMIT")
+                    .map_err(|error| error.to_string())?,
+                Err(error) => {
+                    let _ = connection.execute_batch("ROLLBACK");
+                    return Err(error);
+                }
+            }
+        }
+        let caller_id = caller.id.clone();
+        const MAX_COORDINATION_CONCURRENCY: usize = 4;
+        let fan_out_results = futures_util::stream::iter(dispatches
+            .into_iter()
+            .map(|(member, worker, _member_deadline)| {
+                let database = Arc::clone(database);
+                let engines = Arc::clone(engines);
+                let coordination = Arc::clone(coordination);
+                let batch_id = input.batch_id.clone();
+                let caller_id = caller_id.clone();
+                async move {
+                    let worker_session = worker.session_id.clone().unwrap_or_default();
+                    let worker_id = worker.id.clone();
+                    let outcome: Result<(), String> = async {
+                    let envelope = Envelope {
+                        v: 1,
+                        task_id: batch_id.clone(),
+                        from: caller_id,
+                        to: worker_id.clone(),
+                        kind: opcos_engine::orchestration::EnvelopeKind::Request,
+                        msg_id: format!("coord-{}", Uuid::new_v4()),
+                        reply_to: None,
+                        payload: json!({
+                            "message": member.message,
+                            "batch_id": batch_id,
+                            "member_id": member.member_id,
+                        }),
+                    };
+                    let validation = {
+                        let mut runtimes = coordination.lock().await;
+                        runtimes
+                            .get_mut(&envelope.task_id)
+                            .ok_or_else(|| "coordination batch runtime is not started".to_owned())
+                            .and_then(|runtime| {
+                                runtime
+                                    .validate_and_record(&envelope, Utc::now())
+                                    .map_err(|error| error.to_string())
+                            })
+                    };
+                    validation?;
+                    {
+                        let connection =
+                            database.lock().map_err(|_| "database lock poisoned")?;
+                        connection
+                            .execute(
+                                "INSERT INTO coord_messages
+                                 (project_id,task_id,msg_id,from_role,to_role,kind,reply_to,payload,created_at)
+                                 VALUES (?1,?2,?3,?4,?5,'request',?6,?7,?8)",
+                                params![
+                                    worker.project_id,
+                                    envelope.task_id,
+                                    envelope.msg_id,
+                                    envelope.from,
+                                    envelope.to,
+                                    envelope.reply_to,
+                                    envelope.payload.to_string(),
+                                    Utc::now().to_rfc3339(),
+                                ],
+                            )
+                            .map_err(|error| error.to_string())?;
+                    }
+                    let engine = engines
+                        .lock()
+                        .await
+                        .get(&worker_session)
+                        .cloned()
+                        .ok_or_else(|| "coordination Worker session is not running".to_owned());
+                    match engine {
+                        Ok(engine) => {
+                            {
+                                let connection =
+                                    database.lock().map_err(|_| "database lock poisoned")?;
+                                connection
+                                    .execute(
+                                        "UPDATE coord_batch_members
+                                         SET status='running',started_at=?1
+                                         WHERE batch_id=?2 AND member_id=?3",
+                                        params![
+                                            Utc::now().to_rfc3339(),
+                                            envelope.task_id,
+                                            member.member_id
+                                        ],
+                                    )
+                                    .map_err(|error| error.to_string())?;
+                            }
+                            let encoded = envelope
+                                .encode(None)
+                                .map_err(|error| error.to_string())?;
+                            if engine.has_active_turn() {
+                                engine
+                                    .queue_steering(encoded)
+                                    .await
+                                    .map_err(|error| error.to_string())?;
+                            } else {
+                                wake_session_for_turn(store, &worker_session)?;
+                                let worker_engine = Arc::clone(&engine);
+                                tokio::spawn(async move {
+                                    let _ = worker_engine.submit_text(encoded).await;
+                                });
+                            }
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
+                    }
+                    }
+                    .await;
+                    (worker_id, outcome)
+                }
+            }))
+            .buffer_unordered(MAX_COORDINATION_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        {
+            let connection = database.lock().map_err(|_| "database lock poisoned")?;
+            for (worker_role_id, result) in fan_out_results {
+                if let Err(error) = result {
+                    update_coordination_batch_member(
+                        &connection,
+                        &input.batch_id,
+                        &worker_role_id,
+                        "failed",
+                        Some(&error),
+                    )?;
+                }
+            }
+            return refresh_coordination_batch(&connection, &input.batch_id, Utc::now());
+        }
+    } else if name == "coordination_dispatch" {
         if arguments.get("from_role").is_some() {
             return Err(
                 "coordination dispatch denied: from_role is system-bound and cannot be supplied"
@@ -22874,10 +25478,19 @@ async fn execute_coordination_tool(
             .get(target_session)
             .cloned()
             .ok_or_else(|| "coordination target Worker session is not running".to_owned())?;
-        engine
-            .queue_steering(envelope.encode(None).map_err(|error| error.to_string())?)
-            .await
-            .map_err(|error| error.to_string())?;
+        let encoded = envelope.encode(None).map_err(|error| error.to_string())?;
+        if engine.has_active_turn() {
+            engine
+                .queue_steering(encoded)
+                .await
+                .map_err(|error| error.to_string())?;
+        } else {
+            wake_session_for_turn(store, target_session)?;
+            let worker_engine = Arc::clone(&engine);
+            tokio::spawn(async move {
+                let _ = worker_engine.submit_text(encoded).await;
+            });
+        }
         return Ok(json!({
             "task_id": task.id,
             "status": "dispatched",
@@ -22900,6 +25513,18 @@ async fn execute_coordination_tool(
             .unwrap_or(5)
             .clamp(1, 5) as usize;
         let connection = database.lock().map_err(|_| "database lock poisoned")?;
+        let is_batch = connection
+            .query_row(
+                "SELECT 1 FROM coord_batches WHERE batch_id=?1",
+                [task_id],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .unwrap_or(false);
+        if is_batch {
+            return refresh_coordination_batch(&connection, task_id, Utc::now());
+        }
         let task = load_coord_task(&connection, task_id)?;
         if task.project_id != caller.project_id {
             return Err("coordination task is outside the caller project".to_owned());
@@ -22978,15 +25603,27 @@ async fn execute_coordination_tool(
 }
 
 fn connection_project_for_task(state: &DesktopState, task_id: &str) -> Result<String, String> {
-    state
+    let connection = state
         .database
         .lock()
-        .map_err(|_| "database lock poisoned")?
+        .map_err(|_| "database lock poisoned")?;
+    connection
         .query_row(
             "SELECT project_id FROM coord_tasks WHERE id=?1",
             [task_id],
             |row| row.get(0),
         )
+        .or_else(|error| {
+            if matches!(error, rusqlite::Error::QueryReturnedNoRows) {
+                connection.query_row(
+                    "SELECT project_id FROM coord_batches WHERE batch_id=?1",
+                    [task_id],
+                    |row| row.get(0),
+                )
+            } else {
+                Err(error)
+            }
+        })
         .map_err(|error| error.to_string())
 }
 
@@ -23036,7 +25673,36 @@ async fn persist_coord_message(
             .map_err(|error| error.to_string())?;
     }
     if envelope.kind == opcos_engine::orchestration::EnvelopeKind::Result {
-        coordination_complete_task_inner(state, task_id, &envelope.from, None).await?;
+        let is_batch = {
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            connection
+                .query_row(
+                    "SELECT 1 FROM coord_batches WHERE batch_id=?1",
+                    [task_id],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .unwrap_or(false)
+        };
+        if is_batch {
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            update_coordination_batch_member(
+                &connection,
+                task_id,
+                &envelope.from,
+                "succeeded",
+                None,
+            )?;
+        } else {
+            coordination_complete_task_inner(state, task_id, &envelope.from, None).await?;
+        }
     }
     Ok(())
 }
@@ -23331,6 +25997,7 @@ async fn coordination_ingest_session_inner(
         .store
         .load_messages(session_id)
         .map_err(|error| error.to_string())?;
+    let worker_reports = route_worker_reports(state, session_id).await?;
     let mut accepted = 0usize;
     let mut skipped = 0usize;
     let mut rejected = Vec::new();
@@ -23435,9 +26102,132 @@ async fn coordination_ingest_session_inner(
     Ok(json!({
         "session_id": session_id,
         "accepted": accepted,
+        "worker_reports": worker_reports,
         "skipped": skipped,
         "rejected": rejected
     }))
+}
+
+async fn route_worker_reports(state: &DesktopState, session_id: &str) -> Result<usize, String> {
+    let Some((worker, task_id, project_id, leader, leader_session)) = ({
+        let connection = state
+            .database
+            .lock()
+            .map_err(|_| "database lock poisoned")?;
+        connection
+            .query_row(
+                "SELECT worker.id,task.id,task.project_id,leader.id,leader.session_id
+                 FROM coord_tasks task
+                 JOIN project_agents worker ON worker.id=task.assignee
+                 JOIN project_agents leader
+                   ON leader.project_id=task.project_id AND leader.sort_order=0
+                 WHERE worker.session_id=?1
+                 ORDER BY task.id DESC LIMIT 1",
+                [session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+    }) else {
+        return Ok(0);
+    };
+    let Some(leader_session) = leader_session else {
+        return Err("coordination Lead session is unavailable".into());
+    };
+    let events = state
+        .store
+        .load_session_events(session_id)
+        .map_err(|error| error.to_string())?;
+    let mut routed = 0;
+    for record in events {
+        let event = record.event;
+        let working = event.get("working_event");
+        if working
+            .and_then(|value| value.get("event_type"))
+            .and_then(Value::as_str)
+            != Some("worker_report")
+        {
+            continue;
+        }
+        let report_id = format!(
+            "worker-report-{}",
+            event
+                .get("event_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        );
+        let exists = {
+            let connection = state
+                .database
+                .lock()
+                .map_err(|_| "database lock poisoned")?;
+            connection
+                .query_row(
+                    "SELECT 1 FROM coord_messages WHERE msg_id=?1",
+                    [&report_id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .is_some()
+        };
+        if exists {
+            continue;
+        }
+        let payload = working
+            .and_then(|value| value.get("payload"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let envelope = Envelope {
+            v: 1,
+            task_id: task_id.clone(),
+            from: worker.clone(),
+            to: leader.clone(),
+            kind: opcos_engine::orchestration::EnvelopeKind::Status,
+            msg_id: report_id.clone(),
+            reply_to: None,
+            payload,
+        };
+        {
+            let mut runtimes = state.coordination.lock().await;
+            if let Some(runtime) = runtimes.get_mut(&task_id) {
+                runtime
+                    .validate_and_record(&envelope, Utc::now())
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        persist_coord_message(state, &project_id, &task_id, &envelope).await?;
+        let leader_event = json!({
+            "type": "coordination_report",
+            "event_id": format!("event-{}", Uuid::new_v4()),
+            "created_at_ms": Utc::now().timestamp_millis(),
+            "working_event": {
+                "event_type": "coordination_report",
+                "category": "coordination",
+                "direction": "incoming",
+                "payload": {
+                    "task_id": task_id,
+                    "worker_role_id": worker,
+                    "message_id": report_id,
+                    "payload": envelope.payload,
+                }
+            }
+        });
+        state
+            .store
+            .append_session_event(&leader_session, &leader_event)
+            .map_err(|error| error.to_string())?;
+        routed += 1;
+    }
+    Ok(routed)
 }
 
 fn coordination_text(content: &Value) -> Option<String> {
@@ -24141,6 +26931,7 @@ fn save_schedule(state: State<'_, DesktopState>, schedule: ScheduleInput) -> Res
 }
 
 fn save_schedule_for_state(state: &DesktopState, schedule: ScheduleInput) -> Result<Value, String> {
+    scheduler::Schedule::parse_for_user(&schedule.cron)?;
     let id = schedule.id.unwrap_or_else(|| {
         format!(
             "schedule-{}",
@@ -24359,20 +27150,36 @@ async fn run_schedule_for_inner(
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .map_err(|_| "enabled schedule not found".to_owned())?;
-    let (_trigger_version_id, trigger_content) = state
+    let (_trigger_version_id, trigger_content, trigger_kind) = state
         .database
         .lock()
         .map_err(|_| "database lock poisoned")?
         .query_row(
-            "SELECT v.id,v.content FROM config_object o
+            "SELECT v.id,v.content,o.kind FROM config_object o
              JOIN config_object_version v ON v.id=o.current_version_id
-            WHERE o.id=?1 AND o.kind='trigger' AND o.status='active'",
+            WHERE o.id=?1 AND o.kind IN ('trigger','automation') AND o.status='active'",
             [&trigger_object_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
         .map_err(|_| "playbook not found".to_owned())?;
     let trigger: Value =
         serde_json::from_str(&trigger_content).map_err(|_| "invalid trigger configuration")?;
+    if trigger_kind == "automation" {
+        return run_agent_automation_schedule(
+            app,
+            state,
+            schedule_id,
+            &target_session_id,
+            &trigger,
+        )
+        .await;
+    }
     let runbook_id = trigger
         .get("runbook_id")
         .and_then(Value::as_str)
@@ -24477,6 +27284,95 @@ async fn run_schedule_for_inner(
         )
         .map_err(|error| error.to_string())?;
     result.map(|_| ()).map_err(engine_error_message)
+}
+
+async fn run_agent_automation_schedule(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    schedule_id: &str,
+    source_session_id: &str,
+    automation: &Value,
+) -> Result<(), String> {
+    let result = async {
+        let action = AgentAutomationAction::parse(
+            automation
+                .get("effect")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "automation effect is missing".to_owned())?,
+        )
+        .ok_or_else(|| "automation effect is not allowed".to_owned())?;
+        let payload = automation
+            .get("payload")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let depth = payload
+            .get("automation_depth")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if depth >= 8 {
+            return Err("automation cause depth limit reached".into());
+        }
+        match action {
+            AgentAutomationAction::EnqueueBoundedWork => {
+                let task_type = automation
+                    .get("task_type")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "automation task_type is missing".to_owned())?;
+                BoundedWorkType::parse(task_type)
+                    .ok_or_else(|| "automation task_type is not allowed".to_owned())?;
+                let mut next_payload = payload;
+                next_payload
+                    .as_object_mut()
+                    .ok_or_else(|| "automation payload must be an object".to_owned())?
+                    .insert("automation_depth".into(), json!(depth + 1));
+                state
+                    .store
+                    .enqueue_work_item(
+                        task_type,
+                        &next_payload,
+                        automation.get("dedup_key").and_then(Value::as_str),
+                        automation.get("idempotency_key").and_then(Value::as_str),
+                        automation
+                            .get("max_attempts")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(3) as u32,
+                        None,
+                        Some(source_session_id),
+                        automation.get("project_id").and_then(Value::as_str),
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            AgentAutomationAction::RequestPlanGoal => {
+                let goal_id = payload
+                    .get("goal_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "request_plan_goal requires payload.goal_id".to_owned())?;
+                run_goal_planner(app, state, goal_id).await?;
+            }
+        }
+        state
+            .store
+            .append_audit(
+                source_session_id,
+                "agent_automation.trigger",
+                &json!({"automation_id": schedule_id, "effect": action.as_str(), "cause_depth": depth}),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok::<(), String>(())
+    }
+    .await;
+    let result_label = if result.is_ok() { "ok" } else { "error" };
+    let connection = state
+        .database
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    connection
+        .execute(
+            "UPDATE schedules SET last_run=?2,last_result=?3 WHERE id=?1",
+            params![schedule_id, Utc::now().to_rfc3339(), result_label],
+        )
+        .map_err(|error| error.to_string())?;
+    result
 }
 
 fn constant_time_token_eq(expected: &str, actual: &str) -> bool {
@@ -26562,8 +29458,10 @@ fn main() {
             harness_options,
             change_harness,
             list_sessions_command,
+            session_capabilities,
             set_session_archived,
             read_session_events_command,
+            export_session_trace,
             acp_session_capabilities,
             acp_set_mode,
             acp_set_config_option,
@@ -26580,7 +29478,10 @@ fn main() {
             list_inbox,
             list_pending,
             get_unattended,
+            rename_session,
             set_unattended,
+            get_progressive_tool_disclosure,
+            set_progressive_tool_disclosure,
             change_mode,
             resolve_inbox,
             change_model,
@@ -26604,6 +29505,10 @@ fn main() {
             delete_asset,
             set_asset_enabled,
             list_asset_versions,
+            list_automatic_memories_command,
+            save_automatic_memory_command,
+            disable_automatic_memory_command,
+            delete_automatic_memory_command,
             compare_asset_versions,
             rollback_asset,
             export_assets,
@@ -26769,6 +29674,25 @@ fn main() {
 #[cfg(test)]
 mod m7_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mcp_turn_deadline_returns_without_cancelling_background_work() {
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let marker = Arc::clone(&completed);
+        let returned = await_mcp_turn_with_deadline(
+            async move {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                marker.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+        assert!(!returned);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     fn wake_test_session(store: &SqliteStore, session_id: &str, harness: &str) {
         let now = Utc::now();
@@ -26963,6 +29887,77 @@ mod m7_tests {
     }
 
     #[test]
+    fn autonomous_plan_routing_parallel_wave_keeps_independent_steps_together() {
+        let steps = (0..3)
+            .map(|position| opcos_store::PlanStepRecord {
+                step_id: format!("step-{position}"),
+                plan_id: "plan".into(),
+                position,
+                description: format!("Implement part {position}"),
+                status: "not_started".into(),
+                failure_reason: None,
+                abandoned_reason: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .collect::<Vec<_>>();
+        let wave = select_plan_routing_wave(&steps, false, 2);
+        assert_eq!(
+            wave.iter()
+                .map(|step| step.step_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["step-0", "step-1"]
+        );
+    }
+
+    #[test]
+    fn autonomous_plan_routing_serial_wave_preserves_dependency_order() {
+        let steps = (0..3)
+            .map(|position| opcos_store::PlanStepRecord {
+                step_id: format!("step-{position}"),
+                plan_id: "plan".into(),
+                position,
+                description: format!("Implement part {position}"),
+                status: "not_started".into(),
+                failure_reason: None,
+                abandoned_reason: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .collect::<Vec<_>>();
+        let wave = select_plan_routing_wave(&steps, true, 3);
+        assert_eq!(wave.len(), 1);
+        assert_eq!(wave[0].step_id, "step-0");
+    }
+
+    #[test]
+    fn autonomous_plan_routing_waves_use_distinct_batches_for_deferred_steps() {
+        let steps = (0..3)
+            .map(|position| opcos_store::PlanStepRecord {
+                step_id: format!("step-{position}"),
+                plan_id: "plan".into(),
+                position,
+                description: format!("Implement part {position}"),
+                status: "not_started".into(),
+                failure_reason: None,
+                abandoned_reason: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .collect::<Vec<_>>();
+        let first_wave = select_plan_routing_wave(&steps, false, 2);
+        let second_wave = steps.iter().skip(2).collect::<Vec<_>>();
+        assert_ne!(
+            plan_batch_id("plan", 1, &first_wave),
+            plan_batch_id("plan", 1, &second_wave)
+        );
+        assert_eq!(
+            plan_batch_id("plan", 1, &second_wave),
+            "plan-batch:plan:1:step-2"
+        );
+    }
+
+    #[test]
     fn cloudflare_save_url_is_composed_without_manual_base_url() {
         assert_eq!(
             provider_base_url("cloudflare", None, Some("account-123"), None).unwrap(),
@@ -26994,7 +29989,7 @@ mod m7_tests {
 
     #[test]
     fn builtin_prompt_tools_are_present_in_local_tool_catalog_and_allowlist() {
-        let allowed = builtin_allowed_tools(true, true)
+        let allowed = allowed_builtin_tools(&test_capabilities(true, true, true))
             .into_iter()
             .collect::<HashSet<_>>();
         let catalog = opcos_engine::builtin_tool_names();
@@ -27033,12 +30028,144 @@ mod m7_tests {
                 "{name} is missing from local allowlist"
             );
         }
-        let remote_allowed = builtin_allowed_tools(false, false)
+        let remote_allowed = allowed_builtin_tools(&test_capabilities(false, false, true))
             .into_iter()
             .collect::<HashSet<_>>();
         for name in ["lsp_definition", "lsp_references", "lsp_diagnostics"] {
             assert!(!remote_allowed.contains(name));
         }
+    }
+
+    #[test]
+    fn capability_allowlist_gates_host_tools_without_host_type_flags() {
+        let no_screenshot = allowed_builtin_tools(&test_capabilities(true, true, false));
+        for name in [
+            "recording_start",
+            "recording_annotate",
+            "recording_stop",
+            "computer_use",
+        ] {
+            assert!(!no_screenshot.contains(&name.to_owned()), "{name} leaked");
+        }
+
+        let browser_without_lsp = allowed_builtin_tools(&test_capabilities(false, true, true));
+        for name in [
+            "browser_status",
+            "browser_navigate",
+            "browser_set_viewport",
+            "browser_click",
+            "browser_read",
+            "browser_measure",
+            "browser_assert_geometry",
+            "browser_screenshot",
+        ] {
+            assert!(
+                browser_without_lsp.contains(&name.to_owned()),
+                "{name} incorrectly depends on lsp"
+            );
+        }
+
+        let no_browser = allowed_builtin_tools(&test_capabilities(true, false, true));
+        assert!(!no_browser.iter().any(|name| name.starts_with("browser_")));
+
+        let remote_read_write = test_capabilities(false, false, false);
+        let remote_allowed = allowed_builtin_tools(&remote_read_write);
+        assert!(remote_allowed.contains(&"edit_file".to_owned()));
+        assert!(!remote_allowed.iter().any(|name| name.starts_with("lsp_")));
+    }
+
+    #[test]
+    fn workspace_lsp_projects_prefers_shallow_lexicographic_project() {
+        let root = std::env::temp_dir().join(format!("opcos-lsp-projects-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("z-project")).unwrap();
+        std::fs::create_dir_all(root.join("a-project")).unwrap();
+        std::fs::create_dir_all(root.join("target/nested")).unwrap();
+        std::fs::create_dir_all(root.join("deep/one/two/three/four/five")).unwrap();
+        std::fs::write(root.join("z-project/package.json"), "{}").unwrap();
+        std::fs::write(root.join("a-project/package.json"), "{}").unwrap();
+        std::fs::write(root.join("target/nested/package.json"), "{}").unwrap();
+        std::fs::write(root.join("deep/one/two/three/four/five/package.json"), "{}").unwrap();
+
+        assert_eq!(
+            workspace_lsp_projects(&root),
+            vec![("typescript", root.join("a-project"))]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn capability_preflight_returns_distinct_structured_error_markers() {
+        let unavailable = test_capabilities(true, false, false);
+        let error = capability_preflight(&unavailable, "browser_status", &json!({})).unwrap_err();
+        assert_eq!(
+            error["error_details"]["code"],
+            json!("capability_unavailable")
+        );
+        assert_eq!(error["error_details"]["operation_performed"], json!(false));
+
+        let unknown = HostCapabilities {
+            observed_at: Utc::now(),
+            items: vec![],
+        };
+        let error = capability_preflight(&unknown, "browser_status", &json!({})).unwrap_err();
+        assert_eq!(error["error_details"]["code"], json!("capability_unknown"));
+    }
+
+    #[test]
+    fn lsp_capabilities_are_language_specific_for_mixed_results() {
+        let observed_at = Utc::now();
+        let capabilities = HostCapabilities {
+            observed_at,
+            items: [
+                ("exec", CapabilityState::Available, None),
+                ("stdio", CapabilityState::Available, None),
+                (
+                    "lsp",
+                    CapabilityState::Unavailable,
+                    Some("rust probe failed".into()),
+                ),
+                (
+                    "lsp:rust",
+                    CapabilityState::Unavailable,
+                    Some("rust-analyzer exited with code 1".into()),
+                ),
+                ("lsp:typescript", CapabilityState::Available, None),
+            ]
+            .into_iter()
+            .map(|(name, state, reason)| Capability {
+                name: name.into(),
+                state,
+                source: "runtime-probe".into(),
+                observed_at,
+                reason,
+            })
+            .collect(),
+        };
+        assert!(
+            allowed_builtin_tools(&capabilities)
+                .iter()
+                .any(|tool| tool == "lsp_definition")
+        );
+        let rust_error = lsp_capability_preflight(
+            &capabilities,
+            "lsp_definition",
+            &json!({"language": "rust", "path": "src/main.rs"}),
+        )
+        .unwrap_err();
+        assert!(rust_error.to_string().contains("language=rust"));
+        assert!(
+            rust_error
+                .to_string()
+                .contains("rust-analyzer exited with code 1")
+        );
+        assert!(
+            lsp_capability_preflight(
+                &capabilities,
+                "lsp_definition",
+                &json!({"language": "typescript", "path": "web/src/App.ts"}),
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -27253,6 +30380,7 @@ mod m7_tests {
             origin: ToolOrigin::User,
             repair_loop: None,
             browser: browser::shared_local_browser(None),
+            capabilities: test_capabilities(true, true, true),
         }));
         let result = executor
             .execute("ask_user", json!({"question": "Which format?"}))
@@ -27261,7 +30389,7 @@ mod m7_tests {
             result,
             Err("ask_user must be handled by the engine pending mechanism".into())
         );
-        for name in builtin_allowed_tools(true, true) {
+        for name in allowed_builtin_tools(&test_capabilities(true, true, true)) {
             match name.as_str() {
                 // Starts a persistent process.
                 "background_job_start" => continue,
@@ -27324,8 +30452,9 @@ mod m7_tests {
             coordination: Arc::new(AsyncMutex::new(HashMap::new())),
             origin: ToolOrigin::User,
             repair_loop: None,
+            capabilities: test_capabilities(false, false, true),
         }));
-        for name in builtin_allowed_tools(false, false) {
+        for name in allowed_builtin_tools(&test_capabilities(false, false, true)) {
             match name.as_str() {
                 // Starts a persistent remote process.
                 "background_job_start" => continue,
@@ -27378,6 +30507,14 @@ mod m7_tests {
     }
 
     #[test]
+    fn automatic_memory_rejects_secrets_but_allows_policy_discussion() {
+        assert!(reject_automatic_memory("remember token=abc", &[]).is_err());
+        assert!(reject_automatic_memory("remember the approval policy", &[]).is_ok());
+        assert!(reject_automatic_memory("permissions: deny git push", &[]).is_ok());
+        assert!(reject_automatic_memory("prefer compact summaries", &[]).is_ok());
+    }
+
+    #[test]
     fn learned_skill_results_make_model_assertion_and_staleness_explicit() {
         let record = opcos_store::LearnedSkillRecord {
             id: "learned-1".into(),
@@ -27420,23 +30557,17 @@ mod m7_tests {
     }
 
     #[test]
-    fn coordination_payload_rejects_credentials_and_from_role_is_not_a_tool_field() {
+    fn coordination_payload_rejects_credentials_and_internal_tools_are_hidden() {
         assert!(reject_coordination_sensitive("Bearer xxx").is_err());
         assert!(reject_coordination_sensitive("TOKEN=xxx").is_err());
         assert!(reject_coordination_sensitive("https://user:pass@example.com").is_err());
         let tools = opcos_engine::coordination_tool_definitions();
-        let dispatch = tools
-            .iter()
-            .find(|tool| {
-                tool.pointer("/function/name").and_then(Value::as_str)
-                    == Some("coordination_dispatch")
-            })
-            .unwrap();
-        assert!(
-            dispatch
-                .pointer("/function/parameters/properties/from_role")
-                .is_none()
-        );
+        assert!(!tools.iter().any(|tool| {
+            matches!(
+                tool.pointer("/function/name").and_then(Value::as_str),
+                Some("coordination_dispatch" | "coordination_fan_out")
+            )
+        }));
     }
 
     fn edit_test_host() -> (PathBuf, LocalHost) {
@@ -27865,6 +30996,31 @@ mod m7_tests {
                 .connector_secret_name(),
             "github@ghe.example.com"
         );
+    }
+
+    #[test]
+    fn connector_config_only_credentials_are_exposed_with_project_scope() {
+        let path = std::env::temp_dir().join(format!(
+            "opcos-connector-test-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let secrets = KeyringSecretStore::with_fallback("opcos-test", path.clone());
+        let store = github_test_store(
+            &[("ghes", "https://ghe.example.com/acme/app.git")],
+            &[("ghe.example.com", Some("ghe-token"))],
+        );
+        secrets
+            .set(
+                &project_secret_key("ghes", "connector-config", "github@ghe.example.com"),
+                r#"{"token":"configured-only"}"#,
+            )
+            .unwrap();
+
+        let config =
+            connector_credentials_config_for(&secrets, &store, Some("ghes"), "github").unwrap();
+        assert_eq!(config.as_deref(), Some(r#"{"token":"configured-only"}"#));
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -30249,5 +33405,168 @@ agents:
             sink.terminal_status_at_emit.lock().unwrap().as_ref(),
             Some(&("error".into(), "harness_error".into()))
         );
+    }
+
+    #[test]
+    fn coordination_batch_barrier_tracks_members_and_deadlines() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE coord_batches (
+                   batch_id TEXT PRIMARY KEY,
+                   project_id TEXT NOT NULL,
+                   status TEXT NOT NULL,
+                   deadline_at TEXT NOT NULL,
+                   acceptance_spec TEXT NOT NULL,
+                   acceptance_spec_hash TEXT NOT NULL,
+                   created_at TEXT NOT NULL,
+                   updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE coord_batch_members (
+                   batch_id TEXT NOT NULL,
+                   member_id TEXT NOT NULL,
+                   worker_role_id TEXT NOT NULL,
+                   status TEXT NOT NULL,
+                   member_deadline_at TEXT NOT NULL,
+                   reason TEXT,
+                   started_at TEXT,
+                   finished_at TEXT,
+                   PRIMARY KEY(batch_id,member_id),
+                   UNIQUE(batch_id,worker_role_id)
+                 );",
+            )
+            .unwrap();
+        let now = Utc::now();
+        let spec = json!({"required_checks":["cargo test"]});
+        let spec_text = spec.to_string();
+        let spec_hash = format!("{:x}", Sha256::digest(spec_text.as_bytes()));
+        connection
+            .execute(
+                "INSERT INTO coord_batches
+                 VALUES ('batch-1','project-1','running',?1,?2,?3,?4,?4)",
+                params![
+                    (now + ChronoDuration::seconds(60)).to_rfc3339(),
+                    spec_text,
+                    spec_hash,
+                    now.to_rfc3339()
+                ],
+            )
+            .unwrap();
+        for (member_id, worker_id) in [("member-a", "worker-a"), ("member-b", "worker-b")] {
+            connection
+                .execute(
+                    "INSERT INTO coord_batch_members
+                     VALUES ('batch-1',?1,?2,'running',?3,NULL,NULL,NULL)",
+                    params![
+                        member_id,
+                        worker_id,
+                        (now + ChronoDuration::seconds(30)).to_rfc3339()
+                    ],
+                )
+                .unwrap();
+        }
+
+        let before_all = refresh_coordination_batch(&connection, "batch-1", now).unwrap();
+        assert_eq!(before_all["status"], "running");
+        assert_eq!(before_all["barrier_released"], false);
+        assert_eq!(before_all["active_count"], 2);
+        update_coordination_batch_member(&connection, "batch-1", "worker-a", "succeeded", None)
+            .unwrap();
+        let partial = refresh_coordination_batch(&connection, "batch-1", now).unwrap();
+        assert_eq!(partial["barrier_released"], false);
+        assert_eq!(partial["active_count"], 1);
+        update_coordination_batch_member(&connection, "batch-1", "worker-b", "succeeded", None)
+            .unwrap();
+        let complete = refresh_coordination_batch(&connection, "batch-1", now).unwrap();
+        assert_eq!(complete["status"], "succeeded");
+        assert_eq!(complete["barrier_released"], true);
+        assert_eq!(complete["completed_count"], 2);
+        assert_eq!(complete["acceptance_spec_hash"], spec_hash);
+        assert_eq!(complete["evaluator_consumed"], false);
+    }
+
+    #[test]
+    fn coordination_batch_member_and_batch_timeouts_are_terminal_without_waiting() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE coord_batches (
+                   batch_id TEXT PRIMARY KEY,
+                   project_id TEXT NOT NULL,
+                   status TEXT NOT NULL,
+                   deadline_at TEXT NOT NULL,
+                   acceptance_spec TEXT NOT NULL,
+                   acceptance_spec_hash TEXT NOT NULL,
+                   created_at TEXT NOT NULL,
+                   updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE coord_batch_members (
+                   batch_id TEXT NOT NULL,
+                   member_id TEXT NOT NULL,
+                   worker_role_id TEXT NOT NULL,
+                   status TEXT NOT NULL,
+                   member_deadline_at TEXT NOT NULL,
+                   reason TEXT,
+                   started_at TEXT,
+                   finished_at TEXT,
+                   PRIMARY KEY(batch_id,member_id),
+                   UNIQUE(batch_id,worker_role_id)
+                 );",
+            )
+            .unwrap();
+        let now = Utc::now();
+        connection
+            .execute(
+                "INSERT INTO coord_batches
+                 VALUES ('batch-2','project-1','running',?1,'{}','hash',?2,?2)",
+                params![
+                    (now + ChronoDuration::seconds(60)).to_rfc3339(),
+                    now.to_rfc3339()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO coord_batch_members
+                 VALUES ('batch-2','member-a','worker-a','running',?1,NULL,NULL,NULL)",
+                [(now - ChronoDuration::seconds(1)).to_rfc3339()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO coord_batch_members
+                 VALUES ('batch-2','member-b','worker-b','running',?1,NULL,NULL,NULL)",
+                [(now + ChronoDuration::seconds(30)).to_rfc3339()],
+            )
+            .unwrap();
+
+        let member_timeout = refresh_coordination_batch(&connection, "batch-2", now).unwrap();
+        assert_eq!(member_timeout["status"], "partial");
+        assert_eq!(member_timeout["barrier_released"], false);
+        assert_eq!(member_timeout["timed_out_count"], 1);
+        assert_eq!(member_timeout["active_count"], 1);
+        let member_reason = member_timeout["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|member| member["member_id"] == "member-a")
+            .unwrap();
+        assert_eq!(member_reason["status"], "timed_out");
+        assert!(
+            member_reason["reason"]
+                .as_str()
+                .unwrap()
+                .contains("member deadline")
+        );
+
+        let start = Instant::now();
+        let batch_timeout =
+            refresh_coordination_batch(&connection, "batch-2", now + ChronoDuration::seconds(61))
+                .unwrap();
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(batch_timeout["status"], "timed_out");
+        assert_eq!(batch_timeout["barrier_released"], true);
+        assert_eq!(batch_timeout["timed_out_count"], 2);
+        assert_eq!(batch_timeout["active_count"], 0);
     }
 }

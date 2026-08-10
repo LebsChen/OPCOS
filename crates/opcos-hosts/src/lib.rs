@@ -26,7 +26,7 @@ use tokio::{
     fs,
     io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, SeekFrom},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::{Mutex, mpsc, oneshot},
+    sync::{Mutex, RwLock as AsyncRwLock, mpsc, oneshot},
     time,
 };
 use uuid::Uuid;
@@ -100,9 +100,22 @@ fn sanitized_environment_from_snapshot(
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CapabilityState {
+    Available,
+    Unavailable,
+    Unknown,
+}
+
+impl CapabilityState {
+    pub fn is_available(&self) -> bool {
+        matches!(self, Self::Available)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Capability {
     pub name: String,
-    pub available: bool,
+    pub state: CapabilityState,
     pub source: String,
     pub observed_at: DateTime<Utc>,
     pub reason: Option<String>,
@@ -122,8 +135,8 @@ pub enum HostError {
     Io(#[from] std::io::Error),
     #[error("local host path rejected: {0}")]
     Path(String),
-    #[error("host operation timed out")]
-    Timeout,
+    #[error("host operation timed out after {timeout_seconds} seconds")]
+    Timeout { timeout_seconds: u64 },
     #[error("unsupported host capability: {0}")]
     Unsupported(String),
     #[error("invalid host response: {0}")]
@@ -2039,6 +2052,9 @@ pub trait Host: Send + Sync {
             "host lacks a structured LSP service".into(),
         ))
     }
+    async fn provides_structured_lsp_service(&self) -> Result<bool, HostError> {
+        Ok(false)
+    }
     async fn spawn(&self, request: SpawnRequest) -> Result<Box<dyn HostProcess>, HostError>;
     async fn spawn_stdio(
         &self,
@@ -2067,6 +2083,12 @@ pub struct BrowserRequest {
 #[async_trait]
 pub trait BrowserController: Send + Sync {
     async fn execute(&self, request: BrowserRequest) -> Result<Value, HostError>;
+
+    async fn probe(&self) -> Result<(), HostError> {
+        Err(HostError::Unsupported(
+            "browser capability probe is unavailable".into(),
+        ))
+    }
 
     async fn current_origin(&self) -> Option<String> {
         None
@@ -2132,7 +2154,7 @@ pub async fn execute_lifecycle_stage(
                 -1,
                 String::new(),
                 error.to_string(),
-                matches!(error, HostError::Timeout),
+                matches!(error, HostError::Timeout { .. }),
             ),
         };
         let failed = timed_out || exit_code != 0;
@@ -2160,6 +2182,7 @@ pub struct RvmHost {
     id: String,
     workspace: String,
     client: HttpRvmClient,
+    capabilities_cache: Arc<AsyncRwLock<Option<HostCapabilities>>>,
 }
 
 fn windows_clipboard_command(text: &str) -> String {
@@ -2175,7 +2198,15 @@ impl RvmHost {
             id: id.into(),
             workspace: workspace.into(),
             client,
+            capabilities_cache: Arc::new(AsyncRwLock::new(None)),
         }
+    }
+
+    pub async fn refresh_capabilities(&self) -> Result<HostCapabilities, HostError> {
+        let observed_at = Utc::now();
+        let capabilities = remote_capabilities(self.client.capabilities().await?, observed_at);
+        *self.capabilities_cache.write().await = Some(capabilities.clone());
+        Ok(capabilities)
     }
 }
 
@@ -2190,9 +2221,10 @@ impl Host for RvmHost {
     }
 
     async fn capabilities(&self) -> Result<HostCapabilities, HostError> {
-        let observed_at = Utc::now();
-        let capabilities = self.client.capabilities().await?;
-        Ok(remote_capabilities(capabilities, observed_at))
+        if let Some(capabilities) = self.capabilities_cache.read().await.clone() {
+            return Ok(capabilities);
+        }
+        self.refresh_capabilities().await
     }
 
     async fn exec(&self, request: ExecRequest) -> Result<ExecResult, HostError> {
@@ -2209,6 +2241,15 @@ impl Host for RvmHost {
 
     async fn storage_exists(&self, path: &str) -> Result<bool, HostError> {
         Ok(self.client.storage_exists(path).await?)
+    }
+
+    async fn provides_structured_lsp_service(&self) -> Result<bool, HostError> {
+        Ok(self
+            .capabilities()
+            .await?
+            .items
+            .iter()
+            .any(|capability| capability.name == "lsp" && capability.state.is_available()))
     }
 
     async fn screenshot(&self) -> Result<Screenshot, HostError> {
@@ -2397,6 +2438,7 @@ pub struct LocalHost {
     sessions: Arc<Mutex<HashMap<String, LocalShell>>>,
     secret_values: SecretValues,
     desktop: Arc<LocalDesktop>,
+    capabilities_cache: Arc<AsyncRwLock<Option<HostCapabilities>>>,
 }
 
 #[derive(Debug)]
@@ -2426,6 +2468,7 @@ impl LocalHost {
                 secret_values.into_iter().filter(|v| v.len() >= 8).collect(),
             )),
             desktop: Arc::new(LocalDesktop::new()),
+            capabilities_cache: Arc::new(AsyncRwLock::new(None)),
         })
     }
 
@@ -2440,6 +2483,7 @@ impl LocalHost {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             secret_values,
             desktop: Arc::new(LocalDesktop::new()),
+            capabilities_cache: Arc::new(AsyncRwLock::new(None)),
         })
     }
 
@@ -2513,18 +2557,149 @@ impl LocalHost {
         Ok(canonical)
     }
 
-    fn capability_items(&self, observed_at: DateTime<Utc>) -> HostCapabilities {
-        let available = [
-            "exec",
-            "exec_sync",
-            "read",
-            "write",
-            "ls",
-            "shell_persistent",
-            "process_stream",
-            "stdio",
-            "lsp",
-        ];
+    async fn capability_items(&self, observed_at: DateTime<Utc>) -> HostCapabilities {
+        fn result_reason(exit_code: i32, stderr: &str) -> Option<String> {
+            (exit_code != 0).then(|| {
+                let stderr = stderr.trim();
+                if stderr.is_empty() {
+                    format!("probe exited with code {exit_code}")
+                } else {
+                    format!("probe exited with code {exit_code}: {stderr}")
+                }
+            })
+        }
+
+        let exec_probe = self
+            .exec(ExecRequest {
+                command: "echo opcos-capability-probe".into(),
+                cwd: None,
+                timeout_seconds: 5,
+                session: None,
+                env: None,
+            })
+            .await;
+        let (probe_exec, exec_reason) = match exec_probe {
+            Ok(result) => (
+                result.result.exit_code == 0,
+                result_reason(result.result.exit_code, &result.result.stderr),
+            ),
+            Err(error) => (false, Some(format!("exec probe failed: {error}"))),
+        };
+        let exec_sync_probe = self
+            .exec(ExecRequest {
+                command: "echo opcos-capability-sync-probe".into(),
+                cwd: None,
+                timeout_seconds: 5,
+                session: None,
+                env: None,
+            })
+            .await;
+        let (probe_exec_sync, exec_sync_reason) = match exec_sync_probe {
+            Ok(result) => (
+                result.result.exit_code == 0,
+                result_reason(result.result.exit_code, &result.result.stderr),
+            ),
+            Err(error) => (false, Some(format!("exec_sync probe failed: {error}"))),
+        };
+
+        let (probe_read, read_reason, probe_write, write_reason) = if let Ok(path) =
+            self.temp_file("opcos-capability")
+        {
+            let write_result = self.write(&path, "opcos-capability-probe").await;
+            let (probe_write, write_reason) = match write_result {
+                Ok(_) => (true, None),
+                Err(error) => (
+                    false,
+                    Some(format!("write probe at {path} failed: {error}")),
+                ),
+            };
+            let (probe_read, read_reason) = if probe_write {
+                match self.read(&path).await {
+                    Ok(_) => (true, None),
+                    Err(error) => (false, Some(format!("read probe at {path} failed: {error}"))),
+                }
+            } else {
+                (
+                    false,
+                    Some("read probe skipped because write probe failed".into()),
+                )
+            };
+            let cleanup_reason = std::fs::remove_file(&path)
+                .err()
+                .filter(|error| error.kind() != std::io::ErrorKind::NotFound)
+                .map(|error| format!("probe cleanup at {path} failed: {error}"));
+            (
+                probe_read,
+                read_reason.or_else(|| cleanup_reason.clone()),
+                probe_write,
+                write_reason.or(cleanup_reason),
+            )
+        } else {
+            let reason = "could not allocate a controlled temporary probe path".to_owned();
+            (false, Some(reason.clone()), false, Some(reason))
+        };
+
+        let ls_probe = self.ls(None).await;
+        let (probe_ls, ls_reason) = match ls_probe {
+            Ok(_) => (true, None),
+            Err(error) => (false, Some(format!("ls probe failed: {error}"))),
+        };
+
+        let shell_probe = self
+            .exec(ExecRequest {
+                command: "echo opcos-capability-probe".into(),
+                cwd: None,
+                timeout_seconds: 5,
+                session: Some("opcos-capability-shell".into()),
+                env: None,
+            })
+            .await;
+        let (probe_shell, shell_reason) = match shell_probe {
+            Ok(result) => (
+                result.result.exit_code == 0,
+                result_reason(result.result.exit_code, &result.result.stderr),
+            ),
+            Err(error) => (
+                false,
+                Some(format!("persistent shell probe failed: {error}")),
+            ),
+        };
+
+        let process_probe = self
+            .spawn(SpawnRequest {
+                command: "echo opcos-capability-probe".into(),
+                cwd: None,
+                env: None,
+                cols: 80,
+                rows: 24,
+            })
+            .await;
+        let (probe_process_stream, process_reason) = match process_probe {
+            Ok(_) => (true, None),
+            Err(error) => (false, Some(format!("process stream probe failed: {error}"))),
+        };
+
+        let stdio_probe = self
+            .spawn_stdio(SpawnRequest {
+                command: "echo opcos-capability-probe".into(),
+                cwd: None,
+                env: None,
+                cols: 80,
+                rows: 24,
+            })
+            .await;
+        let (probe_stdio, stdio_reason) = match stdio_probe {
+            Ok(_) => (true, None),
+            Err(error) => (
+                false,
+                Some(format!("structured stdio probe failed: {error}")),
+            ),
+        };
+        let probe_lsp = false;
+        let lsp_reason = Some(
+            "LSP initialization probe is performed by the opcos-lsp adapter during session creation"
+                .into(),
+        );
         let (screenshot_reason, computer_use_reason) = self.desktop.capability_reasons();
         let unavailable = [
             ("pty", "not implemented by the in-process LocalHost"),
@@ -2532,21 +2707,40 @@ impl LocalHost {
             ("ide", "not available for the in-process LocalHost"),
             ("mcp", "not available for the in-process LocalHost"),
         ];
-        let mut items = available
-            .iter()
-            .map(|name| Capability {
-                name: (*name).into(),
-                available: true,
-                source: "static".into(),
+        let probed = [
+            ("exec", probe_exec, exec_reason.clone()),
+            ("exec_sync", probe_exec_sync, exec_sync_reason),
+            ("read", probe_read, read_reason),
+            ("write", probe_write, write_reason),
+            ("ls", probe_ls, ls_reason),
+            ("shell_persistent", probe_shell, shell_reason),
+            ("process_stream", probe_process_stream, process_reason),
+            ("stdio", probe_stdio, stdio_reason),
+            ("lsp", probe_lsp, lsp_reason),
+        ];
+        let mut items = probed
+            .into_iter()
+            .map(|(name, available, reason)| Capability {
+                name: name.into(),
+                state: if name == "lsp" {
+                    CapabilityState::Unknown
+                } else if available {
+                    CapabilityState::Available
+                } else {
+                    CapabilityState::Unavailable
+                },
+                source: if name == "lsp" {
+                    "not-probed".into()
+                } else {
+                    "runtime-probe".into()
+                },
                 observed_at,
-                reason: (*name == "process_stream").then(|| {
-                    "uses local pipes without PTY echo; process exit codes are available".into()
-                }),
+                reason,
             })
             .collect::<Vec<_>>();
         items.extend(unavailable.into_iter().map(|(name, reason)| Capability {
             name: name.into(),
-            available: false,
+            state: CapabilityState::Unavailable,
             source: "static".into(),
             observed_at,
             reason: Some(reason.into()),
@@ -2557,13 +2751,43 @@ impl LocalHost {
         ] {
             items.push(Capability {
                 name: name.into(),
-                available: reason.is_none(),
+                state: if reason.is_none() {
+                    CapabilityState::Available
+                } else {
+                    CapabilityState::Unavailable
+                },
                 source: "runtime".into(),
                 observed_at,
                 reason,
             });
         }
         HostCapabilities { observed_at, items }
+    }
+
+    pub async fn refresh_capabilities(&self) -> HostCapabilities {
+        let capabilities = self.capability_items(Utc::now()).await;
+        *self.capabilities_cache.write().await = Some(capabilities.clone());
+        capabilities
+    }
+
+    pub async fn set_capability_state(
+        &self,
+        name: &str,
+        state: CapabilityState,
+        source: impl Into<String>,
+        reason: Option<String>,
+    ) {
+        let mut cache = self.capabilities_cache.write().await;
+        let Some(capabilities) = cache.as_mut() else {
+            return;
+        };
+        if let Some(item) = capabilities.items.iter_mut().find(|item| item.name == name) {
+            item.state = state;
+            item.source = source.into();
+            item.reason = reason;
+            item.observed_at = Utc::now();
+            capabilities.observed_at = item.observed_at;
+        }
     }
 }
 
@@ -2600,7 +2824,10 @@ impl Host for LocalHost {
     }
 
     async fn capabilities(&self) -> Result<HostCapabilities, HostError> {
-        Ok(self.capability_items(Utc::now()))
+        if let Some(capabilities) = self.capabilities_cache.read().await.clone() {
+            return Ok(capabilities);
+        }
+        Ok(self.refresh_capabilities().await)
     }
 
     async fn screenshot(&self) -> Result<Screenshot, HostError> {
@@ -2649,7 +2876,9 @@ impl Host for LocalHost {
             command.output(),
         )
         .await
-        .map_err(|_| HostError::Timeout)??;
+        .map_err(|_| HostError::Timeout {
+            timeout_seconds: request.timeout_seconds.max(1),
+        })??;
         Ok(ExecResult {
             status: "completed".into(),
             result: CommandResult {
@@ -2662,6 +2891,10 @@ impl Host for LocalHost {
                 shell: None,
             },
         })
+    }
+
+    async fn storage_exists(&self, path: &str) -> Result<bool, HostError> {
+        Ok(self.secure_path(path)?.exists())
     }
 
     async fn spawn(&self, request: SpawnRequest) -> Result<Box<dyn HostProcess>, HostError> {
@@ -3075,7 +3308,9 @@ impl LocalHost {
                     },
                 )
                 .await
-                .map_err(|_| HostError::Timeout)??;
+        .map_err(|_| HostError::Timeout {
+            timeout_seconds: request.timeout_seconds.max(1),
+        })??;
                 tail_output_file(
                     &output_path,
                     &mut file_offset,
@@ -3235,7 +3470,9 @@ impl LocalHost {
                 }
             })
             .await
-            .map_err(|_| HostError::Timeout)
+            .map_err(|_| HostError::Timeout {
+                timeout_seconds: timeout_seconds.max(1),
+            })
         };
         let (stdout, exit_code, actual_cwd) = match result {
             Ok(Ok(result)) => result,
@@ -3853,6 +4090,8 @@ fn remote_capabilities(
                 let advertised = capabilities.available.iter().any(|item| item == name);
                 let available = if name == "remote_lsp_declared" {
                     capabilities.available.iter().any(|item| item == "lsp")
+                } else if name == "lsp" {
+                    advertised && capabilities.available.iter().any(|item| item == "stdio")
                 } else {
                     name != "stdio"
                         && (advertised
@@ -3861,10 +4100,19 @@ fn remote_capabilities(
                 };
                 Capability {
                     name: name.into(),
-                    available,
-                    source: "remote-probe".into(),
+                    state: if available {
+                        CapabilityState::Available
+                    } else {
+                        CapabilityState::Unavailable
+                    },
+                    source: "remote-declared".into(),
                     observed_at,
-                    reason: if name == "lsp" && available {
+                    reason: if name == "lsp" && advertised && !available {
+                        Some(
+                            "remote lsp is declared but OPCOS has no structured stdio proxy"
+                                .into(),
+                        )
+                    } else if name == "lsp" && available {
                         Some("uses the remote host's own LSP service over MCP".into())
                     } else if name == "remote_lsp_declared" && available {
                         Some("remote host exposes an lsp tool over MCP".into())
@@ -3946,7 +4194,7 @@ mod tests {
             !capabilities
                 .items
                 .iter()
-                .any(|item| item.name == "lsp" && item.available)
+                .any(|item| item.name == "lsp" && item.state.is_available())
         );
     }
 
@@ -3986,7 +4234,7 @@ mod tests {
             .iter()
             .find(|item| item.name == "stdio")
             .unwrap();
-        assert!(!stdio.available);
+        assert!(!stdio.state.is_available());
         assert_eq!(
             stdio.reason.as_deref(),
             Some(
@@ -4008,20 +4256,26 @@ mod tests {
             .iter()
             .find(|item| item.name == "lsp")
             .unwrap();
-        assert!(lsp.available);
+        assert!(!lsp.state.is_available());
+        assert_eq!(lsp.state, CapabilityState::Unavailable);
+        assert!(
+            lsp.reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("structured stdio proxy"))
+        );
         let declared = capabilities
             .items
             .iter()
             .find(|item| item.name == "remote_lsp_declared")
             .unwrap();
-        assert!(declared.available);
+        assert!(declared.state.is_available());
         // A host-side LSP service says nothing about raw stdio, which stays off.
         let stdio = capabilities
             .items
             .iter()
             .find(|item| item.name == "stdio")
             .unwrap();
-        assert!(!stdio.available);
+        assert!(!stdio.state.is_available());
     }
     use std::fs;
 
@@ -4051,11 +4305,15 @@ mod tests {
                 .any(|item| item.name == "answer.txt")
         );
         let capabilities = host.capabilities().await.unwrap();
+        let cached = host.capabilities().await.unwrap();
+        assert_eq!(capabilities.observed_at, cached.observed_at);
+        let refreshed = host.refresh_capabilities().await;
+        assert!(refreshed.observed_at >= cached.observed_at);
         assert!(
             capabilities
                 .items
                 .iter()
-                .any(|item| item.name == "vnc" && !item.available)
+                .any(|item| item.name == "vnc" && !item.state.is_available())
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -4912,7 +5170,10 @@ mod tests {
                 env: None,
             })
             .await;
-        assert!(matches!(timed_out, Err(HostError::Timeout)));
+        assert!(matches!(
+            timed_out,
+            Err(HostError::Timeout { timeout_seconds: 1 })
+        ));
         let next = host
             .exec(ExecRequest {
                 command: "printf clean".into(),

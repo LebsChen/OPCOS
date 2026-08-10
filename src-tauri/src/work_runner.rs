@@ -390,6 +390,13 @@ async fn run_item(
     });
     let origin = if item.task_type == "ci_repair_loop" {
         ToolOrigin::RepairLoop
+    } else if item
+        .payload
+        .get("automation_depth")
+        .and_then(Value::as_u64)
+        .is_some()
+    {
+        ToolOrigin::System
     } else {
         ToolOrigin::User
     };

@@ -52,6 +52,10 @@ import {
   type McpTransport,
 } from "./mcp";
 import { summarizeIterationStats } from "./iterationStats";
+import {
+  surfaceRequestForWorkingEvent,
+  type SurfaceRequestTab,
+} from "./surfaceRequests";
 import { Sidebar } from "./components/Sidebar";
 import { sessionStatusLabel } from "./sessionStatus";
 import { Transcript } from "./components/Transcript";
@@ -9583,6 +9587,11 @@ function ArtifactsPane({ selected }: { selected: Session }) {
   const [artifacts, setArtifacts] = useState<ArtifactRecord[]>([]);
   const [opened, setOpened] = useState<ArtifactRecord | null>(null);
   const [content, setContent] = useState<Record<string, unknown> | null>(null);
+  const [frameIndex, setFrameIndex] = useState(0);
+  const [frameContent, setFrameContent] = useState<Record<
+    string,
+    unknown
+  > | null>(null);
   const [loadError, setLoadError] = useState("");
   const refresh = () =>
     void command<ArtifactRecord[]>("list_artifacts", { sessionId: selected.id })
@@ -9602,6 +9611,8 @@ function ArtifactsPane({ selected }: { selected: Session }) {
   useEffect(() => {
     if (!opened) return;
     setContent(null);
+    setFrameIndex(0);
+    setFrameContent(null);
     void command<Record<string, unknown>>("read_artifact", {
       sessionId: selected.id,
       artifactId: opened.id,
@@ -9609,6 +9620,41 @@ function ArtifactsPane({ selected }: { selected: Session }) {
       .then(setContent)
       .catch((error) => setContent({ error: errorMessage(error) }));
   }, [selected.id, opened?.id]);
+  const manifest =
+    opened?.kind === "recording_manifest" &&
+    typeof content?.content === "string"
+      ? (() => {
+          try {
+            return JSON.parse(content.content) as {
+              frames?: Array<{
+                timestamp_ms?: number;
+                artifact_id?: string;
+                reused?: boolean;
+              }>;
+              annotations?: Array<{
+                annotation_type?: string;
+                text?: string;
+                result?: string;
+                timestamp_ms?: number;
+              }>;
+              truncated?: boolean;
+            };
+          } catch {
+            return null;
+          }
+        })()
+      : null;
+  const selectedFrame = manifest?.frames?.[frameIndex];
+  useEffect(() => {
+    if (!selectedFrame?.artifact_id) return;
+    setFrameContent(null);
+    void command<Record<string, unknown>>("read_artifact", {
+      sessionId: selected.id,
+      artifactId: selectedFrame.artifact_id,
+    })
+      .then(setFrameContent)
+      .catch((error) => setFrameContent({ error: errorMessage(error) }));
+  }, [selected.id, selectedFrame?.artifact_id]);
   if (opened) {
     return (
       <div className="artifact-viewer">
@@ -9641,6 +9687,51 @@ function ArtifactsPane({ selected }: { selected: Session }) {
               src={`data:${String(content.mime ?? opened.mime ?? "image/png")};base64,${content.content_base64}`}
               alt={opened.path}
             />
+          ) : opened.kind === "recording_manifest" && manifest ? (
+            <div className="grid gap-3">
+              <div className="flex items-center justify-between text-sm">
+                <strong>Sampled screenshot timeline</strong>
+                <span>
+                  {manifest.frames?.length ?? 0} frames
+                  {manifest.truncated ? " · truncated at limit" : ""}
+                </span>
+              </div>
+              {selectedFrame &&
+                typeof frameContent?.content_base64 === "string" && (
+                  <img
+                    className="artifact-image max-w-full"
+                    src={`data:image/png;base64,${frameContent.content_base64}`}
+                    alt={`Recording frame ${frameIndex + 1}`}
+                  />
+                )}
+              <input
+                type="range"
+                min={0}
+                max={Math.max(0, (manifest.frames?.length ?? 1) - 1)}
+                value={frameIndex}
+                onChange={(event) => setFrameIndex(Number(event.target.value))}
+                disabled={!manifest.frames?.length}
+              />
+              <div className="grid gap-1 text-sm">
+                {(manifest.annotations ?? []).map((annotation, index) => (
+                  <button
+                    className="text-left"
+                    key={`${annotation.timestamp_ms ?? index}-${index}`}
+                    onClick={() => {
+                      const timestamp = annotation.timestamp_ms ?? 0;
+                      const nearest =
+                        manifest.frames?.findIndex(
+                          (frame) => (frame.timestamp_ms ?? 0) >= timestamp,
+                        ) ?? -1;
+                      if (nearest >= 0) setFrameIndex(nearest);
+                    }}
+                  >
+                    {annotation.annotation_type}: {annotation.text}
+                    {annotation.result ? ` · ${annotation.result}` : ""}
+                  </button>
+                ))}
+              </div>
+            </div>
           ) : opened.kind === "diff" ? (
             <DiffPreview text={String(content.content ?? "")} />
           ) : (
@@ -10058,6 +10149,7 @@ function SessionRightPanel({
   onWidthChange,
   eventRefreshKey,
   transcript,
+  focusTabRequest,
 }: {
   selected: Session;
   onError: (error: unknown) => void;
@@ -10070,6 +10162,7 @@ function SessionRightPanel({
   onWidthChange: (width: number) => void;
   eventRefreshKey: string;
   transcript: TimelineEvent[];
+  focusTabRequest?: { tab: PanelTab; requestId: number } | null;
 }) {
   const [panelTab, setPanelTab] = useState<PanelTab>("info");
   const [opened, setOpened] = useState<PanelTab[]>(["info"]);
@@ -10077,6 +10170,16 @@ function SessionRightPanel({
     null,
   );
   const [iterationEvents, setIterationEvents] = useState<TimelineEvent[]>([]);
+  useEffect(() => {
+    if (!focusTabRequest) return;
+    setPanelTab(focusTabRequest.tab);
+    setOpened((items) =>
+      items.includes(focusTabRequest.tab)
+        ? items
+        : [...items, focusTabRequest.tab],
+    );
+    onCollapsedChange?.(false);
+  }, [focusTabRequest, onCollapsedChange]);
   useEffect(() => {
     setInsights(null);
     void command<Record<string, unknown>>("session_insights", {
@@ -10752,6 +10855,8 @@ function AppContent() {
   const [projectDialogOpen, setProjectDialogOpen] = useState(false);
   const [inbox, setInbox] = useState<InboxRecord[]>([]);
   const [unattended, setUnattended] = useState(false);
+  const [progressiveToolDisclosure, setProgressiveToolDisclosure] =
+    useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsSection>("provider");
   const [query, setQuery] = useState("");
   const [error, setError] = useState("");
@@ -10914,6 +11019,12 @@ function AppContent() {
   }, [selected?.id]);
   const [homeWorkspace, setHomeWorkspace] = useState("");
   const [secretBackend, setSecretBackend] = useState("");
+  const [surfaceRequest, setSurfaceRequest] = useState<{
+    sessionId: string;
+    tab: SurfaceRequestTab;
+    requestId: number;
+  } | null>(null);
+  const surfaceRequestId = useRef(0);
   const generation = useRef(0);
   const showErrorToast = (reason: unknown) => {
     const runtime = (window as Window & { __TAURI_INTERNALS__?: unknown })
@@ -11189,10 +11300,16 @@ function AppContent() {
   useEffect(() => {
     if (!selected) {
       setUnattended(false);
+      setProgressiveToolDisclosure(false);
       return;
     }
     void command<boolean>("get_unattended", { sessionId: selected.id })
       .then(setUnattended)
+      .catch((reason) => setError(errorMessage(reason)));
+    void command<boolean>("get_progressive_tool_disclosure", {
+      sessionId: selected.id,
+    })
+      .then(setProgressiveToolDisclosure)
       .catch((reason) => setError(errorMessage(reason)));
   }, [selected?.id]);
   useEffect(() => {
@@ -11231,6 +11348,16 @@ function AppContent() {
           workingEvent?.payload && typeof workingEvent.payload === "object"
             ? (workingEvent.payload as Record<string, unknown>)
             : undefined;
+        const requestedSurface = surfaceRequestForWorkingEvent(
+          workingEvent,
+          ++surfaceRequestId.current,
+        );
+        if (requestedSurface) {
+          setSurfaceRequest({
+            sessionId: payload.session_id || "",
+            ...requestedSurface,
+          });
+        }
         if (streamPayload.type === "user_question_answered") {
           const callId =
             typeof workingPayload?.call_id === "string"
@@ -11381,6 +11508,24 @@ function AppContent() {
         typeof payload.payload.created_at_ms === "number" &&
         typeof payload.payload.type === "string"
       ) {
+        const streamPayload = payload.payload as {
+          working_event?: {
+            payload?: {
+              severity?: unknown;
+              summary?: unknown;
+            };
+          };
+        };
+        if (
+          payload.payload.type === "operational_blocker" &&
+          streamPayload.working_event?.payload?.severity === "hard"
+        ) {
+          const summary =
+            typeof streamPayload.working_event?.payload?.summary === "string"
+              ? streamPayload.working_event.payload.summary
+              : "An operational blocker was reported.";
+          showErrorToast(`Hard blocker: ${summary}`);
+        }
         setLiveTranscript((items) =>
           mergeEvents(items, payload.payload as unknown as TimelineEvent, true),
         );
@@ -11619,6 +11764,11 @@ function AppContent() {
           setSurface("session");
         }}
         onNew={openNewSessionHome}
+        onRenameSession={(id, title) =>
+          command("rename_session", { sessionId: id, title })
+            .then(() => refresh())
+            .catch(onError)
+        }
         onTest={(host: Host) =>
           command<Host>("test_host", { hostId: host.id })
             .then((next) =>
@@ -11843,6 +11993,15 @@ function AppContent() {
                         unattended: on,
                       })
                         .then(() => setUnattended(on))
+                        .catch(onError);
+                    }}
+                    progressiveToolDisclosure={progressiveToolDisclosure}
+                    onProgressiveToolDisclosureChange={(on) => {
+                      void command("set_progressive_tool_disclosure", {
+                        sessionId: selected.id,
+                        enabled: on,
+                      })
+                        .then(() => setProgressiveToolDisclosure(on))
                         .catch(onError);
                     }}
                     onSend={submit}
@@ -12260,6 +12419,9 @@ function AppContent() {
               .catch(onError)
           }
           onError={onError}
+          focusTabRequest={
+            surfaceRequest?.sessionId === selected.id ? surfaceRequest : null
+          }
           onCollapsedChange={setDrawerCollapsed}
           width={rightPanelWidth}
           onWidthChange={setRightPanelWidth}

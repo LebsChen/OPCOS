@@ -186,6 +186,23 @@ pub struct LearnedSkillRecord {
     pub conflict_group: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AutomaticMemoryRecord {
+    pub id: String,
+    pub repository_identity: String,
+    pub project_id: Option<String>,
+    pub identifier: String,
+    pub description: String,
+    pub source_session_id: String,
+    pub source_task: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub status: String,
+    pub supersedes_id: Option<String>,
+    pub superseded_by_id: Option<String>,
+    pub conflict_group: String,
+}
+
 impl ModelDiscoveryRecord {
     pub fn is_fresh(&self, now: DateTime<Utc>, ttl_seconds: i64) -> bool {
         DateTime::parse_from_rfc3339(&self.discovered_at)
@@ -1317,6 +1334,12 @@ pub trait SessionStore {
     ) -> Result<(), StoreError>;
     fn set_unattended(&self, session_id: &str, unattended: bool) -> Result<(), StoreError>;
     fn is_unattended(&self, session_id: &str) -> Result<bool, StoreError>;
+    fn set_progressive_tool_disclosure(
+        &self,
+        session_id: &str,
+        enabled: bool,
+    ) -> Result<(), StoreError>;
+    fn progressive_tool_disclosure(&self, session_id: &str) -> Result<bool, StoreError>;
     fn list_inbox(&self) -> Result<Vec<InboxRecord>, StoreError>;
     fn get_inbox(&self, session_id: &str, call_id: &str)
     -> Result<Option<InboxRecord>, StoreError>;
@@ -1386,6 +1409,7 @@ pub trait SessionStore {
         stop_reason: &str,
     ) -> Result<(), StoreError>;
     fn update_session_mode(&self, session_id: &str, mode: &str) -> Result<(), StoreError>;
+    fn update_session_title(&self, session_id: &str, title: &str) -> Result<(), StoreError>;
     fn update_session_harness(&self, session_id: &str, harness: &str) -> Result<(), StoreError>;
     fn update_external_session_id(
         &self,
@@ -1640,6 +1664,40 @@ fn learned_skill_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LearnedSk
     })
 }
 
+fn automatic_memory_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomaticMemoryRecord> {
+    Ok(AutomaticMemoryRecord {
+        id: row.get(0)?,
+        repository_identity: row.get(1)?,
+        project_id: row.get(2)?,
+        identifier: row.get(3)?,
+        description: row.get(4)?,
+        source_session_id: row.get(5)?,
+        source_task: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+        status: row.get(9)?,
+        supersedes_id: row.get(10)?,
+        superseded_by_id: row.get(11)?,
+        conflict_group: row.get(12)?,
+    })
+}
+
+fn reject_automatic_memory_content(record: &AutomaticMemoryRecord) -> Result<(), StoreError> {
+    let content = format!(
+        "{}\n{}\n{}",
+        record.identifier, record.description, record.source_task
+    )
+    .to_ascii_lowercase();
+    for marker in ["bearer ", "token=", "key=", "password=", "secret="] {
+        if content.contains(marker) {
+            return Err(StoreError::Validation(format!(
+                "automatic memory rejected: credential-like content ({marker})"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
@@ -1790,6 +1848,233 @@ impl SqliteStore {
                 learned_skill_from_row,
             )
             .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn merge_automatic_memory(
+        &self,
+        mut record: AutomaticMemoryRecord,
+    ) -> Result<AutomaticMemoryRecord, StoreError> {
+        if record.repository_identity.trim().is_empty()
+            || record.identifier.trim().is_empty()
+            || record.description.trim().is_empty()
+            || record.source_session_id.trim().is_empty()
+            || record.source_task.trim().is_empty()
+        {
+            return Err(StoreError::Validation(
+                "repository_identity, identifier, description, source_session_id, and source_task are required"
+                    .into(),
+            ));
+        }
+        if !matches!(record.status.as_str(), "" | "active") {
+            return Err(StoreError::Validation(
+                "automatic memory status must be active when writing".into(),
+            ));
+        }
+        reject_automatic_memory_content(&record)?;
+        let now = Utc::now().to_rfc3339();
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let conflict_group = if record.conflict_group.trim().is_empty() {
+            format!(
+                "{}:{}",
+                record.repository_identity,
+                record.identifier.to_ascii_lowercase()
+            )
+        } else {
+            record.conflict_group.clone()
+        };
+        let previous = connection
+            .query_row(
+                "SELECT id,description FROM automatic_memories
+                 WHERE repository_identity=?1 AND conflict_group=?2 AND status='active'
+                 ORDER BY identifier ASC,id ASC LIMIT 1",
+                params![record.repository_identity, conflict_group],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((id, description)) = previous.as_ref()
+            && description == &record.description
+        {
+            drop(connection);
+            return self
+                .get_automatic_memory(id)?
+                .ok_or_else(|| StoreError::Validation("automatic memory disappeared".into()));
+        }
+        record.id = if record.id.trim().is_empty() {
+            format!("automatic-memory-{}", uuid::Uuid::new_v4())
+        } else {
+            record.id
+        };
+        record.created_at = if record.created_at.is_empty() {
+            now.clone()
+        } else {
+            record.created_at
+        };
+        record.updated_at = now.clone();
+        record.status = "active".into();
+        record.conflict_group = conflict_group;
+        record.supersedes_id = previous.as_ref().map(|(id, _)| id.clone());
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute(
+            "INSERT INTO automatic_memories
+             (id,repository_identity,project_id,identifier,description,
+              source_session_id,source_task,created_at,updated_at,status,
+              supersedes_id,superseded_by_id,conflict_group)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,?12)",
+            params![
+                record.id,
+                record.repository_identity,
+                record.project_id,
+                record.identifier,
+                record.description,
+                record.source_session_id,
+                record.source_task,
+                record.created_at,
+                record.updated_at,
+                record.status,
+                record.supersedes_id,
+                record.conflict_group
+            ],
+        )?;
+        if let Some(previous) = record.supersedes_id.as_deref() {
+            transaction.execute(
+                "UPDATE automatic_memories
+                 SET superseded_by_id=?1,status='superseded',updated_at=?2 WHERE id=?3",
+                params![record.id, now, previous],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    pub fn list_automatic_memories(
+        &self,
+        repository_identity: &str,
+        include_inactive: bool,
+    ) -> Result<Vec<AutomaticMemoryRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let query = if include_inactive {
+            "SELECT id,repository_identity,project_id,identifier,description,
+                    source_session_id,source_task,created_at,updated_at,status,
+                    supersedes_id,superseded_by_id,conflict_group
+             FROM automatic_memories WHERE repository_identity=?1
+             ORDER BY identifier ASC,created_at ASC,id ASC"
+        } else {
+            "SELECT id,repository_identity,project_id,identifier,description,
+                    source_session_id,source_task,created_at,updated_at,status,
+                    supersedes_id,superseded_by_id,conflict_group
+             FROM automatic_memories
+             WHERE repository_identity=?1 AND status='active'
+             ORDER BY identifier ASC,created_at ASC,id ASC"
+        };
+        let mut statement = connection.prepare(query)?;
+        let rows = statement.query_map([repository_identity], automatic_memory_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn get_automatic_memory(
+        &self,
+        id: &str,
+    ) -> Result<Option<AutomaticMemoryRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .query_row(
+                "SELECT id,repository_identity,project_id,identifier,description,
+                        source_session_id,source_task,created_at,updated_at,status,
+                        supersedes_id,superseded_by_id,conflict_group
+                 FROM automatic_memories WHERE id=?1",
+                [id],
+                automatic_memory_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn set_automatic_memory_status(&self, id: &str, status: &str) -> Result<(), StoreError> {
+        if !matches!(status, "active" | "disabled") {
+            return Err(StoreError::Validation(
+                "automatic memory status must be active or disabled".into(),
+            ));
+        }
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let changed = connection.execute(
+            "UPDATE automatic_memories SET status=?1,updated_at=?2
+             WHERE id=?3 AND status IN ('active','disabled')",
+            params![status, Utc::now().to_rfc3339(), id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::Validation(
+                "automatic memory is missing or superseded".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn delete_automatic_memory(&self, id: &str) -> Result<bool, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        Ok(connection.execute("DELETE FROM automatic_memories WHERE id=?1", [id])? > 0)
+    }
+
+    pub fn record_learned_skill_source(
+        &self,
+        skill_id: &str,
+        session_id: &str,
+    ) -> Result<(), StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
+            "INSERT INTO learned_skill_provenance(skill_id,source_session_id,created_at)
+             VALUES (?1,?2,?3)
+             ON CONFLICT(skill_id) DO UPDATE SET source_session_id=excluded.source_session_id",
+            params![skill_id, session_id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn learned_skill_provenance(&self, skill_id: &str) -> Result<Option<String>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .query_row(
+                "SELECT source_session_id FROM learned_skill_provenance WHERE skill_id=?1",
+                [skill_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn update_learned_skill_lifecycle(
+        &self,
+        skill_id: &str,
+        action: &str,
+    ) -> Result<LearnedSkillRecord, StoreError> {
+        let status = match action {
+            "archive" => "archived",
+            "delete" => "deleted",
+            "restore" | "rollback" => "active",
+            _ => {
+                return Err(StoreError::Validation(
+                    "unsupported learned skill lifecycle action".into(),
+                ));
+            }
+        };
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let changed = connection.execute(
+            "UPDATE learned_skills SET status=?1,updated_at=?2 WHERE id=?3",
+            params![status, Utc::now().to_rfc3339(), skill_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::Validation("learned skill not found".into()));
+        }
+        connection
+            .query_row(
+                "SELECT id,repository_identity,project_id,title,summary,applies_when,steps_json,
+                        verification,caveats,tags_json,source_commit,model_asserted_status,
+                        created_at,updated_at,status,supersedes_id,superseded_by_id,conflict_group
+                 FROM learned_skills WHERE id=?1",
+                [skill_id],
+                learned_skill_from_row,
+            )
             .map_err(StoreError::from)
     }
 
@@ -4161,8 +4446,30 @@ impl SqliteStore {
                superseded_by_id TEXT,
                conflict_group TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS learned_skill_provenance (
+               skill_id TEXT PRIMARY KEY,
+               source_session_id TEXT NOT NULL,
+               created_at TEXT NOT NULL
+             );
              CREATE INDEX IF NOT EXISTS idx_learned_skills_search
                ON learned_skills(repository_identity,status,updated_at DESC);
+             CREATE TABLE IF NOT EXISTS automatic_memories (
+               id TEXT PRIMARY KEY,
+               repository_identity TEXT NOT NULL,
+               project_id TEXT,
+               identifier TEXT NOT NULL,
+               description TEXT NOT NULL,
+               source_session_id TEXT NOT NULL,
+               source_task TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               status TEXT NOT NULL,
+               supersedes_id TEXT,
+               superseded_by_id TEXT,
+               conflict_group TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_automatic_memories_lookup
+               ON automatic_memories(repository_identity,status,identifier,created_at);
              CREATE INDEX IF NOT EXISTS idx_login_backups_account
                ON login_state_backups(account_id,created_at DESC);
              CREATE INDEX IF NOT EXISTS idx_action_ledger_created_at
@@ -4378,9 +4685,19 @@ impl SqliteStore {
              );
              CREATE TABLE IF NOT EXISTS session_preferences (
                session_id TEXT PRIMARY KEY,
-               unattended INTEGER NOT NULL DEFAULT 0
+               unattended INTEGER NOT NULL DEFAULT 0,
+               progressive_tool_disclosure INTEGER NOT NULL DEFAULT 0
              );",
             )?;
+            if !table_columns(&connection, "session_preferences")?
+                .iter()
+                .any(|column| column == "progressive_tool_disclosure")
+            {
+                connection.execute(
+                    "ALTER TABLE session_preferences ADD COLUMN progressive_tool_disclosure INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
             if !table_columns(&connection, "project_agents")?
                 .iter()
                 .any(|column| column == "template_id")
@@ -5519,6 +5836,21 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub fn update_session_title(&self, session_id: &str, title: &str) -> Result<(), StoreError> {
+        let changed = self
+            .connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "UPDATE sessions SET title=?1, updated_at=?2 WHERE session_id=?3",
+                params![title, Utc::now().to_rfc3339(), session_id],
+            )?;
+        if changed == 0 {
+            return Err(StoreError::SessionNotFound(session_id.into()));
+        }
+        Ok(())
+    }
+
     pub fn update_session_model(&self, session_id: &str, model: &str) -> Result<(), StoreError> {
         let changed = self
             .connection
@@ -5598,6 +5930,10 @@ impl SessionStore for SqliteStore {
 
     fn update_session_mode(&self, session_id: &str, mode: &str) -> Result<(), StoreError> {
         SqliteStore::update_session_mode(self, session_id, mode)
+    }
+
+    fn update_session_title(&self, session_id: &str, title: &str) -> Result<(), StoreError> {
+        SqliteStore::update_session_title(self, session_id, title)
     }
 
     fn update_session_harness(&self, session_id: &str, harness: &str) -> Result<(), StoreError> {
@@ -5837,6 +6173,36 @@ impl SessionStore for SqliteStore {
             .expect("sqlite mutex poisoned")
             .query_row(
                 "SELECT unattended FROM session_preferences WHERE session_id=?1",
+                [session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(value.unwrap_or(0) != 0)
+    }
+
+    fn set_progressive_tool_disclosure(
+        &self,
+        session_id: &str,
+        enabled: bool,
+    ) -> Result<(), StoreError> {
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "INSERT INTO session_preferences(session_id,progressive_tool_disclosure) VALUES (?1,?2)
+             ON CONFLICT(session_id) DO UPDATE SET progressive_tool_disclosure=excluded.progressive_tool_disclosure",
+                params![session_id, enabled],
+            )?;
+        Ok(())
+    }
+
+    fn progressive_tool_disclosure(&self, session_id: &str) -> Result<bool, StoreError> {
+        let value = self
+            .connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .query_row(
+                "SELECT progressive_tool_disclosure FROM session_preferences WHERE session_id=?1",
                 [session_id],
                 |row| row.get::<_, i64>(0),
             )
@@ -7123,6 +7489,9 @@ mod tests {
         assert!(store.is_unattended("s").unwrap());
         store.set_unattended("s", false).unwrap();
         assert!(!store.is_unattended("s").unwrap());
+        assert!(!store.progressive_tool_disclosure("s").unwrap());
+        store.set_progressive_tool_disclosure("s", true).unwrap();
+        assert!(store.progressive_tool_disclosure("s").unwrap());
     }
 
     #[test]
@@ -8119,6 +8488,57 @@ mod tests {
     }
 
     #[test]
+    fn learned_skill_provenance_and_lifecycle_are_persistent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let skill = store
+            .save_learned_skill(LearnedSkillRecord {
+                id: String::new(),
+                repository_identity: "project:test".into(),
+                project_id: Some("test".into()),
+                title: "workflow".into(),
+                summary: "repeatable workflow".into(),
+                applies_when: "when needed".into(),
+                steps: vec!["run it".into()],
+                verification: "observed".into(),
+                caveats: String::new(),
+                tags: vec![],
+                source_commit: "abc".into(),
+                model_asserted_status: "model_asserted_observed".into(),
+                created_at: String::new(),
+                updated_at: String::new(),
+                status: "active".into(),
+                supersedes_id: None,
+                superseded_by_id: None,
+                conflict_group: String::new(),
+            })
+            .unwrap();
+        store
+            .record_learned_skill_source(&skill.id, "session-1")
+            .unwrap();
+        assert_eq!(
+            store
+                .learned_skill_provenance(&skill.id)
+                .unwrap()
+                .as_deref(),
+            Some("session-1")
+        );
+        assert_eq!(
+            store
+                .update_learned_skill_lifecycle(&skill.id, "archive")
+                .unwrap()
+                .status,
+            "archived"
+        );
+        assert_eq!(
+            store
+                .update_learned_skill_lifecycle(&skill.id, "restore")
+                .unwrap()
+                .status,
+            "active"
+        );
+    }
+
+    #[test]
     fn learned_skill_status_must_be_explicitly_model_asserted() {
         let store = SqliteStore::open_in_memory().unwrap();
         let result = store.save_learned_skill(LearnedSkillRecord {
@@ -8142,6 +8562,102 @@ mod tests {
             conflict_group: String::new(),
         });
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn automatic_memory_merge_is_incremental_deduplicated_and_versioned() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let make = |description: &str| AutomaticMemoryRecord {
+            id: String::new(),
+            repository_identity: "project:test".into(),
+            project_id: Some("test".into()),
+            identifier: "preferred-check".into(),
+            description: description.into(),
+            source_session_id: "session-1".into(),
+            source_task: "task-1".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            status: "active".into(),
+            supersedes_id: None,
+            superseded_by_id: None,
+            conflict_group: String::new(),
+        };
+        assert!(
+            store
+                .merge_automatic_memory(make("remember token=never-persist"))
+                .is_err()
+        );
+        let first = store
+            .merge_automatic_memory(make("Run the focused test first."))
+            .unwrap();
+        let duplicate = store
+            .merge_automatic_memory(make("Run the focused test first."))
+            .unwrap();
+        assert_eq!(duplicate.id, first.id);
+        let second = store
+            .merge_automatic_memory(AutomaticMemoryRecord {
+                source_session_id: "session-2".into(),
+                source_task: "task-2".into(),
+                ..make("Run the full test suite first.")
+            })
+            .unwrap();
+        assert_eq!(second.supersedes_id.as_deref(), Some(first.id.as_str()));
+        let old = store.get_automatic_memory(&first.id).unwrap().unwrap();
+        assert_eq!(old.status, "superseded");
+        assert_eq!(old.superseded_by_id.as_deref(), Some(second.id.as_str()));
+        let active = store
+            .list_automatic_memories("project:test", false)
+            .unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, second.id);
+        assert_eq!(active[0].source_session_id, "session-2");
+    }
+
+    #[test]
+    fn automatic_memory_can_be_disabled_deleted_and_reloaded() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let record = store
+            .merge_automatic_memory(AutomaticMemoryRecord {
+                id: String::new(),
+                repository_identity: "workspace:test".into(),
+                project_id: None,
+                identifier: "reload".into(),
+                description: "Keep the output stable.".into(),
+                source_session_id: "session-7".into(),
+                source_task: "task-7".into(),
+                created_at: String::new(),
+                updated_at: String::new(),
+                status: "active".into(),
+                supersedes_id: None,
+                superseded_by_id: None,
+                conflict_group: String::new(),
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .list_automatic_memories("workspace:test", false)
+                .unwrap()
+                .len(),
+            1
+        );
+        store
+            .set_automatic_memory_status(&record.id, "disabled")
+            .unwrap();
+        assert!(
+            store
+                .list_automatic_memories("workspace:test", false)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .list_automatic_memories("workspace:test", true)
+                .unwrap()[0]
+                .status,
+            "disabled"
+        );
+        assert!(store.delete_automatic_memory(&record.id).unwrap());
+        assert!(store.get_automatic_memory(&record.id).unwrap().is_none());
     }
 
     #[test]

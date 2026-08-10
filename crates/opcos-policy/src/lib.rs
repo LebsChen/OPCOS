@@ -10,6 +10,26 @@ pub enum PermissionMode {
     Custom,
 }
 
+impl PermissionMode {
+    pub const ALL: [Self; 5] = [
+        Self::Discuss,
+        Self::Plan,
+        Self::Interactive,
+        Self::Auto,
+        Self::Custom,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Discuss => "Discuss",
+            Self::Plan => "Plan",
+            Self::Interactive => "Interactive",
+            Self::Auto => "Auto",
+            Self::Custom => "Custom",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
     Allow,

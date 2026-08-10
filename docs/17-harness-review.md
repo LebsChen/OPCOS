@@ -236,9 +236,10 @@ OPCOS 现状：`ProviderRequest`/`AssistantTurn`/`TokenUsage` 是 provider-neutr
 ### P0-2 渐进式工具披露 + 工具目录检索（对应 §2.3，任务 #26）
 
 - 依据：“Use progressive disclosure for both. Advertise what and why compactly. Load detailed schemas… after selection.”（lopopolo）+ “100+ tools? → Semantic Tool Search → Only inject relevant defs”（WanLanglin 摘要）。
-- 形状：保留高频核心工具全量注入（file/shell/plan/search/ask_user）；把 browser 15 件套、连接器约 20 件套和 MCP 工具改为目录条目（name / purpose / input shape / first useful call），新增 `tool_search(query)` 与 `tool_describe(name)` 取完整 schema；被 describe 过的工具在本 turn 内保持可直接调用。
-- 风险与缓解：这会改变模型可见工具集，必须先有 P0-3 的轨迹回归；因此实现顺序为 P0-1 → P0-3 骨架 → P0-2，且由会话设置控制开关，默认保持现状直到轨迹集显示无退化。
-- 验收：同一任务集下每轮工具定义 token 数下降且完成率不下降（需 P0-3 提供度量）。
+- 形状：保留高频核心工具全量注入（file/shell/plan/search/ask_user）；把 browser、连接器和 MCP 工具按现有工具定义名称规则降为目录条目（name / purpose / input shape / first useful call），新增 `tool_search(query)` 与 `tool_describe(name)` 取完整 schema。
+- 生命周期：渐进式披露由会话设置控制且默认关闭；开启后，被 describe 的工具在整个 session 内保持展开，避免压缩后模型遗忘已经选择的能力。目录工具若未 describe 就被调用，返回 P0-1 结构化错误并指向 `tool_describe(name)`。
+- 风险与缓解：这会改变模型可见工具集，必须先有 P0-3 的轨迹回归；因此实现顺序为 P0-1 → P0-3 骨架 → P0-2，且默认保持现状直到轨迹集显示无退化。
+- 度量：P0-3 trajectory cost 记录首轮实际工具定义体积、紧凑目录体积与对应全量体积的 token 估算（JSON bytes / 4），用于比较开关关闭与开启时的下降幅度；目录 purpose 仅保留首句并限制长度；本次不引入 embedding 或外部服务。
 
 ### P0-3 Trajectory eval harness（对应 §2.13，任务 #27）
 
@@ -247,6 +248,12 @@ OPCOS 现状：`ProviderRequest`/`AssistantTurn`/`TokenUsage` 是 provider-neutr
 - 首批用例直接来自已修过的真实故障：嵌套目录写入、写失败不得产生 `Created` 行、工作区外写入必须拒绝、卡死 turn 必须收敛、运行中 steering 必须被消费、approval pending 后恢复、压缩后 plan 仍在 system message。
 - 当前骨架验证的是 engine 侧编排不变量；工具行为由 fixture executor 替身提供，不等同于 `src-tauri` 的生产工具实现。要覆盖真实工具语义，后续需将 `src-tauri` 工具实现抽成独立 crate，本次不做。
 - 验收：`cargo test -p opcos-eval` 在 CI 跑；每个 case 输出 outcome / proof / trajectory cost 三段结果。
+
+### P0-4 分层失败轨迹导出
+
+- `crates/opcos-trace` 将生产会话导出为 raw JSONL、确定性的 per-task analysis 和跨 run overview 三层产物；`src-tauri` 通过导出命令调用它。
+- analysis 机械提取终态、工具序列、重复调用、iteration/token 统计和 P0-1 `error_details.code` 序列；签名的因果地位与 agent 机制维度保留为空位，后续由独立分析步骤填写，不在导出器中启发式猜测。
+- 三层所有字段递归经过 scrubber；生产导出必须传入当前已知 secret 值做精确替换，启发式规则只作为第二层兜底。原始事件、分析报告和聚合总览都可直接作为模型输入或用户分享物。
 
 ### P1-4 恢复语义与故障分类（对应 §2.11）
 

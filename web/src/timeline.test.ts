@@ -938,6 +938,54 @@ describe("single event-log timeline", () => {
     );
     expect(nodes).not.toContainEqual(expect.objectContaining({ text: "" }));
   });
+
+  it("renders nonblocking messages and operational blockers as distinct notices", () => {
+    const nodes = buildTimeline([
+      {
+        type: "agent_message",
+        event_id: "agent-message",
+        created_at_ms: 1,
+        working_event: {
+          event_type: "agent_message",
+          category: "message",
+          direction: "outgoing",
+          timestamp: new Date(1).toISOString(),
+          payload: { message: "Progress update", kind: "progress" },
+        },
+      },
+      {
+        type: "operational_blocker",
+        event_id: "operational-blocker",
+        created_at_ms: 2,
+        working_event: {
+          event_type: "operational_blocker",
+          category: "notice",
+          direction: "outgoing",
+          timestamp: new Date(2).toISOString(),
+          payload: {
+            severity: "hard",
+            category: "host",
+            summary: "Host unavailable",
+          },
+        },
+      },
+    ]);
+
+    expect(nodes).toEqual([
+      {
+        kind: "notice",
+        text: "Progress update",
+        tone: "info",
+        noticeKind: "agent_message",
+      },
+      {
+        kind: "notice",
+        text: "Hard blocker: Host unavailable",
+        tone: "warn",
+        noticeKind: "operational_blocker",
+      },
+    ]);
+  });
   it("skips empty tool-call-only assistant iterations", () => {
     const nodes = buildTimeline(toolCallOnlyIteration as TimelineEvent[]);
     expect(nodes).toEqual([]);
