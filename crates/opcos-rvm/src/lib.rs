@@ -1415,22 +1415,24 @@ impl RvmClient for HttpRvmClient {
                 .parse()
                 .map_err(|_| RvmError::WebSocket("invalid authorization header".into()))?,
         );
-        let mut origin = self.config.base_url.clone();
-        origin.set_path("");
-        origin.set_query(None);
-        request.headers_mut().insert(
-            header::ORIGIN,
-            origin
-                .as_str()
-                .parse()
-                .map_err(|_| RvmError::WebSocket("invalid websocket origin".into()))?,
-        );
-        request.headers_mut().insert(
-            header::USER_AGENT,
-            IDE_BROWSER_USER_AGENT
-                .parse()
-                .map_err(|_| RvmError::WebSocket("invalid websocket user-agent".into()))?,
-        );
+        if !matches!(kind, WsKind::Cdp) {
+            let mut origin = self.config.base_url.clone();
+            origin.set_path("");
+            origin.set_query(None);
+            request.headers_mut().insert(
+                header::ORIGIN,
+                origin
+                    .as_str()
+                    .parse()
+                    .map_err(|_| RvmError::WebSocket("invalid websocket origin".into()))?,
+            );
+            request.headers_mut().insert(
+                header::USER_AGENT,
+                IDE_BROWSER_USER_AGENT
+                    .parse()
+                    .map_err(|_| RvmError::WebSocket("invalid websocket user-agent".into()))?,
+            );
+        }
         connect_async(request)
             .await
             .map(|(stream, _)| stream)
