@@ -130,6 +130,7 @@ pub enum ToolErrorCode {
     InvalidArguments,
     RemoteUnsupported,
     HostIo,
+    RemoteTransport,
     McpTransport,
     McpAuth,
     Timeout,
@@ -363,6 +364,10 @@ fn host_io(text: &str) -> bool {
         || contains(text, "failed to apply atomic edit")
 }
 
+fn remote_transport(text: &str) -> bool {
+    contains(text, "rvm request failed: error sending request for url")
+}
+
 // These rules classify summaries across ToolExecutor's String boundary.
 // If a producer changes its wording, the rule intentionally degrades to unclassified.
 const TOOL_ERROR_RULES: &[ToolErrorRule] = &[
@@ -455,6 +460,15 @@ const TOOL_ERROR_RULES: &[ToolErrorRule] = &[
         repair: "resolve the preflight requirement and retry with the permitted action",
         retry: ToolErrorRetry::Adjusted,
         retrieval: None,
+    },
+    ToolErrorRule {
+        pattern: "remote RVM request transport failure",
+        matches: remote_transport,
+        code: ToolErrorCode::RemoteTransport,
+        invariant: "the remote host transport must be reachable and accept requests",
+        repair: "retry the remote operation and verify that the host is online before retrying again",
+        retry: ToolErrorRetry::Same,
+        retrieval: Some("check the remote host health and capability status"),
     },
     ToolErrorRule {
         pattern: "mcp authentication",
@@ -9248,6 +9262,36 @@ mod tests {
                 "local host I/O failed: request timed out",
                 "host_io",
                 "same",
+            ),
+            (
+                "RVM request failed: error sending request for url (https://devbox.windevos.com/api/exec-sync): error trying to connect: tcp connect error: Connection refused",
+                "remote_transport",
+                "same",
+            ),
+            (
+                "RVM request failed: error sending request for url (https://devbox.windevos.com/api/health): error trying to connect: invalid peer certificate: UnknownIssuer",
+                "remote_transport",
+                "same",
+            ),
+            (
+                "RVM request failed: error sending request for url (https://devbox.windevos.com/api/exec-sync): operation timed out",
+                "remote_transport",
+                "same",
+            ),
+            (
+                "RVM returned HTTP 401 Unauthorized: unauthorized",
+                "unclassified",
+                "same",
+            ),
+            (
+                "RVM returned HTTP 404 Not Found: capability unavailable",
+                "remote_unsupported",
+                "no",
+            ),
+            (
+                "RVM request failed: computer-use rejected: unsupported action",
+                "remote_unsupported",
+                "no",
             ),
             ("MCP server authentication required", "mcp_auth", "adjusted"),
             ("tool call denied by user", "approval_denied", "no"),
