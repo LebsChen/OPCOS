@@ -11118,42 +11118,25 @@ function InboxPane({
 
 function QuestionCard({
   question,
+  onCollapse,
   onAnswer,
 }: {
   question: PendingQuestion;
+  onCollapse: () => void;
   onAnswer: (answer: string) => Promise<void>;
 }) {
-  const [answer, setAnswer] = useState("");
   const [selectedOptions, setSelectedOptions] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
-  const [collapsed, setCollapsed] = useState(false);
   const options = question.options ?? [];
   const optionLabel = (index: number) =>
     String.fromCharCode("A".charCodeAt(0) + index);
-  const submit = (value: string) => {
-    if (!value.trim() || submitting) return;
+  const answerOption = (answer: string) => {
+    if (submitting) return;
     setSubmitting(true);
-    void onAnswer(value.trim()).catch(() => setSubmitting(false));
+    void onAnswer(answer).catch(() => setSubmitting(false));
   };
-  if (collapsed) {
-    return (
-      <div className="transcript-question-collapsed">
-        <span className="transcript-question-collapsed-copy">
-          <strong>Question</strong>
-          <span>{question.question}</span>
-        </span>
-        <button
-          className="transcript-question-reopen"
-          type="button"
-          onClick={() => setCollapsed(false)}
-        >
-          Answer
-        </button>
-      </div>
-    );
-  }
   return (
-    <div className="approval transcript-question-card">
+    <div className="transcript-question-card">
       <div className="transcript-question-head">
         <strong>{question.question}</strong>
         <button
@@ -11161,7 +11144,7 @@ function QuestionCard({
           type="button"
           aria-label="Collapse question"
           title="Collapse question"
-          onClick={() => setCollapsed(true)}
+          onClick={onCollapse}
         >
           ×
         </button>
@@ -11172,11 +11155,11 @@ function QuestionCard({
             const selected = selectedOptions.includes(option);
             return (
               <button
-                key={option}
                 className={`approval-option-row${selected ? " selected" : ""}`}
+                key={option}
                 type="button"
                 disabled={submitting}
-                aria-pressed={selected}
+                aria-pressed={question.allowMultiple ? selected : undefined}
                 onClick={() => {
                   if (question.allowMultiple) {
                     setSelectedOptions((current) =>
@@ -11185,7 +11168,7 @@ function QuestionCard({
                         : [...current, option],
                     );
                   } else {
-                    submit(option);
+                    answerOption(option);
                   }
                 }}
               >
@@ -11201,7 +11184,7 @@ function QuestionCard({
               className="approval-option-row"
               type="button"
               disabled={submitting || selectedOptions.length === 0}
-              onClick={() => submit(JSON.stringify(selectedOptions))}
+              onClick={() => answerOption(JSON.stringify(selectedOptions))}
             >
               <span className="approval-option-key">↵</span>
               <span>{submitting ? "Sending…" : "Submit selection"}</span>
@@ -11209,31 +11192,6 @@ function QuestionCard({
           )}
         </div>
       )}
-      <div className="approval-btns">
-        <input
-          className="ob-input flex-1"
-          value={answer}
-          disabled={submitting}
-          onChange={(event) => setAnswer(event.target.value)}
-          placeholder="Type your answer"
-          aria-label="Answer"
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && !event.shiftKey) {
-              event.preventDefault();
-              submit(answer);
-            }
-          }}
-        />
-        <button
-          className="approval-option-row approval-answer-submit"
-          type="button"
-          disabled={submitting || !answer.trim()}
-          onClick={() => submit(answer)}
-        >
-          <span className="approval-option-key">↵</span>
-          <span>{submitting ? "Sending…" : "Answer"}</span>
-        </button>
-      </div>
     </div>
   );
 }
@@ -11302,8 +11260,13 @@ function AppContent() {
   const [showTranscriptJump, setShowTranscriptJump] = useState(false);
   const [pendingQuestion, setPendingQuestion] =
     useState<PendingQuestion | null>(null);
+  const [pendingQuestionCollapsed, setPendingQuestionCollapsed] =
+    useState(false);
   const [pendingApproval, setPendingApproval] =
     useState<PendingApproval | null>(null);
+  useEffect(() => {
+    setPendingQuestionCollapsed(false);
+  }, [pendingQuestion?.callId]);
   const [surface, setSurface] = useState<
     "session" | "automations" | "manage" | "activity" | "inbox" | "project"
   >("session");
@@ -12190,6 +12153,20 @@ function AppContent() {
       void refresh().catch(onError);
     }
   };
+  const answerPendingQuestion = async (answer: string) => {
+    if (!selected || !pendingQuestion) return;
+    setRunning(true);
+    try {
+      await command("resolve_inbox", {
+        sessionId: selected.id,
+        callId: pendingQuestion.callId,
+        resolution: answer,
+      });
+    } catch (reason) {
+      setRunning(false);
+      throw reason;
+    }
+  };
   return (
     <div
       className={`app ${surface === "session" && selected ? "session-layout" : "surface-layout"}${surface === "session" && selected && drawerCollapsed ? " session-drawer-collapsed" : ""}${navCollapsed ? " nav-collapsed" : ""}${windowMaximized ? " window-maximized" : ""}`}
@@ -12444,20 +12421,39 @@ function AppContent() {
                       />
                     </div>
                   )}
-                  {pendingQuestion && (
-                    <QuestionCard
-                      question={pendingQuestion}
-                      onAnswer={async (answer) => {
-                        setRunning(true);
-                        await command("resolve_inbox", {
-                          sessionId: selected.id,
-                          callId: pendingQuestion.callId,
-                          resolution: answer,
-                        });
-                      }}
-                    />
+                  {pendingQuestion && pendingQuestionCollapsed && (
+                    <div className="transcript-question-collapsed">
+                      <span className="transcript-question-collapsed-copy">
+                        <strong>Question</strong>
+                        <span>{pendingQuestion.question}</span>
+                      </span>
+                      <button
+                        className="transcript-question-reopen"
+                        type="button"
+                        onClick={() => setPendingQuestionCollapsed(false)}
+                      >
+                        Answer
+                      </button>
+                    </div>
                   )}
                   <Composer
+                    interactionHeader={
+                      pendingQuestion && !pendingQuestionCollapsed ? (
+                        <QuestionCard
+                          question={pendingQuestion}
+                          onCollapse={() => setPendingQuestionCollapsed(true)}
+                          onAnswer={answerPendingQuestion}
+                        />
+                      ) : undefined
+                    }
+                    pendingQuestion={
+                      Boolean(pendingQuestion) && !pendingQuestionCollapsed
+                    }
+                    onPendingQuestionAnswer={
+                      pendingQuestion && !pendingQuestionCollapsed
+                        ? answerPendingQuestion
+                        : undefined
+                    }
                     mode={selected.mode}
                     harness={selected.harness}
                     harnessOptions={selectedHarnessOptions}
@@ -12554,7 +12550,7 @@ function AppContent() {
                       }).catch(onError)
                     }
                     onUploadFile={uploadTextAttachment}
-                    resetKey={selected.id}
+                    resetKey={`${selected.id}:${pendingQuestion?.callId ?? "none"}`}
                   />
                 </div>
               </div>
