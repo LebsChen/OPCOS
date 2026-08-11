@@ -11282,7 +11282,14 @@ function AppContent() {
   const [error, setError] = useState("");
   const errorTimer = useRef<number | undefined>(undefined);
   const [running, setRunning] = useState(false);
+  const [editingSessionTitle, setEditingSessionTitle] = useState(false);
+  const [sessionTitleDraft, setSessionTitleDraft] = useState("");
+  const titleEditingRef = useRef(false);
   const previousRunningRef = useRef(false);
+  useEffect(() => {
+    titleEditingRef.current = false;
+    setEditingSessionTitle(false);
+  }, [selected?.id]);
   useEffect(() => {
     selectedIdRef.current = selectedId ?? undefined;
   }, [selectedId]);
@@ -12124,6 +12131,32 @@ function AppContent() {
       throw new Error(submitFailureMessage(reason));
     }
   };
+  const beginSessionTitleEdit = () => {
+    if (!selected) return;
+    titleEditingRef.current = true;
+    setSessionTitleDraft(selected.title);
+    setEditingSessionTitle(true);
+  };
+  const cancelSessionTitleEdit = () => {
+    titleEditingRef.current = false;
+    setEditingSessionTitle(false);
+  };
+  const commitSessionTitleEdit = async () => {
+    if (!titleEditingRef.current || !selected) return;
+    titleEditingRef.current = false;
+    setEditingSessionTitle(false);
+    const next = sessionTitleDraft.trim();
+    if (!next || next === selected.title) return;
+    try {
+      await command("rename_session", {
+        sessionId: selected.id,
+        title: next,
+      });
+      await refresh();
+    } catch (reason) {
+      onError(reason);
+    }
+  };
   const uploadTextAttachmentForSession = async (
     sessionId: string,
     file: File,
@@ -12302,9 +12335,36 @@ function AppContent() {
                 Only the facts and Tauri panel action are adapted to OPCOS. */}
               <header className="main-topbar">
                 <div className="main-title">
-                  <span className="main-title-text" title={selected.title}>
-                    {selected.title}
-                  </span>
+                  {editingSessionTitle ? (
+                    <input
+                      className="session-title-input"
+                      value={sessionTitleDraft}
+                      autoFocus
+                      aria-label="Session title"
+                      onChange={(event) =>
+                        setSessionTitleDraft(event.target.value)
+                      }
+                      onBlur={() => void commitSessionTitleEdit()}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          void commitSessionTitleEdit();
+                        } else if (event.key === "Escape") {
+                          event.preventDefault();
+                          cancelSessionTitleEdit();
+                        }
+                      }}
+                    />
+                  ) : (
+                    <button
+                      className="main-title-text session-title-trigger"
+                      type="button"
+                      title={selected.title}
+                      onClick={beginSessionTitleEdit}
+                    >
+                      {selected.title}
+                    </button>
+                  )}
                   <span className="title-sub" data-testid="session-subtitle">
                     {[
                       selected.host_name,
