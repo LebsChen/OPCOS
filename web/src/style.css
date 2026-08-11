@@ -55,6 +55,7 @@ button:disabled {
   opacity: 0.55;
 }
 .app {
+  position: relative;
   display: grid;
   grid-template-columns: 276px minmax(0, 1fr) var(--right-panel-width, 360px);
   height: 100vh;
