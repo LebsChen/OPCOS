@@ -27,6 +27,9 @@ pub struct RvmClientConfig {
     pub request_timeout: Duration,
 }
 
+const WS_CONNECT_TIMEOUT_SECONDS: u64 = 10;
+const CDP_COMMAND_TIMEOUT_SECONDS: u64 = 30;
+
 impl fmt::Debug for RvmClientConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RvmClientConfig")
@@ -677,13 +680,25 @@ impl HttpRvmClient {
 
     pub async fn capture_cdp_screenshot(&self) -> Result<CdpScreenshot, RvmError> {
         let mut socket = self.open_ws(WsKind::Cdp, WsParams::default()).await?;
+        let host = self
+            .config
+            .base_url
+            .host_str()
+            .unwrap_or("remote host")
+            .to_owned();
+        let command_timeout = self
+            .config
+            .request_timeout
+            .min(Duration::from_secs(CDP_COMMAND_TIMEOUT_SECONDS));
         let mut next_id = 1_u64;
-        let screenshot = cdp_command(
+        let screenshot = cdp_command_with_timeout(
             &mut socket,
             &mut next_id,
             "Page.captureScreenshot",
             Some(serde_json::json!({"format": "png"})),
             None,
+            command_timeout,
+            &host,
         )
         .await?;
         let image = screenshot
@@ -1433,8 +1448,19 @@ impl RvmClient for HttpRvmClient {
                     .map_err(|_| RvmError::WebSocket("invalid websocket user-agent".into()))?,
             );
         }
-        connect_async(request)
+        let connect_timeout = self
+            .config
+            .request_timeout
+            .min(Duration::from_secs(WS_CONNECT_TIMEOUT_SECONDS));
+        tokio::time::timeout(connect_timeout, connect_async(request))
             .await
+            .map_err(|_| {
+                RvmError::WebSocket(format!(
+                    "RVM WebSocket connection timed out after {} while connecting to {}",
+                    format_duration(connect_timeout),
+                    self.config.base_url.host_str().unwrap_or("remote host"),
+                ))
+            })?
             .map(|(stream, _)| stream)
             .map_err(|error| {
                 RvmError::WebSocket(RvmError::redact(&error.to_string(), &self.config.token))
@@ -1442,7 +1468,29 @@ impl RvmClient for HttpRvmClient {
     }
 }
 
-async fn cdp_command(
+async fn cdp_command_with_timeout(
+    socket: &mut RvmWebSocket,
+    next_id: &mut u64,
+    method: &str,
+    params: Option<Value>,
+    session_id: Option<&str>,
+    timeout: Duration,
+    host: &str,
+) -> Result<Value, RvmError> {
+    tokio::time::timeout(
+        timeout,
+        cdp_command_inner(socket, next_id, method, params, session_id),
+    )
+    .await
+    .map_err(|_| {
+        RvmError::WebSocket(format!(
+            "CDP command {method} timed out after {} on {host}",
+            format_duration(timeout)
+        ))
+    })?
+}
+
+async fn cdp_command_inner(
     socket: &mut RvmWebSocket,
     next_id: &mut u64,
     method: &str,
@@ -1517,6 +1565,14 @@ async fn cdp_command(
     Err(RvmError::WebSocket(format!(
         "CDP connection closed while waiting for {method}"
     )))
+}
+
+fn format_duration(duration: Duration) -> String {
+    if duration.as_secs() > 0 {
+        format!("{}s", duration.as_secs())
+    } else {
+        format!("{}ms", duration.as_millis().max(1))
+    }
 }
 
 /// MCP tools the host may expose that map onto OPCOS host capabilities.
@@ -2249,6 +2305,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&*timeouts.lock().unwrap(), &[60]);
+    }
+
+    #[tokio::test]
+    async fn websocket_connect_timeout_bounds_server_that_never_handshakes() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let client = HttpRvmClient::new(RvmClientConfig {
+            base_url: Url::parse(&format!("http://{address}")).unwrap(),
+            token: "test-token".into(),
+            request_timeout: Duration::from_millis(200),
+        })
+        .unwrap();
+        let error = match client.open_ws(WsKind::Cdp, WsParams::default()).await {
+            Ok(_) => panic!("WebSocket handshake unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("RVM WebSocket connection timed out")
+        );
+        assert!(error.to_string().contains("127.0.0.1"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cdp_command_timeout_bounds_server_that_never_replies() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let _ = socket.next().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let client = HttpRvmClient::new(RvmClientConfig {
+            base_url: Url::parse(&format!("http://{address}")).unwrap(),
+            token: "test-token".into(),
+            request_timeout: Duration::from_millis(200),
+        })
+        .unwrap();
+        let error = client.capture_cdp_screenshot().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("CDP command Page.captureScreenshot")
+        );
+        assert!(error.to_string().contains("timed out"));
+        assert!(error.to_string().contains("127.0.0.1"));
+        server.await.unwrap();
     }
 
     #[tokio::test]
