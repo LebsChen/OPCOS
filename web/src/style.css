@@ -1444,6 +1444,20 @@ h3 {
   font-size: 12px;
   line-height: 18px;
 }
+.transcript-sleep {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--color-muted);
+  font-size: 13px;
+  line-height: 18px;
+}
+.transcript-sleep-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--color-muted);
+}
 .standalone-pane {
   display: flex;
   width: 100vw;
