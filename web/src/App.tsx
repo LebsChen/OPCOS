@@ -10087,7 +10087,11 @@ function LayoutSplitter({
       }}
       onPointerDown={(event) => {
         event.preventDefault();
-        event.currentTarget.setPointerCapture(event.pointerId);
+        try {
+          event.currentTarget.setPointerCapture(event.pointerId);
+        } catch {
+          // Synthetic pointer events used by automated checks have no active pointer.
+        }
         const startX = event.clientX;
         const startValue = value;
         const direction = label.includes("right") ? -1 : 1;

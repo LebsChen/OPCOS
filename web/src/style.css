@@ -59,7 +59,7 @@ button:disabled {
   grid-template-columns: 276px minmax(0, 1fr) var(--right-panel-width, 360px);
   height: 100vh;
   overflow: hidden;
-  background: var(--color-panel);
+  background: var(--column-surface);
 }
 .app.session-layout {
   grid-template-columns: var(--nav-panel-width, 276px) 6px minmax(320px, 1fr);
@@ -100,7 +100,7 @@ button:disabled {
   flex-direction: column;
   min-height: 0;
   border-right: 1px solid var(--color-line);
-  background: var(--panel);
+  background: var(--column-surface);
   color: var(--ink);
 }
 /* Cloud-Dev-style collapsed navigation stays in the layout as an icon rail. */
@@ -411,7 +411,7 @@ select:focus {
   grid-column: 3;
   grid-row: 1;
   min-width: 0;
-  background: var(--panel);
+  background: var(--column-surface);
 }
 .layout-splitter {
   position: relative;
@@ -1126,7 +1126,7 @@ h3 {
 .right-rail {
   min-width: 0;
   overflow: hidden;
-  background: var(--panel);
+  background: var(--column-surface);
   padding: 0;
 }
 
@@ -1156,7 +1156,7 @@ h3 {
   flex: 1;
   display: flex;
   flex-direction: column;
-  background: var(--panel);
+  background: var(--column-surface);
 }
 .icon-rail,
 .session-icon-rail {
@@ -1507,14 +1507,14 @@ h3 {
   min-height: 0;
   padding: 0 14px 0 20px;
   border-bottom: 0;
-  background: var(--panel);
+  background: var(--column-surface);
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
   z-index: 6;
 }
 .app.session-layout .main-chat {
   padding-top: 48px;
-  background: var(--panel);
+  background: var(--column-surface);
 }
 .app.session-layout .main-scroll {
   padding: 24px 22px;
