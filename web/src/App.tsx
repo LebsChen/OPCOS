@@ -10060,6 +10060,7 @@ function LayoutSplitter({
   onChange,
   onCollapse,
   collapseThreshold,
+  maxValue,
   className,
 }: {
   label: string;
@@ -10067,14 +10068,17 @@ function LayoutSplitter({
   onChange: (value: number) => void;
   onCollapse?: () => void;
   collapseThreshold?: number;
+  maxValue?: number;
   className?: string;
 }) {
   const applyValue = (next: number) => {
-    if (collapseThreshold !== undefined && next <= collapseThreshold) {
+    const bounded =
+      maxValue === undefined ? next : Math.min(next, Math.max(1, maxValue));
+    if (collapseThreshold !== undefined && bounded <= collapseThreshold) {
       onCollapse?.();
       return true;
     }
-    onChange(next);
+    onChange(bounded);
     return false;
   };
   return (
@@ -10338,6 +10342,7 @@ function SessionRightPanel({
   onCollapsedChange,
   width,
   onWidthChange,
+  maxWidth,
   onCollapse,
   eventRefreshKey,
   transcript,
@@ -10352,6 +10357,7 @@ function SessionRightPanel({
   onCollapsedChange?: (collapsed: boolean) => void;
   width: number;
   onWidthChange: (width: number) => void;
+  maxWidth: number;
   onCollapse: () => void;
   eventRefreshKey: string;
   transcript: TimelineEvent[];
@@ -10670,6 +10676,7 @@ function SessionRightPanel({
           label="Resize right session panel"
           value={width}
           collapseThreshold={260}
+          maxValue={maxWidth}
           onCollapse={onCollapse}
           className="session-panel-resizer"
           onChange={onWidthChange}
@@ -12005,6 +12012,12 @@ function AppContent() {
           label="Resize left session list"
           value={navWidth}
           collapseThreshold={180}
+          maxValue={
+            window.innerWidth -
+            (drawerCollapsed ? 44 : rightPanelWidth) -
+            6 -
+            320
+          }
           onCollapse={toggleNav}
           onChange={setNavWidth}
         />
@@ -12637,6 +12650,9 @@ function AppContent() {
           onCollapsedChange={setDrawerCollapsed}
           width={rightPanelWidth}
           onWidthChange={setRightPanelWidth}
+          maxWidth={
+            window.innerWidth - (navCollapsed ? 56 : navWidth) - 6 - 320
+          }
           onCollapse={() => setDrawerCollapsed(true)}
         />
       )}
