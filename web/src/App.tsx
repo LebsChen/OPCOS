@@ -10633,7 +10633,9 @@ function SessionRightPanel({
             icon: "monitor" as const,
           },
         ]),
-    { id: "ide", label: "Editor", icon: "code" },
+    ...(capabilities.ide?.state === "Unavailable" && panelTab !== "ide"
+      ? []
+      : [{ id: "ide" as const, label: "Editor", icon: "code" as const }]),
     ...(selected.host_id === "local" ||
     (capabilities.pty?.state === "Unavailable" && panelTab !== "terminal")
       ? []
@@ -10657,7 +10659,9 @@ function SessionRightPanel({
           capabilities.vnc?.state === "Unavailable" &&
           capabilities.computer_use?.state === "Unavailable"
         ? capabilities.vnc
-        : null;
+        : panelTab === "ide" && capabilities.ide?.state === "Unavailable"
+          ? capabilities.ide
+          : null;
   const workspaceTabIds: PanelTab[] = [
     "review",
     "terminal",
@@ -11266,6 +11270,10 @@ function AppContent() {
   const [pendingApprovals, setPendingApprovals] = useState<
     Record<string, PendingApproval>
   >({});
+  const [restoredComposerDraft, setRestoredComposerDraft] = useState<{
+    text: string;
+    nonce: number;
+  } | null>(null);
   useEffect(() => {
     setPendingQuestionCollapsed(false);
   }, [pendingQuestion?.callId]);
@@ -11677,6 +11685,7 @@ function AppContent() {
     const submittingSelectedSession =
       submittingSessionIdRef.current === selected?.id;
     if (!submittingSelectedSession) setLiveTranscript([]);
+    if (!submittingSelectedSession) setRestoredComposerDraft(null);
     setPendingQuestion(null);
     setPendingApprovals({});
     if (!submittingSelectedSession) setRunning(false);
@@ -11869,6 +11878,35 @@ function AppContent() {
         setRunning((previous) =>
           reconcileRunningState(previous, { kind: "turn_done", runState }),
         );
+        if (payload.session_id) {
+          void command<
+            Array<{
+              session_id: string;
+              call_id: string;
+              tool: string;
+              arguments: Record<string, unknown>;
+              state: string;
+            }>
+          >("list_pending", { sessionId: payload.session_id })
+            .then((items) => {
+              setPendingApprovals(
+                items
+                  .filter(
+                    (item) =>
+                      item.tool !== "ask_user" && item.state !== "resolved",
+                  )
+                  .reduce<Record<string, PendingApproval>>((current, item) => {
+                    current[item.call_id] = {
+                      callId: item.call_id,
+                      name: item.tool,
+                      args: item.arguments,
+                    };
+                    return current;
+                  }, {}),
+              );
+            })
+            .catch(onError);
+        }
         if (runState || stopReason) {
           setSessions((items) =>
             updateSessionRunState(
@@ -11943,9 +11981,10 @@ function AppContent() {
         (payload.kind === "notice" &&
           String(payload.payload?.kind) === "approval_pending")
       ) {
-        if (selected) {
+        const selectedSessionId = selectedIdRef.current;
+        if (selectedSessionId) {
           void command<TimelineEvent[]>("read_session_events", {
-            sessionId: selected.id,
+            sessionId: selectedSessionId,
           })
             .then((items) =>
               setTranscript((current) => mergeEvents(current, items)),
@@ -12119,6 +12158,7 @@ function AppContent() {
       setSelected(next);
       setSurface("session");
       setHomeInput("");
+      setRestoredComposerDraft(null);
       submittingSessionIdRef.current = next.id;
       setLiveTranscript((items) =>
         mergeEvents(items, optimisticUserMessageEvent(next.id, text), true),
@@ -12150,6 +12190,11 @@ function AppContent() {
             !optimisticUserMessageMatches(event, submittedSessionId, text),
         ),
       );
+      if (submittedSessionId) {
+        setRestoredComposerDraft({ text, nonce: Date.now() });
+      } else {
+        setHomeInput(text);
+      }
       setRunning(false);
       onError(submitFailureMessage(reason));
     }
@@ -12713,6 +12758,7 @@ function AppContent() {
                       }).catch(onError)
                     }
                     onUploadFile={uploadTextAttachment}
+                    restoreDraft={restoredComposerDraft || undefined}
                     resetKey={`${selected.id}:${pendingQuestion?.callId ?? "none"}`}
                   />
                 </div>

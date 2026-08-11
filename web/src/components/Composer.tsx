@@ -153,6 +153,7 @@ interface Props {
   // Push text + attachments into the composer (e.g. a start-panel task card). The `nonce` makes
   // repeated identical prefills re-apply; the user can still edit before sending.
   prefill?: { text: string; attachments?: Attachment[]; nonce: number };
+  restoreDraft?: { text: string; nonce: number };
   // Changes when the active conversation changes; clears any unsent draft.
   resetKey?: string;
   // Surface-specific hint shown in the empty textarea.
@@ -219,6 +220,14 @@ export function Composer(props: Props) {
     setAttachments([]);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.resetKey]);
+
+  useEffect(() => {
+    const draft = props.restoreDraft;
+    if (!draft || draft.nonce === appliedNonce.current) return;
+    appliedNonce.current = draft.nonce;
+    setText(draft.text);
+    textareaRef.current?.focus();
+  }, [props.restoreDraft?.nonce]);
 
   // Dictation is intentionally native-only: the browser/dev build remains a local server client
   // and never turns on the browser microphone or ships audio anywhere.

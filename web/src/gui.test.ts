@@ -376,6 +376,44 @@ describe("GUI boundary behavior", () => {
     expect(source).toContain("delete next[callId]");
   });
 
+  it("restores failed home submissions into the session composer", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("./App.tsx", import.meta.url)),
+      "utf8",
+    );
+    expect(source).toContain("setRestoredComposerDraft({ text, nonce:");
+    expect(source).toContain(
+      "restoreDraft={restoredComposerDraft || undefined}",
+    );
+    expect(source).toContain("setHomeInput(text)");
+  });
+
+  it("reconciles approvals from the backend when a turn ends", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("./App.tsx", import.meta.url)),
+      "utf8",
+    );
+    expect(source).toContain(
+      "command<\n            Array<{\n              session_id: string;",
+    );
+    expect(source).toContain(
+      '>("list_pending", { sessionId: payload.session_id })',
+    );
+    expect(source).toContain(
+      'item.tool !== "ask_user" && item.state !== "resolved"',
+    );
+  });
+
+  it("gates the editor by the remote IDE capability", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("./App.tsx", import.meta.url)),
+      "utf8",
+    );
+    expect(source).toContain('capabilities.ide?.state === "Unavailable"');
+    expect(source).toContain('panelTab === "ide"');
+    expect(source).toContain("restoreDraft");
+  });
+
   it("submits the first message optimistically without blocking on refresh", () => {
     const source = readFileSync(
       fileURLToPath(new URL("./App.tsx", import.meta.url)),

@@ -1427,3 +1427,66 @@ marker paths outside the repository's test material when possible so the agent c
 expected answers by searching parent directories. Restore temporary host URLs and provider
 fixtures before finishing, and record any intentionally changed agent setting without silently
 “fixing” it.
+
+## Local RVM fixture host: test capability gating / MCP / surfaces without a remote box
+
+A remote RVM host is not always usable (expired token, no VNC password, gateway down). A small
+aiohttp "dev-agent" fixture on `127.0.0.1:8899` covers almost every OPCOS host code path and is
+fully controllable, so gating/approval/surface tests stop depending on an external service.
+Endpoints OPCOS actually needs: `/api/health`, `/api/info`, `/api/capabilities`, `/api/exec-sync`,
+`/api/read`, `/api/write`, `/api/ls`, `/api/screenshot`, `/api/computer-use`, `/api/storage/stat`,
+`/api/storage/exists`, `/mcp`, `/pty-ws`, `/vnc-ws`. Wire-shape traps (read the Rust structs in
+`crates/opcos-rvm/src/lib.rs` before guessing): exec-sync takes `cmd` + `timeout` (not
+`command`/`timeout_seconds`), `/api/read` must return `size`, `/api/ls` must return `items`,
+`/api/screenshot` must return a nonempty `image` **plus** `format`, `/api/computer-use` must return
+`ok: true` (not `status`).
+
+Useful fixture knobs (add them; they turn hard-to-stage cases into one curl):
+`POST /fixture/capabilities {"capabilities":[...]}` to add/remove `vnc`/`pty`/`browser`/`cdp`/
+`computer_use`, `POST /fixture/delays {"health_delay":4,"computer_use_delay":60}` to make the
+optimistic-render window and the in-flight computer-use lease observable, `POST /fixture/tools` to
+change host MCP tools. Bridge `/vnc-ws` to a local `x11vnc -display :0 -nopw` and `/pty-ws` to a
+real `bash -i` pty so Desktop/Terminal surfaces are genuinely live.
+
+**Fixture pty pitfall that looks exactly like an OPCOS bug.** If the pty reader uses
+`loop.run_in_executor(None, os.read, master, 4096)`, every connection permanently consumes one
+default-ThreadPoolExecutor thread; after a handful of Terminal opens/pop-outs new pty websockets
+connect but never emit a byte, i.e. **black terminal panels and black pop-out windows**. Before
+blaming OPCOS, connect to `/pty-ws` directly with an aiohttp client and see whether the *host* echoes
+anything; fix the fixture with `loop.add_reader(master, ...)` + an asyncio queue. Also `pkill -f
+"bash -i"` between rounds. Generally: for any black surface, first prove the host side alone.
+
+## Provider / host credential fallbacks
+
+- Gateways expire mid-session: a provider card that validated earlier can start returning
+  `401 Invalid token`, which then surfaces as a mid-turn error and makes submit-failure tests
+  ambiguous. Keep an alternate OpenAI-compatible base URL + key (`LLM_Baseurl` / `LLM_KEY`) and
+  re-run Settings → Provider → Test/Save until it prints `Provider key validated successfully.`
+  Also re-pick the **session model chip** — a session created earlier keeps the old model id
+  (e.g. `glm-5.1`) and will fail with "model not found" even after the provider is fixed.
+- To stage a *submit* failure deterministically, add a host pointing at a dead port
+  (`http://127.0.0.1:9`) and send from a session bound to it; the error text is
+  `rvm request failed …`, no provider involvement.
+- Remote Desktop may be unreachable for a host-side reason. Probe the RFB handshake yourself before
+  calling it an OPCOS bug: connect to `wss://<RVM_URL>/vnc-ws` with the Bearer header, reply
+  `RFB 003.008\n`, and read the security-type list. `[1, 2]` on the wire means count=1, type=2
+  (VncAuth) ⇒ the host really requires a VNC password and OPCOS correctly shows
+  `Remote VNC requires a password; configure the host VNC password.` Ask for the host VNC password
+  as a secret (there is a per-host field); `/api/info` does not expose it.
+
+## Pop-out panes (`#/pane?session=…&tab=…`)
+
+`StandalonePane` re-fetches `list_sessions` and renders the same `SurfaceView`, so a pop-out calls
+`start_surface` again and gets its **own** bridge port. Desktop and Terminal pop-outs do paint live
+VNC/pty content on a healthy host — if a pop-out is black, suspect the host/bridge (see the fixture
+pty pitfall) before the pane route. `ide` pop-out shows only the backend reason when the session has
+no workspace, which is expected, so set a workspace if you need to test the IDE pop-out.
+
+## Capability gating specifics (App.tsx `remoteTabs`)
+
+Desktop is hidden only when **both** `vnc` and `computer_use` are Unavailable; Terminal is hidden
+when `pty` is Unavailable **or** the host is `local`; Browser is hidden when `browser` is
+Unavailable; Editor is hidden when `ide` is Unavailable. All four keep their tab when that pane is
+currently open, and show the backend `reason` text when the open pane's capability is unavailable.
+So: to test the "reason instead of blank" path, open the pane first, then drop the capability and
+force a re-probe by switching session away and back.
