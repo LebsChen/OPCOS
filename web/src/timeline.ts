@@ -65,6 +65,7 @@ export type TimelineNode =
         processId?: string;
         exitCode?: number;
         durationMs?: number;
+        providerWaiting?: boolean;
         startedAt?: number;
         resultSummary?: string;
         resultError?: boolean;
@@ -546,15 +547,44 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
       ].includes(type)
     ) {
       continue;
-    } else if (type === "provider_waiting" || type === "provider_retrying") {
+    } else if (type === "provider_waiting") {
       const activeWork = ensureWork(event.created_at_ms);
       const message =
         typeof data.message === "string" && data.message.trim()
           ? data.message.trim()
-          : type === "provider_retrying"
-            ? `Retrying provider request (${String(data.attempt ?? "?")}/${String(data.max_attempts ?? "?")})`
-            : `Waiting for provider response (${String(data.elapsed_seconds ?? 0)}s)`;
-      activeWork.rows.push({ label: message, activityLabel: true });
+          : `Waiting for provider response (${String(data.elapsed_seconds ?? 0)}s)`;
+      const existing = activeWork.rows.find((row) => row.providerWaiting);
+      if (existing) {
+        existing.label = message;
+      } else {
+        activeWork.rows.push({
+          label: message,
+          activityLabel: true,
+          providerWaiting: true,
+        });
+      }
+    } else if (type === "provider_waiting_cleared") {
+      const currentWork = work as Extract<
+        TimelineNode,
+        { kind: "work" }
+      > | null;
+      if (currentWork) {
+        const waitingRow = currentWork.rows.findIndex(
+          (row) => row.providerWaiting,
+        );
+        if (waitingRow >= 0) {
+          currentWork.rows.splice(waitingRow, 1);
+        }
+      }
+    } else if (type === "provider_retrying") {
+      const activeWork = ensureWork(event.created_at_ms);
+      activeWork.rows.push({
+        label:
+          typeof data.message === "string" && data.message.trim()
+            ? data.message.trim()
+            : `Retrying provider request (${String(data.attempt ?? "?")}/${String(data.max_attempts ?? "?")})`,
+        activityLabel: true,
+      });
     } else if (type === "steering_received" || type === "steering_applied") {
       const activeWork = ensureWork(event.created_at_ms);
       const iteration =

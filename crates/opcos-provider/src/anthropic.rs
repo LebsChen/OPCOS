@@ -91,6 +91,10 @@ impl AnthropicProvider {
             .await
             {
                 Ok(Ok(response)) => response,
+                Err(_) if transient_attempt < TRANSIENT_RETRY_LIMIT => {
+                    tokio::time::sleep(retry_delay(transient_attempt, None)).await;
+                    continue;
+                }
                 Err(_) => {
                     return Err(ProviderError::FirstByteTimeout {
                         seconds: self.config.first_byte_timeout_seconds,

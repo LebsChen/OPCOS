@@ -21,6 +21,49 @@ const saved = persisted as TimelineEvent[];
 const opcos = opcosEvents as TimelineEvent[];
 
 describe("single event-log timeline", () => {
+  it("updates and clears a persisted provider wait row when streaming resumes", () => {
+    const nodes = buildTimeline([
+      {
+        type: "provider_waiting",
+        event_id: "provider-wait-1",
+        created_at_ms: 3000,
+        working_event: {
+          event_type: "provider_waiting",
+          payload: {
+            elapsed_seconds: 3,
+            message: "Waiting for provider response (3s)",
+          },
+        },
+      },
+      {
+        type: "provider_waiting",
+        event_id: "provider-wait-2",
+        created_at_ms: 8000,
+        working_event: {
+          event_type: "provider_waiting",
+          payload: {
+            elapsed_seconds: 8,
+            message: "Waiting for provider response (8s)",
+          },
+        },
+      },
+      {
+        type: "provider_waiting_cleared",
+        event_id: "provider-wait-cleared",
+        created_at_ms: 9000,
+        working_event: {
+          event_type: "provider_waiting_cleared",
+          payload: { message: "Provider response resumed" },
+        },
+      },
+    ] as TimelineEvent[]);
+
+    const rows = nodes
+      .filter((node) => node.kind === "work")
+      .flatMap((node) => node.rows);
+    expect(rows.filter((row) => row.providerWaiting)).toHaveLength(0);
+  });
+
   it("replays captured tool results and terminal transitions", () => {
     const nodes = buildTimeline(live);
     const resultEvent = live.find((event) => event.type === "tool_result");

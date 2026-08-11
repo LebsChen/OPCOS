@@ -71,6 +71,11 @@ impl OpenAiProvider {
             .await
             {
                 Ok(Ok(response)) => response,
+                Err(_) if transient_attempt < TRANSIENT_RETRY_LIMIT => {
+                    tokio::time::sleep(retry_delay(transient_attempt, None)).await;
+                    transient_attempt += 1;
+                    continue;
+                }
                 Err(_) => {
                     return Err(ProviderError::FirstByteTimeout {
                         seconds: self.config.first_byte_timeout_seconds,
@@ -984,17 +989,18 @@ mod tests {
         let mut config = ProviderConfig::new(format!("http://{address}"), "test-key");
         config.first_byte_timeout_seconds = 1;
         let provider = OpenAiProvider::new(config);
-        let (output, mut chunks) = mpsc::channel(8);
         let turn = provider
-            .stream(
-                ProviderRequest {
-                    model: "test".into(),
-                    ..Default::default()
-                },
-                output,
+            .send(
+                provider.body(
+                    &ProviderRequest {
+                        model: "test".into(),
+                        ..Default::default()
+                    },
+                    true,
+                ),
+                true,
             )
             .await;
-        while chunks.try_recv().is_ok() {}
         assert!(matches!(
             turn,
             Err(ProviderError::FirstByteTimeout { seconds: 1 })

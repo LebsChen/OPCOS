@@ -3543,9 +3543,11 @@ has failed {} times and the last error code was {}",
         tokio::pin!(idle_timer);
         let mut waiting_tick = tokio::time::interval(Duration::from_secs(1));
         waiting_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let waiting_started = tokio::time::Instant::now();
+        let mut waiting_started = tokio::time::Instant::now();
         let mut last_chunk_at = waiting_started;
         let mut first_chunk_received = false;
+        let mut waiting_reported = false;
+        let mut last_wait_report_at: Option<tokio::time::Instant> = None;
         let mut retry_attempt = 1usize;
         let mut partial = PartialOutput::default();
         loop {
@@ -3573,6 +3575,18 @@ has failed {} times and the last error code was {}",
                         return (Err(ProviderError::Protocol("interrupted".into())), partial);
                     }
                     if chunk.stream_reset {
+                        let now = tokio::time::Instant::now();
+                        if waiting_reported {
+                            let _ = self.working_event(
+                                "provider_waiting_cleared",
+                                "status",
+                                json!({"message": "Provider response resumed"}),
+                            ).await;
+                        }
+                        waiting_started = now;
+                        last_chunk_at = now;
+                        waiting_reported = false;
+                        last_wait_report_at = None;
                         partial = PartialOutput::default();
                         let _ = self.emit_event("stream_reset", chunk);
                         retry_attempt += 1;
@@ -3593,6 +3607,16 @@ has failed {} times and the last error code was {}",
                     }
                     let now = tokio::time::Instant::now();
                     last_chunk_at = now;
+                    if waiting_reported {
+                        let _ = self.working_event(
+                            "provider_waiting_cleared",
+                            "status",
+                            json!({"message": "Provider response resumed"}),
+                        ).await;
+                    }
+                    waiting_started = now;
+                    waiting_reported = false;
+                    last_wait_report_at = None;
                     first_chunk_received = true;
                     idle_timer.as_mut().reset(now + idle_timeout);
                     if let Some(text) = chunk.text_delta.clone() {
@@ -3628,6 +3652,15 @@ has failed {} times and the last error code was {}",
                     } else {
                         waiting_started.elapsed().as_secs()
                     };
+                    const WAIT_REPORT_THRESHOLD_SECONDS: u64 = 3;
+                    const WAIT_REPORT_INTERVAL_SECONDS: u64 = 5;
+                    if elapsed < WAIT_REPORT_THRESHOLD_SECONDS
+                        || last_wait_report_at.is_some_and(|reported_at| {
+                            reported_at.elapsed().as_secs() < WAIT_REPORT_INTERVAL_SECONDS
+                        })
+                    {
+                        continue;
+                    }
                     let message = if first_chunk_received {
                         format!("Waiting for provider stream ({elapsed}s)")
                     } else {
@@ -3642,6 +3675,8 @@ has failed {} times and the last error code was {}",
                             "message": message,
                         }),
                     ).await;
+                    waiting_reported = true;
+                    last_wait_report_at = Some(tokio::time::Instant::now());
                 }
             }
         }
