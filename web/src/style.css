@@ -177,7 +177,6 @@ button:disabled {
   padding: 0 18px;
   font-size: 16px;
   letter-spacing: -0.02em;
-  border-bottom: 1px solid var(--color-line);
 }
 .brand-wordmark {
   display: flex;
@@ -1308,8 +1307,8 @@ h3 {
   align-items: center;
   justify-content: space-between;
   box-sizing: border-box;
-  flex: 0 0 52px;
-  height: 52px;
+  flex: 0 0 var(--session-header-height, 52px);
+  height: var(--session-header-height, 52px);
   padding: 0 14px;
   border-bottom: 1px solid var(--color-line);
   background: var(--panel);
@@ -1388,6 +1387,13 @@ h3 {
   min-height: 0;
   flex: 1;
   overflow: auto;
+}
+.session-panel-drawer,
+.session-panel-drawer .drawer-head,
+.session-panel-drawer .session-panel-content,
+.session-panel-drawer .session-pane,
+.session-panel-drawer .session-pane > .surface-panel {
+  background-color: var(--column-surface);
 }
 .tasks-pane {
   display: flex;
@@ -1522,10 +1528,10 @@ h3 {
   gap: 12px;
   position: absolute;
   inset: 0 0 auto 0;
-  height: 48px;
+  height: var(--session-header-height, 52px);
   min-height: 0;
   padding: 0 14px 0 20px;
-  border-bottom: 0;
+  border-bottom: 1px solid var(--color-line);
   background: var(--column-surface);
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
@@ -1538,11 +1544,19 @@ h3 {
   min-width: 32px;
 }
 .app.session-layout .main-title {
+  position: static;
   min-width: 0;
-  flex: 1;
+  flex: 1 1 auto;
+  height: auto;
+  transform: none;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  max-width: none;
 }
 .app.session-layout .main-chat {
-  padding-top: 48px;
+  padding-top: var(--session-header-height, 52px);
   background: var(--column-surface);
 }
 .app.session-layout .main-scroll {
